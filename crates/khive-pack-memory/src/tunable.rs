@@ -1,3 +1,5 @@
+//! Brain-tunable parameter surface for the memory pack's recall scoring pipeline.
+
 use khive_pack_brain::state::BalancedRecallState;
 use khive_pack_brain::tunable::{PackTunable, ParameterDef, ParameterSpace};
 use khive_runtime::RuntimeError;
@@ -11,7 +13,7 @@ use crate::MemoryPack;
 ///
 /// Parameter names (`memory::relevance_weight`, `memory::salience_weight`,
 /// `memory::temporal_weight`) correspond to the three Beta posteriors in
-/// `BalancedRecallState` (ADR-032 §5a). Posterior means flow directly into
+/// `BalancedRecallState`. Posterior means flow directly into
 /// `RecallConfig`.
 ///
 /// `project_config` reads posterior means → `RecallConfig`.

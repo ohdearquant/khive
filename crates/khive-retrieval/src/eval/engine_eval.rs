@@ -1,17 +1,4 @@
-//! Retrieval evaluation types and metrics for the khive compose pipeline.
-//!
-//! Provides the label taxonomy, graded scoring, and standard information-retrieval
-//! metrics needed to measure compose quality against annotated benchmarks.
-//!
-//! # Design
-//!
-//! Labels follow a 5-level taxonomy (`Decisive` → `AdjacentWrong`) modelled on
-//! GPQA-style relevance judgements where topically adjacent but factually wrong
-//! sections are explicitly penalised. The `gain` scoring function drives nDCG and
-//! `net_evidence` metrics.
-//!
-//! All metric functions operate on a slice of [`LabeledResult`] in **ranked order**
-//! (index 0 = rank 1). Callers are responsible for pre-sorting.
+//! Retrieval evaluation: 5-level label taxonomy, nDCG, and `net_evidence` metrics.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

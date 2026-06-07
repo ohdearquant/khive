@@ -1,15 +1,14 @@
-//! Pack runtime trait and verb registry (ADR-025 step 2).
+// FILE SIZE JUSTIFICATION: pack.rs is the load-bearing dispatch core — VerbRegistry,
+// VerbRegistryBuilder, PackRuntime, DispatchHook, and their test scaffolding all
+// share internal state (packs Vec, gate, event_store) that cannot be cleanly split
+// without exposing private fields or duplicating the scaffolding. Inline tests cover
+// collision detection and dispatch path that require direct access to VerbRegistry
+// internals. Split plan: when the verb surface reaches a stable v1 API, extract
+// VerbRegistryBuilder into `pack/builder.rs` and gate/event logic into `pack/dispatch.rs`.
+//! Pack runtime trait and verb registry.
 //!
-//! Packs register verbs into the runtime. The registry routes verb calls
-//! to the pack that declares them.
-//!
-//! `Pack` (in khive-types) uses const associated items which are not
-//! object-safe. `PackRuntime` mirrors that metadata as methods so the
-//! registry can store packs as trait objects. See ADR-025 §PackRuntime.
-//!
-//! Lifecycle: build with `VerbRegistryBuilder`, then call `.build()` to
-//! get a cheaply-cloneable `VerbRegistry`. Registration is only possible
-//! through the builder.
+//! `PackRuntime` mirrors `Pack`'s const associated items as methods for object safety.
+//! Build a [`VerbRegistry`] via `VerbRegistryBuilder::build()`; registration is builder-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -32,15 +31,15 @@ pub use khive_types::VerbDef;
 
 use crate::validation::ValidationRule;
 
-/// Pack-auxiliary schema plan (ADR-017 §Storage profile and pack-auxiliary schema).
+/// Pack-auxiliary schema plan.
 ///
 /// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
 /// are NOT part of the core substrate schema (entities, notes, edges, events).
 /// Applied at boot via `StorageBackend::apply_schema` / `apply_pack_schema_plan`.
 ///
-/// Core substrate tables evolve through versioned migrations (ADR-015). Pack
-/// schema is strictly for pack-auxiliary tables (e.g. GTD lifecycle audit,
-/// memory index). v1 pack schemas are non-versioned.
+/// Core substrate tables evolve through versioned migrations. Pack schema is
+/// strictly for pack-auxiliary tables (e.g. GTD lifecycle audit, memory index).
+/// v1 pack schemas are non-versioned.
 #[derive(Debug, Default, Clone)]
 pub struct SchemaPlan {
     /// Owning pack name.
@@ -87,7 +86,7 @@ use crate::error::{
 };
 use crate::KhiveRuntime;
 
-/// Async dispatch trait for packs (ADR-025).
+/// Async dispatch trait for packs.
 ///
 /// This is the object-safe behavioral counterpart to `khive_types::Pack`.
 /// `Pack` uses const associated items (not object-safe in Rust); this trait
@@ -111,18 +110,18 @@ pub trait PackRuntime: Send + Sync {
 
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
-    /// can ignore it (ADR-031).
+    /// can ignore it.
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
         &[]
     }
 
-    /// Pack names whose vocabulary this pack references (ADR-037).
+    /// Pack names whose vocabulary this pack references.
     /// Defaults to empty so existing packs compile without changes.
     fn requires(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// NoteKindSpec declarations for note kinds this pack owns (ADR-004).
+    /// NoteKindSpec declarations for note kinds this pack owns.
     ///
     /// Packs that introduce note kinds with explicit lifecycle semantics
     /// declare the spec here.  The runtime collects these for introspection
@@ -132,7 +131,7 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
-    /// Optional per-kind hook for shared CRUD specialization (ADR-030).
+    /// Optional per-kind hook for shared CRUD specialization.
     ///
     /// When a kind is owned by this pack (declared in `note_kinds()` or
     /// `entity_kinds()`), returning `Some(hook)` opts that kind into
@@ -143,13 +142,13 @@ pub trait PackRuntime: Send + Sync {
         None
     }
 
-    /// Pack-auxiliary schema (ADR-017 §Storage profile and pack-auxiliary schema).
+    /// Pack-auxiliary schema.
     ///
     /// Returns DDL statements for pack-owned tables that are NOT part of the
     /// core substrate schema. Statements are idempotent (`CREATE TABLE IF NOT
     /// EXISTS`) so callers can apply them safely on every registration. Core
-    /// substrate tables evolve through versioned migrations (ADR-015); pack
-    /// schema is strictly pack-auxiliary.
+    /// substrate tables evolve through versioned migrations; pack schema is
+    /// strictly pack-auxiliary.
     ///
     /// Defaults to an empty plan — packs that store everything in the core
     /// substrate tables (entities, notes, edges, events) return this default.
@@ -162,7 +161,7 @@ pub trait PackRuntime: Send + Sync {
         SchemaPlan::empty()
     }
 
-    /// Domain-specific validation rules contributed by this pack (ADR-034 §9).
+    /// Domain-specific validation rules contributed by this pack.
     ///
     /// Rule IDs MUST follow the `<pack>/<rule-id>` namespace convention.
     /// Built-in rules (no pack prefix) are reserved for the `khive-runtime`
@@ -173,7 +172,7 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
-    /// Register custom embedding providers with the runtime (ADR-031 extension).
+    /// Register custom embedding providers with the runtime.
     ///
     /// Called by the transport during pack initialisation, before the first verb
     /// dispatch, so that `KhiveRuntime::embedder(name)` resolves provider names
@@ -206,7 +205,7 @@ pub trait PackRuntime: Send + Sync {
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged
-    /// vocabulary and kind hooks across all loaded packs (ADR-030).
+    /// vocabulary and kind hooks across all loaded packs.
     /// The `token` is an authorized namespace token minted by the dispatch
     /// boundary after gate authorization — handlers must use it directly.
     async fn dispatch(
@@ -218,7 +217,7 @@ pub trait PackRuntime: Send + Sync {
     ) -> Result<Value, RuntimeError>;
 }
 
-/// Per-kind specialization for shared CRUD (ADR-030).
+/// Per-kind specialization for shared CRUD.
 ///
 /// Packs implement `KindHook` for kinds they own that need:
 /// - **Defaults** filled into create args (e.g. `status="inbox"` for tasks)
@@ -268,7 +267,7 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
-    /// Optional audit event sink (ADR-018).
+    /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
     /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
@@ -284,6 +283,7 @@ pub struct VerbRegistryBuilder {
 }
 
 impl VerbRegistryBuilder {
+    /// Create a builder with no packs, `AllowAllGate`, and the local namespace as default.
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
@@ -301,7 +301,7 @@ impl VerbRegistryBuilder {
         self
     }
 
-    /// Register a boxed pack directly (ADR-027).
+    /// Register a boxed pack directly.
     ///
     /// Crate-private: only [`PackRegistry::register_packs`] should call this.
     /// External callers must use the typed [`Self::register`] which enforces the
@@ -312,7 +312,7 @@ impl VerbRegistryBuilder {
         self
     }
 
-    /// Set the authorization gate consulted on every dispatch (ADR-018).
+    /// Set the authorization gate consulted on every dispatch.
     ///
     /// Defaults to `AllowAllGate` if not set. `Deny` is authoritative — a deny
     /// decision aborts dispatch with `RuntimeError::PermissionDenied`. Gate
@@ -326,13 +326,13 @@ impl VerbRegistryBuilder {
     /// Set the namespace surfaced to the gate when a verb does not carry an
     /// explicit `namespace` argument. Transports should plumb the runtime's
     /// `default_namespace` so the gate's `input.namespace` always reflects
-    /// the operation's true tenant (ADR-018 + ADR-007).
+    /// the operation's true tenant.
     pub fn with_default_namespace(&mut self, ns: impl Into<String>) -> &mut Self {
         self.default_namespace = ns.into();
         self
     }
 
-    /// Set the `EventStore` used to persist audit events (ADR-018).
+    /// Set the `EventStore` used to persist audit events.
     ///
     /// When configured, every gate check appends one `Event` (substrate =
     /// `Event`, outcome = `Success` on allow, `Denied` on deny) in addition to
@@ -362,7 +362,7 @@ impl VerbRegistryBuilder {
 
     /// Consume the builder and produce an immutable, cloneable registry.
     ///
-    /// Performs a topological sort of packs using Kahn's algorithm (ADR-037).
+    /// Performs a topological sort of packs using Kahn's algorithm.
     /// Returns an error if any declared dependency is missing from the loaded
     /// pack set, or if a circular dependency is detected.
     pub fn build(self) -> Result<VerbRegistry, RuntimeError> {
@@ -476,7 +476,7 @@ fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), Runt
 }
 
 /// Validate that no two packs declare the same `Visibility::Verb` handler name
-/// (ADR-017 §Boot-time collision checks, F093).
+/// (F093).
 ///
 /// `Visibility::Subhandler` entries are pack-prefixed by convention and excluded
 /// from cross-pack collision detection. Two packs declaring the same subhandler
@@ -576,7 +576,7 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
-    /// Audit event sink — `None` means tracing-only (v0.2 default) (ADR-018).
+    /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
@@ -585,31 +585,10 @@ pub struct VerbRegistry {
 impl VerbRegistry {
     /// Return the help schema envelope for a verb (issue #287).
     ///
-    /// Called by `dispatch` when `params["help"] == true`. Walks all registered
-    /// packs to find the first `HandlerDef` whose `name` matches `verb`, then
-    /// returns a structured envelope:
-    ///
-    /// ```json
-    /// {
-    ///   "verb": "recall",
-    ///   "pack": "memory",
-    ///   "description": "...",
-    ///   "category": "Assertive",
-    ///   "params": [
-    ///     { "name": "query", "type": "string", "required": true, "description": "..." },
-    ///     ...
-    ///   ]
-    /// }
-    /// ```
-    ///
-    /// For `Visibility::Subhandler` handlers the envelope carries
-    /// `"visibility": "internal"` and `"callable_via_mcp": false` so that
-    /// callers who discover the schema via `help=true` see the same
-    /// non-callable status that dispatch would enforce (ue-help-introspection C1).
-    ///
-    /// Returns `Err(RuntimeError::InvalidInput(...))` when the verb is unknown
-    /// to all loaded packs — identical to the error the normal dispatch path
-    /// would emit (so callers get consistent feedback for unknown verbs).
+    /// Walks registered packs for the first matching `HandlerDef` and returns a
+    /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
+    /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
+    /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
         for pack in self.packs.iter() {
             for handler in pack.handlers().iter() {
@@ -672,40 +651,9 @@ impl VerbRegistry {
 
     /// Dispatch a verb to the first pack that handles it.
     ///
-    /// When multiple packs declare the same verb, the first registered pack wins.
-    ///
-    /// **`help=true` interception (issue #287)**: when `params` contains
-    /// `"help": true`, dispatch is short-circuited before gate evaluation and
-    /// pack invocation. The call returns a schema envelope for the verb:
-    /// `{ verb, pack, description, category, params: [{name, type, required, description}] }`.
-    /// This is a read-only introspection path; no side effects occur.
-    ///
-    /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
-    /// (ADR-018). `Deny` decisions return
-    /// [`RuntimeError::PermissionDenied`] immediately — the pack is never
-    /// invoked. `Allow` decisions proceed to pack dispatch as before.
-    ///
-    /// Every gate consultation emits one `tracing::info!(... "gate.check")` event
-    /// with a structured `audit_event` field (ADR-018). When a [`EventStore`]
-    /// is configured via [`VerbRegistryBuilder::with_event_store`], an `Event`
-    /// is also persisted to the `Event` substrate (ADR-018; ADR-004/ADR-005). Storage errors are logged
-    /// via `tracing::warn!` and never propagated.
-    ///
-    /// When `gate.check` itself returns an error (gate infrastructure failure),
-    /// the error is logged via `tracing::warn!` and dispatch proceeds (fail-open,
-    /// consistent with ADR-018 "Fail-open on gate Err"). No audit event
-    /// is persisted for an errored gate check — no decision was produced.
-    ///
-    /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
-    /// operation's namespace — pulled from `params["namespace"]` when present
-    /// (including an explicit empty string, which `KhiveRuntime::ns` also
-    /// preserves), otherwise the registry's default namespace (configured via
-    /// [`VerbRegistryBuilder::with_default_namespace`]). Gate-visible
-    /// namespace and runtime-visible namespace MUST stay aligned; coercing an
-    /// empty string here while the runtime keeps `""` would create an
-    /// authorization/audit blind spot on the namespace field governed by ADR-018.
-    /// Transports that have richer caller context (auth headers, session
-    /// info) will gain a sibling dispatch path in a follow-up.
+    /// Routes through the gate, then invokes the matching pack handler. When
+    /// `params["help"] == true`, short-circuits to `describe_verb` with no side effects.
+    /// Gate errors are fail-open. Full dispatch flow documented in `docs/protocol.md`.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
         // help=true interception (issue #287) — short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
@@ -722,7 +670,7 @@ impl VerbRegistry {
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
         let gate_req = GateRequest::new(ActorRef::anonymous(), ns, verb, params.clone());
 
-        // Consult the gate (ADR-018).
+        // Consult the gate.
         //
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
@@ -731,7 +679,7 @@ impl VerbRegistry {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
-                // Emit audit event via tracing (ADR-018).
+                // Emit audit event via tracing.
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
@@ -739,7 +687,7 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // Persist to EventStore when configured (ADR-018; ADR-004/ADR-005).
+                // Persist to EventStore when configured.
                 if let Some(store) = &self.event_store {
                     let outcome = if is_deny {
                         EventOutcome::Denied
@@ -782,14 +730,14 @@ impl VerbRegistry {
                 }
             }
             Err(err) => {
-                // Gate infrastructure failure — fail-open (ADR-018).
+                // Gate infrastructure failure — fail-open.
                 // No decision was produced; no audit event is persisted.
                 tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
                 None
             }
         };
 
-        // Hard enforcement (ADR-018): Deny is authoritative.
+        // Hard enforcement: Deny is authoritative.
         if let Some(reason) = gate_blocked {
             return Err(RuntimeError::PermissionDenied {
                 verb: verb.to_string(),
@@ -797,7 +745,7 @@ impl VerbRegistry {
             });
         }
 
-        // Mint the authorized namespace token at the dispatch boundary (ADR-007).
+        // Mint the authorized namespace token at the dispatch boundary.
         // ns_str was already validated above when building the gate request.
         let token = NamespaceToken::mint_authorized(
             Namespace::parse(&ns_str)
@@ -807,7 +755,7 @@ impl VerbRegistry {
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
-                // Strip `namespace` from params before forwarding to packs (ADR-007).
+                // Strip `namespace` from params before forwarding to packs.
                 // The registry has already consumed it to mint the NamespaceToken.
                 //
                 // Exception: if the handler's own `params` schema declares
@@ -887,7 +835,7 @@ impl VerbRegistry {
         )))
     }
 
-    /// Find a kind hook (ADR-030) among the registered packs.
+    /// Find a kind hook among the registered packs.
     ///
     /// Walks packs in registration order; the first pack that both owns the
     /// kind (declares it in `note_kinds()` or `entity_kinds()`) and returns
@@ -908,9 +856,8 @@ impl VerbRegistry {
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
     /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
-    /// pipeline steps not surfaced on the MCP wire (ADR-017 §Visibility filtering,
-    /// F118). Returned with `'static` lifetime since pack handlers are `&'static
-    /// [HandlerDef]` constants.
+    /// pipeline steps not surfaced on the MCP wire (F118). Returned with `'static`
+    /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
@@ -923,8 +870,8 @@ impl VerbRegistry {
     /// (`Visibility::Verb` only).
     ///
     /// Subhandlers (`Visibility::Subhandler`) are excluded from the MCP catalog
-    /// (ADR-017 §Visibility filtering, F118-F123). Use `all_handlers_with_names`
-    /// when internal handlers must also be enumerated (e.g. runtime introspection).
+    /// (F118-F123). Use `all_handlers_with_names` when internal handlers must
+    /// also be enumerated (e.g. runtime introspection).
     pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
         self.packs
             .iter()
@@ -937,7 +884,7 @@ impl VerbRegistry {
     ///
     /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
     /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
-    /// the complete handler surface (ADR-017 §Introspection).
+    /// the complete handler surface.
     pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
         self.packs
             .iter()
@@ -972,7 +919,7 @@ impl VerbRegistry {
         self.packs.iter().map(|p| p.name()).collect()
     }
 
-    /// Declared dependencies for a registered pack (ADR-037).
+    /// Declared dependencies for a registered pack.
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
         self.packs
             .iter()
@@ -1005,8 +952,7 @@ impl VerbRegistry {
     /// Handlers declared by a specific registered pack.
     ///
     /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
-    /// carries name + description + visibility — sufficient for introspection
-    /// clients like `kkernel pack handler` (ADR-076).
+    /// carries name + description + visibility — sufficient for introspection clients.
     pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
         self.packs
             .iter()
@@ -1014,7 +960,7 @@ impl VerbRegistry {
             .map(|p| p.handlers())
     }
 
-    /// All pack-declared edge endpoint rules across registered packs (ADR-031).
+    /// All pack-declared edge endpoint rules across registered packs.
     ///
     /// Order follows topological pack registration; duplicates are *not* deduplicated —
     /// validation only checks membership, and an exact-duplicate rule is a
@@ -1026,7 +972,7 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// Collect all `NoteKindSpec` declarations from every loaded pack (ADR-004).
+    /// Collect all `NoteKindSpec` declarations from every loaded pack.
     ///
     /// Used by the runtime for lifecycle introspection and future enforcement.
     pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
@@ -1036,7 +982,7 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// All pack-contributed validation rules across registered packs (ADR-034 §9).
+    /// All pack-contributed validation rules across registered packs.
     ///
     /// Returns references into the pack-owned `'static` slices — no allocation
     /// beyond the outer `Vec`. Rule IDs are namespaced by pack; callers can
@@ -1048,7 +994,7 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// Pack-auxiliary schema plans for all registered packs (ADR-017).
+    /// Pack-auxiliary schema plans for all registered packs.
     ///
     /// Returns one `SchemaPlan` per pack. Callers (typically the runtime
     /// bootstrap) apply each plan to the pack's assigned backend. Empty plans
@@ -1058,8 +1004,7 @@ impl VerbRegistry {
         self.packs.iter().map(|p| p.schema_plan()).collect()
     }
 
-    /// Invoke `PackRuntime::register_embedders` on every registered pack
-    /// (ADR-031 extension — pack embedder hook).
+    /// Invoke `PackRuntime::register_embedders` on every registered pack.
     ///
     /// Called by the transport during startup, after the registry is built and
     /// before the first verb dispatch, so that custom embedding providers
@@ -1074,7 +1019,7 @@ impl VerbRegistry {
         }
     }
 
-    /// Invoke `PackRuntime::warm` on every registered pack (ADR-049).
+    /// Invoke `PackRuntime::warm` on every registered pack.
     /// Called by the daemon at boot (in a background task) so expensive in-memory
     /// state (ANN indexes) is pre-loaded without blocking request serving.
     pub async fn call_warm_all(&self) {
@@ -1083,7 +1028,7 @@ impl VerbRegistry {
         }
     }
 
-    /// Resolve the presentation policy for a verb name (ADR-045 §6).
+    /// Resolve the presentation policy for a verb name.
     ///
     /// Walks all registered handlers (including subhandlers) for the first
     /// matching name and returns its declared [`VerbPresentationPolicy`].
@@ -1102,8 +1047,8 @@ impl VerbRegistry {
     /// `Visibility::Subhandler` (internal / operator-only).
     ///
     /// Used by the MCP server to gate subhandler invocation at the wire
-    /// boundary (ADR-017 §Visibility) without blocking internal callers that
-    /// invoke the same verbs through the runtime directly.
+    /// boundary without blocking internal callers that invoke the same verbs
+    /// through the runtime directly.
     pub fn is_subhandler_verb(&self, verb: &str) -> bool {
         for pack in self.packs.iter() {
             if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
@@ -1114,7 +1059,7 @@ impl VerbRegistry {
     }
 
     /// Apply all non-empty pack-auxiliary schema plans to the given backend
-    /// (ADR-017 §c12 startup application).
+    /// (c12 startup application).
     ///
     /// This is the centralized startup hook that replaced the previous lazy
     /// per-pack self-bootstrap pattern. Each pack's `SchemaPlan` carries
@@ -1141,10 +1086,10 @@ impl VerbRegistry {
     }
 }
 
-// ── ADR-027: inventory-based dynamic pack loading ─────────────────────────────
+// ── Inventory-based dynamic pack loading ────────────────────────────────────
 
-/// Factory for creating pack instances registered via `inventory` at link time
-/// (ADR-027). Each pack crate submits a `&'static dyn PackFactory` wrapped in a
+/// Factory for creating pack instances registered via `inventory` at link time.
+/// Each pack crate submits a `&'static dyn PackFactory` wrapped in a
 /// [`PackRegistration`]; the binary's linker collects them all into a single
 /// slice iterable at runtime.
 ///
@@ -1154,12 +1099,12 @@ pub trait PackFactory: Send + Sync + 'static {
     /// Canonical lowercase name for this pack (e.g. `"kg"`, `"gtd"`).
     fn name(&self) -> &'static str;
 
-    /// Names of packs that must be loaded before this one (ADR-037).
+    /// Names of packs that must be loaded before this one.
     ///
     /// Defaults to empty so pack crates that have no dependencies compile
     /// without changes. [`PackRegistry::register_packs`] validates that every
     /// name listed here is present in the caller's explicit pack list — absent
-    /// dependencies are a boot error, not silently auto-added (ADR-027).
+    /// dependencies are a boot error, not silently auto-added.
     fn requires(&self) -> &'static [&'static str] {
         &[]
     }
@@ -1170,8 +1115,7 @@ pub trait PackFactory: Send + Sync + 'static {
 
 /// Newtype wrapper collected by `inventory` so pack crates can submit
 /// `&'static dyn PackFactory` references without the type-ascription syntax
-/// that `inventory::submit!` does not support for bare trait-object references
-/// (ADR-027).
+/// that `inventory::submit!` does not support for bare trait-object references.
 pub struct PackRegistration(pub &'static dyn PackFactory);
 
 inventory::collect!(PackRegistration);
@@ -1205,7 +1149,7 @@ impl std::fmt::Display for PackLoadError {
 
 impl std::error::Error for PackLoadError {}
 
-/// Registry of pack factories discovered via `inventory` at link time (ADR-027).
+/// Registry of pack factories discovered via `inventory` at link time.
 ///
 /// No instance is needed — all methods are associated functions that walk the
 /// globally-collected [`PackRegistration`] slice.
@@ -1224,8 +1168,8 @@ impl PackRegistry {
     ///
     /// Validates the explicit pack list against `PackFactory::requires()` —
     /// if any requested pack declares a dependency that is absent from `names`,
-    /// registration fails (ADR-027: missing dependency is a boot error, not
-    /// silently auto-added). Callers must include all required packs explicitly.
+    /// registration fails (missing dependency is a boot error, not silently
+    /// auto-added). Callers must include all required packs explicitly.
     ///
     /// The [`VerbRegistryBuilder::build`] topo-sort enforces correct load order.
     ///
@@ -1253,7 +1197,7 @@ impl PackRegistry {
         }
 
         // Validate that all requires() dependencies are explicitly present in
-        // the requested set. ADR-027: missing dep → boot error, not auto-add.
+        // the requested set. Missing dep → boot error, not auto-add.
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             for &dep in factory.requires() {
@@ -1283,6 +1227,11 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
 
+// INLINE TEST JUSTIFICATION: tests here exercise VerbRegistry collision detection,
+// gate enforcement, and dispatch ordering that depend on direct access to the
+// registry's private `packs` Vec and gate field. Moving them to tests/ would
+// require pub-exporting registry internals. Broad behavioral dispatch tests
+// live in tests/integration.rs.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,7 +1302,7 @@ mod tests {
             },
             // "create" is Subhandler so it does NOT collide with AlphaPack's
             // Verb-visibility "create" — subhandlers are pack-internal and
-            // excluded from cross-pack collision detection (ADR-017).
+            // excluded from cross-pack collision detection.
             HandlerDef {
                 name: "create",
                 description: "beta internal create (subhandler)",
@@ -1454,9 +1403,9 @@ mod tests {
         assert_eq!(res["pack"], "beta");
     }
 
-    /// ADR-017 §Boot-time collision checks (F093/F094): two packs declaring the
-    /// same `Visibility::Verb` handler must be rejected at build time — the old
-    /// "first registered wins" behaviour is replaced by a boot error.
+    /// F093/F094: two packs declaring the same `Visibility::Verb` handler must be
+    /// rejected at build time — the old "first registered wins" behaviour is
+    /// replaced by a boot error.
     #[test]
     fn verb_collision_is_boot_time_error() {
         let mut builder = VerbRegistryBuilder::new();
@@ -1483,7 +1432,7 @@ mod tests {
 
     /// Subhandler-visibility handlers with the same name across packs are NOT
     /// a collision — they are pack-internal and excluded from cross-pack
-    /// collision detection (ADR-017 §Boot-time collision checks).
+    /// collision detection.
     #[test]
     fn subhandler_same_name_across_packs_is_not_a_collision() {
         struct SubhandlerPack;
@@ -1541,7 +1490,7 @@ mod tests {
         assert!(msg.contains("create"));
     }
 
-    /// `all_verbs` returns only `Visibility::Verb` entries (ADR-017 F118).
+    /// `all_verbs` returns only `Visibility::Verb` entries (F118).
     ///
     /// BetaPack's `create` is `Visibility::Subhandler` — it must NOT appear
     /// in `all_verbs()` even though it has the same name as a Verb in AlphaPack.
@@ -1657,7 +1606,7 @@ mod tests {
         assert_eq!(kinds, vec!["widget", "gadget"]);
     }
 
-    // ---- Gate wiring (ADR-018) ----
+    // ---- Gate wiring ----
 
     use khive_gate::{Gate, GateError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1708,7 +1657,7 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build().expect("registry builds");
 
-        // Gate denies — dispatch now returns PermissionDenied (hard enforcement, ADR-018).
+        // Gate denies — dispatch now returns PermissionDenied (hard enforcement).
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
             matches!(err, RuntimeError::PermissionDenied { ref verb, .. } if verb == "create"),
@@ -1810,7 +1759,7 @@ mod tests {
         assert_eq!(seen, vec!["local"]);
     }
 
-    // ---- Audit event emission (ADR-018) ----
+    // ---- Audit event emission ----
 
     use khive_gate::{AuditDecision, AuditEvent, Obligation};
 
@@ -1886,7 +1835,7 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build().expect("registry builds");
 
-        // Gate denies — dispatch returns PermissionDenied (hard enforcement, ADR-018).
+        // Gate denies — dispatch returns PermissionDenied (hard enforcement).
         // The audit event is still recorded (captured inside the gate impl).
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
@@ -1914,13 +1863,13 @@ mod tests {
 
         let evs = gate.events.lock().unwrap();
         let ev = &evs[0];
-        // Namespace from params wins (ADR-018 alignment rule).
+        // Namespace from params wins.
         assert_eq!(ev.namespace, "tenant-q");
         assert_eq!(ev.verb, "list");
         assert_eq!(ev.actor.kind, "anonymous");
     }
 
-    // ---- Audit tracing emission (ADR-018) ----
+    // ---- Audit tracing emission ----
     //
     // The AuditCapturingGate tests above prove that AuditEvent::from_check is
     // called with the right inputs, but they observe the event *inside* the
@@ -1928,9 +1877,8 @@ mod tests {
     // `tracing::info!(audit_event = ..., "gate.check")` were deleted or
     // renamed. The tests below install a capture Layer and assert on the
     // actual tracing event surfaced from dispatch. This locks the public
-    // observability contract from ADR-018: one `gate.check` info event per
-    // dispatch, carrying an `audit_event` field that round-trips back to an
-    // `AuditEvent`.
+    // observability contract: one `gate.check` info event per dispatch,
+    // carrying an `audit_event` field that round-trips back to an `AuditEvent`.
 
     use std::sync::{Mutex as StdMutex, Once, OnceLock};
 
@@ -2133,7 +2081,7 @@ mod tests {
         );
     }
 
-    // ---- Hard enforcement + EventStore persistence (ADR-018; ADR-004/ADR-005) ----
+    // ---- Hard enforcement + EventStore persistence ----
 
     use crate::runtime::NamespaceToken;
     use async_trait::async_trait;
@@ -2422,7 +2370,7 @@ mod tests {
             builder.register(AlphaPack);
             builder.with_gate(Arc::new(TracingDenyGate));
             let reg = builder.build().expect("registry builds");
-            // Hard enforcement (ADR-018) — dispatch returns PermissionDenied on Deny.
+            // Hard enforcement — dispatch returns PermissionDenied on Deny.
             // The tracing audit event is still emitted before the error is returned.
             let _ = reg.dispatch("create", serde_json::Value::Null).await;
         });
@@ -2442,9 +2390,9 @@ mod tests {
         assert_eq!(audit.decision, AuditDecision::Deny);
         assert_eq!(audit.deny_reason.as_deref(), Some("denied by test gate"));
         assert_eq!(audit.gate_impl, "TracingDenyGate");
-        // Wire-shape rule from ADR-018: obligations is always serialized as an
-        // array, empty on Deny. Round-trip back through serde_json::Value to
-        // confirm the field exists on the wire and is `[]`, not missing.
+        // Wire-shape rule: obligations is always serialized as an array, empty
+        // on Deny. Round-trip back through serde_json::Value to confirm the
+        // field exists on the wire and is `[]`, not missing.
         let payload_json: serde_json::Value =
             serde_json::from_str(payload).expect("payload must be valid JSON");
         assert_eq!(
@@ -2454,7 +2402,7 @@ mod tests {
         );
     }
 
-    // ---- EventStore audit envelope round-trip (ADR-018 / ADR-004/ADR-005) ----
+    // ---- EventStore audit envelope round-trip ----
     //
     // Codex review finding (Major #1): EventStore was persisting a summary
     // Event without the full AuditEvent fields (deny_reason, gate_impl,
@@ -2511,7 +2459,7 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // The payload field must hold the full AuditEvent envelope (ADR-018 contract).
+        // The payload field must hold the full AuditEvent envelope.
         let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
@@ -2593,7 +2541,7 @@ mod tests {
         }
     }
 
-    // ---- SQL-backed audit envelope round-trip (ADR-018 / ADR-004/ADR-005, codex r2) ----
+    // ---- SQL-backed audit envelope round-trip (codex r2) ----
     //
     // The two tests above use MemoryEventStore (no serialization). This test
     // wires the production SqlEventStore via KhiveRuntime::memory() to verify
@@ -2798,15 +2746,15 @@ mod tests {
         }
     }
 
-    // ---- Audit payload shape for 'create' verb dispatch (ADR-018 / ADR-004/ADR-005) ----
+    // ---- Audit payload shape for 'create' verb dispatch ----
     //
     // The previous audit tests verify the envelope shape for the 'list' verb.
     // This test dispatches 'create' (matching the create_note + annotates path)
     // and verifies that ev.verb, ev.outcome, and ev.data all round-trip correctly
-    // through the EventStore. Ensures the ADR-018 wire shape is independent of
-    // which verb triggers the gate check.
+    // through the EventStore. Ensures the wire shape is independent of which verb
+    // triggers the gate check.
     #[tokio::test]
-    async fn audit_event_payload_shape_for_create_verb_matches_adr035_envelope() {
+    async fn audit_event_payload_shape_for_create_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -2835,7 +2783,7 @@ mod tests {
             .unwrap();
         let ev = &page.items[0];
 
-        // Top-level Event fields (ADR-004/ADR-005).
+        // Top-level Event fields.
         assert_eq!(ev.verb, "create", "ev.verb must be the dispatched verb");
         assert_eq!(
             ev.outcome,
@@ -2847,7 +2795,7 @@ mod tests {
             "ev.namespace must match the dispatch namespace"
         );
 
-        // ev.payload must hold the full AuditEvent envelope (ADR-018 / ADR-004/ADR-005 contract).
+        // ev.payload must hold the full AuditEvent envelope.
         let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
@@ -2877,7 +2825,7 @@ mod tests {
         assert_eq!(
             payload_json["obligations"],
             serde_json::Value::Array(Vec::new()),
-            "obligations must be [] on AllowAllGate (wire-shape rule ADR-018)"
+            "obligations must be [] on AllowAllGate"
         );
     }
 
@@ -2917,7 +2865,7 @@ mod tests {
     }
 }
 
-// ---- ADR-037: inter-pack dependency checking ----
+// ---- Inter-pack dependency checking ----
 
 #[cfg(test)]
 mod dep_tests {

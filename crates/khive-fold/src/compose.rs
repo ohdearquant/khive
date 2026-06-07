@@ -3,12 +3,6 @@
 use crate::{Fold, FoldContext, FoldOutcome};
 
 /// Sequential fold — run one fold, then use its output to inform another.
-///
-/// # Type Compatibility Invariant
-///
-/// Both `F1` and `F2` must accept the same entry type `L`. The state types
-/// `S1` and `S2` are independent. The `context_mapper` is the only bridge
-/// between the two folds.
 pub struct SequentialFold<L, S1, S2, F1, F2, M>
 where
     F1: Fold<L, S1>,
@@ -54,10 +48,7 @@ where
     }
 }
 
-/// Dual fold — run two folds independently over the same entries.
-///
-/// Execution is sequential (not parallel threads). The name "dual" reflects
-/// that two independent folds are combined, not that they run concurrently.
+/// Dual fold — run two independent folds over the same entries sequentially.
 pub struct DualFold<L, S1, S2, F1, F2>
 where
     F1: Fold<L, S1>,

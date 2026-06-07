@@ -1,17 +1,4 @@
-//! Structured cross-crate error model for khive.
-//!
-//! Ported from khive-internal's `foundation/types/src/error/`.
-//!
-//! # Design
-//!
-//! - `KhiveError` — unified error struct with kind + code + message + details
-//! - `ErrorKind` — semantic severity / HTTP-mapping bucket
-//! - `ErrorCode` — domain-scoped numeric code (`ErrorDomain::Db, 1`)
-//! - `Details` — bounded key/value metadata (max 8 pairs)
-//! - `RetryHint` — whether the caller should retry
-//!
-//! All types are `#![no_std]` compatible. Serde impls are feature-gated
-//! behind the `serde` flag (existing crate pattern).
+//! Unified cross-crate error model: `KhiveError`, `ErrorKind`, `ErrorCode`, `Details`, `RetryHint`.
 
 extern crate alloc;
 use alloc::borrow::Cow;
@@ -101,6 +88,7 @@ pub enum ErrorDomain {
 }
 
 impl ErrorDomain {
+    /// Return the lowercase string name for this domain.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Db => "db",
@@ -129,14 +117,17 @@ pub struct ErrorCode {
 }
 
 impl ErrorCode {
+    /// Create a new error code in the given domain.
     pub fn new(domain: ErrorDomain, code: u32) -> Self {
         Self { domain, code }
     }
 
+    /// Return the domain that owns this error code.
     pub fn domain(self) -> ErrorDomain {
         self.domain
     }
 
+    /// Return the numeric code within the domain.
     pub fn code(self) -> u32 {
         self.code
     }
@@ -303,6 +294,7 @@ pub struct KhiveError {
 impl KhiveError {
     // ---- constructors ----
 
+    /// Create a `NotFound` error for a missing resource identified by `id`.
     pub fn not_found(resource: impl fmt::Display, id: impl fmt::Display) -> Self {
         Self {
             kind: ErrorKind::NotFound,
@@ -312,6 +304,7 @@ impl KhiveError {
         }
     }
 
+    /// Create an `InvalidInput` error with the given message.
     pub fn invalid_input(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::InvalidInput,
@@ -321,6 +314,7 @@ impl KhiveError {
         }
     }
 
+    /// Create an `Unauthorized` error with the given message.
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Unauthorized,
@@ -330,6 +324,7 @@ impl KhiveError {
         }
     }
 
+    /// Create a `Conflict` error with the given message.
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Conflict,
@@ -339,6 +334,7 @@ impl KhiveError {
         }
     }
 
+    /// Create an `Unavailable` error with the given message.
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Unavailable,
@@ -348,6 +344,7 @@ impl KhiveError {
         }
     }
 
+    /// Create an `Internal` error with the given message.
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Internal,
@@ -359,11 +356,13 @@ impl KhiveError {
 
     // ---- builder methods ----
 
+    /// Attach a domain-scoped error code.
     pub fn with_code(mut self, code: ErrorCode) -> Self {
         self.code = Some(code);
         self
     }
 
+    /// Attach bounded key-value metadata.
     pub fn with_details(mut self, details: Details) -> Self {
         self.details = Some(details);
         self
@@ -371,18 +370,22 @@ impl KhiveError {
 
     // ---- accessors ----
 
+    /// Return the semantic error category.
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
+    /// Return the human-readable error message.
     pub fn message(&self) -> &str {
         &self.message
     }
 
+    /// Return the domain-scoped error code, if set.
     pub fn code(&self) -> Option<ErrorCode> {
         self.code
     }
 
+    /// Return the bounded metadata details, if set.
     pub fn details(&self) -> Option<&Details> {
         self.details.as_ref()
     }

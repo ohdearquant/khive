@@ -1,16 +1,14 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Edge-level three-way merge and dangling-edge validation (ADR-043 §5).
+//! Edge-level three-way merge and dangling-edge validation.
 
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
-use khive_vcs::merge_engine::{BranchSide, MergeConflict};
-use khive_vcs::VcsError;
-
 use crate::diff_local::{diff_edges, EdgeChange, EdgeKey};
+use crate::types::{BranchSide, MergeConflict, MergeError};
 
 /// Merge edges from base, ours, and theirs.
 ///
@@ -24,7 +22,7 @@ pub fn merge_edges(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
-) -> Result<(Vec<ExportedEdge>, Vec<MergeConflict>), VcsError> {
+) -> Result<(Vec<ExportedEdge>, Vec<MergeConflict>), MergeError> {
     let ours_diff = diff_edges(base, ours)?;
     let theirs_diff = diff_edges(base, theirs)?;
 
@@ -33,12 +31,20 @@ pub fn merge_edges(
         .chain(theirs_diff.keys())
         .cloned()
         .collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_keys_sorted: Vec<EdgeKey> = all_keys.into_iter().collect();
+    all_keys_sorted.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then(a.target.cmp(&b.target))
+            .then(a.relation.cmp(&b.relation))
+    });
 
     let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
     // Build edge lookups so we can retrieve the original edge_id when
-    // constructing merged edges (ADR-048 D1: preserve edge identity).
+    // constructing merged edges (edge identity must survive merge/diff cycles).
     let base_edge_map: HashMap<EdgeKey, &ExportedEdge> = base
         .edges
         .iter()
@@ -55,7 +61,7 @@ pub fn merge_edges(
         .map(|e| (EdgeKey::from_edge(e), e))
         .collect();
 
-    for key in &all_keys {
+    for key in &all_keys_sorted {
         let ours_change = ours_diff.get(key);
         let theirs_change = theirs_diff.get(key);
 
@@ -81,7 +87,7 @@ pub fn merge_edges(
 
             // Added in both with same weight → include once.
             (Some(EdgeChange::Added(e_ours)), Some(EdgeChange::Added(e_theirs))) => {
-                // Auto-resolve: max weight wins (ADR-017 §6.2 `duplicate_edge_weight`).
+                // Auto-resolve: max weight wins (last-write-wins on weight conflicts).
                 let weight = f64::max(e_ours.weight, e_theirs.weight);
                 let mut edge = e_ours.clone();
                 edge.weight = weight;
@@ -202,16 +208,16 @@ pub fn validate_dangling_edges(
 /// Build a merged edge, preserving `edge_id` when it is already known.
 ///
 /// Pass `existing_id` from the ours/theirs/base archive to avoid generating a
-/// fresh UUID and breaking ADR-048 D1 edge-identity continuity.
+/// fresh UUID; edge identity must be stable across merge/diff cycles.
 fn build_edge(
     key: &EdgeKey,
     weight: f64,
     existing_id: Option<Uuid>,
-) -> Result<ExportedEdge, VcsError> {
+) -> Result<ExportedEdge, MergeError> {
     let relation = key
         .relation
         .parse::<khive_storage::EdgeRelation>()
-        .map_err(|e| VcsError::Internal(e.to_string()))?;
+        .map_err(|e| MergeError::Internal(e.to_string()))?;
     Ok(ExportedEdge {
         edge_id: existing_id.unwrap_or_else(Uuid::new_v4),
         source: key.source,
@@ -319,7 +325,7 @@ mod tests {
         ));
     }
 
-    // ── edge_id preservation tests (ADR-048 D1) ──────────────────────────────
+    // ── edge_id preservation tests ───────────────────────────────────────────
 
     /// Branch adds an edge not present in base → merged result uses the branch's edge_id.
     #[test]
@@ -357,7 +363,7 @@ mod tests {
             weight: 0.5,
         };
         // ours modifies only the weight; the edge_id differs from base to simulate
-        // a fresh edge_id that ours assigned (ADR-048 D1 identity must survive).
+        // a fresh edge_id that ours assigned (edge identity must survive across merges).
         let ours_edge = ExportedEdge {
             edge_id: Uuid::new_v4(),
             source: a,

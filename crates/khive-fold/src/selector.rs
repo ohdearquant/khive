@@ -12,7 +12,9 @@ use crate::error::FoldError;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectorInput<T> {
+    /// Stable string identifier for deterministic tie-breaking.
     pub id: String,
+    /// The item payload carried through selection.
     pub content: T,
     /// Size in the unit of the caller's budget (tokens, bytes, count).
     pub size: usize,
@@ -26,7 +28,7 @@ pub struct SelectorInput<T> {
     /// Callers pre-compute this because the Selector is pure-math and has no
     /// access to the embedding space required to estimate KL divergence. When
     /// `None` (the default), the value is treated as 0.0. Only has an effect
-    /// when `SelectorWeights.epistemic_weight > 0.0` (ADR-059).
+    /// when `SelectorWeights.epistemic_weight > 0.0`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub information_gain: Option<f32>,
 }
@@ -59,7 +61,7 @@ pub struct SelectorWeights {
     ///
     /// The effective selection score is `pragmatic_score + epistemic_weight * information_gain`.
     /// Default 0.0 (pure pragmatic). Higher values prefer candidates that reduce uncertainty.
-    /// When 0.0, behavior is identical to ADR-058 (backwards-compatible, ADR-059).
+    /// When 0.0, behavior is identical to pure pragmatic selection (backwards-compatible).
     #[cfg_attr(feature = "serde", serde(default))]
     pub epistemic_weight: f32,
 }
@@ -69,6 +71,7 @@ pub struct SelectorWeights {
 /// An implementation collapses N inputs into a subset that fits a budget,
 /// using weights and an optional query for relevance context.
 pub trait Selector<T>: Send + Sync {
+    /// Select a budget-constrained subset from `inputs`.
     fn select(
         &self,
         inputs: Vec<SelectorInput<T>>,
@@ -97,7 +100,7 @@ pub struct GreedySelector;
 /// Compute the base pragmatic score adjusted for epistemic weight.
 ///
 /// `base` is the pragmatic score (after category-weight multipliers).
-/// `epistemic_weight * information_gain` is the epistemic bonus (ADR-059).
+/// `epistemic_weight * information_gain` is the epistemic bonus.
 #[inline]
 fn pragmatic_plus_epistemic<T>(item: &SelectorInput<T>, epistemic_weight: f32) -> f32 {
     if epistemic_weight == 0.0 {
@@ -216,6 +219,10 @@ impl<T: Clone> Selector<T> for GreedySelector {
     }
 }
 
+// INLINE TEST JUSTIFICATION: selector tests exercise private helper functions
+// (pragmatic_plus_epistemic, effective_score) and internal sort logic that are
+// not accessible from a separate crate-level tests/ file. Consolidating here
+// avoids duplicating the SelectorInput construction scaffolding.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,7 +505,7 @@ mod tests {
         assert_eq!(out.selected[1].id, "b");
     }
 
-    // ── ADR-059: epistemic weight tests ──────────────────────────────────────
+    // ── epistemic weight tests ────────────────────────────────────────────────
 
     fn input_with_gain(id: &str, size: usize, score: f32, gain: f32) -> SelectorInput<()> {
         SelectorInput {

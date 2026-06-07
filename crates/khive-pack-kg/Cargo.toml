@@ -25,7 +25,14 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+criterion = { workspace = true }
+serde_json = { workspace = true }
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[bench]]
+name = "kg_bench"
+harness = false
+path = "benches/kg_bench.rs"

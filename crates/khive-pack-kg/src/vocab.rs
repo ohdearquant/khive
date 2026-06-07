@@ -1,20 +1,13 @@
-//! KG-pack vocabulary — pack-owned entity and note vocabulary.
-//!
-//! Entity kind validation now uses `khive_types::EntityKind` directly.
-//! The runtime accepts any String — validation is the pack's responsibility.
+//! KG-pack vocabulary — pack-owned entity and note kinds.
 
 use core::fmt;
 use std::string::String;
 
 use khive_types::UnknownVariant;
 
-/// Closed taxonomy for entity classification (ADR-001).
-///
-/// `Resource` is the 9th kind added in ADR-048: actionable content agents
-/// consume — atoms, domains, skills, tools. Distinct from `Concept` which
-/// models abstract ideas and their graph relationships.
+/// Pack-local entity kind extension adding `Resource` (atoms, domains, skills, tools).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum EntityKind {
+pub(crate) enum EntityKind {
     #[default]
     Concept,
     Document,
@@ -24,13 +17,17 @@ pub enum EntityKind {
     Org,
     Artifact,
     Service,
-    /// Actionable content agents consume (ADR-048): atoms, domains, skills,
-    /// tools, templates, prompts, runbooks.
+    /// Actionable content agents consume: atoms, domains, skills, tools,
+    /// templates, prompts, runbooks.
     Resource,
 }
 
 impl EntityKind {
-    pub const ALL: [Self; 9] = [
+    // REASON: ALL and NAMES are used exclusively in the test module below.
+    // Suppressed here because pub(crate) items in non-test code still trigger
+    // dead_code if they have no callers outside cfg(test).
+    #[allow(dead_code)]
+    pub(crate) const ALL: [Self; 9] = [
         Self::Concept,
         Self::Document,
         Self::Dataset,
@@ -42,12 +39,14 @@ impl EntityKind {
         Self::Resource,
     ];
 
-    pub const NAMES: &'static [&'static str] = &[
+    #[allow(dead_code)]
+    pub(crate) const NAMES: &'static [&'static str] = &[
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
         "resource",
     ];
 
-    pub const fn name(self) -> &'static str {
+    #[allow(dead_code)]
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Concept => "concept",
             Self::Document => "document",
@@ -95,18 +94,24 @@ impl std::str::FromStr for EntityKind {
     }
 }
 
-/// KG pack note kinds. Public note kind validation is canonical-only per ADR-013.
+/// KG pack note kinds. Only canonical names are accepted — aliases are rejected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NoteKind {
+    /// A factual record or finding (default).
     #[default]
     Observation,
+    /// A derived understanding or pattern from observations.
     Insight,
+    /// An open question requiring further investigation.
     Question,
+    /// A recorded choice or resolution.
     Decision,
+    /// A pointer to an external source or citation.
     Reference,
 }
 
 impl NoteKind {
+    /// All 5 canonical note kinds in declaration order.
     pub const ALL: [Self; 5] = [
         Self::Observation,
         Self::Insight,
@@ -115,6 +120,7 @@ impl NoteKind {
         Self::Reference,
     ];
 
+    /// Canonical lowercase name strings for all note kinds.
     pub const NAMES: &'static [&'static str] = &[
         "observation",
         "insight",
@@ -123,6 +129,7 @@ impl NoteKind {
         "reference",
     ];
 
+    /// Return the canonical lowercase wire string for this note kind.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Observation => "observation",
@@ -176,7 +183,7 @@ mod tests {
 
     #[test]
     fn note_kind_aliases_rejected() {
-        // Aliases were removed per ADR-013 — only canonical names are accepted.
+        // Only canonical names are accepted; aliases are rejected.
         assert!(NoteKind::from_str("obs").is_err());
         assert!(NoteKind::from_str("finding").is_err());
         assert!(NoteKind::from_str("q").is_err());
@@ -195,7 +202,7 @@ mod tests {
 
     #[test]
     fn entity_kind_resource_aliases() {
-        // ADR-048: aliases for resource entity_type values.
+        // `resource` is the 9th entity kind; these are its accepted aliases.
         for alias in ["atom", "runbook", "template", "prompt", "skill", "tool"] {
             let parsed = EntityKind::from_str(alias).unwrap();
             assert_eq!(

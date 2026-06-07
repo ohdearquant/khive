@@ -1,8 +1,8 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Canonical JSON serialization and SHA-256 snapshot hashing.
 //!
-//! Algorithm (ADR-010 §canonical-hash-algorithm, ADR-042 retained):
+//! Algorithm:
 //! 1. Collect non-soft-deleted entities; sort by UUID string ascending.
 //! 2. Collect edges; sort by (source, target, relation) ascending.
 //! 3. Serialize as `{"edges":[...],"entities":[...]}` with fixed field order and no whitespace.
@@ -72,6 +72,9 @@ pub fn canonical_json(archive: &KgArchive) -> Result<String, VcsError> {
 }
 
 /// Serialize a single entity with fixed key order and sorted sub-fields.
+///
+/// `entity_type` is included in the canonical representation so that two
+/// snapshots differing only in `entity_type` produce different `SnapshotId`s.
 fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
     let properties = sort_properties_value(e.properties.clone());
     let mut tags = e.tags.clone();
@@ -80,6 +83,12 @@ fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
     let mut obj = Map::new();
     obj.insert("id".to_string(), Value::String(e.id.to_string()));
     obj.insert("kind".to_string(), Value::String(e.kind.clone()));
+    obj.insert(
+        "entity_type".to_string(),
+        e.entity_type
+            .as_ref()
+            .map_or(Value::Null, |t| Value::String(t.clone())),
+    );
     obj.insert("name".to_string(), Value::String(e.name.clone()));
     obj.insert(
         "description".to_string(),
@@ -361,6 +370,26 @@ mod tests {
         assert_ne!(
             snapshot_id_for_archive(&a1).unwrap(),
             snapshot_id_for_archive(&a2).unwrap()
+        );
+    }
+
+    #[test]
+    fn entity_type_change_changes_hash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let mut e1 = make_entity(id, "Alpha");
+        e1.entity_type = None;
+        let mut e2 = make_entity(id, "Alpha");
+        e2.entity_type = Some("paper".to_string());
+
+        let mut a1 = empty_archive();
+        a1.entities = vec![e1];
+        let mut a2 = empty_archive();
+        a2.entities = vec![e2];
+
+        assert_ne!(
+            snapshot_id_for_archive(&a1).unwrap(),
+            snapshot_id_for_archive(&a2).unwrap(),
+            "entity_type must be included in canonical hash (VCS-AUD-003)"
         );
     }
 }

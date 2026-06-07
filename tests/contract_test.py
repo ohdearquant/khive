@@ -185,11 +185,13 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 
 def _start_server(db_path: str) -> subprocess.Popen:
     """Spawn a fresh khive-mcp process backed by a temp SQLite file."""
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [BINARY, "--db", db_path, "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     # MCP handshake
     _send(proc, "initialize", {
@@ -247,59 +249,61 @@ def _run_test(name: str, fn) -> None:
 # ---------------------------------------------------------------------------
 
 def test_namespace_isolation(proc: subprocess.Popen) -> None:
-    """Entities live in shared graph namespace; notes are caller-namespace-isolated."""
-    # ADR-007: KG entities/edges use a shared graph namespace so that cross-project
-    # graph structure is visible to all actors.  Notes (tasks, memories, observations)
-    # remain scoped to the caller's namespace.
+    """All substrates (entities, notes) are namespace-isolated per ADR-050."""
+    # ADR-050 supersedes ADR-007 §"Namespace-by-Layer Rule": KG entity and edge
+    # verbs now honor the NamespaceToken from VerbRegistry::dispatch.  Entities,
+    # edges, and notes are all scoped to the caller's namespace.
 
-    # ---- entities: shared graph — visible across namespaces ----
+    # ---- entities: namespace-isolated ----
     entity = _tool(proc, "create", {
         "kind": "entity",
         "entity_kind": "concept",
         "name": "AlphaEntity",
-        "description": "Visible from any namespace",
+        "description": "Only visible in ns-alpha",
         "namespace": "ns-alpha",
     })
     full_id = entity["id"]
 
-    # get from ns-beta MUST succeed (shared graph namespace)
-    fetched = _tool(proc, "get", {"id": full_id, "namespace": "ns-beta"})
-    assert fetched["kind"] == "concept", f"Expected kind=concept, got {fetched['kind']}"
-    assert fetched["name"] == "AlphaEntity"
-
-    # get from ns-alpha MUST also succeed
+    # get from ns-alpha MUST succeed (own namespace)
     fetched_alpha = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
+    assert fetched_alpha["kind"] == "concept", f"Expected kind=concept, got {fetched_alpha['kind']}"
     assert fetched_alpha["name"] == "AlphaEntity"
 
-    # list from ns-beta MUST find the entity (shared graph)
+    # get from ns-beta MUST fail (cross-namespace, ADR-050)
+    err_text = _expect_rpc_error(proc, "get", {"id": full_id, "namespace": "ns-beta"})
+    assert "not found" in err_text.lower(), (
+        f"Expected entity not found from ns-beta (ADR-050), got: {err_text!r}"
+    )
+
+    # list from ns-beta MUST NOT find the entity
     entities_beta = _tool(proc, "list", {
         "kind": "entity",
         "entity_kind": "concept",
         "namespace": "ns-beta",
     })
     ids_beta = [e["id"] for e in entities_beta]
-    assert full_id in ids_beta, (
-        f"AlphaEntity must be visible in ns-beta list (shared graph): {ids_beta}"
+    assert full_id not in ids_beta, (
+        f"AlphaEntity must NOT be visible in ns-beta list (ADR-050): {ids_beta}"
     )
 
-    # link across namespaces MUST succeed (both entities in shared graph)
-    beta_entity = _tool(proc, "create", {
+    # same-namespace link MUST succeed
+    alpha_entity2 = _tool(proc, "create", {
         "kind": "entity",
         "entity_kind": "concept",
-        "name": "BetaEntity",
-        "namespace": "ns-beta",
+        "name": "AlphaEntity2",
+        "namespace": "ns-alpha",
     })
     link_result = _tool(proc, "link", {
-        "source_id": beta_entity["id"],
+        "source_id": alpha_entity2["id"],
         "target_id": full_id,
         "relation": "extends",
-        "namespace": "ns-beta",
+        "namespace": "ns-alpha",
     })
     assert link_result.get("ok", link_result.get("id")) is not None, (
-        f"Cross-namespace link must succeed in shared graph: {link_result}"
+        f"Same-namespace link must succeed: {link_result}"
     )
 
-    # ---- notes: namespace-isolated ----
+    # ---- notes: namespace-isolated (unchanged from ADR-007) ----
     note = _tool(proc, "create", {
         "kind": "note",
         "note_kind": "observation",

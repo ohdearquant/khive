@@ -1,0 +1,1024 @@
+//! Shared types, param structs, and helper functions for KG verb handlers.
+
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer};
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use khive_runtime::{
+    micros_to_iso, ContentMergeStrategy, EntityDedupMergePolicy, KhiveRuntime, NamespaceToken,
+    QueryResult, RuntimeError, VerbRegistry,
+};
+use khive_storage::types::{Direction, SqlValue};
+use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
+
+use khive_types::{EntityKind, EventKind};
+
+use crate::entity_type_registry::EntityTypeRegistry;
+use crate::vocab::NoteKind;
+
+// ---- Kind canonicalization ----
+
+pub(crate) fn canonical_entity_kind(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<String, RuntimeError> {
+    if let Ok(k) = EntityKind::from_str(raw) {
+        return Ok(k.name().to_string());
+    }
+    if let Ok(k) = crate::vocab::EntityKind::from_str(raw) {
+        return Ok(k.name().to_string());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_entity_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown entity_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+pub(crate) fn canonical_note_kind(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<String, RuntimeError> {
+    if let Ok(k) = NoteKind::from_str(raw) {
+        return Ok(k.name().to_string());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_note_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown note_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+// ---- Entity-type validation ----
+
+pub(crate) fn validate_entity_type(
+    kind_name: &str,
+    entity_type: Option<&str>,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(raw) = entity_type else {
+        return Ok(None);
+    };
+    let kind = kind_name
+        .parse::<khive_types::EntityKind>()
+        .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
+    let resolved = EntityTypeRegistry::global().resolve(kind, Some(raw))?;
+    Ok(resolved.entity_type)
+}
+
+// ---- Granular `kind` discriminator ----
+
+/// Resolved shape of a `kind` discriminator string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KindSpec {
+    Entity { specific: Option<String> },
+    Note { specific: Option<String> },
+    Edge,
+    Event,
+    Proposal,
+}
+
+impl KindSpec {
+    pub(crate) fn substrate_label(&self) -> &'static str {
+        match self {
+            KindSpec::Entity { .. } => "entity",
+            KindSpec::Note { .. } => "note",
+            KindSpec::Edge => "edge",
+            KindSpec::Event => "event",
+            KindSpec::Proposal => "proposal",
+        }
+    }
+}
+
+/// Resolve a wire-level `kind` value into a [`KindSpec`].
+pub(crate) fn resolve_kind_spec(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<KindSpec, RuntimeError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "entity" => return Ok(KindSpec::Entity { specific: None }),
+        "note" => return Ok(KindSpec::Note { specific: None }),
+        "edge" => return Ok(KindSpec::Edge),
+        "event" => return Ok(KindSpec::Event),
+        "proposal" => return Ok(KindSpec::Proposal),
+        _ => {}
+    }
+
+    if let Ok(k) = EntityKind::from_str(raw) {
+        return Ok(KindSpec::Entity {
+            specific: Some(k.name().to_string()),
+        });
+    }
+    if let Ok(k) = crate::vocab::EntityKind::from_str(raw) {
+        return Ok(KindSpec::Entity {
+            specific: Some(k.name().to_string()),
+        });
+    }
+    if let Ok(k) = NoteKind::from_str(raw) {
+        return Ok(KindSpec::Note {
+            specific: Some(k.name().to_string()),
+        });
+    }
+
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(KindSpec::Entity {
+            specific: Some(normalized),
+        });
+    }
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(KindSpec::Note {
+            specific: Some(normalized),
+        });
+    }
+
+    let mut all: Vec<String> = vec![
+        "entity".into(),
+        "note".into(),
+        "edge".into(),
+        "event".into(),
+        "proposal".into(),
+    ];
+    all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
+    all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
+    all.sort();
+    all.dedup();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+/// Reconcile a granular `kind` with a legacy `entity_kind`/`note_kind` subfield.
+pub(crate) fn reconcile_specific(
+    spec_specific: Option<String>,
+    legacy_raw: Option<&str>,
+    canonicalize: impl Fn(&str) -> Result<String, RuntimeError>,
+    legacy_field: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let legacy_canonical = match legacy_raw {
+        Some(s) => Some(canonicalize(s)?),
+        None => None,
+    };
+    match (spec_specific, legacy_canonical) {
+        (Some(a), Some(b)) if a != b => Err(RuntimeError::InvalidInput(format!(
+            "kind={a:?} contradicts {legacy_field}={b:?}; pick one"
+        ))),
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
+}
+
+// ---- Param structs ----
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeSpec {
+    pub(crate) target_id: String,
+    pub(crate) relation: String,
+    pub(crate) weight: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateParams {
+    pub(crate) kind: String,
+    pub(crate) entity_type: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) content: Option<String>,
+    pub(crate) salience: Option<f64>,
+    pub(crate) annotates: Option<Vec<String>>,
+    pub(crate) properties: Option<Value>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) skip_dedup_check: Option<bool>,
+    pub(crate) edges: Option<Vec<EdgeSpec>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetParams {
+    pub(crate) id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListParams {
+    pub(crate) kind: String,
+    pub(crate) limit: Option<u32>,
+    pub(crate) offset: Option<u32>,
+    pub(crate) entity_kind: Option<String>,
+    pub(crate) entity_type: Option<String>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) source_id: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) relations: Option<Vec<String>>,
+    pub(crate) min_weight: Option<f64>,
+    pub(crate) max_weight: Option<f64>,
+    pub(crate) note_kind: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) direction: Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) read: Option<bool>,
+    pub(crate) verb: Option<String>,
+    pub(crate) verbs: Option<Vec<String>>,
+    pub(crate) outcome: Option<String>,
+    pub(crate) actor: Option<String>,
+    pub(crate) substrate: Option<String>,
+    pub(crate) since: Option<i64>,
+    pub(crate) until: Option<i64>,
+    pub(crate) event_kind: Option<String>,
+    pub(crate) event_kinds: Option<Vec<String>>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) observed: Option<Vec<String>>,
+    pub(crate) selected: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StatsParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateParams {
+    pub(crate) id: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) name: Option<Value>,
+    pub(crate) description: Option<Value>,
+    pub(crate) content: Option<String>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    pub(crate) salience: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    pub(crate) decay_factor: Option<Option<f64>>,
+    pub(crate) properties: Option<Value>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) relation: Option<String>,
+    pub(crate) weight: Option<f64>,
+    pub(crate) entity_kind: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeleteParams {
+    pub(crate) id: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) hard: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MergeParams {
+    #[serde(alias = "winner_id", alias = "target_id")]
+    pub(crate) into_id: String,
+    #[serde(alias = "loser_id", alias = "source_id")]
+    pub(crate) from_id: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) strategy: Option<String>,
+    pub(crate) content_strategy: Option<String>,
+    pub(crate) dry_run: Option<bool>,
+    #[allow(dead_code)]
+    pub(crate) verbose: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchParams {
+    pub(crate) kind: String,
+    pub(crate) query: String,
+    pub(crate) limit: Option<u32>,
+    pub(crate) entity_kind: Option<String>,
+    pub(crate) entity_type: Option<String>,
+    pub(crate) note_kind: Option<String>,
+    pub(crate) include_superseded: Option<bool>,
+    pub(crate) properties: Option<Value>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) min_score: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BulkLinkEntry {
+    pub(crate) source_id: String,
+    pub(crate) target_id: String,
+    pub(crate) relation: String,
+    pub(crate) weight: Option<f64>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) dependency_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LinkParams {
+    pub(crate) source_id: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) relation: Option<String>,
+    pub(crate) weight: Option<f64>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) dependency_kind: Option<String>,
+    pub(crate) verbose: Option<bool>,
+    pub(crate) links: Option<Vec<BulkLinkEntry>>,
+    pub(crate) atomic: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NeighborsParams {
+    #[serde(alias = "node_id")]
+    pub(crate) id: String,
+    pub(crate) direction: Option<String>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) min_weight: Option<f64>,
+    pub(crate) relations: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TraverseParams {
+    #[serde(alias = "ids", alias = "start_ids")]
+    pub(crate) roots: Vec<String>,
+    pub(crate) max_depth: Option<usize>,
+    pub(crate) direction: Option<String>,
+    pub(crate) relations: Option<Vec<String>>,
+    pub(crate) min_weight: Option<f64>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) include_roots: Option<bool>,
+}
+
+pub(crate) const HARD_CAP: usize = 10_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueryParams {
+    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProposeParams {
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) changeset: Value,
+    #[serde(default)]
+    pub(crate) reviewers: Vec<String>,
+    pub(crate) expiry: Option<i64>,
+    pub(crate) parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewParams {
+    pub(crate) proposal_id: String,
+    pub(crate) decision: String,
+    pub(crate) comment: Option<String>,
+    pub(crate) max_new_entries: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WithdrawParams {
+    pub(crate) proposal_id: String,
+    pub(crate) rationale: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListProposalsParams {
+    pub(crate) status: Option<String>,
+    pub(crate) proposer: Option<String>,
+    pub(crate) actor: Option<String>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) offset: Option<u32>,
+}
+
+// ---- Helpers ----
+
+async fn resolve_name_async(
+    name: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Uuid, RuntimeError> {
+    let filter = EntityFilter {
+        name_prefix: Some(name.to_string()),
+        ..Default::default()
+    };
+    let page = runtime
+        .entities(token)?
+        .query_entities(
+            token.namespace().as_str(),
+            filter,
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let name_lower = name.to_ascii_lowercase();
+    let exact: Vec<_> = page
+        .items
+        .into_iter()
+        .filter(|e| e.name.to_ascii_lowercase() == name_lower && e.deleted_at.is_none())
+        .collect();
+
+    match exact.len() {
+        0 => Err(RuntimeError::NotFound(format!(
+            "entity not found: {name:?}"
+        ))),
+        1 => Ok(exact[0].id),
+        n => {
+            let ids: Vec<String> = exact
+                .iter()
+                .map(|e| e.id.to_string()[..8].to_string())
+                .collect();
+            Err(RuntimeError::Ambiguous(format!(
+                "ambiguous name {name:?}: found {n} entities [{}]",
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
+pub(crate) async fn resolve_uuid_async(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = Uuid::from_str(s) {
+        return Ok(uuid);
+    }
+    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        match runtime.resolve_prefix(token, s).await {
+            Ok(Some(uuid)) => return Ok(uuid),
+            Ok(None) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "no record matches prefix: {s:?}"
+                )))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    resolve_name_async(s, runtime, token).await
+}
+
+// ---- Output formatting helpers ----
+
+pub(crate) fn format_edge_output(v: Value, _verbose: bool) -> Value {
+    v
+}
+
+pub(crate) fn flatten_get_result(substrate: &str, mut inner: Value) -> Result<Value, RuntimeError> {
+    if let Some(obj) = inner.as_object_mut() {
+        match substrate {
+            "edge" => {
+                obj.entry("kind".to_string())
+                    .or_insert_with(|| serde_json::Value::String("edge".to_string()));
+            }
+            "event" => {
+                if let Some(event_kind) = obj.remove("kind") {
+                    obj.insert("event_kind".to_string(), event_kind);
+                }
+                obj.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String("event".to_string()),
+                );
+            }
+            _ => {}
+        }
+        Ok(inner)
+    } else {
+        Ok(serde_json::json!({"kind": substrate, "data": inner}))
+    }
+}
+
+pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
+    let Some(obj) = note_value.as_object_mut() else {
+        return note_value;
+    };
+    let lifecycle_status = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("status"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    if let Some(gtd_status) = lifecycle_status {
+        if let Some(row_vis) = obj.remove("status") {
+            obj.insert("lifecycle".to_string(), row_vis);
+        }
+        obj.insert("status".to_string(), Value::String(gtd_status));
+    }
+    note_value
+}
+
+pub(crate) fn parse_direction(s: Option<&str>) -> Direction {
+    match s {
+        Some("in") | Some("incoming") => Direction::In,
+        Some("both") => Direction::Both,
+        Some("out") | Some("outgoing") | None => Direction::Out,
+        Some(_) => Direction::Out,
+    }
+}
+
+pub(crate) fn merge_entry_metadata(
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(dk) = dependency_kind else {
+        return Ok(metadata);
+    };
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+    map.entry("dependency_kind".to_string())
+        .or_insert_with(|| serde_json::json!(dk));
+    Ok(Some(obj))
+}
+
+pub(crate) fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
+    s.parse::<EdgeRelation>().map_err(|_| {
+        let valid = EdgeRelation::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        RuntimeError::InvalidInput(format!("unknown relation {s:?}; valid: {valid}"))
+    })
+}
+
+pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> {
+    let w = weight.unwrap_or(1.0);
+    if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "edge weight must be a finite number in [0.0, 1.0], got {w}"
+        )));
+    }
+    Ok(w)
+}
+
+pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) -> Vec<&'static str> {
+    const RULES: &[(&str, &str, &str)] = &[
+        ("concept", "contains", "concept"),
+        ("project", "contains", "project"),
+        ("project", "contains", "artifact"),
+        ("org", "contains", "project"),
+        ("org", "contains", "service"),
+        ("concept", "part_of", "concept"),
+        ("project", "part_of", "project"),
+        ("project", "part_of", "org"),
+        ("*", "instance_of", "concept"),
+        ("service", "instance_of", "project"),
+        ("concept", "extends", "concept"),
+        ("concept", "variant_of", "concept"),
+        ("artifact", "variant_of", "artifact"),
+        ("concept", "introduced_by", "document"),
+        ("concept", "introduced_by", "person"),
+        ("artifact", "introduced_by", "document"),
+        ("artifact", "derived_from", "dataset"),
+        ("artifact", "derived_from", "document"),
+        ("artifact", "derived_from", "project"),
+        ("artifact", "derived_from", "artifact"),
+        ("document", "precedes", "document"),
+        ("dataset", "precedes", "dataset"),
+        ("artifact", "precedes", "artifact"),
+        ("service", "precedes", "service"),
+        ("project", "precedes", "project"),
+        ("project", "depends_on", "project"),
+        ("service", "depends_on", "project"),
+        ("service", "depends_on", "service"),
+        ("service", "depends_on", "artifact"),
+        ("service", "depends_on", "dataset"),
+        ("artifact", "depends_on", "project"),
+        ("artifact", "depends_on", "service"),
+        ("concept", "enables", "concept"),
+        ("service", "enables", "concept"),
+        ("dataset", "enables", "concept"),
+        ("project", "implements", "concept"),
+        ("service", "implements", "concept"),
+        ("concept", "competes_with", "concept"),
+        ("project", "competes_with", "project"),
+        ("service", "competes_with", "service"),
+        ("concept", "composed_with", "concept"),
+        ("project", "composed_with", "project"),
+        ("concept", "supersedes", "concept"),
+        ("document", "supersedes", "document"),
+        ("artifact", "supersedes", "artifact"),
+        ("service", "supersedes", "service"),
+        ("dataset", "supersedes", "dataset"),
+        ("person", "part_of", "org"),
+        ("person", "instance_of", "org"),
+        ("org", "depends_on", "org"),
+        ("org", "enables", "org"),
+        ("org", "contains", "org"),
+        ("org", "part_of", "org"),
+        ("org", "precedes", "org"),
+    ];
+    let mut relations: Vec<&'static str> = RULES
+        .iter()
+        .filter(|(src, _rel, tgt)| (*src == "*" || *src == src_kind) && *tgt == tgt_kind)
+        .map(|(_src, rel, _tgt)| *rel)
+        .collect();
+    relations.sort_unstable();
+    relations.dedup();
+    relations
+}
+
+pub(crate) async fn enrich_allowlist_error(
+    original: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+) -> String {
+    let src_kind = match runtime.get_entity(token, source_id).await {
+        Ok(e) => e.kind,
+        Err(_) => return original.to_string(),
+    };
+    let tgt_kind = match runtime.get_entity(token, target_id).await {
+        Ok(e) => e.kind,
+        Err(_) => return original.to_string(),
+    };
+    let valid = valid_relations_for_entity_pair(&src_kind, &tgt_kind);
+    if valid.is_empty() {
+        format!(
+            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
+             No valid relations exist for {src_kind}\u{2192}{tgt_kind} in the current edge rules.",
+            relation.as_str()
+        )
+    } else {
+        format!(
+            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
+             Valid relations: {}",
+            relation.as_str(),
+            valid.join(", ")
+        )
+    }
+}
+
+pub(crate) const IMMUTABLE_EVENT_MSG: &str =
+    "events are immutable — create/update/delete are not permitted";
+
+pub(crate) fn immutable_event_error() -> RuntimeError {
+    RuntimeError::InvalidInput(IMMUTABLE_EVENT_MSG.into())
+}
+
+pub(crate) fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "success" => Ok(EventOutcome::Success),
+        "denied" => Ok(EventOutcome::Denied),
+        "error" => Ok(EventOutcome::Error),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "unknown outcome {raw:?}; valid: success | denied | error"
+        ))),
+    }
+}
+
+pub(crate) fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeError> {
+    raw.trim()
+        .to_ascii_lowercase()
+        .parse::<SubstrateKind>()
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "unknown substrate {raw:?}; valid: note | entity | event"
+            ))
+        })
+}
+
+pub(crate) fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
+    raw.parse::<EventKind>()
+        .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
+}
+
+pub(crate) fn event_filter_from_params(
+    p: &ListParams,
+) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
+    let mut verbs = Vec::new();
+    if let Some(verb) = &p.verb {
+        verbs.push(verb.clone());
+    }
+    if let Some(more) = &p.verbs {
+        verbs.extend(more.clone());
+    }
+
+    let substrates = match p.substrate.as_deref() {
+        Some(raw) => vec![parse_event_substrate(raw)?],
+        None => Vec::new(),
+    };
+
+    let outcome = p.outcome.as_deref().map(parse_event_outcome).transpose()?;
+
+    let mut kinds: Vec<EventKind> = Vec::new();
+    if let Some(k) = &p.event_kind {
+        kinds.push(parse_event_kind(k)?);
+    }
+    if let Some(ks) = &p.event_kinds {
+        for k in ks {
+            kinds.push(parse_event_kind(k)?);
+        }
+    }
+
+    let session_id = p
+        .session_id
+        .as_deref()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid session_id {s:?}: {e}")))
+        })
+        .transpose()?;
+
+    let observed = p
+        .observed
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid observed id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selected = p
+        .selected
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid selected id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((
+        EventFilter {
+            verbs,
+            substrates,
+            actors: p.actor.clone().into_iter().collect(),
+            after: p.since,
+            before: p.until,
+            kinds,
+            session_id,
+            observed,
+            selected,
+            ..EventFilter::default()
+        },
+        outcome,
+    ))
+}
+
+pub(crate) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
+    serde_json::to_value(v).map_err(|e| RuntimeError::Internal(format!("serialize: {e}")))
+}
+
+pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
+    serde_json::from_value(params)
+        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
+}
+
+pub(crate) fn normalize_entity_timestamps(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        for field in &["created_at", "updated_at", "deleted_at", "expires_at"] {
+            if let Some(val) = obj.get_mut(*field) {
+                if let Some(micros) = val.as_i64() {
+                    *val = Value::String(micros_to_iso(micros));
+                }
+            }
+        }
+    }
+    v
+}
+
+pub(crate) fn normalize_entity_timestamps_array(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_entity_timestamps).collect())
+        }
+        other => normalize_entity_timestamps(other),
+    }
+}
+
+const TIMESTAMP_KEYS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "deleted_at",
+    "expiry",
+    "applied_at",
+    "withdrawn_at",
+    "reviewed_at",
+    "completed_at",
+    "scheduled_at",
+    "expires_at",
+    "due",
+    "remind_at",
+];
+
+pub(crate) fn walk_timestamps(v: &mut Value) {
+    match v {
+        Value::Object(obj) => {
+            for (key, val) in obj.iter_mut() {
+                if TIMESTAMP_KEYS.contains(&key.as_str()) {
+                    let micros_opt = val
+                        .as_u64()
+                        .and_then(|n| i64::try_from(n).ok())
+                        .or_else(|| val.as_i64());
+                    if let Some(micros) = micros_opt {
+                        *val = Value::String(micros_to_iso(micros));
+                        continue;
+                    }
+                }
+                walk_timestamps(val);
+            }
+        }
+        Value::Array(arr) => {
+            for elem in arr.iter_mut() {
+                walk_timestamps(elem);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn normalize_event_timestamps(mut v: Value) -> Value {
+    walk_timestamps(&mut v);
+    v
+}
+
+pub(crate) fn normalize_event_timestamps_array(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_event_timestamps).collect())
+        }
+        other => normalize_event_timestamps(other),
+    }
+}
+
+pub(crate) fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
+    let required = match filter.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return true,
+    };
+    let actual = match entity_props.and_then(Value::as_object) {
+        Some(obj) => obj,
+        None => return false,
+    };
+    required
+        .iter()
+        .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
+}
+
+pub(crate) fn tags_match_any(entity_tags: &[String], wanted: &[String]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    entity_tags
+        .iter()
+        .any(|tag| wanted.iter().any(|w| tag.eq_ignore_ascii_case(w)))
+}
+
+// ---- Handler helpers ----
+
+pub(crate) fn parse_entity_policy(s: &str) -> Result<EntityDedupMergePolicy, RuntimeError> {
+    match s {
+        "prefer_into" => Ok(EntityDedupMergePolicy::PreferInto),
+        "prefer_from" => Ok(EntityDedupMergePolicy::PreferFrom),
+        "union" => Ok(EntityDedupMergePolicy::Union),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown strategy {other:?}; use prefer_into | prefer_from | union"
+        ))),
+    }
+}
+
+pub(crate) fn parse_content_strategy(s: &str) -> Result<ContentMergeStrategy, RuntimeError> {
+    match s {
+        "append" => Ok(ContentMergeStrategy::Append),
+        "prefer_into" => Ok(ContentMergeStrategy::PreferInto),
+        "prefer_from" => Ok(ContentMergeStrategy::PreferFrom),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown content_strategy {other:?}; use append | prefer_into | prefer_from"
+        ))),
+    }
+}
+
+pub(crate) async fn ensure_entity_kind(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let entity = runtime.get_entity(token, id).await?;
+    if let Some(k) = expected_kind {
+        if entity.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_note_kind(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    use khive_runtime::Resolved;
+    let note = match runtime.resolve(token, id).await? {
+        Some(Resolved::Note(note)) => note,
+        _ => return Err(RuntimeError::NotFound("not found in this namespace".into())),
+    };
+    if let Some(k) = expected_kind {
+        if note.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn description_patch(v: Option<Value>) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "description must be null or a string, got: {other}"
+        ))),
+    }
+}
+
+pub(crate) fn string_value(v: Option<Value>, field: &str) -> Result<Option<String>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be a string, got: {other}"
+        ))),
+    }
+}
+
+pub(crate) fn optional_string_patch(
+    v: Option<Value>,
+    field: &str,
+) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be null or a string, got: {other}"
+        ))),
+    }
+}
+
+pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Ok(Some(Option::deserialize(d)?))
+}
+
+// ---- Query result rendering ----
+
+pub(crate) fn sql_value_to_json(value: SqlValue) -> Value {
+    match value {
+        SqlValue::Null => Value::Null,
+        SqlValue::Bool(v) => json!(v),
+        SqlValue::Integer(v) => json!(v),
+        SqlValue::Float(v) => json!(v),
+        SqlValue::Text(v) => json!(v),
+        SqlValue::Blob(v) => json!(v),
+        SqlValue::Json(v) => v,
+        SqlValue::Uuid(v) => json!(v.to_string()),
+        SqlValue::Timestamp(v) => json!(v.to_rfc3339()),
+    }
+}
+
+pub(crate) fn render_query_result(result: QueryResult) -> Value {
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            for col in row.columns {
+                obj.insert(col.name, sql_value_to_json(col.value));
+            }
+            Value::Object(obj)
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = serde_json::Map::new();
+    out.insert("rows".to_string(), Value::Array(rows));
+    if !result.warnings.is_empty() {
+        out.insert("warnings".to_string(), json!(result.warnings));
+    }
+    Value::Object(out)
+}

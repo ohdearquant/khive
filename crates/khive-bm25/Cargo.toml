@@ -16,3 +16,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "bm25_bench"
+harness = false
+
+[[test]]
+name = "wand_correctness"
+path = "tests/wand_correctness.rs"

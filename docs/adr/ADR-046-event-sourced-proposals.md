@@ -247,7 +247,7 @@ maintains as a fold over the four proposal events:
 
 ```sql
 CREATE TABLE proposals_open (
-    proposal_id    BLOB PRIMARY KEY,
+    proposal_id    TEXT PRIMARY KEY,
     namespace      TEXT NOT NULL,
     proposer       TEXT NOT NULL,
     title          TEXT NOT NULL,
@@ -255,7 +255,7 @@ CREATE TABLE proposals_open (
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
     expiry         INTEGER,
-    last_decision  TEXT,                      -- JSON of the most recent ProposalReviewedPayload.decision
+    last_decision  TEXT,                      -- bare decision string from the most recent ProposalReviewedPayload
     review_count   INTEGER NOT NULL DEFAULT 0,
     approve_count  INTEGER NOT NULL DEFAULT 0,
     reject_count   INTEGER NOT NULL DEFAULT 0
@@ -287,8 +287,8 @@ the proposal is not permanently stuck. `'applying'` is never written to the
 event log — it is a purely transient projection state.
 
 Hard-state (status != 'open' | 'changes_requested') rows are retained for
-audit; cleanup is operator-driven (`kkernel call kg proposal_cleanup
---older-than 90d`).
+audit. A `proposal_cleanup` operator command is deferred; future work must
+define the CLI surface, retention policy, and safe-delete semantics.
 
 **Review history retrieval (Fix 7):** The projection stores only aggregates
 (`review_count`, `approve_count`, `reject_count`). Individual `ProposalReviewed`
@@ -375,68 +375,30 @@ feedback. The check fires only when `decision=approve`; rejecting one's own
 proposal is allowed (treated as withdrawal-via-reject). When
 `ProposalPolicy::allow_self_approve = true`, the check is skipped entirely.
 
-This is configurable in pack manifest (`kg.proposals`):
+The shipped v1 default is **one approve from any non-self actor, no recorded
+reject**. The inline self-approval guard in the `review` handler is the only
+shipped policy enforcement point.
 
-```toml
-[packs.kg.proposals]
-approval_threshold = 1     # number of approve votes required
-allow_self_approve = true  # OSS default: single-developer deployments work out-of-box
-require_listed_reviewer = false  # if true, only the listed reviewers can approve
-```
+Configurable approval thresholds, pack manifest TOML configuration
+(`[packs.kg.proposals]`), `ProposalPolicy` struct instantiation, and
+`require_listed_reviewer` are deferred. Multi-actor deployments requiring
+configurable thresholds or reviewer lists must await a future ADR amendment
+before those controls are available.
 
-**Defaults for OSS happy-path (Fix 10):**
+### ProposalPolicy: pack-owned, gate-enforced (deferred)
 
-- `approval_threshold = 1`
-- `allow_self_approve = true` — single-developer deployments work out-of-box
-  without needing a second actor
+`ProposalPolicy`, `ProposalGatePolicy`, and `PackGatePolicy` are deferred.
+The shipped v1 enforcement is the inline self-approval guard in `handle_review`:
+the handler reads `proposals_open.proposer` and rejects with
+`RuntimeError::SelfApprovalForbidden { proposal_id, actor_id }` when
+`decision=approve` and `actor.id == proposer`. This check fires before any
+event is emitted, giving immediate feedback.
 
-Multi-actor deployments override with
-`ProposalPolicy { approval_threshold: 2, allow_self_approve: false, ... }`.
-The OSS default optimizes for single-developer ergonomics; review-gated
-deployments are explicit opt-in.
-
-More sophisticated policies (M-of-N, weighted reviewers, mandatory operator
-approval for high-blast-radius changesets) are operator-config additions, not
-v1 ADR scope.
-
-### ProposalPolicy: pack-owned, gate-enforced
-
-`ProposalPolicy` is proposal-pack configuration (not ADR-018-owned). ADR-046
-defines the policy struct and registers a `PackGatePolicy` implementation with
-the authorization gate (ADR-018). The gate invokes the registered policy for
-proposal verbs.
-
-```rust
-pub struct ProposalPolicy {
-    pub allow_self_approve:        bool,
-    pub approval_threshold:        u32,
-    pub require_listed_reviewer:   bool,
-}
-
-pub struct ProposalGatePolicy {
-    policy: ProposalPolicy,
-}
-
-impl PackGatePolicy for ProposalGatePolicy {
-    fn evaluate(&self, input: &GateRequest, ctx: &GateContext) -> GateDecision {
-        if input.verb == VerbName::new("review")
-            && !self.policy.allow_self_approve
-            && proposer_of(&input, ctx) == input.actor.id
-        {
-            return GateDecision::Deny {
-                reason: "self-approve forbidden by ProposalPolicy".to_string(),
-            };
-        }
-        GateDecision::Allow { obligations: vec![] }
-    }
-}
-```
-
-The `ProposalGatePolicy` is registered with the gate via
-`VerbRegistryBuilder::with_pack_policy` during KG pack initialization. The gate
-remains the authoritative trust boundary; the handler also defensively checks
-`proposals_open.proposer == actor.id` to give callers immediate feedback before
-emitting events (defense-in-depth, not sole enforcement).
+The full configurable policy struct, gate registration, and
+`VerbRegistryBuilder::with_pack_policy` wiring are future work. When shipped,
+`ProposalGatePolicy` will register with the ADR-018 authorization gate as the
+authoritative trust boundary; the handler's inline check will remain as a
+defense-in-depth layer but not the sole enforcement point.
 
 ### 7. Brain integration
 
@@ -465,10 +427,12 @@ verbs and the apply worker each have policy hooks:
   who need restrictions add a rego rule.
 - `review`: policy decides whether `actor` can review proposals in
   `namespace`. Default: any actor. Operators may restrict to specific roles.
-- `propose-apply` worker: policy decides whether the worker's `system:propose-apply`
-  actor can write the target namespace's records. Default: yes for the
-  pack-owned namespace, denied for foreign namespaces. This is the security
-  boundary that prevents cross-namespace proposal injection.
+- `propose-apply` worker: the worker emits `ActorRef { kind: "system", id: "propose-apply" }`
+  as its actor identity. The authorization gate evaluates this identity against
+  the active policy; with the OSS default (AllowAllGate) it is permitted
+  transparently. A dedicated `system:propose-apply` policy rule is future work;
+  production deployments requiring explicit cross-namespace injection prevention
+  should add a rego rule for this actor class when configuring ADR-018.
 
 ### 9. Failure modes
 
@@ -478,20 +442,20 @@ verbs and the apply worker each have policy hooks:
 | Apply fails (validation, network, etc.)           | `ProposalApplied { Failed }` emitted; status is reverted from `'applying'` back to `'approved'` (best-effort CAS) so the proposal is not permanently stuck. Apply retry is deferred to a follow-up ADR. v1 behavior: failed applies return to `'approved'`; operators may issue a new `propose` (with `parent_id` referencing the failed proposal) to retry. Direct re-emission of `apply` events is not supported in v1.                                                                                                                                                                                                                                                                               |
 | Apply policy denied                               | Same as Apply fails with `error = "denied by policy"`. Operator adjusts policy and issues a new `propose` (with `parent_id`) to retry; direct `apply` re-emission is not supported in v1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Reviewer reverses Approve to Reject               | Each review is its own event; the worker uses the latest decision per reviewer. If a previously-approved proposal hits Reject before Apply fires, status moves to 'rejected'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Two reviewers race (both Approve simultaneously)  | Each emits its own `ProposalReviewed` event; the apply worker is single-threaded per process — it sees them in event order and fires apply on the first one that crosses threshold. Idempotency on the worker side: it checks `proposals_open.status` before applying; if already applied, no-op.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Two reviewers race (both Approve simultaneously)  | Each `review(approve)` call invokes the apply worker synchronously after `reviewed_and_emit`. The `reviewed_and_emit` CAS serializes concurrent reviews at the projection layer; the apply worker’s `approved → applying` CAS ensures only one invocation executes the changeset. The worker checks `proposals_open.status` before applying; if already `applied` or `applying`, it returns without re-executing.                                                                                                                                                                                                                                                                                       |
 | Proposal expires                                  | A background sweep (TBD: cron-style, not v1) emits `ProposalWithdrawn` with `by = "system:expiry"` on proposals past their `expiry` timestamp.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Stale-target conflict (Fix 6)                     | An `UpdateEntity` or `MergeEntities` proposal targets a specific entity ID. Between propose-time and apply-time the entity may be independently modified. v1 default: **last-writer-wins** — the proposal applies its patch unconditionally. Optional: proposals may include `expected_version: Option<u64>` in the payload (if entity versioning is introduced via ADR-014 amendment). The apply worker would then check `current_version == expected_version` and emit `ProposalApplied { Failed { error: "stale: target was modified since proposal", current_version, expected_version } }` on mismatch. v1 does NOT introduce entity versioning; this knob is gated on a future ADR-014 amendment. |
 
 ### 10. CLI / MCP surface summary
 
-| Surface                                                        | Action                                              | How                                    |
-| -------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------- |
-| MCP `propose(...)`                                             | Create a proposal                                   | Verb                                   |
-| MCP `review(proposal_id, decision, comment?)`                  | Cast a review                                       | Verb                                   |
-| MCP `withdraw(proposal_id, rationale?)`                        | Withdraw a proposal (proposer-only)                 | Verb                                   |
-| MCP `list(kind=proposal, status="open")`                       | Browse open proposals                               | Lists from `proposals_open` projection |
-| MCP `get(id=<proposal_id>)`                                    | Fetch a single proposal's `ProposalCreated` payload | Resolves to the event payload          |
-| CLI `kkernel call kg proposal_cleanup --older-than <duration>` | Archive resolved proposals                          | Operator housekeeping                  |
+| Surface                                                        | Action                                                    | How                                    |
+| -------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------- |
+| MCP `propose(...)`                                             | Create a proposal                                         | Verb                                   |
+| MCP `review(proposal_id, decision, comment?)`                  | Cast a review                                             | Verb                                   |
+| MCP `withdraw(proposal_id, rationale?)`                        | Withdraw a proposal (proposer-only)                       | Verb                                   |
+| MCP `list(kind=proposal, status="open")`                       | Browse open proposals                                     | Lists from `proposals_open` projection |
+| MCP `get(id=<proposal_id>)`                                    | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
+| CLI `kkernel call kg proposal_cleanup --older-than <duration>` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
 
 `list(kind=proposal)` dispatches to a new `kg.list_proposals` handler under
 the kg pack — it queries `proposals_open` directly, supports the standard
@@ -622,24 +586,22 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 
 ### Crate placement
 
-- Verb handlers: `khive-pack-kg::proposals`
-- Apply worker: `khive-pack-kg::proposals::apply_worker`
-- Projection table + projection worker: `khive-pack-kg::proposals::projection_worker`
+- Verb handlers: `crates/khive-pack-kg/src/handlers.rs`
+- Apply worker: `crates/khive-pack-kg/src/apply_worker.rs`
+- Projection table + projection worker: `crates/khive-pack-kg/src/projection_worker.rs`
 - Payload types: `khive-types::events::proposal_payloads`
 
 ### Migration
 
-The current latest migration in `khive-db` is V4 (`dedupe_graph_edge_triples`).
-ADR-043 (Embedding Model Migration) takes V5. This ADR's migration is **V6**.
-**Ordering rule:** ADR-043 migration (V5) MUST be applied before this ADR's
-migration (V6) — the version sequence must remain contiguous and ADR-043 was
-specified first. `proposals_open` has no schema dependency on ADR-043's tables.
+The `proposals_open` projection table was created in migration V15 in
+`crates/khive-db/src/migrations.rs`. The `applying` transient status and
+its CAS invariants were added in V18.
 
-A new `VersionedMigration` in `crates/khive-db/src/migrations.rs`:
+A `VersionedMigration` in `crates/khive-db/src/migrations.rs`:
 
 ```rust
 VersionedMigration {
-    version: 6,
+    version: 15,
     name: "proposals_open",
     up: PROPOSALS_OPEN_DDL,
 }
@@ -674,25 +636,25 @@ form (ADR-017 §pack handler trait shape; `VerbDef/VERBS` is deprecated):
 pub const HANDLERS: &[HandlerDef] = &[
     // ... existing handlers ...
     HandlerDef {
-        name:       "propose",
-        visibility: Visibility::Verb,
-        speech_act: SpeechAct::Commissive,
-        handler:    Handler::Proposals(ProposalsHandler::Propose),
-        presentation_policy: VerbPresentationPolicy::Standard,
+        name:        "propose",
+        description: "Create a proposal for a KG change.",
+        visibility:  Visibility::Verb,
+        category:    Category::Proposals,
+        params:      &PROPOSE_PARAMS,
     },
     HandlerDef {
-        name:       "review",
-        visibility: Visibility::Verb,
-        speech_act: SpeechAct::Declaration,
-        handler:    Handler::Proposals(ProposalsHandler::Review),
-        presentation_policy: VerbPresentationPolicy::Standard,
+        name:        "review",
+        description: "Approve, reject, comment, or request changes on a proposal.",
+        visibility:  Visibility::Verb,
+        category:    Category::Proposals,
+        params:      &REVIEW_PARAMS,
     },
     HandlerDef {
-        name:       "withdraw",
-        visibility: Visibility::Verb,
-        speech_act: SpeechAct::Commissive,
-        handler:    Handler::Proposals(ProposalsHandler::Withdraw),
-        presentation_policy: VerbPresentationPolicy::Standard,
+        name:        "withdraw",
+        description: "Rescind a proposal (proposer only).",
+        visibility:  Visibility::Verb,
+        category:    Category::Proposals,
+        params:      &WITHDRAW_PARAMS,
     },
 ];
 ```
@@ -743,11 +705,12 @@ for v1, the JSON path is sufficient.
 Lookup wire shape:
 
 - `get(id=<event_uuid>)` resolves to the specific event record by event UUID.
-- For aggregate-ID lookup (all events for a proposal), use the events query
-  surface with `EventFilter { kinds: vec![EventKind::ProposalCreated], ... }`
-  and a payload predicate on `proposal_id`. Do NOT overload bare `get(id=...)`
-  to silently resolve event UUIDs OR aggregate IDs — that creates ambiguous
-  collision policy.
+- `get(id=<proposal_id>)` resolves raw proposal IDs and short prefixes via
+  `proposals_open` and returns the `ProposalCreated` event payload from the
+  event log.
+- For full review history, use the events query surface with
+  `EventFilter { kinds: vec![EventKind::ProposalReviewed], ... }` and a
+  payload predicate on `proposal_id`.
 
 ## References
 

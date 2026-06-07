@@ -1,8 +1,12 @@
 // Licensed under the Apache License, Version 2.0.
 
+// FILE SIZE JUSTIFICATION: curation.rs holds entity/note/edge patch types alongside
+// their update and merge implementations. The implementations share private helpers
+// (merge_properties, namespace checks, dedup policy) that need pub(crate) access to
+// runtime internals. Inline tests cover merge semantics that require direct access to
+// those helpers. Split plan: extract patch types into `curation/patch.rs` and merge
+// logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
-//!
-//! See ADR-014 for the full specification and semantics.
 
 use std::collections::HashSet;
 
@@ -168,7 +172,7 @@ impl KhiveRuntime {
     /// when `name` or `description` changes; skips re-indexing for property/tag-only patches.
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
-    /// namespace. This enforces ADR-007 namespace isolation at the runtime layer.
+    /// namespace. Namespace isolation is enforced at the runtime layer.
     pub async fn update_entity(
         &self,
         token: &NamespaceToken,
@@ -263,7 +267,7 @@ impl KhiveRuntime {
                 "cannot merge an entity into itself".into(),
             ));
         }
-        // H2 fix: enforce same-kind constraint at the runtime layer (ADR-014).
+        // H2 fix: enforce same-kind constraint at the runtime layer.
         // The handler also checks this, but any direct runtime caller (CLI, tests,
         // future SDK) would bypass the handler guard without this check here.
         {
@@ -471,10 +475,27 @@ impl KhiveRuntime {
             note.content = content;
         }
         if let Some(salience_patch) = patch.salience {
-            note.salience = salience_patch.map(|s| s.clamp(0.0, 1.0));
+            // Reject non-finite or out-of-range salience at the runtime boundary
+            // rather than silently clamping invalid caller input (coding-standards §608-622).
+            if let Some(s) = salience_patch {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(crate::RuntimeError::InvalidInput(format!(
+                        "salience must be a finite value in [0.0, 1.0]; got {s}"
+                    )));
+                }
+            }
+            note.salience = salience_patch;
         }
         if let Some(decay_patch) = patch.decay_factor {
-            note.decay_factor = decay_patch.map(|d| d.max(0.0));
+            // Reject non-finite or negative decay_factor at the runtime boundary.
+            if let Some(d) = decay_patch {
+                if !d.is_finite() || d < 0.0 {
+                    return Err(crate::RuntimeError::InvalidInput(format!(
+                        "decay_factor must be a finite value >= 0.0; got {d}"
+                    )));
+                }
+            }
+            note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
             let (merged, _) = merge_properties(
@@ -785,7 +806,7 @@ fn merge_entity_sql(
             } else {
                 edge.target_id
             };
-            // ADR-002 §134: symmetric relations must be stored with source_uuid < target_uuid.
+            // Symmetric relations must be stored with source_uuid < target_uuid.
             // Apply canonicalization so the conflict check and UPDATE both use the canonical form.
             let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
                 Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
@@ -801,7 +822,7 @@ fn merge_entity_sql(
             }
 
             let now_ts = chrono::Utc::now().timestamp();
-            // H3 fix (ADR-009/ADR-014): preserve the original edge ID by updating
+            // H3 fix: preserve the original edge ID by updating
             // source_id/target_id in-place when no conflict exists.
             //
             // Two-step approach to handle all cases while keeping the original ID:
@@ -951,7 +972,7 @@ fn merge_entity_sql(
             )?;
         }
 
-        // --- Tombstone from entity (ADR-014: soft-delete with provenance) ---
+        // --- Tombstone from entity (soft-delete with provenance) ---
         let merge_event_id = Uuid::new_v4();
         conn.execute(
             "UPDATE entities \
@@ -1251,7 +1272,7 @@ fn merge_note_sql(
             } else {
                 edge.target_id
             };
-            // ADR-002 §134: canonicalize symmetric relations before conflict check + UPDATE.
+            // Canonicalize symmetric relations before conflict check + UPDATE.
             let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
                 Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
                 Err(_) => (raw_src, raw_tgt),
@@ -1555,7 +1576,11 @@ fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests
+// INLINE TEST JUSTIFICATION: tests here exercise patch/merge helpers and the
+// update_note/update_entity paths that share private merge_properties logic.
+// Moving them to tests/ would require pub-exporting merge_properties, which is
+// an internal invariant not suitable for the public API surface. Broad
+// behavioral curation tests live in tests/integration.rs.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2329,7 +2354,7 @@ mod tests {
         let tok = NamespaceToken::local();
 
         // Create three entities: A and B will be merged; shared is the common target.
-        // Use `extends` (concept→concept) which is in the ADR-002 base allowlist.
+        // Use `extends` (concept→concept) which is a valid endpoint combination.
         let a = rt
             .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
@@ -2537,5 +2562,111 @@ mod tests {
             matches!(foreign_from, Err(RuntimeError::NotFound(_))),
             "foreign from_id must be denied before merge, got {foreign_from:?}"
         );
+    }
+
+    // ── #hardening Item 5: cross-namespace entity update/merge must be denied ──
+
+    #[tokio::test]
+    async fn update_entity_cross_namespace_returns_not_found_and_preserves_source() {
+        use crate::error::RuntimeError;
+        use crate::Namespace;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let entity = rt
+            .create_entity(
+                &ns_a,
+                "concept",
+                None,
+                "Alpha",
+                Some("original"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_entity(
+                &ns_b,
+                entity.id,
+                EntityPatch {
+                    name: Some("Compromised".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(err, Err(RuntimeError::NotFound(_))),
+            "cross-namespace update must return opaque NotFound, got {err:?}"
+        );
+
+        let after = rt.get_entity(&ns_a, entity.id).await.unwrap();
+        assert_eq!(
+            after.name, "Alpha",
+            "foreign update must not mutate source row"
+        );
+        assert_eq!(after.description.as_deref(), Some("original"));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_cross_namespace_either_id_returns_not_found() {
+        use crate::error::RuntimeError;
+        use crate::Namespace;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let into_a = rt
+            .create_entity(&ns_a, "concept", None, "Into A", None, None, vec![])
+            .await
+            .unwrap();
+        let from_a = rt
+            .create_entity(&ns_a, "concept", None, "From A", None, None, vec![])
+            .await
+            .unwrap();
+        let foreign_b = rt
+            .create_entity(&ns_b, "concept", None, "Foreign B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // foreign into_id: foreign_b belongs to ns_b, caller token is ns_a
+        let foreign_into = rt
+            .merge_entity(
+                &ns_a,
+                foreign_b.id,
+                from_a.id,
+                EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_into, Err(RuntimeError::NotFound(_))),
+            "foreign into_id must be denied before merge, got {foreign_into:?}"
+        );
+
+        // foreign from_id: foreign_b belongs to ns_b, caller token is ns_a
+        let foreign_from = rt
+            .merge_entity(
+                &ns_a,
+                into_a.id,
+                foreign_b.id,
+                EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_from, Err(RuntimeError::NotFound(_))),
+            "foreign from_id must be denied before merge, got {foreign_from:?}"
+        );
+
+        // All three entities survive the failed merges.
+        assert!(rt.get_entity(&ns_a, into_a.id).await.is_ok());
+        assert!(rt.get_entity(&ns_a, from_a.id).await.is_ok());
+        assert!(rt.get_entity(&ns_b, foreign_b.id).await.is_ok());
     }
 }

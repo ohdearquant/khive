@@ -1,4 +1,9 @@
-//! Smoke tests for the comm pack (ADR-040).
+//! Smoke tests for the comm pack.
+//!
+//! INLINE TEST JUSTIFICATION: all five comm verbs (send, inbox, read, reply, thread) share a
+//! single in-memory runtime fixture. Splitting into per-verb files would require duplicating
+//! the fixture and lose cross-verb invariant tests (e.g. send→inbox→read→reply→thread
+//! roundtrip and thread-isolation assertions) that exercise interactions between verbs.
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
@@ -136,7 +141,7 @@ async fn read_marks_message_as_read() {
 async fn reply_creates_threaded_message() {
     let (registry, _rt) = build_registry();
 
-    // Send the original message (same namespace — cross-namespace is denied per ADR-040 §481).
+    // Send the original message (same namespace — cross-namespace sends are denied).
     let original = registry
         .dispatch(
             "comm.send",
@@ -404,7 +409,7 @@ async fn test_short_id_collision_errors_clearly() {
 
 /// send() within the same namespace writes one outbound note in the caller's namespace.
 ///
-/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace sends are denied (issue #481 fix).
 /// Same-namespace sends must produce both outbound and inbound copies.
 #[tokio::test]
 async fn test_send_writes_outbound_in_caller_ns() {
@@ -455,7 +460,7 @@ async fn test_send_writes_outbound_in_caller_ns() {
 
 /// send() within the same namespace writes one inbound note alongside the outbound copy.
 ///
-/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace sends are denied (issue #481 fix).
 /// Same-namespace send creates both copies in the caller's namespace.
 #[tokio::test]
 async fn test_send_writes_inbound_in_recipient_ns() {
@@ -512,7 +517,7 @@ async fn test_send_writes_inbound_in_recipient_ns() {
 
 /// inbox() returns the inbound message after a same-namespace send.
 ///
-/// Cross-namespace delivery is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace delivery is denied (issue #481 fix).
 /// Same-namespace send creates an inbound copy visible in inbox().
 #[tokio::test]
 async fn test_inbox_returns_inbound_for_recipient() {
@@ -608,7 +613,7 @@ async fn test_send_to_self_writes_two_notes() {
 /// the outbound copy. Because from==to, the reply routes back to the same namespace
 /// (which is correct — there is no other party in a self-send).
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_sender_routes_to_recipient() {
     // Registry scoped to lambda:khive (sender == recipient in same-namespace mode).
@@ -662,7 +667,7 @@ async fn test_reply_from_sender_routes_to_recipient() {
 /// Within same-namespace: both are the same namespace so the routing is always self.
 /// This test verifies reply() works on an inbound message and preserves the metadata.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_recipient_routes_to_sender() {
     // Same namespace: lambda:khive sends to lambda:khive, then replies.
@@ -1054,7 +1059,7 @@ async fn test_list_message_direction_filter() {
 /// Before the fix, read() silently mutated outbound messages, corrupting
 /// the read/unread invariant.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used here; the outbound copy stays in lambda:khive.
 #[tokio::test]
 async fn test_read_rejects_outbound_message() {
@@ -1165,7 +1170,7 @@ async fn test_thread_verb_returns_threaded_messages() {
 /// Before the fix, reply() created only an outbound note via a single
 /// create_note call, so inbox() would not surface the reply.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used here — both copies land in the caller's namespace.
 #[tokio::test]
 async fn test_reply_delivers_inbound_to_recipient() {
@@ -1485,7 +1490,7 @@ async fn test_inbox_invalid_status_banana_rejected() {
 /// After the fix, both copies share the same canonical thread_id (outbound UUID),
 /// and all replies carry that thread_id so the thread query finds them.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used to test the canonical thread_id invariant.
 #[tokio::test]
 async fn test_cross_namespace_thread_query_finds_reply() {
@@ -1902,7 +1907,7 @@ async fn test_thread_sort_is_not_a_noop_issue_485() {
     );
 }
 
-// ── schema_plan regression: CommPack declares ADR-040 message indexes ─────────
+// ── schema_plan regression: CommPack declares comm message indexes ────────────
 
 #[tokio::test]
 async fn comm_pack_exposes_non_empty_schema_plan() {
@@ -1934,9 +1939,11 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );
+    // Indexes now use WHERE deleted_at IS NULL so the parameterized kind = ?N
+    // predicate can use the index (literal WHERE kind = 'message' blocks this).
     assert!(
-        combined.contains("'message'"),
-        "schema plan indexes must be scoped to kind='message'; got: {combined}"
+        combined.contains("deleted_at IS NULL"),
+        "schema plan indexes must use WHERE deleted_at IS NULL partial condition; got: {combined}"
     );
 }
 
@@ -1956,5 +1963,278 @@ async fn verb_registry_aggregates_comm_schema_plan() {
     assert!(
         !comm_plan.is_empty(),
         "comm schema plan must have DDL statements"
+    );
+}
+
+/// thread isolation: comm.thread returns only messages belonging to the requested thread,
+/// not messages from other threads in the same namespace.
+#[tokio::test]
+async fn test_thread_returns_only_requested_thread_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // Send two independent root messages (thread A and thread B).
+    let msg_a = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "thread A root" }),
+        )
+        .await
+        .expect("send thread A root");
+    let thread_a_id = msg_a
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id A");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "thread B root" }),
+        )
+        .await
+        .expect("send thread B root");
+
+    // Reply to thread A.
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": thread_a_id, "content": "reply to A" }),
+        )
+        .await
+        .expect("reply to A");
+
+    // Fetch thread A — must contain exactly the root + 1 reply (the inbound copy of each).
+    // With self-send, each comm.send creates outbound + inbound, and reply creates outbound + inbound.
+    // SQL filter ensures only thread-A messages are returned.
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": thread_a_id }))
+        .await
+        .expect("thread A fetch");
+
+    let messages = thread
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    // All returned messages must have thread_id == thread_a_id.
+    for msg in messages {
+        let props = msg.get("properties").expect("has properties");
+        let stored_tid = props
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            stored_tid, thread_a_id,
+            "all thread messages must carry thread_id={thread_a_id}, got {stored_tid}"
+        );
+    }
+
+    // Must have at least 2 messages (root + reply, inbound copies).
+    assert!(
+        messages.len() >= 2,
+        "thread must contain at least root + reply; got {}",
+        messages.len()
+    );
+}
+
+/// read filter 5-case truth table: json_type-based filter matches old as_bool().unwrap_or(false).
+/// Seeds messages with $.read set to: missing, bool false, bool true, string "true", integer 1.
+/// Verifies that inbox(status=unread) and inbox(status=read) classify each case correctly.
+#[tokio::test]
+async fn test_inbox_read_filter_json_type_truth_table() {
+    use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let (_registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let store = rt.notes(&token).expect("note store");
+
+    // Seed 5 inbound message notes directly (bypassing send) to control $.read exactly.
+    let make_msg = |read_val: serde_json::Value, label: &str| -> Note {
+        Note::new("local", "message", label).with_properties(serde_json::json!({
+            "direction": "inbound",
+            "from": "local",
+            "to": "local",
+            "thread_id": null,
+            "read": read_val,
+        }))
+    };
+
+    // missing: don't set read at all in properties
+    let note_missing = Note::new("local", "message", "read=missing").with_properties(
+        serde_json::json!({ "direction": "inbound", "from": "local", "to": "local" }),
+    );
+    let note_false = make_msg(serde_json::json!(false), "read=false");
+    let note_true = make_msg(serde_json::json!(true), "read=true");
+    let note_str_true = make_msg(serde_json::json!("true"), "read=string_true");
+    let note_int_1 = make_msg(serde_json::json!(1), "read=int_1");
+
+    store.upsert_note(note_missing).await.unwrap();
+    store.upsert_note(note_false).await.unwrap();
+    store.upsert_note(note_true).await.unwrap();
+    store.upsert_note(note_str_true).await.unwrap();
+    store.upsert_note(note_int_1).await.unwrap();
+
+    // Query unread: missing, false, "true" (string), 1 (integer) → all count as unread.
+    let unread_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+        ],
+        order_by: None,
+    };
+    let unread_page = store
+        .query_notes_filtered("local", &unread_filter, PageRequest::default())
+        .await
+        .unwrap();
+    let unread_contents: Vec<&str> = unread_page
+        .items
+        .iter()
+        .map(|n| n.content.as_str())
+        .collect();
+
+    assert!(
+        unread_contents.contains(&"read=missing"),
+        "missing $.read must be unread; got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=false"),
+        "bool false must be unread; got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=string_true"),
+        "string 'true' must be unread (not JSON bool true); got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=int_1"),
+        "integer 1 must be unread (not JSON bool true); got {unread_contents:?}"
+    );
+    assert!(
+        !unread_contents.contains(&"read=true"),
+        "JSON bool true must NOT be unread; got {unread_contents:?}"
+    );
+
+    // Query read: only JSON boolean true → exactly 1 result.
+    let read_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("true".to_string()),
+            },
+        ],
+        order_by: None,
+    };
+    let read_page = store
+        .query_notes_filtered("local", &read_filter, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_page.items.len(),
+        1,
+        "only JSON bool true must be in 'read'; got {:?}",
+        read_page
+            .items
+            .iter()
+            .map(|n| &n.content)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(read_page.items[0].content, "read=true");
+}
+
+// ── COMM-AUD-003: thread_id validation at verb boundary ───────────────────────
+
+/// send with a malformed thread_id must return InvalidInput, not persist garbage.
+#[tokio::test]
+async fn send_rejects_malformed_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "hi", "thread_id": "not-a-uuid" }),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "send with malformed thread_id must fail; got: {err:?}"
+    );
+}
+
+/// send with a valid UUID thread_id must succeed.
+#[tokio::test]
+async fn send_accepts_valid_uuid_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // First send to get a real thread root UUID.
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let thread_uuid = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "threaded reply", "thread_id": thread_uuid }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "send with valid UUID thread_id must succeed; got: {result:?}"
+    );
+}
+
+// ── COMM-AUD-004: ThreadParams deny_unknown_fields ────────────────────────────
+
+/// comm.thread with an unknown argument must return an error, not silently ignore it.
+#[tokio::test]
+async fn thread_rejects_unknown_field() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // Send a root message so there is a valid id to use.
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("send succeeds");
+    let root_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+
+    let err = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_id, "typo_arg": "oops" }),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "comm.thread with unknown field must fail; got: {err:?}"
     );
 }

@@ -1,17 +1,4 @@
-//! `khive-vamana` — batch-built Vamana ANN index for pre-normalized `f32` vectors.
-//!
-//! All vectors must be unit-normalized before insertion. The crate validates
-//! vector dimensionality but not norms.
-//!
-//! # Quick start
-//!
-//! ```rust,ignore
-//! use khive_vamana::{VamanaConfig, build, search};
-//!
-//! let config = VamanaConfig::with_dimensions(128);
-//! let index = build(&vectors, config)?;
-//! let results = search(&index, &query, 10)?;
-//! ```
+//! Vamana ANN index: batch-built approximate nearest-neighbor search over unit-normalized vectors.
 
 pub mod config;
 pub mod distance;
@@ -27,10 +14,12 @@ pub use index::{
     VAMANA_SNAPSHOT_VERSION,
 };
 
+/// Build a Vamana index from a flat row-major vector slice.
 pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<VamanaIndex> {
     VamanaIndex::build(vectors, config)
 }
 
+/// Search an index for the `k` nearest neighbors of `query`.
 pub fn search(index: &VamanaIndex, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
     index.search(query, k)
 }

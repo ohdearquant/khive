@@ -7,13 +7,8 @@ use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::stats::RebuildStats;
 
 impl HnswIndex {
-    /// Mark a vector for deletion (lazy tombstone).
-    ///
-    /// The vector is not physically removed until `rebuild()` is called.
-    /// Returns true if the vector existed and was marked.
-    ///
-    /// If the deleted node is the current entry point, a replacement is
-    /// found immediately from the node's neighbors (O(M), not O(N)).
+    /// Mark a vector for deletion (lazy tombstone); returns true if it existed.
+    /// If the deleted node was the entry point, a replacement is found from neighbors O(M).
     pub fn delete(&mut self, id: NodeId) -> bool {
         match self.id_to_internal.get(&id) {
             Some(&iid) => {
@@ -33,13 +28,7 @@ impl HnswIndex {
         }
     }
 
-    /// If `tombstoned_id` is the current entry point, find a non-tombstoned
-    /// replacement from its neighbors. This is O(M) in the typical case
-    /// (M = neighbor count per layer) rather than O(N) scanning all nodes.
-    ///
-    /// Falls back to an O(N) scan only if ALL neighbors of the entry point
-    /// across ALL layers are also tombstoned -- an extremely unlikely scenario
-    /// that would require deleting an entire neighborhood simultaneously.
+    /// Repair the entry point after a delete; O(M) typical, O(N) fallback only if all neighbors are dead.
     fn repair_entry_point_after_delete(&mut self, tombstoned_id: usize) {
         let current_ep = match self.entry_point {
             Some(ep) if ep == tombstoned_id => ep,
@@ -73,42 +62,8 @@ impl HnswIndex {
         self.entry_point = None;
     }
 
-    /// Rebuild the index by removing tombstoned nodes.
-    ///
-    /// This physically removes tombstoned nodes and cleans up neighbor references.
-    /// Call this when `needs_rebuild()` returns true.
-    ///
-    /// # RETRIEVAL-11: Entry Point Behavior After Rebuild
-    ///
-    /// When rebuild removes the current entry point (because it was tombstoned),
-    /// a new entry point is selected automatically. The selection algorithm:
-    ///
-    /// 1. **Filter**: Consider only non-tombstoned nodes
-    /// 2. **Select**: Choose the node with the highest `max_layer` value
-    /// 3. **Tie-break**: If multiple nodes have the same max_layer, selection
-    ///    is deterministic but implementation-defined
-    ///
-    /// ## Why Highest Layer?
-    ///
-    /// HNSW search starts at the entry point and descends through layers. A node
-    /// at a higher layer provides better "coverage" of the graph, allowing search
-    /// to quickly narrow down to the relevant region before descending.
-    ///
-    /// ## Edge Cases
-    ///
-    /// | Scenario | Behavior |
-    /// |----------|----------|
-    /// | All nodes tombstoned | Entry point becomes `None`, searches return empty |
-    /// | Entry point not tombstoned | Entry point unchanged |
-    /// | Single node remains | That node becomes entry point |
-    ///
-    /// ## Return Value
-    ///
-    /// The `entry_point_updated` field in `RebuildStats` indicates whether the
-    /// entry point was changed during rebuild.
-    /// Emits `hnsw.rebuild.duration_ms`, `hnsw.rebuild.count`,
-    /// `hnsw.rebuild.nodes_removed`, and `hnsw.index.size` metrics when a
-    /// sink is attached.
+    /// Physically remove tombstoned nodes and clean up neighbor references.
+    /// Emits rebuild metrics when a sink is attached.
     pub fn rebuild(&mut self) -> RebuildStats {
         let start = std::time::Instant::now();
 
@@ -152,10 +107,7 @@ impl HnswIndex {
         stats
     }
 
-    /// Inner rebuild logic (uninstrumented).
-    ///
-    /// Rebuilds the dense storage by compacting: removes tombstoned nodes and
-    /// re-assigns internal IDs so the Vec remains dense.
+    /// Inner rebuild logic (uninstrumented); compacts storage and re-assigns internal IDs.
     fn rebuild_inner(&mut self) -> RebuildStats {
         let nodes_before = self.nodes.len();
         let nodes_removed = self.tombstone_count;
@@ -265,6 +217,8 @@ impl HnswIndex {
     }
 
     /// Update entry point to the node with the highest max_layer.
+    // REASON: Called by rebuild in manual mode; not dead in all compile paths.
+    // Kept here to avoid split of rebuild state management across modules.
     #[allow(dead_code)]
     pub(super) fn update_entry_point(&mut self) {
         let new_entry = self

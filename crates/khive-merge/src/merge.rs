@@ -1,37 +1,128 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Top-level `three_way_merge()` and `ThreeWayMergeEngine` (ADR-043 §4–§11).
+//! Top-level `three_way_merge()` and `ThreeWayMergeEngine`.
 
 use std::collections::HashSet;
 
-use chrono::Utc;
-use khive_runtime::portability::KgArchive;
+use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
-use khive_vcs::merge_engine::{MergeConflict, MergeEngine, MergeResult, MergeStrategy};
-use khive_vcs::VcsError;
-
+use crate::diff_local::EdgeKey;
 use crate::edge::{merge_edges, validate_dangling_edges};
 use crate::entity::merge_entities;
 use crate::strategy::{apply_ours, apply_theirs};
+use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, MergeStrategy};
+
+/// Validate archive invariants before merge.
+///
+/// Checks:
+/// - All three archives share the same namespace.
+/// - No edge has a non-finite weight (NaN / Inf).
+/// - No duplicate entity IDs within a single archive.
+/// - No duplicate edge natural keys `(source, target, relation)` within a single archive.
+fn validate_inputs(
+    base: &KgArchive,
+    ours: &KgArchive,
+    theirs: &KgArchive,
+) -> Result<(), MergeError> {
+    if base.namespace != ours.namespace || base.namespace != theirs.namespace {
+        return Err(MergeError::NamespaceMismatch {
+            base: base.namespace.clone(),
+            ours: ours.namespace.clone(),
+            theirs: theirs.namespace.clone(),
+        });
+    }
+
+    for archive in [base, ours, theirs] {
+        validate_archive(archive)?;
+    }
+
+    Ok(())
+}
+
+fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
+    // Reject non-finite edge weights.
+    for edge in &archive.edges {
+        if !edge.weight.is_finite() {
+            return Err(MergeError::InvalidEdgeWeight(format!(
+                "edge ({}, {}, {}): weight={}",
+                edge.source, edge.target, edge.relation, edge.weight
+            )));
+        }
+    }
+
+    // Reject duplicate entity IDs.
+    let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(archive.entities.len());
+    for entity in &archive.entities {
+        if !entity_ids.insert(entity.id) {
+            return Err(MergeError::DuplicateEntityId {
+                entity_id: entity.id,
+            });
+        }
+    }
+
+    // Reject duplicate edge natural keys.
+    let mut edge_keys: HashSet<EdgeKey> = HashSet::with_capacity(archive.edges.len());
+    for edge in &archive.edges {
+        let key = EdgeKey::from_edge(edge);
+        if !edge_keys.insert(key.clone()) {
+            return Err(MergeError::DuplicateEdgeKey {
+                edge_source: edge.source,
+                edge_target: edge.target,
+                edge_relation: edge.relation.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Sort entities by UUID for deterministic output.
+fn sort_entities(archive: &mut KgArchive) {
+    archive.entities.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
+/// Sort edges by `(source, target, relation)` for deterministic output.
+fn sort_edges(edges: &mut [ExportedEdge]) {
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.relation.to_string().cmp(&b.relation.to_string()))
+            .then_with(|| a.edge_id.cmp(&b.edge_id))
+    });
+}
+
+/// Produce a deterministic `exported_at` timestamp: latest of `ours` and `theirs`.
+fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::DateTime<chrono::Utc> {
+    std::cmp::max(ours.exported_at, theirs.exported_at)
+}
 
 /// Perform a three-way merge.
 ///
-/// - `Auto`: entity pass → edge pass → dangling validation → return `Conflicts` or `Clean`.
-/// - `Ours`/`Theirs`: call the last-write-wins shortcut; always returns `Clean`.
+/// - `Auto`: validate → entity pass → edge pass → dangling validation → deterministic sort → `Conflicts` or `Clean`.
+/// - `Ours`/`Theirs`: validate → last-write-wins shortcut → deterministic sort → always returns `Clean`.
 pub fn three_way_merge(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
     strategy: MergeStrategy,
-) -> Result<MergeResult, VcsError> {
+) -> Result<MergeResult, MergeError> {
+    validate_inputs(base, ours, theirs)?;
+
     match strategy {
         MergeStrategy::Ours => {
-            let merged = apply_ours(base, ours, theirs);
+            let mut merged = apply_ours(base, ours, theirs);
+            sort_entities(&mut merged);
+            sort_edges(&mut merged.edges);
+            merged.exported_at = deterministic_timestamp(ours, theirs);
             Ok(MergeResult::Clean { merged })
         }
         MergeStrategy::Theirs => {
-            let merged = apply_theirs(base, ours, theirs);
+            let mut merged = apply_theirs(base, ours, theirs);
+            sort_entities(&mut merged);
+            sort_edges(&mut merged.edges);
+            merged.exported_at = deterministic_timestamp(ours, theirs);
             Ok(MergeResult::Clean { merged })
         }
         MergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
@@ -42,31 +133,30 @@ fn three_way_merge_auto(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
-) -> Result<MergeResult, VcsError> {
+) -> Result<MergeResult, MergeError> {
     let mut all_conflicts: Vec<MergeConflict> = Vec::new();
 
-    // Step 1: entity merge.
     let (merged_entities, entity_conflicts) = merge_entities(base, ours, theirs);
     all_conflicts.extend(entity_conflicts);
 
-    // Step 2: edge merge.
     let (merged_edges, edge_conflicts) = merge_edges(base, ours, theirs)?;
     all_conflicts.extend(edge_conflicts);
 
-    // Step 3: dangling-edge validation.
     let entity_id_set: HashSet<Uuid> = merged_entities.iter().map(|e| e.id).collect();
     let dangling = validate_dangling_edges(&merged_edges, &entity_id_set);
     all_conflicts.extend(dangling);
 
     if all_conflicts.is_empty() {
-        let merged = KgArchive {
+        let mut merged = KgArchive {
             format: ours.format.clone(),
             version: ours.version.clone(),
             namespace: ours.namespace.clone(),
-            exported_at: Utc::now(),
+            exported_at: deterministic_timestamp(ours, theirs),
             entities: merged_entities,
             edges: merged_edges,
         };
+        sort_entities(&mut merged);
+        sort_edges(&mut merged.edges);
         Ok(MergeResult::Clean { merged })
     } else {
         Ok(MergeResult::Conflicts {
@@ -87,225 +177,7 @@ impl MergeEngine for ThreeWayMergeEngine {
         ours: &KgArchive,
         theirs: &KgArchive,
         strategy: MergeStrategy,
-    ) -> Result<MergeResult, VcsError> {
+    ) -> Result<MergeResult, MergeError> {
         three_way_merge(base, ours, theirs, strategy)
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use chrono::Utc;
-    use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
-    use khive_storage::EdgeRelation;
-    use uuid::Uuid;
-
-    use super::*;
-
-    fn empty(ns: &str) -> KgArchive {
-        KgArchive {
-            format: "khive-kg".into(),
-            version: "0.1".into(),
-            namespace: ns.into(),
-            exported_at: Utc::now(),
-            entities: vec![],
-            edges: vec![],
-        }
-    }
-
-    fn entity(id: Uuid, name: &str) -> ExportedEntity {
-        ExportedEntity {
-            id,
-            kind: "concept".into(),
-            name: name.into(),
-            description: None,
-            properties: None,
-            tags: vec![],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn edge(src: Uuid, tgt: Uuid) -> ExportedEdge {
-        ExportedEdge {
-            edge_id: Uuid::new_v4(),
-            source: src,
-            target: tgt,
-            relation: EdgeRelation::Extends,
-            weight: 1.0,
-        }
-    }
-
-    #[test]
-    fn clean_merge_no_overlap() {
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let base = empty("test");
-        let mut ours = empty("test");
-        ours.entities = vec![entity(id1, "A")];
-        let mut theirs = empty("test");
-        theirs.entities = vec![entity(id2, "B")];
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
-        assert!(matches!(result, MergeResult::Clean { .. }));
-        if let MergeResult::Clean { merged } = result {
-            assert_eq!(merged.entities.len(), 2);
-        }
-    }
-
-    #[test]
-    fn conflicts_on_name_mismatch() {
-        let id = Uuid::new_v4();
-        let base = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "Original")];
-            a
-        };
-        let ours = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameA")];
-            a
-        };
-        let theirs = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameB")];
-            a
-        };
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
-        assert!(matches!(result, MergeResult::Conflicts { .. }));
-    }
-
-    #[test]
-    fn ours_strategy_always_clean() {
-        let id = Uuid::new_v4();
-        let base = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "Original")];
-            a
-        };
-        let ours = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameA")];
-            a
-        };
-        let theirs = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameB")];
-            a
-        };
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
-        assert!(matches!(result, MergeResult::Clean { .. }));
-        if let MergeResult::Clean { merged } = result {
-            assert_eq!(merged.entities[0].name, "NameA");
-        }
-    }
-
-    #[test]
-    fn dangling_edge_conflict() {
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-
-        // base: entity id1
-        let base = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id1, "A")];
-            a
-        };
-        // ours: add edge id1→id2, add entity id2
-        let ours = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id1, "A"), entity(id2, "B")];
-            a.edges = vec![edge(id1, id2)];
-            a
-        };
-        // theirs: delete entity id2
-        let theirs = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id1, "A")];
-            a
-        };
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
-        // The edge id1→id2 is added in ours; entity id2 was added in ours but
-        // not in theirs (absent in both base and theirs). So after merge entity id2
-        // will be included (added in ours only). Edge should NOT be dangling.
-        // This tests that the auto-resolve path works for the common case.
-        assert!(matches!(result, MergeResult::Clean { .. }));
-    }
-
-    #[test]
-    fn three_way_merge_engine_impl() {
-        let engine = ThreeWayMergeEngine;
-        let base = empty("test");
-        let ours = empty("test");
-        let theirs = empty("test");
-        let result = engine
-            .merge_branch(&base, &ours, &theirs, MergeStrategy::Auto)
-            .unwrap();
-        assert!(matches!(result, MergeResult::Clean { .. }));
-    }
-
-    #[test]
-    fn theirs_strategy_always_clean() {
-        let id = Uuid::new_v4();
-        let base = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "Original")];
-            a
-        };
-        let ours = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameA")];
-            a
-        };
-        let theirs = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "NameB")];
-            a
-        };
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
-        assert!(matches!(result, MergeResult::Clean { .. }));
-        if let MergeResult::Clean { merged } = result {
-            assert_eq!(merged.entities[0].name, "NameB");
-        }
-    }
-
-    #[test]
-    fn kind_conflict_detected() {
-        let id = Uuid::new_v4();
-        let base = {
-            let mut a = empty("test");
-            a.entities = vec![entity(id, "E")]; // kind = "concept"
-            a
-        };
-        let ours = {
-            let mut a = empty("test");
-            let mut e = entity(id, "E");
-            e.kind = "document".into();
-            a.entities = vec![e];
-            a
-        };
-        let theirs = {
-            let mut a = empty("test");
-            let mut e = entity(id, "E");
-            e.kind = "dataset".into();
-            a.entities = vec![e];
-            a
-        };
-
-        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
-        assert!(matches!(result, MergeResult::Conflicts { .. }));
-        if let MergeResult::Conflicts { conflicts } = result {
-            assert!(
-                conflicts
-                    .iter()
-                    .any(|c| matches!(c, MergeConflict::KindConflict { .. })),
-                "expected at least one KindConflict, got: {conflicts:?}"
-            );
-        }
     }
 }

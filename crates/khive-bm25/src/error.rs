@@ -27,6 +27,10 @@ pub enum RetrievalError {
     /// Invalid BM25 configuration parameters.
     #[error("configuration error: {0}")]
     Configuration(String),
+
+    /// Internal document ID space exhausted (u32::MAX documents indexed).
+    #[error("internal document ID space exhausted (u32::MAX reached)")]
+    IdSpaceExhausted,
 }
 
 impl RetrievalError {

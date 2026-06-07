@@ -1,15 +1,15 @@
 //! `kkernel` binary — khive admin/management Rust CLI.
 //!
-//! See [ADR-003](../../docs/adr/ADR-003-system-architecture.md) for the
-//! kernel/MCP split rationale.
+//! The kernel/MCP split keeps admin and infrastructure operations out of the
+//! MCP surface.
 //!
 //! Subcommands:
 //!
 //! - `sync`    — build a queryable SQLite DB from NDJSON sources (issue #174)
 //! - `pack`    — introspect registered packs (`list`, `handler <name>`)
-//! - `kg`      — KG validation, init, hook management (ADR-034, ADR-035)
-//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
-//! - `vector`  — vector store capabilities and orphan sweep (ADR-044)
+//! - `kg`      — KG validation, init, hook management
+//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
+//! - `vector`  — vector store capabilities and orphan sweep
 //! - `reindex` — rebuild embedding vectors for entities and notes
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
@@ -28,7 +28,7 @@ use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, reindex
 #[command(
     name = "kkernel",
     version,
-    about = "khive kernel — admin/management Rust binary (ADR-076)"
+    about = "khive kernel — admin/management Rust binary"
 )]
 struct Args {
     /// Log level for stderr output. JSON results go to stdout regardless.
@@ -48,24 +48,76 @@ enum Command {
     #[command(subcommand)]
     Pack(PackCommand),
 
-    /// KG validation, init, and hook management (ADR-034, ADR-035).
+    /// KG validation, init, and hook management.
     #[command(subcommand)]
     Kg(kg::KgCommand),
 
-    /// Embedding model lifecycle: list, status, migrate, drift-check (ADR-043).
+    /// Schema migration lifecycle: migrate and check.
+    #[command(subcommand)]
+    Db(DbCommand),
+
+    /// Embedding model lifecycle: list, status, migrate, drift-check.
     #[command(subcommand)]
     Engine(engine::EngineCommand),
 
-    /// Vector store capabilities and orphan sweep (ADR-044).
+    /// Vector store capabilities and orphan sweep.
     #[command(subcommand)]
     Vector(vector::VectorCommand),
 
     /// Re-embed all entities and notes using the configured embedding model.
     Reindex(reindex::ReindexArgs),
 
-    /// Inspect registered backends (ADR-009, ADR-028).
+    /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
+}
+
+/// Database schema lifecycle subcommands.
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    /// Apply any pending schema migrations to the configured database.
+    Migrate(DbMigrateArgs),
+
+    /// Report per-backend schema state without applying changes.
+    Check(DbCheckArgs),
+}
+
+#[derive(clap::Parser, Debug)]
+struct DbMigrateArgs {
+    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    /// Target a specific backend by name.
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Show what would be applied without executing migrations.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Exit 0 if current, nonzero if any migration is pending (implies --dry-run).
+    #[arg(long)]
+    check: bool,
+
+    /// Print human-readable output instead of JSON.
+    #[arg(long)]
+    human: bool,
+}
+
+#[derive(clap::Parser, Debug)]
+struct DbCheckArgs {
+    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    /// Exit nonzero if any backend is behind the current schema version.
+    #[arg(long)]
+    strict: bool,
+
+    /// Print human-readable output instead of JSON.
+    #[arg(long)]
+    human: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -103,7 +155,7 @@ enum PackCommand {
     },
 }
 
-/// Backend admin commands (ADR-003 §four-invariants, ADR-009, ADR-028).
+/// Backend admin commands.
 ///
 /// In the full multi-backend deployment, `kkernel backend list` reads `khive.toml`
 /// and enumerates all configured `[[backends]]` entries. In the current v1 implementation,
@@ -137,11 +189,139 @@ async fn main() -> Result<()> {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
+        Command::Db(d) => cmd_db(d).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::Backend(b) => cmd_backend(b),
     }
+}
+
+async fn cmd_db(cmd: DbCommand) -> Result<()> {
+    match cmd {
+        DbCommand::Migrate(args) => cmd_db_migrate(args).await,
+        DbCommand::Check(args) => cmd_db_check(args).await,
+    }
+}
+
+async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
+    // KhiveRuntime::new() runs run_migrations() internally.
+    // Constructing the runtime is therefore sufficient to apply all pending migrations.
+    let mut cfg = RuntimeConfig::default();
+    if let Some(ref db) = args.db {
+        cfg.db_path = Some(db.clone());
+    }
+
+    if args.dry_run || args.check {
+        // For dry-run / --check, query the current schema version without writing.
+        return cmd_db_check(DbCheckArgs {
+            db: args.db,
+            strict: args.check,
+            human: args.human,
+        })
+        .await;
+    }
+
+    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let latest = khive_db::MIGRATIONS.len() as u32;
+
+    // Query the applied version to report what was done.
+    let sql = rt.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .context("open SQL reader after migration")?;
+    use khive_storage::types::{SqlStatement, SqlValue};
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
+            params: vec![],
+            label: Some("db_migrate_version".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let applied: u32 = rows
+        .first()
+        .and_then(|r| match r.get("COALESCE(MAX(version), 0)") {
+            Some(SqlValue::Integer(v)) => Some(*v as u32),
+            _ => None,
+        })
+        .unwrap_or(latest);
+
+    if args.human {
+        println!("schema migrated: version {applied} of {latest} (current)");
+    } else {
+        let json = serde_json::json!({
+            "applied_version": applied,
+            "latest_version": latest,
+            "current": applied == latest,
+        });
+        println!("{}", serde_json::to_string(&json).expect("serialize"));
+    }
+    Ok(())
+}
+
+async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let mut cfg = RuntimeConfig::default();
+    if let Some(ref db) = args.db {
+        cfg.db_path = Some(db.clone());
+    }
+
+    // Use read-only constructor so we don't write if just checking.
+    let rt = KhiveRuntime::new_readonly(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let latest = khive_db::MIGRATIONS.len() as u32;
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.context("open SQL reader for db check")?;
+
+    let current_version: u32 = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
+            params: vec![],
+            label: Some("db_check_version".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|r| match r.get("COALESCE(MAX(version), 0)") {
+                    Some(SqlValue::Integer(v)) => Some(*v as u32),
+                    _ => None,
+                })
+        })
+        .unwrap_or(0);
+
+    let is_current = current_version >= latest;
+
+    if args.human {
+        println!(
+            "main:    V{current_version} ({})",
+            if is_current {
+                "current"
+            } else {
+                "behind — run: kkernel db migrate"
+            }
+        );
+    } else {
+        let json = serde_json::json!({
+            "current_version": current_version,
+            "latest_version": latest,
+            "current": is_current,
+            "pending": if is_current { 0 } else { latest - current_version },
+        });
+        println!("{}", serde_json::to_string(&json).expect("serialize"));
+    }
+
+    if args.strict && !is_current {
+        anyhow::bail!(
+            "schema is behind: V{current_version} applied, V{latest} is current — \
+             run `kkernel db migrate` to bring the schema up to date"
+        );
+    }
+    Ok(())
 }
 
 fn init_tracing(level: &str) {
@@ -223,7 +403,7 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
 
 fn cmd_backend(cmd: BackendCommand) -> Result<()> {
     // v1: enumerate backends from RuntimeConfig defaults.
-    // Full multi-backend implementation reads khive.toml (ADR-028); this ships
+    // Full multi-backend implementation reads khive.toml; this ships
     // the CLI surface so tooling can already call `kkernel backend list`.
     let default_config = RuntimeConfig::default();
     let default_id = default_config.backend_id.clone();

@@ -1,10 +1,7 @@
-//! Observability sink for BM25 index operations.
-//!
-//! Provides a pluggable [`MetricsSink`] trait and a [`RecordingSink`] for tests.
+//! Observability sink: pluggable [`MetricsSink`] trait and [`RecordingSink`] for tests.
 
 use std::sync::Arc;
 
-#[cfg(test)]
 use parking_lot::Mutex;
 
 /// A single metric event emitted by the BM25 index.
@@ -29,10 +26,7 @@ pub enum MetricValue {
     Histogram(f64),
 }
 
-/// Trait for receiving metric events.
-///
-/// Implementations must be `Send + Sync` to allow the index to hold an
-/// `Arc<dyn MetricsSink>` and emit events from `&self` methods.
+/// Pluggable sink for receiving metric events; must be `Send + Sync`.
 pub trait MetricsSink: Send + Sync {
     /// Receive a single metric event.
     fn record(&self, event: MetricEvent);
@@ -57,12 +51,11 @@ pub mod names {
 }
 
 /// In-memory sink that records all events. Used in tests.
-#[cfg(test)]
+#[doc(hidden)]
 pub struct RecordingSink {
     events: Mutex<Vec<MetricEvent>>,
 }
 
-#[cfg(test)]
 impl Default for RecordingSink {
     fn default() -> Self {
         Self {
@@ -71,7 +64,6 @@ impl Default for RecordingSink {
     }
 }
 
-#[cfg(test)]
 impl RecordingSink {
     /// Create an empty recording sink.
     pub fn new() -> Self {
@@ -94,7 +86,6 @@ impl RecordingSink {
     }
 }
 
-#[cfg(test)]
 impl MetricsSink for RecordingSink {
     fn record(&self, event: MetricEvent) {
         self.events.lock().push(event);

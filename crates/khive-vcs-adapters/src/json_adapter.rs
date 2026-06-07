@@ -1,24 +1,13 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! JSON array format adapter (ADR-036 §2 "JSON array").
-//!
-//! Accepts a JSON array of objects at the top level. Objects with both `source`
-//! and `target` keys are treated as edge records; all other objects are treated
-//! as entity records. Unknown keys on entity objects are collected into
-//! `properties`.
-//!
-//! ## Parse strategy
-//!
-//! The P0 JSON adapter uses eager `serde_json::from_str` — the full source is
-//! loaded into memory before iteration begins.  ADR-036 §7 calls for streaming
-//! parsers; that requirement is deferred to P1 for this adapter.
-//! TODO(P1): replace with `serde_json::Deserializer::from_reader` streaming
-//! parse once the CLI pipeline wires in an `impl Read` source.
+//! JSON array format adapter.
 
 use crate::adapter::FormatAdapter;
 use crate::error::AdapterError;
 use crate::record::{EdgeRecord, EntityRecord};
+use khive_types::{EdgeRelation, EntityKind};
 use serde_json::Value;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// A [`FormatAdapter`] that parses a JSON array of objects.
@@ -69,7 +58,7 @@ impl JsonFormatAdapter {
             };
 
             // Normalise keys to lowercase once for dispatch detection.
-            // Case-insensitive per ADR-036 §2: "maps keys … case-insensitively".
+            // Keys are matched case-insensitively.
             let has_source = obj.keys().any(|k| {
                 let l = k.to_ascii_lowercase();
                 l == "source" || l == "from"
@@ -132,67 +121,97 @@ fn remove_ci(
     Some((key, val))
 }
 
+/// Extract a required non-empty string field, case-insensitive.
+fn extract_required_string(
+    obj: &mut serde_json::Map<String, Value>,
+    index: usize,
+    field: &str,
+) -> Result<String, AdapterError> {
+    match remove_ci(obj, field) {
+        Some((_, Value::String(s))) if !s.is_empty() => Ok(s),
+        Some(_) => Err(AdapterError::InvalidField {
+            index,
+            field: field.into(),
+            reason: "must be a non-empty string".into(),
+        }),
+        None => Err(AdapterError::MissingField {
+            index,
+            field: field.into(),
+        }),
+    }
+}
+
+/// Extract an optional UUID field, generating a new one if absent.
+fn extract_uuid_field(
+    obj: &mut serde_json::Map<String, Value>,
+    index: usize,
+    field: &str,
+) -> Result<Uuid, AdapterError> {
+    match remove_ci(obj, field) {
+        Some((_, Value::String(s))) => s.parse::<Uuid>().map_err(|e| AdapterError::InvalidField {
+            index,
+            field: field.into(),
+            reason: e.to_string(),
+        }),
+        Some(_) => Err(AdapterError::InvalidField {
+            index,
+            field: field.into(),
+            reason: "must be a UUID string".into(),
+        }),
+        None => Ok(Uuid::new_v4()),
+    }
+}
+
+/// Extract and validate an edge weight field.
+fn extract_weight(
+    obj: &mut serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<f64, AdapterError> {
+    match remove_ci(obj, "weight") {
+        Some((_, Value::Number(n))) => {
+            let w = n.as_f64().ok_or_else(|| AdapterError::InvalidField {
+                index,
+                field: "weight".into(),
+                reason: "weight is not a finite f64".into(),
+            })?;
+            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                return Err(AdapterError::InvalidField {
+                    index,
+                    field: "weight".into(),
+                    reason: format!("must be finite and in [0.0, 1.0], got {w}"),
+                });
+            }
+            Ok(w)
+        }
+        Some(_) => Err(AdapterError::InvalidField {
+            index,
+            field: "weight".into(),
+            reason: "must be a number".into(),
+        }),
+        None => Ok(0.7),
+    }
+}
+
 fn parse_entity(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
 ) -> Result<EntityRecord, AdapterError> {
-    // Required: name (case-insensitive per ADR-036 §2)
-    let name = match remove_ci(&mut obj, "name") {
-        Some((_, Value::String(s))) if !s.is_empty() => s,
-        Some(_) => {
-            return Err(AdapterError::InvalidField {
-                index,
-                field: "name".into(),
-                reason: "must be a non-empty string".into(),
-            })
-        }
-        None => {
-            return Err(AdapterError::MissingField {
-                index,
-                field: "name".into(),
-            })
-        }
-    };
+    let name = extract_required_string(&mut obj, index, "name")?;
 
-    // Required: kind (falls back to warning + "concept" when absent; case-insensitive)
-    let kind = match remove_ci(&mut obj, "kind") {
-        Some((_, Value::String(s))) if !s.is_empty() => s,
-        Some(_) => {
-            return Err(AdapterError::InvalidField {
+    let kind = {
+        let raw = extract_required_string(&mut obj, index, "kind")?;
+        EntityKind::from_str(&raw)
+            .map_err(|_| AdapterError::UnknownKind {
                 index,
-                field: "kind".into(),
-                reason: "must be a non-empty string".into(),
-            })
-        }
-        None => {
-            warnings.push(format!(
-                "record {index}: missing 'kind'; defaulting to 'concept'"
-            ));
-            "concept".into()
-        }
-    };
-
-    // Optional: id (generate if absent; case-insensitive)
-    let id = match remove_ci(&mut obj, "id") {
-        Some((_, Value::String(s))) => {
-            s.parse::<Uuid>().map_err(|e| AdapterError::InvalidField {
-                index,
-                field: "id".into(),
-                reason: e.to_string(),
+                kind: raw.clone(),
             })?
-        }
-        Some(_) => {
-            return Err(AdapterError::InvalidField {
-                index,
-                field: "id".into(),
-                reason: "must be a UUID string".into(),
-            })
-        }
-        None => Uuid::new_v4(),
+            .name()
+            .to_owned()
     };
 
-    // Optional: description (case-insensitive)
+    let id = extract_uuid_field(&mut obj, index, "id")?;
+
     let description = match remove_ci(&mut obj, "description") {
         Some((_, Value::String(s))) => Some(s),
         Some(_) => {
@@ -204,7 +223,6 @@ fn parse_entity(
         None => None,
     };
 
-    // Optional: tags (array of strings; case-insensitive)
     let tags: Vec<String> = match remove_ci(&mut obj, "tags") {
         Some((_, Value::Array(arr))) => arr
             .into_iter()
@@ -223,8 +241,7 @@ fn parse_entity(
         None => Vec::new(),
     };
 
-    // Optional: explicit properties block merges into remaining keys (case-insensitive)
-    let mut properties = match remove_ci(&mut obj, "properties") {
+    let mut props_base = match remove_ci(&mut obj, "properties") {
         Some((_, Value::Object(m))) => m,
         Some((_, other)) => {
             warnings.push(format!(
@@ -235,10 +252,8 @@ fn parse_entity(
         }
         None => serde_json::Map::new(),
     };
-
-    // All remaining keys fold into properties (ADR-036 §2: "All other keys collect into properties")
     for (k, v) in obj {
-        properties.insert(k, v);
+        props_base.insert(k, v);
     }
 
     Ok(EntityRecord {
@@ -246,7 +261,7 @@ fn parse_entity(
         kind,
         name,
         description,
-        properties: Value::Object(properties),
+        properties: Value::Object(props_base),
         tags,
     })
 }
@@ -255,7 +270,6 @@ fn parse_edge(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
 ) -> Result<EdgeRecord, AdapterError> {
-    // Support both "source"/"target" and "from"/"to" aliases, case-insensitive
     let source = remove_ci(&mut obj, "source")
         .or_else(|| remove_ci(&mut obj, "from"))
         .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
@@ -272,21 +286,15 @@ fn parse_edge(
             field: "target".into(),
         })?;
 
-    let relation = match remove_ci(&mut obj, "relation") {
-        Some((_, Value::String(s))) if !s.is_empty() => s,
-        Some(_) => {
-            return Err(AdapterError::InvalidField {
+    let relation = {
+        let raw = extract_required_string(&mut obj, index, "relation")?;
+        EdgeRelation::from_str(&raw)
+            .map_err(|_| AdapterError::UnknownRelation {
                 index,
-                field: "relation".into(),
-                reason: "must be a non-empty string".into(),
-            })
-        }
-        None => {
-            return Err(AdapterError::MissingField {
-                index,
-                field: "relation".into(),
-            })
-        }
+                relation: raw.clone(),
+            })?
+            .as_str()
+            .to_owned()
     };
 
     let edge_id = match remove_ci(&mut obj, "edge_id").or_else(|| remove_ci(&mut obj, "id")) {
@@ -307,32 +315,12 @@ fn parse_edge(
         None => Uuid::new_v4(),
     };
 
-    let weight = match remove_ci(&mut obj, "weight") {
-        Some((_, Value::Number(n))) => n.as_f64().ok_or_else(|| AdapterError::InvalidField {
-            index,
-            field: "weight".into(),
-            reason: "weight is not a finite f64".into(),
-        })?,
-        Some(_) => {
-            return Err(AdapterError::InvalidField {
-                index,
-                field: "weight".into(),
-                reason: "must be a number".into(),
-            })
-        }
-        None => 0.7,
-    };
+    let weight = extract_weight(&mut obj, index)?;
 
-    // Extract top-level "properties" object as the base (case-insensitive).
-    // Remaining unknown edge keys are then merged in — this mirrors parse_entity's
-    // approach and prevents the double-nesting bug where a round-tripped edge with
-    // an explicit "properties" field would produce properties.properties.
     let mut properties = match remove_ci(&mut obj, "properties") {
         Some((_, Value::Object(m))) => m,
         Some(_) | None => serde_json::Map::new(),
     };
-
-    // Remaining unknown keys fold into edge properties
     for (k, v) in obj {
         properties.insert(k, v);
     }

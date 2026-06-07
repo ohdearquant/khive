@@ -6,18 +6,13 @@ use rand::Rng;
 use super::HnswIndex;
 use crate::config::MAX_LEVEL;
 use crate::distance::compute_ordering_distance;
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::node::HnswNode;
 
 impl HnswIndex {
-    /// Insert a vector into the index.
-    ///
-    /// If the ID already exists, the vector is updated.
-    /// Returns an error if dimensions don't match.
-    ///
-    /// Emits `hnsw.insert.duration_ms`, `hnsw.insert.count`, and
-    /// `hnsw.index.size` metrics when a sink is attached.
+    /// Insert a vector into the index; updates in place if the ID already exists.
+    /// Returns an error on dimension mismatch. Emits insert metrics when a sink is attached.
     pub fn insert(&mut self, id: NodeId, vector: Vec<f32>) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -53,10 +48,7 @@ impl HnswIndex {
         result
     }
 
-    /// Insert a batch of vectors. Returns IDs that failed along with their errors.
-    ///
-    /// Callers can hold the write lock once around this call rather than once
-    /// per record, keeping the lock window bounded to the batch size.
+    /// Insert a batch of vectors; returns IDs that failed with their errors.
     pub fn insert_many(
         &mut self,
         items: impl IntoIterator<Item = (NodeId, Vec<f32>)>,
@@ -78,18 +70,36 @@ impl HnswIndex {
                 actual: vector.len(),
             });
         }
+        validate_finite_vector(&vector)?;
 
-        // If updating existing node, just update the vector (bypasses budget)
+        // If updating an existing node that is tombstoned, perform delete + fresh insert
+        // so that the new vector is properly reconnected in the graph. A simple
+        // vector-only update on a tombstoned node leaves it unreachable (the
+        // tombstone prevents graph traversal to it and the in-edges were not
+        // added back).
         if let Some(&iid) = self.id_to_internal.get(&id) {
-            self.nodes[iid].update_vector(vector.clone());
-            // Update quantized arena to stay in sync
-            self.quantized.update(iid, &vector, self.nodes[iid].norm);
-            // Remove from tombstones if it was marked
-            if iid < self.tombstones.len() && self.tombstones[iid] {
+            let is_tombstoned = iid < self.tombstones.len() && self.tombstones[iid];
+            if is_tombstoned {
+                // Undo the tombstone so `delete` does not double-count it,
+                // and so the fresh insert below sees the ID as gone.
                 self.tombstones[iid] = false;
                 self.tombstone_count -= 1;
+                // Remove from the ID maps so insert_inner treats this as a new node.
+                // The internal slot (iid) becomes a permanent hole (like any deleted node).
+                self.id_to_internal.remove(&id);
+                // internal_to_id still holds the old external ID at position iid;
+                // leave it in place — the slot is effectively dead (tombstoned above).
+                // Fall through to the fresh-insert path below.
+            } else {
+                // Live node update: just swap the vector. Graph edges remain valid
+                // because neighbors were chosen by proximity; after an in-place
+                // vector update the edges may be slightly stale but the node
+                // stays reachable and participates in search.
+                self.nodes[iid].update_vector(vector.clone());
+                // Update quantized arena to stay in sync
+                self.quantized.update(iid, &vector, self.nodes[iid].norm);
+                return Ok(());
             }
-            return Ok(());
         }
 
         // Budget check before allocating a new node
@@ -198,15 +208,8 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Generate random level for new node (exponential distribution).
-    ///
-    /// Uses seeded RNG if `config.seed` was set for reproducible builds.
-    ///
-    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_prob_sums_to_one`
-    /// Level probabilities form a valid distribution: sum_{l=0}^{inf} P(level=l) = 1
-    ///
-    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_survival_decreasing`
-    /// Survival probability decreases exponentially: P(level >= l) = (1/M)^l
+    /// Generate random level for a new node using exponential distribution.
+    /// Uses seeded RNG when `config.seed` is set for reproducible builds.
     pub(super) fn random_level(&mut self) -> usize {
         let r: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
         let level = (-r.ln() * self.config.ml).floor() as usize;
@@ -278,6 +281,8 @@ impl HnswIndex {
     /// Sort a node's neighbor list by distance to the node.
     ///
     /// Available for batch operations like post-rebuild optimization.
+    // REASON: Kept for future batch post-rebuild neighbor sorting; not yet
+    // wired into the rebuild path but part of the planned graph optimization pass.
     #[allow(dead_code)]
     pub(super) fn sort_neighbors(&mut self, id: usize, layer: usize) {
         use crate::distance::OrderedF32;

@@ -20,6 +20,7 @@ use khive_types::SubstrateKind;
 
 const MAX_EMBED_BYTES: usize = 32_768;
 
+/// Arguments for `kkernel reindex` — rebuilds embedding vectors for all entities and notes.
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
     /// Database path (defaults to `~/.khive/khive-graph.db`).
@@ -75,6 +76,7 @@ async fn filter_unembedded(
     }
 }
 
+/// Re-embed all entities and notes using the configured or specified embedding model.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut cfg = RuntimeConfig::default();
     if let Some(ref db) = args.db {

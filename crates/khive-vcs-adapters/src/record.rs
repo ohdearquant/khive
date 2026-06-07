@@ -1,11 +1,11 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! ADR-020 §2 record shapes for adapter output.
+//! Wire record shapes produced by format adapters for the KG import pipeline.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Entity record shape (ADR-020 §2) produced by adapters.
+/// Entity record shape produced by format adapters.
 ///
 /// Adapters produce these; the standard `khive kg import` pipeline validates
 /// and loads them into `working.db`.
@@ -22,7 +22,7 @@ pub struct EntityRecord {
     pub tags: Vec<String>,
 }
 
-/// Edge record shape (ADR-020 §2) produced by adapters.
+/// Edge record shape produced by format adapters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeRecord {
     pub edge_id: Uuid,

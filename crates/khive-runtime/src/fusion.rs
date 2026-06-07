@@ -25,12 +25,15 @@ pub fn fuse_with_strategy(
     vector_hits: Vec<VectorSearchHit>,
     strategy: &FusionStrategy,
     limit: usize,
-) -> Vec<SearchHit> {
+) -> RuntimeResult<Vec<SearchHit>> {
     match strategy {
         FusionStrategy::VectorOnly => fuse_sources(Vec::new(), vector_hits, strategy, limit),
         FusionStrategy::KeywordOnly => fuse_sources(text_hits, Vec::new(), strategy, limit),
         FusionStrategy::Rrf { .. } | FusionStrategy::Weighted { .. } | FusionStrategy::Union => {
             fuse_sources(text_hits, vector_hits, strategy, limit)
+        }
+        FusionStrategy::Custom { ref name, .. } => {
+            Err(khive_fusion::FuseError::CustomRequiresRuntime(name.clone()).into())
         }
     }
 }
@@ -41,7 +44,7 @@ pub(crate) fn rrf_fuse_k(
     vector_hits: Vec<VectorSearchHit>,
     k: usize,
     limit: usize,
-) -> Vec<SearchHit> {
+) -> RuntimeResult<Vec<SearchHit>> {
     fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
 }
 
@@ -50,7 +53,7 @@ fn fuse_sources(
     vector_hits: Vec<VectorSearchHit>,
     strategy: &FusionStrategy,
     limit: usize,
-) -> Vec<SearchHit> {
+) -> RuntimeResult<Vec<SearchHit>> {
     let mut metadata: HashMap<Uuid, SearchHit> =
         HashMap::with_capacity(text_hits.len() + vector_hits.len());
 
@@ -88,14 +91,19 @@ fn fuse_sources(
         })
         .collect();
 
-    khive_fusion::fuse(vec![text_source, vector_source], strategy, limit)
+    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![text_source, vector_source]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    Ok(khive_fusion::fuse(sources, strategy, limit)?
         .into_iter()
         .filter_map(|(id, score)| {
             let mut hit = metadata.remove(&id)?;
             hit.score = score;
             Some(hit)
         })
-        .collect()
+        .collect())
 }
 
 fn merge_metadata(metadata: &mut HashMap<Uuid, SearchHit>, hit: SearchHit) {
@@ -167,7 +175,7 @@ impl KhiveRuntime {
             Vec::new()
         };
 
-        let mut fused = fuse_with_strategy(text_hits, vector_hits, &strategy, limit as usize);
+        let mut fused = fuse_with_strategy(text_hits, vector_hits, &strategy, limit as usize)?;
 
         // Filter out soft-deleted entities. A single query fetches all alive IDs from the
         // fused set; any ID absent from the result has been soft-deleted (deleted_at IS NOT NULL).
@@ -231,8 +239,10 @@ mod tests {
         // k=60: same math, but: 1/61 + 1/62 ≈ 0.0326 each — same tie
         // Instead verify k=1 produces larger absolute score differences for rank differences
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
-        let hits_k1 = fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10);
-        let hits_k60 = fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10);
+        let hits_k1 =
+            fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10).unwrap();
+        let hits_k60 =
+            fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10).unwrap();
         // Both should have a first (rank 1 always wins in single-source)
         assert_eq!(hits_k1[0].entity_id, a);
         assert_eq!(hits_k60[0].entity_id, a);
@@ -256,7 +266,8 @@ mod tests {
                 weights: vec![0.7, 0.3],
             },
             10,
-        );
+        )
+        .unwrap();
         let heavy_vec = fuse_with_strategy(
             text,
             vec_hits,
@@ -264,7 +275,8 @@ mod tests {
                 weights: vec![0.3, 0.7],
             },
             10,
-        );
+        )
+        .unwrap();
 
         assert_eq!(heavy_text[0].entity_id, a);
         assert_eq!(heavy_vec[0].entity_id, b);
@@ -285,7 +297,8 @@ mod tests {
                 weights: vec![0.7, 0.3],
             },
             10,
-        );
+        )
+        .unwrap();
         let w2 = fuse_with_strategy(
             text,
             vec_hits,
@@ -293,7 +306,8 @@ mod tests {
                 weights: vec![7.0, 3.0],
             },
             10,
-        );
+        )
+        .unwrap();
 
         assert_eq!(w1[0].entity_id, w2[0].entity_id);
         assert_eq!(w1[1].entity_id, w2[1].entity_id);
@@ -317,7 +331,8 @@ mod tests {
                 weights: vec![0.0, 0.0],
             },
             10,
-        );
+        )
+        .unwrap();
         assert_eq!(hits[0].entity_id, a);
     }
 
@@ -334,7 +349,8 @@ mod tests {
                 weights: vec![1.0, -0.5],
             },
             10,
-        );
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
     }
@@ -346,7 +362,7 @@ mod tests {
         let text = vec![text_hit(a, 0.3, "a")];
         let vec_hits = vec![vector_hit(a, 0.9)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10);
+        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score.to_f64() - 0.9).abs() < 1e-6);
         assert_eq!(hits[0].source, SearchSource::Both);
@@ -360,7 +376,7 @@ mod tests {
         let text = vec![text_hit(b, 0.9, "b")];
         let vec_hits = vec![vector_hit(a, 0.8)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10);
+        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
         assert_eq!(hits[0].source, SearchSource::Vector);

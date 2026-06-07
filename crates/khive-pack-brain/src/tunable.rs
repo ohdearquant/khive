@@ -1,3 +1,5 @@
+//! Optional auto-tuning extension trait for packs that expose parameter spaces.
+
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::RuntimeError;
 use serde::{Deserialize, Serialize};
@@ -10,9 +12,17 @@ use crate::state::{BalancedRecallState, BetaPosterior};
 /// The brain discovers tunable packs at startup via the PackRegistry.
 /// `project_config` now receives a `BalancedRecallState` — the v1 profile
 /// state — rather than the old flat `BrainState` scalar map.
+/// Extension trait for packs that expose a parameter space to brain auto-tuning.
 pub trait PackTunable: PackRuntime {
+    /// Describe the parameter space this pack exposes to brain.
     fn parameter_space(&self) -> ParameterSpace;
+    /// Project a live `BalancedRecallState` into a config `Value` for this pack.
     fn project_config(&self, state: &BalancedRecallState) -> Value;
+    /// Apply a projected config to the pack's runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError::InvalidInput` when the config is malformed.
     fn apply_config(&self, config: Value) -> Result<(), RuntimeError>;
 }
 

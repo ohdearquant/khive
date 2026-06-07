@@ -1,0 +1,165 @@
+# khive-query Design
+
+Backend-agnostic GQL/SPARQL parsing and SQL compilation crate. Parses query text
+into a shared `GqlQuery` AST, validates edge relations against the closed
+`EdgeRelation` taxonomy, and compiles the AST to parameterized SQL for execution
+by the runtime. The crate depends only on `khive-types` (for `EdgeRelation`); it
+has no dependency on storage, DB, or runtime crates.
+
+## ADR Links
+
+- [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
+- [ADR-002: Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
+- [ADR-008: Query Layer Separation](../../../docs/adr/ADR-008-query-layer-separation.md)
+- [ADR-041: Event Provenance Projection](../../../docs/adr/ADR-041-event-provenance-projection.md)
+
+## Modules
+
+- [`src/ast.rs`](../src/ast.rs) -- GQL abstract syntax tree types
+- [`src/parsers/gql.rs`](../src/parsers/gql.rs) -- hand-written recursive descent
+  GQL parser
+- [`src/parsers/sparql.rs`](../src/parsers/sparql.rs) -- SPARQL-inspired syntax
+  parser
+- [`src/validate.rs`](../src/validate.rs) -- AST validation and relation
+  normalization
+- [`src/compilers/sql.rs`](../src/compilers/sql.rs) -- SQL compiler (fixed-length
+  JOIN chain + variable-length recursive CTE)
+- [`src/error.rs`](../src/error.rs) -- query-layer error types
+
+## Tests
+
+- Inline unit tests in `compilers/sql.rs`, `parsers/gql.rs`, `parsers/sparql.rs`
+  (access private helpers and internal types)
+- Extracted tests in `src/validate_tests.rs` (via `#[path]` attribute from
+  `validate.rs`)
+
+## Benchmarks
+
+- [`benches/parse_bench.rs`](../benches/parse_bench.rs) -- Criterion parse-latency
+  benchmarks
+- See [benchmarks.md](benchmarks.md) for the ledger
+
+## ADR Compliance
+
+### ADR-008: Query Layer Separation
+
+This crate implements the query parsing and compilation pipeline described in
+ADR-008. It is intentionally split into three stages:
+
+1. **Parse** (`parsers/gql.rs`, `parsers/sparql.rs`) -- hand-written recursive
+   descent parsers that convert GQL or SPARQL text into a shared `GqlQuery` AST.
+2. **Validate** (`validate.rs`) -- normalizes edge relation strings to canonical
+   snake_case, rejects `namespace` in query text (scoping is
+   `CompileOptions::scopes` only), and enforces the 10-hop traversal depth cap.
+3. **Compile** (`compilers/sql.rs`) -- lowers the validated AST to parameterized
+   SQL for execution by the runtime.
+
+**Key design decisions:**
+
+- `QueryValue` deliberately mirrors only the subset of
+  `khive_storage::types::SqlValue` that the query compiler needs to emit. The
+  runtime converts these to storage-layer `SqlValue` at the query-storage
+  boundary. This keeps the query crate dependent only on `khive-types`, not on
+  `khive-storage` or `khive-db`.
+- `WhereExpr` supports AND, OR, and leaf conditions. The tree is compiled
+  preserving SQL OR/AND connectives rather than flattening to AND-only.
+- GQL WHERE grammar: `where_expr = and_expr ('OR' and_expr)*` where
+  `and_expr = condition ('AND' condition)*`. AND binds tighter than OR.
+- Node kind strings are pack-agnostic and pass through the query layer unchanged.
+  Kind validation is a pack-handler concern, not a query-layer concern.
+- `namespace` is always injected via `CompileOptions.scopes`, never from query
+  text. Any attempt to set `namespace` in a query node property or WHERE condition
+  is rejected at validation time.
+
+### ADR-041: Synthetic Observation Edge Paths
+
+Relations prefixed `observed_as_*` (specifically: `observed_as_candidate`,
+`observed_as_selected`, `observed_as_target`, `observed_as_signal`) are synthetic
+edges that join against `event_observations`, not `graph_edges`.
+
+**Key design decisions:**
+
+- Only the four known `observed_as_*` strings are valid. Unknown
+  `observed_as_bogus` strings are rejected at validation with the closed list of
+  valid values.
+- Synthetic edges are always outbound (event -> entity/note). Inbound or
+  undirected synthetic edges are rejected at compile time.
+- Synthetic edges cannot be variable-length. The recursive CTE targets
+  `graph_edges` only.
+- Mixed synthetic + canonical relations in a single edge pattern are rejected.
+- Event source nodes bind to the `events` table; observation target nodes bind to
+  the `notes` table (discriminated by `referent_kind = 'note'`).
+- Event nodes do not have `entity_type` or arbitrary `properties` -- these are
+  rejected at compile time with an actionable error.
+
+## Invariants and Failure Modes
+
+### Invariants
+
+- **Namespace injection**: `namespace` always comes from `CompileOptions.scopes`,
+  never from query text. Bound as a parameter, never as a SQL literal.
+- **Edge property whitelist**: only `relation` and `weight` are queryable edge
+  columns. Any other property name is rejected.
+- **Depth cap**: traversal depth is capped at `MAX_DEPTH` (10 hops). Exceeding it
+  is an `InvalidInput` error, not a silent clamp.
+- **Pattern shape**: patterns must alternate Node/Edge/Node. Malformed ASTs are
+  rejected at validation time.
+- **Closed relation taxonomy**: edge relations are validated against
+  `EdgeRelation`. Unknown relations are rejected.
+- **Synthetic relation closure**: only the four known `observed_as_*` relations
+  are valid.
+
+### Failure Modes
+
+- `QueryError::Parse` -- malformed input syntax
+- `QueryError::Validation` -- namespace in query text, unknown relation, inverted
+  hop range, malformed pattern shape
+- `QueryError::InvalidInput` -- depth exceeds cap, limit overflows `i64`,
+  non-finite float parameter
+- `QueryError::Unsupported` -- zero-hop range, repeated node variable, mixed
+  fixed+variable chains, SPARQL `*` paths, OR spanning both endpoints
+- `QueryError::Compile` -- empty pattern, unknown variable in RETURN/WHERE, mixed
+  synthetic+canonical relations
+
+## Compilation Paths
+
+### Fixed-length (all edges `*1..1`)
+
+Compiles to a JOIN chain:
+
+```text
+MATCH (a:concept)-[e:introduced_by]->(b:paper)
+->
+SELECT ... FROM entities a
+JOIN graph_edges e ON e.source_id = a.id
+JOIN entities b ON b.id = e.target_id
+WHERE ... LIMIT ?
+```
+
+### Variable-length (any edge `*N..M` where M > 1)
+
+Compiles to a recursive CTE. Only a single `start_node -[*N..M]-> end_node`
+pattern is supported; mixed fixed+variable chains are rejected.
+
+```text
+WITH RECURSIVE traverse(...) AS (
+    SELECT ... FROM entities s JOIN graph_edges e ... WHERE ...
+    UNION ALL
+    SELECT ... FROM traverse t JOIN graph_edges e ...
+      JOIN entities next_node ...
+    WHERE t.depth < ?max_depth AND ... NOT LIKE ...
+)
+SELECT DISTINCT ... FROM traverse t JOIN entities r ... WHERE ... LIMIT ?
+```
+
+## Consistency Notes
+
+- `SPARQL '*'` (zero-or-more hops) is not supported. The recursive CTE seed
+  starts at depth 1 and cannot emit a depth-0 row.
+- Repeated node variables are rejected at validation. Supporting them requires
+  alias-equality predicates not yet implemented.
+- `validate_pattern_shape` is called both from `validate_with_warnings` and from
+  `compile` to catch hand-constructed malformed ASTs.
+- The `parse_auto` fallback for unrecognized prefixes uses the GQL parser.
+
+Last reviewed: 2026-06-06

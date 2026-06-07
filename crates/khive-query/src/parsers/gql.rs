@@ -1,18 +1,4 @@
 //! Hand-written recursive descent parser for GQL subset.
-//!
-//! Grammar:
-//!   query     = 'MATCH' pattern ['WHERE' where_expr] 'RETURN' items ['LIMIT' number]
-//!   pattern   = node_pat (edge_pat node_pat)*
-//!   node_pat  = '(' [var] [':' ident] [props] ')'
-//!   edge_pat  = '-[' [var] [':' rels] [range] ']->' | '<-[' ... ']-' | '-[' ... ']-'
-//!   rels      = ident ('|' ident)*
-//!   range     = '*' number ['..' number]
-//!   props     = '{' key ':' value (',' key ':' value)* '}'
-//!   where_expr = and_expr ('OR' and_expr)*
-//!   and_expr   = condition ('AND' condition)*
-//!   condition  = var '.' prop op value
-//!   items     = item (',' item)*
-//!   item      = var | var '.' prop
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -196,7 +182,9 @@ impl Parser {
             let key = self.parse_ident()?;
             self.expect_char(':')?;
             let val = self.parse_string_literal()?;
-            props.insert(key, val);
+            if props.insert(key.clone(), val).is_some() {
+                return Err(self.err(format!("duplicate property '{key}'")));
+            }
         }
         Ok(props)
     }
@@ -321,25 +309,23 @@ impl Parser {
 
         self.expect_char(']')?;
 
-        // Direction suffix
-        let direction = if self.peek() == Some('-') {
+        // Direction suffix: a `-` is required after `]` to close the edge pattern.
+        // Without it, patterns like `(a)-[e:extends](b)` would be silently accepted
+        // with an arbitrary direction — reject instead.
+        self.expect_char('-')?;
+        let direction = if self.peek() == Some('>') {
             self.advance();
-            if self.peek() == Some('>') {
-                self.advance();
-                if direction_start == EdgeDirection::In {
-                    EdgeDirection::Both
-                } else {
-                    EdgeDirection::Out
-                }
+            if direction_start == EdgeDirection::In {
+                EdgeDirection::Both
             } else {
-                if direction_start == EdgeDirection::In {
-                    EdgeDirection::In
-                } else {
-                    EdgeDirection::Both
-                }
+                EdgeDirection::Out
             }
         } else {
-            direction_start
+            if direction_start == EdgeDirection::In {
+                EdgeDirection::In
+            } else {
+                EdgeDirection::Both
+            }
         };
 
         Ok(EdgePattern {
@@ -440,7 +426,7 @@ impl Parser {
         Ok(acc)
     }
 
-    /// Parse a WHERE expression: and_expr ('OR' and_expr)* (ADR-008 §"GQL WHERE expression").
+    /// Parse a WHERE expression: and_expr ('OR' and_expr)*. AND binds tighter than OR.
     fn parse_where_expr(&mut self) -> Result<WhereExpr, QueryError> {
         let first = self.parse_and_expr()?;
         let mut acc = first;
@@ -517,6 +503,7 @@ impl Parser {
     }
 }
 
+/// Parse a GQL query string into a [`GqlQuery`] AST. Errors on invalid syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = Parser::new(input.trim());
     parser.parse_query()

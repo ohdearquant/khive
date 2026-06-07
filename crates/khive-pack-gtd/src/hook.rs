@@ -1,17 +1,9 @@
-//! `TaskHook` — gtd's per-kind specialization for the `task` note kind (ADR-030).
+//! `TaskHook` — gtd's per-kind specialization for the `task` note kind.
 //!
-//! Registered via `GtdPack::kind_hook("task")`, this hook layers GTD semantics
-//! over kg's shared `create` path:
-//!
-//! - `prepare_create` normalizes user-facing fields (`title`, `priority`,
-//!   `status`, `depends_on`, …) into the kg-shape (`name`, `content`,
-//!   `properties`, `salience`) that the shared CRUD writes to storage.
-//! - `after_create` creates `depends_on` graph edges from the new task to each
-//!   resolved dependency (best-effort — failures are logged, not propagated).
-//!
-//! The gtd `assign` verb (handlers.rs) remains as a flavored convenience —
-//! both paths now produce equivalent task notes; `create(kind="note",
-//! note_kind="task", ...)` is the canonical CRUD route.
+//! Implements the `KindHook` extension point for the pack standard. Normalises
+//! user-facing GTD fields into the kg storage shape on `prepare_create`, and
+//! creates `depends_on` graph edges on `after_create` (best-effort). GTD
+//! lifecycle semantics are documented in `docs/design.md`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -26,6 +18,7 @@ use crate::schema::{
 };
 
 #[derive(Debug, Default)]
+/// KindHook implementation for the `task` note kind; normalises GTD fields on create.
 pub struct TaskHook;
 
 #[async_trait]
@@ -90,7 +83,7 @@ impl KindHook for TaskHook {
         // pre-validate each target is a task note before the storage write so
         // the kg-create path matches GTD `assign` and never leaves a task
         // persisted with a `properties.depends_on` pointing at a non-task
-        // (the GTD ADR-031 edge rule only legalises task→task `depends_on`).
+        // (the GTD pack edge rule only legalises task→task `depends_on`).
         let mut resolved_deps: Vec<String> = Vec::new();
         if let Some(arr) = args.get("depends_on").and_then(Value::as_array) {
             for entry in arr {
@@ -103,14 +96,14 @@ impl KindHook for TaskHook {
                     Some(Resolved::Note(n)) => {
                         return Err(RuntimeError::InvalidInput(format!(
                             "depends_on target {uuid} must be a task note for relation depends_on \
-                             (got note kind {:?}); the GTD pack's ADR-031 edge rule is task→task only",
+                             (got note kind {:?}); the GTD pack edge rule is task→task only",
                             n.kind
                         )));
                     }
                     Some(_) => {
                         return Err(RuntimeError::InvalidInput(format!(
                             "depends_on target {uuid} must be a task note for relation depends_on \
-                             (got non-note substrate); the GTD pack's ADR-031 edge rule is task→task only"
+                             (got non-note substrate); the GTD pack edge rule is task→task only"
                         )));
                     }
                     None => {

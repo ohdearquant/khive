@@ -1,9 +1,4 @@
 //! 256-bit content hash for checkpoint integrity verification.
-//!
-//! # Formal proof reference
-//!
-//! `proofs/Retrieval/HNSW.lean` — hash identity used in checkpoint
-//! compatibility checks (khive.Retrieval.HNSW.checkpoint_correctness).
 
 use core::fmt;
 

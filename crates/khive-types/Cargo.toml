@@ -21,7 +21,7 @@ blake3 = ["dep:blake3"]
 [dependencies]
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-blake3 = { version = "1", optional = true, default-features = false }
+blake3 = { workspace = true, optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }

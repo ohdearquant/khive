@@ -1,44 +1,7 @@
 //! Error types for retrieval operations.
 //!
-//! Uses khive-db error patterns and integrates with EmbeddingError.
-//!
-//! # Error Classification (RETRIEVAL-06)
-//!
-//! Errors are classified into two categories for retry behavior:
-//!
-//! ## Transient Errors (retryable)
-//!
-//! These errors may succeed on retry and include:
-//! - **Network errors**: Connection timeouts, temporary unavailability
-//! - **Resource contention**: Lock conflicts, rate limiting
-//! - **External service errors**: Embedding/link store temporary failures
-//!
-//! Recommended retry strategy: exponential backoff with jitter, max 3 retries.
-//!
-//! ## Permanent Errors (non-retryable)
-//!
-//! These errors indicate logic/data issues that won't be fixed by retry:
-//! - **Validation errors**: Invalid query, dimension mismatch
-//! - **Configuration errors**: Bad parameters, missing required fields
-//! - **Data integrity errors**: Corrupt index, rebuild required
-//!
-//! These should be surfaced to the user immediately.
-//!
-//! # Usage
-//!
-//! ```rust
-//! use khive_retrieval::error::RetrievalError;
-//!
-//! fn handle_error(err: RetrievalError) {
-//!     if err.is_transient() {
-//!         // Retry with backoff
-//!         println!("Retrying: {}", err);
-//!     } else {
-//!         // Surface to user immediately
-//!         eprintln!("Permanent error: {}", err);
-//!     }
-//! }
-//! ```
+//! Errors are classified as transient (retryable: network, external services) or
+//! permanent (non-retryable: validation, config, data integrity). See RETRIEVAL-06.
 
 use thiserror::Error;
 
@@ -200,30 +163,7 @@ impl RetrievalError {
         }
     }
 
-    /// Check if this error is transient (may succeed on retry).
-    ///
-    /// Transient errors include:
-    /// - External service failures (embedding store, link store)
-    /// - Network-related issues
-    /// - Resource contention
-    ///
-    /// # Retry Strategy
-    ///
-    /// For transient errors, use exponential backoff with jitter:
-    /// - Initial delay: 100ms
-    /// - Max delay: 5s
-    /// - Max retries: 3
-    /// - Jitter: +/- 20%
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use khive_retrieval::error::RetrievalError;
-    ///
-    /// fn should_retry(err: &RetrievalError) -> bool {
-    ///     err.is_transient()
-    /// }
-    /// ```
+    /// Check if this error is transient (external/network/contention — may succeed on retry).
     #[inline]
     pub fn is_transient(&self) -> bool {
         self.kind() == ErrorKind::Transient

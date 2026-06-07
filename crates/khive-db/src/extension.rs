@@ -1,3 +1,8 @@
+//! SQLite extension registration for sqlite-vec.
+//!
+//! Provides `ensure_extensions_loaded` which registers `sqlite-vec` as an
+//! auto-extension so every new connection has `vec0` and `vec_*` available.
+
 /// Register sqlite-vec as a SQLite auto-extension so that every new connection
 /// automatically has the `vec0` virtual table and `vec_*` scalar functions
 /// available.
@@ -34,6 +39,7 @@ pub fn ensure_extensions_loaded() {
     });
 }
 
+/// No-op stub when the `vectors` feature is disabled.
 #[cfg(not(feature = "vectors"))]
 pub fn ensure_extensions_loaded() {
     // No-op: the `vectors` feature is not enabled.

@@ -22,6 +22,36 @@ compose/suggest, hooks, lint, export, and observability phases.
 | Resource entity dual-write                                    | deferred | `knowledge.upsert_atoms` and `knowledge.upsert_domains` write corpus tables; domain mirror is into `knowledge_atoms` for FTS, not graph `entities`.                                                                     |
 | `knowledge.lint`, `knowledge.lint_config`, `knowledge.export` | deferred | These verbs are not registered in the shipped knowledge pack.                                                                                                                                                           |
 
+## Governance for Shipped Knowledge Sections and Profiles
+
+ADR-048 treats knowledge sections as shipped corpus storage and lifecycle state, while
+profile persistence remains owned by the brain pack. The knowledge pack does not ship a
+`knowledge_profiles` table or knowledge-local profile verbs. Shipped profile persistence
+is the V20 brain profile snapshot/event-log model, and section posterior learning is
+driven through brain profile state and feedback events.
+
+`knowledge_sections` is the authoritative table for atom sections. Section edits are
+keyed by `(atom_id, section_type)`: `knowledge.edit` upserts only the specified sections,
+preserves sibling sections, clears stale section embeddings, and downgrades edited verified
+sections to reviewed. `knowledge.import` supports `atlas_md` file/directory import and,
+with the default section chunk strategy, parses section headings into section rows.
+
+Section lifecycle governance is explicit. `knowledge.challenge` marks an eligible section
+as disputed and increments the atom dispute counter. `knowledge.adjudicate` requires a
+disputed section; accept marks the section verified, reject returns it to reviewed, and the
+atom dispute counter is decremented.
+
+`knowledge.suggest` is a base domain-discovery verb. It accepts query/role/limit, searches
+domains, may fuse ANN results when the index is warm, reranks with embeddings, and returns
+domain IDs, names, and scores. It does not implicitly resolve a brain profile or apply
+profile-weighted section scoring in the shipped implementation.
+
+`knowledge.compose` is a base explicit-composition verb. It requires explicit domain IDs
+and/or atom IDs plus query context, resolves those records, reranks atom text, and returns
+markdown with atom/domain metadata. It does not emit implicit feedback, does not call
+`brain.resolve`, and does not perform section-manifest weighting in the shipped
+implementation.
+
 ## Context
 
 Knowledge atoms in the corpus tier ([ADR-047](ADR-047-knowledge-pack.md)) store content as
@@ -84,13 +114,15 @@ CREATE TABLE IF NOT EXISTS knowledge_sections (
     embedding    BLOB,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'draft',
     FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id),
     UNIQUE(atom_id, section_type)
 );
 ```
 
-V21 also creates indexes on `atom_id`, `(namespace, section_type)`, and `(namespace, atom_id)`,
+V21 creates indexes on `atom_id`, `(namespace, section_type)`, and `(namespace, atom_id)`,
 plus an external-content FTS5 table `fts_sections` with insert/delete/update triggers.
+V22 adds the `status` column and `idx_knowledge_sections_status`.
 
 Section_type is a closed enum matching the atlas schema v1: `overview`, `core_model`,
 `boundary_conditions`, `formalism`, `operational_guidance`, `examples`, `failure_modes`,
@@ -1045,6 +1077,41 @@ Every phase ships with benchmarks that gate merge:
 
 ---
 
+## Shipped Schema Reference
+
+### `knowledge_sections` (V21 + V22)
+
+V21 creates `knowledge_sections`; V22 adds the `status` lifecycle column. The shipped
+columns, constraints, and indexes are:
+
+- `id TEXT PRIMARY KEY`
+- `atom_id TEXT NOT NULL`
+- `namespace TEXT NOT NULL`
+- `section_type TEXT NOT NULL`
+- `heading TEXT NOT NULL DEFAULT ''`
+- `content TEXT NOT NULL DEFAULT ''`
+- `tokens INTEGER NOT NULL DEFAULT 0`
+- `sort_order INTEGER NOT NULL DEFAULT 0`
+- `embedding BLOB` (nullable)
+- `created_at INTEGER NOT NULL`
+- `updated_at INTEGER NOT NULL`
+- `status TEXT NOT NULL DEFAULT 'draft'` (added by V22)
+- `FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id)`
+- `UNIQUE(atom_id, section_type)`
+
+Indexes: `idx_knowledge_sections_atom`, `idx_knowledge_sections_ns_type`,
+`idx_knowledge_sections_ns_atom`, `idx_knowledge_sections_status`.
+
+Full-text search: `fts_sections`, an external-content FTS5 table over `heading` and
+`content`, with `id`, `namespace`, `atom_id`, and `section_type` as unindexed metadata.
+FTS insert, delete, and update triggers maintain the FTS table on section changes.
+
+### Profile Persistence (brain-owned, not knowledge-local)
+
+ADR-048 does not ship a `knowledge_profiles` table. Profile persistence is brain-owned;
+the authoritative shipped tables are `brain_profile_snapshots` and `brain_event_log`
+(see V20 DDL note in the Amendment section below and ADR-032).
+
 ## Amendment: Research-Informed Design Corrections (2026-05-27)
 
 **Authors**: Ocean, lambda:khive
@@ -1121,9 +1188,26 @@ order produces different posteriors. This breaks event-sourced snapshot recovery
 
 ```markdown
 V20 brain persistence DDL in this ADR is superseded by ADR-032 and ADR-015 V20. The
-authoritative shipped tables are `brain_profile_snapshots(profile_id, namespace,
-snapshot_json, updated_at)` and `brain_event_log(id, profile_id, namespace, event_kind,
-payload, created_at)`, plus `idx_brain_events_profile`.
+authoritative shipped tables are defined in the brain pack. There is no shipped
+`knowledge_profiles` table; profile persistence is brain-owned.
+
+`brain_profile_snapshots`:
+
+- `profile_id TEXT NOT NULL`
+- `namespace TEXT NOT NULL DEFAULT 'default'`
+- `snapshot_json TEXT NOT NULL`
+- `updated_at INTEGER NOT NULL`
+- `PRIMARY KEY (profile_id, namespace)`
+
+`brain_event_log`:
+
+- `id INTEGER PRIMARY KEY AUTOINCREMENT`
+- `profile_id TEXT NOT NULL`
+- `namespace TEXT NOT NULL DEFAULT 'default'`
+- `event_kind TEXT NOT NULL`
+- `payload TEXT NOT NULL`
+- `created_at INTEGER NOT NULL`
+- `idx_brain_events_profile` on `(profile_id, namespace, created_at)`
 ```
 
 ### Correction 3: Filtered ANN — StitchedVamana, not ACORN

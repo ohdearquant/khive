@@ -1,39 +1,16 @@
 //! EntityTypeRegistry — validates and normalises `(EntityKind, entity_type)` pairs.
-//!
-//! `entity_type` is a first-class column on the `entities` table but was
-//! previously stored as a free-text string with no validation.  This module
-//! introduces a static registry that:
-//!
-//! 1. Declares the canonical subtypes for every `EntityKind`.
-//! 2. Resolves aliases to canonical names (e.g. `"algo"` → `"algorithm"`).
-//! 3. Infers the `EntityKind` from a bare subtype string (e.g. `"paper"` →
-//!    `(Document, "paper")`), which allows `kind="paper"` at the wire level
-//!    without an explicit `entity_kind`.
-//! 4. Rejects `entity_type` values that don't belong to the supplied kind.
-//! 5. Is extensible: external packs (e.g. `brain`) can call
-//!    [`EntityTypeRegistry::register`] to append their own subtypes.
-//!
-//! # Design notes
-//!
-//! - The registry is kept in `khive-pack-kg`, not `khive-types`, because
-//!   domain-specific subtype names are pack-owned vocabulary.
-//! - A `once_cell::sync::Lazy` global holds the default registry with all
-//!   built-in subtypes pre-populated.  Packs that extend it create a clone,
-//!   add entries, and store the result.  The typical path is to call
-//!   [`EntityTypeRegistry::global`] which returns the built-in registry; the
-//!   handful of packs that extend it can call
-//!   [`EntityTypeRegistry::with_extra`] to derive an extended copy.
 
 use std::collections::HashMap;
 
 use khive_types::EntityKind;
 
-use crate::RuntimeError;
+use khive_runtime::RuntimeError;
 
 /// One entry in the registry: a canonical subtype name for a specific kind,
 /// together with any accepted aliases.
 #[derive(Clone, Debug)]
 pub struct EntityTypeDef {
+    /// The entity kind this subtype belongs to.
     pub kind: EntityKind,
     /// Canonical name that is written to the DB.
     pub type_name: &'static str,
@@ -44,7 +21,6 @@ pub struct EntityTypeDef {
 
 /// Static table of built-in subtypes (non-exhaustive; packs may extend).
 ///
-/// Ordered by kind so it is easy to scan visually.
 static BUILTIN_DEFS: &[EntityTypeDef] = &[
     // ── Document ────────────────────────────────────────────────────────────
     EntityTypeDef {
@@ -100,7 +76,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Concept,
-        // ADR-001: "model" is the alias; canonical name is "model_family"
+        // "model" is the alias; canonical name is "model_family"
         // to distinguish from a Dataset or Artifact trained model instance.
         type_name: "model_family",
         aliases: &["model"],
@@ -136,7 +112,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &["loss"],
     },
     // ── Dataset ──────────────────────────────────────────────────────────────
-    // ADR-001: benchmark belongs to Dataset, not Concept.
+    // benchmark belongs to Dataset, not Concept (it evaluates models, it is not itself a concept).
     EntityTypeDef {
         kind: EntityKind::Dataset,
         type_name: "benchmark",
@@ -168,8 +144,8 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &["synthetic"],
     },
     // ── Project ─────────────────────────────────────────────────────────────
-    // ADR-001 Project subtypes: library, framework, tool, application, repository.
-    // "service" and "svc" are removed — EntityKind::Service handles running
+    // Project subtypes: library, framework, tool, application, repository.
+    // "service" and "svc" are omitted — EntityKind::Service handles running
     // instances; a service codebase repo is Project + application or tool.
     EntityTypeDef {
         kind: EntityKind::Project,
@@ -264,7 +240,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &[],
     },
     // ── Service ──────────────────────────────────────────────────────────────
-    // ADR-001 Service subtypes: inference_engine, retrieval_engine,
+    // Service subtypes: inference_engine, retrieval_engine,
     // embedding_engine, api, database, search_engine, mcp_server.
     EntityTypeDef {
         kind: EntityKind::Service,
@@ -301,7 +277,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "mcp_server",
         aliases: &["mcp"],
     },
-    // Person  — no standard subtypes (roles are metadata, not subtypes per ADR-001).
+    // Person  — no standard subtypes (roles are metadata, not subtypes).
 ];
 
 /// Resolved output of [`EntityTypeRegistry::resolve`].
@@ -314,12 +290,7 @@ pub struct ResolvedType {
     pub entity_type: Option<String>,
 }
 
-/// Registry for `(EntityKind, entity_type)` pair validation and alias
-/// normalisation.
-///
-/// Build the default registry with [`EntityTypeRegistry::new`]; the lazily
-/// initialised global is available via [`EntityTypeRegistry::global`].
-/// Extend it with [`EntityTypeRegistry::with_extra`].
+/// Registry for `(EntityKind, entity_type)` pair validation and alias normalisation.
 #[derive(Clone)]
 pub struct EntityTypeRegistry {
     /// `alias_or_name (lowercase) → def index`.  Covers both canonical names
@@ -330,9 +301,6 @@ pub struct EntityTypeRegistry {
 
 impl EntityTypeRegistry {
     /// Build a fresh registry from the supplied definitions.
-    ///
-    /// Panics in debug builds when two definitions share an alias under the
-    /// same `EntityKind` (would produce an ambiguous lookup).
     pub fn new(defs: impl IntoIterator<Item = EntityTypeDef>) -> Self {
         let defs: Vec<EntityTypeDef> = defs.into_iter().collect();
         let mut lookup: HashMap<String, usize> = HashMap::new();
@@ -351,7 +319,7 @@ impl EntityTypeRegistry {
         Self { lookup, defs }
     }
 
-    /// Return the built-in registry (subtypes from [`BUILTIN_DEFS`]).
+    /// Return the built-in registry with all static subtype definitions.
     pub fn builtin() -> Self {
         Self::new(BUILTIN_DEFS.iter().cloned())
     }
@@ -364,9 +332,6 @@ impl EntityTypeRegistry {
     }
 
     /// Register additional subtypes into an existing registry clone.
-    ///
-    /// Intended for pack initialisation: a pack calls `registry.register(...)`
-    /// on a cloned global to obtain an extended copy for its lifetime.
     pub fn register(&mut self, def: EntityTypeDef) {
         let idx = self.defs.len();
         let canonical_key = format!("{}:{}", def.kind.name(), def.type_name);
@@ -380,22 +345,7 @@ impl EntityTypeRegistry {
         self.defs.push(def);
     }
 
-    /// Validate and normalise a `(kind_str, entity_type)` wire pair.
-    ///
-    /// Semantics:
-    ///
-    /// - `entity_type = None` → accepted for all kinds; `ResolvedType.entity_type`
-    ///   is also `None`.
-    /// - `entity_type = Some(t)` where `t` is a canonical name or alias valid
-    ///   for `kind_str` → normalised to the canonical name.
-    /// - `entity_type = Some(t)` where `t` belongs to a *different* kind →
-    ///   `InvalidInput` listing valid subtypes for the supplied kind.
-    /// - `entity_type = Some(t)` where `t` is not recognised at all →
-    ///   `InvalidInput` listing valid subtypes for the supplied kind.
-    ///
-    /// `kind_str` must already be a canonical kind name (the result of
-    /// `EntityKind::from_str(raw).map(|k| k.name())`).  Callers should
-    /// resolve the kind string first.
+    /// Validate and normalise a `(kind, entity_type)` wire pair.
     pub fn resolve(
         &self,
         kind: EntityKind,
@@ -474,8 +424,6 @@ static GLOBAL_REGISTRY: OnceLock<EntityTypeRegistry> = OnceLock::new();
 
 impl EntityTypeRegistry {
     /// Return a reference to the module-level built-in registry.
-    ///
-    /// Initialised on first access; subsequent calls are zero-cost reads.
     pub fn global() -> &'static EntityTypeRegistry {
         GLOBAL_REGISTRY.get_or_init(EntityTypeRegistry::builtin)
     }
@@ -653,7 +601,7 @@ mod tests {
 
     #[test]
     fn benchmark_is_dataset_not_concept() {
-        // F3 fix: benchmark moved from Concept to Dataset per ADR-001.
+        // F3 fix: benchmark belongs to Dataset, not Concept (it evaluates, it is not a concept).
         let r = reg();
         let res = r
             .resolve(EntityKind::Dataset, Some("benchmark"))
@@ -665,7 +613,7 @@ mod tests {
 
     #[test]
     fn model_alias_resolves_to_model_family() {
-        // F3 fix: "model" is an alias for "model_family" per ADR-001.
+        // F3 fix: "model" is an accepted alias for the canonical name "model_family".
         let r = reg();
         let res = r
             .resolve(EntityKind::Concept, Some("model"))

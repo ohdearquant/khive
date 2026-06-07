@@ -1,3 +1,5 @@
+//! Vamana index: build, search, save/load, and snapshot serialization.
+
 use std::{
     fs::{self, File},
     path::Path,
@@ -18,14 +20,12 @@ use crate::{
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
 
+/// Format identifier string stored in every `VamanaSnapshot`.
 pub const VAMANA_SNAPSHOT_FORMAT: &str = "khive-vamana-index";
+/// Snapshot format version; a mismatch causes `from_snapshot` to return an error.
 pub const VAMANA_SNAPSHOT_VERSION: u32 = 1;
 
 /// Corpus identity check stored inside a `VamanaSnapshot`.
-///
-/// A snapshot is accepted only when these values match the current vector store.
-/// `kkernel reindex` actively deletes snapshots after re-embedding, giving a
-/// second line of defence against serving stale ANN results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusFingerprint {
     pub vector_count: u64,
@@ -35,21 +35,25 @@ pub struct CorpusFingerprint {
 /// Serialisable graph payload stored inside `VamanaSnapshot`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VamanaIndexSnapshot {
+    /// Number of indexed vectors.
     pub num_vectors: u64,
+    /// Vector dimensionality.
     pub dimensions: u32,
+    /// Maximum out-degree used during build.
     pub max_degree: u32,
+    /// Greedy-search candidate list size used during build.
     pub search_list_size: u32,
+    /// Robust-prune alpha used during build.
     pub alpha: f64,
+    /// Medoid node ID (start node for greedy search).
     pub medoid: u32,
+    /// Adjacency lists; one `Vec<u32>` per node.
     pub adjacency: Vec<Vec<u32>>,
+    /// Row-major flat vector data; `num_vectors × dimensions` `f32` values.
     pub vectors: Vec<f32>,
 }
 
 /// Self-validating snapshot of a `VamanaIndex`.
-///
-/// Persisted via `RetrievalPersistence` / `retrieval_snapshots` SQLite BLOB.
-/// The `fingerprint` field must match the live vector corpus before the snapshot
-/// is installed into memory; a mismatch causes a silent rebuild.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VamanaSnapshot {
     pub format: String,
@@ -96,6 +100,7 @@ impl VectorStorage {
     }
 }
 
+/// An in-memory Vamana ANN index over pre-normalized vectors.
 #[derive(Debug)]
 pub struct VamanaIndex {
     vectors: VectorStorage,
@@ -113,7 +118,18 @@ struct IndexMetadata {
     alpha: f64,
 }
 
+/// Scan a flat f32 slice for any non-finite value, returning an error on the first hit.
+fn require_finite(values: &[f32], location: &str) -> Result<()> {
+    for (i, v) in values.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(VamanaError::non_finite(location, format!("index {i}: {v}")));
+        }
+    }
+    Ok(())
+}
+
 impl VamanaIndex {
+    /// Build from row-major flat slice. Errors if config invalid, empty, wrong length, non-finite, or N > u32::MAX.
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         config.validate()?;
         if vectors.is_empty() {
@@ -125,6 +141,7 @@ impl VamanaIndex {
                 actual: vectors.len() % config.dimensions,
             });
         }
+        require_finite(vectors, "build vectors")?;
         let num_vectors = vectors.len() / config.dimensions;
         if num_vectors > u32::MAX as usize {
             return Err(VamanaError::TooManyVectors { count: num_vectors });
@@ -142,6 +159,7 @@ impl VamanaIndex {
         })
     }
 
+    /// Search for `k` nearest neighbors. Errors if dimension mismatch or non-finite query values.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.dimensions {
             return Err(VamanaError::DimensionMismatch {
@@ -152,6 +170,7 @@ impl VamanaIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
+        require_finite(query, "search query")?;
 
         let mut visited = VisitedSet::new(self.num_vectors);
         let result = self.graph.greedy_search(
@@ -170,6 +189,7 @@ impl VamanaIndex {
         Ok(output)
     }
 
+    /// Persist the index to `path` (a directory); writes `metadata.bin`, `graph.bin`, `vectors.bin`.
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         write_metadata(&path.join("metadata.bin"), self)?;
@@ -178,6 +198,7 @@ impl VamanaIndex {
         Ok(())
     }
 
+    /// Load an index from a directory previously written by [`VamanaIndex::save`].
     pub fn load(path: &Path) -> Result<Self> {
         let meta = read_metadata(&path.join("metadata.bin"))?;
         let config = VamanaConfig {
@@ -220,9 +241,15 @@ impl VamanaIndex {
         })
     }
 
+    /// Mean recall@k across `queries` vs. exact brute-force. Errors on empty, bad dim, or non-finite.
     pub fn recall_at_k(&self, queries: &[f32], k: usize) -> Result<f64> {
         if queries.is_empty() {
             return Err(VamanaError::EmptyInput);
+        }
+        if k == 0 {
+            return Err(VamanaError::invalid_config(
+                "k must be > 0 for recall_at_k".into(),
+            ));
         }
         if !queries.len().is_multiple_of(self.dimensions) {
             return Err(VamanaError::DimensionMismatch {
@@ -235,28 +262,23 @@ impl VamanaIndex {
         let num_queries = queries.len() / self.dimensions;
         let denom = k.min(self.num_vectors) as f64;
 
-        let total_recall: f64 = (0..num_queries)
-            .map(|qi| {
-                let query = &queries[qi * self.dimensions..(qi + 1) * self.dimensions];
-                let exact = exact_search(vecs, self.dimensions, query, k);
-                let ann = self.search(query, k).unwrap_or_default();
+        let total_recall: f64 = (0..num_queries).try_fold(0.0f64, |acc, qi| {
+            let query = &queries[qi * self.dimensions..(qi + 1) * self.dimensions];
+            let exact = exact_search(vecs, self.dimensions, query, k);
+            let ann = self.search(query, k)?;
 
-                let exact_ids: std::collections::HashSet<u32> =
-                    exact.iter().map(|(id, _)| *id).collect();
-                let ann_ids: std::collections::HashSet<u32> =
-                    ann.iter().map(|(id, _)| *id).collect();
+            let exact_ids: std::collections::HashSet<u32> =
+                exact.iter().map(|(id, _)| *id).collect();
+            let ann_ids: std::collections::HashSet<u32> = ann.iter().map(|(id, _)| *id).collect();
 
-                let overlap = exact_ids.intersection(&ann_ids).count() as f64;
-                overlap / denom
-            })
-            .sum();
+            let overlap = exact_ids.intersection(&ann_ids).count() as f64;
+            Ok::<f64, VamanaError>(acc + overlap / denom)
+        })?;
 
         Ok(total_recall / num_queries as f64)
     }
 
     /// Serialise this index into a self-validating `VamanaSnapshot`.
-    ///
-    /// `external_ids` must have the same length as `self.num_vectors()`.
     pub fn to_snapshot(
         &self,
         namespace: impl Into<String>,
@@ -271,6 +293,14 @@ impl VamanaIndex {
                 self.num_vectors
             )));
         }
+        let num_vectors_u64 = u64::try_from(self.num_vectors)
+            .map_err(|_| VamanaError::invalid_format("num_vectors overflows u64".into()))?;
+        let dimensions_u32 = u32::try_from(self.dimensions)
+            .map_err(|_| VamanaError::invalid_format("dimensions overflows u32".into()))?;
+        let max_degree_u32 = u32::try_from(self.config.max_degree)
+            .map_err(|_| VamanaError::invalid_format("max_degree overflows u32".into()))?;
+        let search_list_size_u32 = u32::try_from(self.config.search_list_size)
+            .map_err(|_| VamanaError::invalid_format("search_list_size overflows u32".into()))?;
         Ok(VamanaSnapshot {
             format: VAMANA_SNAPSHOT_FORMAT.to_string(),
             version: VAMANA_SNAPSHOT_VERSION,
@@ -278,10 +308,10 @@ impl VamanaIndex {
             model: model.into(),
             fingerprint,
             index: VamanaIndexSnapshot {
-                num_vectors: self.num_vectors as u64,
-                dimensions: self.dimensions as u32,
-                max_degree: self.config.max_degree as u32,
-                search_list_size: self.config.search_list_size as u32,
+                num_vectors: num_vectors_u64,
+                dimensions: dimensions_u32,
+                max_degree: max_degree_u32,
+                search_list_size: search_list_size_u32,
                 alpha: self.config.alpha,
                 medoid: self.graph.medoid(),
                 adjacency: self.graph.adjacency().to_vec(),
@@ -292,9 +322,6 @@ impl VamanaIndex {
     }
 
     /// Reconstruct a `VamanaIndex` from a `VamanaSnapshot`.
-    ///
-    /// Returns `VamanaError::InvalidFormat` for any structural inconsistency.
-    /// The caller is responsible for fingerprint validation before calling this.
     pub fn from_snapshot(snapshot: &VamanaSnapshot) -> Result<Self> {
         if snapshot.format != VAMANA_SNAPSHOT_FORMAT {
             return Err(VamanaError::invalid_format(format!(
@@ -340,6 +367,7 @@ impl VamanaIndex {
                 "snapshot vector data length mismatch".into(),
             ));
         }
+        require_finite(&ix.vectors, "snapshot vectors")?;
 
         let config = VamanaConfig {
             dimensions,
@@ -369,6 +397,16 @@ impl VamanaIndex {
                     )));
                 }
             }
+            // Reject duplicate neighbors.
+            let mut sorted = neighbors.clone();
+            sorted.sort_unstable();
+            let before = sorted.len();
+            sorted.dedup();
+            if sorted.len() != before {
+                return Err(VamanaError::invalid_format(format!(
+                    "snapshot node {node} has duplicate neighbors"
+                )));
+            }
             graph.adjacency_mut_for_load()[node] = neighbors.clone();
         }
 
@@ -381,22 +419,27 @@ impl VamanaIndex {
         })
     }
 
+    /// Return a reference to the underlying Vamana graph.
     pub fn graph(&self) -> &VamanaGraph {
         &self.graph
     }
 
+    /// Return a reference to the build configuration.
     pub fn config(&self) -> &VamanaConfig {
         &self.config
     }
 
+    /// Return the number of indexed vectors.
     pub fn num_vectors(&self) -> usize {
         self.num_vectors
     }
 
+    /// Return the vector dimensionality.
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
 
+    /// Return the flat row-major vector data as a slice.
     pub fn vectors(&self) -> Result<&[f32]> {
         self.vectors.as_slice()
     }
@@ -411,10 +454,22 @@ fn exact_search(vectors: &[f32], dimensions: usize, query: &[f32], k: usize) -> 
             (id, l2_squared(query, v))
         })
         .collect();
+
+    // Use select_nth_unstable_by to find the k-th element in O(N) rather than
+    // full-sorting in O(N log N). Only the top-k prefix needs to be sorted.
+    let effective_k = k.min(dists.len());
+    if effective_k == 0 {
+        return Vec::new();
+    }
+    if effective_k < dists.len() {
+        dists.select_nth_unstable_by(effective_k - 1, |(a_id, a_d), (b_id, b_d)| {
+            a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
+        });
+    }
+    dists.truncate(effective_k);
     dists.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
         a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
     });
-    dists.truncate(k);
     dists
 }
 
@@ -444,10 +499,14 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
     if data.len() < expected_len {
         return Err(VamanaError::invalid_format("metadata.bin truncated".into()));
     }
-    let num_vectors = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-    let dimensions = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
-    let max_degree = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
-    let search_list_size = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+    let num_vectors = usize::try_from(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("num_vectors overflows usize".into()))?;
+    let dimensions = usize::try_from(u64::from_le_bytes(data[16..24].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("dimensions overflows usize".into()))?;
+    let max_degree = usize::try_from(u64::from_le_bytes(data[24..32].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("max_degree overflows usize".into()))?;
+    let search_list_size = usize::try_from(u64::from_le_bytes(data[32..40].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("search_list_size overflows usize".into()))?;
     let alpha = f64::from_le_bytes(data[40..48].try_into().unwrap());
 
     if num_vectors == 0 {
@@ -467,7 +526,9 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
 }
 
 fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
-    let num_nodes = graph.node_count() as u32;
+    let num_nodes = u32::try_from(graph.node_count()).map_err(|_| VamanaError::TooManyVectors {
+        count: graph.node_count(),
+    })?;
     let medoid = graph.medoid();
 
     let total_edges: usize = graph.adjacency().iter().map(|v| v.len()).sum();
@@ -480,7 +541,13 @@ fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
     buf.extend_from_slice(&medoid.to_le_bytes());
 
     for neighbors in graph.adjacency() {
-        buf.extend_from_slice(&(neighbors.len() as u32).to_le_bytes());
+        let degree = u32::try_from(neighbors.len()).map_err(|_| {
+            VamanaError::invalid_format(format!(
+                "neighbor list length {} overflows u32",
+                neighbors.len()
+            ))
+        })?;
+        buf.extend_from_slice(&degree.to_le_bytes());
         for &nb in neighbors {
             buf.extend_from_slice(&nb.to_le_bytes());
         }
@@ -555,7 +622,27 @@ fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<Vama
             }
             neighbors.push(nb);
         }
+
+        // Reject duplicate neighbors — they reduce effective degree and indicate a
+        // corrupted or improperly written graph file.
+        let original_len = neighbors.len();
+        let mut sorted = neighbors.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != original_len {
+            return Err(VamanaError::invalid_format(format!(
+                "node {_node} has duplicate neighbors"
+            )));
+        }
+
         adjacency.push(neighbors);
+    }
+
+    if offset != data.len() {
+        return Err(VamanaError::invalid_format(format!(
+            "graph.bin has {} trailing bytes",
+            data.len() - offset
+        )));
     }
 
     let mut graph = VamanaGraph::new(num_nodes, medoid)?;
@@ -576,8 +663,11 @@ fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
 
 fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     let file = File::open(path)?;
-    let byte_len = file.metadata()?.len() as usize;
-    let expected_bytes = expected_len_f32 * std::mem::size_of::<f32>();
+    let byte_len = usize::try_from(file.metadata()?.len())
+        .map_err(|_| VamanaError::invalid_format("vectors.bin file size exceeds usize".into()))?;
+    let expected_bytes = expected_len_f32
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| VamanaError::invalid_format("vectors.bin byte length overflow".into()))?;
     if byte_len != expected_bytes {
         return Err(VamanaError::invalid_format(format!(
             "vectors.bin byte length {byte_len} != expected {expected_bytes}"
@@ -586,7 +676,7 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
 
     // SAFETY: The index exposes this mapping as read-only via `as_slice()`.
     // Callers must not mutate or truncate the vectors.bin file while this index is alive.
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let mmap = unsafe { MmapOptions::new().len(expected_bytes).map(&file)? };
 
     Ok(VectorStorage::Mmap {
         mmap,
@@ -594,6 +684,12 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     })
 }
 
+// INLINE TEST JUSTIFICATION: Tests in this module exercise private helpers
+// (`exact_search`, `write_metadata`, `read_metadata`, `write_graph`, `read_graph`,
+// `mmap_vectors`) and the internal `VectorStorage` enum that cannot be accessed
+// from `tests/`. Moving snapshot-corruption and save/load tests here avoids
+// publishing test-only re-exports. The section is larger than 300 lines because
+// each persistence and snapshot variant requires independent fixture setup.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,7 +1017,226 @@ mod tests {
             "snapshot fingerprint must equal the build-time fingerprint"
         );
     }
-} // end mod tests
+    // ---- Regression tests for P0/P1 fixes ----
 
-// ---- tempfile dependency shim ----
-// The tempfile crate is used only in tests. Declare it as a dev-dependency below.
+    /// P1: recall_at_k must reject k=0 to avoid 0/0 = NaN.
+    #[test]
+    fn recall_at_k_rejects_zero_k() {
+        let vectors = rand_unit_vectors(10, 8, 5);
+        let cfg = VamanaConfig::with_dimensions(8)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let query = rand_unit_vectors(1, 8, 77);
+        assert!(
+            matches!(
+                idx.recall_at_k(&query, 0),
+                Err(VamanaError::InvalidConfig { .. })
+            ),
+            "k=0 must return InvalidConfig"
+        );
+    }
+
+    /// P1: load must reject duplicate neighbors in graph.bin.
+    #[test]
+    fn load_rejects_duplicate_neighbors() {
+        let vectors = rand_unit_vectors(5, 4, 12);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        idx.save(dir.path()).unwrap();
+
+        // Parse graph.bin and inject a duplicate neighbor for the first node
+        // that has at least 2 neighbors.
+        let mut gdata = fs::read(dir.path().join("graph.bin")).unwrap();
+        let mut offset = 16usize;
+        'inject: for _node in 0..5usize {
+            let degree = u32::from_le_bytes(gdata[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if degree >= 2 {
+                // Copy first neighbor over second neighbor → duplicate.
+                let first_nb = gdata[offset..offset + 4].to_vec();
+                gdata[offset + 4..offset + 8].copy_from_slice(&first_nb);
+                break 'inject;
+            }
+            offset += degree * 4;
+        }
+        fs::write(dir.path().join("graph.bin"), &gdata).unwrap();
+
+        assert!(
+            matches!(
+                VamanaIndex::load(dir.path()),
+                Err(VamanaError::InvalidFormat { .. })
+            ),
+            "load must reject duplicate neighbors"
+        );
+    }
+
+    /// P1: load must reject graph.bin with trailing bytes.
+    #[test]
+    fn load_rejects_trailing_graph_bytes() {
+        let vectors = rand_unit_vectors(5, 4, 13);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        idx.save(dir.path()).unwrap();
+
+        // Append 4 extra bytes to graph.bin.
+        let mut gdata = fs::read(dir.path().join("graph.bin")).unwrap();
+        gdata.extend_from_slice(&[0u8; 4]);
+        fs::write(dir.path().join("graph.bin"), &gdata).unwrap();
+
+        assert!(
+            matches!(
+                VamanaIndex::load(dir.path()),
+                Err(VamanaError::InvalidFormat { .. })
+            ),
+            "load must reject trailing bytes in graph.bin"
+        );
+    }
+
+    /// P1: from_snapshot must reject duplicate neighbors.
+    #[test]
+    fn snapshot_rejects_duplicate_neighbors() {
+        let vectors = rand_unit_vectors(5, 4, 14);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let fp = CorpusFingerprint {
+            vector_count: 5,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..5).map(|i| format!("id-{i}")).collect();
+        let mut snapshot = idx.to_snapshot("ns", "model", fp, ext_ids).unwrap();
+
+        // Inject a duplicate into the first node that has at least 2 neighbors.
+        for neighbors in snapshot.index.adjacency.iter_mut() {
+            if neighbors.len() >= 2 {
+                let dup = neighbors[0];
+                neighbors[1] = dup;
+                break;
+            }
+        }
+
+        assert!(
+            matches!(
+                VamanaIndex::from_snapshot(&snapshot),
+                Err(VamanaError::InvalidFormat { .. })
+            ),
+            "from_snapshot must reject duplicate neighbors"
+        );
+    }
+    // ---- Non-finite float boundary tests (VAMANA-AUD-001) ----
+
+    #[test]
+    fn build_rejects_nan_in_vectors() {
+        let mut vectors = rand_unit_vectors(10, 4, 20);
+        vectors[3] = f32::NAN;
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        assert!(
+            matches!(
+                VamanaIndex::build(&vectors, cfg),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "build must reject NaN in vectors"
+        );
+    }
+
+    #[test]
+    fn build_rejects_infinity_in_vectors() {
+        let mut vectors = rand_unit_vectors(10, 4, 21);
+        vectors[7] = f32::INFINITY;
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        assert!(
+            matches!(
+                VamanaIndex::build(&vectors, cfg),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "build must reject Infinity in vectors"
+        );
+    }
+
+    #[test]
+    fn build_rejects_neg_infinity_in_vectors() {
+        let mut vectors = rand_unit_vectors(10, 4, 22);
+        vectors[5] = f32::NEG_INFINITY;
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        assert!(
+            matches!(
+                VamanaIndex::build(&vectors, cfg),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "build must reject -Infinity in vectors"
+        );
+    }
+
+    #[test]
+    fn search_rejects_nan_in_query() {
+        let vectors = rand_unit_vectors(10, 4, 23);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let mut query = rand_unit_vectors(1, 4, 24);
+        query[1] = f32::NAN;
+        assert!(
+            matches!(
+                idx.search(&query, 3),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "search must reject NaN in query"
+        );
+    }
+
+    #[test]
+    fn search_rejects_infinity_in_query() {
+        let vectors = rand_unit_vectors(10, 4, 25);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let mut query = rand_unit_vectors(1, 4, 26);
+        query[0] = f32::INFINITY;
+        assert!(
+            matches!(
+                idx.search(&query, 3),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "search must reject Infinity in query"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_nan_in_vectors() {
+        let vectors = rand_unit_vectors(4, 4, 27);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(6);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let fp = CorpusFingerprint {
+            vector_count: 4,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..4).map(|i| format!("id-{i}")).collect();
+        let mut snapshot = idx.to_snapshot("ns", "model", fp, ext_ids).unwrap();
+        snapshot.index.vectors[2] = f32::NAN;
+        assert!(
+            matches!(
+                VamanaIndex::from_snapshot(&snapshot),
+                Err(VamanaError::NonFiniteFloat { .. })
+            ),
+            "from_snapshot must reject NaN in vectors"
+        );
+    }
+}

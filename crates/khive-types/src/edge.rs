@@ -1,4 +1,4 @@
-//! Edge relation types for the closed ontology defined in ADR-002 / ADR-021.
+//! Edge relation types for the closed ontology used throughout khive.
 
 extern crate alloc;
 use alloc::string::String;
@@ -33,7 +33,7 @@ pub enum EdgeCategory {
     Annotation,
 }
 
-/// Closed set of 15 canonical edge relations (ADR-002).
+/// Closed set of 15 canonical edge relations.
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -67,7 +67,7 @@ pub enum EdgeRelation {
 }
 
 impl EdgeRelation {
-    /// All 15 canonical relations in ADR-002 table order.
+    /// All 15 canonical relations in ontology-table order.
     pub const ALL: [Self; 15] = [
         Self::Contains,
         Self::PartOf,
@@ -157,6 +157,13 @@ impl fmt::Display for EdgeRelation {
 impl FromStr for EdgeRelation {
     type Err = crate::error::UnknownVariant;
 
+    /// Parse a string into an `EdgeRelation`.
+    ///
+    /// Accepts the 15 canonical relation names (case-insensitive, with hyphens
+    /// normalised to underscores) and also squashed forms that omit the separator
+    /// (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist for ergonomic
+    /// DSL entry; they are **not** stored on the wire, which always uses the
+    /// canonical snake_case form produced by [`EdgeRelation::as_str`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let normalised: String = s
             .chars()

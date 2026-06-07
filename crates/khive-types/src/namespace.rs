@@ -1,12 +1,4 @@
-//! Namespace — validated string-based scoping for substrate records.
-//!
-//! In khive OSS, namespace is a plain string (e.g., `"local"`, `"research"`,
-//! `"lattice-project"`). It groups records and supports cross-namespace
-//! queries via the entity graph.
-//!
-//! Multi-tenant deployments (hosted khive deployments) add capability-based
-//! access controls on top in a separate crate — those are not part of the
-//! open-source runtime.
+//! Namespace — validated string token for scoping substrate records.
 
 extern crate alloc;
 use alloc::string::String;
@@ -15,10 +7,21 @@ use core::fmt;
 /// Validation error returned when a namespace string is rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NamespaceError {
+    /// The input was empty.
     Empty,
-    TooLong { max: usize },
-    InvalidCharacter { ch: char },
+    /// The input exceeded the maximum allowed length.
+    TooLong {
+        /// The maximum allowed number of bytes.
+        max: usize,
+    },
+    /// The input contained a character outside `[a-zA-Z0-9\-_.]`.
+    InvalidCharacter {
+        /// The offending character.
+        ch: char,
+    },
+    /// A `::`-separated segment was empty.
     EmptySegment,
+    /// The input ended with a `:` separator.
     TrailingSeparator,
 }
 
@@ -88,11 +91,13 @@ impl Namespace {
         Self(String::from(Self::LOCAL))
     }
 
+    /// Return the namespace as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Consume the `Namespace` and return the underlying owned string.
     pub fn into_inner(self) -> String {
         self.0
     }

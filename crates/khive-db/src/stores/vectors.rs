@@ -1,11 +1,4 @@
-//! sqlite-vec backed `VectorStore` implementation.
-//!
-//! Each `SqliteVecStore` manages a single vec0 virtual table for one embedding
-//! model. The store is scoped to a namespace for tenant isolation.
-//!
-//! # Blob format
-//!
-//! sqlite-vec expects embeddings as contiguous little-endian f32 bytes.
+//! sqlite-vec backed `VectorStore`: one vec0 table per embedding model, scoped to namespace.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -404,9 +397,10 @@ impl VectorStore for SqliteVecStore {
                 ));
             }
 
-            // Restrict candidate set to namespace+embedding_model (and optionally kind)
-            // via subquery, then MATCH-rank by embedding distance.
-            let subquery_kind_clause = if kind_filter.is_some() {
+            // Push namespace+embedding_model (and optionally kind) directly into
+            // the MATCH predicate so sqlite-vec evaluates them before computing
+            // global top-k, preventing cross-namespace recall starvation.
+            let kind_clause = if kind_filter.is_some() {
                 "AND kind = ?5"
             } else {
                 ""
@@ -415,14 +409,13 @@ impl VectorStore for SqliteVecStore {
                 "SELECT subject_id, distance \
                  FROM {t} \
                  WHERE embedding MATCH ?1 \
-                   AND subject_id IN (\
-                     SELECT subject_id FROM {t} \
-                     WHERE namespace = ?3 AND embedding_model = ?4 {kind_clause}\
-                   ) \
+                   AND namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
                  ORDER BY distance \
                  LIMIT ?2",
                 t = table,
-                kind_clause = subquery_kind_clause
+                kind_clause = kind_clause
             );
 
             let query_blob = f32_slice_as_bytes(&query_embedding);
@@ -681,7 +674,7 @@ impl SqliteVecStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vectors"))]
 mod batch_exists_tests {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -798,6 +791,79 @@ mod batch_exists_tests {
             .await
             .expect("batch_exists");
         assert!(exists.is_empty());
+    }
+
+    /// A nearer vector in namespace A must not starve the top-k result in namespace B.
+    ///
+    /// Regression for the cross-namespace recall starvation path: sqlite-vec must
+    /// evaluate the namespace predicate before computing global top-k, not after.
+    #[tokio::test]
+    async fn vector_search_namespace_predicate_prevents_recall_starvation() {
+        let pool = make_vec_pool();
+        let model_key = "knn_namespace_scope";
+        let dims = 4;
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:b".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let distractor_a = Uuid::new_v4();
+        let victim_b = Uuid::new_v4();
+
+        // Insert a nearer vector in namespace A (distractor).
+        store
+            .insert(
+                distractor_a,
+                SubstrateKind::Entity,
+                "ns:a",
+                "body",
+                vec![vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .expect("insert nearer cross-namespace vector");
+
+        // Insert a slightly farther vector in namespace B (victim).
+        store
+            .insert(
+                victim_b,
+                SubstrateKind::Entity,
+                "ns:b",
+                "body",
+                vec![vec![0.8, 0.2, 0.0, 0.0]],
+            )
+            .await
+            .expect("insert in-namespace vector");
+
+        // top_k=1 search in ns:b must return victim_b, not the nearer distractor_a.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec![1.0, 0.0, 0.0, 0.0]],
+                top_k: 1,
+                namespace: Some("ns:b".to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search");
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "namespace B must not be starved by namespace A"
+        );
+        assert_eq!(
+            hits[0].subject_id, victim_b,
+            "top-1 in ns:b must be victim_b, not cross-namespace distractor_a"
+        );
     }
 
     /// Hyphenated model_key must be rejected at SqliteVecStore::new(), preventing

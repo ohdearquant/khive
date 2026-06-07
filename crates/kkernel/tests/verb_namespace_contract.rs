@@ -1,10 +1,10 @@
 //! Contract test: every non-kg verb must be namespaced as `<pack>.<verb>`.
 //!
-//! ADR-023 §4 establishes that the kg substrate pack owns the 16 bare verb
-//! names (create, get, list, …). Every other pack must prefix its verbs with
-//! the pack name followed by a single dot: `memory.recall`, `gtd.assign`, etc.
-//! Sub-variants use a single additional underscore-delimited segment, NOT a
-//! second dot: `memory.recall_embed`, not `memory.recall.embed`.
+//! The kg substrate pack owns the 16 bare verb names (create, get, list, …).
+//! Every other pack must prefix its verbs with the pack name followed by a
+//! single dot: `memory.recall`, `gtd.assign`, etc. Sub-variants use a single
+//! additional underscore-delimited segment, NOT a second dot:
+//! `memory.recall_embed`, not `memory.recall.embed`.
 //!
 //! This test walks every `HandlerDef` across every pack registered in the
 //! `inventory` (i.e. linked into this test binary) and asserts:
@@ -38,8 +38,8 @@ use khive_pack_memory::MemoryPack as _;
 #[allow(unused_imports)]
 use khive_pack_schedule::SchedulePack as _;
 
-/// Bare verb names owned by the kg substrate pack (ADR-023 §4, ADR-024,
-/// ADR-046). These are the only names permitted to omit the `<pack>.` prefix.
+/// Bare verb names owned by the kg substrate pack. These are the only names
+/// permitted to omit the `<pack>.` prefix.
 ///
 /// The 16 entries cover CRUD + graph + curation + proposal primitives, plus
 /// `stats` for aggregate namespace metrics and `verbs` for verb-registry
@@ -88,8 +88,8 @@ fn build_full_registry() -> Vec<(String, String)> {
         .collect()
 }
 
-/// ADR-023 §4: every non-kg verb name must carry exactly one dot-prefix
-/// matching the pack name that owns it.
+/// Every non-kg verb name must carry exactly one dot-prefix matching the pack
+/// name that owns it.
 #[test]
 fn every_non_kg_verb_is_namespaced() {
     let handlers = build_full_registry();
@@ -105,7 +105,7 @@ fn every_non_kg_verb_is_namespaced() {
                 if !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
                     violations.push(format!(
                         "pack={pack_name:?} verb={verb_name:?}: bare name is not in the \
-                         kg-substrate-16 allowlist (ADR-023 §4). Add `{pack_name}.` prefix."
+                         kg-substrate-16 allowlist. Add `{pack_name}.` prefix."
                     ));
                 }
             }
@@ -115,15 +115,15 @@ fn every_non_kg_verb_is_namespaced() {
                 if prefix != pack_name {
                     violations.push(format!(
                         "pack={pack_name:?} verb={verb_name:?}: prefix {prefix:?} does not \
-                         match pack name {pack_name:?} (ADR-023 §4)."
+                         match pack name {pack_name:?}."
                     ));
                 }
             }
-            // Two or more dots — always invalid under ADR-023 §4.
+            // Two or more dots — always invalid (sub-variants use underscore, not nesting dots).
             _ => {
                 violations.push(format!(
                     "pack={pack_name:?} verb={verb_name:?}: name contains {dot_count} dots; \
-                     sub-variants must use underscore, not nested dots (ADR-023 §4). \
+                     sub-variants must use underscore, not nested dots. \
                      Example: `{pack_name}.recall_embed`, not `{pack_name}.recall.embed`."
                 ));
             }
@@ -132,7 +132,7 @@ fn every_non_kg_verb_is_namespaced() {
 
     assert!(
         violations.is_empty(),
-        "Verb namespace contract violations (ADR-023 §4):\n{}",
+        "Verb namespace contract violations:\n{}",
         violations.join("\n")
     );
 }
@@ -156,7 +156,7 @@ fn kg_pack_exposes_bare_verbs_only() {
         .collect();
     assert!(
         missing.is_empty(),
-        "kg pack is missing substrate verbs: {missing:?} (ADR-024 + ADR-046)"
+        "kg pack is missing substrate verbs: {missing:?}"
     );
 
     // No kg verb may carry a dot.

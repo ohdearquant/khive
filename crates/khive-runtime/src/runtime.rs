@@ -12,7 +12,7 @@ use crate::error::RuntimeResult;
 
 // ---- BackendId ----
 
-/// Identifies a named backend in a multi-backend deployment (ADR-009, ADR-028).
+/// Identifies a named backend in a multi-backend deployment.
 ///
 /// The `main` backend is the default single-backend name. Multi-backend deployments
 /// assign each `[[backends]]` entry a distinct `BackendId`. The
@@ -100,19 +100,21 @@ impl NamespaceToken {
         Self::mint_authorized(ns, ActorRef::anonymous())
     }
 
+    /// Return the namespace this token authorises access to.
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
     }
 
+    /// Return the actor reference embedded in this token.
     pub fn actor(&self) -> &ActorRef {
         &self.actor
     }
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// Used by packs that apply a namespace policy (e.g. ADR-007 §"Namespace-by-Layer
-    /// Rule": KG pack overrides the caller's namespace to `Namespace::local()` so
-    /// that entity/edge/note records always land in the shared graph).
+    /// Used by packs that apply a namespace policy (e.g. the KG pack overrides the
+    /// caller's namespace to `Namespace::local()` so that entity/edge/note records
+    /// always land in the shared graph).
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }
@@ -122,7 +124,7 @@ impl NamespaceToken {
 
 /// Runtime configuration.
 ///
-/// Per ADR-028, the `db_path` and `embedding_model` fields are deprecated in favour of
+/// The `db_path` and `embedding_model` fields are deprecated in favour of
 /// constructing the backend externally and calling [`KhiveRuntime::from_backend`].
 /// They remain for backward compatibility with tests and single-binary deployments.
 #[derive(Clone, Debug)]
@@ -138,9 +140,9 @@ pub struct RuntimeConfig {
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     ///
-    /// Deprecated: per ADR-028/ADR-031, embedding engines move to a per-pack
-    /// `EmbedderRegistry`. This field persists for backward compatibility until
-    /// the embedder registry is fully plumbed.
+    /// Deprecated: embedding engines move to a per-pack `EmbedderRegistry`.
+    /// This field persists for backward compatibility until the embedder registry
+    /// is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
     /// Additional embedding models to make available by request name.
     ///
@@ -149,7 +151,7 @@ pub struct RuntimeConfig {
     /// selected with `embedder(name)`, `embed_with_model(...)`, memory
     /// `remember.embedding_model`, and memory `recall.embedding_model`.
     pub additional_embedding_models: Vec<EmbeddingModel>,
-    /// Authorization gate consulted before each verb dispatch (ADR-029).
+    /// Authorization gate consulted before each verb dispatch.
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
     /// plug in a Rego- or capability-witness-backed impl.
     pub gate: GateRef,
@@ -159,7 +161,7 @@ pub struct RuntimeConfig {
     /// by the transport, not silently ignored.
     /// Default: `["kg"]`.
     pub packs: Vec<String>,
-    /// Identifies this runtime's backend in a multi-backend deployment (ADR-009, ADR-028).
+    /// Identifies this runtime's backend in a multi-backend deployment.
     ///
     /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
     /// Single-backend deployments use the default `BackendId::MAIN`.
@@ -230,7 +232,7 @@ impl Default for RuntimeConfig {
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
-    /// Pack-extensible embedder registry (ADR-031 extension).
+    /// Pack-extensible embedder registry.
     ///
     /// Shared across clones via `Arc<RwLock<_>>` so that
     /// [`register_embedder`](Self::register_embedder) after clone is visible
@@ -238,11 +240,19 @@ pub struct KhiveRuntime {
     /// construction; packs may add more via [`PackRuntime::register_embedders`].
     embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
-    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
+    /// Pack-extensible edge endpoint rules. Shared across clones
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
-    /// `VerbRegistry` is built. Empty until installed — base rules
-    /// (ADR-002) still apply on their own.
+    /// `VerbRegistry` is built. Empty until installed
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
+    /// Pack-aggregated valid entity and note kind strings.
+    ///
+    /// Installed by the transport layer after building the `VerbRegistry`.
+    /// When non-empty, `create_entity`, `create_note_inner`, and `import_kg`
+    /// reject kinds not in these sets. When empty (no packs loaded, e.g.
+    /// bare runtime in unit tests), kind validation is skipped — the pack
+    /// handler layer is the primary enforcement point.
+    valid_entity_kinds: Arc<RwLock<Vec<String>>>,
+    valid_note_kinds: Arc<RwLock<Vec<String>>>,
 }
 
 impl KhiveRuntime {
@@ -279,6 +289,8 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -303,10 +315,12 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
-    /// Construct a runtime from an already-opened backend (ADR-028 boot path).
+    /// Construct a runtime from an already-opened backend.
     ///
     /// This is the preferred constructor for multi-backend deployments. The caller
     /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
@@ -326,6 +340,8 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -524,15 +540,74 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the pack-aggregated edge endpoint rules (ADR-031).
+    /// Install the pack-aggregated edge endpoint rules.
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so
-    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
-    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
+    /// that runtime-layer edge validation can consult pack rules. Idempotent:
     /// later calls overwrite the previous rule set.
     pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
         if let Ok(mut guard) = self.edge_rules.write() {
             *guard = rules;
+        }
+    }
+
+    /// Install the pack-aggregated valid entity and note kinds.
+    ///
+    /// Called by the transport layer after the `VerbRegistry` is built so that
+    /// runtime-layer entity/note creation and import validate kind strings against
+    /// the merged pack vocabulary. Idempotent: later calls overwrite previous sets.
+    ///
+    /// When no kinds are installed (empty lists), kind validation is skipped at
+    /// the runtime layer. The pack handler layer remains the primary enforcement
+    /// point; this provides defense-in-depth for direct Rust callers and import.
+    pub fn install_kind_registry(&self, entity_kinds: Vec<String>, note_kinds: Vec<String>) {
+        if let Ok(mut guard) = self.valid_entity_kinds.write() {
+            *guard = entity_kinds;
+        }
+        if let Ok(mut guard) = self.valid_note_kinds.write() {
+            *guard = note_kinds;
+        }
+    }
+
+    /// Validate that `kind` is a pack-registered entity kind.
+    ///
+    /// Returns `Ok(())` when no kinds are installed (bare runtime without packs).
+    /// Returns `InvalidInput` when kinds are installed and `kind` is not among them.
+    pub(crate) fn validate_entity_kind(&self, kind: &str) -> crate::RuntimeResult<()> {
+        let guard = self.valid_entity_kinds.read().map_err(|_| {
+            crate::RuntimeError::Internal("entity kind registry lock poisoned".into())
+        })?;
+        if guard.is_empty() {
+            return Ok(());
+        }
+        if guard.iter().any(|k| k == kind) {
+            Ok(())
+        } else {
+            Err(crate::RuntimeError::InvalidInput(format!(
+                "unknown entity kind {kind:?}; valid: {}",
+                guard.join(", ")
+            )))
+        }
+    }
+
+    /// Validate that `kind` is a pack-registered note kind.
+    ///
+    /// Returns `Ok(())` when no kinds are installed (bare runtime without packs).
+    /// Returns `InvalidInput` when kinds are installed and `kind` is not among them.
+    pub(crate) fn validate_note_kind(&self, kind: &str) -> crate::RuntimeResult<()> {
+        let guard = self.valid_note_kinds.read().map_err(|_| {
+            crate::RuntimeError::Internal("note kind registry lock poisoned".into())
+        })?;
+        if guard.is_empty() {
+            return Ok(());
+        }
+        if guard.iter().any(|k| k == kind) {
+            Ok(())
+        } else {
+            Err(crate::RuntimeError::InvalidInput(format!(
+                "unknown note kind {kind:?}; valid: {}",
+                guard.join(", ")
+            )))
         }
     }
 
@@ -919,6 +994,9 @@ pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> 
     }
 }
 
+// INLINE TEST JUSTIFICATION: tests here cover KhiveRuntime construction helpers
+// (in-memory backend wiring, NamespaceToken::for_namespace) that are
+// pub(crate)-only and cannot be called from the integration test crate.
 #[cfg(test)]
 mod tests {
     use super::*;

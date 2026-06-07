@@ -1,5 +1,3 @@
-//! Internal HNSW node representation.
-
 /// Internal node in the HNSW graph.
 ///
 /// Nodes are stored in a dense `Vec<HnswNode>` indexed by an internal `usize` ID.

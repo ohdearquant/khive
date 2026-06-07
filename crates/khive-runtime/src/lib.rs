@@ -1,23 +1,6 @@
 //! khive-runtime: composable Service API used by daemon, MCP server, and CLI.
 //!
-//! Wraps `StorageBackend` + query compilation into a single Rust API.
-//!
-//! # Quick start
-//!
-//! ```ignore
-//! use khive_runtime::{KhiveRuntime, RuntimeConfig};
-//! use khive_types::Namespace;
-//!
-//! // In-memory for tests:
-//! let rt = KhiveRuntime::memory()?;
-//! let tok = rt.authorize(Namespace::local()).unwrap();
-//!
-//! // Create an entity:
-//! let entity = rt.create_entity(&tok, "concept", None, "LoRA", None, None, vec![]).await?;
-//!
-//! // Link two entities:
-//! let edge = rt.link(&tok, entity.id, other_id, EdgeRelation::Extends, 1.0, None).await?;
-//! ```
+//! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod curation;
 #[cfg(unix)]

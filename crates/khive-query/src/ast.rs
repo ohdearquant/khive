@@ -2,12 +2,7 @@
 
 use std::collections::HashMap;
 
-/// A SQL parameter value local to the query layer.
-///
-/// Deliberately mirrors the subset of `khive_storage::types::SqlValue` that the
-/// query compiler needs to emit.  The runtime converts these to the storage-layer
-/// `SqlValue` at the query–storage boundary (ADR-008 §"Query crate compiles
-/// against khive-types only").
+/// A SQL parameter value emitted by the query compiler.
 #[derive(Clone, Debug)]
 pub enum QueryValue {
     Null,
@@ -17,6 +12,7 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
+/// Top-level GQL query node produced by the parser.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
@@ -25,8 +21,7 @@ pub struct GqlQuery {
     pub limit: Option<usize>,
 }
 
-/// A WHERE expression tree supporting AND, OR, and leaf conditions (ADR-008
-/// §"GQL WHERE expression").
+/// A WHERE expression tree supporting AND, OR, and leaf conditions.
 #[derive(Debug, Clone)]
 pub enum WhereExpr {
     /// AND of two sub-expressions.
@@ -75,6 +70,7 @@ impl WhereExpr {
     }
 }
 
+/// A single item in the RETURN clause — either a bound variable or a property projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnItem {
     Variable(String),
@@ -82,6 +78,7 @@ pub enum ReturnItem {
 }
 
 impl ReturnItem {
+    /// Returns the variable name bound to this return item.
     pub fn variable(&self) -> &str {
         match self {
             Self::Variable(v) | Self::Property(v, _) => v,
@@ -89,6 +86,7 @@ impl ReturnItem {
     }
 }
 
+/// The MATCH pattern of a GQL query, as an alternating sequence of node and edge elements.
 #[derive(Debug, Clone)]
 pub struct MatchPattern {
     pub elements: Vec<PatternElement>,
@@ -114,12 +112,14 @@ impl MatchPattern {
     }
 }
 
+/// A single element in the MATCH pattern -- either a node or an edge.
 #[derive(Debug, Clone)]
 pub enum PatternElement {
     Node(NodePattern),
     Edge(EdgePattern),
 }
 
+/// A node binding in the MATCH pattern with optional kind, entity_type, and property filters.
 #[derive(Debug, Clone)]
 pub struct NodePattern {
     pub variable: Option<String>,

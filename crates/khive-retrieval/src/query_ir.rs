@@ -1,28 +1,7 @@
 //! Query Intermediate Representation for the retrieval pipeline.
 //!
-//! Provides a composable, analyzable tree representation of search queries
-//! that can be inspected and optimized before execution.
-//!
-//! # Motivation
-//!
-//! The existing [`Query`](crate::hybrid::Query) struct captures *what* to
-//! search (text + optional embedding), but not *how* the retrieval pipeline
-//! should compose sub-queries, apply filters, or perform fusion.  `QueryNode`
-//! makes that composition explicit as an IR tree.
-//!
-//! # Example
-//!
-//! ```rust
-//! use khive_retrieval::query_ir::{QueryNode, FuseStrategy};
-//!
-//! // Build a hybrid query: vector + keyword fused with RRF, then top-10
-//! let embedding = vec![0.1_f32; 128];
-//! let q = QueryNode::hybrid(embedding, "distributed consensus", 10);
-//!
-//! assert_eq!(q.leaf_count(), 2);
-//! assert_eq!(q.top_k(), 10);
-//! assert!(!q.is_empty());
-//! ```
+//! Composable IR tree representing how sub-queries are structured, filtered, and fused,
+//! separate from the Query struct which captures what to search.
 
 use khive_score::DeterministicScore;
 use serde::{Deserialize, Serialize};
@@ -174,11 +153,6 @@ pub enum RerankMethod {
 
 impl QueryNode {
     /// Create a vector search leaf node.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding` - Pre-computed query embedding.
-    /// * `top_k` - Number of results to return.
     pub fn vector(embedding: Vec<f32>, top_k: usize) -> Self {
         QueryNode::Vector {
             embedding,
@@ -188,11 +162,6 @@ impl QueryNode {
     }
 
     /// Create a keyword search leaf node.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - Query text (converted via `Into<String>`).
-    /// * `top_k` - Number of results to return.
     pub fn keyword(text: impl Into<String>, top_k: usize) -> Self {
         QueryNode::Keyword {
             text: text.into(),
@@ -201,21 +170,13 @@ impl QueryNode {
         }
     }
 
-    /// Create a hybrid query (vector + keyword with RRF fusion).
-    ///
-    /// The two leaf sub-queries each request `top_k * 3` candidates to give
-    /// the fusion step a sufficiently large candidate pool.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding` - Pre-computed query embedding.
-    /// * `text` - Query text (converted via `Into<String>`).
-    /// * `top_k` - Number of final results after fusion.
+    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 3` candidates each).
     pub fn hybrid(embedding: Vec<f32>, text: impl Into<String>, top_k: usize) -> Self {
+        let candidate_k = top_k.saturating_mul(3);
         QueryNode::Fuse {
             children: vec![
-                QueryNode::vector(embedding, top_k * 3),
-                QueryNode::keyword(text, top_k * 3),
+                QueryNode::vector(embedding, candidate_k),
+                QueryNode::keyword(text, candidate_k),
             ],
             strategy: FuseStrategy::Rrf { k: 60 },
             top_k,

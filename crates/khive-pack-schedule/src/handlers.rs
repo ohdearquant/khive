@@ -1,8 +1,8 @@
-//! Verb handler implementations for the schedule pack (ADR-040).
+//! Verb handler implementations for the schedule pack.
 //!
 //! All four verbs (`remind`, `schedule`, `agenda`, `cancel`) store and query
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
-//! the pack only stores intent. See ADR-040 §Trigger evaluation for execution modes.
+//! the pack only stores intent. See `docs/design.md` for execution modes.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -88,22 +88,62 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validate a cron expression (5-field) — only basic structure check in v1.
+/// Validate a cron expression (5-field).
+///
+/// Accepts the literals `daily`, `weekly`, `monthly`, and standard five-field
+/// cron expressions of the form `MIN HOUR DOM MON DOW`, where each field is
+/// either `*` or a non-negative integer within the accepted range:
+/// - MIN  0–59
+/// - HOUR 0–23
+/// - DOM  1–31
+/// - MON  1–12
+/// - DOW  0–7
+///
+/// Malformed fields (non-numeric, out-of-range) are rejected with
+/// `RuntimeError::InvalidInput` rather than silently accepted.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     match repeat {
-        "daily" | "weekly" | "monthly" => Ok(()),
-        cron => {
-            let fields: Vec<&str> = cron.split_whitespace().collect();
-            if fields.len() == 5 {
-                Ok(())
-            } else {
-                Err(RuntimeError::InvalidInput(format!(
-                    "invalid repeat expression {cron:?}: must be \"daily\", \"weekly\", \
-                     \"monthly\", or a 5-field cron expression"
-                )))
+        "daily" | "weekly" | "monthly" => return Ok(()),
+        _ => {}
+    }
+
+    let fields: Vec<&str> = repeat.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "invalid repeat expression {repeat:?}: must be \"daily\", \"weekly\", \
+             \"monthly\", or a 5-field cron expression (MIN HOUR DOM MON DOW)"
+        )));
+    }
+
+    // (field_name, min_val, max_val)
+    let ranges: [(&str, u64, u64); 5] = [
+        ("minute", 0, 59),
+        ("hour", 0, 23),
+        ("day-of-month", 1, 31),
+        ("month", 1, 12),
+        ("day-of-week", 0, 7),
+    ];
+    for (field, (name, lo, hi)) in fields.iter().zip(ranges.iter()) {
+        if *field == "*" {
+            continue;
+        }
+        match field.parse::<u64>() {
+            Ok(v) if v >= *lo && v <= *hi => {}
+            Ok(v) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "invalid repeat expression {repeat:?}: cron {name} field {v} is out of \
+                     range {lo}–{hi}"
+                )));
+            }
+            Err(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "invalid repeat expression {repeat:?}: cron {name} field {field:?} is not \
+                     \"*\" or a non-negative integer"
+                )));
             }
         }
     }
+    Ok(())
 }
 
 /// Validate that `action` is parseable DSL via `khive_request::parse_request`.
@@ -161,7 +201,7 @@ pub(crate) struct CancelParams {
 
 // ── handlers ─────────────────────────────────────────────────────────────────
 
-/// `remind` — create a time-triggered reminder (ADR-040 §remind).
+/// `remind` — create a time-triggered reminder.
 pub(crate) async fn handle_remind(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -221,7 +261,7 @@ pub(crate) async fn handle_remind(
     }))
 }
 
-/// `schedule` — schedule a future verb dispatch (ADR-040 §schedule).
+/// `schedule` — schedule a future verb dispatch.
 pub(crate) async fn handle_schedule(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -285,14 +325,27 @@ pub(crate) async fn handle_schedule(
     }))
 }
 
-/// `agenda` — list upcoming scheduled events (ADR-040 §agenda).
+/// `agenda` — list upcoming scheduled events.
 pub(crate) async fn handle_agenda(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: AgendaParams = deser(params)?;
-    let limit = p.limit.unwrap_or(20).clamp(1, 200);
+    let limit: u32 = match p.limit {
+        None => 20,
+        Some(0) => {
+            return Err(RuntimeError::InvalidInput(
+                "agenda: `limit` must be between 1 and 200 (inclusive); got 0".into(),
+            ));
+        }
+        Some(n) if n > 200 => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "agenda: `limit` must be between 1 and 200 (inclusive); got {n}"
+            )));
+        }
+        Some(n) => n,
+    };
 
     // Parse from/to bounds as instants so comparison is correct regardless of
     // timezone offset or DST. Reject non-RFC-3339 filter values (H1).
@@ -338,8 +391,20 @@ pub(crate) async fn handle_agenda(
     };
 
     const PAGE_SIZE: u32 = 200;
-    let mut offset: u32 = 0;
-    let mut events: Vec<(DateTime<Utc>, Value)> = Vec::new();
+    // Use u64 for offset so it cannot overflow for very large stores (SCH-AUD-006).
+    let mut offset: u64 = 0;
+    // Bounded top-k: keep only the `limit` earliest events while scanning
+    // so we avoid full allocation + sort of an unbounded set (SCH-AUD-004).
+    // BinaryHeap requires Ord on the element; serde_json::Value does not
+    // implement Ord, so we maintain a max-heap over just the timestamp and
+    // pair it with a separate Vec for the serialized payloads.
+    use std::collections::BinaryHeap;
+    // Max-heap over timestamps: the root is always the latest (worst) entry.
+    let mut ts_heap: BinaryHeap<DateTime<Utc>> = BinaryHeap::new();
+    // Parallel vec of serialized events, kept in the same insertion order.
+    // After scanning we zip ts_heap (drained) with this vec and sort.
+    let mut ts_vec: Vec<DateTime<Utc>> = Vec::new();
+    let mut ev_vec: Vec<Value> = Vec::new();
 
     loop {
         let page = store
@@ -348,7 +413,7 @@ pub(crate) async fn handle_agenda(
                 &filter,
                 PageRequest {
                     limit: PAGE_SIZE,
-                    offset: offset.into(),
+                    offset,
                 },
             )
             .await?;
@@ -379,30 +444,53 @@ pub(crate) async fn handle_agenda(
                     continue;
                 }
             }
-            events.push((instant, note_to_event_json(n)));
+
+            // Maintain bounded top-k (SCH-AUD-004):
+            // if we already have `limit` items and this one is not earlier
+            // than the current worst (maximum), skip it entirely.
+            if ts_heap.len() < limit as usize {
+                ts_heap.push(instant);
+                ts_vec.push(instant);
+                ev_vec.push(note_to_event_json(n));
+            } else if let Some(&max_ts) = ts_heap.peek() {
+                if instant < max_ts {
+                    // Evict the worst entry and insert the better one.
+                    // We need to remove max_ts from ts_vec/ev_vec too; find
+                    // its last occurrence (insertion order, LIFO for ties).
+                    ts_heap.pop();
+                    if let Some(pos) = ts_vec.iter().rposition(|t| *t == max_ts) {
+                        ts_vec.remove(pos);
+                        ev_vec.remove(pos);
+                    }
+                    ts_heap.push(instant);
+                    ts_vec.push(instant);
+                    ev_vec.push(note_to_event_json(n));
+                }
+            }
         }
 
         // Stop when the storage page is exhausted.
         if page_len < PAGE_SIZE {
             break;
         }
-        offset += PAGE_SIZE;
+        // Checked addition — extremely unlikely to overflow u64 for personal
+        // schedule data, but the standard coding policy requires it (SCH-AUD-006).
+        offset = offset
+            .checked_add(u64::from(PAGE_SIZE))
+            .ok_or_else(|| RuntimeError::Internal("agenda: pagination offset overflow".into()))?;
     }
 
-    // Sort ascending by parsed timestamp — correct regardless of tz format (H1).
-    events.sort_by_key(|(ts, _)| *ts);
+    // Sort ascending by parsed timestamp (sort only the selected ≤ limit items).
+    let mut selected: Vec<(DateTime<Utc>, Value)> = ts_vec.into_iter().zip(ev_vec).collect();
+    selected.sort_by_key(|(ts, _)| *ts);
 
-    let events: Vec<Value> = events
-        .into_iter()
-        .map(|(_, v)| v)
-        .take(limit as usize)
-        .collect();
+    let events: Vec<Value> = selected.into_iter().map(|(_, v)| v).collect();
     let count = events.len();
 
     Ok(json!({ "events": events, "count": count }))
 }
 
-/// `cancel` — cancel a scheduled event (ADR-040 §cancel).
+/// `cancel` — cancel a scheduled event.
 pub(crate) async fn handle_cancel(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -430,7 +518,27 @@ pub(crate) async fn handle_cancel(
         )));
     }
 
-    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+    // Require properties to be a JSON object (or absent — treated as `{}`).
+    // Mutable string-key indexing on a non-object value panics in serde_json;
+    // reject corrupt notes here with a clear error instead (SCH-AUD-001).
+    let raw_props = note.properties.clone().unwrap_or_else(|| json!({}));
+    let mut props = match raw_props {
+        Value::Object(_) => raw_props,
+        ref other => {
+            let type_name = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => unreachable!(),
+            };
+            return Err(RuntimeError::InvalidInput(format!(
+                "cancel: event {id} has malformed properties (expected JSON object, got \
+                 {type_name}); cannot mutate"
+            )));
+        }
+    };
     if props.get("status").and_then(Value::as_str) == Some("cancelled") {
         return Err(RuntimeError::InvalidInput(format!(
             "cancel: event {id} is already cancelled"

@@ -1,35 +1,8 @@
-//! EmbedderRegistry — pack-extensible embedding provider surface (ADR-031 extension).
+//! EmbedderRegistry — pack-extensible embedding provider surface.
 //!
-//! Packs can contribute custom embedding models at registration time by
-//! implementing [`EmbedderProvider`] and calling
-//! [`KhiveRuntime::register_embedder`]. The built-in lattice models
-//! (MiniLM, paraphrase, etc.) are pre-registered as [`LatticeEmbedderProvider`]
-//! instances during runtime construction and require no opt-in.
-//!
-//! # Extension contract
-//!
-//! ```ignore
-//! use khive_runtime::embedder_registry::{EmbedderProvider, EmbedderRegistry};
-//! use khive_runtime::{KhiveRuntime, RuntimeError};
-//! use lattice_embed::EmbeddingService;
-//! use std::sync::Arc;
-//! use async_trait::async_trait;
-//!
-//! struct MyProvider;
-//!
-//! #[async_trait]
-//! impl EmbedderProvider for MyProvider {
-//!     fn name(&self) -> &str { "my-custom-encoder" }
-//!     fn dimensions(&self) -> usize { 384 }
-//!     async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
-//!         // construct and return your EmbeddingService impl
-//!         todo!()
-//!     }
-//! }
-//! ```
-//!
-//! Register via `PackRuntime::register_embedders` (called by the transport after
-//! the pack is instantiated) or directly via `KhiveRuntime::register_embedder`.
+//! Packs implement [`EmbedderProvider`] and register custom models via
+//! [`KhiveRuntime::register_embedder`]. Built-in lattice models are pre-registered
+//! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
 use std::sync::Arc;

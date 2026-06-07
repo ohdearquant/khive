@@ -32,18 +32,7 @@ pub fn matches_link_type(link: &Link, filter: &Option<Vec<String>>) -> bool {
     }
 }
 
-/// Get neighbor links based on direction.
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `entity` - The entity to get neighbors for
-/// * `direction` - Which direction to follow edges
-///
-/// # Returns
-///
-/// Vector of links in the specified direction(s).
+/// Get neighbor links for `entity` in the given `direction`.
 pub async fn get_neighbors<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,
@@ -75,34 +64,7 @@ pub async fn get_neighbors<S: LinkStore>(
     links
 }
 
-/// Convert graph depth to proximity score.
-///
-/// Closer nodes (lower depth) get higher scores. This enables fusion with
-/// vector and keyword search results via RRF.
-///
-/// # Arguments
-///
-/// * `depth` - Distance from the start node (0 = start node itself)
-/// * `max_depth` - Maximum traversal depth configured
-///
-/// # Returns
-///
-/// A `DeterministicScore` in range [0.0, 1.0]:
-/// - depth=0 → 1.0 (at start node)
-/// - depth=max_depth → 0.0 (maximum distance)
-///
-/// # Edge Cases
-///
-/// When `max_depth = 0`:
-/// - depth=0 → 1.0 (only start node is reachable)
-/// - depth>0 → 0.0 (should not occur, but handled safely)
-///
-/// # Proof Correspondence
-///
-/// This function maintains the invariant:
-/// - `proximity_nonneg`: Result is always >= 0
-/// - `proximity_bounded`: Result is always <= 1.0
-/// - `proximity_mono`: Higher depth → lower score (monotonically decreasing)
+/// Convert graph depth to proximity score: `1 - depth/max_depth`, range `[0.0, 1.0]`.
 pub fn proximity_score(depth: usize, max_depth: usize) -> DeterministicScore {
     // Guard against division by zero
     if max_depth == 0 {
@@ -114,29 +76,19 @@ pub fn proximity_score(depth: usize, max_depth: usize) -> DeterministicScore {
     DeterministicScore::from_f64(proximity)
 }
 
-/// Get the neighbor entity from a link based on traversal direction and current node.
-///
-/// # Arguments
-///
-/// * `link` - The link to extract neighbor from
-/// * `current` - The current entity we're traversing from
-/// * `direction` - The traversal direction
-///
-/// # Returns
-///
-/// The entity at the "other end" of the link relative to the traversal direction.
-pub fn get_neighbor_entity(link: &Link, current: &EntityRef, direction: &Direction) -> EntityRef {
+/// Return the neighbor entity from `link` relative to `current` and `direction`. `None` if invalid endpoint.
+pub fn get_neighbor_entity(
+    link: &Link,
+    current: &EntityRef,
+    direction: &Direction,
+) -> Option<EntityRef> {
     match direction {
-        Direction::Out => link.target.clone(),
-        Direction::In => link.source.clone(),
-        Direction::Both => {
-            // In bidirectional mode, return the "other end" of the link
-            if &link.source == current {
-                link.target.clone()
-            } else {
-                link.source.clone()
-            }
-        }
+        Direction::Out if &link.source == current => Some(link.target.clone()),
+        Direction::In if &link.target == current => Some(link.source.clone()),
+        Direction::Both if &link.source == current => Some(link.target.clone()),
+        Direction::Both if &link.target == current => Some(link.source.clone()),
+        // current is not an endpoint of this link — skip it.
+        _ => None,
     }
 }
 
@@ -203,22 +155,57 @@ mod tests {
         let target = EntityRef::External("target".to_string());
         let link = Link::new(LinkId::NIL, source.clone(), target.clone(), "test");
 
-        // Outgoing: return target
-        assert_eq!(get_neighbor_entity(&link, &source, &Direction::Out), target);
-
-        // Incoming: return source
-        assert_eq!(get_neighbor_entity(&link, &target, &Direction::In), source);
-
-        // Both from source: return target (other end)
+        // Outgoing from source: return Some(target)
         assert_eq!(
-            get_neighbor_entity(&link, &source, &Direction::Both),
-            target
+            get_neighbor_entity(&link, &source, &Direction::Out),
+            Some(target.clone())
         );
 
-        // Both from target: return source (other end)
+        // Incoming from target: return Some(source)
+        assert_eq!(
+            get_neighbor_entity(&link, &target, &Direction::In),
+            Some(source.clone())
+        );
+
+        // Both from source: return Some(target) (other end)
+        assert_eq!(
+            get_neighbor_entity(&link, &source, &Direction::Both),
+            Some(target.clone())
+        );
+
+        // Both from target: return Some(source) (other end)
         assert_eq!(
             get_neighbor_entity(&link, &target, &Direction::Both),
-            source
+            Some(source.clone())
+        );
+    }
+
+    #[test]
+    fn test_get_neighbor_entity_unrelated_node_returns_none() {
+        let source = EntityRef::External("source".to_string());
+        let target = EntityRef::External("target".to_string());
+        let unrelated = EntityRef::External("unrelated".to_string());
+        let link = Link::new(LinkId::NIL, source.clone(), target.clone(), "test");
+
+        // Outgoing from an unrelated node: link.source != unrelated → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::Out),
+            None,
+            "Out direction: current must be source; unrelated node must return None"
+        );
+
+        // Incoming from an unrelated node: link.target != unrelated → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::In),
+            None,
+            "In direction: current must be target; unrelated node must return None"
+        );
+
+        // Both from an unrelated node: current is neither source nor target → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::Both),
+            None,
+            "Both direction: unrelated node must return None"
         );
     }
 

@@ -1,34 +1,4 @@
-//! Tunable hybrid search configuration — Brain Phase 7 substrate.
-//!
-//! `SearchConfig` is a per-call configuration that controls how vector and
-//! keyword results are retrieved and fused. It is the public API surface for
-//! `recall()` and compose's internal search phase.
-//!
-//! # Defaults (backward-compatible)
-//!
-//! `SearchConfig::default()` is designed to produce **identical results** to
-//! the pre-Phase-7 hardcoded search behavior: RRF with k=60, top_k=10,
-//! no min_score filter. Existing callers that do not supply a `SearchConfig`
-//! get the same behavior as before.
-//!
-//! # Presets
-//!
-//! | Preset | Strategy | vector_weight |
-//! |--------|----------|---------------|
-//! | `default()` / `hybrid_balanced()` | RRF (k=60) | 0.5 |
-//! | `vector_only()` | VectorOnly | 1.0 |
-//! | `keyword_only()` | KeywordOnly | 0.0 |
-//!
-//! # Usage in recall
-//!
-//! ```rust,ignore
-//! let opts = RecallOptions {
-//!     query: "metal inference kernel".to_string(),
-//!     search: Some(SearchConfig::vector_only()),
-//!     ..Default::default()
-//! };
-//! service.recall(opts).await?;
-//! ```
+//! Per-call hybrid search configuration (fusion strategy + top_k). Default: RRF k=60, top_k=10.
 
 use serde::{Deserialize, Serialize};
 
@@ -158,16 +128,20 @@ impl SearchConfig {
         self
     }
 
-    /// Set a minimum score filter.
+    /// Set a minimum score filter. Debug-asserts `min` is finite.
     #[must_use]
     pub fn with_min_score(mut self, min: f64) -> Self {
+        debug_assert!(min.is_finite(), "min_score must be finite, got {min}");
         self.min_score = Some(min);
         self
     }
 
     /// Compute the candidate pool size from `top_k * candidate_pool_multiplier`.
+    ///
+    /// Uses saturating multiplication to avoid overflow on pathological inputs.
     pub fn candidate_pool_size(&self) -> usize {
-        self.top_k * self.candidate_pool_multiplier.max(1)
+        self.top_k
+            .saturating_mul(self.candidate_pool_multiplier.max(1))
     }
 }
 

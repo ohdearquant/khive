@@ -5157,3 +5157,123 @@ async fn withdraw_cas_divergence_after_approval() {
         "CAS divergence: proposal must still be 'applied' after failed withdraw; items: {list}"
     );
 }
+
+// ---- KG pack edge endpoint extensions (ADR-002 v0.2.4) ----
+//
+// These tests verify the 7 new endpoint pairs declared in KG_EDGE_RULES.
+// Each test constructs a fixture with edge rules installed (mirroring what the
+// MCP transport does at startup per ADR-031) before calling link().
+
+fn pack_with_edge_rules() -> (Fixture, KhiveRuntime) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    (Fixture { registry }, rt)
+}
+
+/// person→org with part_of must succeed after edge rules are installed.
+#[tokio::test]
+async fn link_person_to_org_part_of_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let person = f
+        .dispatch(
+            "create",
+            json!({ "kind": "person", "name": "Alice Researcher" }),
+        )
+        .await
+        .expect("create person");
+    let org = f
+        .dispatch("create", json!({ "kind": "org", "name": "DeepMind" }))
+        .await
+        .expect("create org");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": person["id"],
+                "target_id": org["id"],
+                "relation": "part_of",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "person→org part_of must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "part_of");
+}
+
+/// org→org with depends_on must succeed after edge rules are installed.
+#[tokio::test]
+async fn link_org_to_org_depends_on_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let org_a = f
+        .dispatch("create", json!({ "kind": "org", "name": "SubsidiaryInc" }))
+        .await
+        .expect("create org_a");
+    let org_b = f
+        .dispatch("create", json!({ "kind": "org", "name": "ParentCorp" }))
+        .await
+        .expect("create org_b");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": org_a["id"],
+                "target_id": org_b["id"],
+                "relation": "depends_on",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "org→org depends_on must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "depends_on");
+}
+
+/// Regression: concept→concept extends must still work after adding KG edge rules.
+#[tokio::test]
+async fn link_concept_to_concept_extends_still_works() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let parent = f
+        .dispatch("create", json!({ "kind": "concept", "name": "Attention" }))
+        .await
+        .expect("create parent concept");
+    let child = f
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "FlashAttention" }),
+        )
+        .await
+        .expect("create child concept");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": child["id"],
+                "target_id": parent["id"],
+                "relation": "extends",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "concept→concept extends must still succeed (regression); got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "extends");
+}

@@ -85,3 +85,9 @@ npm/bin/khive-*
 
 # Codex review artifacts (local working notes, not part of the codebase)
 codex_review_*.md
+
+# Real-data recall benchmark corpus (extracted from khive-graph.db, never commit)
+crates/khive-pack-memory/tests/fixtures/
+
+uv.lock
+pyproject.toml

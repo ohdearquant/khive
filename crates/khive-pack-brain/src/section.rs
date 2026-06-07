@@ -1,3 +1,5 @@
+//! Section weight derivation — Thompson sampling and deterministic fallback.
+
 use std::collections::HashMap;
 
 use rand::Rng;

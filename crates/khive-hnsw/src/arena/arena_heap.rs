@@ -1,28 +1,10 @@
-//! Arena-backed binary heap.
-//!
-//! `ArenaBinaryHeap<'a, T>` provides min-heap or max-heap behavior backed
-//! by an `ArenaVec`. It implements the same operations as `std::BinaryHeap`
-//! (push, pop, peek, len, clear, drain) with identical algorithmic complexity.
-//!
-//! # Heap Ordering
-//!
-//! The heap uses `Ord` ordering. For a max-heap (default BinaryHeap behavior),
-//! use `T` directly. For a min-heap, wrap elements in `std::cmp::Reverse`.
-//!
-//! In the HNSW search context:
-//! - `candidates`: min-heap via `Reverse<(OrderedF32, usize)>` -- closest first
-//! - `results`: max-heap via `(OrderedF32, usize)` -- furthest first (for pruning)
+//! Arena-backed binary heap backed by `ArenaVec` (min or max, via `Ord` / `Reverse`).
 
 use super::arena::SearchArena;
 use super::arena_vec::ArenaVec;
 
-/// A binary heap backed by arena allocation.
-///
-/// This is a max-heap by default (like `std::BinaryHeap`). For a min-heap,
-/// wrap elements in `std::cmp::Reverse`.
-///
-/// Elements must be `Copy + Ord`. `Copy` because the backing `ArenaVec`
-/// requires it. `Ord` for heap ordering.
+/// A max-heap backed by arena allocation; wrap in `Reverse` for a min-heap.
+/// Elements must be `Copy + Ord`.
 pub struct ArenaBinaryHeap<'a, T: Copy + Ord> {
     data: ArenaVec<'a, T>,
 }
@@ -92,10 +74,7 @@ impl<'a, T: Copy + Ord> ArenaBinaryHeap<'a, T> {
         self.data.clear();
     }
 
-    /// Drain all elements from the heap (in arbitrary order).
-    ///
-    /// The returned iterator yields elements in storage order, NOT heap order.
-    /// If sorted order is needed, collect and sort separately.
+    /// Drain all elements in storage order (not heap order).
     pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         self.data.drain()
     }

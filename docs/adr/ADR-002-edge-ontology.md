@@ -256,6 +256,31 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 `annotates` is the only relation that crosses substrate kinds. Source is always a note.
 Target may be any existing UUID (entity, note, event, edge) in the caller's namespace.
 
+#### KG pack extensions (added v0.2.4)
+
+The KG pack extends the base endpoint contract via `EDGE_RULES` to cover
+person→org and org→org relationships common in research KGs:
+
+| Source   | Relation      | Target | Added  |
+| -------- | ------------- | ------ | ------ |
+| `Person` | `part_of`     | `Org`  | v0.2.4 |
+| `Person` | `instance_of` | `Org`  | v0.2.4 |
+| `Org`    | `depends_on`  | `Org`  | v0.2.4 |
+| `Org`    | `enables`     | `Org`  | v0.2.4 |
+| `Org`    | `contains`    | `Org`  | v0.2.4 |
+| `Org`    | `part_of`     | `Org`  | v0.2.4 |
+| `Org`    | `precedes`    | `Org`  | v0.2.4 |
+
+These are additive — the base contract is unchanged. Semantics:
+
+- `Person part_of Org` — a person is a member or employee of an org
+- `Person instance_of Org` — a person represents or embodies an org (e.g. a founder)
+- `Org depends_on Org` — one org depends on another (e.g. subsidiary dependency)
+- `Org enables Org` — one org enables another (e.g. incubator → startup)
+- `Org contains Org` — org hierarchy (e.g. parent company contains subsidiary)
+- `Org part_of Org` — inverse of contains; subsidiary is part of parent
+- `Org precedes Org` — temporal ordering without replacement (predecessor org)
+
 ## Edge Metadata
 
 `Edge.metadata` remains open JSON for relation-specific annotations. ADR-governed metadata

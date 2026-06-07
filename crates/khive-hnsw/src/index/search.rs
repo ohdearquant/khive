@@ -1,12 +1,10 @@
-//! Search operations for HNSW index.
-
 use crate::NodeId;
 use khive_score::DeterministicScore;
 
 use super::HnswIndex;
 use crate::config::DistanceMetric;
 use crate::distance::{cosine_distance_from_parts, score_from_distance, OrderedF32};
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::search_context::HnswSearchContext;
 
@@ -19,17 +17,11 @@ const EXACT_SCAN_THRESHOLD: usize = 3_000;
 // Inlined distance function type
 // ---------------------------------------------------------------------------
 
-/// Distance function signature: (query, query_norm, vector, vector_norm) -> distance.
-///
-/// Resolved once per search from `DistanceMetric` so the inner loop avoids a
-/// `match` dispatch per neighbor. The compiler can inline the concrete SIMD
-/// kernel through the function pointer on most targets.
+/// Distance function signature: `(query, query_norm, vector, vector_norm) -> distance`.
+/// Resolved once per search to avoid per-neighbor `match` dispatch.
 type DistanceFn = fn(&[f32], f32, &[f32], f32) -> f32;
 
-/// Resolve the metric enum to a concrete distance function pointer.
-///
-/// This is called once at the top of `search_layer_inner_ctx` so the hot loop
-/// uses a direct call instead of branching on `DistanceMetric` per neighbor.
+/// Resolve `DistanceMetric` to a concrete function pointer once per search.
 #[inline]
 fn resolve_distance_fn(metric: DistanceMetric) -> DistanceFn {
     match metric {
@@ -53,20 +45,14 @@ fn resolve_distance_fn(metric: DistanceMetric) -> DistanceFn {
 // Batch-4 distance helpers (query-vs-4-candidates HNSW fast path)
 // ---------------------------------------------------------------------------
 
-/// Check if a cached vector norm (the sqrt norm stored in HnswNode) is ≈ 1.0.
-///
-/// HNSW stores sqrt norms, so the squared norm is `norm²`. We apply the same
-/// 1e-4 threshold as `is_unit_norm` in `foundation/embed/src/simd/tier.rs`.
+/// Check if a cached sqrt norm is ≈ 1.0 (1e-4 threshold on the squared norm).
 #[inline]
 fn cached_norm_is_unit(norm: f32) -> bool {
     norm.is_finite() && ((norm * norm) - 1.0).abs() < 1e-4
 }
 
 /// Convert four dot products to HNSW distances using cached candidate norms.
-///
-/// For Cosine with unit query + unit candidate: `1 - dot.clamp(-1, 1)` (no sqrt/divide).
-/// For Cosine otherwise: `cosine_distance_from_parts` (full formula).
-/// For Dot: negate the dot (HNSW uses minimum-distance ordering).
+/// Unit-norm shortcut for Cosine; negates for Dot (min-distance ordering).
 #[inline]
 fn hnsw_distance_batch4_from_dots(
     metric: DistanceMetric,
@@ -96,17 +82,8 @@ fn hnsw_distance_batch4_from_dots(
 // Software prefetch helpers
 // ---------------------------------------------------------------------------
 
-/// Prefetch a memory region into L1 data cache (temporal, keep in cache).
-///
-/// On aarch64 this emits `PRFM PLDL1KEEP`; on x86_64 it emits `PREFETCHT0`.
-/// On other architectures the call is a no-op.
-///
-/// # Safety
-///
-/// The pointer does not need to be valid or aligned -- hardware prefetch
-/// instructions are advisory and silently ignore bad addresses (including
-/// null). The unsafe block is required only because we use inline asm /
-/// intrinsics.
+/// Prefetch a memory region into L1 data cache.
+/// Advisory hint — hardware silently ignores invalid addresses; pointer need not be valid.
 #[inline(always)]
 fn prefetch_read_data(ptr: *const f32) {
     #[cfg(target_arch = "aarch64")]
@@ -142,19 +119,7 @@ fn prefetch_read_data(ptr: *const f32) {
 }
 
 impl HnswIndex {
-    /// Search for k nearest neighbors.
-    ///
-    /// Returns results sorted by descending score (most similar first).
-    /// Tombstoned nodes are automatically filtered.
-    ///
-    /// Emits `hnsw.search.duration_ms`, `hnsw.search.count`, and
-    /// `hnsw.search.results` metrics when a sink is attached.
-    ///
-    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.search_complexity_log`
-    /// Search complexity is O(ef * log_M(N)) where:
-    /// - ef is the search expansion factor
-    /// - M is the number of neighbors per node
-    /// - N is the total number of nodes
+    /// Search for k nearest neighbors sorted by descending score; tombstones filtered automatically.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(NodeId, DeterministicScore)>> {
         let start = std::time::Instant::now();
 
@@ -192,16 +157,7 @@ impl HnswIndex {
         result
     }
 
-    /// Search for k nearest neighbors using a pre-allocated search context.
-    ///
-    /// This avoids per-query heap allocation by reusing buffers across searches.
-    /// For maximum throughput in batch/streaming scenarios, create one
-    /// `HnswSearchContext` and pass it to every search call.
-    ///
-    /// Returns results sorted by descending score (most similar first).
-    /// Tombstoned nodes are automatically filtered.
-    ///
-    /// Emits the same metrics as [`search`](Self::search).
+    /// Search using a pre-allocated context to avoid per-query heap allocation.
     pub fn search_with_context(
         &self,
         query: &[f32],
@@ -264,6 +220,7 @@ impl HnswIndex {
                 actual: query.len(),
             });
         }
+        validate_finite_vector(query)?;
 
         if self.nodes.is_empty() {
             return Ok(Vec::new());
@@ -360,10 +317,8 @@ impl HnswIndex {
         Ok(search_results)
     }
 
-    /// Exact linear scan for small indexes (n <= EXACT_SCAN_THRESHOLD).
-    ///
-    /// Uses the batch-4 SIMD dot kernel for throughput. For Cosine and Dot metrics
-    /// only — the early-exit condition in search_inner_with_ctx enforces this.
+    /// Exact linear scan for small indexes (n <= EXACT_SCAN_THRESHOLD) using batch-4 SIMD dot.
+    /// Cosine and Dot metrics only — enforced by the early-exit in `search_inner_with_ctx`.
     fn exact_scan_top_k(
         &self,
         query: &[f32],
@@ -432,10 +387,22 @@ impl HnswIndex {
 
         let effective_k = k.min(scored.len());
         if scored.len() > effective_k {
-            scored.select_nth_unstable_by(effective_k - 1, |(_, a), (_, b)| b.cmp(a));
+            // Tie-break by external NodeId to match graph-search determinism.
+            scored.select_nth_unstable_by(effective_k - 1, |(iid_a, a), (iid_b, b)| {
+                match b.cmp(a) {
+                    std::cmp::Ordering::Equal => {
+                        self.external_id(*iid_a).cmp(&self.external_id(*iid_b))
+                    }
+                    other => other,
+                }
+            });
             scored.truncate(effective_k);
         }
-        scored.sort_by(|(_, a), (_, b)| b.cmp(a));
+        // Sort descending by score; equal scores broken by external NodeId (matches graph search).
+        scored.sort_by(|(iid_a, a), (iid_b, b)| match b.cmp(a) {
+            std::cmp::Ordering::Equal => self.external_id(*iid_a).cmp(&self.external_id(*iid_b)),
+            other => other,
+        });
 
         Ok(scored
             .into_iter()
@@ -443,12 +410,7 @@ impl HnswIndex {
             .collect())
     }
 
-    /// Find a live (non-tombstoned) node by searching neighbors of the given
-    /// node across all layers. Returns `None` only if every reachable neighbor
-    /// and every node in the index is tombstoned.
-    ///
-    /// Complexity: O(M * L) in the typical case (M = neighbors per layer,
-    /// L = layers). Falls back to O(N) scan only if all neighbors are dead.
+    /// Find a live (non-tombstoned) neighbor node; O(M·L) typical, O(N) fallback only when all neighbors are dead.
     fn find_live_neighbor(&self, node_id: usize) -> Option<usize> {
         let node = &self.nodes[node_id];
         // Check neighbors from highest layer down (higher layers have better
@@ -465,16 +427,8 @@ impl HnswIndex {
         (0..self.nodes.len()).find(|&iid| !self.is_tombstoned(iid))
     }
 
-    /// Compute overscan factors based on tombstone ratio.
-    ///
-    /// Returns `(effective_k, effective_ef)` where both are scaled up
-    /// proportionally to compensate for tombstoned nodes that will be
-    /// filtered from results.
-    ///
-    /// Previously only `k` was scaled, which had no effect when
-    /// `ef_search >> k` (the common case). Now `ef_search` is also scaled
-    /// so the beam width expands to compensate for dead nodes encountered
-    /// during graph traversal.
+    /// Compute overscan factors `(effective_k, effective_ef)` scaled by tombstone ratio.
+    /// Both k and ef_search are scaled so beam width compensates for dead nodes in traversal.
     pub(super) fn compute_overscan(&self, k: usize) -> (usize, usize) {
         let stats = self.tombstone_stats();
         if stats.tombstone_count == 0 {
@@ -488,21 +442,21 @@ impl HnswIndex {
 
         let inv_live = 1.0 / live_ratio;
 
+        // Use saturating arithmetic to avoid overflow when inv_live is very large.
+        // Cap at k * 4 and ef_search * 4 using saturating_mul.
         let overscan_k = (k as f64 * inv_live).ceil() as usize;
-        let effective_k = overscan_k.min(k * 4).max(k);
+        let k_cap = k.saturating_mul(4);
+        let effective_k = overscan_k.min(k_cap).max(k);
 
         let overscan_ef = (self.config.ef_search as f64 * inv_live).ceil() as usize;
-        let effective_ef = overscan_ef
-            .min(self.config.ef_search * 4)
-            .max(self.config.ef_search);
+        let ef_cap = self.config.ef_search.saturating_mul(4);
+        let effective_ef = overscan_ef.min(ef_cap).max(self.config.ef_search);
 
         (effective_k, effective_ef)
     }
 
-    /// Search a single layer for nearest neighbors (allocates fresh buffers).
-    ///
-    /// Used by insert path where a search context is not available.
-    /// Returns (distance, internal_id) pairs.
+    /// Search a single layer for nearest neighbors; allocates fresh buffers.
+    /// Returns `(distance, internal_id)` pairs.
     pub(crate) fn search_layer(
         &self,
         query: &[f32],
@@ -514,8 +468,7 @@ impl HnswIndex {
         self.search_layer_inner(query, query_norm, entry_points, ef, layer, false)
     }
 
-    /// Internal search implementation with tombstone filtering option.
-    /// Allocates fresh buffers -- used by the insert path.
+    /// Internal search with tombstone filtering option; allocates fresh buffers for the insert path.
     pub(super) fn search_layer_inner(
         &self,
         query: &[f32],
@@ -539,20 +492,8 @@ impl HnswIndex {
         std::mem::take(&mut ctx.result_buf)
     }
 
-    /// Core search implementation using pre-allocated buffers.
-    ///
-    /// Results are written into `ctx.result_buf`, sorted by distance ascending
-    /// with deterministic tie-breaking by external NodeId.
-    ///
-    /// This is the hot path. Optimizations applied:
-    /// - Pre-allocated visited set with O(1) generation-counter clear
-    /// - O(1) array indexing via dense usize IDs (no HashMap probing)
-    /// - Cached worst-distance to avoid heap peek per neighbor
-    /// - Tombstone check skipped entirely when tombstone set is empty
-    /// - Early termination when candidate distance exceeds worst result
-    /// - Inlined distance dispatch: metric resolved to function pointer once
-    /// - Batch neighbor processing with software prefetch pipelining
-    /// - (Optional) INT8 quantized pre-filter: skip f32 for obviously distant neighbors
+    /// Core search using pre-allocated buffers; writes sorted results into `ctx.result_buf`.
+    // REASON: argument count reflects distinct algorithm degrees of freedom; wrapper struct adds hot-path indirection.
     #[allow(clippy::too_many_arguments)]
     fn search_layer_inner_ctx(
         &self,
@@ -825,10 +766,3 @@ impl HnswIndex {
             });
     }
 }
-
-// NOTE ON SORTED NEIGHBORS: Sorting neighbor lists by distance was evaluated. It adds
-// O(M log M) work per connection during insert. With dense Vec-based node storage,
-// neighbors are already accessed via O(1) array index. Sorting could improve early
-// termination in the distance computation phase but the benefit is marginal.
-// The `sort_neighbors` method is preserved for future use with post-rebuild batch
-// optimization, but is not called on the insert hot path.

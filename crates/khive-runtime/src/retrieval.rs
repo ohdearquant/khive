@@ -1,6 +1,4 @@
 //! Retrieval operations: local embedding generation and hybrid search with RRF fusion.
-//!
-//! See ADR-012 — Retrieval Architecture.
 
 use std::collections::{HashMap, HashSet};
 
@@ -330,7 +328,7 @@ impl KhiveRuntime {
 
     /// Backfill vector and FTS index entries for entities and notes that are missing them.
     ///
-    /// Intended to run once at startup as a background task (ADR-043 §8, steps 2–4).
+    /// Intended to run once at startup as a background task (warm-up sequence steps 2–4).
     /// Queries the SQL substrate for entity descriptions and note contents that have no
     /// corresponding entry in the vector store for any registered embedding model, then
     /// embeds and inserts them. FTS entries missing for notes are also repopulated.
@@ -600,8 +598,7 @@ impl KhiveRuntime {
     /// A vector entry is orphaned when its `subject_id` no longer exists as a
     /// live row in the entity or note tables (i.e. either the row is absent or
     /// has `deleted_at IS NOT NULL`). Orphaned entries accumulate after
-    /// hard-deletes because the vector store and SQL substrate are decoupled
-    /// (ADR-044 §rationale).
+    /// hard-deletes because the vector store and SQL substrate are decoupled.
     ///
     /// Iterates over every registered embedding model and calls
     /// [`VectorStore::orphan_sweep`] for the token's namespace. Models whose
