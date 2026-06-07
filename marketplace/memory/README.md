@@ -12,10 +12,10 @@ to a source entity or note.
 All verbs are dispatched through the single MCP `request` tool
 ([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
 
-| Verb                                                                                                        | What it does                                                             |
-| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, namespace?, tags?)`           | Store a memory note with salience and decay metadata.                    |
-| `memory.recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?, presentation?)` | Search memory notes only, then rank by relevance, salience, and recency. |
+| Verb                                                                                                                                                                                          | What it does                                                              |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `memory.remember(content, salience?, decay_factor?, memory_type?, source_id?, embedding_model?, tags?)`                                                                                       | Store a memory note with salience and decay metadata.                     |
+| `memory.recall(query, limit?, top_k?, min_score?, score_floor?, min_salience?, memory_type?, fusion_strategy?, embedding_model?, include_breakdown?, entity_names?, full_content?, tags?, tag_mode?)` | Search memory notes only, then rank by relevance, salience, and recency.  |
 
 Memory types (`memory_type` values):
 
@@ -27,17 +27,15 @@ Memory types (`memory_type` values):
 `memory.recall` results include a score triplet: `score` (absolute relevance, `[0.0, 1.0]`),
 `rank_score` (composite ordering score, `[0.0, 1.0]`), and `raw_score` (pre-fusion vector cosine
 similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bounded to `[0.0, 1.0]`.
-Passing `presentation="verbose"` adds a per-component `breakdown` field; `presentation` defaults to
-`"agent"` when omitted.
+The default fusion strategy is `weighted`. Pass `include_breakdown=true` to include a per-component
+`breakdown` field (relevance, salience contributions, temporal).
 
-## What's New in 0.2.3
+Fusion strategies (`fusion_strategy` values): `weighted` (default), `rrf`, `union`, `vector_only`,
+`keyword_only`. Composite scores are always `[0.0, 1.0]` regardless of strategy.
 
-- **Tags filter on recall**: `memory.recall` now accepts `tags` and `tag_mode` (`any` or `all`)
-  parameters to filter recalled memories by tag values.
-- **`include_embeddings` on recall**: pass `include_embeddings=true` to include raw embedding
-  vectors in recall results (useful for downstream reranking or clustering).
-- **`presentation` alias removed**: the deprecated `presentation` positional alias on `recall` is
-  removed; use the standard `presentation` field on the `request` call instead.
+`top_k` overrides `limit` (max 100). `score_floor` is an alias for `min_score`. `entity_names`
+accepts an array of entity name strings and applies a 1.3× boost to matching memories.
+`full_content=true` (default) returns the full memory body; set to `false` for compact listings.
 
 ## Skills
 

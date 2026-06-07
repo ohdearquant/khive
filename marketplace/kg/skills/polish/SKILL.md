@@ -95,6 +95,7 @@ List edges from high-value entities:
 ```
 list(kind="edge", source_id="<entity-id>")
 list(kind="edge", target_id="<entity-id>")
+list(kind="edge", source_id="<entity-id>", relations=["introduced_by", "extends"])  # filter by relation type
 ```
 
 Check for:

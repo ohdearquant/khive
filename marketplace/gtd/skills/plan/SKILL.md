@@ -95,13 +95,13 @@ request(ops="gtd.transition(id=\"<id>\", status=\"cancelled\", note=\"weekly pla
 If the review reveals work that is not already captured, create concrete tasks immediately:
 
 ```
-request(ops="gtd.assign(title=\"Write release notes for memory plugin\", priority=\"p1\", status=\"next\", description=\"Follow-up from weekly planning\")")
+request(ops="gtd.assign(title=\"Write release notes for memory plugin\", priority=\"p1\", status=\"next\", tags=[\"weekly-plan\"])")
 ```
 
 When delegating, set an assignee:
 
 ```
-request(ops="gtd.assign(title=\"Verify KG agent queue syntax\", assignee=\"critic\", priority=\"p1\", status=\"next\", tags=[\"weekly-plan\",\"verification\"])")
+request(ops="gtd.assign(title=\"Verify KG agent queue syntax\", assignee=\"critic\", priority=\"p1\", status=\"next\", tags=[\"weekly-plan\", \"verification\"])")
 ```
 
 ### 6. Confirm the plan

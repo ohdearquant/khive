@@ -49,13 +49,13 @@ Default is `agent` (token-efficient) for MCP callers.
 | `brain.activate(profile_id)`                               | Move a profile to Active — starts the live update loop.         |
 | `brain.deactivate(profile_id)`                             | Move a profile to Inactive — stops live updates, retains state. |
 | `brain.archive(profile_id)`                                | Move a profile to Archived — read-only, audit-retained.         |
-| `brain.feedback(target_id, signal, served_by_profile_id?)` | Emit a FeedbackExplicit event and update posteriors.            |
+| `brain.feedback(target_id, signal, served_by_profile_id?, section_signals?)` | Emit a FeedbackExplicit event and update posteriors. |
 
 ### Write binding / declaration
 
 | Verb                                                                    | What it does                                              |
 | ----------------------------------------------------------------------- | --------------------------------------------------------- |
-| `brain.create_profile(name, description?, consumer_kind?)`              | Create a new Bayesian profile; starts in Inactive state.  |
+| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | Create a new Bayesian profile; starts in Inactive state. |
 | `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | Write a row in the profile resolution table.              |
 | `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows (at least one filter required).               |
 | `brain.reset(profile_id?)`                                              | Reset posteriors to priors; increments exploration_epoch. |

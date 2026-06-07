@@ -16,7 +16,7 @@ applies for a given caller.
 | `brain.profile(profile_id)`                                       | Full profile record with state snapshot.             |
 | `brain.resolve(consumer_kind, actor?, namespace?)`                | Which profile would serve this caller?               |
 | `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)` | List binding rows, optionally filtered.              |
-| `brain.create_profile(name, description?, consumer_kind?)`        | Create a new Bayesian profile (starts Inactive).     |
+| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | Create a new Bayesian profile (starts Inactive). |
 
 ## Workflow
 
@@ -93,7 +93,7 @@ calling `brain.resolve`.
 ### brain.create_profile — create a new profile
 
 Required arg: `name` (alphanumeric and hyphens, e.g. `"my-profile-v1"`). Optional: `description`,
-`consumer_kind` (default `"recall"`).
+`consumer_kind` (default `"recall"`), `seed_priors` (object to override default Beta priors).
 
 ```
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")

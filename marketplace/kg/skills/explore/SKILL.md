@@ -32,6 +32,10 @@ search(kind="note", query="<topic>")
 Entity search finds concepts/papers/projects by name and description. Note search finds
 observations/insights/decisions by content (excludes superseded notes automatically).
 
+Narrow results with optional filters: `tags=["<tag>"]`, `entity_kind="concept"`,
+`min_score=0.5` (0–1 relevance threshold), `include_superseded=true` (to surface superseded
+notes explicitly). Use `properties={"domain": "attention"}` to post-filter by JSON properties.
+
 ### 2. Expand from hits
 
 For each relevant entity found:
@@ -70,6 +74,7 @@ query(query="MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RET
 - For JSON properties: use `a.domain`, `a.type` etc. (accessed via json_extract internally)
 - `RETURN a.properties` gets the full JSON blob
 - NOT supported: `WHERE NOT`, `COUNT`, `ORDER BY`, `[*..N]` variable-length without min
+- The outer `limit?` param defaults to 500, hard cap 10000. Use `LIMIT N` in the GQL string for tighter control.
 - Relations in patterns: use the 15 canonical relation names
 
 ### 4. Narrate

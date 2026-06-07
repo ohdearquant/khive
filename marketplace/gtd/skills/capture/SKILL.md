@@ -29,13 +29,7 @@ request(ops="gtd.assign(title=\"<title>\", priority=\"p2\")")
 Default priority is `p2`. Use `p0`/`p1` only if you genuinely want it pushed up in `next` listings.
 `p3` for "nice to have, no pressure".
 
-### 3. Add context if it's not in your head
-
-If you might forget _why_ this matters, add a description:
-
-```
-request(ops="gtd.assign(title=\"<title>\", priority=\"p1\", description=\"<one-sentence why>\")")
-```
+### 3. Add a deadline if it's real
 
 If there's a deadline, set it — but only if it's a real deadline, not aspirational:
 
@@ -70,7 +64,7 @@ Resist:
 | Situation                                               | Verb                                                                                                                                                                   |
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | "Can I act on this right now?" — actually start working | `gtd.transition(id=..., status="active")`                                                                                                                              |
-| "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` + describe blocker in `description`                                                                                                |
+| "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` — note the blocker in the title or a `gtd.transition` note later                                                                  |
 | "Maybe someday, not now"                                | `gtd.assign(..., status="someday")`                                                                                                                                    |
 | Need to record several together and link dependencies   | capture the blocker first, then `gtd.assign(..., depends_on=[blocker_full_id])` for the dependent task — the property and the `depends_on` graph edge both get written |
 

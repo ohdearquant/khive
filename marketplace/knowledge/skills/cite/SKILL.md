@@ -18,8 +18,8 @@ request(ops="knowledge.cite(concept_id=\"<concept_uuid>\", source_id=\"<document
 
 | Parameter    | Type   | Required | Description                                                        |
 | ------------ | ------ | -------- | ------------------------------------------------------------------ |
-| `concept_id` | string | yes      | Full UUID or 8-char prefix of the concept.                         |
-| `source_id`  | string | yes      | Full UUID or 8-char prefix of the source (`document` or `person`). |
+| `concept_id` | string | yes      | Full UUID of the concept entity.                                   |
+| `source_id`  | string | yes      | Full UUID of the source entity; must be kind `document` or `person`. |
 | `weight`     | float  | no       | Edge weight in `[0.0, 1.0]`. Default: `1.0` (definitional).        |
 
 ## Response shape

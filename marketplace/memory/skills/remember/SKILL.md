@@ -67,6 +67,9 @@ request(ops="memory.remember(content=\"ADR-036 defines recall as memory-scoped r
 
 `source_id` creates an `annotates` relationship from the memory note to the source.
 
+Pass `embedding_model` to select a non-default encoder for this memory (the same model should be
+used at recall time to ensure comparable vectors).
+
 ### 5. Verify retrievability
 
 After storing important memory, check that a future query can find it:

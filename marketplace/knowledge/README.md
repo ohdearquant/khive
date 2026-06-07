@@ -2,41 +2,59 @@
 
 Structured knowledge management on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-The knowledge pack provides three focused verbs for registering concepts, recording provenance, and
-browsing by domain — all built on the kg substrate without duplicating storage.
+The knowledge pack provides verbs for managing research concepts and knowledge atoms — all built
+on the kg substrate without duplicating storage. This README covers the 10 most commonly used
+verbs. Run `verbs(pack="knowledge")` for the full surface (18 verbs total).
 
 ## Why this pack exists
 
 The `kg` pack gives you direct CRUD for any entity kind (`create`, `link`, `search`). The knowledge
-pack adds **opinionated sugar** for the specific pattern of managing research concepts:
+pack adds **opinionated sugar** for two distinct patterns:
 
+**Concept management** (built on the kg substrate):
 - `learn` = `create(kind="concept")` with automatic `domain` → tag promotion (makes domain
   filterable via FTS and the `domain=` parameter on `topic`).
-- `cite` = `link(relation="introduced_by")` with weight clamped to [0, 1] and a cleaner parameter
-  name (`concept_id` / `source_id` instead of `source_id` / `target_id`).
+- `cite` = `link(relation="introduced_by")` with weight clamped to [0, 1] and cleaner parameter
+  names (`concept_id` / `source_id` instead of `source_id` / `target_id`).
 - `topic` = `search(kind="concept")` with optional post-filter on the domain tag.
 
-Use the knowledge pack when you want the auto-promotion and concise API. Use `kg` verbs directly
-when you need other entity kinds, relations, or full parameter control.
+**Atom management** (lore/knowledge atoms, distinct from the KG entity store):
+- `upsert_atoms`, `edit`, `list`, `get`, `delete_atoms` — CRUD for structured knowledge atoms
+  (markdown-chunked documents with sections).
+- `search` — hybrid FTS + embedding search with optional reranking.
+- `stats` — counts across atoms, domains, and embeddings.
+
+Use the knowledge pack when you want auto-promotion for concepts or atom-based document storage.
+Use `kg` verbs directly when you need other entity kinds, relations, or full parameter control.
 
 ## Verbs
 
 All verbs are dispatched through the single MCP `request` tool.
 
-| Verb                                                  | What it does                                                                                                                        |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `knowledge.learn(name, description?, domain?, tags?)` | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability.     |
-| `knowledge.cite(concept_id, source_id, weight?)`      | Create an `introduced_by` edge from a concept to its source document or person. `weight` is clamped to [0.0, 1.0]; defaults to 1.0. |
-| `knowledge.topic(domain?, query?, limit?)`            | List or search concept entities, optionally filtered by domain tag. `limit` max is 100; defaults to 20.                             |
+### Concept management
 
-## What's New in 0.2.3
+| Verb | Params | What it does |
+| ---- | ------ | ------------ |
+| `knowledge.learn` | `name` (required), `description?`, `domain?`, `tags?` | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability. |
+| `knowledge.cite` | `concept_id` (required UUID), `source_id` (required UUID, must be `document` or `person`), `weight?` (float, default 1.0) | Create an `introduced_by` edge from a concept to its source. `weight` clamped to [0.0, 1.0]. |
+| `knowledge.topic` | `domain?`, `query?`, `limit?` (default 20, max 100) | List or search concept entities, optionally filtered by domain tag. |
 
-- **Score normalization**: all search/topic scores are now normalized to `[0, 1]` for consistent
-  cross-query comparison.
-- **`rerank=true` default**: `knowledge.topic` and `knowledge.search` now default to `rerank=true`,
-  producing cleaner relevance ordering out of the box.
-- **FTS5 special character hardening**: queries containing parentheses, colons, quotes, and other
-  FTS5 metacharacters are escaped automatically instead of returning parse errors.
+### Atom management
+
+| Verb | Params | What it does |
+| ---- | ------ | ------------ |
+| `knowledge.upsert_atoms` | `atoms` (required, array of `{slug, name, content, description?, tags?, properties?, finalized?}`), `chunk_size?` | Create or update knowledge atoms. Field is `content` (not `body`). |
+| `knowledge.edit` | `id` (required, UUID or slug), `sections` (required, array of `{section_type, content, heading?, sort_order?}`) | Upsert sections within an atom. Sections are identified by `section_type`; existing sections with matching type are replaced. |
+| `knowledge.list` | `type?` (`"atom"` or `"domain"`, default `"atom"`), `limit?` (default 20, max 500), `offset?` | Paginate atoms or domains. |
+| `knowledge.get` | `id` (required, UUID or slug) | Fetch a single atom or domain by UUID or slug. Short UUID prefix is NOT supported — use full UUID or slug. |
+| `knowledge.delete_atoms` | `ids` (required, array of slugs or UUIDs) | Delete atoms by slug or UUID. Param is `ids` (not `slugs`). |
+
+### Search and retrieval
+
+| Verb | Params | What it does |
+| ---- | ------ | ------------ |
+| `knowledge.search` | `query` (required), `type?` (`"atom"` or `"domain"`), `role?`, `limit?` (default 10, max 100), `min_score?`, `weights?`, `decompose?` (boolean), `decompose_threshold?`, `intersection_bonus?`, `rerank?` (default true), `rerank_alpha?` (default 0.7) | Hybrid FTS + embedding search over atoms/domains. `rerank=true` blends TF-IDF and embedding scores via `rerank_alpha` (0 = pure embedding, 1 = pure TF-IDF). |
+| `knowledge.stats` | (none) | Atom, domain, and embedding counts. |
 
 ## Skills
 
