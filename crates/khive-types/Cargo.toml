@@ -1,0 +1,27 @@
+[package]
+name = "khive-types"
+description = "Core type primitives: Id128, Timestamp, Namespace, and the 3 substrate data types (Note, Entity, Event)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# std is included in default so the crate is usable without explicit feature selection.
+# serde is optional — removed from default so `khive-types` is truly no_std-optional.
+# All internal dependents that need serde must declare `features = ["serde"]` explicitly.
+default = ["std"]
+serde = ["dep:serde", "dep:serde_json"]
+std = []
+blake3 = ["dep:blake3"]
+
+[dependencies]
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true, default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }

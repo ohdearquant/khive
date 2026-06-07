@@ -1,0 +1,32 @@
+[package]
+name = "khive-pack-comm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Communication pack — inter-agent messaging (send, inbox, read, reply, thread) (ADR-040)"
+
+[dependencies]
+khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.5", path = "../khive-runtime" }
+khive-storage = { version = "0.2.5", path = "../khive-storage" }
+inventory = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "comm_bench"
+harness = false

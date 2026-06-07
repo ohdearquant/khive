@@ -1,0 +1,46 @@
+[package]
+name = "khive-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "khive stdio MCP server — the only user-facing Rust binary"
+
+[dependencies]
+khive-runtime = { version = "0.2.5", path = "../khive-runtime" }
+khive-request = { version = "0.2.5", path = "../khive-request" }
+khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.2.5", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.2.5", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.2.5", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.2.5", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.2.5", path = "../khive-pack-schedule" }
+khive-pack-knowledge = { version = "0.2.5", path = "../khive-pack-knowledge" }
+inventory = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-io"] }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
+khive-types = { version = "0.2.5", path = "../khive-types" }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+khive-pack-knowledge = { version = "0.2.5", path = "../khive-pack-knowledge" }
+
+[[bin]]
+name = "khive-mcp"
+path = "src/main.rs"

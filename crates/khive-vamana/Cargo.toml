@@ -1,0 +1,26 @@
+[package]
+name = "khive-vamana"
+description = "Batch-built Vamana ANN index for pre-normalized vector search."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "vamana_bench"
+harness = false

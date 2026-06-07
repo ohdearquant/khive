@@ -1,0 +1,48 @@
+[package]
+name = "khive-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "SQLite storage backend: entities, edges, notes, events, FTS5, sqlite-vec vectors."
+
+[dependencies]
+khive-storage = { version = "0.2.5", path = "../khive-storage" }
+khive-score = { version = "0.2.5", path = "../khive-score" }
+khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
+crossbeam-queue = "0.3"
+parking_lot = { workspace = true }
+sqlite-vec = { version = "0.1.9", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
+khive-storage = { version = "0.2.5", path = "../khive-storage" }
+khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
+uuid = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "db_hot_path"
+harness = false
+path = "benches/db_hot_path.rs"
+required-features = ["vectors"]
+
+[features]
+default = []
+vectors = ["dep:sqlite-vec"]

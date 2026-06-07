@@ -1,0 +1,651 @@
+//! `kkernel kg export` and `kkernel kg import` — archive round-trip operations.
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_storage::EdgeRelation;
+use khive_types::EntityKind;
+use khive_vcs_adapters::{EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter};
+use uuid::Uuid;
+
+use super::types::{ExportArgs, ImportArgs, ImportFormat};
+
+pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
+    let ns = Namespace::parse(&args.namespace)?;
+
+    // Refuse to clobber the source database with the JSON export.
+    // Resolve the output's real identity: canonicalize it directly when it
+    // already exists (this follows an existing symlink to its target), else
+    // canonicalize the parent and rejoin the file name. Compare literally too so
+    // `./x.db` vs `x.db` can't slip through.
+    let db_canon = std::fs::canonicalize(&args.db).ok();
+    let out_canon = std::fs::canonicalize(&args.output).ok().or_else(|| {
+        args.output
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .map(|p| p.join(args.output.file_name().unwrap_or_default()))
+    });
+    if args.output == args.db || (db_canon.is_some() && db_canon == out_canon) {
+        anyhow::bail!(
+            "refusing to export: --output {} resolves to the --db path {} (would overwrite the database)",
+            args.output.display(),
+            args.db.display(),
+        );
+    }
+
+    let config = RuntimeConfig {
+        db_path: Some(args.db.clone()),
+        default_namespace: ns.clone(),
+        embedding_model: None,
+        ..Default::default()
+    };
+    let runtime = KhiveRuntime::new(config)?;
+    let token = runtime.authorize(ns)?;
+
+    let json = runtime
+        .export_kg_json(&token)
+        .await
+        .with_context(|| format!("export namespace {:?}", args.namespace))?;
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+    // Write through a temp sibling + atomic rename so a symlinked --output is
+    // replaced rather than followed into the source DB. The temp is created with
+    // O_EXCL (create_new): a pre-existing temp path — including a planted symlink
+    // to the DB — fails the create rather than being followed, closing the whole
+    // symlink-overwrite class, not just --output itself.
+    use std::io::Write as _;
+    let mut tmp_name = args.output.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.inprogress", std::process::id()));
+    let tmp = args.output.with_file_name(tmp_name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create temp {}", tmp.display()))?;
+    f.write_all(json.as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    f.sync_all().ok();
+    drop(f);
+    std::fs::rename(&tmp, &args.output)
+        .with_context(|| format!("finalize {}", args.output.display()))?;
+    Ok(())
+}
+
+pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
+    let ns = Namespace::parse(&args.namespace)?;
+    let config = RuntimeConfig {
+        db_path: Some(args.db.clone()),
+        default_namespace: ns.clone(),
+        embedding_model: None,
+        ..Default::default()
+    };
+    let runtime = KhiveRuntime::new(config)?;
+    let token = runtime.authorize(ns)?;
+
+    let source = std::fs::read_to_string(&args.source)
+        .with_context(|| format!("read {}", args.source.display()))?;
+
+    let summary = match args.format {
+        ImportFormat::Archive => {
+            let archive: KgArchive = serde_json::from_str(&source)
+                .with_context(|| format!("parse archive {}", args.source.display()))?;
+            validate_archive_entity_kinds(&archive)?;
+            runtime
+                .import_kg(&archive, &token)
+                .await
+                .with_context(|| format!("import archive {}", args.source.display()))?
+        }
+        ImportFormat::Json | ImportFormat::Ndjson => {
+            let input = match args.format {
+                ImportFormat::Json => source,
+                ImportFormat::Ndjson => ndjson_to_json_array(&source)?,
+                ImportFormat::Archive => unreachable!(),
+            };
+            let mut adapter = JsonFormatAdapter::new(&input)
+                .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            if args.verbose {
+                for warning in adapter.warnings() {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            let entities: Vec<EntityRecord> = adapter
+                .entities()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let edges: Vec<EdgeRecord> = adapter
+                .edges()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let archive = adapter_records_to_archive(&args.namespace, entities, edges)?;
+            runtime
+                .import_kg(&archive, &token)
+                .await
+                .with_context(|| format!("import adapter records {}", args.source.display()))?
+        }
+    };
+
+    let json = serde_json::to_string(&summary).expect("serialize ImportSummary");
+    println!("{json}");
+    Ok(())
+}
+
+fn ndjson_to_json_array(source: &str) -> Result<String> {
+    let mut values = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse NDJSON line {}", idx + 1))?;
+        values.push(value);
+    }
+    serde_json::to_string(&values).context("serialize NDJSON records as JSON array")
+}
+
+fn adapter_records_to_archive(
+    namespace: &str,
+    entities: Vec<EntityRecord>,
+    edges: Vec<EdgeRecord>,
+) -> Result<KgArchive> {
+    let now = Utc::now();
+    let entity_ids: HashSet<Uuid> = entities.iter().map(|e| e.id).collect();
+
+    let exported_entities: Vec<ExportedEntity> = entities
+        .into_iter()
+        .map(|e| {
+            let _: EntityKind = e.kind.parse().map_err(|_| {
+                anyhow::anyhow!("unknown entity kind {:?} on entity {}", e.kind, e.id)
+            })?;
+            Ok(ExportedEntity {
+                id: e.id,
+                kind: e.kind,
+                entity_type: None,
+                name: e.name,
+                description: e.description,
+                properties: if e.properties.is_null() {
+                    None
+                } else {
+                    Some(e.properties)
+                },
+                tags: e.tags,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let exported_edges = edges
+        .into_iter()
+        .map(|edge| adapter_edge_to_exported(edge, &entity_ids))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(KgArchive {
+        format: "khive-kg".to_string(),
+        version: "0.1".to_string(),
+        namespace: namespace.to_string(),
+        exported_at: now,
+        entities: exported_entities,
+        edges: exported_edges,
+    })
+}
+
+/// Validate that a deserialized edge weight is finite and within [0.0, 1.0].
+pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display) -> Result<()> {
+    if !weight.is_finite() {
+        bail!(
+            "edge {} weight {weight} is not finite (NaN or infinity not allowed)",
+            edge_id
+        );
+    }
+    if !(0.0..=1.0).contains(&weight) {
+        bail!(
+            "edge {} weight {weight} is outside the valid range [0.0, 1.0]",
+            edge_id
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_archive_entity_kinds(archive: &KgArchive) -> Result<()> {
+    for e in &archive.entities {
+        let _: EntityKind = e
+            .kind
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown entity kind {:?} on entity {}", e.kind, e.id))?;
+    }
+    for edge in &archive.edges {
+        validate_edge_weight(edge.weight, edge.edge_id)?;
+    }
+    Ok(())
+}
+
+fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Result<ExportedEdge> {
+    let source = edge
+        .source
+        .parse::<Uuid>()
+        .with_context(|| format!("edge {} source must be a UUID", edge.edge_id))?;
+    let target = edge
+        .target
+        .parse::<Uuid>()
+        .with_context(|| format!("edge {} target must be a UUID", edge.edge_id))?;
+    if !entity_ids.contains(&source) {
+        bail!(
+            "edge {} source {} is not present in adapter entities",
+            edge.edge_id,
+            source
+        );
+    }
+    if !entity_ids.contains(&target) {
+        bail!(
+            "edge {} target {} is not present in adapter entities",
+            edge.edge_id,
+            target
+        );
+    }
+    let relation: EdgeRelation = edge
+        .relation
+        .parse()
+        .with_context(|| format!("edge {} invalid relation {:?}", edge.edge_id, edge.relation))?;
+
+    validate_edge_weight(edge.weight, edge.edge_id)?;
+    Ok(ExportedEdge {
+        edge_id: edge.edge_id,
+        source,
+        target,
+        relation,
+        weight: edge.weight,
+    })
+}
+
+/// Build a [`KgArchive`] from on-disk NDJSON files for hashing or import.
+pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<KgArchive> {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct NdjsonEntity {
+        id: Uuid,
+        kind: String,
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        properties: Option<serde_json::Value>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        updated_at: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NdjsonEdge {
+        edge_id: Uuid,
+        source: Uuid,
+        target: Uuid,
+        relation: String,
+        #[serde(default = "default_weight")]
+        weight: f64,
+    }
+
+    fn default_weight() -> f64 {
+        1.0
+    }
+
+    let kg_dir = repo.join(".khive/kg");
+    let entities = read_ndjson_records::<NdjsonEntity>(&kg_dir.join("entities.ndjson"), "entity")?;
+    let edges = read_ndjson_records::<NdjsonEdge>(&kg_dir.join("edges.ndjson"), "edge")?;
+    let now = Utc::now();
+
+    let exported_entities = entities
+        .into_iter()
+        .map(|e| ExportedEntity {
+            id: e.id,
+            kind: e.kind,
+            entity_type: None,
+            name: e.name,
+            description: e.description,
+            properties: e.properties,
+            tags: e.tags,
+            created_at: parse_dt(e.created_at.as_deref(), now),
+            updated_at: parse_dt(e.updated_at.as_deref(), now),
+        })
+        .collect();
+
+    let exported_edges = edges
+        .into_iter()
+        .map(|edge| {
+            let relation: EdgeRelation = edge
+                .relation
+                .parse()
+                .with_context(|| format!("invalid relation {:?}", edge.relation))?;
+            validate_edge_weight(edge.weight, edge.edge_id)?;
+            Ok(ExportedEdge {
+                edge_id: edge.edge_id,
+                source: edge.source,
+                target: edge.target,
+                relation,
+                weight: edge.weight,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(KgArchive {
+        format: "khive-kg".to_string(),
+        version: "0.1".to_string(),
+        namespace: namespace.to_string(),
+        exported_at: now,
+        entities: exported_entities,
+        edges: exported_edges,
+    })
+}
+
+pub(super) fn read_ndjson_records<T>(path: &Path, label: &str) -> Result<Vec<T>>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut records = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse {label} at {}:{}", path.display(), idx + 1))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+    value
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn export_creates_archive_json() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let output_path = tmp.path().join("archive.json");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let runtime = KhiveRuntime::new(config).unwrap();
+        let token = runtime.authorize(ns).unwrap();
+        runtime
+            .create_entity(&token, "concept", None, "TestEntity", None, None, vec![])
+            .await
+            .unwrap();
+
+        let args = ExportArgs {
+            output: output_path.clone(),
+            db: db_path,
+            namespace: "test-ns".to_string(),
+        };
+        cmd_export(args).await.unwrap();
+
+        assert!(output_path.exists(), "output archive must exist");
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let archive: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(archive["format"].as_str().unwrap(), "khive-kg");
+        let entities = archive["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 1, "one entity exported");
+        assert_eq!(entities[0]["name"].as_str().unwrap(), "TestEntity");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn export_refuses_symlinked_output_to_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("working.db");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let runtime = KhiveRuntime::new(config).unwrap();
+        let token = runtime.authorize(ns).unwrap();
+        runtime
+            .create_entity(&token, "concept", None, "Keep", None, None, vec![])
+            .await
+            .unwrap();
+        drop(runtime);
+        let before = std::fs::read(&db_path).unwrap();
+
+        let link = tmp.path().join("archive.json");
+        std::os::unix::fs::symlink(&db_path, &link).unwrap();
+
+        let args = ExportArgs {
+            output: link,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+        };
+        assert!(
+            cmd_export(args).await.is_err(),
+            "export through a symlink to the DB must be refused"
+        );
+
+        let after = std::fs::read(&db_path).unwrap();
+        assert_eq!(before, after, "source DB must be byte-for-byte unchanged");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn export_refuses_symlinked_temp_to_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("working.db");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let runtime = KhiveRuntime::new(config).unwrap();
+        let token = runtime.authorize(ns).unwrap();
+        runtime
+            .create_entity(&token, "concept", None, "Keep", None, None, vec![])
+            .await
+            .unwrap();
+        drop(runtime);
+        let before = std::fs::read(&db_path).unwrap();
+
+        let out = tmp.path().join("archive.json");
+        let mut tmp_name = out.file_name().unwrap().to_os_string();
+        tmp_name.push(format!(".{}.inprogress", std::process::id()));
+        let temp_path = out.with_file_name(tmp_name);
+        std::os::unix::fs::symlink(&db_path, &temp_path).unwrap();
+
+        let args = ExportArgs {
+            output: out,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+        };
+        assert!(
+            cmd_export(args).await.is_err(),
+            "export must refuse when the temp path is a symlink to the DB"
+        );
+        let after = std::fs::read(&db_path).unwrap();
+        assert_eq!(before, after, "source DB must be byte-for-byte unchanged");
+    }
+
+    #[tokio::test]
+    async fn import_archive_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("import-test.db");
+        let entity_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+        let archive_json = format!(
+            r#"{{"format":"khive-kg","version":"0.1","namespace":"test-ns","exported_at":"2026-01-01T00:00:00Z","entities":[{{"id":"{entity_id}","kind":"concept","name":"Imported","tags":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}],"edges":[]}}"#
+        );
+        let source_path = tmp.path().join("archive.json");
+        std::fs::write(&source_path, &archive_json).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Archive,
+            verbose: false,
+        };
+        cmd_import(args).await.unwrap();
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.name, "Imported");
+    }
+
+    #[tokio::test]
+    async fn import_json_adapter_imports_entities() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-json.db");
+        let e1_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let e2_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+        let json_input = format!(
+            r#"[{{"id":"{e1_id}","kind":"concept","name":"Entity1"}},{{"id":"{e2_id}","kind":"concept","name":"Entity2"}}]"#
+        );
+        let source_path = tmp.path().join("records.json");
+        std::fs::write(&source_path, &json_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        };
+        cmd_import(args).await.unwrap();
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let e1_uuid: Uuid = e1_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, e1_uuid).await.unwrap();
+        assert_eq!(entity.name, "Entity1");
+    }
+
+    #[tokio::test]
+    async fn import_ndjson_adapter_imports_entity() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-ndjson.db");
+        let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+        let ndjson_input =
+            format!(r#"{{"id":"{entity_id}","kind":"concept","name":"NdjsonEntity"}}"#);
+        let source_path = tmp.path().join("records.ndjson");
+        std::fs::write(&source_path, &ndjson_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Ndjson,
+            verbose: false,
+        };
+        cmd_import(args).await.unwrap();
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.name, "NdjsonEntity");
+    }
+
+    #[test]
+    fn validate_edge_weight_valid_boundaries() {
+        assert!(validate_edge_weight(0.0, "edge-a").is_ok());
+        assert!(validate_edge_weight(1.0, "edge-a").is_ok());
+        assert!(validate_edge_weight(0.5, "edge-a").is_ok());
+    }
+
+    #[test]
+    fn validate_edge_weight_nan_is_rejected() {
+        let err = validate_edge_weight(f64::NAN, "edge-x").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_edge_weight_infinity_is_rejected() {
+        let err = validate_edge_weight(f64::INFINITY, "edge-y").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+        let err = validate_edge_weight(f64::NEG_INFINITY, "edge-y").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_edge_weight_out_of_range_is_rejected() {
+        let err = validate_edge_weight(1.5, "edge-z").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the valid range"),
+            "expected range error: {err}"
+        );
+        let err = validate_edge_weight(-0.1, "edge-z").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the valid range"),
+            "expected range error: {err}"
+        );
+    }
+}

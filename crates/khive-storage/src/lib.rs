@@ -1,0 +1,42 @@
+//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`.
+
+pub mod capability;
+pub mod entity;
+pub mod error;
+pub mod event;
+pub mod graph;
+pub mod note;
+pub mod sparse;
+pub mod sql;
+pub mod text;
+pub mod types;
+pub mod vectors;
+
+pub use capability::StorageCapability;
+pub use entity::{Entity, EntityFilter, EntityStore};
+pub use error::StorageError;
+
+pub use event::{
+    Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
+};
+pub use graph::GraphStore;
+pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
+pub use sparse::SparseStore;
+pub use sql::{SqlAccess, SqlReader, SqlTransaction, SqlWriter};
+pub use text::TextSearch;
+pub use types::StorageResult;
+pub use vectors::VectorStore;
+
+pub use types::{
+    BatchWriteSummary, DeleteMode, Direction, Edge, EdgeFilter, EdgeSortField, GraphPath,
+    IndexRebuildScope, LinkId, NeighborHit, NeighborQuery, OrphanSweepConfig, OrphanSweepResult,
+    Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SortDirection, SortOrder,
+    SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, SqlIsolation, SqlRow,
+    SqlStatement, SqlTxOptions, SqlValue, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
+    TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
+    TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind,
+    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorStoreCapabilities, VectorStoreInfo,
+};
+
+pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};

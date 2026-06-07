@@ -1,0 +1,26 @@
+[package]
+name = "khive-score"
+description = "Deterministic fixed-point scoring: cross-platform ordering, aggregation (sum/avg/max/min/RRF), ranking with ID tiebreak."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+khive-types = { version = "0.2.5", path = "../khive-types" }
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "score_ops"
+harness = false

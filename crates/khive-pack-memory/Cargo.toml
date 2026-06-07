@@ -1,0 +1,56 @@
+[package]
+name = "khive-pack-memory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Memory verb pack — remember/recall semantics with decay-aware ranking"
+
+[dependencies]
+khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.5", path = "../khive-runtime" }
+khive-fusion = { version = "0.2.5", path = "../khive-fusion" }
+khive-retrieval = { version = "0.2.5", path = "../khive-retrieval" }
+khive-score = { version = "0.2.5", path = "../khive-score" }
+khive-pack-brain = { version = "0.2.5", path = "../khive-pack-brain" }
+khive-vamana = { version = "0.2.5", path = "../khive-vamana" }
+inventory = { workspace = true }
+khive-storage = { version = "0.2.5", path = "../khive-storage" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+khive-db = { version = "0.2.5", path = "../khive-db" }
+khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
+tokio = { workspace = true, features = ["test-util"] }
+lattice-embed = { workspace = true }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[bench]]
+name = "e2e_recall"
+harness = false
+
+[[bench]]
+name = "fts_gather"
+harness = false
+
+[[bench]]
+name = "memory_bench"
+harness = false

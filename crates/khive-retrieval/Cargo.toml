@@ -1,0 +1,69 @@
+[package]
+name = "khive-retrieval"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-encoder) with deterministic scoring"
+
+[dependencies]
+khive-hnsw    = { version = "0.2.5", path = "../khive-hnsw" }
+khive-bm25    = { version = "0.2.5", path = "../khive-bm25" }
+khive-fusion  = { version = "0.2.5", path = "../khive-fusion" }
+khive-score   = { version = "0.2.5", path = "../khive-score" }
+khive-types   = { version = "0.2.5", path = "../khive-types" }
+khive-fold    = { version = "0.2.5", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.2.5", path = "../khive-storage", optional = true }
+khive-db      = { version = "0.2.5", path = "../khive-db" }
+khive-gate    = { version = "0.2.5", path = "../khive-gate", optional = true }
+lattice-embed = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[features]
+# ADR-030 originally marked checkpoint/persist/embed/storage-adapters as default-on.
+# The current default = [] reflects a deliberate decision to keep the base crate lightweight
+# and avoid pulling in rusqlite/lattice-embed/khive-storage unless explicitly requested.
+# This deviation is tracked as a known gap pending an ADR-030 amendment.
+default = []
+# Policy-based access control for search results (uses khive-gate API)
+policy = ["khive-gate"]
+# HNSW checkpoint integration with khive-fold (ADR-030 F167)
+# Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
+checkpoint = ["khive-fold", "khive-hnsw/checkpoint"]
+# SQLite-based persistence for HNSW and BM25 indexes
+persist = ["rusqlite", "tracing", "rand"]
+# Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
+# Enables the vectors feature on khive-db so sqlite-vec is loaded for tests.
+storage-adapters = ["khive-storage", "khive-db/vectors"]
+# Native cross-encoder reranking (deferred until khive-inference is ported)
+native-rerank = []
+# Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
+embed = []
+# Legacy graph traversal module (depends on old EntityRef/LinkStore API; not yet ported)
+graph-legacy = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+khive-score = { version = "0.2.5", path = "../khive-score" }
+khive-fusion = { version = "0.2.5", path = "../khive-fusion" }
+
+[[bench]]
+name = "fusion_bench"
+path = "benches/fusion_bench.rs"
+harness = false

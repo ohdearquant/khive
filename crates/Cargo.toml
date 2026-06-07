@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = [
+    "khive-types",
+    "khive-score",
+    "khive-fold",
+    "khive-storage",
+    "khive-text",
+    "khive-db",
+    "khive-query",
+    "khive-gate",
+    "khive-gate-rego",
+    "khive-fusion",
+    "khive-bm25",
+    "khive-hnsw",
+    "khive-vamana",
+    "khive-runtime",
+    "khive-request",
+    "khive-pack-kg",
+    "khive-pack-gtd",
+    "khive-pack-memory",
+    "khive-pack-brain",
+    "khive-pack-comm",
+    "khive-pack-schedule",
+    "khive-pack-template",
+    "khive-pack-knowledge",
+    "khive-mcp",
+    "khive-vcs",
+    "khive-vcs-adapters",
+    "kkernel",
+    "khive-retrieval",
+]
+exclude = ["khive-merge"]
+# khive-merge is forward-deployed v2 infrastructure (ADR-039), not removed or
+# superseded. It is excluded from workspace members because it is ahead of the
+# restructured khive-vcs crate until ADR-039 integration lands. The v1 merge path
+# remains git line-merge on sorted NDJSON (ADR-010, ADR-020); ADR-039's conflict
+# taxonomy and semantic merge are retained for v2. Keep the crate directory and
+# keep this exclusion from members.
+
+[workspace.package]
+version = "0.2.6"
+edition = "2021"
+authors = ["Ocean <ocean@lionagi.ai>"]
+license = "Apache-2.0"
+repository = "https://github.com/ohdearquant/khive"
+homepage = "https://github.com/ohdearquant"
+keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]
+categories = ["database", "command-line-utilities"]
+
+[workspace.dependencies]
+inventory = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rusqlite = { version = "0.33" }
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+lattice-embed = "0.3.0"
+parking_lot = "0.12"
+rand = "0.8"
+rand_distr = "0.4"
+toml = "0.8"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+rayon = "1.10"
+memmap2 = "0.9"
+bytemuck = "1.16"
+unicode-segmentation = "1.11"
+rust-stemmers = "1.2"
+tempfile = "3"
+lru = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+blake3 = { version = "1", default-features = false }
+regorus = "0.10"
+rmcp = "1.7"
+futures = "0.3"
+serial_test = "3"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
+# block below to point at local lattice when iterating on lattice-side fixes.

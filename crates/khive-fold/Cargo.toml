@@ -1,0 +1,46 @@
+[package]
+name = "khive-fold"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
+
+[features]
+# serde: enables Serialize/Deserialize derives on all fold types.
+# Enabled by default so existing callers compile without explicit opt-in.
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+khive-score = { version = "0.2.5", path = "../khive-score" }
+# ADR-024 boundary: khive-types + khive-score only.
+# blake3 feature enables Hash32::from_blake3 for checkpoint hashing.
+khive-types = { version = "0.2.5", path = "../khive-types", features = ["blake3", "serde"] }
+# serde: optional, gated by the `serde` feature above.
+serde = { workspace = true, optional = true }
+# serde_json: kept direct — serde_json::Value is used in FoldContext.extra,
+# ObjectiveContext.extra, and selector types as a concrete field type.
+# Removing it would require changing the public API.
+serde_json = { workspace = true }
+# uuid: kept direct — Uuid is a first-class type in AnchorRef/Checkpoint/FoldError;
+# khive-types does not re-export uuid::Uuid (it uses Id128 internally).
+uuid = { workspace = true }
+# chrono: kept for DateTime<Utc> in FoldContext/ObjectiveContext/Checkpoint/HasTimestamp.
+# Clock calls (Utc::now) are removed per ADR-024 "no clock" invariant.
+chrono = { workspace = true }
+# thiserror: proc-macro, zero runtime cost; acceptable per ADR-024.
+thiserror = { workspace = true }
+# blake3 for checkpoint hash computation/verification.
+blake3 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "fold_bench"
+harness = false

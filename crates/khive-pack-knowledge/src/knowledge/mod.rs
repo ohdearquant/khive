@@ -1,0 +1,13 @@
+//! Knowledge corpus handlers — atoms, domains, TF-IDF search, fold, index.
+
+pub(crate) mod matching;
+pub(crate) mod schema;
+pub(crate) mod vamana;
+
+mod crud;
+mod fold_handler;
+mod index_handler;
+mod search;
+mod sections;
+pub(super) mod util;
+pub(crate) struct KnowledgeHandlers;

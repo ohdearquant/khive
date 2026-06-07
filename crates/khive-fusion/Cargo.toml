@@ -1,0 +1,23 @@
+[package]
+name = "khive-fusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Rank fusion strategies (RRF, Weighted, Union) with deterministic scoring"
+
+[dependencies]
+khive-score = { version = "0.2.5", path = "../khive-score" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "fusion_bench"
+harness = false

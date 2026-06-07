@@ -1,0 +1,30 @@
+[package]
+name = "khive-bm25"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "BM25 (Okapi BM25) keyword index with deterministic scoring"
+
+[dependencies]
+khive-score = { version = "0.2.5", path = "../khive-score" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "bm25_bench"
+harness = false
+
+[[test]]
+name = "wand_correctness"
+path = "tests/wand_correctness.rs"

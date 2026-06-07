@@ -1,0 +1,25 @@
+//! Vamana ANN index: batch-built approximate nearest-neighbor search over unit-normalized vectors.
+
+pub mod config;
+pub mod distance;
+pub mod error;
+pub mod graph;
+pub mod index;
+
+pub use config::VamanaConfig;
+pub use error::{Result, VamanaError};
+pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
+pub use index::{
+    CorpusFingerprint, VamanaIndex, VamanaIndexSnapshot, VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT,
+    VAMANA_SNAPSHOT_VERSION,
+};
+
+/// Build a Vamana index from a flat row-major vector slice.
+pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<VamanaIndex> {
+    VamanaIndex::build(vectors, config)
+}
+
+/// Search an index for the `k` nearest neighbors of `query`.
+pub fn search(index: &VamanaIndex, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
+    index.search(query, k)
+}

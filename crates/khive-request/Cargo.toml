@@ -1,0 +1,22 @@
+[package]
+name = "khive-request"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Request DSL — parses verb-dispatch strings (function-call, JSON, and future LNDL / pipe / bash-style syntaxes) into a transport-agnostic ParsedRequest AST"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "request_bench"
+harness = false

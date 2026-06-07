@@ -1,0 +1,22 @@
+[package]
+name = "khive-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
+
+[dependencies]
+khive-types = { version = "0.2.5", path = "../khive-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse_bench"
+harness = false

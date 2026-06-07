@@ -1,0 +1,1468 @@
+// FILE SIZE JUSTIFICATION: This file covers the full public verb surface of the knowledge
+// pack (upsert_atoms, upsert_domains, get, list, delete_atoms, stats, index, fold, search,
+// suggest, compose, edit, import, challenge, adjudicate, learn, cite, topic) with multiple
+// scenarios per verb (happy path, edge cases, namespace isolation, pagination). Each test
+// requires a fresh in-memory runtime, making per-verb test file splitting impractical without
+// re-creating the same setup boilerplate in every file. Splitting is deferred until shared
+// test fixtures can be extracted into a crate-level test helper module.
+
+//! Integration tests for the knowledge pack against an in-memory runtime.
+
+use khive_pack_kg::KgPack;
+use khive_pack_knowledge::KnowledgePack;
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use serde_json::{json, Value};
+
+// ── test fixture ──────────────────────────────────────────────────────────────
+
+fn rt() -> KhiveRuntime {
+    KhiveRuntime::memory().expect("memory runtime")
+}
+
+struct Fixture {
+    registry: VerbRegistry,
+}
+
+impl Fixture {
+    async fn dispatch(&self, verb: &str, args: Value) -> Result<Value, RuntimeError> {
+        self.registry.dispatch(verb, args).await
+    }
+}
+
+fn pack(rt: KhiveRuntime) -> Fixture {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(KnowledgePack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    Fixture { registry }
+}
+
+// ── pack metadata ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pack_registers_cleanly_with_verb_registry() {
+    let f = pack(rt());
+    let verbs: Vec<&str> = f.registry.all_verbs().iter().map(|v| v.name).collect();
+    assert!(
+        verbs.contains(&"knowledge.learn"),
+        "expected 'learn' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.cite"),
+        "expected 'cite' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.topic"),
+        "expected 'topic' verb, got: {verbs:?}"
+    );
+    // Corpus-tier verbs must also be registered.
+    assert!(
+        verbs.contains(&"knowledge.upsert_atoms"),
+        "expected 'knowledge.upsert_atoms' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.search"),
+        "expected 'knowledge.search' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.fold"),
+        "expected 'knowledge.fold' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.suggest"),
+        "expected 'knowledge.suggest' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.compose"),
+        "expected 'knowledge.compose' verb, got: {verbs:?}"
+    );
+    // No note kinds added.
+    let note_kinds: Vec<&str> = f.registry.all_note_kinds();
+    assert!(
+        !note_kinds.contains(&"knowledge"),
+        "knowledge pack should not add note kinds"
+    );
+}
+
+// ── learn verb ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn learn_creates_concept_with_name_and_domain() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({
+                "name": "LoRA",
+                "description": "Low-Rank Adaptation of large language models",
+                "domain": "fine-tuning",
+                "tags": ["adapter"]
+            }),
+        )
+        .await
+        .expect("learn ok");
+
+    assert_eq!(resp["kind"], "concept");
+    assert_eq!(resp["name"], "LoRA");
+    assert_eq!(resp["domain"], "fine-tuning");
+    // Domain is promoted to tags.
+    let tags = resp["tags"].as_array().expect("tags array");
+    let tag_strs: Vec<&str> = tags.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        tag_strs.contains(&"fine-tuning"),
+        "domain not in tags: {tag_strs:?}"
+    );
+    assert!(tag_strs.contains(&"adapter"));
+    // Response shape: short id (8 chars) + full UUID.
+    let id = resp["id"].as_str().expect("id");
+    let full_id = resp["full_id"].as_str().expect("full_id");
+    assert_eq!(id.len(), 8, "expected 8-char short id, got: {id}");
+    assert!(
+        full_id.contains('-'),
+        "expected UUID in full_id, got: {full_id}"
+    );
+}
+
+#[tokio::test]
+async fn learn_creates_concept_without_domain() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch("knowledge.learn", json!({ "name": "FlashAttention" }))
+        .await
+        .expect("learn ok");
+
+    assert_eq!(resp["kind"], "concept");
+    assert_eq!(resp["name"], "FlashAttention");
+    assert!(resp["domain"].is_null());
+}
+
+#[tokio::test]
+async fn learn_rejects_empty_name() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.learn", json!({ "name": "   " }))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("name must not be empty"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn learn_rejects_missing_name_and_content() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.learn", json!({ "domain": "attention" }))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    // Neither name nor content supplied — handler returns a descriptive error.
+    assert!(
+        msg.contains("name must not be empty"),
+        "expected descriptive error, got: {msg}"
+    );
+}
+
+// ── learn content-alias (issue #488) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn learn_content_without_name_auto_generates_name() {
+    let f = pack(rt());
+    // Agent-style call: only `content` provided, no explicit `name`.
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "content": "Some long description about X that keeps going and going beyond sixty characters easily" }),
+        )
+        .await
+        .expect("learn with content only should succeed");
+
+    assert_eq!(resp["kind"], "concept");
+    let name = resp["name"].as_str().expect("name present");
+    assert!(!name.is_empty(), "auto-generated name must not be empty");
+    assert!(
+        name.len() <= 60,
+        "auto-generated name must be <= 60 chars, got: {name:?}"
+    );
+    // Description is populated from `content`.
+    let desc = resp["description"].as_str().expect("description present");
+    assert!(
+        desc.contains("Some long description"),
+        "description should contain content: {desc:?}"
+    );
+}
+
+#[tokio::test]
+async fn learn_content_alias_maps_to_description() {
+    let f = pack(rt());
+    // When both `name` and `content` are provided, content becomes the description.
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({
+                "name": "GQA",
+                "content": "Grouped-Query Attention mechanism"
+            }),
+        )
+        .await
+        .expect("learn with name + content");
+
+    assert_eq!(resp["name"], "GQA");
+    assert_eq!(resp["description"], "Grouped-Query Attention mechanism");
+}
+
+#[tokio::test]
+async fn learn_short_content_uses_full_text_as_name() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "content": "Speculative Decoding" }),
+        )
+        .await
+        .expect("learn short content");
+
+    assert_eq!(resp["name"], "Speculative Decoding");
+    assert_eq!(resp["description"], "Speculative Decoding");
+}
+
+// ── cite verb ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cite_creates_introduced_by_edge() {
+    let f = pack(rt());
+
+    // Create concept via learn.
+    let concept = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "name": "LoRA", "domain": "fine-tuning" }),
+        )
+        .await
+        .expect("learn concept");
+
+    // Create paper as a `document` entity (base allowlist: concept -[introduced_by]-> document).
+    let paper = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "name": "Hu et al. 2021",
+                "description": "LoRA: Low-Rank Adaptation paper"
+            }),
+        )
+        .await
+        .expect("create document");
+
+    let concept_id = concept["full_id"].as_str().unwrap();
+    // `create` serialises the raw Entity — id field is the full UUID string.
+    let source_id = paper["id"].as_str().unwrap();
+
+    let resp = f
+        .dispatch(
+            "knowledge.cite",
+            json!({
+                "concept_id": concept_id,
+                "source_id": source_id,
+                "weight": 1.0
+            }),
+        )
+        .await
+        .expect("cite ok");
+
+    assert_eq!(resp["relation"], "introduced_by");
+    assert_eq!(resp["concept_id"], concept_id);
+    assert_eq!(resp["source_id"], source_id);
+    assert_eq!(resp["weight"], 1.0);
+    let id = resp["id"].as_str().expect("id");
+    assert_eq!(id.len(), 8, "expected 8-char edge id, got: {id}");
+}
+
+#[tokio::test]
+async fn cite_rejects_unknown_id() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.cite",
+            json!({
+                "concept_id": "00000000-0000-0000-0000-000000000001",
+                "source_id":  "00000000-0000-0000-0000-000000000002"
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "expected error for unknown IDs, got empty");
+}
+
+#[tokio::test]
+async fn cite_rejects_missing_concept_id() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.cite",
+            json!({ "source_id": "00000000-0000-0000-0000-000000000001" }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "expected deserialization error");
+}
+
+// ── topic verb ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn topic_lists_all_concepts_without_filter() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "GQA", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 1");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "FlashAttention", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 2");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn 3");
+
+    let resp = f
+        .dispatch("knowledge.topic", json!({}))
+        .await
+        .expect("topic ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3, "expected 3 concepts, got: {}", items.len());
+}
+
+#[tokio::test]
+async fn topic_filters_by_domain() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "GQA", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 1");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "FlashAttention", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 2");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn 3");
+
+    let resp = f
+        .dispatch("knowledge.topic", json!({ "domain": "attention" }))
+        .await
+        .expect("topic filtered");
+
+    let items = resp["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 2 attention concepts, got: {}",
+        items.len()
+    );
+
+    let names: Vec<&str> = items.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(names.contains(&"GQA"), "expected GQA in items: {names:?}");
+    assert!(
+        names.contains(&"FlashAttention"),
+        "expected FlashAttention: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn topic_returns_empty_for_unknown_domain() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn");
+
+    let resp = f
+        .dispatch("knowledge.topic", json!({ "domain": "quantum-computing" }))
+        .await
+        .expect("topic ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    assert!(items.is_empty(), "expected 0 items for unknown domain");
+}
+
+#[tokio::test]
+async fn topic_respects_limit() {
+    let f = pack(rt());
+    for i in 0..5 {
+        f.dispatch("knowledge.learn", json!({ "name": format!("Concept{i}") }))
+            .await
+            .expect("learn");
+    }
+
+    let resp = f
+        .dispatch("knowledge.topic", json!({ "limit": 2 }))
+        .await
+        .expect("topic ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    assert!(
+        items.len() <= 2,
+        "expected <= 2 items, got: {}",
+        items.len()
+    );
+}
+
+// ── H1 regression: case-insensitive domain filter (ADR-047 §91) ──────────────
+
+#[tokio::test]
+async fn topic_domain_filter_is_case_insensitive_listing_path() {
+    let f = pack(rt());
+
+    // Store concept with uppercase domain "Attention".
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "FlashAttention", "domain": "Attention" }),
+    )
+    .await
+    .expect("learn with Attention");
+
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn with fine-tuning");
+
+    // Query with lowercase "attention" — must find the concept stored as "Attention".
+    let resp = f
+        .dispatch("knowledge.topic", json!({ "domain": "attention" }))
+        .await
+        .expect("topic ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    let names: Vec<&str> = items.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert_eq!(items.len(), 1, "expected 1 match, got: {names:?}");
+    assert!(
+        names.contains(&"FlashAttention"),
+        "expected FlashAttention in results: {names:?}"
+    );
+    assert_eq!(
+        resp["total"].as_u64().unwrap_or(0),
+        1,
+        "total should be 1 on listing path"
+    );
+}
+
+// ── H2 regression: search-path `total` semantics ─────────────────────────────
+
+#[tokio::test]
+async fn topic_search_path_total_is_bounded_by_candidate_window() {
+    let f = pack(rt());
+
+    // Learn 10 concepts — more than a small limit, so we can observe truncation.
+    for i in 0..10 {
+        f.dispatch(
+            "knowledge.learn",
+            json!({ "name": format!("Attention{i}"), "domain": "attention" }),
+        )
+        .await
+        .expect("learn");
+    }
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn unrelated");
+
+    // Search path with limit=3.  total must be <= limit*4 (12) and >= returned items.
+    let resp = f
+        .dispatch(
+            "knowledge.topic",
+            json!({ "query": "attention", "limit": 3 }),
+        )
+        .await
+        .expect("topic search ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    let total = resp["total"].as_u64().expect("total field present");
+
+    assert!(
+        items.len() <= 3,
+        "items must respect limit: got {}",
+        items.len()
+    );
+    // total is the candidate-window count, bounded by limit*4 = 12.
+    assert!(
+        total <= 12,
+        "search-path total must be bounded by limit*4 (12), got {total}"
+    );
+    assert!(
+        total >= items.len() as u64,
+        "total must be >= returned items: total={total}, items={}",
+        items.len()
+    );
+}
+
+// ── upsert_atoms ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upsert_atoms_creates_new_atoms() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating." },
+                    { "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation of LLMs", "tags": ["fine-tuning", "adapter"] },
+                    { "slug": "flash-attention", "name": "FlashAttention", "description": "Memory-efficient attention", "tags": ["attention"] },
+                ]
+            }),
+        )
+        .await
+        .expect("upsert_atoms ok");
+
+    assert_eq!(resp["created"], 3, "expected 3 created");
+    assert_eq!(resp["updated"], 0, "expected 0 updated");
+    assert_eq!(resp["total"], 3);
+}
+
+#[tokio::test]
+async fn upsert_atoms_updates_on_second_call() {
+    let f = pack(rt());
+    // First insert.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "rag", "name": "RAG", "content": "original content" }] }),
+    )
+    .await
+    .expect("first upsert");
+
+    // Second call with same slug — should update.
+    let resp = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{ "slug": "rag", "name": "RAG updated", "content": "updated content" }] }),
+        )
+        .await
+        .expect("second upsert");
+
+    assert_eq!(resp["created"], 0, "expected 0 created on second call");
+    assert_eq!(resp["updated"], 1, "expected 1 updated");
+
+    // Verify get returns the updated name.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "rag" }))
+        .await
+        .expect("get ok");
+    assert_eq!(got["name"], "RAG updated");
+    assert_eq!(got["slug"], "rag");
+}
+
+#[tokio::test]
+async fn upsert_atoms_rejects_empty_list() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.upsert_atoms", json!({ "atoms": [] }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+}
+
+#[tokio::test]
+async fn upsert_atoms_rejects_empty_slug() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{ "slug": "  ", "name": "Bad" }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("slug"), "got: {err}");
+}
+
+// ── upsert_domains ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upsert_domains_creates_and_updates() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [
+                    { "slug": "retrieval", "name": "Retrieval", "description": "Retrieval techniques", "members": ["rag", "dense-retrieval"] }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert_domains ok");
+
+    assert_eq!(resp["created"], 1);
+    assert_eq!(resp["updated"], 0);
+
+    // Second call — update.
+    let resp2 = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [
+                    { "slug": "retrieval", "name": "Retrieval updated", "members": ["rag", "dense-retrieval", "bm25"] }
+                ]
+            }),
+        )
+        .await
+        .expect("second upsert_domains ok");
+
+    assert_eq!(resp2["created"], 0);
+    assert_eq!(resp2["updated"], 1);
+
+    // get by slug returns updated name.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "retrieval" }))
+        .await
+        .expect("get domain ok");
+    assert_eq!(got["name"], "Retrieval updated");
+    assert_eq!(got["kind"], "domain");
+    let members = got["members"].as_array().expect("members array");
+    assert_eq!(members.len(), 3);
+}
+
+#[tokio::test]
+async fn upsert_domains_rejects_empty_list() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.upsert_domains", json!({ "domains": [] }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+}
+
+// ── knowledge.get ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_returns_atom_by_slug() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "lora" }))
+        .await
+        .expect("get ok");
+
+    assert_eq!(got["slug"], "lora");
+    assert_eq!(got["name"], "LoRA");
+    assert_eq!(got["kind"], "atom");
+}
+
+#[tokio::test]
+async fn get_returns_not_found_for_unknown_slug() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.get", json!({ "id": "nonexistent-slug-xyz" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not found") || err.to_string().contains("NotFound"),
+        "expected not-found error, got: {err}"
+    );
+}
+
+// ── knowledge.list ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_atoms_returns_all_atoms() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "a1", "name": "Alpha" },
+                { "slug": "a2", "name": "Beta" },
+                { "slug": "a3", "name": "Gamma" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    let resp = f
+        .dispatch("knowledge.list", json!({ "type": "atom" }))
+        .await
+        .expect("list ok");
+
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(resp["total"], 3);
+}
+
+#[tokio::test]
+async fn list_domains_returns_only_domains() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "a1", "name": "Alpha" }] }),
+    )
+    .await
+    .expect("upsert atom");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let resp = f
+        .dispatch("knowledge.list", json!({ "type": "domain" }))
+        .await
+        .expect("list domains ok");
+
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["kind"], "domain");
+}
+
+#[tokio::test]
+async fn list_respects_limit_and_offset() {
+    let f = pack(rt());
+    for i in 0..10 {
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{ "slug": format!("a{i}"), "name": format!("Atom{i}") }] }),
+        )
+        .await
+        .expect("upsert");
+    }
+
+    let page1 = f
+        .dispatch("knowledge.list", json!({ "limit": 3, "offset": 0 }))
+        .await
+        .expect("page1 ok");
+    let page2 = f
+        .dispatch("knowledge.list", json!({ "limit": 3, "offset": 3 }))
+        .await
+        .expect("page2 ok");
+
+    let r1 = page1["results"].as_array().expect("r1");
+    let r2 = page2["results"].as_array().expect("r2");
+    assert_eq!(r1.len(), 3, "page1 should have 3 items");
+    assert_eq!(r2.len(), 3, "page2 should have 3 items");
+    assert_eq!(page1["total"], 10);
+    // IDs on page1 and page2 should not overlap.
+    let ids1: std::collections::HashSet<&str> =
+        r1.iter().filter_map(|v| v["id"].as_str()).collect();
+    let ids2: std::collections::HashSet<&str> =
+        r2.iter().filter_map(|v| v["id"].as_str()).collect();
+    assert!(
+        ids1.is_disjoint(&ids2),
+        "page1 and page2 ids must not overlap"
+    );
+}
+
+// ── delete_atoms ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_atoms_soft_deletes_by_slug() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "to-delete", "name": "Will be gone" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    let del_resp = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": ["to-delete"] }))
+        .await
+        .expect("delete ok");
+
+    assert_eq!(del_resp["deleted"], 1);
+
+    // get should now return not-found.
+    let err = f
+        .dispatch("knowledge.get", json!({ "id": "to-delete" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not found") || err.to_string().contains("NotFound"),
+        "expected not-found after delete, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_returns_zero_for_unknown_slug() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({ "ids": ["does-not-exist"] }),
+        )
+        .await
+        .expect("delete ok even for missing");
+    assert_eq!(resp["deleted"], 0);
+}
+
+// ── stats ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stats_reflects_current_corpus() {
+    let f = pack(rt());
+    // Empty corpus.
+    let empty = f
+        .dispatch("knowledge.stats", json!({}))
+        .await
+        .expect("stats ok");
+    assert_eq!(empty["total_atoms"], 0);
+    assert_eq!(empty["total_domains"], 0);
+
+    // Add atoms.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "a1", "name": "Alpha", "finalized": true },
+                { "slug": "a2", "name": "Beta", "finalized": false },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let resp = f
+        .dispatch("knowledge.stats", json!({}))
+        .await
+        .expect("stats ok 2");
+    assert_eq!(resp["total_atoms"], 2);
+    assert_eq!(resp["total_domains"], 1);
+    // 1 of 2 atoms is finalized → eval_coverage = 0.5.
+    let cov = resp["eval_coverage"].as_f64().expect("eval_coverage f64");
+    assert!(
+        (cov - 0.5).abs() < 1e-6,
+        "expected eval_coverage=0.5, got {cov}"
+    );
+}
+
+// ── fold ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn fold_selects_within_budget() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.fold",
+            json!({
+                "candidates": [
+                    { "id": "c1", "score": 0.9, "size": 100 },
+                    { "id": "c2", "score": 0.8, "size": 200 },
+                    { "id": "c3", "score": 0.7, "size": 150 },
+                    { "id": "c4", "score": 0.6, "size": 50 },
+                ],
+                "budget": 300
+            }),
+        )
+        .await
+        .expect("fold ok");
+
+    let selected = resp["selected"].as_array().expect("selected array");
+    let total_size = resp["total_size"].as_u64().expect("total_size");
+    assert!(
+        total_size <= 300,
+        "total_size {total_size} must not exceed budget 300"
+    );
+    assert!(!selected.is_empty(), "at least one item should be selected");
+    assert_eq!(resp["budget"], 300);
+}
+
+#[tokio::test]
+async fn fold_empty_candidates_returns_empty_selection() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.fold",
+            json!({ "candidates": [], "budget": 1000 }),
+        )
+        .await
+        .expect("fold empty ok");
+
+    let selected = resp["selected"].as_array().expect("selected array");
+    assert!(selected.is_empty());
+    assert_eq!(resp["total_size"], 0);
+}
+
+#[tokio::test]
+async fn fold_respects_min_score_filter() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.fold",
+            json!({
+                "candidates": [
+                    { "id": "high", "score": 0.9, "size": 100 },
+                    { "id": "low",  "score": 0.2, "size": 100 },
+                ],
+                "budget": 10000,
+                "min_score": 0.5
+            }),
+        )
+        .await
+        .expect("fold ok");
+
+    let selected = resp["selected"].as_array().expect("selected");
+    let ids: Vec<&str> = selected.iter().filter_map(|v| v["id"].as_str()).collect();
+    assert!(
+        ids.contains(&"high"),
+        "high-score item should be selected: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"low"),
+        "low-score item should be filtered: {ids:?}"
+    );
+}
+
+// ── knowledge.search ──────────────────────────────────────────────────────────
+
+/// Seed 10 atoms with realistic content for search tests.
+async fn seed_search_corpus(f: &Fixture) {
+    let atoms = json!({
+        "atoms": [
+            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text" },
+            { "slug": "lora",            "name": "LoRA",              "description": "Low-Rank Adaptation of large language models", "tags": ["fine-tuning", "adapter"] },
+            { "slug": "flash-attention", "name": "FlashAttention",    "description": "Memory-efficient attention using tiling", "tags": ["attention", "gpu"] },
+            { "slug": "gqa",             "name": "GQA",               "description": "Grouped Query Attention reduces KV cache", "tags": ["attention", "inference"] },
+            { "slug": "rope",            "name": "RoPE",              "description": "Rotary Position Embedding for transformers", "tags": ["embedding", "position"] },
+            { "slug": "agent",           "name": "Agent",             "description": "Autonomous agent using LLM tool calls", "tags": ["agent", "tool-use"] },
+            { "slug": "chain-of-thought","name": "Chain-of-Thought",  "description": "Prompting technique for step-by-step reasoning", "tags": ["reasoning", "prompting"] },
+            { "slug": "speculative",     "name": "Speculative Decoding", "description": "Draft model accelerates inference via speculation", "tags": ["inference", "draft"] },
+            { "slug": "quantization",    "name": "Quantization",     "description": "Reduce model size by lowering numerical precision", "tags": ["compression", "inference"] },
+            { "slug": "dpo",             "name": "DPO",               "description": "Direct Preference Optimization for RLHF alignment", "tags": ["fine-tuning", "alignment"] },
+        ]
+    });
+    f.dispatch("knowledge.upsert_atoms", atoms)
+        .await
+        .expect("seed atoms");
+}
+
+#[tokio::test]
+async fn search_basic_returns_ranked_results() {
+    let f = pack(rt());
+    seed_search_corpus(&f).await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval generation", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "expected some results");
+
+    // RAG should rank highly for "retrieval generation".
+    let first_name = results[0]["name"].as_str().unwrap_or("");
+    assert_eq!(
+        first_name, "RAG",
+        "RAG should rank first for 'retrieval generation', got: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_exact_name_bonus_surfaces_exact_match_first() {
+    let f = pack(rt());
+    seed_search_corpus(&f).await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "LoRA", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "expected results for LoRA");
+    let first_name = results[0]["name"].as_str().unwrap_or("");
+    assert_eq!(
+        first_name, "LoRA",
+        "exact name match LoRA should rank first"
+    );
+}
+
+#[tokio::test]
+async fn search_query_expansion_matches_related_form() {
+    let f = pack(rt());
+    // "agents" expands to "agent" via plural stripping.
+    seed_search_corpus(&f).await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "agents", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    // Agent atom should appear in results.
+    let names: Vec<&str> = results.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Agent"),
+        "expected Agent in search results for 'agents', got: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_weight_override_changes_ranking() {
+    let f = pack(rt());
+    seed_search_corpus(&f).await;
+
+    // With very high w_tags weight, the result tagged "attention" should rank first for "attention".
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "attention",
+                "weights": { "w_tags": 50.0, "w_name": 1.0, "w_description": 0.1 },
+                "rerank": false
+            }),
+        )
+        .await
+        .expect("search ok with weights");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "expected results");
+    // FlashAttention or GQA have tag "attention".
+    let first_name = results[0]["name"].as_str().unwrap_or("");
+    assert!(
+        first_name == "FlashAttention" || first_name == "GQA",
+        "expected attention-tagged atom first, got: {first_name}"
+    );
+}
+
+#[tokio::test]
+async fn search_limit_is_respected() {
+    let f = pack(rt());
+    seed_search_corpus(&f).await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "inference", "limit": 2, "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        results.len() <= 2,
+        "expected at most 2 results, got {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn search_empty_corpus_returns_empty_results() {
+    let f = pack(rt());
+    // No atoms seeded.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "anything", "rerank": false }),
+        )
+        .await
+        .expect("search ok on empty corpus");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(results.is_empty(), "empty corpus should return no results");
+}
+
+#[tokio::test]
+async fn search_rejects_empty_query() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.search", json!({ "query": "  " }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("query must not be empty"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn search_type_filter_returns_only_atoms() {
+    let f = pack(rt());
+    seed_search_corpus(&f).await;
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "attention-domain", "name": "Attention Domain", "description": "covers attention methods" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "attention", "type": "atom", "rerank": false }),
+        )
+        .await
+        .expect("search filtered ok");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    for r in results {
+        assert_eq!(
+            r["kind"].as_str().unwrap_or(""),
+            "atom",
+            "all results should be atoms when type=atom: {r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_type_domain_finds_upserted_domains() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [
+            { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "Dense and sparse retrieval techniques" }
+        ]}),
+    )
+    .await
+    .expect("upsert domain");
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search domain ok");
+
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        !results.is_empty(),
+        "domain search should find the upserted domain"
+    );
+    assert_eq!(results[0]["kind"].as_str().unwrap_or(""), "domain");
+}
+
+// ── suggest ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn suggest_returns_domains_for_query() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques" },
+                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domains");
+
+    let resp = f
+        .dispatch("knowledge.suggest", json!({ "query": "retrieval" }))
+        .await
+        .expect("suggest ok");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        !results.is_empty(),
+        "suggest should return at least one domain"
+    );
+    let first = &results[0];
+    assert!(first["id"].is_string(), "result must have id");
+    assert!(first["name"].is_string(), "result must have name");
+    assert!(first["score"].is_number(), "result must have score");
+}
+
+#[tokio::test]
+async fn suggest_rejects_empty_query() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.suggest", json!({ "query": "" }))
+        .await
+        .expect_err("empty query should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+// ── compose ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn compose_returns_markdown_for_atoms() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rag-overview",
+                    "name": "RAG Overview",
+                    "content": "Retrieval-augmented generation combines retrieval with generation."
+                },
+                {
+                    "slug": "dense-retrieval",
+                    "name": "Dense Retrieval",
+                    "content": "Dense retrieval uses vector embeddings to find relevant documents."
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["rag-overview", "dense-retrieval"],
+                "query": "retrieval augmented generation"
+            }),
+        )
+        .await
+        .expect("compose ok");
+
+    assert_eq!(resp["status"], "ok");
+    let md = resp["data"]["markdown"].as_str().expect("markdown");
+    assert!(
+        md.contains("Knowledge Briefing"),
+        "markdown must have heading"
+    );
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms array");
+    assert_eq!(atoms.len(), 2, "expected 2 atoms in response");
+    let count = resp["data"]["count"].as_u64().expect("count");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn compose_returns_markdown_for_domain() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "atom-a", "name": "Atom A", "content": "content of atom a" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                {
+                    "slug": "test-domain",
+                    "name": "Test Domain",
+                    "members": ["atom-a"]
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain_resp = f
+        .dispatch("knowledge.get", json!({ "id": "test-domain" }))
+        .await
+        .expect("get domain");
+    let domain_id = domain_resp["id"].as_str().expect("domain id");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "domain_ids": [domain_id],
+                "query": "content"
+            }),
+        )
+        .await
+        .expect("compose from domain ok");
+
+    assert_eq!(resp["status"], "ok");
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms");
+    assert!(
+        !atoms.is_empty(),
+        "compose from domain should include member atoms"
+    );
+}
+
+#[tokio::test]
+async fn compose_rejects_missing_ids() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.compose", json!({ "query": "test" }))
+        .await
+        .expect_err("compose with no ids should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn compose_rejects_empty_query() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.compose",
+            json!({ "atom_ids": ["some-atom"], "query": "" }),
+        )
+        .await
+        .expect_err("empty query should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn suggest_returns_empty_when_no_domains_present() {
+    let f = pack(rt());
+    // Empty corpus: no domains upserted. suggest should succeed with an empty results array.
+    let resp = f
+        .dispatch("knowledge.suggest", json!({ "query": "anything" }))
+        .await
+        .expect("suggest on empty corpus must not crash");
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        results.is_empty(),
+        "no domains in corpus → empty results, got: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn suggest_honors_limit_param() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval" },
+                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search" },
+                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domains");
+
+    let resp = f
+        .dispatch(
+            "knowledge.suggest",
+            json!({ "query": "domain", "limit": 1 }),
+        )
+        .await
+        .expect("suggest with limit=1");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    // All 3 seeded domains match the FTS phrase "domain"; suggest truncates to
+    // exactly `limit` via hits.truncate(limit) before returning.
+    assert_eq!(
+        results.len(),
+        1,
+        "limit=1 with 3 matching domains must return exactly 1 result, got: {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
+    let f = pack(rt());
+
+    // Atom directly referenced by atom_ids.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "direct-atom", "name": "Direct Atom", "content": "directly specified atom content" },
+                { "slug": "member-atom", "name": "Member Atom", "content": "member atom from domain" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    // Domain whose member provides member-atom.
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "mix-domain", "name": "Mix Domain", "members": ["member-atom"] }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain_resp = f
+        .dispatch("knowledge.get", json!({ "id": "mix-domain" }))
+        .await
+        .expect("get domain");
+    let domain_id = domain_resp["id"].as_str().expect("domain id");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "domain_ids": [domain_id],
+                "atom_ids": ["direct-atom"],
+                "query": "content"
+            }),
+        )
+        .await
+        .expect("compose with mix of domain_ids and atom_ids");
+
+    assert_eq!(resp["status"], "ok");
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms array");
+    assert_eq!(
+        atoms.len(),
+        2,
+        "compose with 1 domain member + 1 direct atom should yield 2 atoms (deduped), got: {atoms:?}"
+    );
+    let count = resp["data"]["count"].as_u64().expect("count");
+    assert_eq!(count, 2);
+}
