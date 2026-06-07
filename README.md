@@ -219,7 +219,7 @@ This adds 4 workflow skills and a researcher agent:
 ### Configuration
 
 ```bash
-khive mcp                                     # Default: ~/.khive/khive-graph.db
+khive mcp                                     # Default: ~/.khive/khive.db
 khive mcp --db /path/to/my.db                # Custom DB path
 khive mcp --db :memory:                       # Ephemeral (testing)
 khive mcp --namespace my-project              # Default namespace (default: "local")

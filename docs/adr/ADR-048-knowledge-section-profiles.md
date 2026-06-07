@@ -12,9 +12,9 @@ compose/suggest, hooks, lint, export, and observability phases.
 
 | Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                        |
 | ------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| V21 `knowledge_sections`                                      | shipped  | Dedicated section rows with 10-value `SectionType`, `UNIQUE(atom_id, section_type)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers.                                                          |
+| `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                          |
-| `knowledge.edit`                                              | shipped  | Upserts named sections only, keeps sibling sections untouched, preserves stable section ids, clears `embedding=NULL`, and downgrades edited verified sections to `reviewed`.                                            |
+| `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                      |
 | `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                      |
 | `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                     |
 | Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                           |
@@ -30,11 +30,33 @@ profile persistence remains owned by the brain pack. The knowledge pack does not
 is the V20 brain profile snapshot/event-log model, and section posterior learning is
 driven through brain profile state and feedback events.
 
-`knowledge_sections` is the authoritative table for atom sections. Section edits are
-keyed by `(atom_id, section_type)`: `knowledge.edit` upserts only the specified sections,
-preserves sibling sections, clears stale section embeddings, and downgrades edited verified
-sections to reviewed. `knowledge.import` supports `atlas_md` file/directory import and,
-with the default section chunk strategy, parses section headings into section rows.
+`knowledge_sections` is the authoritative table for atom sections. Sections are
+**content-addressed**: `knowledge.edit` upserts each supplied section by
+`(atom_id, content_hash)`. Byte-identical content is an idempotent metadata refresh
+(status and embedding preserved); content not already present is inserted as a new row, so
+repeated section types with differing content coexist as sibling rows. Existing sibling
+sections — including verified ones — are never overwritten. `knowledge.import` supports
+`atlas_md` file/directory import and, with the default section chunk strategy, parses
+section headings into section rows. For a section-only document (an empty or short
+pre-section body), import synthesizes the atom's `content` from its section bodies so the
+atom satisfies the content minimum and remains searchable at the atom level.
+
+### Atom and section content constraints
+
+The `knowledge_atoms` table stores atom body text in a single `content` column. There is
+no separate `description` column — content **is** the atom's description. The
+`knowledge.upsert_atoms` verb accepts `content` only; there is no `description` input
+alias. Atom content must be **at least 20 words**; shorter content is rejected at write
+time as a stub.
+
+`knowledge_sections.content` must be **at least 80 characters**; shorter section content is
+rejected as a stub. Each section row carries a `content_hash` column holding the first 16
+hex characters of `sha256(content)`. The uniqueness key is `UNIQUE(atom_id, content_hash)`
+— multiple sections of the same `section_type` are legitimate as long as their content
+differs, and exact-duplicate content for a given atom collapses onto the existing row via
+the hash key rather than being stored twice. `knowledge.edit` resolves the target section
+by `(atom_id, content_hash)`: a hash hit refreshes that row's metadata, a miss inserts a
+new row.
 
 Section lifecycle governance is explicit. `knowledge.challenge` marks an eligible section
 as disputed and increments the atom dispute counter. `knowledge.adjudicate` requires a
@@ -109,6 +131,7 @@ CREATE TABLE IF NOT EXISTS knowledge_sections (
     section_type TEXT NOT NULL,
     heading      TEXT NOT NULL DEFAULT '',
     content      TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
     tokens       INTEGER NOT NULL DEFAULT 0,
     sort_order   INTEGER NOT NULL DEFAULT 0,
     embedding    BLOB,
@@ -116,7 +139,7 @@ CREATE TABLE IF NOT EXISTS knowledge_sections (
     updated_at   INTEGER NOT NULL,
     status       TEXT NOT NULL DEFAULT 'draft',
     FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id),
-    UNIQUE(atom_id, section_type)
+    UNIQUE(atom_id, content_hash)
 );
 ```
 
@@ -1021,10 +1044,10 @@ Implement section posterior initialization from caller-provided priors.
   is a follow-up.
 - `knowledge.upsert_atoms` / `knowledge.upsert_domains`: corpus tables only; graph
   entity dual-write is deferred.
-- V21 migration: `knowledge_sections` table with section type enum, nullable section
-  embeddings, FK to atom, `UNIQUE(atom_id, section_type)`, indexes, and FTS5 triggers.
-- `knowledge.edit`: shipped section-level upsert without wiping siblings; verified edits
-  downgrade to `reviewed`.
+- `knowledge_sections` table with section type enum, nullable section embeddings, FK to
+  atom, `content_hash` + `UNIQUE(atom_id, content_hash)`, indexes, and FTS5 triggers.
+- `knowledge.edit`: section-level upsert keyed by `content_hash`; identical content is
+  idempotent, distinct content inserts a sibling row, and siblings are left untouched.
 - `knowledge.import`: shipped atlas markdown ingestion with section parsing.
 
 ### Phase 3: Compose + suggest verbs with profile resolution
@@ -1090,14 +1113,15 @@ columns, constraints, and indexes are:
 - `section_type TEXT NOT NULL`
 - `heading TEXT NOT NULL DEFAULT ''`
 - `content TEXT NOT NULL DEFAULT ''`
+- `content_hash TEXT NOT NULL DEFAULT ''` (sha256(content)[:16])
 - `tokens INTEGER NOT NULL DEFAULT 0`
 - `sort_order INTEGER NOT NULL DEFAULT 0`
 - `embedding BLOB` (nullable)
 - `created_at INTEGER NOT NULL`
 - `updated_at INTEGER NOT NULL`
-- `status TEXT NOT NULL DEFAULT 'draft'` (added by V22)
+- `status TEXT NOT NULL DEFAULT 'draft'`
 - `FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id)`
-- `UNIQUE(atom_id, section_type)`
+- `UNIQUE(atom_id, content_hash)`
 
 Indexes: `idx_knowledge_sections_atom`, `idx_knowledge_sections_ns_type`,
 `idx_knowledge_sections_ns_atom`, `idx_knowledge_sections_status`.

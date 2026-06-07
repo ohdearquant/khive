@@ -83,16 +83,16 @@ fn pack(rt: KhiveRuntime) -> Fixture {
     }
 }
 
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
-}
-
 fn row_text(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
     match row.get(col) {
         Some(SqlValue::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
+    match row.get(col) {
+        Some(SqlValue::Integer(n)) => Some(*n),
         _ => None,
     }
 }
@@ -108,8 +108,7 @@ async fn w5_search_excludes_deprecated_by_default() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique term xyzqwerty",
-                "content": "retrieval unique xyzqwerty deprecated content"
+                "content": "retrieval unique xyzqwerty deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -129,7 +128,7 @@ async fn w5_search_excludes_deprecated_by_default() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         !names.contains(&"Deprecated Atom"),
@@ -146,8 +145,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique qwertyzyx",
-                "content": "retrieval unique qwertyzyx deprecated content"
+                "content": "retrieval unique qwertyzyx deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -167,7 +165,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"Deprecated Atom"),
@@ -185,14 +183,12 @@ async fn w5_status_multiplier_verified_beats_draft() {
                 {
                     "slug": "veri-atom",
                     "name": "Verified Atom",
-                    "description": "neural network learning gradient descent unique zzzxxx",
-                    "content": "neural network gradient descent unique zzzxxx learning"
+                    "content": "neural network gradient descent unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "draft-atom",
                     "name": "Draft Atom",
-                    "description": "neural network learning gradient unique zzzxxx",
-                    "content": "neural network gradient unique zzzxxx learning"
+                    "content": "neural network gradient unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
         }),
@@ -218,7 +214,7 @@ async fn w5_status_multiplier_verified_beats_draft() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
 
     let verified_score = results
         .iter()
@@ -246,8 +242,8 @@ async fn w5_list_excludes_deprecated_by_default() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "vis-atom", "name": "Visible Atom" },
-                { "slug": "dep-atom", "name": "Hidden Deprecated Atom" },
+                { "slug": "vis-atom", "name": "Visible Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "dep-atom", "name": "Hidden Deprecated Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -287,9 +283,8 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
             "atoms": [{
                 "slug": "retrieval-domain",
                 "name": "Retrieval Domain",
-                "description": "domain organizing retrieval technique families xyzabc",
                 "tags": ["type:domain", "retrieval"],
-                "content": "retrieval domain techniques xyzabc organization"
+                "content": "retrieval domain techniques xyzabc organization dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -303,7 +298,7 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let hit = results
         .iter()
         .find(|r| r["name"].as_str() == Some("Retrieval Domain"))
@@ -324,7 +319,7 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
             "domains": [{
                 "slug": "ml-techniques",
                 "name": "ML Techniques",
-                "description": "machine learning techniques domain organization"
+                "description": "machine learning techniques domain organization — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —"
             }]
         }),
     )
@@ -338,7 +333,7 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         !results.is_empty(),
         "domain search should return the upserted domain"
@@ -352,137 +347,126 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
     }
 }
 
-// ── W8: edit transitions verified → reviewed ──────────────────────────────────
+// ── W8: content-addressed section upsert (dedup by content_hash) ──────────────
 
 #[tokio::test]
-async fn w8_editing_verified_section_transitions_to_reviewed() {
+async fn w8_reimport_identical_section_content_is_idempotent() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "edit-atom", "name": "Edit Atom", "content": "original" }] }),
+        json!({ "atoms": [{ "slug": "edit-atom", "name": "Edit Atom", "content": "original dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
 
-    let atom_resp = f
-        .dispatch("knowledge.get", json!({ "id": "edit-atom" }))
-        .await
-        .expect("get");
-    let atom_uuid = atom_resp["id"].as_str().expect("atom uuid");
-    let ns = atom_resp["namespace"].as_str().unwrap_or("local");
-    let now = now_us();
+    let content = "Overview content long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index";
 
-    // Insert section with status='verified' directly.
+    // Create the section via edit, then mark it verified out-of-band.
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "edit-atom", "sections": [{ "section_type": "overview", "content": content }] }),
+    )
+    .await
+    .expect("edit ok");
     f.sql_exec(
-        "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        vec![
-            SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000001".into()),
-            SqlValue::Text(atom_uuid.to_string()),
-            SqlValue::Text(ns.to_string()),
-            SqlValue::Text("overview".into()),
-            SqlValue::Text("Overview".into()),
-            SqlValue::Text("original section".into()),
-            SqlValue::Integer(2),
-            SqlValue::Integer(0),
-            SqlValue::Text("verified".into()),
-            SqlValue::Integer(now),
-            SqlValue::Integer(now),
-        ],
+        "UPDATE knowledge_sections SET status='verified' WHERE section_type='overview'",
+        vec![],
     )
     .await;
 
+    // Re-edit with byte-identical content: idempotent, no new row, status preserved.
     f.dispatch(
         "knowledge.edit",
-        json!({
-            "id": "edit-atom",
-            "sections": [{ "section_type": "overview", "content": "updated content after edit" }]
-        }),
+        json!({ "id": "edit-atom", "sections": [{ "section_type": "overview", "content": content }] }),
     )
     .await
     .expect("edit ok");
 
-    let row = f
+    let count = f
         .sql_query_one(
-            "SELECT status FROM knowledge_sections WHERE atom_id=?1 AND section_type=?2",
-            vec![
-                SqlValue::Text(atom_uuid.to_string()),
-                SqlValue::Text("overview".into()),
-            ],
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
         )
         .await
-        .expect("section row");
+        .expect("count row");
     assert_eq!(
-        row_text(&row, "status").as_deref(),
-        Some("reviewed"),
-        "editing a verified section must transition it to reviewed"
+        row_i64(&count, "n"),
+        Some(1),
+        "identical content must not create a sibling row"
+    );
+
+    let status = f
+        .sql_query_one(
+            "SELECT status FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
+        )
+        .await
+        .expect("status row");
+    assert_eq!(
+        row_text(&status, "status").as_deref(),
+        Some("verified"),
+        "re-importing identical content must not downgrade verification"
     );
 }
 
 #[tokio::test]
-async fn w8_editing_non_verified_section_leaves_status_unchanged() {
+async fn w8_edit_distinct_content_same_type_creates_sibling() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "edit-atom2", "name": "Edit Atom 2", "content": "original" }] }),
+        json!({ "atoms": [{ "slug": "edit-atom2", "name": "Edit Atom 2", "content": "original dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
 
-    let atom_resp = f
-        .dispatch("knowledge.get", json!({ "id": "edit-atom2" }))
-        .await
-        .expect("get");
-    let atom_uuid = atom_resp["id"].as_str().expect("atom uuid");
-    let ns = atom_resp["namespace"].as_str().unwrap_or("local");
-    let now = now_us();
-
-    f.sql_exec(
-        "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        vec![
-            SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000002".into()),
-            SqlValue::Text(atom_uuid.to_string()),
-            SqlValue::Text(ns.to_string()),
-            SqlValue::Text("examples".into()),
-            SqlValue::Text("Examples".into()),
-            SqlValue::Text("example content".into()),
-            SqlValue::Integer(2),
-            SqlValue::Integer(0),
-            SqlValue::Text("reviewed".into()),
-            SqlValue::Integer(now),
-            SqlValue::Integer(now),
-        ],
-    )
-    .await;
+    let first = "First overview block long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector";
+    let second = "Second overview block, distinct content, also long enough to satisfy the 80-character minimum. examples formalism boundary conditions operational guidance failure modes expert lens references other";
 
     f.dispatch(
         "knowledge.edit",
-        json!({
-            "id": "edit-atom2",
-            "sections": [{ "section_type": "examples", "content": "updated examples content" }]
-        }),
+        json!({ "id": "edit-atom2", "sections": [{ "section_type": "overview", "content": first }] }),
+    )
+    .await
+    .expect("edit ok");
+    f.sql_exec(
+        "UPDATE knowledge_sections SET status='verified' WHERE section_type='overview'",
+        vec![],
+    )
+    .await;
+
+    // Distinct content under the same section_type must insert a sibling row,
+    // not overwrite the existing (verified) one.
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "edit-atom2", "sections": [{ "section_type": "overview", "content": second }] }),
     )
     .await
     .expect("edit ok");
 
-    let row = f
+    let total = f
         .sql_query_one(
-            "SELECT status FROM knowledge_sections WHERE atom_id=?1 AND section_type=?2",
-            vec![
-                SqlValue::Text(atom_uuid.to_string()),
-                SqlValue::Text("examples".into()),
-            ],
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
         )
         .await
-        .expect("section row");
-    // 'reviewed' is not 'verified', so no transition should happen.
+        .expect("count row");
     assert_eq!(
-        row_text(&row, "status").as_deref(),
-        Some("reviewed"),
-        "editing a non-verified section must leave status unchanged"
+        row_i64(&total, "n"),
+        Some(2),
+        "distinct same-type content must coexist as sibling rows"
+    );
+
+    let verified = f
+        .sql_query_one(
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview' AND status='verified'",
+            vec![],
+        )
+        .await
+        .expect("verified count row");
+    assert_eq!(
+        row_i64(&verified, "n"),
+        Some(1),
+        "inserting a sibling must not disturb an existing verified section"
     );
 }
 
@@ -493,7 +477,7 @@ async fn w9_challenge_increments_dispute_count() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "challenge-atom", "name": "Challengeable Atom" }] }),
+        json!({ "atoms": [{ "slug": "challenge-atom", "name": "Challengeable Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -503,7 +487,7 @@ async fn w9_challenge_increments_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "challenge-atom",
-            "sections": [{ "section_type": "overview", "content": "section content" }]
+            "sections": [{ "section_type": "overview", "content": "Section content for challenge test — this text is sufficiently long to satisfy the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -534,7 +518,7 @@ async fn w9_challenge_on_atom_with_no_prior_dispute_count_starts_at_one() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "fresh-atom", "name": "Fresh Atom" }] }),
+        json!({ "atoms": [{ "slug": "fresh-atom", "name": "Fresh Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -542,7 +526,7 @@ async fn w9_challenge_on_atom_with_no_prior_dispute_count_starts_at_one() {
         "knowledge.edit",
         json!({
             "id": "fresh-atom",
-            "sections": [{ "section_type": "formalism", "content": "formalism content" }]
+            "sections": [{ "section_type": "formalism", "content": "Formalism content for fresh-atom challenge test — this text satisfies the 80-character minimum length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -573,7 +557,7 @@ async fn w9_adjudicate_decrements_dispute_count() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "adjud-atom", "name": "Adjudicate Atom" }] }),
+        json!({ "atoms": [{ "slug": "adjud-atom", "name": "Adjudicate Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -581,7 +565,7 @@ async fn w9_adjudicate_decrements_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "adjud-atom",
-            "sections": [{ "section_type": "core_model", "content": "core model content" }]
+            "sections": [{ "section_type": "core_model", "content": "Core model content for adjudication test — this text satisfies the 80-character minimum length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -626,13 +610,13 @@ async fn w9_double_challenge_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "dbl-chal", "name": "Double Challenge" }] }),
+        json!({ "atoms": [{ "slug": "dbl-chal", "name": "Double Challenge", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "some content" }] }),
+        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "Some content for double-challenge test — this text is sufficiently long to satisfy the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("edit");
@@ -658,7 +642,7 @@ async fn w9_challenge_missing_section_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "no-sec", "name": "No Section" }] }),
+        json!({ "atoms": [{ "slug": "no-sec", "name": "No Section", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -677,13 +661,13 @@ async fn w9_adjudicate_non_disputed_section_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "adj-nodis", "name": "Not Disputed" }] }),
+        json!({ "atoms": [{ "slug": "adj-nodis", "name": "Not Disputed", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "content" }] }),
+        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "Content for adjudicate-non-disputed test — this text is long enough to satisfy the 80-character minimum requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("edit");
@@ -697,6 +681,91 @@ async fn w9_adjudicate_non_disputed_section_is_rejected() {
     assert!(err.is_err(), "adjudicate on non-disputed section must fail");
 }
 
+#[tokio::test]
+async fn w9_challenge_disambiguates_same_type_siblings() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "sib-atom", "name": "Sibling Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    // Two distinct-content overview sections are valid siblings under
+    // UNIQUE(atom_id, content_hash), so section_type alone no longer targets one.
+    let edit = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "sib-atom", "sections": [
+                { "section_type": "overview", "content": "First overview variant — long enough to clear the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient transformer attention vector index" },
+                { "section_type": "overview", "content": "Second overview variant — also long enough to clear the 80-character minimum. ranking fusion pipeline embedding rerank cosine similarity nearest neighbor corpus benchmark" }
+            ] }),
+        )
+        .await
+        .expect("edit two siblings");
+    let sections = edit["sections"].as_array().expect("sections array");
+    assert_eq!(sections.len(), 2, "two distinct overviews must be siblings");
+    let hash0 = sections[0]["content_hash"]
+        .as_str()
+        .expect("content_hash")
+        .to_string();
+
+    // Without a disambiguator the challenge is ambiguous and must be rejected.
+    let ambiguous = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview" }),
+        )
+        .await;
+    assert!(
+        ambiguous.is_err(),
+        "ambiguous same-type challenge without content_hash must be rejected"
+    );
+
+    // Targeting by content_hash disputes exactly one section.
+    let res = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview", "content_hash": hash0 }),
+        )
+        .await
+        .expect("targeted challenge ok");
+    assert_eq!(
+        res["disputed"].as_i64(),
+        Some(1),
+        "exactly one section disputed"
+    );
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "sib-atom" }))
+        .await
+        .expect("get");
+    assert_eq!(
+        atom["properties"]["dispute_count"].as_i64(),
+        Some(1),
+        "dispute_count increments once, not once per sibling"
+    );
+
+    // The other sibling is still the only eligible overview now, so an un-hashed
+    // challenge resolves it and the counter advances to 2.
+    let res2 = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview" }),
+        )
+        .await
+        .expect("second sibling is independently challengeable");
+    assert_eq!(res2["disputed"].as_i64(), Some(1));
+    let atom2 = f
+        .dispatch("knowledge.get", json!({ "id": "sib-atom" }))
+        .await
+        .expect("get2");
+    assert_eq!(
+        atom2["properties"]["dispute_count"].as_i64(),
+        Some(2),
+        "each sibling disputes independently"
+    );
+}
+
 // ── W10: import populates source_uri / source_type ────────────────────────────
 
 #[tokio::test]
@@ -707,7 +776,7 @@ async fn w10_import_with_atlas_id_sets_source_uri() {
     let md_path = dir.join("atlas-doc.md");
     std::fs::write(
         &md_path,
-        "atlas_id: ATLAS-001\n\n# Atlas Doc\n\nContent about retrieval.\n",
+        "atlas_id: ATLAS-001\n\n# Atlas Doc\n\nContent about retrieval covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n",
     )
     .expect("write md");
 
@@ -742,7 +811,7 @@ async fn w10_import_with_references_section_sets_source_type_paper() {
     let md_path = dir.join("paper-doc.md");
     std::fs::write(
         &md_path,
-        "# Paper Doc\n\nContent about machine learning.\n\n## References\n\n1. Smith et al. 2023\n2. Jones et al. 2022\n",
+        "# Paper Doc\n\nContent about machine learning covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n\n## References\n\n1. Smith et al. 2023\n2. Jones et al. 2022\n",
     )
     .expect("write md");
 
@@ -777,7 +846,7 @@ async fn w10_import_without_references_sets_source_type_imported() {
     let md_path = dir.join("plain-doc.md");
     std::fs::write(
         &md_path,
-        "# Plain Doc\n\nContent without any references section.\n",
+        "# Plain Doc\n\nContent without any references section covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n",
     )
     .expect("write md");
 
@@ -804,6 +873,48 @@ async fn w10_import_without_references_sets_source_type_imported() {
     );
 }
 
+#[tokio::test]
+async fn w10_import_section_only_markdown_synthesizes_atom_content() {
+    let f = pack(rt());
+    let dir = std::env::temp_dir().join("khive_fixes_test_w10_section_only");
+    std::fs::create_dir_all(&dir).ok();
+    let md_path = dir.join("section-only.md");
+    // All useful text lives under `##` sections; the pre-section body is empty.
+    std::fs::write(
+        &md_path,
+        "# Section Only\n\n## Overview\n\nThis overview section is long enough to satisfy the eighty character minimum section length requirement, covering dense sparse retrieval corpus benchmark search latency.\n\n## Formalism\n\nThe formalism section also exceeds eighty characters with gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity.\n",
+    )
+    .expect("write md");
+
+    let resp = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": md_path.to_str().unwrap(), "chunk_strategy": "section" }),
+        )
+        .await
+        .expect("section-only import should succeed");
+    assert_eq!(
+        resp["imported_atoms"].as_i64().unwrap_or(0),
+        1,
+        "atom must be imported even though the pre-section body is empty"
+    );
+    assert!(
+        resp["imported_sections"].as_i64().unwrap_or(0) >= 2,
+        "section bodies must be imported"
+    );
+
+    // Atom content is synthesized from the section bodies (>= 20 words).
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "section-only" }))
+        .await
+        .expect("get");
+    let content = atom["content"].as_str().unwrap_or("");
+    assert!(
+        content.split_whitespace().count() >= 20,
+        "atom content should be synthesized from sections: {content:?}"
+    );
+}
+
 // ── S4: namespace guard on UPDATE WHERE clauses ───────────────────────────────
 
 #[tokio::test]
@@ -814,7 +925,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert alpha");
@@ -822,7 +933,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-beta",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Beta Name" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Beta Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert beta");
@@ -831,7 +942,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name Updated" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("update alpha");
@@ -866,7 +977,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert alpha domain");
@@ -874,7 +985,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-beta",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert beta domain");
@@ -882,7 +993,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("update alpha domain");
@@ -969,9 +1080,9 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method", "content": "rrf fusion scoring alpha" },
-                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta", "content": "rrf fusion scoring beta" },
-                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma", "content": "rrf fusion scoring gamma" },
+                { "slug": "rrf-a", "name": "RRF Alpha", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-b", "name": "RRF Beta",  "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-c", "name": "RRF Gamma", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -986,8 +1097,7 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         .await
         .expect("search ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(!results.is_empty(), "fusion pipeline must produce results");
 
     for r in results {
@@ -1019,8 +1129,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
             "atoms": [{
                 "slug": "rrf-single",
                 "name": "Single Result",
-                "description": "unique sentinel zzzyyyxxx term for exact match",
-                "content": "unique sentinel zzzyyyxxx exact match content"
+                "content": "unique sentinel zzzyyyxxx exact match content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1035,7 +1144,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
         .await
         .expect("search ok");
 
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         !results.is_empty(),
         "single-result search must return the atom"
@@ -1060,7 +1169,7 @@ async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
     // First insert: a non-finalized atom defaults to status='draft'.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body" }] }),
+        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("insert draft");
@@ -1081,7 +1190,7 @@ async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
     // status to 'reviewed', mirroring the V22 finalized=1 => reviewed backfill.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("finalize upsert");
@@ -1104,7 +1213,7 @@ async fn upsert_finalizing_does_not_demote_verified() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V", "content": "b", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "verified-atom", "name": "V", "content": "b dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("insert");
@@ -1117,7 +1226,7 @@ async fn upsert_finalizing_does_not_demote_verified() {
     // Re-upsert with finalized=true again: must NOT demote verified -> reviewed.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V2", "content": "b2", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "verified-atom", "name": "V2", "content": "b2 dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("re-upsert");
@@ -1146,8 +1255,7 @@ async fn fts_query_special_characters_do_not_crash() {
             "atoms": [{
                 "slug": "tenant-isolation",
                 "name": "Tenant Isolation",
-                "description": "multi-tenant isolation handles Bob's tenant",
-                "content": "multi-tenant isolation and Bob's data separation"
+                "content": "multi-tenant isolation and Bob's data separation dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1155,14 +1263,13 @@ async fn fts_query_special_characters_do_not_crash() {
     .expect("seed atom");
 
     for query in ["multi-tenant isolation", "Bob's tenant"] {
-        let resp = f
+        let _resp = f
             .dispatch(
                 "knowledge.search",
                 json!({ "query": query, "rerank": false }),
             )
             .await
             .expect("search should not crash on FTS5 special characters");
-        assert_eq!(resp["status"], "ok");
     }
 }
 
@@ -1176,8 +1283,7 @@ async fn fts_operator_matrix_does_not_crash() {
             "atoms": [{
                 "slug": "fts-matrix-anchor",
                 "name": "FTS Matrix Anchor",
-                "description": "tenant isolation multi-concept search operator regression anchor",
-                "content": "tenant isolation operator regression matrix anchor"
+                "content": "tenant isolation operator regression matrix anchor dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1222,9 +1328,9 @@ async fn fts_operator_matrix_does_not_crash() {
             .unwrap_or_else(|err| {
                 panic!("#570 query {label} {query:?} must not crash FTS5: {err}")
             });
-        assert_eq!(
-            resp["status"], "ok",
-            "#570 query {label} {query:?} must return status=ok, got: {resp:?}"
+        assert!(
+            resp["results"].is_array(),
+            "#570 query {label} {query:?} must return results array, got: {resp:?}"
         );
     }
 }
@@ -1259,8 +1365,8 @@ async fn stats_embedding_coverage_counts_atom_vectors() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "covered", "name": "Covered", "content": "has vector" },
-                { "slug": "uncovered", "name": "Uncovered", "content": "no vector" }
+                { "slug": "covered", "name": "Covered", "content": "has vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "uncovered", "name": "Uncovered", "content": "no vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
             ]
         }),
     )
@@ -1323,20 +1429,17 @@ async fn search_scores_are_normalized_without_rank_inversion() {
                 {
                     "slug": "norm-high",
                     "name": "Normalization High",
-                    "description": "normalization unique qzxqzx alpha scoring",
-                    "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon"
+                    "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-mid",
                     "name": "Normalization Mid",
-                    "description": "normalization unique qzxqzx beta",
-                    "content": "normalization unique qzxqzx beta scoring"
+                    "content": "normalization unique qzxqzx beta scoring dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-low",
                     "name": "Normalization Low",
-                    "description": "normalization unique qzxqzx",
-                    "content": "normalization qzxqzx"
+                    "content": "normalization qzxqzx dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
         }),
@@ -1359,8 +1462,7 @@ async fn search_scores_are_normalized_without_rank_inversion() {
         .await
         .expect("search ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         results.len() >= 2,
         "expected at least 2 results: {results:?}"
@@ -1401,8 +1503,8 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv", "content": "cosine similarity embedding rerank vector" },
-                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta", "content": "cosine similarity embedding rerank" },
+                { "slug": "rerank-a", "name": "Cosine Alpha", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1417,8 +1519,7 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         )
         .await
         .expect("default rerank search ok");
-    assert_eq!(resp_default["status"], "ok");
-    let results_default = resp_default["data"]["results"].as_array().expect("results");
+    let results_default = resp_default["results"].as_array().expect("results");
     assert!(
         !results_default.is_empty(),
         "expected results with default rerank"
@@ -1441,10 +1542,7 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         )
         .await
         .expect("explicit rerank=false search ok");
-    assert_eq!(resp_norerank["status"], "ok");
-    let results_norerank = resp_norerank["data"]["results"]
-        .as_array()
-        .expect("results");
+    let results_norerank = resp_norerank["results"].as_array().expect("results");
     assert!(
         !results_norerank.is_empty(),
         "expected results with rerank=false"
@@ -1474,7 +1572,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx", "content": "opt out rerank test" },
+                { "slug": "optout-a", "name": "Opt Out Alpha", "content": "opt out rerank test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1489,8 +1587,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         )
         .await
         .expect("rerank=false search ok");
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     for r in results {
         let score = r["score"].as_f64().expect("score");
         assert!(
@@ -1507,7 +1604,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard", "content": "multi-concept tenant isolation decompose guard" },
+                { "slug": "decompose-guard", "name": "Decompose Guard", "content": "multi-concept tenant isolation decompose guard dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1526,5 +1623,8 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         )
         .await
         .expect("default rerank + decompose must not crash");
-    assert_eq!(resp["status"], "ok", "expected ok status, got: {resp:?}");
+    assert!(
+        resp["results"].is_array(),
+        "expected results array, got: {resp:?}"
+    );
 }

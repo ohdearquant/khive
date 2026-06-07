@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => Some(PathBuf::from(path)),
         None => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Some(PathBuf::from(format!("{home}/.khive/khive-graph.db")))
+            Some(PathBuf::from(format!("{home}/.khive/khive.db")))
         }
     };
 

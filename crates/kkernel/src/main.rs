@@ -84,7 +84,7 @@ enum DbCommand {
 
 #[derive(clap::Parser, Debug)]
 struct DbMigrateArgs {
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     db: Option<PathBuf>,
 
@@ -107,7 +107,7 @@ struct DbMigrateArgs {
 
 #[derive(clap::Parser, Debug)]
 struct DbCheckArgs {
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     db: Option<PathBuf>,
 

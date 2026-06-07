@@ -90,7 +90,7 @@ The following target fields are **deferred** and are not part of the shipped par
   `read_only`
 
 Current backend behavior is one default backend, `BackendId::main()`, backed by
-`RuntimeConfig::db_path` (`~/.khive/khive-graph.db` by default). The `kkernel backend`
+`RuntimeConfig::db_path` (`~/.khive/khive.db` by default). The `kkernel backend`
 commands expose this single default backend shape while the multi-backend parser/boot path
 is deferred.
 

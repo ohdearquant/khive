@@ -274,7 +274,7 @@ impl KnowledgePack {
                 })
                 .collect();
 
-            Ok(json!({ "items": results, "total": total }))
+            Ok(json!({ "results": results, "total": total }))
         } else {
             // Listing path: DB-level domain filter via tags_any avoids silent
             // truncation (K-3).  `count_entities_tagged` gives the pre-limit
@@ -302,7 +302,7 @@ impl KnowledgePack {
                 })
                 .collect();
 
-            Ok(json!({ "items": results, "total": total }))
+            Ok(json!({ "results": results, "total": total }))
         }
     }
 }

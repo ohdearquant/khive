@@ -7,6 +7,9 @@ cd "$SCRIPT_DIR/../crates"
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 
+echo "=== SQL Lint ==="
+sh "$SCRIPT_DIR/lint-sql.sh"
+
 echo "=== Clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
 

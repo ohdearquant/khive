@@ -10,7 +10,9 @@ use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
 };
 use super::util::resolve_atom_id;
-use super::util::{deser, new_id, now_us, row_str, sql_err};
+use super::util::{
+    content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content,
+};
 use super::KnowledgeHandlers;
 
 // ─── section helpers ──────────────────────────────────────────────────────────
@@ -43,6 +45,8 @@ fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
         section_type,
         heading: row_str(row, "heading").unwrap_or_default(),
         content: row_str(row, "content").unwrap_or_default(),
+        content_hash: row_str(row, "content_hash").unwrap_or_default(),
+        status: row_str(row, "status").unwrap_or_else(|| "draft".into()),
         tokens: super::util::row_i64(row, "tokens").unwrap_or(0),
         sort_order: super::util::row_i64(row, "sort_order").unwrap_or(0),
         created_at: super::util::row_i64(row, "created_at").unwrap_or(0),
@@ -208,6 +212,7 @@ impl KnowledgeHandlers {
 
         for su in &p.sections {
             let stype = parse_section_type(&su.section_type)?;
+            validate_section_content(&su.content)?;
             let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
             let sort_order = su.sort_order.unwrap_or_else(|| {
@@ -216,28 +221,30 @@ impl KnowledgeHandlers {
                     .position(|&t| t == stype)
                     .unwrap_or(9) as i64
             });
+            let hash = content_hash(&su.content);
 
+            // Sections are content-addressed: the dedup key is (atom_id, content_hash),
+            // matching the UNIQUE constraint. Identical content is an idempotent
+            // metadata refresh; distinct content inserts a new row, so repeated
+            // section types with differing content coexist as sibling rows.
             let mut reader = sql
                 .reader()
                 .await
                 .map_err(|e| sql_err("edit section reader", e))?;
             let existing_section = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, status FROM knowledge_sections WHERE atom_id = ?1 AND section_type = ?2 LIMIT 1".into(),
+                    sql: "SELECT id FROM knowledge_sections \
+                          WHERE atom_id = ?1 AND content_hash = ?2 LIMIT 1"
+                        .into(),
                     params: vec![
                         SqlValue::Text(atom_id.clone()),
-                        SqlValue::Text(stype.as_str().to_string()),
+                        SqlValue::Text(hash.clone()),
                     ],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("edit section lookup", e))?;
 
-            let was_verified = existing_section
-                .as_ref()
-                .and_then(|r| row_str(r, "status"))
-                .as_deref()
-                == Some("verified");
             let section_id = existing_section
                 .as_ref()
                 .and_then(|r| row_str(r, "id"))
@@ -247,48 +254,54 @@ impl KnowledgeHandlers {
                 .writer()
                 .await
                 .map_err(|e| sql_err("edit section writer", e))?;
-            writer
-                .execute(SqlStatement {
-                    sql: "INSERT INTO knowledge_sections \
-                          (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, created_at, updated_at) \
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-                          ON CONFLICT(atom_id, section_type) DO UPDATE SET \
-                            heading=excluded.heading, \
-                            content=excluded.content, \
-                            tokens=excluded.tokens, \
-                            sort_order=excluded.sort_order, \
-                            embedding=NULL, \
-                            updated_at=excluded.updated_at"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(section_id.clone()),
-                        SqlValue::Text(atom_id.clone()),
-                        SqlValue::Text(ns.clone()),
-                        SqlValue::Text(stype.as_str().to_string()),
-                        SqlValue::Text(heading.clone()),
-                        SqlValue::Text(su.content.clone()),
-                        SqlValue::Integer(tokens),
-                        SqlValue::Integer(sort_order),
-                        SqlValue::Integer(now),
-                        SqlValue::Integer(now),
-                    ],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("edit section upsert", e))?;
 
-            if was_verified {
+            if existing_section.is_some() {
+                // Identical content already stored: refresh metadata only. Content
+                // is unchanged, so the embedding and verification status stay valid.
                 writer
                     .execute(SqlStatement {
-                        sql: "UPDATE knowledge_sections SET status='reviewed' WHERE atom_id=?1 AND section_type=?2 AND status='verified'".into(),
+                        sql: "UPDATE knowledge_sections SET \
+                              heading=?1, tokens=?2, sort_order=?3, updated_at=?4 \
+                              WHERE id=?5"
+                            .into(),
                         params: vec![
-                            SqlValue::Text(atom_id.clone()),
-                            SqlValue::Text(stype.as_str().to_string()),
+                            SqlValue::Text(heading.clone()),
+                            SqlValue::Integer(tokens),
+                            SqlValue::Integer(sort_order),
+                            SqlValue::Integer(now),
+                            SqlValue::Text(section_id.clone()),
                         ],
                         label: None,
                     })
                     .await
-                    .map_err(|e| sql_err("edit section status transition", e))?;
+                    .map_err(|e| sql_err("edit section update", e))?;
+            } else {
+                // New content: insert a fresh row, leaving any sibling sections
+                // (including verified ones of the same type) untouched.
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO knowledge_sections \
+                              (id, atom_id, namespace, section_type, heading, content, \
+                               content_hash, tokens, sort_order, created_at, updated_at) \
+                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                            .into(),
+                        params: vec![
+                            SqlValue::Text(section_id.clone()),
+                            SqlValue::Text(atom_id.clone()),
+                            SqlValue::Text(ns.clone()),
+                            SqlValue::Text(stype.as_str().to_string()),
+                            SqlValue::Text(heading.clone()),
+                            SqlValue::Text(su.content.clone()),
+                            SqlValue::Text(hash.clone()),
+                            SqlValue::Integer(tokens),
+                            SqlValue::Integer(sort_order),
+                            SqlValue::Integer(now),
+                            SqlValue::Integer(now),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit section insert", e))?;
             }
 
             upserted += 1;
@@ -298,6 +311,7 @@ impl KnowledgeHandlers {
                 "section_type": stype.as_str(),
                 "heading": heading,
                 "tokens": tokens,
+                "content_hash": hash,
             }));
         }
 
@@ -384,6 +398,22 @@ impl KnowledgeHandlers {
                 atom_name
             };
 
+            // Atom content is its description. A section-only document (e.g.
+            // `# Title` followed entirely by `##` sections) has an empty/short
+            // pre-section body, which would fail the atom content minimum before
+            // the sections are imported. Synthesize atom content from the section
+            // bodies in that case so the atom carries meaningful text.
+            let atom_content =
+                if atom_body.split_whitespace().count() >= super::util::MIN_ATOM_CONTENT_WORDS {
+                    atom_body
+                } else {
+                    sections
+                        .iter()
+                        .map(|(_, _, body)| body.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+
             let atlas_id = extract_atlas_id(&content);
             let citation_count = sections
                 .iter()
@@ -405,7 +435,7 @@ impl KnowledgeHandlers {
                 "atoms": [{
                     "slug": slug,
                     "name": name,
-                    "content": atom_body,
+                    "content": atom_content,
                     "properties": Value::Object(properties),
                     "source_uri": source_uri,
                     "source_type": source_type,
@@ -415,8 +445,11 @@ impl KnowledgeHandlers {
             imported_atoms += 1;
 
             if chunk_strategy == "section" && !sections.is_empty() {
+                // Filter out stub sections below the 80-char minimum to avoid
+                // errors during import of markdown files with short sections.
                 let section_updates: Vec<Value> = sections
                     .iter()
+                    .filter(|(_, _, body)| body.len() >= super::util::MIN_SECTION_CONTENT_LEN)
                     .map(|(stype, heading, body)| {
                         json!({
                             "section_type": stype.as_str(),
@@ -425,13 +458,15 @@ impl KnowledgeHandlers {
                         })
                     })
                     .collect();
-                let edit_params = json!({
-                    "id": slug,
-                    "sections": section_updates,
-                });
-                let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
-                if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
-                    imported_sections += n as usize;
+                if !section_updates.is_empty() {
+                    let edit_params = json!({
+                        "id": slug,
+                        "sections": section_updates,
+                    });
+                    let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
+                    if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
+                        imported_sections += n as usize;
+                    }
                 }
             }
         }
@@ -454,6 +489,25 @@ impl KnowledgeHandlers {
 
         let atom_id = resolve_atom_id(runtime, &ns, &p.atom_id).await?;
         let stype = parse_section_type(&p.section_type)?;
+        let hash = p
+            .content_hash
+            .as_ref()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
+
+        // Same-type sibling sections are valid (UNIQUE(atom_id, content_hash)),
+        // so section_type alone no longer identifies one section. Resolve the
+        // single eligible target before mutating: a content_hash pins it
+        // exactly, otherwise there must be exactly one eligible section.
+        let target_hash = Self::resolve_section_hash(
+            runtime,
+            &atom_id,
+            stype,
+            hash.as_deref(),
+            "status NOT IN ('disputed','deprecated')",
+            "section not found, already disputed, or deprecated",
+        )
+        .await?;
 
         let mut writer = sql
             .writer()
@@ -462,10 +516,14 @@ impl KnowledgeHandlers {
 
         let affected = writer
             .execute(SqlStatement {
-                sql: "UPDATE knowledge_sections SET status='disputed' WHERE atom_id=?1 AND section_type=?2 AND status NOT IN ('disputed','deprecated')".into(),
+                sql: "UPDATE knowledge_sections SET status='disputed' \
+                      WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 \
+                      AND status NOT IN ('disputed','deprecated')"
+                    .into(),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(stype.as_str().to_string()),
+                    SqlValue::Text(target_hash.clone()),
                 ],
                 label: None,
             })
@@ -480,7 +538,9 @@ impl KnowledgeHandlers {
 
         writer
             .execute(SqlStatement {
-                sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+1) WHERE id=?1 AND namespace=?2".into(),
+                sql: format!(
+                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2"
+                ),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(ns.clone()),
@@ -493,8 +553,65 @@ impl KnowledgeHandlers {
         Ok(json!({
             "atom_id": atom_id,
             "section_type": stype.as_str(),
+            "content_hash": target_hash,
+            "disputed": affected,
             "reason": p.reason,
         }))
+    }
+
+    /// Resolve the single section of `stype` on `atom_id` that the lifecycle
+    /// verbs should act on. `hash` pins an exact sibling; without it there must
+    /// be exactly one section matching `status_filter`, otherwise the call is
+    /// ambiguous and is rejected. Returns the target `content_hash`.
+    async fn resolve_section_hash(
+        runtime: &KhiveRuntime,
+        atom_id: &str,
+        stype: SectionType,
+        hash: Option<&str>,
+        status_filter: &str,
+        not_found_msg: &str,
+    ) -> Result<String, RuntimeError> {
+        let sql = runtime.sql();
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("section resolve reader", e))?;
+
+        let mut query = format!(
+            "SELECT content_hash FROM knowledge_sections \
+             WHERE atom_id=?1 AND section_type=?2 AND {status_filter}"
+        );
+        let mut params = vec![
+            SqlValue::Text(atom_id.to_owned()),
+            SqlValue::Text(stype.as_str().to_string()),
+        ];
+        if let Some(h) = hash {
+            query.push_str(" AND content_hash=?3");
+            params.push(SqlValue::Text(h.to_owned()));
+        }
+
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: query,
+                params,
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("section resolve", e))?;
+
+        if rows.is_empty() {
+            return Err(RuntimeError::InvalidInput(not_found_msg.to_owned()));
+        }
+        if hash.is_none() && rows.len() > 1 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "atom has {} '{}' sections matching; specify content_hash to target one",
+                rows.len(),
+                stype.as_str(),
+            )));
+        }
+        rows.first()
+            .and_then(|r| row_str(r, "content_hash"))
+            .ok_or_else(|| RuntimeError::Internal("section row missing content_hash".into()))
     }
 
     pub(crate) async fn adjudicate(
@@ -515,12 +632,29 @@ impl KnowledgeHandlers {
 
         let atom_id = resolve_atom_id(runtime, &ns, &p.atom_id).await?;
         let stype = parse_section_type(&p.section_type)?;
+        let hash = p
+            .content_hash
+            .as_ref()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
 
         let new_status = if resolution == "accept" {
             "verified"
         } else {
             "reviewed"
         };
+
+        // Target a single disputed section — same-type siblings can be disputed
+        // independently, so resolve one before resolving its lifecycle.
+        let target_hash = Self::resolve_section_hash(
+            runtime,
+            &atom_id,
+            stype,
+            hash.as_deref(),
+            "status='disputed'",
+            "section not found or not in disputed state",
+        )
+        .await?;
 
         let mut writer = sql
             .writer()
@@ -530,11 +664,13 @@ impl KnowledgeHandlers {
         let affected = writer
             .execute(SqlStatement {
                 sql: format!(
-                    "UPDATE knowledge_sections SET status='{new_status}' WHERE atom_id=?1 AND section_type=?2 AND status='disputed'"
+                    "UPDATE knowledge_sections SET status='{new_status}' \
+                     WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'"
                 ),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(stype.as_str().to_string()),
+                    SqlValue::Text(target_hash.clone()),
                 ],
                 label: None,
             })
@@ -549,7 +685,9 @@ impl KnowledgeHandlers {
 
         writer
             .execute(SqlStatement {
-                sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) > 0 THEN coalesce(json_extract(properties,'$.dispute_count'),0)-1 ELSE 0 END) WHERE id=?1 AND namespace=?2".into(),
+                sql: format!(
+                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2"
+                ),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(ns.clone()),
@@ -562,8 +700,10 @@ impl KnowledgeHandlers {
         Ok(json!({
             "atom_id": atom_id,
             "section_type": stype.as_str(),
+            "content_hash": target_hash,
             "resolution": resolution,
             "new_status": new_status,
+            "resolved": affected,
         }))
     }
 }

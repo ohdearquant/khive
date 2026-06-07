@@ -102,6 +102,22 @@ The canonical ledger of database schema migration versions. Migration versions a
 > `knowledge_atoms.status`, `source_uri`, `source_type`, `knowledge_sections.status`,
 > `knowledge_domains.status`, status indexes, and the `finalized -> reviewed` atom backfill.
 > Versions V1–V22 are production schema and are frozen.
+>
+> **Consolidation (2026-06-07, fresh-start v0.2.8)**: The V1–V22 ledger above is
+> **historical**. The repository was reset at v0.2.8 (no external deployments depend on the
+> incremental chain; the only database that ever needs migrating is ours). The 22 incremental
+> migrations were collapsed into a single `V1 = initial_schema` that materializes the full
+> cumulative schema in one transaction. A fresh database runs exactly one migration. The
+> ledger table is retained as a record of how the schema evolved, not as a live application
+> sequence. Future schema changes append `V2`, `V3`, … as normal; the consolidation is a
+> one-time baseline reset, not a new model.
+>
+> A database that still carries the **pre-consolidation ledger** (recorded version
+> `2..=22`) is ahead of the single known migration. `run_migrations` detects
+> `current_version > latest_version` and **fails with an explicit error** rather than
+> silently skipping `V1` and leaving the process on the stale schema. Such a database must
+> be recreated from the current `schema.sql`; in-place downgrade across the reset is not
+> supported.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -143,10 +159,11 @@ pub struct VersionedMigration {
     pub up: &'static str,
 }
 
+const V1_UP: &str = include_str!("../sql/schema.sql");
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration { version: 1, name: "initial_schema", up: V1_UP },
-    VersionedMigration { version: 2, name: "...",            up: V2_UP },
-    ...
+    // V2, V3, … appended as schema evolves; each sources its own .sql file.
 ];
 ```
 
@@ -154,6 +171,45 @@ The migration array is contiguous (`1, 2, 3, ...`); `run_migrations` validates
 this at startup and returns `SqliteError::InvalidData` on gaps. Appending a
 migration is a one-line change to the array. Inserting in the middle, renumbering,
 or skipping versions is a hard error.
+
+### DDL lives in `.sql` files, not inline Rust strings
+
+Migration SQL is authored in `.sql` files under `crates/khive-db/sql/` and pulled
+into the migration array with `include_str!`. The `up` field of every
+`VersionedMigration` points at a file, not a hand-concatenated Rust string
+literal. `V1`'s body is `crates/khive-db/sql/schema.sql`; a future `V2` adds
+`crates/khive-db/sql/NNN-<name>.sql` and references it the same way.
+
+This is the canonical place for schema DDL. Reasons:
+
+- **Tooling sees real SQL.** A `.sql` file is lintable, formattable, and loadable
+  into a throwaway SQLite database. `scripts/lint-sql.sh` (wired into CI and
+  pre-commit) executes every `crates/**/*.sql` file against an in-memory database
+  and checks hygiene, so a malformed migration fails before it ships. Inline
+  `"CREATE TABLE …\" \\\n …"` string literals are invisible to every tool and
+  drift silently.
+- **Diffs are readable.** A schema change shows up as a SQL diff, not as edits to
+  escaped Rust string concatenation.
+- **No recompile to inspect.** Operators and reviewers read the schema directly
+  from the file.
+
+The only DDL that remains an inline Rust constant is the small belt-and-suspenders
+set that is _also_ applied outside the migration path (e.g. `EMBEDDING_MODELS_DDL`,
+referenced both by the V1 schema and by `StorageBackend::vectors_for_namespace` so
+the registry table exists even on a backend created lazily). Those constants are
+the documented exception, not the rule — anything that exists only to evolve the
+schema belongs in a `.sql` file.
+
+### Future direction: extract reusable SQL into named files
+
+The same principle extends beyond migrations. Non-trivial query SQL — recall
+fusion, traversal, scoring/calibration queries — is a candidate for extraction
+into `.sql` files (or `.sql`-templated fragments) rather than living as inline
+string literals in handler code. Separated SQL can be linted, profiled with
+`EXPLAIN QUERY PLAN`, A/B-compared, and tuned for calibration without touching or
+recompiling Rust. This is a directional preference, applied where a query is
+large, hot, or tuned often enough to justify it — not a mandate to externalize
+every one-line `SELECT`.
 
 ### Migration tracking table
 
@@ -482,11 +538,17 @@ the codebase's migration set is global, but applied state is per-file.
 
 ## Implementation
 
+- `crates/khive-db/sql/`:
+  - `schema.sql` — the full V1 baseline schema, included via `include_str!`.
+  - Future migrations add one `NNN-<name>.sql` file each.
 - `crates/khive-db/src/migrations.rs`:
-  - `VersionedMigration` struct.
+  - `VersionedMigration` struct; `up` sourced from a `.sql` file via `include_str!`.
   - `MIGRATIONS: &[VersionedMigration]` — contiguous, append-only.
   - `run_migrations(conn)` — applies all unapplied migrations in order.
   - `MIGRATION_TRACKING_TABLE` DDL for `_schema_migrations`.
+- `scripts/lint-sql.sh`:
+  - Executes every `crates/**/*.sql` against an in-memory SQLite database and
+    checks hygiene. Wired into `scripts/ci.sh` and `.pre-commit-config.yaml`.
 - `crates/kkernel/src/db.rs` (or similar subcommand module):
   - `kkernel db migrate [--backend <name>] [--dry-run] [--check]`.
   - `kkernel db check [--strict]`.

@@ -1,8 +1,26 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted
+**Status**: accepted (amended 2026-06-07)
 **Date**: 2026-05-25
 **Authors**: Ocean, lambda:khive
+
+## Amendment (2026-06-07): content-only atoms; normalized response envelope
+
+The schema-consolidation work supersedes two parts of the original contract below.
+Where the body still reads otherwise, this amendment governs:
+
+- **Atoms have no separate `description` column — the `content` column carries it.**
+  `content` holds the atom's _description_ (the `description` field from the atom
+  markdown front matter — a short summary, ≥ 20 words). The atom's full **body** is
+  its typed **sections** (`knowledge_sections`), not the `content` column.
+  `knowledge.upsert_atoms` accepts `content` only — there is no `description` input
+  alias. The `knowledge_atoms` table and `fts_knowledge` index carry no `description`
+  column, and atom scoring ranks across name, tags, and content.
+  (`knowledge_domains` keep their own `description` — this change is atoms-only.) See
+  [ADR-048](ADR-048-knowledge-section-profiles.md) §"Atom and section content constraints".
+- **`search`, `topic`, and `list` return `{results, total, ...}`**, not
+  `{items, total}` — part of the response-envelope normalization. Inline
+  `{items: ...}` references below are stale.
 
 ## Context
 
@@ -64,13 +82,15 @@ they do not introduce new ones.
 The corpus tier introduces two tables via versioned migration V19
 (`knowledge_atoms_and_domains`):
 
-- `knowledge_atoms` — slug-keyed content units with name, description, content,
-  tags (JSON array), properties (JSON object), and finalized flag.
+- `knowledge_atoms` — slug-keyed content units with name, content (the atom's
+  description/summary from front matter; no separate `description` column — the
+  full body lives in the typed `knowledge_sections`), tags (JSON array),
+  properties (JSON object), and finalized flag.
 - `knowledge_domains` — named groupings with slug, name, description, tags, and
   members (JSON array of atom slugs).
 
 An FTS5 external-content virtual table (`fts_knowledge`) indexes slug, name,
-description, and content from `knowledge_atoms` via triggers that sync on
+and content from `knowledge_atoms` via triggers that sync on
 insert/update/delete. The trigram tokenizer enables substring matching.
 
 Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index via
@@ -92,11 +112,11 @@ does **not** introduce new note kinds, entity kinds, or edge relations:
 #### `knowledge.upsert_atoms` — bulk atom insert/update
 
 ```
-upsert_atoms(atoms: [{slug, name, content?, description?, tags?, properties?, finalized?}, ...], chunk_size?) → {upserted: N}
+upsert_atoms(atoms: [{slug, name, content, tags?, properties?, finalized?}, ...], chunk_size?) → {upserted: N}
 ```
 
 Inserts or updates atoms by `(namespace, slug)` key. On conflict, updates name,
-description, content, tags, properties, finalized, and `updated_at`. Empty `atoms`
+content, tags, properties, finalized, and `updated_at`. Empty `atoms`
 array is rejected. Tags are stored as a JSON array string; properties as a JSON
 object string.
 
@@ -121,7 +141,7 @@ Resolves by UUID first, then by slug against both `knowledge_atoms` and
 #### `knowledge.list` — paginated listing
 
 ```
-list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {items: [...], total: N}
+list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {results: [...], total: N, limit, offset}
 ```
 
 Default type is `atom`. Limit capped at 500.
@@ -163,10 +183,10 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {items: [...], total: N}
+search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N}
 ```
 
-FTS5 recall → in-memory TF-IDF scoring across name, description, tags, and content
+FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
 fields with configurable weights. Features:
 
 - **Query decomposition**: splits long queries into sub-queries, scores each
@@ -212,7 +232,7 @@ cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, sou
 ### 5. `topic` — concept browsing
 
 ```
-topic(domain?, query?, limit?) → {items: [...], total: N}
+topic(domain?, query?, limit?) → {results: [...], total: N}
 ```
 
 - Without `query`: lists all concepts in the namespace up to `limit`.

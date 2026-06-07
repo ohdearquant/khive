@@ -183,7 +183,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         let db_path = std::env::var("HOME")
             .ok()
-            .map(|h| std::path::PathBuf::from(h).join(".khive/khive-graph.db"));
+            .map(|h| std::path::PathBuf::from(h).join(".khive/khive.db"));
         let embedding_model = std::env::var("KHIVE_EMBEDDING_MODEL")
             .ok()
             .and_then(|s| s.parse().ok())

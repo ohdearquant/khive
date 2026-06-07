@@ -152,6 +152,8 @@ pub(crate) struct Section {
     pub section_type: SectionType,
     pub heading: String,
     pub content: String,
+    pub content_hash: String,
+    pub status: String,
     pub tokens: i64,
     pub sort_order: i64,
     pub created_at: i64,
@@ -166,7 +168,8 @@ pub(crate) struct Atom {
     pub namespace: String,
     pub slug: String,
     pub name: String,
-    pub description: Option<String>,
+    /// The atom's content text (also serves as its description). Backed by the
+    /// `content` column in `knowledge_atoms`.
     pub content: String,
     /// JSON array string e.g. `["rag","retrieval"]`
     pub tags: String,
@@ -218,8 +221,7 @@ pub(crate) struct Domain {
 pub(crate) struct AtomInput {
     pub slug: String,
     pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
+    /// The atom's content text (>= 20 words).
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -378,7 +380,6 @@ pub(crate) struct SearchParams {
 pub(crate) struct SearchWeights {
     pub w_exact_name: Option<f64>,
     pub w_name: Option<f64>,
-    pub w_description: Option<f64>,
     pub w_tags: Option<f64>,
     pub w_content: Option<f64>,
     pub expand_discount: Option<f64>,
@@ -441,6 +442,11 @@ pub(crate) struct ChallengeParams {
     pub atom_id: String,
     /// Section type to challenge.
     pub section_type: String,
+    /// Disambiguator when an atom has multiple same-type sections
+    /// (`content_hash` from `knowledge.edit`). Required if more than one
+    /// eligible section of `section_type` exists.
+    #[serde(default)]
+    pub content_hash: Option<String>,
     /// Optional challenge reason.
     #[serde(default)]
     pub reason: Option<String>,
@@ -452,6 +458,11 @@ pub(crate) struct AdjudicateParams {
     pub atom_id: String,
     /// Section type to adjudicate.
     pub section_type: String,
+    /// Disambiguator when an atom has multiple same-type disputed sections
+    /// (`content_hash` from `knowledge.edit`). Required if more than one
+    /// disputed section of `section_type` exists.
+    #[serde(default)]
+    pub content_hash: Option<String>,
     /// Resolution: "accept" (keep disputed, mark reviewed) or "reject" (revert to reviewed).
     pub resolution: String,
 }

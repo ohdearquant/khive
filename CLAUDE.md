@@ -235,10 +235,18 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
 
 ### Schema changes
 
+- **DDL lives in `.sql` files.** Schema DDL is authored in `crates/khive-db/sql/`
+  and pulled into `migrations.rs` via `include_str!` — never hand-written as inline
+  Rust string literals. `V1`'s body is `sql/schema.sql`.
 - **Migrations only.** Schema changes go through `crates/khive-db/src/migrations.rs`.
-  Add a new `VersionedMigration` with `version = <last + 1>`. Never edit V1.
-- **Store DDL** (`NOTES_DDL`, etc.) must include new columns for test convenience,
-  and `run_migrations` must handle the idempotency.
+  Add a new `VersionedMigration` (`version = <last + 1>`) pointing at a new
+  `sql/NNN-<name>.sql` file. Never edit V1. (V1 is the consolidated fresh-start
+  baseline — see [ADR-015](docs/adr/ADR-015-schema-migrations.md).)
+- **Lint SQL.** `scripts/lint-sql.sh` loads every `crates/**/*.sql` into an
+  in-memory SQLite db and checks hygiene; it runs in `make ci` and pre-commit. A
+  malformed `.sql` fails before it ships.
+- **Reusable query SQL** (hot/tuned queries) should likewise move to `.sql` files
+  where it makes sense — lintable, `EXPLAIN`-able, and tunable without recompiling.
 
 ### MCP tool changes
 
@@ -346,7 +354,7 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 | Change DSL syntax                                           | `crates/khive-request/src/lib.rs` + unit tests (ADR-016)                                                                              |
 | Change MCP surface shape                                    | `crates/khive-mcp/src/server.rs` (ADR-016 — `request` is the only tool)                                                               |
 | Add a runtime operation                                     | `crates/khive-runtime/src/operations.rs`                                                                                              |
-| Change DB schema                                            | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                                                         |
+| Change DB schema                                            | New `crates/khive-db/sql/NNN-<name>.sql` file + register it as a new `VersionedMigration` in `crates/khive-db/src/migrations.rs`      |
 | Add a new entity kind                                       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                               |
 | Add a new edge relation                                     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                  |
 | Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"); additive only             |
