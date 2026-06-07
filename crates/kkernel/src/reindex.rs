@@ -74,6 +74,14 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub best_effort: bool,
 
+    /// Skip knowledge section embeddings (embed atoms but not sections).
+    #[arg(long, conflicts_with = "sections_only")]
+    pub no_sections: bool,
+
+    /// Only embed knowledge sections (skip entities, notes, and atoms).
+    #[arg(long, conflicts_with = "no_knowledge")]
+    pub sections_only: bool,
+
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     pub human: bool,
@@ -85,6 +93,8 @@ struct ReindexReport {
     notes_processed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_atoms_indexed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_sections_indexed: Option<u64>,
     /// Atoms whose vector write failed during the knowledge pass.
     knowledge_atoms_failed: u64,
     /// True when the knowledge pass itself errored (could not run to completion).
@@ -93,6 +103,10 @@ struct ReindexReport {
     /// knowledge pass. Distinct from atom-level failures: atom vectors DID
     /// persist; the ANN snapshot is the failure dimension.
     knowledge_ann_failed: bool,
+    /// Section-level embed or SQL-write failures during the knowledge pass.
+    /// Distinct from atom-level failures; sections still index atoms even if
+    /// section embedding fails.
+    knowledge_sections_failed: u64,
     models_used: Vec<String>,
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
@@ -106,6 +120,7 @@ impl ReindexReport {
             || self.knowledge_atoms_failed > 0
             || self.knowledge_pass_errored
             || self.knowledge_ann_failed
+            || self.knowledge_sections_failed > 0
     }
 }
 
@@ -242,8 +257,11 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
-    let do_graph = !args.knowledge_only; // entities + notes
+    // `--sections-only` is the narrowest scope: knowledge sections alone.
+    let do_graph = !args.knowledge_only && !args.sections_only; // entities + notes
     let do_knowledge = !args.no_knowledge; // knowledge corpus
+    let do_atoms = do_knowledge && !args.sections_only;
+    let do_sections = do_knowledge && !args.no_sections;
 
     // Explicit --model targets a single engine; otherwise fan out to ALL
     // registered engines, matching the runtime's multi-model write path so a
@@ -261,9 +279,11 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                         entities_processed: 0,
                         notes_processed: 0,
                         knowledge_atoms_indexed: None,
+                        knowledge_sections_indexed: None,
                         knowledge_atoms_failed: 0,
                         knowledge_pass_errored: false,
                         knowledge_ann_failed: false,
+                        knowledge_sections_failed: 0,
                         models_used: vec![],
                         elapsed_ms: 0,
                         errors_skipped: 0,
@@ -395,20 +415,42 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // Reindex through the knowledge library directly (the `knowledge.index`
     // handler over the full corpus), not the verb-DSL shell.
     let mut knowledge_atoms_indexed: Option<u64> = None;
+    let mut knowledge_sections_indexed: Option<u64> = None;
     let mut knowledge_atoms_failed: u64 = 0;
     let mut knowledge_pass_errored = false;
     let mut knowledge_ann_failed = false;
-    if do_knowledge {
+    let mut knowledge_sections_failed: u64 = 0;
+    if do_atoms || do_sections {
         eprintln!("  indexing knowledge corpus (this can take a while)…");
-        match khive_pack_knowledge::reindex_knowledge(&rt, &token, true, Some(batch_size)).await {
+        let opts = khive_pack_knowledge::KnowledgeReindexOptions {
+            atoms: do_atoms,
+            sections: do_sections,
+            drop_existing,
+            rebuild_ann: true,
+            batch_size: Some(batch_size),
+        };
+        match khive_pack_knowledge::reindex_knowledge(&rt, &token, opts).await {
             Ok(v) => {
-                knowledge_atoms_indexed =
-                    Some(v.get("indexed").and_then(|n| n.as_u64()).unwrap_or(0));
-                knowledge_atoms_failed = v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
-                knowledge_ann_failed = v
-                    .get("ann_failed")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false);
+                if do_atoms {
+                    knowledge_atoms_indexed =
+                        Some(v.get("atoms_indexed").and_then(|n| n.as_u64()).unwrap_or(0));
+                    knowledge_atoms_failed = v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
+                    knowledge_ann_failed = v
+                        .get("ann_failed")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
+                }
+                if do_sections {
+                    knowledge_sections_indexed = Some(
+                        v.get("sections_indexed")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0),
+                    );
+                    knowledge_sections_failed = v
+                        .get("sections_failed")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "knowledge reindex failed");
@@ -424,9 +466,11 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         entities_processed,
         notes_processed,
         knowledge_atoms_indexed,
+        knowledge_sections_indexed,
         knowledge_atoms_failed,
         knowledge_pass_errored,
         knowledge_ann_failed,
+        knowledge_sections_failed,
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
@@ -517,9 +561,13 @@ fn truncate_text(t: &str) -> String {
 
 fn print_report(report: &ReindexReport, human: bool) {
     if human {
-        let knowledge = report
+        let atoms = report
             .knowledge_atoms_indexed
             .map(|n| format!(", {n} knowledge atoms"))
+            .unwrap_or_default();
+        let sections = report
+            .knowledge_sections_indexed
+            .map(|n| format!(", {n} sections"))
             .unwrap_or_default();
         let status = if report.has_failures() {
             "Reindex completed WITH FAILURES"
@@ -527,10 +575,11 @@ fn print_report(report: &ReindexReport, human: bool) {
             "Reindex complete"
         };
         println!(
-            "{status}: {} entities, {} notes{} ({} entity/note errors) in {}ms",
+            "{status}: {} entities, {} notes{}{} ({} entity/note errors) in {}ms",
             report.entities_processed,
             report.notes_processed,
-            knowledge,
+            atoms,
+            sections,
             report.errors_skipped,
             report.elapsed_ms
         );
@@ -540,6 +589,12 @@ fn print_report(report: &ReindexReport, human: bool) {
             println!(
                 "Knowledge pass: {} atom vector inserts FAILED",
                 report.knowledge_atoms_failed
+            );
+        }
+        if report.knowledge_sections_failed > 0 {
+            println!(
+                "Knowledge sections: {} section embed/write failures",
+                report.knowledge_sections_failed
             );
         }
         if report.knowledge_ann_failed {
@@ -649,9 +704,11 @@ mod tests {
             entities_processed: 0,
             notes_processed: 0,
             knowledge_atoms_indexed: Some(0),
+            knowledge_sections_indexed: None,
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
             knowledge_ann_failed: false,
+            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
@@ -681,9 +738,11 @@ mod tests {
             entities_processed: 0,
             notes_processed: 0,
             knowledge_atoms_indexed: Some(10),
+            knowledge_sections_indexed: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: true,
+            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
@@ -699,6 +758,35 @@ mod tests {
         assert!(
             decide_result(report.has_failures(), true).is_ok(),
             "best-effort downgrades knowledge_ann_failed to exit 0"
+        );
+    }
+
+    #[test]
+    fn has_failures_flags_knowledge_sections_failed() {
+        let report = ReindexReport {
+            entities_processed: 0,
+            notes_processed: 0,
+            knowledge_atoms_indexed: None,
+            knowledge_sections_indexed: Some(0),
+            knowledge_atoms_failed: 0,
+            knowledge_pass_errored: false,
+            knowledge_ann_failed: false,
+            knowledge_sections_failed: 3,
+            models_used: vec![],
+            elapsed_ms: 0,
+            errors_skipped: 0,
+        };
+        assert!(
+            report.has_failures(),
+            "knowledge_sections_failed > 0 alone must drive has_failures() = true"
+        );
+        assert!(
+            decide_result(report.has_failures(), false).is_err(),
+            "knowledge_sections_failed must fail closed (non-zero exit)"
+        );
+        assert!(
+            decide_result(report.has_failures(), true).is_ok(),
+            "best-effort downgrades knowledge_sections_failed to exit 0"
         );
     }
 
