@@ -1,6 +1,6 @@
 # khive-contract
 
-ADR-organized contract tests for the `khive-mcp` binary.
+ADR-organized contract tests for the MCP surface, served by the `kkernel mcp` subcommand.
 
 ## What this is
 
@@ -40,16 +40,16 @@ uv run pytest -v -m "not slow"
 
 ## Binary resolution
 
-The client looks for the `khive-mcp` binary in this order:
+The client looks for the `kkernel` binary in this order:
 
 1. `binary=` argument to `KhiveMcpSession`
-2. `KHIVE_MCP_BINARY` environment variable
-3. `<repo-root>/crates/target/release/khive-mcp`
+2. `KKERNEL_BINARY` environment variable (`KHIVE_MCP_BINARY` is accepted as a deprecated alias)
+3. `<repo-root>/crates/target/release/kkernel`, then `<repo-root>/crates/target/debug/kkernel`
 
-If the binary is missing, build it first:
+The session invokes it as `kkernel mcp …`. If the binary is missing, build it first:
 
 ```bash
-cd crates && cargo build --release -p khive-mcp
+cd crates && cargo build --release -p kkernel
 ```
 
 ## Organization

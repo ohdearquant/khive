@@ -151,6 +151,30 @@ const MIGRATION_TRACKING_TABLE: &str = "\
 
 /// Apply all unapplied migrations in order. Idempotent; each migration runs in its own transaction.
 /// Errors on non-contiguous version array or failed migration.
+/// Read the applied schema version from an open connection **without** running
+/// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
+/// un-migrated or empty database). Never writes.
+pub fn read_schema_version(conn: &Connection) -> u32 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Open `path` read-only and report its applied schema version without creating
+/// or migrating the file. The caller must ensure `path` exists — opening a
+/// missing file read-only errors rather than creating it. This is the path used
+/// by schema-inspection commands that must not mutate the database.
+pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    Ok(read_schema_version(&conn))
+}
+
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
 

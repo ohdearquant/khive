@@ -23,8 +23,8 @@ import sys
 import os
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"),
+    "KKERNEL_BINARY",
+    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
 )
 
 request_id = 0
@@ -94,7 +94,7 @@ def main():
 
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
-        [BINARY, "--db", ":memory:", "--no-embed", "--log", "error"],
+        [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -382,7 +382,7 @@ def gtd_smoke():
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [
-            BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
             "--pack", "kg", "--pack", "gtd",
         ],
         stdin=subprocess.PIPE,
@@ -477,7 +477,7 @@ def memory_smoke():
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [
-            BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
             "--pack", "kg", "--pack", "memory",
         ],
         stdin=subprocess.PIPE,

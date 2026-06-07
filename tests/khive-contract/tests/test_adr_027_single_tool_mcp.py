@@ -163,29 +163,20 @@ def test_unknown_pack_fails_startup() -> None:
     from khive_contract.client import _resolve_binary
 
     binary = _resolve_binary(None)
+    # The MCP server is the `mcp` subcommand of the unified kkernel binary. An
+    # unknown pack must fail initialization with a non-empty error, not hang.
     proc = subprocess.Popen(
-        [str(binary), "--db", ":memory:", "--no-embed", "--log", "error",
+        [str(binary), "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
          "--pack", "kg", "--pack", "does_not_exist"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1,
     )
-    # Either the process exits quickly, or initialize fails
     try:
-        # Try to initialize — it should fail either at process exit or at response level
-        with KhiveMcpSession(packs=("kg", "does_not_exist")) as _session:
-            pass
-        pytest.fail("Expected startup failure for unknown pack 'does_not_exist'")
-    except Exception as exc:
-        # Any exception (FileNotFoundError, KhiveRpcError, RuntimeError) is acceptable
-        # as long as it's attributable — check it's not a silent empty message
-        err_msg = str(exc)
-        assert err_msg, "Startup failure must produce a non-empty error message"
-    finally:
-        try:
-            proc.kill()
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+        _, stderr = proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail("kkernel mcp with an unknown pack should fail fast, not hang")
+    assert proc.returncode != 0, "unknown pack must cause a nonzero exit"
+    assert stderr.strip(), "startup failure must produce a non-empty error message"

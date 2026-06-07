@@ -14,8 +14,7 @@
     "x64"
   ],
   "bin": {
-    "kkernel": "bin/kkernel.exe",
-    "khive-mcp": "bin/khive-mcp.exe"
+    "kkernel": "bin/kkernel.exe"
   },
   "files": [
     "bin/"

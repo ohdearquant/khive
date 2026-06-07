@@ -25,6 +25,7 @@ import { runSync } from "./kg/sync.ts";
 import { runStatus } from "./kg/status.ts";
 import { runValidate } from "./kg/validate.ts";
 import { getRepoRoot } from "./lib/git.ts";
+import { kkernelPath } from "./lib/kernel.ts";
 import { CLI_VERSION } from "./version.ts";
 
 function printUsage(): void {
@@ -241,36 +242,17 @@ if (!group || group === "--help" || group === "-h") {
 } else if (group === "pack") {
   await dispatchPack(groupArgs);
 } else if (group === "mcp") {
-  // Delegate to the khive-mcp Rust binary. Resolve from PATH, cargo bin,
-  // or the platform subpackage (same locations the npm shim checks).
-  const candidates = [
-    "khive-mcp",
-    Deno.env.get("HOME") + "/.cargo/bin/khive-mcp",
-  ];
-  let found: string | undefined;
-  for (const c of candidates) {
-    try {
-      const s = Deno.statSync(c);
-      if (s.isFile) {
-        found = c;
-        break;
-      }
-    } catch { /* next */ }
+  // `khive mcp [flags]` delegates to `kkernel mcp [flags]` — the MCP server
+  // lives under the kkernel `mcp` subcommand (single-binary distribution).
+  let repoRoot: string | undefined;
+  try {
+    repoRoot = await getRepoRoot();
+  } catch {
+    // Not in a git repo — production resolution (npm subpackage) does not need it.
   }
-  if (!found) {
-    // Try PATH resolution via `which`
-    try {
-      const p = new Deno.Command("which", { args: ["khive-mcp"], stdout: "piped", stderr: "null" });
-      const out = new TextDecoder().decode((await p.output()).stdout).trim();
-      if (out) found = out;
-    } catch { /* not found */ }
-  }
-  if (!found) {
-    console.error("khive-mcp not found. Install with: cargo install khive-mcp");
-    Deno.exit(1);
-  }
-  const proc = new Deno.Command(found, {
-    args: groupArgs,
+  const bin = kkernelPath(repoRoot);
+  const proc = new Deno.Command(bin, {
+    args: ["mcp", ...groupArgs],
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",

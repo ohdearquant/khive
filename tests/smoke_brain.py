@@ -18,8 +18,8 @@ import sys
 import os
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"),
+    "KKERNEL_BINARY",
+    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
 )
 
 request_id = 0
@@ -100,7 +100,7 @@ def spawn_brain_proc():
     proc = subprocess.Popen(
         [
             BINARY,
-            "--db", ":memory:",
+            "mcp", "--db", ":memory:",
             "--no-embed",
             "--log", "error",
             "--namespace", "local",

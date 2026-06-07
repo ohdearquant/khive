@@ -81,20 +81,22 @@ def _find_repo_root(start: Path) -> Path | None:
 def _resolve_binary(binary: str | Path | None) -> Path:
     if binary is not None:
         return Path(binary)
-    env_val = os.environ.get("KHIVE_MCP_BINARY")
+    # KKERNEL_BINARY is canonical after the binary unification; KHIVE_MCP_BINARY
+    # is retained as a deprecated alias.
+    env_val = os.environ.get("KKERNEL_BINARY") or os.environ.get("KHIVE_MCP_BINARY")
     if env_val:
         return Path(env_val)
     repo_root = _find_repo_root(Path(__file__).parent)
     if repo_root is not None:
-        release = repo_root / "crates" / "target" / "release" / "khive-mcp"
+        release = repo_root / "crates" / "target" / "release" / "kkernel"
         if release.exists():
             return release
-        debug = repo_root / "crates" / "target" / "debug" / "khive-mcp"
+        debug = repo_root / "crates" / "target" / "debug" / "kkernel"
         if debug.exists():
             return debug
     raise FileNotFoundError(
-        "khive-mcp binary not found. "
-        "Set KHIVE_MCP_BINARY or build with: cd crates && cargo build --release -p khive-mcp"
+        "kkernel binary not found. "
+        "Set KKERNEL_BINARY or build with: cd crates && cargo build --release -p kkernel"
     )
 
 
@@ -141,10 +143,11 @@ class KhiveMcpSession:
         binary = self._binary
         if not binary.exists():
             raise FileNotFoundError(
-                f"khive-mcp binary not found at {binary}. "
-                "Build with: cd crates && cargo build --release -p khive-mcp"
+                f"kkernel binary not found at {binary}. "
+                "Build with: cd crates && cargo build --release -p kkernel"
             )
-        cmd = [str(binary), "--db", str(self._db)]
+        # The MCP server is the `mcp` subcommand of the unified kkernel binary.
+        cmd = [str(binary), "mcp", "--db", str(self._db)]
         if self._no_embed:
             cmd.append("--no-embed")
         cmd += ["--log", self._log]

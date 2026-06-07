@@ -26,7 +26,7 @@ All verbs are dispatched through the single MCP `request` tool
 Enable the brain pack by passing `--pack brain` (the kg pack dependency is resolved automatically):
 
 ```bash
-khive-mcp --pack brain
+kkernel mcp --pack brain
 ```
 
 The `request` tool also accepts an optional `presentation` field (`agent` | `verbose` | `human`) per
@@ -44,21 +44,21 @@ Default is `agent` (token-efficient) for MCP callers.
 
 ### Write lifecycle (commissive)
 
-| Verb                                                       | What it does                                                    |
-| ---------------------------------------------------------- | --------------------------------------------------------------- |
-| `brain.activate(profile_id)`                               | Move a profile to Active — starts the live update loop.         |
-| `brain.deactivate(profile_id)`                             | Move a profile to Inactive — stops live updates, retains state. |
-| `brain.archive(profile_id)`                                | Move a profile to Archived — read-only, audit-retained.         |
-| `brain.feedback(target_id, signal, served_by_profile_id?, section_signals?)` | Emit a FeedbackExplicit event and update posteriors. |
+| Verb                                                                         | What it does                                                    |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `brain.activate(profile_id)`                                                 | Move a profile to Active — starts the live update loop.         |
+| `brain.deactivate(profile_id)`                                               | Move a profile to Inactive — stops live updates, retains state. |
+| `brain.archive(profile_id)`                                                  | Move a profile to Archived — read-only, audit-retained.         |
+| `brain.feedback(target_id, signal, served_by_profile_id?, section_signals?)` | Emit a FeedbackExplicit event and update posteriors.            |
 
 ### Write binding / declaration
 
-| Verb                                                                    | What it does                                              |
-| ----------------------------------------------------------------------- | --------------------------------------------------------- |
-| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | Create a new Bayesian profile; starts in Inactive state. |
-| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | Write a row in the profile resolution table.              |
-| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows (at least one filter required).               |
-| `brain.reset(profile_id?)`                                              | Reset posteriors to priors; increments exploration_epoch. |
+| Verb                                                                     | What it does                                              |
+| ------------------------------------------------------------------------ | --------------------------------------------------------- |
+| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | Create a new Bayesian profile; starts in Inactive state.  |
+| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)`  | Write a row in the profile resolution table.              |
+| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`          | Remove rows (at least one filter required).               |
+| `brain.reset(profile_id?)`                                               | Reset posteriors to priors; increments exploration_epoch. |
 
 ### Convenience
 
@@ -92,15 +92,15 @@ Default is `agent` (token-efficient) for MCP callers.
 
 ## Prerequisites
 
-This plugin provides skills only — it does **not** bundle an MCP server. Install `khive-mcp` and
+This plugin provides skills only — it does **not** bundle an MCP server. Install `kkernel` and
 register it with the `brain` pack before using any skill.
 
 ```bash
 # Install the binary
-cargo install khive-mcp
+cargo install kkernel
 
 # Register in your harness (Claude Code example)
-claude mcp add --transport stdio khive -- khive-mcp --pack brain
+claude mcp add --transport stdio khive -- kkernel mcp --pack brain
 ```
 
 Or add to your project's `.mcp.json`:
@@ -109,8 +109,8 @@ Or add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": ["--pack", "brain"]
+      "command": "kkernel",
+      "args": ["mcp", "--pack", "brain"]
     }
   }
 }

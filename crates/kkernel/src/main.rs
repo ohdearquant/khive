@@ -11,6 +11,8 @@
 //! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
 //! - `vector`  — vector store capabilities and orphan sweep
 //! - `reindex` — rebuild embedding vectors for entities and notes
+//! - `exec`    — run a verb DSL expression through the pack registry
+//! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
@@ -22,7 +24,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig};
-use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, reindex, sync, vector};
+use kkernel::{
+    coordinator::BackendRegistry, engine, exec, kg, pack_introspect, reindex, sync, vector,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,6 +70,13 @@ enum Command {
 
     /// Re-embed all entities and notes using the configured embedding model.
     Reindex(reindex::ReindexArgs),
+
+    /// Execute a verb DSL expression (same syntax as MCP `request` tool).
+    Exec(exec::ExecArgs),
+
+    /// Serve the MCP `request` surface (stdio by default; `--daemon` for the
+    /// warm Unix-socket server; `--transport` selects a registered transport).
+    Mcp(khive_mcp::args::Args),
 
     /// Inspect registered backends.
     #[command(subcommand)]
@@ -193,6 +204,11 @@ async fn main() -> Result<()> {
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
+        Command::Exec(e) => exec::run_exec(e).await,
+        Command::Mcp(a) => {
+            khive_mcp::serve::run(a, &khive_mcp::transport::TransportRegistry::with_builtins())
+                .await
+        }
         Command::Backend(b) => cmd_backend(b),
     }
 }
@@ -262,60 +278,61 @@ async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
 }
 
 async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
-    use khive_storage::types::{SqlStatement, SqlValue};
-
-    let mut cfg = RuntimeConfig::default();
-    if let Some(ref db) = args.db {
-        cfg.db_path = Some(db.clone());
-    }
-
-    // Use read-only constructor so we don't write if just checking.
-    let rt = KhiveRuntime::new_readonly(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     let latest = khive_db::MIGRATIONS.len() as u32;
 
-    let sql = rt.sql();
-    let mut reader = sql.reader().await.context("open SQL reader for db check")?;
+    // A schema check must never mutate the database. Resolve the effective path
+    // and read `_schema_migrations` read-only — opening through a runtime would
+    // run migrations and bring an out-of-date database current before reporting,
+    // masking the pending state this command exists to detect.
+    let resolved: Option<PathBuf> = match args.db {
+        Some(p) => Some(p),
+        None => std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".khive/khive.db")),
+    };
 
-    let current_version: u32 = reader
-        .query_all(SqlStatement {
-            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
-            params: vec![],
-            label: Some("db_check_version".into()),
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|r| match r.get("COALESCE(MAX(version), 0)") {
-                    Some(SqlValue::Integer(v)) => Some(*v as u32),
-                    _ => None,
-                })
-        })
-        .unwrap_or(0);
+    // An absent file is an un-migrated database (version 0); do not create it.
+    let current_version: u32 = match resolved {
+        Some(ref p) if p.exists() => {
+            khive_db::inspect_schema_version(p).map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        _ => 0,
+    };
 
-    let is_current = current_version >= latest;
+    let is_current = current_version == latest;
+    // A version beyond the latest known migration is a stale ledger: the database
+    // predates the consolidated V1 baseline (ADR-015) or was written by a newer
+    // build. Report it rather than treating it as current.
+    let ahead = current_version > latest;
 
     if args.human {
-        println!(
-            "main:    V{current_version} ({})",
-            if is_current {
-                "current"
-            } else {
-                "behind — run: kkernel db migrate"
-            }
-        );
+        let state = if ahead {
+            "ahead — predates the consolidated baseline (ADR-015) or written by a newer build; recreate it"
+        } else if is_current {
+            "current"
+        } else {
+            "behind — run: kkernel db migrate"
+        };
+        println!("main:    V{current_version} ({state})");
     } else {
         let json = serde_json::json!({
             "current_version": current_version,
             "latest_version": latest,
             "current": is_current,
-            "pending": if is_current { 0 } else { latest - current_version },
+            "ahead": ahead,
+            "pending": latest.saturating_sub(current_version),
         });
         println!("{}", serde_json::to_string(&json).expect("serialize"));
     }
 
     if args.strict && !is_current {
+        if ahead {
+            anyhow::bail!(
+                "schema version {current_version} is ahead of the latest known migration {latest} — \
+                 this database predates the consolidated baseline (ADR-015) or was written by a newer \
+                 build; recreate it from the current schema"
+            );
+        }
         anyhow::bail!(
             "schema is behind: V{current_version} applied, V{latest} is current — \
              run `kkernel db migrate` to bring the schema up to date"
@@ -468,5 +485,55 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // A schema check must be read-only: it must not create a missing database,
+    // and it must not migrate (mutate) an existing one. Regression for the codex
+    // finding that `db check` ran migrations via the read-only runtime path.
+    #[tokio::test]
+    async fn db_check_does_not_create_missing_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("missing.db");
+        assert!(!path.exists());
+        cmd_db_check(DbCheckArgs {
+            db: Some(path.clone()),
+            strict: false,
+            human: false,
+        })
+        .await
+        .expect("db check succeeds on a missing file");
+        assert!(!path.exists(), "db check must not create the database file");
+    }
+
+    #[tokio::test]
+    async fn db_check_does_not_mutate_existing_db() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("real.db");
+        cmd_db_migrate(DbMigrateArgs {
+            db: Some(path.clone()),
+            backend: None,
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect("migrate creates the database");
+        let before = std::fs::read(&path).expect("read db before check");
+        // strict passes only when the db is already current — proves the read sees V1.
+        cmd_db_check(DbCheckArgs {
+            db: Some(path.clone()),
+            strict: true,
+            human: false,
+        })
+        .await
+        .expect("db check passes on a current db");
+        let after = std::fs::read(&path).expect("read db after check");
+        assert_eq!(before, after, "db check must not mutate the database");
     }
 }

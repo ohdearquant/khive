@@ -10,7 +10,7 @@ test:
 	cd crates && cargo test --workspace
 
 contract-test:
-	cd crates && cargo build --release -p khive-mcp
+	cd crates && cargo build --release -p kkernel
 	python3 tests/contract_test.py
 
 fmt:
@@ -42,22 +42,22 @@ publish:
 	./scripts/publish.sh --live
 
 local:
-	@echo "==> Building khive-mcp (release)..."
-	@cd crates && cargo build --release -p khive-mcp
-	@SRC=crates/target/release/khive-mcp; \
-	DEST=$$HOME/.cargo/bin/khive-mcp; \
+	@echo "==> Building kkernel (release)..."
+	@cd crates && cargo build --release -p kkernel
+	@SRC=crates/target/release/kkernel; \
+	DEST=$$HOME/.cargo/bin/kkernel; \
 	if [ ! -f "$$SRC" ]; then echo "==> ERROR: build artifact $$SRC missing"; exit 1; fi; \
 	SRC_HASH=$$(md5 -q "$$SRC"); \
 	SRC_SIZE=$$(stat -f '%z' "$$SRC"); \
 	echo "==> Source:  $$SRC ($$SRC_HASH, $$SRC_SIZE bytes)"; \
-	echo "==> Killing running khive-mcp processes..."; \
-	pkill -f 'khive-mcp' 2>/dev/null || true; \
+	echo "==> Killing running kkernel processes..."; \
+	pkill -f 'kkernel' 2>/dev/null || true; \
 	for i in 1 2 3 4 5; do \
-	  if pgrep -f 'khive-mcp' >/dev/null 2>&1; then sleep 1; else break; fi; \
+	  if pgrep -f 'kkernel' >/dev/null 2>&1; then sleep 1; else break; fi; \
 	done; \
-	if pgrep -f 'khive-mcp' >/dev/null 2>&1; then \
+	if pgrep -f 'kkernel' >/dev/null 2>&1; then \
 	  echo "==> WARNING: still running after 5s — SIGKILL"; \
-	  pkill -9 -f 'khive-mcp' 2>/dev/null || true; \
+	  pkill -9 -f 'kkernel' 2>/dev/null || true; \
 	  sleep 1; \
 	fi; \
 	echo "==> Staging + codesigning $$DEST.new..."; \

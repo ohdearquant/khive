@@ -12,6 +12,7 @@ The `kg` pack gives you direct CRUD for any entity kind (`create`, `link`, `sear
 pack adds **opinionated sugar** for two distinct patterns:
 
 **Concept management** (built on the kg substrate):
+
 - `learn` = `create(kind="concept")` with automatic `domain` → tag promotion (makes domain
   filterable via FTS and the `domain=` parameter on `topic`).
 - `cite` = `link(relation="introduced_by")` with weight clamped to [0, 1] and cleaner parameter
@@ -19,6 +20,7 @@ pack adds **opinionated sugar** for two distinct patterns:
 - `topic` = `search(kind="concept")` with optional post-filter on the domain tag.
 
 **Atom management** (lore/knowledge atoms, distinct from the KG entity store):
+
 - `upsert_atoms`, `edit`, `list`, `get`, `delete_atoms` — CRUD for structured knowledge atoms
   (markdown-chunked documents with sections).
 - `search` — hybrid FTS + embedding search with optional reranking.
@@ -33,28 +35,28 @@ All verbs are dispatched through the single MCP `request` tool.
 
 ### Concept management
 
-| Verb | Params | What it does |
-| ---- | ------ | ------------ |
-| `knowledge.learn` | `name` (required), `description?`, `domain?`, `tags?` | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability. |
-| `knowledge.cite` | `concept_id` (required UUID), `source_id` (required UUID, must be `document` or `person`), `weight?` (float, default 1.0) | Create an `introduced_by` edge from a concept to its source. `weight` clamped to [0.0, 1.0]. |
-| `knowledge.topic` | `domain?`, `query?`, `limit?` (default 20, max 100) | List or search concept entities, optionally filtered by domain tag. |
+| Verb              | Params                                                                                                                    | What it does                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge.learn` | `name` (required), `description?`, `domain?`, `tags?`                                                                     | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability. |
+| `knowledge.cite`  | `concept_id` (required UUID), `source_id` (required UUID, must be `document` or `person`), `weight?` (float, default 1.0) | Create an `introduced_by` edge from a concept to its source. `weight` clamped to [0.0, 1.0].                                    |
+| `knowledge.topic` | `domain?`, `query?`, `limit?` (default 20, max 100)                                                                       | List or search concept entities, optionally filtered by domain tag.                                                             |
 
 ### Atom management
 
-| Verb | Params | What it does |
-| ---- | ------ | ------------ |
-| `knowledge.upsert_atoms` | `atoms` (required, array of `{slug, name, content, description?, tags?, properties?, finalized?}`), `chunk_size?` | Create or update knowledge atoms. Field is `content` (not `body`). |
-| `knowledge.edit` | `id` (required, UUID or slug), `sections` (required, array of `{section_type, content, heading?, sort_order?}`) | Upsert sections within an atom. Sections are identified by `section_type`; existing sections with matching type are replaced. |
-| `knowledge.list` | `type?` (`"atom"` or `"domain"`, default `"atom"`), `limit?` (default 20, max 500), `offset?` | Paginate atoms or domains. |
-| `knowledge.get` | `id` (required, UUID or slug) | Fetch a single atom or domain by UUID or slug. Short UUID prefix is NOT supported — use full UUID or slug. |
-| `knowledge.delete_atoms` | `ids` (required, array of slugs or UUIDs) | Delete atoms by slug or UUID. Param is `ids` (not `slugs`). |
+| Verb                     | Params                                                                                                            | What it does                                                                                                                  |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge.upsert_atoms` | `atoms` (required, array of `{slug, name, content, description?, tags?, properties?, finalized?}`), `chunk_size?` | Create or update knowledge atoms. Field is `content` (not `body`).                                                            |
+| `knowledge.edit`         | `id` (required, UUID or slug), `sections` (required, array of `{section_type, content, heading?, sort_order?}`)   | Upsert sections within an atom. Sections are identified by `section_type`; existing sections with matching type are replaced. |
+| `knowledge.list`         | `type?` (`"atom"` or `"domain"`, default `"atom"`), `limit?` (default 20, max 500), `offset?`                     | Paginate atoms or domains.                                                                                                    |
+| `knowledge.get`          | `id` (required, UUID or slug)                                                                                     | Fetch a single atom or domain by UUID or slug. Short UUID prefix is NOT supported — use full UUID or slug.                    |
+| `knowledge.delete_atoms` | `ids` (required, array of slugs or UUIDs)                                                                         | Delete atoms by slug or UUID. Param is `ids` (not `slugs`).                                                                   |
 
 ### Search and retrieval
 
-| Verb | Params | What it does |
-| ---- | ------ | ------------ |
+| Verb               | Params                                                                                                                                                                                                                                                  | What it does                                                                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `knowledge.search` | `query` (required), `type?` (`"atom"` or `"domain"`), `role?`, `limit?` (default 10, max 100), `min_score?`, `weights?`, `decompose?` (boolean), `decompose_threshold?`, `intersection_bonus?`, `rerank?` (default true), `rerank_alpha?` (default 0.7) | Hybrid FTS + embedding search over atoms/domains. `rerank=true` blends TF-IDF and embedding scores via `rerank_alpha` (0 = pure embedding, 1 = pure TF-IDF). |
-| `knowledge.stats` | (none) | Atom, domain, and embedding counts. |
+| `knowledge.stats`  | (none)                                                                                                                                                                                                                                                  | Atom, domain, and embedding counts.                                                                                                                          |
 
 ## Skills
 
@@ -64,20 +66,20 @@ All verbs are dispatched through the single MCP `request` tool.
 
 ## Install
 
-`khive-mcp` ships with the knowledge pack bundled. The knowledge pack requires the `kg` pack as a
+`kkernel` ships with the knowledge pack bundled. The knowledge pack requires the `kg` pack as a
 dependency — both must be listed explicitly when launching the server:
 
 ```bash
-cargo install khive-mcp
+cargo install kkernel
 
 # Claude Code
-claude mcp add --transport stdio khive -- khive-mcp --pack kg --pack knowledge
+claude mcp add --transport stdio khive -- kkernel mcp --pack kg --pack knowledge
 ```
 
 Or using the `KHIVE_PACKS` environment variable:
 
 ```bash
-claude mcp add --transport stdio khive -- env KHIVE_PACKS=kg,knowledge khive-mcp
+claude mcp add --transport stdio khive -- env KHIVE_PACKS=kg,knowledge kkernel mcp
 ```
 
 Or add to `.mcp.json`:
@@ -86,8 +88,8 @@ Or add to `.mcp.json`:
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": ["--pack", "kg", "--pack", "knowledge"]
+      "command": "kkernel",
+      "args": ["mcp", "--pack", "kg", "--pack", "knowledge"]
     }
   }
 }

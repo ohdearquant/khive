@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral-contract tests for the khive-mcp binary (GitHub issue #21).
+"""Behavioral-contract tests for the MCP surface, served by `kkernel mcp` (GitHub issue #21).
 
 CONTRACT vs SMOKE
 -----------------
@@ -33,7 +33,8 @@ How to run
 Each test function is named `test_<contract>` and prints [pass] / [FAIL].
 Exit code is 0 if every test passes, 1 if any fail.
 
-The KHIVE_MCP_BINARY env var overrides the default binary path.
+The KKERNEL_BINARY env var overrides the default binary path. The server is the
+`mcp` subcommand of the unified kkernel binary.
 """
 
 import json
@@ -49,9 +50,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
+    "KKERNEL_BINARY",
     os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"
+        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
     ),
 )
 
@@ -184,10 +185,10 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _start_server(db_path: str) -> subprocess.Popen:
-    """Spawn a fresh khive-mcp process backed by a temp SQLite file."""
+    """Spawn a fresh `kkernel mcp` process backed by a temp SQLite file."""
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
-        [BINARY, "--db", db_path, "--no-embed", "--log", "error"],
+        [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -848,7 +849,7 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
 def main() -> int:
     assert os.path.exists(BINARY), (
         f"Binary not found at {BINARY!r}.\n"
-        f"Build with: cd crates && cargo build --release -p khive-mcp"
+        f"Build with: cd crates && cargo build --release -p kkernel"
     )
     print(f"Binary: {BINARY}")
     print()

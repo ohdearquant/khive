@@ -18,8 +18,8 @@ import os
 import uuid
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"),
+    "KKERNEL_BINARY",
+    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
 )
 
 request_id = 0
@@ -107,7 +107,7 @@ def spawn_proc():
     """Spawn a fresh khive-mcp process with kg + schedule packs."""
     return subprocess.Popen(
         [
-            BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
             "--pack", "kg", "--pack", "schedule",
         ],
         stdin=subprocess.PIPE,
