@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::recall_feedback::{on_recall_hit, on_recall_miss};
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -34,6 +36,7 @@ impl MemoryPack {
     ) -> Result<Value, RuntimeError> {
         use std::sync::atomic::Ordering;
 
+        let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
         let prof = super::common::recall_profile_enabled();
         let call_id = if prof {
@@ -196,6 +199,9 @@ impl MemoryPack {
         }
 
         if fused.is_empty() {
+            if let Ok(mut state) = self.recall_state.lock() {
+                on_recall_miss(&mut state);
+            }
             return to_json(&Vec::<Value>::new());
         }
 
@@ -492,6 +498,23 @@ impl MemoryPack {
                 result
             })
             .collect();
+
+        // Update recall-domain posteriors before returning.
+        {
+            let latency_us = recall_start.elapsed().as_micros() as i64;
+            let top_id = results.first().and_then(|r| {
+                r.get("note_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Uuid>().ok())
+            });
+            if let Ok(mut state) = self.recall_state.lock() {
+                if let Some(tid) = top_id {
+                    on_recall_hit(&mut state, tid, latency_us);
+                } else {
+                    on_recall_miss(&mut state);
+                }
+            }
+        }
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             let per_model: Vec<Value> = candidates
