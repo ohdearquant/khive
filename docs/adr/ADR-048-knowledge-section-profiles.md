@@ -14,7 +14,7 @@ compose/suggest, hooks, lint, export, and observability phases.
 | ------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                          |
-| `knowledge.edit`                                              | shipped  | Upserts named sections only, keeps sibling sections untouched, preserves stable section ids, clears `embedding=NULL`, and downgrades edited verified sections to `reviewed`.                                            |
+| `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                      |
 | `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                      |
 | `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                     |
 | Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                           |
@@ -30,28 +30,31 @@ profile persistence remains owned by the brain pack. The knowledge pack does not
 is the V20 brain profile snapshot/event-log model, and section posterior learning is
 driven through brain profile state and feedback events.
 
-`knowledge_sections` is the authoritative table for atom sections. Section edits are
-keyed by `(atom_id, section_type)`: `knowledge.edit` upserts only the specified sections,
-preserves sibling sections, clears stale section embeddings, and downgrades edited verified
-sections to reviewed. `knowledge.import` supports `atlas_md` file/directory import and,
-with the default section chunk strategy, parses section headings into section rows.
+`knowledge_sections` is the authoritative table for atom sections. Sections are
+**content-addressed**: `knowledge.edit` upserts each supplied section by
+`(atom_id, content_hash)`. Byte-identical content is an idempotent metadata refresh
+(status and embedding preserved); content not already present is inserted as a new row, so
+repeated section types with differing content coexist as sibling rows. Existing sibling
+sections — including verified ones — are never overwritten. `knowledge.import` supports
+`atlas_md` file/directory import and, with the default section chunk strategy, parses
+section headings into section rows.
 
 ### Atom and section content constraints
 
 The `knowledge_atoms` table stores atom body text in a single `content` column. There is
 no separate `description` column — content **is** the atom's description. The
-`knowledge.upsert_atoms` verb accepts `content` (with `description` as a legacy synonym;
-the fuller of the two wins). Atom content must be **at least 20 words**; shorter content
-is rejected at write time as a stub.
+`knowledge.upsert_atoms` verb accepts `content` only; there is no `description` input
+alias. Atom content must be **at least 20 words**; shorter content is rejected at write
+time as a stub.
 
 `knowledge_sections.content` must be **at least 80 characters**; shorter section content is
 rejected as a stub. Each section row carries a `content_hash` column holding the first 16
 hex characters of `sha256(content)`. The uniqueness key is `UNIQUE(atom_id, content_hash)`
 — multiple sections of the same `section_type` are legitimate as long as their content
-differs, and exact-duplicate content for a given atom is rejected by the hash constraint
-rather than by section type. `knowledge.edit` resolves the target section by
-`(atom_id, section_type)` ordered by `sort_order, created_at` and performs an explicit
-insert-or-update (no `ON CONFLICT(section_type)`).
+differs, and exact-duplicate content for a given atom collapses onto the existing row via
+the hash key rather than being stored twice. `knowledge.edit` resolves the target section
+by `(atom_id, content_hash)`: a hash hit refreshes that row's metadata, a miss inserts a
+new row.
 
 Section lifecycle governance is explicit. `knowledge.challenge` marks an eligible section
 as disputed and increments the atom dispute counter. `knowledge.adjudicate` requires a
@@ -1041,8 +1044,8 @@ Implement section posterior initialization from caller-provided priors.
   entity dual-write is deferred.
 - `knowledge_sections` table with section type enum, nullable section embeddings, FK to
   atom, `content_hash` + `UNIQUE(atom_id, content_hash)`, indexes, and FTS5 triggers.
-- `knowledge.edit`: shipped section-level upsert without wiping siblings; verified edits
-  downgrade to `reviewed`.
+- `knowledge.edit`: section-level upsert keyed by `content_hash`; identical content is
+  idempotent, distinct content inserts a sibling row, and siblings are left untouched.
 - `knowledge.import`: shipped atlas markdown ingestion with section parsing.
 
 ### Phase 3: Compose + suggest verbs with profile resolution

@@ -223,31 +223,28 @@ impl KnowledgeHandlers {
             });
             let hash = content_hash(&su.content);
 
-            // Look up existing section by section_type (the semantic key per atom).
+            // Sections are content-addressed: the dedup key is (atom_id, content_hash),
+            // matching the UNIQUE constraint. Identical content is an idempotent
+            // metadata refresh; distinct content inserts a new row, so repeated
+            // section types with differing content coexist as sibling rows.
             let mut reader = sql
                 .reader()
                 .await
                 .map_err(|e| sql_err("edit section reader", e))?;
             let existing_section = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, status FROM knowledge_sections \
-                          WHERE atom_id = ?1 AND section_type = ?2 \
-                          ORDER BY sort_order ASC, created_at ASC LIMIT 1"
+                    sql: "SELECT id FROM knowledge_sections \
+                          WHERE atom_id = ?1 AND content_hash = ?2 LIMIT 1"
                         .into(),
                     params: vec![
                         SqlValue::Text(atom_id.clone()),
-                        SqlValue::Text(stype.as_str().to_string()),
+                        SqlValue::Text(hash.clone()),
                     ],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("edit section lookup", e))?;
 
-            let was_verified = existing_section
-                .as_ref()
-                .and_then(|r| row_str(r, "status"))
-                .as_deref()
-                == Some("verified");
             let section_id = existing_section
                 .as_ref()
                 .and_then(|r| row_str(r, "id"))
@@ -259,18 +256,16 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("edit section writer", e))?;
 
             if existing_section.is_some() {
-                // UPDATE path: section exists for this section_type.
+                // Identical content already stored: refresh metadata only. Content
+                // is unchanged, so the embedding and verification status stay valid.
                 writer
                     .execute(SqlStatement {
                         sql: "UPDATE knowledge_sections SET \
-                              heading=?1, content=?2, content_hash=?3, tokens=?4, \
-                              sort_order=?5, embedding=NULL, updated_at=?6 \
-                              WHERE id=?7"
+                              heading=?1, tokens=?2, sort_order=?3, updated_at=?4 \
+                              WHERE id=?5"
                             .into(),
                         params: vec![
                             SqlValue::Text(heading.clone()),
-                            SqlValue::Text(su.content.clone()),
-                            SqlValue::Text(hash.clone()),
                             SqlValue::Integer(tokens),
                             SqlValue::Integer(sort_order),
                             SqlValue::Integer(now),
@@ -281,7 +276,8 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("edit section update", e))?;
             } else {
-                // INSERT path: new section.
+                // New content: insert a fresh row, leaving any sibling sections
+                // (including verified ones of the same type) untouched.
                 writer
                     .execute(SqlStatement {
                         sql: "INSERT INTO knowledge_sections \
@@ -306,22 +302,6 @@ impl KnowledgeHandlers {
                     })
                     .await
                     .map_err(|e| sql_err("edit section insert", e))?;
-            }
-
-            if was_verified {
-                writer
-                    .execute(SqlStatement {
-                        sql: "UPDATE knowledge_sections SET status='reviewed' \
-                              WHERE atom_id=?1 AND section_type=?2 AND status='verified'"
-                            .into(),
-                        params: vec![
-                            SqlValue::Text(atom_id.clone()),
-                            SqlValue::Text(stype.as_str().to_string()),
-                        ],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("edit section status transition", e))?;
             }
 
             upserted += 1;

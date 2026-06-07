@@ -83,16 +83,16 @@ fn pack(rt: KhiveRuntime) -> Fixture {
     }
 }
 
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
-}
-
 fn row_text(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
     match row.get(col) {
         Some(SqlValue::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
+    match row.get(col) {
+        Some(SqlValue::Integer(n)) => Some(*n),
         _ => None,
     }
 }
@@ -347,10 +347,10 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
     }
 }
 
-// ── W8: edit transitions verified → reviewed ──────────────────────────────────
+// ── W8: content-addressed section upsert (dedup by content_hash) ──────────────
 
 #[tokio::test]
-async fn w8_editing_verified_section_transitions_to_reviewed() {
+async fn w8_reimport_identical_section_content_is_idempotent() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
@@ -359,65 +359,58 @@ async fn w8_editing_verified_section_transitions_to_reviewed() {
     .await
     .expect("upsert");
 
-    let atom_resp = f
-        .dispatch("knowledge.get", json!({ "id": "edit-atom" }))
-        .await
-        .expect("get");
-    let atom_uuid = atom_resp["id"].as_str().expect("atom uuid");
-    let ns = atom_resp["namespace"].as_str().unwrap_or("local");
-    let now = now_us();
+    let content = "Overview content long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index";
 
-    // Insert section with status='verified' directly.
+    // Create the section via edit, then mark it verified out-of-band.
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "edit-atom", "sections": [{ "section_type": "overview", "content": content }] }),
+    )
+    .await
+    .expect("edit ok");
     f.sql_exec(
-        "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, content_hash, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        vec![
-            SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000001".into()),
-            SqlValue::Text(atom_uuid.to_string()),
-            SqlValue::Text(ns.to_string()),
-            SqlValue::Text("overview".into()),
-            SqlValue::Text("Overview".into()),
-            SqlValue::Text("original section content that is long enough to satisfy constraints padding.".into()),
-            SqlValue::Text("aabbccdd00000001".into()),
-            SqlValue::Integer(2),
-            SqlValue::Integer(0),
-            SqlValue::Text("verified".into()),
-            SqlValue::Integer(now),
-            SqlValue::Integer(now),
-        ],
+        "UPDATE knowledge_sections SET status='verified' WHERE section_type='overview'",
+        vec![],
     )
     .await;
 
+    // Re-edit with byte-identical content: idempotent, no new row, status preserved.
     f.dispatch(
         "knowledge.edit",
-        json!({
-            "id": "edit-atom",
-            "sections": [{ "section_type": "overview", "content": "Updated content after edit — this text is long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
-        }),
+        json!({ "id": "edit-atom", "sections": [{ "section_type": "overview", "content": content }] }),
     )
     .await
     .expect("edit ok");
 
-    let row = f
+    let count = f
         .sql_query_one(
-            "SELECT status FROM knowledge_sections WHERE atom_id=?1 AND section_type=?2",
-            vec![
-                SqlValue::Text(atom_uuid.to_string()),
-                SqlValue::Text("overview".into()),
-            ],
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
         )
         .await
-        .expect("section row");
+        .expect("count row");
     assert_eq!(
-        row_text(&row, "status").as_deref(),
-        Some("reviewed"),
-        "editing a verified section must transition it to reviewed"
+        row_i64(&count, "n"),
+        Some(1),
+        "identical content must not create a sibling row"
+    );
+
+    let status = f
+        .sql_query_one(
+            "SELECT status FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
+        )
+        .await
+        .expect("status row");
+    assert_eq!(
+        row_text(&status, "status").as_deref(),
+        Some("verified"),
+        "re-importing identical content must not downgrade verification"
     );
 }
 
 #[tokio::test]
-async fn w8_editing_non_verified_section_leaves_status_unchanged() {
+async fn w8_edit_distinct_content_same_type_creates_sibling() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
@@ -426,60 +419,54 @@ async fn w8_editing_non_verified_section_leaves_status_unchanged() {
     .await
     .expect("upsert");
 
-    let atom_resp = f
-        .dispatch("knowledge.get", json!({ "id": "edit-atom2" }))
-        .await
-        .expect("get");
-    let atom_uuid = atom_resp["id"].as_str().expect("atom uuid");
-    let ns = atom_resp["namespace"].as_str().unwrap_or("local");
-    let now = now_us();
-
-    f.sql_exec(
-        "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, content_hash, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        vec![
-            SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000002".into()),
-            SqlValue::Text(atom_uuid.to_string()),
-            SqlValue::Text(ns.to_string()),
-            SqlValue::Text("examples".into()),
-            SqlValue::Text("Examples".into()),
-            SqlValue::Text("example content that is sufficiently long to satisfy the minimum length constraint.".into()),
-            SqlValue::Text("aabbccdd00000002".into()),
-            SqlValue::Integer(2),
-            SqlValue::Integer(0),
-            SqlValue::Text("reviewed".into()),
-            SqlValue::Integer(now),
-            SqlValue::Integer(now),
-        ],
-    )
-    .await;
+    let first = "First overview block long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector";
+    let second = "Second overview block, distinct content, also long enough to satisfy the 80-character minimum. examples formalism boundary conditions operational guidance failure modes expert lens references other";
 
     f.dispatch(
         "knowledge.edit",
-        json!({
-            "id": "edit-atom2",
-            "sections": [{ "section_type": "examples", "content": "Updated examples content — this text is long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
-        }),
+        json!({ "id": "edit-atom2", "sections": [{ "section_type": "overview", "content": first }] }),
+    )
+    .await
+    .expect("edit ok");
+    f.sql_exec(
+        "UPDATE knowledge_sections SET status='verified' WHERE section_type='overview'",
+        vec![],
+    )
+    .await;
+
+    // Distinct content under the same section_type must insert a sibling row,
+    // not overwrite the existing (verified) one.
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "edit-atom2", "sections": [{ "section_type": "overview", "content": second }] }),
     )
     .await
     .expect("edit ok");
 
-    let row = f
+    let total = f
         .sql_query_one(
-            "SELECT status FROM knowledge_sections WHERE atom_id=?1 AND section_type=?2",
-            vec![
-                SqlValue::Text(atom_uuid.to_string()),
-                SqlValue::Text("examples".into()),
-            ],
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview'",
+            vec![],
         )
         .await
-        .expect("section row");
-    // 'reviewed' is not 'verified', so no transition should happen.
+        .expect("count row");
     assert_eq!(
-        row_text(&row, "status").as_deref(),
-        Some("reviewed"),
-        "editing a non-verified section must leave status unchanged"
+        row_i64(&total, "n"),
+        Some(2),
+        "distinct same-type content must coexist as sibling rows"
+    );
+
+    let verified = f
+        .sql_query_one(
+            "SELECT COUNT(*) AS n FROM knowledge_sections WHERE section_type='overview' AND status='verified'",
+            vec![],
+        )
+        .await
+        .expect("verified count row");
+    assert_eq!(
+        row_i64(&verified, "n"),
+        Some(1),
+        "inserting a sibling must not disturb an existing verified section"
     );
 }
 
