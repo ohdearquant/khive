@@ -2,8 +2,9 @@
 
 Structured knowledge management on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-The knowledge pack provides 10 verbs for managing research concepts and knowledge atoms — all built
-on the kg substrate without duplicating storage.
+The knowledge pack provides verbs for managing research concepts and knowledge atoms — all built
+on the kg substrate without duplicating storage. This README covers the 10 most commonly used
+verbs. Run `verbs(pack="knowledge")` for the full surface (18 verbs total).
 
 ## Why this pack exists
 

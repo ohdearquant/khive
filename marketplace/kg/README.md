@@ -41,7 +41,7 @@ Or add to your project's `.mcp.json`:
 
 ## What You Get
 
-### 1 MCP tool (`request`), 14 verbs inside it
+### 1 MCP tool (`request`), 16 verbs inside it
 
 The MCP server exposes a single tool, `request`, that takes the verb call as a string:
 
@@ -52,20 +52,22 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 
 | Verb        | Key params                                                                                                          | What it does                                |
 | ----------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `create`    | `kind` (req), `name?`, `entity_kind?`, `note_kind?`, `content?`, `description?`, `tags?`, `properties?`, `annotates?` | Create entities or notes                    |
-| `get`       | `id` (req, UUID)                                                                                                    | Fetch any record by UUID                    |
-| `list`      | `kind` (req), `limit?`, `offset?`, `entity_kind?`, `tags?`, `note_kind?`, `source_id?`, `target_id?`, `relations?`, `min_weight?`, `max_weight?`, `direction?` | Browse with filters                         |
-| `update`    | `id` (req), `kind?`, `name?`, `description?`, `content?`, `relation?`, `weight?`, `properties?`, `tags?`           | Patch entity, note, or edge fields          |
+| `create`    | `kind` (req), `name?`, `entity_kind?`, `entity_type?`, `note_kind?`, `content?`, `description?`, `tags?`, `properties?`, `annotates?` | Create entities or notes                    |
+| `get`       | `id` (req, UUID), `include_deleted?`                                                                                | Fetch any record by UUID                    |
+| `list`      | `kind` (req), `limit?`, `offset?`, `entity_kind?`, `entity_type?`, `tags?`, `note_kind?`, `source_id?`, `target_id?`, `relations?`, `min_weight?`, `max_weight?`, `direction?`, `event_kind?`, `event_kinds?` | Browse with filters                         |
+| `update`    | `id` (req), `kind?`, `name?`, `description?`, `content?`, `salience?`, `decay_factor?`, `relation?`, `weight?`, `properties?`, `tags?` | Patch entity, note, or edge fields          |
 | `delete`    | `id` (req), `kind?`, `hard?`                                                                                        | Soft (default) or hard delete               |
 | `merge`     | `into_id` (req), `from_id` (req)                                                                                    | Deduplicate two entities                    |
-| `search`    | `kind` (req), `query` (req), `limit?`, `entity_kind?`, `note_kind?`, `tags?`, `properties?`, `include_superseded?`, `min_score?` | Hybrid FTS5 + vector search                 |
+| `search`    | `kind` (req), `query` (req), `limit?`, `entity_kind?`, `entity_type?`, `note_kind?`, `tags?`, `properties?`, `include_superseded?`, `min_score?` | Hybrid FTS5 + vector search                 |
 | `link`      | `source_id` (req), `target_id` (req), `relation` (req), `weight?`                                                  | Create typed directed edge (self-loops rejected) |
-| `neighbors` | `node_id` (req), `direction?` (default `"out"`), `relations?`, `min_weight?`                                        | Immediate graph neighbors                   |
+| `neighbors` | `node_id` (req), `direction?` (default `"both"`), `relations?`, `min_weight?`                                       | Immediate graph neighbors                   |
 | `traverse`  | `roots` (req, array), `max_depth?` (default 3), `relations?`, `direction?`                                          | Multi-hop BFS                               |
 | `query`     | `query` (req, GQL string), `limit?` (default 500, cap 10000)                                                        | GQL/SPARQL pattern matching                 |
 | `propose`   | `title` (req), `description` (req), `changeset` (req), `reviewers?`, `expiry?`, `parent_id?`                        | Create an event-sourced change proposal     |
 | `review`    | `proposal_id` (req), `decision` (req), `comment?`                                                                   | Review a proposal                           |
 | `withdraw`  | `proposal_id` (req), `rationale?`                                                                                   | Withdraw an open proposal                   |
+| `stats`     | (none)                                                                                                              | Aggregate entity, edge, and note counts     |
+| `verbs`     | `category?`, `pack?`                                                                                                | List all registered MCP-callable verbs      |
 
 **Proposal lifecycle**: `open → approved → applying → applied` (happy path). Terminal states:
 `rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while the

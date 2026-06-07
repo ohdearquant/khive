@@ -52,10 +52,11 @@ Optional: attribute the feedback to a specific profile (useful when multiple pro
 request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\", served_by_profile_id=\"balanced-recall-v1\")")
 ```
 
-Optional: send per-section signals (object mapping section names to signal strings):
+Optional: send per-section signals (object mapping section names to signal strings). Section signals
+only accept `"useful"`, `"not_useful"`, or `"wrong"` — the top-level signal enum values do not apply here:
 
 ```
-request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\", section_signals={relevance: \"explicit_positive\", salience: \"implicit_negative\"})")
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\", section_signals={relevance: \"useful\", salience: \"not_useful\"})")
 ```
 
 The response includes `emitted: true`, the event ID, and the signal that was recorded.

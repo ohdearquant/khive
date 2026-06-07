@@ -36,13 +36,13 @@ request(ops="schedule.agenda()")
 
 ## Parameters
 
-| Parameter | Type   | Required | Description                          |
-| --------- | ------ | -------- | ------------------------------------ |
-| `id`      | string | yes      | Full UUID of the scheduled event.    |
+| Parameter | Type   | Required | Description                                                        |
+| --------- | ------ | -------- | ------------------------------------------------------------------ |
+| `id`      | string | yes      | Full UUID or unambiguous 8+ hex prefix of the scheduled event.    |
 
 ## Anti-patterns
 
-- **Using a short UUID prefix.** `cancel` requires a full UUID — short prefixes are rejected.
+- **Using an ambiguous prefix.** `cancel` accepts full UUIDs or unambiguous 8+ hex prefixes. If the prefix matches more than one event, the call is rejected — use a longer prefix or the full UUID.
 - **Cancelling a non-scheduled-event note.** `cancel` only works on notes with
   `kind="scheduled_event"`. Cancelling a task or observation returns an error.
 - **Cancelling a nonexistent ID.** Returns "not found".
