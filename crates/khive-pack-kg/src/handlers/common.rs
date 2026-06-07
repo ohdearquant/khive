@@ -480,10 +480,7 @@ pub(crate) fn format_edge_output(v: Value, _verbose: bool) -> Value {
     v
 }
 
-pub(crate) fn flatten_get_result(
-    substrate: &str,
-    mut inner: Value,
-) -> Result<Value, RuntimeError> {
+pub(crate) fn flatten_get_result(substrate: &str, mut inner: Value) -> Result<Value, RuntimeError> {
     if let Some(obj) = inner.as_object_mut() {
         match substrate {
             "edge" => {
@@ -573,10 +570,7 @@ pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> 
     Ok(w)
 }
 
-pub(crate) fn valid_relations_for_entity_pair(
-    src_kind: &str,
-    tgt_kind: &str,
-) -> Vec<&'static str> {
+pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) -> Vec<&'static str> {
     const RULES: &[(&str, &str, &str)] = &[
         ("concept", "contains", "concept"),
         ("project", "contains", "project"),
@@ -953,9 +947,7 @@ pub(crate) async fn ensure_note_kind(
     Ok(())
 }
 
-pub(crate) fn description_patch(
-    v: Option<Value>,
-) -> Result<Option<Option<String>>, RuntimeError> {
+pub(crate) fn description_patch(v: Option<Value>) -> Result<Option<Option<String>>, RuntimeError> {
     match v {
         None => Ok(None),
         Some(Value::Null) => Ok(Some(None)),
@@ -990,9 +982,7 @@ pub(crate) fn optional_string_patch(
     }
 }
 
-pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(
-    d: D,
-) -> Result<Option<Option<f64>>, D::Error> {
+pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }
 

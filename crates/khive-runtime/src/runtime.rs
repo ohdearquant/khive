@@ -560,11 +560,7 @@ impl KhiveRuntime {
     /// When no kinds are installed (empty lists), kind validation is skipped at
     /// the runtime layer. The pack handler layer remains the primary enforcement
     /// point; this provides defense-in-depth for direct Rust callers and import.
-    pub fn install_kind_registry(
-        &self,
-        entity_kinds: Vec<String>,
-        note_kinds: Vec<String>,
-    ) {
+    pub fn install_kind_registry(&self, entity_kinds: Vec<String>, note_kinds: Vec<String>) {
         if let Ok(mut guard) = self.valid_entity_kinds.write() {
             *guard = entity_kinds;
         }

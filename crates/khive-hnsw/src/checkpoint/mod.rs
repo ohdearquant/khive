@@ -1,9 +1,9 @@
 //! HNSW index checkpointing — snapshots for crash recovery and warm-start restores.
 
 mod ckpt_config;
-mod snapshot;
 #[cfg(feature = "checkpoint")]
 mod fold_types;
+mod snapshot;
 
 pub use ckpt_config::HnswCheckpointConfig;
 pub use snapshot::{HnswSnapshot, SnapshotError};

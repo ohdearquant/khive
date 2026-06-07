@@ -19,9 +19,7 @@ fn make_batch(n: usize) -> String {
 const CHAIN_2: &str = r#"create(kind="concept", name="LoRA") | link(source_id=$prev.id, target_id="550e8400-e29b-41d4-a716-446655440000", relation="extends")"#;
 
 fn make_chain(n: usize) -> String {
-    let mut ops: Vec<String> = vec![
-        r#"create(kind="concept", name="seed")"#.to_owned(),
-    ];
+    let mut ops: Vec<String> = vec![r#"create(kind="concept", name="seed")"#.to_owned()];
     for i in 1..n {
         ops.push(format!(
             r#"create(kind="concept", name="step_{i}", description=$prev.id)"#
@@ -53,9 +51,7 @@ fn bench_parse_batch(c: &mut Criterion) {
     let mut g = c.benchmark_group("parse/batch");
     g.sample_size(100);
 
-    g.bench_function("3", |b| {
-        b.iter(|| parse_request(black_box(BATCH_3)))
-    });
+    g.bench_function("3", |b| b.iter(|| parse_request(black_box(BATCH_3))));
 
     {
         let input = make_batch(10);
@@ -71,9 +67,7 @@ fn bench_parse_chain(c: &mut Criterion) {
     let mut g = c.benchmark_group("parse/chain");
     g.sample_size(100);
 
-    g.bench_function("2", |b| {
-        b.iter(|| parse_request(black_box(CHAIN_2)))
-    });
+    g.bench_function("2", |b| b.iter(|| parse_request(black_box(CHAIN_2))));
 
     {
         let input = make_chain(5);
@@ -89,9 +83,7 @@ fn bench_parse_json_form(c: &mut Criterion) {
     let mut g = c.benchmark_group("parse/json_form");
     g.sample_size(100);
 
-    g.bench_function("3_ops", |b| {
-        b.iter(|| parse_request(black_box(JSON_FORM)))
-    });
+    g.bench_function("3_ops", |b| b.iter(|| parse_request(black_box(JSON_FORM))));
 
     g.finish();
 }

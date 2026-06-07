@@ -10,7 +10,7 @@ mod validate;
 
 pub use dispatch::run_kg;
 pub use types::{
-    ExportArgs, FetchArgs, HookCommand, HookStatus, ImportArgs, ImportFormat, InitArgs,
-    KgCommand, KgStatusReport, OutputFormat, RuleResult, StatusArgs, ValidateArgs,
-    ValidationReport, ValidationSummary, Violation,
+    ExportArgs, FetchArgs, HookCommand, HookStatus, ImportArgs, ImportFormat, InitArgs, KgCommand,
+    KgStatusReport, OutputFormat, RuleResult, StatusArgs, ValidateArgs, ValidationReport,
+    ValidationSummary, Violation,
 };

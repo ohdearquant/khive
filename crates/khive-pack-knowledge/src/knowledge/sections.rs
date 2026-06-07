@@ -6,10 +6,11 @@ use uuid::Uuid;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::schema::{AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section,
-    SectionType};
-use super::util::{deser, new_id, now_us, row_str, sql_err};
+use super::schema::{
+    AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
+};
 use super::util::resolve_atom_id;
+use super::util::{deser, new_id, now_us, row_str, sql_err};
 use super::KnowledgeHandlers;
 
 // ─── section helpers ──────────────────────────────────────────────────────────

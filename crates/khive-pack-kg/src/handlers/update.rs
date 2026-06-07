@@ -3,10 +3,12 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, NotePatch, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    EdgePatch, EntityPatch, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
+};
 
 use super::common::{
-    deser, description_patch, immutable_event_error, normalize_entity_timestamps,
+    description_patch, deser, immutable_event_error, normalize_entity_timestamps,
     optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_async, string_value,
     to_json, DeleteParams, KindSpec, UpdateParams,
 };

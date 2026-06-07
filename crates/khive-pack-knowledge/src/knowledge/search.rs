@@ -14,8 +14,8 @@ use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
 use super::util::{
     atom_embed_text, atom_from_row, deser, domain_from_row, explicitly_requested_status, is_stop,
     row_bool, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
-    D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_DESCRIPTION,
-    D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, MIN_TERM_LEN, CANDIDATE_POOL,
+    CANDIDATE_POOL, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_DESCRIPTION,
+    D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;

@@ -10,8 +10,8 @@ pub mod tunable;
 
 mod pack;
 
-pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 pub(crate) use pack::sync_balanced_recall_record;
+pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 
 #[cfg(test)]
 mod tests;

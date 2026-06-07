@@ -9,11 +9,13 @@ use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SubstrateKind;
 use khive_types::{
-    EventKind, ProposalChangeset, ProposalCreatedPayload, ProposalDecision, ProposalReviewedPayload,
-    ProposalWithdrawnPayload,
+    EventKind, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
+    ProposalReviewedPayload, ProposalWithdrawnPayload,
 };
 
-use super::common::{deser, to_json, ListProposalsParams, ProposeParams, ReviewParams, WithdrawParams};
+use super::common::{
+    deser, to_json, ListProposalsParams, ProposeParams, ReviewParams, WithdrawParams,
+};
 use crate::KgPack;
 
 use khive_runtime::micros_to_iso;

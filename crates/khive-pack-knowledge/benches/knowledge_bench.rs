@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    AllowAllGate, BackendId, KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
+};
 use khive_types::Namespace;
 
 // ── runtime helpers ───────────────────────────────────────────────────────────
@@ -151,10 +153,7 @@ fn bench_list(c: &mut Criterion) {
             &corpus_size,
             |b, _| {
                 b.to_async(&rt_tokio).iter(|| {
-                    registry.dispatch(
-                        "knowledge.list",
-                        black_box(json!({ "limit": 20 })),
-                    )
+                    registry.dispatch("knowledge.list", black_box(json!({ "limit": 20 })))
                 });
             },
         );
@@ -196,9 +195,8 @@ fn bench_stats(c: &mut Criterion) {
     seed_atoms(&registry, &rt_tokio, 50);
 
     group.bench_function("stats_query", |b| {
-        b.to_async(&rt_tokio).iter(|| {
-            registry.dispatch("knowledge.stats", black_box(json!({})))
-        });
+        b.to_async(&rt_tokio)
+            .iter(|| registry.dispatch("knowledge.stats", black_box(json!({}))));
     });
 
     group.finish();
@@ -228,11 +226,7 @@ fn bench_get(c: &mut Criterion) {
 
 // ── criterion entry points ────────────────────────────────────────────────────
 
-criterion_group!(
-    write_benches,
-    bench_learn,
-    bench_upsert_atoms,
-);
+criterion_group!(write_benches, bench_learn, bench_upsert_atoms,);
 
 criterion_group!(
     read_benches,

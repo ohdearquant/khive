@@ -11,8 +11,8 @@ use khive_runtime::EdgeListFilter;
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, event_filter_from_params,
     normalize_entity_timestamps, normalize_entity_timestamps_array,
-    normalize_event_timestamps_array, reconcile_specific, remap_note_status, resolve_kind_spec,
-    resolve_uuid_async, to_json, validate_entity_type, KindSpec, ListParams, parse_relation,
+    normalize_event_timestamps_array, parse_relation, reconcile_specific, remap_note_status,
+    resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, KindSpec, ListParams,
 };
 use crate::KgPack;
 

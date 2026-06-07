@@ -32,10 +32,8 @@ impl KgPack {
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 for entry in entries {
-                    let source =
-                        resolve_uuid_async(&entry.source_id, &self.runtime, token).await?;
-                    let target =
-                        resolve_uuid_async(&entry.target_id, &self.runtime, token).await?;
+                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, token).await?;
+                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
                     let (source, target) = if relation.is_symmetric() && target < source {
                         (target, source)
@@ -80,8 +78,7 @@ impl KgPack {
                         match resolve_uuid_async(&entry.source_id, &self.runtime, token).await {
                             Ok(id) => id,
                             Err(e) => {
-                                error_list
-                                    .push(json!({"index": idx, "error": format!("{e}")}));
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
                                 continue;
                             }
                         };
@@ -89,8 +86,7 @@ impl KgPack {
                         match resolve_uuid_async(&entry.target_id, &self.runtime, token).await {
                             Ok(id) => id,
                             Err(e) => {
-                                error_list
-                                    .push(json!({"index": idx, "error": format!("{e}")}));
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
                                 continue;
                             }
                         };
@@ -118,23 +114,21 @@ impl KgPack {
                             continue;
                         }
                     };
-                    let metadata =
-                        match merge_entry_metadata(entry.metadata, entry.dependency_kind) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
-                                continue;
-                            }
-                        };
+                    let metadata = match merge_entry_metadata(entry.metadata, entry.dependency_kind)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
                     match self
                         .runtime
                         .link(token, source, target, relation, weight, metadata)
                         .await
                     {
                         Ok(edge) => results.push(to_json(&edge)?),
-                        Err(e) => {
-                            error_list.push(json!({"index": idx, "error": format!("{e}")}))
-                        }
+                        Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }
                 let mut resp = serde_json::json!({

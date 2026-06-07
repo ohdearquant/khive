@@ -15,8 +15,8 @@ use khive_types::{
     ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch, Timestamp,
 };
 
+use super::budget::{count_new_entries, WriteBudget};
 use crate::projection_worker::ProposalsProjectionWorker;
-use super::budget::{WriteBudget, count_new_entries};
 
 /// Worker that applies approved proposal changesets.
 pub struct ProposalApplyWorker {

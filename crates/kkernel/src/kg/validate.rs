@@ -5,7 +5,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::types::{OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation};
+use super::types::{
+    OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
+};
 
 pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
     let kg_dir = args.repo.join(".khive/kg");
@@ -576,9 +578,7 @@ mod tests {
     fn write_entities(kg_dir: &std::path::Path, entities: &[(&str, &str, &str)]) {
         let content: String = entities
             .iter()
-            .map(|(id, kind, name)| {
-                format!(r#"{{"id":"{id}","kind":"{kind}","name":"{name}"}}"#)
-            })
+            .map(|(id, kind, name)| format!(r#"{{"id":"{id}","kind":"{kind}","name":"{name}"}}"#))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(kg_dir.join("entities.ndjson"), content + "\n").unwrap();

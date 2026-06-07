@@ -116,25 +116,18 @@ fn bench_agenda(c: &mut Criterion) {
         let fixture = build_fixture();
         seed_events(&fixture, n_events);
 
-        group.bench_with_input(
-            BenchmarkId::new("agenda", n_events),
-            &n_events,
-            |b, _n| {
-                b.to_async(&fixture.rt).iter(|| {
-                    let registry = &fixture.registry;
-                    async move {
-                        let result = registry
-                            .dispatch(
-                                "schedule.agenda",
-                                black_box(json!({ "limit": 20 })),
-                            )
-                            .await
-                            .expect("agenda ok");
-                        black_box(result)
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("agenda", n_events), &n_events, |b, _n| {
+            b.to_async(&fixture.rt).iter(|| {
+                let registry = &fixture.registry;
+                async move {
+                    let result = registry
+                        .dispatch("schedule.agenda", black_box(json!({ "limit": 20 })))
+                        .await
+                        .expect("agenda ok");
+                    black_box(result)
+                }
+            });
+        });
     }
 
     group.finish();

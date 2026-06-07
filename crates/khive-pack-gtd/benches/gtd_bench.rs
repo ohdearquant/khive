@@ -83,22 +83,18 @@ fn bench_next(c: &mut Criterion) {
         let fixture = build_fixture();
         seed_tasks(&fixture, n_tasks);
 
-        group.bench_with_input(
-            BenchmarkId::new("next", n_tasks),
-            &n_tasks,
-            |b, _n| {
-                b.to_async(&fixture.rt).iter(|| {
-                    let registry = &fixture.registry;
-                    async move {
-                        let result = registry
-                            .dispatch("gtd.next", black_box(json!({ "limit": 10 })))
-                            .await
-                            .expect("next ok");
-                        black_box(result)
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("next", n_tasks), &n_tasks, |b, _n| {
+            b.to_async(&fixture.rt).iter(|| {
+                let registry = &fixture.registry;
+                async move {
+                    let result = registry
+                        .dispatch("gtd.next", black_box(json!({ "limit": 10 })))
+                        .await
+                        .expect("next ok");
+                    black_box(result)
+                }
+            });
+        });
     }
 
     group.finish();
@@ -170,5 +166,11 @@ fn bench_transition(c: &mut Criterion) {
 
 // ── criterion entry points ────────────────────────────────────────────────────
 
-criterion_group!(gtd_benches, bench_assign, bench_next, bench_tasks, bench_transition);
+criterion_group!(
+    gtd_benches,
+    bench_assign,
+    bench_next,
+    bench_tasks,
+    bench_transition
+);
 criterion_main!(gtd_benches);

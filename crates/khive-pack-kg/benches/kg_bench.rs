@@ -196,10 +196,7 @@ fn bench_list(c: &mut Criterion) {
             let registry = &registry;
             async move {
                 let resp = registry
-                    .dispatch(
-                        "list",
-                        black_box(json!({ "kind": "entity", "limit": 50 })),
-                    )
+                    .dispatch("list", black_box(json!({ "kind": "entity", "limit": 50 })))
                     .await
                     .expect("list");
                 black_box(resp)
@@ -221,29 +218,25 @@ fn bench_search(c: &mut Criterion) {
         let (_, registry) = build_registry();
         rt.block_on(async { seed_entities(&registry, corpus).await });
 
-        group.bench_with_input(
-            BenchmarkId::new("entity_fts", corpus),
-            &corpus,
-            |b, _| {
-                b.to_async(&rt).iter(|| {
-                    let registry = &registry;
-                    async move {
-                        let resp = registry
-                            .dispatch(
-                                "search",
-                                black_box(json!({
-                                    "kind": "entity",
-                                    "query": "knowledge graph retrieval benchmark semantic",
-                                    "limit": 20,
-                                })),
-                            )
-                            .await
-                            .expect("search");
-                        black_box(resp)
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("entity_fts", corpus), &corpus, |b, _| {
+            b.to_async(&rt).iter(|| {
+                let registry = &registry;
+                async move {
+                    let resp = registry
+                        .dispatch(
+                            "search",
+                            black_box(json!({
+                                "kind": "entity",
+                                "query": "knowledge graph retrieval benchmark semantic",
+                                "limit": 20,
+                            })),
+                        )
+                        .await
+                        .expect("search");
+                    black_box(resp)
+                }
+            });
+        });
     }
 
     group.finish();

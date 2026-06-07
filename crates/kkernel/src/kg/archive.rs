@@ -265,10 +265,7 @@ fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Res
 }
 
 /// Build a [`KgArchive`] from on-disk NDJSON files for hashing or import.
-pub(super) fn archive_from_ndjson_repo(
-    repo: &Path,
-    namespace: &str,
-) -> Result<KgArchive> {
+pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<KgArchive> {
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
@@ -371,10 +368,7 @@ where
     Ok(records)
 }
 
-fn parse_dt(
-    value: Option<&str>,
-    fallback: chrono::DateTime<Utc>,
-) -> chrono::DateTime<Utc> {
+fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
     value
         .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
         .map(|dt| dt.with_timezone(&Utc))
@@ -655,4 +649,3 @@ mod tests {
         );
     }
 }
-

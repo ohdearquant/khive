@@ -245,8 +245,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         },
         ..RecallConfig::default()
     };
-    let weighted_results =
-        fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
+    let weighted_results = fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
     let weighted_order: Vec<Uuid> = weighted_results.iter().map(|h| h.entity_id).collect();
 
     assert_ne!(
@@ -278,8 +277,7 @@ fn compute_score_weighted_strategy_formula() {
     let decay_factor = 0.01;
     let age_days = 0.0;
     let pipeline = make_pipeline(&cfg);
-    let (total, bd) =
-        compute_score(&cfg, &pipeline, relevance, salience, decay_factor, age_days);
+    let (total, bd) = compute_score(&cfg, &pipeline, relevance, salience, decay_factor, age_days);
     let amplified = 0.8_f64.powf(SALIENCE_AMPLIFIER_ALPHA);
     let expected = 0.70 * 0.5 + 0.20 * amplified + 0.10 * 1.0;
     assert!(
@@ -449,9 +447,9 @@ fn remember_params_decay_factor_above_one_accepted() {
 #[test]
 fn remember_params_invalid_source_id_uuid_is_rejected() {
     let sid = "not-a-uuid";
-    let result: Result<Uuid, RuntimeError> = sid.parse::<Uuid>().map_err(|_| {
-        RuntimeError::InvalidInput(format!("source_id {sid:?} is not a valid UUID"))
-    });
+    let result: Result<Uuid, RuntimeError> = sid
+        .parse::<Uuid>()
+        .map_err(|_| RuntimeError::InvalidInput(format!("source_id {sid:?} is not a valid UUID")));
     assert!(result.is_err(), "expected error for invalid UUID string");
 }
 
@@ -522,8 +520,7 @@ fn high_salience_outranks_low_salience_on_similar_relevance() {
     let decay_factor = 0.01;
     let pipeline = make_pipeline(&cfg);
 
-    let (score_high, _) =
-        compute_score(&cfg, &pipeline, relevance, 0.9, decay_factor, age_days);
+    let (score_high, _) = compute_score(&cfg, &pipeline, relevance, 0.9, decay_factor, age_days);
     let (score_low, _) = compute_score(&cfg, &pipeline, relevance, 0.3, decay_factor, age_days);
 
     assert!(
@@ -641,8 +638,7 @@ fn compute_score_composite_bounded_to_unit_interval() {
         let pipeline = make_pipeline(cfg);
         for raw_relevance in [0.0, 0.5, 1.0, 2.0 / 61.0, 1.0 / 61.0] {
             for salience in [0.0, 0.3, 0.9, 1.0] {
-                let (total, _) =
-                    compute_score(cfg, &pipeline, raw_relevance, salience, 0.01, 0.0);
+                let (total, _) = compute_score(cfg, &pipeline, raw_relevance, salience, 0.01, 0.0);
                 assert!(
                     (0.0..=1.0).contains(&total),
                     "composite score out of [0,1]: {total} (relevance={raw_relevance}, salience={salience}, strategy={:?})",

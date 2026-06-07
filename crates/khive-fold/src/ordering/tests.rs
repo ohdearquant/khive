@@ -1,5 +1,5 @@
-use super::*;
 use super::canonical::{CANONICAL_NAN_F32, CANONICAL_NAN_F64};
+use super::*;
 use std::cmp::Ordering;
 use uuid::Uuid;
 

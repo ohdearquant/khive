@@ -65,10 +65,7 @@ impl KgPack {
             .map_err(RuntimeError::Storage)?
         {
             if event.namespace == token.namespace().as_str() {
-                return flatten_get_result(
-                    "event",
-                    normalize_event_timestamps(to_json(&event)?),
-                );
+                return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
             }
         }
 
@@ -143,9 +140,7 @@ impl KgPack {
                 }
             })
             .ok_or_else(|| {
-                RuntimeError::Internal(
-                    "proposal_id column missing from proposals_open row".into(),
-                )
+                RuntimeError::Internal("proposal_id column missing from proposals_open row".into())
             })?;
 
         let proposal_uuid = Uuid::from_str(&full_uuid_str).map_err(|e| {
@@ -178,8 +173,8 @@ impl KgPack {
         };
 
         let payload_str = event.payload.to_string();
-        let payload: khive_types::ProposalCreatedPayload =
-            serde_json::from_str(&payload_str).map_err(|e| {
+        let payload: khive_types::ProposalCreatedPayload = serde_json::from_str(&payload_str)
+            .map_err(|e| {
                 RuntimeError::Internal(format!(
                     "failed to deserialize ProposalCreated payload: {e}"
                 ))

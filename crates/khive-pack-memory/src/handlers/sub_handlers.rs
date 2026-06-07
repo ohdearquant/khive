@@ -10,9 +10,9 @@ use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, recall_candidate_count,
-    search_source_label, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags,
+    recall_candidate_count, search_source_label, to_json, validate_memory_type,
+    RecallCandidateParams, RecallParams, TextSnippetPolicy, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
 };
 
 impl MemoryPack {

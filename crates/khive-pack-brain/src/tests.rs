@@ -1559,8 +1559,22 @@ async fn w4_h2_bindings_filtered() {
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
 
-    pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-1", "consumer_kind": "recall"}), &registry, &token).await.unwrap();
-    pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-2", "consumer_kind": "search"}), &registry, &token).await.unwrap();
+    pack.dispatch(
+        "brain.bind",
+        json!({"profile_id": "balanced-recall-v1", "actor": "agent-1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "brain.bind",
+        json!({"profile_id": "balanced-recall-v1", "actor": "agent-2", "consumer_kind": "search"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
 
     let result = pack
         .dispatch(
@@ -2537,466 +2551,466 @@ async fn namespace_isolation_state_does_not_leak() {
 
 #[cfg(test)]
 mod help_tests {
-use super::*;
-use crate::handlers::BRAIN_HANDLERS;
+    use super::*;
+    use crate::handlers::BRAIN_HANDLERS;
 
-fn find_handler(name: &str) -> &'static HandlerDef {
-    BRAIN_HANDLERS
-        .iter()
-        .find(|h| h.name == name)
-        .unwrap_or_else(|| panic!("handler {name:?} not found in BRAIN_HANDLERS"))
-}
-
-#[test]
-fn brain_feedback_params_non_empty_and_has_target_and_signal() {
-    let h = find_handler("brain.feedback");
-    assert!(!h.params.is_empty(), "brain.feedback must have params");
-    assert!(
-        h.params.iter().any(|p| p.name == "target_id" && p.required),
-        "brain.feedback must have required target_id param"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "signal" && p.required),
-        "brain.feedback must have required signal param"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "served_by_profile_id"),
-        "brain.feedback must document served_by_profile_id"
-    );
-}
-
-#[test]
-fn brain_auto_feedback_handler_is_declared() {
-    let h = find_handler("brain.auto_feedback");
-    assert!(
-        h.params.iter().any(|p| p.name == "query" && p.required),
-        "brain.auto_feedback must have required query param"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "results" && p.required),
-        "brain.auto_feedback must have required results param"
-    );
-}
-
-#[test]
-fn brain_profile_params_has_required_profile_id() {
-    let h = find_handler("brain.profile");
-    assert!(!h.params.is_empty(), "brain.profile must have params");
-    assert!(
-        h.params
+    fn find_handler(name: &str) -> &'static HandlerDef {
+        BRAIN_HANDLERS
             .iter()
-            .any(|p| p.name == "profile_id" && p.required),
-        "brain.profile must have required profile_id param (H4 fix)"
-    );
-}
+            .find(|h| h.name == name)
+            .unwrap_or_else(|| panic!("handler {name:?} not found in BRAIN_HANDLERS"))
+    }
 
-#[test]
-fn brain_profiles_params_has_lifecycle_filter() {
-    let h = find_handler("brain.profiles");
-    assert!(!h.params.is_empty(), "brain.profiles must have params");
-    assert!(
-        h.params.iter().any(|p| p.name == "lifecycle"),
-        "brain.profiles must document lifecycle filter param"
-    );
-}
+    #[test]
+    fn brain_feedback_params_non_empty_and_has_target_and_signal() {
+        let h = find_handler("brain.feedback");
+        assert!(!h.params.is_empty(), "brain.feedback must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "target_id" && p.required),
+            "brain.feedback must have required target_id param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "signal" && p.required),
+            "brain.feedback must have required signal param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "served_by_profile_id"),
+            "brain.feedback must document served_by_profile_id"
+        );
+    }
 
-#[test]
-fn brain_resolve_params_has_consumer_kind_required() {
-    let h = find_handler("brain.resolve");
-    assert!(!h.params.is_empty(), "brain.resolve must have params");
-    assert!(
-        h.params
-            .iter()
-            .any(|p| p.name == "consumer_kind" && p.required),
-        "brain.resolve must have required consumer_kind"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "actor"),
-        "brain.resolve must document optional actor"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "namespace"),
-        "brain.resolve must document optional namespace"
-    );
-}
+    #[test]
+    fn brain_auto_feedback_handler_is_declared() {
+        let h = find_handler("brain.auto_feedback");
+        assert!(
+            h.params.iter().any(|p| p.name == "query" && p.required),
+            "brain.auto_feedback must have required query param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "results" && p.required),
+            "brain.auto_feedback must have required results param"
+        );
+    }
 
-#[test]
-fn brain_bind_params_has_required_profile_id_and_optionals() {
-    let h = find_handler("brain.bind");
-    assert!(!h.params.is_empty(), "brain.bind must have params");
-    assert!(
-        h.params
-            .iter()
-            .any(|p| p.name == "profile_id" && p.required),
-        "brain.bind must have required profile_id"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "actor"),
-        "brain.bind must document actor"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "namespace"),
-        "brain.bind must document namespace"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "consumer_kind"),
-        "brain.bind must document consumer_kind"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "priority"),
-        "brain.bind must document priority"
-    );
-}
-
-#[test]
-fn brain_unbind_params_non_empty_all_optional() {
-    let h = find_handler("brain.unbind");
-    assert!(!h.params.is_empty(), "brain.unbind must have params");
-    assert!(
-        h.params.iter().all(|p| !p.required),
-        "brain.unbind params must all be optional (filter semantics)"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "profile_id"),
-        "brain.unbind must document profile_id filter"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "actor"),
-        "brain.unbind must document actor filter"
-    );
-}
-
-#[test]
-fn brain_activate_deactivate_archive_each_have_profile_id() {
-    for verb in ["brain.activate", "brain.deactivate", "brain.archive"] {
-        let h = find_handler(verb);
-        assert!(!h.params.is_empty(), "{verb} must have params");
+    #[test]
+    fn brain_profile_params_has_required_profile_id() {
+        let h = find_handler("brain.profile");
+        assert!(!h.params.is_empty(), "brain.profile must have params");
         assert!(
             h.params
                 .iter()
                 .any(|p| p.name == "profile_id" && p.required),
-            "{verb} must have required profile_id param"
+            "brain.profile must have required profile_id param (H4 fix)"
         );
     }
-}
 
-#[test]
-fn brain_reset_params_has_optional_profile_id() {
-    let h = find_handler("brain.reset");
-    assert!(!h.params.is_empty(), "brain.reset must have params");
-    assert!(
-        h.params
-            .iter()
-            .any(|p| p.name == "profile_id" && !p.required),
-        "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
-    );
-}
+    #[test]
+    fn brain_profiles_params_has_lifecycle_filter() {
+        let h = find_handler("brain.profiles");
+        assert!(!h.params.is_empty(), "brain.profiles must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "lifecycle"),
+            "brain.profiles must document lifecycle filter param"
+        );
+    }
 
-#[test]
-fn brain_config_params_has_parameter() {
-    let h = find_handler("brain.config");
-    assert!(
-        !h.params.is_empty(),
-        "brain.config must document the parameter arg"
-    );
-    assert!(
-        h.params
-            .iter()
-            .any(|p| p.name == "parameter" && !p.required),
-        "brain.config parameter must be optional"
-    );
-}
+    #[test]
+    fn brain_resolve_params_has_consumer_kind_required() {
+        let h = find_handler("brain.resolve");
+        assert!(!h.params.is_empty(), "brain.resolve must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "consumer_kind" && p.required),
+            "brain.resolve must have required consumer_kind"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.resolve must document optional actor"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "namespace"),
+            "brain.resolve must document optional namespace"
+        );
+    }
 
-#[test]
-fn brain_events_params_has_limit() {
-    let h = find_handler("brain.events");
-    assert!(
-        !h.params.is_empty(),
-        "brain.events must document the limit arg"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "limit" && !p.required),
-        "brain.events limit must be optional"
-    );
-}
+    #[test]
+    fn brain_bind_params_has_required_profile_id_and_optionals() {
+        let h = find_handler("brain.bind");
+        assert!(!h.params.is_empty(), "brain.bind must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "profile_id" && p.required),
+            "brain.bind must have required profile_id"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.bind must document actor"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "namespace"),
+            "brain.bind must document namespace"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "consumer_kind"),
+            "brain.bind must document consumer_kind"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "priority"),
+            "brain.bind must document priority"
+        );
+    }
 
-#[test]
-fn brain_emit_params_non_empty_with_target_and_signal() {
-    let h = find_handler("brain.emit");
-    assert!(
-        !h.params.is_empty(),
-        "brain.emit must have params (mirrors brain.feedback)"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "target_id" && p.required),
-        "brain.emit must have required target_id"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "signal" && p.required),
-        "brain.emit must have required signal"
-    );
-}
+    #[test]
+    fn brain_unbind_params_non_empty_all_optional() {
+        let h = find_handler("brain.unbind");
+        assert!(!h.params.is_empty(), "brain.unbind must have params");
+        assert!(
+            h.params.iter().all(|p| !p.required),
+            "brain.unbind params must all be optional (filter semantics)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "profile_id"),
+            "brain.unbind must document profile_id filter"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.unbind must document actor filter"
+        );
+    }
 
-#[test]
-fn brain_bindings_params_all_optional() {
-    let h = find_handler("brain.bindings");
-    assert!(
-        h.params.iter().all(|p| !p.required),
-        "brain.bindings: all params must be optional filter args"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "profile_id"),
-        "brain.bindings must document profile_id filter"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "consumer_kind"),
-        "brain.bindings must document consumer_kind filter"
-    );
-}
+    #[test]
+    fn brain_activate_deactivate_archive_each_have_profile_id() {
+        for verb in ["brain.activate", "brain.deactivate", "brain.archive"] {
+            let h = find_handler(verb);
+            assert!(!h.params.is_empty(), "{verb} must have params");
+            assert!(
+                h.params
+                    .iter()
+                    .any(|p| p.name == "profile_id" && p.required),
+                "{verb} must have required profile_id param"
+            );
+        }
+    }
 
-#[test]
-fn brain_create_profile_params_has_required_name() {
-    let h = find_handler("brain.create_profile");
-    assert!(
-        !h.params.is_empty(),
-        "brain.create_profile must have params"
-    );
-    assert!(
-        h.params.iter().any(|p| p.name == "name" && p.required),
-        "brain.create_profile must have required name param"
-    );
-    assert!(
-        h.params
-            .iter()
-            .any(|p| p.name == "consumer_kind" && !p.required),
-        "brain.create_profile consumer_kind must be optional"
-    );
-}
+    #[test]
+    fn brain_reset_params_has_optional_profile_id() {
+        let h = find_handler("brain.reset");
+        assert!(!h.params.is_empty(), "brain.reset must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "profile_id" && !p.required),
+            "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
+        );
+    }
 
-// ── Regression: schema-aware namespace strip (codex round-2 H1) ──────────
-//
-// brain.bind / brain.resolve / brain.unbind / brain.bindings declare
-// `namespace` as a *business* parameter in their HandlerDef.params.  The
-// VerbRegistry dispatch path must NOT strip `namespace` from those verbs
-// even though it strips it as a transport routing key from all other verbs.
-//
-// These tests go through VerbRegistry::dispatch (not pack.dispatch) to
-// exercise the actual strip logic in pack.rs.
+    #[test]
+    fn brain_config_params_has_parameter() {
+        let h = find_handler("brain.config");
+        assert!(
+            !h.params.is_empty(),
+            "brain.config must document the parameter arg"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "parameter" && !p.required),
+            "brain.config parameter must be optional"
+        );
+    }
 
-/// Build a VerbRegistry with kg + brain packs, returning the registry and
-/// an owned BrainPack snapshot handle.  We need a reference to the brain
-/// state after dispatch — the registry owns the pack, so we verify via a
-/// second dispatch (brain.bindings) rather than peeking at internal state.
-fn make_brain_registry() -> (khive_runtime::VerbRegistry, KhiveRuntime) {
-    use khive_pack_kg::KgPack;
-    use khive_runtime::VerbRegistryBuilder;
-    let rt = KhiveRuntime::memory().expect("in-memory runtime for brain registry");
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(BrainPack::new(rt.clone()));
-    let registry = builder.build().expect("kg+brain registry builds");
-    (registry, rt)
-}
+    #[test]
+    fn brain_events_params_has_limit() {
+        let h = find_handler("brain.events");
+        assert!(
+            !h.params.is_empty(),
+            "brain.events must document the limit arg"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "limit" && !p.required),
+            "brain.events limit must be optional"
+        );
+    }
 
-/// brain.bind via VerbRegistry must store the caller-supplied namespace,
-/// not default to "*".  Regression for the blanket-strip bug (codex H1).
-#[tokio::test]
-async fn r2_h1_bind_via_registry_preserves_namespace() {
-    use serde_json::json;
-    let (registry, _rt) = make_brain_registry();
+    #[test]
+    fn brain_emit_params_non_empty_with_target_and_signal() {
+        let h = find_handler("brain.emit");
+        assert!(
+            !h.params.is_empty(),
+            "brain.emit must have params (mirrors brain.feedback)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "target_id" && p.required),
+            "brain.emit must have required target_id"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "signal" && p.required),
+            "brain.emit must have required signal"
+        );
+    }
 
-    // Bind with a specific namespace.
-    let result = registry
-        .dispatch(
-            "brain.bind",
-            json!({
-                "profile_id": "balanced-recall-v1",
-                "actor": "alice",
-                "namespace": "team-a",
-                "consumer_kind": "recall",
-            }),
+    #[test]
+    fn brain_bindings_params_all_optional() {
+        let h = find_handler("brain.bindings");
+        assert!(
+            h.params.iter().all(|p| !p.required),
+            "brain.bindings: all params must be optional filter args"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "profile_id"),
+            "brain.bindings must document profile_id filter"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "consumer_kind"),
+            "brain.bindings must document consumer_kind filter"
+        );
+    }
+
+    #[test]
+    fn brain_create_profile_params_has_required_name() {
+        let h = find_handler("brain.create_profile");
+        assert!(
+            !h.params.is_empty(),
+            "brain.create_profile must have params"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "name" && p.required),
+            "brain.create_profile must have required name param"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "consumer_kind" && !p.required),
+            "brain.create_profile consumer_kind must be optional"
+        );
+    }
+
+    // ── Regression: schema-aware namespace strip (codex round-2 H1) ──────────
+    //
+    // brain.bind / brain.resolve / brain.unbind / brain.bindings declare
+    // `namespace` as a *business* parameter in their HandlerDef.params.  The
+    // VerbRegistry dispatch path must NOT strip `namespace` from those verbs
+    // even though it strips it as a transport routing key from all other verbs.
+    //
+    // These tests go through VerbRegistry::dispatch (not pack.dispatch) to
+    // exercise the actual strip logic in pack.rs.
+
+    /// Build a VerbRegistry with kg + brain packs, returning the registry and
+    /// an owned BrainPack snapshot handle.  We need a reference to the brain
+    /// state after dispatch — the registry owns the pack, so we verify via a
+    /// second dispatch (brain.bindings) rather than peeking at internal state.
+    fn make_brain_registry() -> (khive_runtime::VerbRegistry, KhiveRuntime) {
+        use khive_pack_kg::KgPack;
+        use khive_runtime::VerbRegistryBuilder;
+        let rt = KhiveRuntime::memory().expect("in-memory runtime for brain registry");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+        (registry, rt)
+    }
+
+    /// brain.bind via VerbRegistry must store the caller-supplied namespace,
+    /// not default to "*".  Regression for the blanket-strip bug (codex H1).
+    #[tokio::test]
+    async fn r2_h1_bind_via_registry_preserves_namespace() {
+        use serde_json::json;
+        let (registry, _rt) = make_brain_registry();
+
+        // Bind with a specific namespace.
+        let result = registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.bind must succeed");
+        assert_eq!(
+            result["namespace"],
+            json!("team-a"),
+            "brain.bind response must echo the caller-supplied namespace"
+        );
+
+        // Verify via brain.bindings: the stored row must have namespace=team-a.
+        let bindings = registry
+            .dispatch(
+                "brain.bindings",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "team-a",
+                }),
+            )
+            .await
+            .expect("brain.bindings must succeed");
+        assert_eq!(
+            bindings["count"],
+            json!(1u64),
+            "must find exactly one binding for namespace=team-a"
+        );
+        assert_eq!(
+            bindings["bindings"][0]["namespace"],
+            json!("team-a"),
+            "stored binding namespace must be team-a, not wildcard"
+        );
+    }
+
+    /// brain.resolve via VerbRegistry must use the caller-supplied namespace to
+    /// match the binding stored by brain.bind.  Regression for codex H1.
+    #[tokio::test]
+    async fn r2_h1_resolve_via_registry_uses_namespace() {
+        use serde_json::json;
+        let (registry, _rt) = make_brain_registry();
+
+        // Store a binding scoped to team-a.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.bind team-a");
+
+        // Resolve for alice / team-a / recall — must find balanced-recall-v1.
+        let resolved = registry
+            .dispatch(
+                "brain.resolve",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.resolve must succeed for team-a");
+        assert_eq!(
+            resolved["resolved_profile_id"],
+            json!("balanced-recall-v1"),
+            "resolve must return the profile bound for team-a"
+        );
+    }
+
+    /// brain.unbind via VerbRegistry must use the caller-supplied namespace to
+    /// remove only the matching binding.  Regression for codex H1.
+    #[tokio::test]
+    async fn r2_h1_unbind_via_registry_uses_namespace() {
+        use serde_json::json;
+        let (registry, _rt) = make_brain_registry();
+
+        // Two bindings: team-a and team-b.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind team-a");
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-b",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind team-b");
+
+        // Unbind only team-a.
+        let unbound = registry
+            .dispatch(
+                "brain.unbind",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-a",
+                }),
+            )
+            .await
+            .expect("unbind team-a");
+        assert_eq!(
+            unbound["unbound"],
+            json!(1u64),
+            "must remove exactly one binding (team-a)"
+        );
+
+        // team-b must survive.
+        let remaining = registry
+            .dispatch(
+                "brain.bindings",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-b",
+                }),
+            )
+            .await
+            .expect("bindings after unbind");
+        assert_eq!(
+            remaining["count"],
+            json!(1u64),
+            "team-b binding must survive the team-a unbind"
+        );
+    }
+
+    // BRAIN-AUD-005: brain.profiles output order must be deterministic.
+    #[tokio::test]
+    async fn profiles_output_is_sorted_by_id() {
+        use khive_runtime::{Namespace, PackRuntime, VerbRegistryBuilder};
+        use serde_json::json;
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = BrainPack::new(rt.clone());
+        let registry = VerbRegistryBuilder::new().build().expect("empty registry");
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Create multiple profiles so there are several entries to sort.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({ "name": "z-profile" }),
+            &registry,
+            &token,
         )
         .await
-        .expect("brain.bind must succeed");
-    assert_eq!(
-        result["namespace"],
-        json!("team-a"),
-        "brain.bind response must echo the caller-supplied namespace"
-    );
+        .expect("create z-profile");
 
-    // Verify via brain.bindings: the stored row must have namespace=team-a.
-    let bindings = registry
-        .dispatch(
-            "brain.bindings",
-            json!({
-                "profile_id": "balanced-recall-v1",
-                "namespace": "team-a",
-            }),
+        pack.dispatch(
+            "brain.create_profile",
+            json!({ "name": "a-profile" }),
+            &registry,
+            &token,
         )
         .await
-        .expect("brain.bindings must succeed");
-    assert_eq!(
-        bindings["count"],
-        json!(1u64),
-        "must find exactly one binding for namespace=team-a"
-    );
-    assert_eq!(
-        bindings["bindings"][0]["namespace"],
-        json!("team-a"),
-        "stored binding namespace must be team-a, not wildcard"
-    );
-}
+        .expect("create a-profile");
 
-/// brain.resolve via VerbRegistry must use the caller-supplied namespace to
-/// match the binding stored by brain.bind.  Regression for codex H1.
-#[tokio::test]
-async fn r2_h1_resolve_via_registry_uses_namespace() {
-    use serde_json::json;
-    let (registry, _rt) = make_brain_registry();
+        let result = pack
+            .dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("profiles list");
 
-    // Store a binding scoped to team-a.
-    registry
-        .dispatch(
-            "brain.bind",
-            json!({
-                "profile_id": "balanced-recall-v1",
-                "actor": "alice",
-                "namespace": "team-a",
-                "consumer_kind": "recall",
-            }),
-        )
-        .await
-        .expect("brain.bind team-a");
+        let profiles = result["profiles"].as_array().expect("profiles array");
+        let ids: Vec<&str> = profiles.iter().filter_map(|p| p["id"].as_str()).collect();
 
-    // Resolve for alice / team-a / recall — must find balanced-recall-v1.
-    let resolved = registry
-        .dispatch(
-            "brain.resolve",
-            json!({
-                "actor": "alice",
-                "namespace": "team-a",
-                "consumer_kind": "recall",
-            }),
-        )
-        .await
-        .expect("brain.resolve must succeed for team-a");
-    assert_eq!(
-        resolved["resolved_profile_id"],
-        json!("balanced-recall-v1"),
-        "resolve must return the profile bound for team-a"
-    );
-}
-
-/// brain.unbind via VerbRegistry must use the caller-supplied namespace to
-/// remove only the matching binding.  Regression for codex H1.
-#[tokio::test]
-async fn r2_h1_unbind_via_registry_uses_namespace() {
-    use serde_json::json;
-    let (registry, _rt) = make_brain_registry();
-
-    // Two bindings: team-a and team-b.
-    registry
-        .dispatch(
-            "brain.bind",
-            json!({
-                "profile_id": "balanced-recall-v1",
-                "actor": "alice",
-                "namespace": "team-a",
-                "consumer_kind": "recall",
-            }),
-        )
-        .await
-        .expect("bind team-a");
-    registry
-        .dispatch(
-            "brain.bind",
-            json!({
-                "profile_id": "balanced-recall-v1",
-                "actor": "alice",
-                "namespace": "team-b",
-                "consumer_kind": "recall",
-            }),
-        )
-        .await
-        .expect("bind team-b");
-
-    // Unbind only team-a.
-    let unbound = registry
-        .dispatch(
-            "brain.unbind",
-            json!({
-                "actor": "alice",
-                "namespace": "team-a",
-            }),
-        )
-        .await
-        .expect("unbind team-a");
-    assert_eq!(
-        unbound["unbound"],
-        json!(1u64),
-        "must remove exactly one binding (team-a)"
-    );
-
-    // team-b must survive.
-    let remaining = registry
-        .dispatch(
-            "brain.bindings",
-            json!({
-                "actor": "alice",
-                "namespace": "team-b",
-            }),
-        )
-        .await
-        .expect("bindings after unbind");
-    assert_eq!(
-        remaining["count"],
-        json!(1u64),
-        "team-b binding must survive the team-a unbind"
-    );
-}
-
-// BRAIN-AUD-005: brain.profiles output order must be deterministic.
-#[tokio::test]
-async fn profiles_output_is_sorted_by_id() {
-    use khive_runtime::{Namespace, PackRuntime, VerbRegistryBuilder};
-    use serde_json::json;
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let pack = BrainPack::new(rt.clone());
-    let registry = VerbRegistryBuilder::new().build().expect("empty registry");
-    let token = rt.authorize(Namespace::local()).unwrap();
-
-    // Create multiple profiles so there are several entries to sort.
-    pack.dispatch(
-        "brain.create_profile",
-        json!({ "name": "z-profile" }),
-        &registry,
-        &token,
-    )
-    .await
-    .expect("create z-profile");
-
-    pack.dispatch(
-        "brain.create_profile",
-        json!({ "name": "a-profile" }),
-        &registry,
-        &token,
-    )
-    .await
-    .expect("create a-profile");
-
-    let result = pack
-        .dispatch("brain.profiles", json!({}), &registry, &token)
-        .await
-        .expect("profiles list");
-
-    let profiles = result["profiles"].as_array().expect("profiles array");
-    let ids: Vec<&str> = profiles.iter().filter_map(|p| p["id"].as_str()).collect();
-
-    let mut sorted = ids.clone();
-    sorted.sort();
-    assert_eq!(
-        ids, sorted,
-        "brain.profiles must return profiles sorted by id"
-    );
-}
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "brain.profiles must return profiles sorted by id"
+        );
+    }
 }

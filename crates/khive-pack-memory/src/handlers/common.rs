@@ -131,11 +131,7 @@ pub(super) enum TagMode {
     All,
 }
 
-pub(super) fn note_matches_tags(
-    props: Option<&Value>,
-    expected: &[String],
-    mode: TagMode,
-) -> bool {
+pub(super) fn note_matches_tags(props: Option<&Value>, expected: &[String], mode: TagMode) -> bool {
     let Some(stored) = props
         .and_then(|p| p.get("tags"))
         .and_then(|tags| tags.as_array())
@@ -773,9 +769,7 @@ impl MemoryPack {
                                 .enumerate()
                                 .map(|(idx, (uuid, score))| VectorSearchHit {
                                     subject_id: uuid,
-                                    score: khive_score::DeterministicScore::from_f64(
-                                        score as f64,
-                                    ),
+                                    score: khive_score::DeterministicScore::from_f64(score as f64),
                                     rank: (idx + 1) as u32,
                                 })
                                 .collect();

@@ -7,7 +7,7 @@ use khive_storage::types::{NeighborQuery, TraversalOptions, TraversalRequest};
 
 use super::common::{
     deser, parse_direction, parse_relation, render_query_result, resolve_uuid_async, to_json,
-    HARD_CAP, NeighborsParams, QueryParams, TraverseParams,
+    NeighborsParams, QueryParams, TraverseParams, HARD_CAP,
 };
 use crate::KgPack;
 

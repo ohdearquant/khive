@@ -240,5 +240,12 @@ fn bench_thread(c: &mut Criterion) {
 
 // ── criterion entry points ────────────────────────────────────────────────────
 
-criterion_group!(comm_benches, bench_send, bench_inbox, bench_read, bench_reply, bench_thread);
+criterion_group!(
+    comm_benches,
+    bench_send,
+    bench_inbox,
+    bench_read,
+    bench_reply,
+    bench_thread
+);
 criterion_main!(comm_benches);

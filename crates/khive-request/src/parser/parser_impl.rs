@@ -215,8 +215,7 @@ impl<'a> Parser<'a> {
                 Some('"') => {
                     let start = self.pos;
                     let end = scan_string_end(self.src, start)?;
-                    let raw =
-                        std::str::from_utf8(&self.src[start..end]).expect("utf8 key literal");
+                    let raw = std::str::from_utf8(&self.src[start..end]).expect("utf8 key literal");
                     let s: String =
                         serde_json::from_str(raw).map_err(|e| DslError::InvalidValue {
                             pos: start,

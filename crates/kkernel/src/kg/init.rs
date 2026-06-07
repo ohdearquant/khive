@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
 use super::types::{HookCommand, HookStatus, InitArgs};
+use anyhow::{bail, Context, Result};
 
 const DEFAULT_KHIVE_TOML: &str = r#"# .khive/khive.toml — project KG configuration
 # Committed to git. All collaborators use these settings.

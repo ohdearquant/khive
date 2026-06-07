@@ -33,9 +33,7 @@ fn make_selector_inputs(n: usize) -> Vec<SelectorInput<()>> {
 
 fn make_f64_candidates(n: usize) -> Vec<f64> {
     let mut state = 0xcafe_dead_u64;
-    (0..n)
-        .map(|_| lcg_next(&mut state) as f64)
-        .collect()
+    (0..n).map(|_| lcg_next(&mut state) as f64).collect()
 }
 
 fn make_scored_entries(n: usize) -> Vec<ScoredEntry<Uuid>> {

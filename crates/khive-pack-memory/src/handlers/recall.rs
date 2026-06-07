@@ -21,8 +21,8 @@ use crate::MemoryPack;
 
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
-    recall_candidate_count, to_json, validate_memory_type, PROF_CID, RECALL_CALL_ID,
-    RecallCandidateParams, RecallParams, TextSnippetPolicy,
+    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
+    TextSnippetPolicy, PROF_CID, RECALL_CALL_ID,
 };
 
 impl MemoryPack {
