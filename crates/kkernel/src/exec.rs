@@ -1,13 +1,13 @@
 //! `kkernel exec` — run a verb DSL expression directly through the pack registry.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::Parser;
 
 use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+
+use crate::dbpath::resolve_db_override;
 
 /// Arguments for `kkernel exec` — execute a verb DSL expression against a chosen
 /// database and namespace, the same syntax accepted by the MCP `request` tool.
@@ -36,18 +36,6 @@ pub struct ExecArgs {
 }
 
 /// Execute the DSL expression in-process and print the JSON result to stdout.
-/// Resolve the `--db`/`KHIVE_DB` value into a `db_path` override, mirroring
-/// `kkernel mcp`: an explicit `:memory:` means the ephemeral in-memory db
-/// (`None`), not a file literally named ":memory:" (which SQLite treats as a
-/// per-connection file → empty schema). `None` leaves the default in place.
-fn resolve_db_override(db: Option<&str>) -> Option<Option<PathBuf>> {
-    match db {
-        Some(":memory:") => Some(None),
-        Some(path) => Some(Some(PathBuf::from(path))),
-        None => None,
-    }
-}
-
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let mut cfg = RuntimeConfig::default();
     if let Some(db_path) = resolve_db_override(args.db.as_deref()) {
@@ -78,26 +66,6 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serial_test::serial;
-
-    #[test]
-    fn memory_sentinel_maps_to_none() {
-        // `:memory:` must become db_path=None (ephemeral), not a file path.
-        assert_eq!(resolve_db_override(Some(":memory:")), Some(None));
-    }
-
-    #[test]
-    fn explicit_path_maps_to_some() {
-        assert_eq!(
-            resolve_db_override(Some("/tmp/kkernel-exec-test.db")),
-            Some(Some(PathBuf::from("/tmp/kkernel-exec-test.db")))
-        );
-    }
-
-    #[test]
-    fn absent_db_leaves_default() {
-        // None → no override; run_exec keeps RuntimeConfig::default().db_path.
-        assert_eq!(resolve_db_override(None), None);
-    }
 
     #[test]
     #[serial]

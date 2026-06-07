@@ -24,7 +24,7 @@ impl KnowledgeHandlers {
 
         if runtime.default_embedder_name().is_empty() {
             return Ok(
-                json!({ "indexed": 0, "skipped": 0, "total": 0, "reason": "no embedding model configured" }),
+                json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
             );
         }
 
@@ -84,6 +84,7 @@ impl KnowledgeHandlers {
         let total = atoms.len();
         let mut indexed = 0usize;
         let mut skipped = 0usize;
+        let mut failed = 0usize;
 
         let mut ann_vectors: Vec<f32> = Vec::new();
         let mut ann_ids: Vec<uuid::Uuid> = Vec::new();
@@ -130,28 +131,50 @@ impl KnowledgeHandlers {
                 continue;
             }
 
-            if let Ok(vectors) = runtime.vectors(token) {
-                let ns_str = token.namespace().as_str();
-                if !insert_only {
-                    for (id, _) in &staged {
-                        let _ = vectors.delete(*id).await;
+            // Track which atoms in this chunk had their vector persisted, so a
+            // failed insert is reported as `failed` rather than silently counted
+            // as `indexed`. A failed vector write means recall cannot retrieve
+            // that atom — that is a failure, not a success.
+            let mut chunk_ok: Vec<bool> = vec![true; staged.len()];
+            match runtime.vectors(token) {
+                Ok(vectors) => {
+                    let ns_str = token.namespace().as_str();
+                    if !insert_only {
+                        for (id, _) in &staged {
+                            let _ = vectors.delete(*id).await;
+                        }
+                    }
+                    for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
+                        if let Err(e) = vectors
+                            .insert(
+                                *id,
+                                SubstrateKind::Entity,
+                                ns_str,
+                                "knowledge.atom",
+                                vec![emb.clone()],
+                            )
+                            .await
+                        {
+                            tracing::warn!(id = %id, error = %e, "knowledge vector insert failed");
+                            chunk_ok[i] = false;
+                            failed += 1;
+                        }
                     }
                 }
-                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
-                    let _ = vectors
-                        .insert(
-                            *id,
-                            SubstrateKind::Entity,
-                            ns_str,
-                            "knowledge.atom",
-                            vec![emb.clone()],
-                        )
-                        .await;
+                Err(e) => {
+                    tracing::warn!(error = %e, "knowledge vector store unavailable");
+                    for ok in chunk_ok.iter_mut() {
+                        *ok = false;
+                    }
+                    failed += staged.len();
                 }
             }
 
             if rebuild_ann {
-                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
+                for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
+                    if !chunk_ok[i] {
+                        continue;
+                    }
                     if ann_dim == 0 {
                         ann_dim = emb.len();
                     }
@@ -162,7 +185,7 @@ impl KnowledgeHandlers {
                 }
             }
 
-            indexed += staged.len();
+            indexed += chunk_ok.iter().filter(|ok| **ok).count();
         }
 
         // Any vector write invalidates the existing snapshot — the corpus has changed.
@@ -198,6 +221,7 @@ impl KnowledgeHandlers {
         Ok(json!({
             "indexed": indexed,
             "skipped": skipped,
+            "failed": failed,
             "total": total,
             "ann_vectors": ann_count,
         }))

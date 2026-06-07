@@ -13,7 +13,8 @@ use clap::Parser;
 use serde::Serialize;
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
+use khive_runtime::{KhiveRuntime, Namespace};
 use khive_storage::error::StorageError;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
@@ -21,12 +22,23 @@ use khive_types::SubstrateKind;
 const MAX_EMBED_BYTES: usize = 32_768;
 
 /// Arguments for `kkernel reindex` — rebuilds embedding vectors for entities,
-/// notes, and the knowledge corpus.
+/// notes, and the knowledge corpus, fanning out across every configured
+/// embedding engine (resolved with the same config-file/env precedence as
+/// `kkernel mcp`).
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
-    /// Database path (defaults to `~/.khive/khive.db`).
-    #[arg(long)]
-    pub db: Option<PathBuf>,
+    /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
+    /// ephemeral in-memory database, matching `kkernel mcp`/`kkernel exec`.
+    #[arg(long, env = "KHIVE_DB")]
+    pub db: Option<String>,
+
+    /// Path to a khive TOML config file (env `KHIVE_CONFIG`). When provided,
+    /// embedding engines and actor namespace are resolved from it with the same
+    /// precedence as `kkernel mcp`, so reindex writes vectors for the SAME
+    /// engine set the MCP server serves recall from. Absent → home-fallback
+    /// search (./khive.toml, ./.khive/config.toml, ~/.khive/config.toml).
+    #[arg(long = "config", env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
 
     /// Embedding model for entities/notes. When omitted, fans out to ALL
     /// registered models. (Knowledge always uses the default embedder.)
@@ -53,6 +65,13 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub no_knowledge: bool,
 
+    /// Downgrade partial failures (failed model, failed vector insert, failed
+    /// knowledge pass) to a warning and still exit 0. Without this flag,
+    /// reindex FAILS CLOSED: any failure returns a non-zero exit so automation
+    /// does not treat a partial rebuild as a clean one.
+    #[arg(long)]
+    pub best_effort: bool,
+
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     pub human: bool,
@@ -64,9 +83,21 @@ struct ReindexReport {
     notes_processed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_atoms_indexed: Option<u64>,
+    /// Atoms whose vector write failed during the knowledge pass.
+    knowledge_atoms_failed: u64,
+    /// True when the knowledge pass itself errored (could not run to completion).
+    knowledge_pass_errored: bool,
     models_used: Vec<String>,
     elapsed_ms: u64,
+    /// Entity/note vector inserts that failed across all engines.
     errors_skipped: u64,
+}
+
+impl ReindexReport {
+    /// Did any part of the run fail? Drives the fail-closed exit decision.
+    fn has_failures(&self) -> bool {
+        self.errors_skipped > 0 || self.knowledge_atoms_failed > 0 || self.knowledge_pass_errored
+    }
 }
 
 /// Embed `staged` with every model in `model_names` and store one vector record
@@ -170,12 +201,24 @@ async fn filter_unembedded(
     }
 }
 
-/// Re-embed all entities and notes using the configured or specified embedding model.
+/// Re-embed entities, notes, and the knowledge corpus, fanning out across every
+/// configured embedding engine. Engines, db path, and config are resolved with
+/// the same precedence as `kkernel mcp` so reindex writes the SAME vectors the
+/// MCP server serves recall from. Fails closed on any partial failure unless
+/// `--best-effort` is set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
-    let mut cfg = RuntimeConfig::default();
-    if let Some(ref db) = args.db {
-        cfg.db_path = Some(db.clone());
-    }
+    // `--namespace` is the operator's explicit per-namespace target (reindex is
+    // run once per namespace), so it always wins over any config `[actor] id`;
+    // the config tier still supplies engines + db path.
+    let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = resolve_runtime_config(RuntimeConfigInputs {
+        db: args.db.as_deref(),
+        config: args.config.as_deref(),
+        namespace: ns,
+        namespace_explicit: true,
+        no_embed: false,
+        packs: None,
+    })?;
 
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -203,6 +246,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                         entities_processed: 0,
                         notes_processed: 0,
                         knowledge_atoms_indexed: None,
+                        knowledge_atoms_failed: 0,
+                        knowledge_pass_errored: false,
                         models_used: vec![],
                         elapsed_ms: 0,
                         errors_skipped: 0,
@@ -289,10 +334,10 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
             let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
             for note in &batch {
-                let text = match &note.name {
-                    Some(name) if !name.is_empty() => format!("{name} {}", note.content),
-                    _ => note.content.clone(),
-                };
+                // Embed note.content ONLY — matching the create/update write path
+                // (operations.rs / curation.rs embed `note.content`, never the
+                // name). Reindex must reproduce exactly what those paths embedded.
+                let text = note.content.clone();
                 if !text.trim().is_empty() {
                     staged.push((note.id, text));
                 }
@@ -334,16 +379,20 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // Reindex through the knowledge library directly (the `knowledge.index`
     // handler over the full corpus), not the verb-DSL shell.
     let mut knowledge_atoms_indexed: Option<u64> = None;
+    let mut knowledge_atoms_failed: u64 = 0;
+    let mut knowledge_pass_errored = false;
     if do_knowledge {
         eprintln!("  indexing knowledge corpus (this can take a while)…");
         match khive_pack_knowledge::reindex_knowledge(&rt, &token, true, Some(batch_size)).await {
             Ok(v) => {
                 knowledge_atoms_indexed =
                     Some(v.get("indexed").and_then(|n| n.as_u64()).unwrap_or(0));
+                knowledge_atoms_failed = v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "knowledge reindex failed");
-                eprintln!("warning: knowledge reindex failed: {e}");
+                tracing::error!(error = %e, "knowledge reindex failed");
+                eprintln!("error: knowledge reindex failed: {e}");
+                knowledge_pass_errored = true;
             }
         }
     }
@@ -354,13 +403,37 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         entities_processed,
         notes_processed,
         knowledge_atoms_indexed,
+        knowledge_atoms_failed,
+        knowledge_pass_errored,
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
     };
 
     print_report(&report, args.human);
+    finish(&report, args.best_effort)
+}
+
+/// Decide the process exit from a completed report: `Ok(())` when clean or in
+/// best-effort mode, `Err` (non-zero exit) when fail-closed and any part failed.
+/// Pure decision logic, unit-tested without running embedders.
+fn decide_result(has_failures: bool, best_effort: bool) -> Result<()> {
+    if has_failures && !best_effort {
+        anyhow::bail!(
+            "reindex completed with failures; recall/search state may be stale. \
+             Re-run, or pass --best-effort to accept a partial rebuild."
+        );
+    }
     Ok(())
+}
+
+/// Surface the fail-closed decision after printing the report.
+fn finish(report: &ReindexReport, best_effort: bool) -> Result<()> {
+    let result = decide_result(report.has_failures(), best_effort);
+    if report.has_failures() && best_effort {
+        eprintln!("warning: reindex completed with failures (best-effort mode; exiting 0)");
+    }
+    result
 }
 
 async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyhow::Result<()> {
@@ -426,14 +499,27 @@ fn print_report(report: &ReindexReport, human: bool) {
             .knowledge_atoms_indexed
             .map(|n| format!(", {n} knowledge atoms"))
             .unwrap_or_default();
+        let status = if report.has_failures() {
+            "Reindex completed WITH FAILURES"
+        } else {
+            "Reindex complete"
+        };
         println!(
-            "Reindex complete: {} entities, {} notes{} ({} errors skipped) in {}ms",
+            "{status}: {} entities, {} notes{} ({} entity/note errors) in {}ms",
             report.entities_processed,
             report.notes_processed,
             knowledge,
             report.errors_skipped,
             report.elapsed_ms
         );
+        if report.knowledge_pass_errored {
+            println!("Knowledge pass: FAILED (did not run to completion)");
+        } else if report.knowledge_atoms_failed > 0 {
+            println!(
+                "Knowledge pass: {} atom vector inserts FAILED",
+                report.knowledge_atoms_failed
+            );
+        }
         if !report.models_used.is_empty() {
             println!("Models: {}", report.models_used.join(", "));
         }
@@ -446,7 +532,10 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbpath::resolve_db_override;
+    use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
+    use serial_test::serial;
 
     #[tokio::test]
     async fn test_reindex_invalidates_vamana_snapshots() {
@@ -527,6 +616,96 @@ mod tests {
         assert!(
             !remaining.contains(&"local::vamana::model-b".to_string()),
             "local vamana model-b must be deleted: {remaining:?}"
+        );
+    }
+
+    fn report_with(errors: u64, k_failed: u64, k_errored: bool) -> ReindexReport {
+        ReindexReport {
+            entities_processed: 0,
+            notes_processed: 0,
+            knowledge_atoms_indexed: Some(0),
+            knowledge_atoms_failed: k_failed,
+            knowledge_pass_errored: k_errored,
+            models_used: vec![],
+            elapsed_ms: 0,
+            errors_skipped: errors,
+        }
+    }
+
+    #[test]
+    fn has_failures_flags_each_failure_source() {
+        assert!(!report_with(0, 0, false).has_failures());
+        assert!(
+            report_with(1, 0, false).has_failures(),
+            "entity/note errors"
+        );
+        assert!(
+            report_with(0, 1, false).has_failures(),
+            "knowledge atom fails"
+        );
+        assert!(
+            report_with(0, 0, true).has_failures(),
+            "knowledge pass error"
+        );
+    }
+
+    #[test]
+    fn decide_result_fails_closed_by_default() {
+        assert!(decide_result(false, false).is_ok(), "clean run exits 0");
+        assert!(
+            decide_result(true, false).is_err(),
+            "failures fail closed (non-zero exit)"
+        );
+    }
+
+    #[test]
+    fn decide_result_best_effort_downgrades_to_ok() {
+        assert!(
+            decide_result(true, true).is_ok(),
+            "best-effort downgrades failures to exit 0"
+        );
+        assert!(decide_result(false, true).is_ok());
+    }
+
+    // DB resolution parity with `kkernel exec` / `kkernel mcp`. The shared
+    // helper is unit-tested in `dbpath`; here we assert reindex consumes it
+    // through clap (`--db` / `KHIVE_DB` / `:memory:`) the same way.
+    #[test]
+    fn db_memory_sentinel_resolves_to_none() {
+        assert_eq!(resolve_db_override(Some(":memory:")), Some(None));
+    }
+
+    #[test]
+    fn db_explicit_path_resolves_to_some() {
+        assert_eq!(
+            resolve_db_override(Some("/tmp/kkernel-reindex-test.db")),
+            Some(Some(PathBuf::from("/tmp/kkernel-reindex-test.db")))
+        );
+    }
+
+    #[test]
+    fn db_absent_leaves_default() {
+        assert_eq!(resolve_db_override(None), None);
+    }
+
+    #[test]
+    #[serial]
+    fn khive_db_env_binds_to_db_arg() {
+        std::env::set_var("KHIVE_DB", "/tmp/kkernel-reindex-env.db");
+        let args = ReindexArgs::parse_from(["reindex"]);
+        std::env::remove_var("KHIVE_DB");
+        assert_eq!(args.db.as_deref(), Some("/tmp/kkernel-reindex-env.db"));
+    }
+
+    #[test]
+    #[serial]
+    fn khive_config_env_binds_to_config_arg() {
+        std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-reindex.toml");
+        let args = ReindexArgs::parse_from(["reindex"]);
+        std::env::remove_var("KHIVE_CONFIG");
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-reindex.toml"))
         );
     }
 }

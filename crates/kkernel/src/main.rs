@@ -10,7 +10,8 @@
 //! - `kg`      — KG validation, init, hook management
 //! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
 //! - `vector`  — vector store capabilities and orphan sweep
-//! - `reindex` — rebuild embedding vectors for entities and notes
+//! - `reindex` — rebuild embedding vectors for entities, notes, and the
+//!   knowledge corpus (fans out across every configured engine)
 //! - `exec`    — run a verb DSL expression through the pack registry
 //! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
@@ -68,7 +69,8 @@ enum Command {
     #[command(subcommand)]
     Vector(vector::VectorCommand),
 
-    /// Re-embed all entities and notes using the configured embedding model.
+    /// Re-embed entities, notes, and the knowledge corpus, fanning out across
+    /// every configured embedding engine (resolved like `kkernel mcp`).
     Reindex(reindex::ReindexArgs),
 
     /// Execute a verb DSL expression (same syntax as MCP `request` tool).
