@@ -1,31 +1,8 @@
 //! TOML-based embedding engine configuration for khive.
 //!
-//! Loads `./.khive/config.toml` (or a path from `--config` / `KHIVE_CONFIG`)
-//! and exposes an `[[engines]]` array that drives arbitrary-N embedding engine
-//! registration per ADR-031 §D3.
-//!
-//! # Config file format
-//!
-//! ```toml
-//! [[engines]]
-//! name = "default"
-//! model = "all-minilm-l6-v2"
-//! default = true
-//! fusion_weight = 0.5
-//!
-//! [[engines]]
-//! name = "paraphrase"
-//! model = "paraphrase-multilingual-minilm-l12-v2"
-//! fusion_weight = 0.5
-//! ```
-//!
-//! # Resolution order
-//!
-//! 1. Config file (from `--config` / `KHIVE_CONFIG` / `./.khive/config.toml`)
-//! 2. Env-var fallback (`KHIVE_EMBEDDING_MODEL` + `KHIVE_ADDITIONAL_EMBEDDING_MODELS`)
-//!    when no config file is present
-//!
-//! If both file and env vars are present, the file wins and a warning is emitted.
+//! Loads `.khive/config.toml` (or `--config` / `KHIVE_CONFIG`) and exposes an
+//! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
+//! to `KHIVE_EMBEDDING_MODEL` env vars when no config file is present.
 
 use std::path::{Path, PathBuf};
 
@@ -135,13 +112,13 @@ pub struct ActorConfig {
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
-/// - `[[engines]]`: embedding engine declarations (ADR-031 §D3)
+/// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
 ///
 /// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
-    /// Embedding engine declarations (ADR-031 §D3).
+    /// Embedding engine declarations.
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
 
@@ -257,7 +234,7 @@ impl KhiveConfig {
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate actor.id when present — an invalid namespace is a startup error,
-        // not a silent fallback (ADR-007 §NamespaceToken minting).
+        // not a silent fallback.
         if let Some(id) = self.actor.id.as_deref() {
             if id.is_empty() {
                 return Err(ConfigError::InvalidActorId {
@@ -294,10 +271,12 @@ impl KhiveConfig {
             });
         }
 
-        // Positive fusion_weight when present
+        // Positive, finite fusion_weight when present.
+        // NaN does not satisfy `w <= 0.0`, and positive infinity is unbounded,
+        // so reject all non-finite values explicitly before the range check.
         for engine in &self.engines {
             if let Some(w) = engine.fusion_weight {
-                if w <= 0.0 {
+                if !w.is_finite() || w <= 0.0 {
                     return Err(ConfigError::InvalidFusionWeight {
                         name: engine.name.clone(),
                         value: w,
@@ -380,6 +359,10 @@ pub fn config_from_env() -> KhiveConfig {
 
 // ---- Tests ----
 
+// INLINE TEST JUSTIFICATION: tests here cover config validation error paths that
+// rely on private ConfigError variants and temp-file helpers shared with the
+// config loader. Moving them to tests/ would require pub-exporting ConfigError
+// internals that are not part of the stable public API.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,48 +1,8 @@
-//! Verb response presentation modes and transformation (ADR-045).
+//! Verb response presentation modes and transformation.
 //!
-//! Handlers always return a canonical (verbose) shape. This module transforms
-//! that shape into a caller-appropriate form AFTER dispatch, BEFORE wire
-//! serialization.
-//!
-//! ## Transformation rules
-//!
-//! | Field type          | Verbose form                  | Agent form            |
-//! | ------------------- | ----------------------------- | --------------------- |
-//! | UUID (36-char)      | `"a1b2c3d4-e5f6-..."`         | `"a1b2c3d4"` (8 chars)|
-//! | ISO-8601 timestamp  | `"2026-05-23T16:18:15.234Z"`  | `"2026-05-23T16:18"` (< 24h: `"3m ago"`) |
-//! | Empty string `""`   | included                      | dropped               |
-//! | Empty array `[]`    | included                      | dropped               |
-//! | Empty object `{}`   | included                      | dropped               |
-//! | `null` (non-lifecycle) | included                   | dropped               |
-//! | `null` (lifecycle `*_at`, relationship markers) | included | preserved |
-//! | Score fields        | `0.1234567890`                | `0.123` (3 sig figs)  |
-//!
-//! ## `Human` mode design decision (ADR-045 C3)
-//!
-//! `Human` mode (`presentation=human`) is intentionally a **no-op at the MCP
-//! runtime layer** — it returns the same canonical JSON as `Verbose`. The full
-//! terminal formatting described in ADR-045 §3 (relative timestamps, glyph
-//! substitution, table layout, UUID dimming) is the responsibility of the
-//! **CLI layer** (`khive-cli::format::pretty`), not the MCP response pipeline.
-//!
-//! Rationale: MCP responses are consumed by callers over a JSON transport.
-//! Injecting ANSI escape codes or table-layout whitespace into JSON would corrupt
-//! the response for non-terminal consumers. The CLI receives verbose JSON and
-//! applies the terminal transform before printing. Implementing terminal
-//! formatting inside `present()` would couple the runtime to a display concern
-//! that belongs at the output layer.
-//!
-//! Consequence: agents that call `presentation=human` receive verbose JSON. This
-//! is documented behavior, not a bug. If the CLI is the caller it applies its own
-//! second-pass formatting — it should not use `presentation=human` over MCP
-//! precisely because the MCP boundary is not a terminal.
-//!
-//! `Verbose` mode passes through canonically. `Human` mode is identical to
-//! `Verbose` at this layer by design.
-//!
-//! **Chain invariant:** `present_response` MUST NOT be called on intermediate
-//! chain results — only on the final response envelope after all `$prev`
-//! substitutions complete.
+//! Transforms canonical handler output into caller-appropriate form after dispatch
+//! and before wire serialization. `Agent` mode abbreviates UUIDs/timestamps and drops
+//! empty fields; `Verbose` and `Human` pass through canonical JSON unchanged.
 
 use std::collections::HashSet;
 
@@ -51,7 +11,6 @@ use serde_json::{Map, Value};
 
 /// Convert a microsecond epoch `i64` to an RFC 3339 / ISO-8601 string.
 ///
-/// ADR-045 §5 handler invariant: "Use full ISO-8601 timestamps."
 /// Entity and Note storage uses `i64` microseconds internally; this is the
 /// single conversion point before any field reaches the MCP boundary.
 ///
@@ -62,7 +21,7 @@ pub fn micros_to_iso(micros: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// How the response envelope is presented to the caller (ADR-045).
+/// How the response envelope is presented to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PresentationMode {
@@ -83,15 +42,12 @@ pub enum PresentationMode {
     /// canonical JSON is returned unchanged. Terminal formatting (relative
     /// timestamps, glyph substitution, table layout) is applied by the CLI
     /// layer (`khive-cli::format::pretty`), not the MCP response pipeline.
-    ///
-    /// See module-level doc for full rationale (ADR-045 C3 design decision).
     Human,
 }
 
 /// Lifecycle `null` fields that are PRESERVED in Agent mode even when null.
 ///
 /// These fields carry lifecycle meaning (absent ≠ null) and must not be dropped.
-/// ADR-045 §3 Agent mode — "Drop semantics — lifecycle null preservation".
 const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "completed_at",
     "deleted_at",
@@ -108,8 +64,6 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 ];
 
 /// Score field names that are truncated to 3 significant figures in Agent mode.
-///
-/// ADR-045 §3 Agent mode — "Score truncation".
 const SCORE_FIELDS: &[&str] = &[
     "score",
     "salience",

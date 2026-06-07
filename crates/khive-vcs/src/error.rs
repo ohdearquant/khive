@@ -1,17 +1,18 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Error types for the VCS layer.
 //!
 //! Remote-server and custom-push/pull error variants (`RemoteUnreachable`,
-//! `AuthFailed`, `NonFastForward`, `MergeRequired`) were removed per ADR-010/
-//! ADR-020: git is the remote protocol; there is no custom `khive-sync` server.
+//! `AuthFailed`, `NonFastForward`, `MergeRequired`) were removed: git is the
+//! remote protocol; there is no custom `khive-sync` server.
 //! `MergeNotImplemented` was removed because the custom merge engine is
-//! superseded for v1 (ADR-020 §what-adr-010-retains-this-adr-replaces).
+//! superseded for v1.
 
 use thiserror::Error;
 
 use crate::types::SnapshotId;
 
+/// Errors that can occur in the khive VCS layer (snapshot hashing, NDJSON sync, remote fetch).
 #[derive(Debug, Error)]
 pub enum VcsError {
     /// The archive stored at the remote has a different hash than expected.

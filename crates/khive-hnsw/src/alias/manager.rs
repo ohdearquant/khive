@@ -1,18 +1,4 @@
-//! Index alias manager for zero-downtime index migration.
-//!
-//! Provides blue-green deployment semantics for HNSW indexes: readers always
-//! get a consistent snapshot, writers build a new index in the background,
-//! and the alias swap is atomic (single pointer update under a brief write lock).
-//!
-//! # Concurrency Model
-//!
-//! - **Read path**: `parking_lot::RwLock` read guard. `parking_lot` uses
-//!   adaptive spinning before OS-level blocking, so short critical sections
-//!   (pointer clone) have near-zero contention overhead.
-//! - **Write path**: Brief exclusive lock for the pointer swap only.
-//! - **Background build**: Runs on `tokio::task::spawn_blocking`. Does not
-//!   hold any locks on the alias map.
-//! - **Drain**: Async poll with configurable interval and timeout.
+//! Index alias manager: atomic blue-green swap for zero-downtime HNSW index migration.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,25 +42,7 @@ pub struct MigrationReport {
     pub swap_drain_duration: Duration,
 }
 
-/// Manages named collections and aliases for zero-downtime index switching.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// let manager = IndexAliasManager::new(Duration::from_secs(5));
-///
-/// // Register initial index
-/// manager.register_collection("index_v1", initial_index)?;
-/// manager.create_alias("active", "index_v1")?;
-///
-/// // Search through alias
-/// let guard = manager.acquire_reader("active")?;
-/// let results = guard.search(&query, 10)?;
-/// drop(guard); // releases reader count
-///
-/// // Migrate to new index
-/// let report = manager.migrate("active", vectors, new_config, None).await?;
-/// ```
+/// Manages named collections and aliases for zero-downtime HNSW index switching.
 pub struct IndexAliasManager {
     /// Collection name -> Collection data.
     /// Protected by RwLock: reads (search) take shared lock, writes (register/remove)
@@ -145,15 +113,8 @@ impl IndexAliasManager {
         Ok(())
     }
 
-    /// Acquire a reader guard for the index behind an alias.
-    ///
-    /// The returned guard holds an `Arc<HnswIndex>` snapshot and increments the
-    /// reader counter. The index is guaranteed to remain alive until the guard
-    /// is dropped, even if the alias is swapped in the meantime.
-    ///
-    /// This is the primary read-path entry point. The critical section is
-    /// minimal: read-lock the alias map, read-lock the collection map, clone
-    /// the Arc, increment the counter.
+    /// Acquire a reader guard; holds an `Arc<HnswIndex>` snapshot that stays alive until dropped.
+    /// Critical section is minimal: resolve alias, clone Arc, increment counter.
     pub fn acquire_reader(&self, alias: &str) -> Result<ReaderGuard, AliasError> {
         // Resolve alias -> collection name
         let collection_name = {
@@ -176,12 +137,8 @@ impl IndexAliasManager {
         ))
     }
 
-    /// Switch an alias to point to a different collection.
-    ///
-    /// If a validator is provided, it runs against the target collection's
-    /// index before the swap. If validation fails, the alias is not changed.
-    ///
-    /// Returns the name of the previous collection (for drain purposes).
+    /// Switch an alias to a different collection, optionally validating first.
+    /// Returns the previous collection name for drain purposes.
     pub fn switch_alias(
         &self,
         alias: &str,
@@ -212,11 +169,8 @@ impl IndexAliasManager {
         Ok(old_collection)
     }
 
-    /// Wait for all readers on a collection to finish, then remove it.
-    ///
-    /// This is typically called after `switch_alias` to clean up the old
-    /// collection. If the drain times out, the collection is NOT removed
-    /// and the error is returned.
+    /// Wait for all readers on a collection to drain, then remove it.
+    /// If drain times out, the collection is NOT removed and an error is returned.
     pub async fn drain_and_remove(&self, collection: &str) -> Result<(), AliasError> {
         // Extract the reader counter (under read lock -- we just need the Arc)
         let counter = {
@@ -236,21 +190,7 @@ impl IndexAliasManager {
         Ok(())
     }
 
-    /// Full migration: build new index, validate, swap alias, drain old.
-    ///
-    /// This is the high-level API for embedding model migrations. The build
-    /// phase runs on `spawn_blocking` to avoid blocking the tokio runtime.
-    ///
-    /// # Arguments
-    ///
-    /// * `alias` - The alias to migrate (must already exist)
-    /// * `vectors` - All vectors for the new index
-    /// * `new_config` - Configuration for the new index
-    /// * `validator` - Optional pre-swap validation
-    ///
-    /// # Returns
-    ///
-    /// A `MigrationReport` with timing and size information.
+    /// Build new index, validate, swap alias atomically, drain old; returns `MigrationReport`.
     pub async fn migrate(
         &self,
         alias: &str,

@@ -62,7 +62,7 @@ mod tests {
             live_nodes: 80,
             ratio: 0.20,
         };
-        assert!(stats.needs_rebuild()); // 20% > 10% threshold (ADR-003)
+        assert!(stats.needs_rebuild()); // 20% > 10% threshold
     }
 
     #[test]

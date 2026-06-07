@@ -1,0 +1,28 @@
+[package]
+name = "khive-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Text analysis primitives for khive: tokenization, normalization, filtering"
+
+[dependencies]
+unicode-segmentation = { workspace = true, optional = true }
+rust-stemmers = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[features]
+default = []
+unicode = ["dep:unicode-segmentation"]
+stem = ["dep:rust-stemmers"]
+full = ["unicode", "stem"]
+
+[[bench]]
+name = "text_bench"
+harness = false

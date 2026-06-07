@@ -1,76 +1,108 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Least-common-ancestor (LCA) computation for snapshot histories (ADR-043 §2).
+//! Least-common-ancestor (LCA) computation for snapshot histories.
 //!
 //! Algorithm: iterative walk of the `ours` parent chain into a HashSet;
 //! then walk the `theirs` parent chain until the first ID in the set.
 //! O(D_ours + D_theirs) snapshot metadata reads.
+//!
+//! The `SnapshotReader` trait abstracts the storage backend so the algorithm
+//! can be tested independently. Production wiring goes through `KhiveRuntime`.
 
 use std::collections::HashSet;
 
-use khive_runtime::KhiveRuntime;
-use khive_vcs::{SnapshotId, VcsError};
+/// Snapshot reader trait for LCA computation.
+///
+/// Implementations provide the parent chain for a given snapshot ID.
+pub trait SnapshotReader: Send + Sync {
+    fn parent_of(&self, id: &str) -> Option<String>;
+}
 
 /// Find the lowest common ancestor of two snapshot histories.
 ///
 /// Returns `None` if the two histories are disjoint (no common ancestor).
 /// In that case the merge uses an empty `KgArchive` as the base.
-pub async fn find_lca(
-    runtime: &KhiveRuntime,
-    ours_id: &SnapshotId,
-    theirs_id: &SnapshotId,
-) -> Result<Option<SnapshotId>, VcsError> {
+pub fn find_lca(reader: &dyn SnapshotReader, ours_id: &str, theirs_id: &str) -> Option<String> {
     if ours_id == theirs_id {
-        return Ok(Some(ours_id.clone()));
+        return Some(ours_id.to_string());
     }
 
-    // Step 1: collect all ours ancestors into a set.
-    let ours_ancestors = collect_ancestors(runtime, ours_id).await?;
+    let ours_ancestors = collect_ancestors(reader, ours_id);
 
-    // Step 2: walk theirs until we hit a known ancestor.
-    let their_chain = collect_ancestors(runtime, theirs_id).await?;
-    for id in &their_chain {
-        if ours_ancestors.contains(id) {
-            return Ok(Some(id.clone()));
+    let mut current = Some(theirs_id.to_string());
+    while let Some(id) = current {
+        if ours_ancestors.contains(&id) {
+            return Some(id);
         }
+        current = reader.parent_of(&id);
     }
 
-    Ok(None)
+    None
 }
 
-/// Collect all ancestor IDs for a snapshot (including itself).
-async fn collect_ancestors(
-    runtime: &KhiveRuntime,
-    start: &SnapshotId,
-) -> Result<HashSet<SnapshotId>, VcsError> {
-    let chain = khive_vcs::log::ancestor_ids(runtime, start).await?;
-    Ok(chain.into_iter().collect())
+fn collect_ancestors(reader: &dyn SnapshotReader, start: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert(start.to_string());
+    let mut current = reader.parent_of(start);
+    while let Some(id) = current {
+        if !set.insert(id.clone()) {
+            break;
+        }
+        current = reader.parent_of(&id);
+    }
+    set
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use khive_vcs::SnapshotId;
+    use super::*;
+    use std::collections::HashMap;
 
-    // LCA on identical IDs should return that ID immediately.
-    // (No runtime needed since the early-exit fires before any DB reads.)
-    #[test]
-    fn lca_same_id_is_itself() {
-        // Since the async runtime is needed for actual DB ops, we test the
-        // identity-shortcut logic here and rely on integration tests for the
-        // full walk.
-        let a = SnapshotId::from_hash(&"a".repeat(64)).unwrap();
-        let b = a.clone();
-        // The `find_lca` function returns `Some(ours_id)` when ours == theirs.
-        // We verify the SnapshotId equality that enables this.
-        assert_eq!(a, b);
+    struct MockReader {
+        parents: HashMap<String, String>,
+    }
+
+    impl SnapshotReader for MockReader {
+        fn parent_of(&self, id: &str) -> Option<String> {
+            self.parents.get(id).cloned()
+        }
     }
 
     #[test]
-    fn lca_different_ids_not_equal() {
-        let a = SnapshotId::from_hash(&"a".repeat(64)).unwrap();
-        let b = SnapshotId::from_hash(&"b".repeat(64)).unwrap();
-        assert_ne!(a, b);
+    fn lca_same_id_is_itself() {
+        let reader = MockReader {
+            parents: HashMap::new(),
+        };
+        assert_eq!(find_lca(&reader, "a", "a"), Some("a".into()));
+    }
+
+    #[test]
+    fn lca_disjoint_returns_none() {
+        let mut parents = HashMap::new();
+        parents.insert("a".into(), "root_a".into());
+        parents.insert("b".into(), "root_b".into());
+        let reader = MockReader { parents };
+        assert_eq!(find_lca(&reader, "a", "b"), None);
+    }
+
+    #[test]
+    fn lca_linear_chain() {
+        let mut parents = HashMap::new();
+        parents.insert("c".into(), "b".into());
+        parents.insert("b".into(), "a".into());
+        let reader = MockReader { parents };
+        assert_eq!(find_lca(&reader, "c", "b"), Some("b".into()));
+    }
+
+    #[test]
+    fn lca_fork() {
+        // ours: d -> c -> base
+        // theirs: e -> c -> base
+        let mut parents = HashMap::new();
+        parents.insert("d".into(), "c".into());
+        parents.insert("e".into(), "c".into());
+        parents.insert("c".into(), "base".into());
+        let reader = MockReader { parents };
+        assert_eq!(find_lca(&reader, "d", "e"), Some("c".into()));
     }
 }

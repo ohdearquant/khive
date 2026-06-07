@@ -1,40 +1,4 @@
 //! Timeout and cancellation support for search operations.
-//!
-//! Provides utilities for wrapping search futures with timeout and cancellation
-//! semantics. Uses `tokio::time::timeout` for deadline enforcement and
-//! `tokio_util::sync::CancellationToken` for cooperative cancellation.
-//!
-//! # Design
-//!
-//! Timeout and cancellation are applied at the search entry points (hybrid search,
-//! graph traversal) rather than at every internal function call. This keeps the
-//! internal algorithms clean while providing operational safety at the boundaries.
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use std::time::Duration;
-//! use khive_retrieval::timeout::{search_with_timeout, search_with_cancellation};
-//! use tokio_util::sync::CancellationToken;
-//!
-//! // Timeout: cancel if search takes longer than 5 seconds
-//! let results = search_with_timeout(
-//!     searcher.hybrid_search(&query, &config),
-//!     Duration::from_secs(5),
-//! ).await?;
-//!
-//! // Cancellation: cancel via token (e.g., from a request handler)
-//! let token = CancellationToken::new();
-//! let results = search_with_cancellation(
-//!     searcher.hybrid_search(&query, &config),
-//!     token.clone(),
-//! ).await?;
-//!
-//! // From another task:
-//! token.cancel();
-//! ```
-//!
-//! See also: [`HybridConfig::timeout`] for declarative timeout configuration.
 
 use std::future::Future;
 use std::time::Duration;
@@ -43,58 +7,27 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, RetrievalError};
 
-/// Execute a search future with a timeout.
-///
-/// Wraps the given future with `tokio::time::timeout`. If the future does not
-/// complete within the specified duration, returns [`RetrievalError::QueryTimeout`].
-///
-/// # Arguments
-///
-/// * `future` - The search operation to execute
-/// * `duration` - Maximum time to wait for completion
-///
-/// # Returns
-///
-/// The search result if completed within the timeout, or `QueryTimeout` error.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::time::Duration;
-/// use khive_retrieval::timeout::search_with_timeout;
-///
-/// let results = search_with_timeout(
-///     searcher.hybrid_search(&query, &config),
-///     Duration::from_secs(5),
-/// ).await?;
-/// ```
+/// Execute a search future with a timeout; returns [`RetrievalError::QueryTimeout`] if elapsed.
 pub async fn search_with_timeout<F, T>(future: F, duration: Duration) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
     match tokio::time::timeout(duration, future).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(RetrievalError::QueryTimeout {
-            elapsed_ms: duration.as_millis() as u64,
-        }),
+        Err(_elapsed) => {
+            // as-cast is safe for all realistic timeout values (u64::MAX ms ≈ 585M years).
+            debug_assert!(
+                duration.as_millis() <= u64::MAX as u128,
+                "timeout duration overflows u64 milliseconds"
+            );
+            Err(RetrievalError::QueryTimeout {
+                elapsed_ms: duration.as_millis() as u64,
+            })
+        }
     }
 }
 
-/// Execute a search future with an optional timeout.
-///
-/// If `timeout` is `Some`, wraps the future with [`search_with_timeout`].
-/// If `None`, executes the future directly without timeout.
-///
-/// This is a convenience function for use with [`HybridConfig::timeout`].
-///
-/// # Arguments
-///
-/// * `future` - The search operation to execute
-/// * `timeout` - Optional maximum time to wait
-///
-/// # Returns
-///
-/// The search result, or `QueryTimeout` if the timeout elapsed.
+/// Execute a search future with an optional timeout (`None` = no timeout).
 pub async fn search_with_optional_timeout<F, T>(future: F, timeout: Option<Duration>) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -105,41 +38,7 @@ where
     }
 }
 
-/// Execute a search future with a cancellation token.
-///
-/// Uses `tokio::select!` to race the search future against the cancellation token.
-/// If the token is cancelled before the search completes, returns
-/// [`RetrievalError::QueryCancelled`].
-///
-/// # Arguments
-///
-/// * `future` - The search operation to execute
-/// * `token` - Cancellation token to observe
-///
-/// # Returns
-///
-/// The search result if completed before cancellation, or `QueryCancelled` error.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use tokio_util::sync::CancellationToken;
-/// use khive_retrieval::timeout::search_with_cancellation;
-///
-/// let token = CancellationToken::new();
-/// let token_clone = token.clone();
-///
-/// // Spawn a task that cancels after 1 second
-/// tokio::spawn(async move {
-///     tokio::time::sleep(Duration::from_secs(1)).await;
-///     token_clone.cancel();
-/// });
-///
-/// let results = search_with_cancellation(
-///     searcher.hybrid_search(&query, &config),
-///     token,
-/// ).await?;
-/// ```
+/// Execute a search future with a cancellation token; returns `QueryCancelled` if token fires first.
 pub async fn search_with_cancellation<F, T>(future: F, token: CancellationToken) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -150,23 +49,7 @@ where
     }
 }
 
-/// Execute a search future with both timeout and optional cancellation.
-///
-/// Combines timeout and cancellation into a single wrapper. The search will
-/// be terminated if either:
-/// - The timeout duration elapses (`QueryTimeout`)
-/// - The cancellation token is triggered (`QueryCancelled`)
-/// - The search completes normally
-///
-/// # Arguments
-///
-/// * `future` - The search operation to execute
-/// * `timeout` - Optional maximum time to wait
-/// * `cancel` - Optional cancellation token to observe
-///
-/// # Returns
-///
-/// The search result, or an appropriate error if timed out or cancelled.
+/// Execute a search future with optional timeout and optional cancellation token.
 pub async fn search_with_deadline<F, T>(
     future: F,
     timeout: Option<Duration>,
@@ -181,9 +64,15 @@ where
                 result = tokio::time::timeout(duration, future) => {
                     match result {
                         Ok(inner) => inner,
-                        Err(_elapsed) => Err(RetrievalError::QueryTimeout {
-                            elapsed_ms: duration.as_millis() as u64,
-                        }),
+                        Err(_elapsed) => {
+                            debug_assert!(
+                                duration.as_millis() <= u64::MAX as u128,
+                                "timeout duration overflows u64 milliseconds"
+                            );
+                            Err(RetrievalError::QueryTimeout {
+                                elapsed_ms: duration.as_millis() as u64,
+                            })
+                        }
                     }
                 }
                 _ = token.cancelled() => Err(RetrievalError::QueryCancelled),
@@ -212,7 +101,14 @@ pub(crate) mod serde_opt_duration {
         S: Serializer,
     {
         match value {
-            Some(d) => DurationMs(d.as_millis() as u64).serialize(serializer),
+            Some(d) => {
+                // as-cast is safe for all realistic timeout values (u64::MAX ms ≈ 585M years).
+                debug_assert!(
+                    d.as_millis() <= u64::MAX as u128,
+                    "timeout duration overflows u64 milliseconds"
+                );
+                DurationMs(d.as_millis() as u64).serialize(serializer)
+            }
             None => serializer.serialize_none(),
         }
     }

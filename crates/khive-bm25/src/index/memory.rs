@@ -16,16 +16,11 @@ impl Bm25Index {
     }
 
     /// Set or clear the memory budget at runtime.
-    ///
-    /// Pass `Some(bytes)` to enforce a limit, or `None` to remove it.
     pub fn set_memory_budget(&mut self, budget: Option<usize>) {
         self.config.memory_budget = budget;
     }
 
-    /// Estimate the current memory usage of the index in bytes.
-    ///
-    /// This is an approximation. It includes the inverted index, document
-    /// metadata, ID maps, and block-max metadata.
+    /// Estimate the index memory usage in bytes (approximation).
     pub fn memory_usage(&self) -> usize {
         let mut inverted_index_size: usize = 0;
         let mut block_max_size: usize = 0;

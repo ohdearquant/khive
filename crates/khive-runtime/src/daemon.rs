@@ -1,4 +1,4 @@
-//! khived daemon server — persistent warm runtime over a Unix socket (ADR-049).
+//! khived daemon server — persistent warm runtime over a Unix socket.
 //!
 //! The daemon binds `~/.khive/khived.sock`, accepts length-prefixed request
 //! frames, dispatches them through a [`DaemonDispatch`] implementor, and serves
@@ -351,4 +351,58 @@ pub fn env_truthy(key: &str) -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Focused regression tests for the unsafe process probe (SAFETY: signal 0
+    // is an existence check with no side effects; see is_process_running).
+
+    #[test]
+    fn current_process_is_running() {
+        // The current PID is always alive.
+        let pid = std::process::id();
+        assert!(
+            is_process_running(pid),
+            "current process {pid} should be detected as running"
+        );
+    }
+
+    #[test]
+    fn pid_zero_is_not_running() {
+        // PID 0 is the process group; kill(0, 0) sends to the group,
+        // which we treat as invalid — the guard `pid <= 0` must block it.
+        assert!(
+            !is_process_running(0),
+            "pid 0 must be rejected by the guard before the unsafe call"
+        );
+    }
+
+    #[test]
+    fn very_large_pid_is_not_running() {
+        // u32::MAX overflows i32 — try_from returns Err, guard returns false.
+        assert!(
+            !is_process_running(u32::MAX),
+            "u32::MAX should fail i32 conversion and return false"
+        );
+    }
+
+    #[test]
+    fn env_truthy_recognises_set_values() {
+        assert!(!env_truthy("__KHIVE_TEST_ABSENT_VAR_XYZ__"));
+
+        // env_truthy with a live value — set and unset atomically to avoid
+        // cross-test pollution (not parallel-safe without serial_test, but these
+        // are fast unit tests and the variable name is unique).
+        let key = "__KHIVE_TEST_TRUTHY_ABC__";
+        std::env::set_var(key, "1");
+        assert!(env_truthy(key));
+        std::env::set_var(key, "false");
+        assert!(!env_truthy(key));
+        std::env::set_var(key, "0");
+        assert!(!env_truthy(key));
+        std::env::remove_var(key);
+    }
 }

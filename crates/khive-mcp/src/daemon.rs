@@ -1,4 +1,4 @@
-//! khived daemon client — forwarding + auto-spawn (ADR-049).
+//! khived daemon client — forwarding + auto-spawn.
 //!
 //! The daemon server lives in `khive-runtime::daemon`. This module provides the
 //! client side: [`forward_or_spawn`] connects to the daemon, auto-spawns it on

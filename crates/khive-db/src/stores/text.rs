@@ -1,43 +1,4 @@
-//! FTS5-backed `TextSearch` implementation.
-//!
-//! Each `Fts5TextSearch` manages a single FTS5 virtual table for full-text
-//! search. The table stores document metadata alongside the indexed text
-//! columns (`title` and `body`), with non-searchable columns marked
-//! `UNINDEXED`.
-//!
-//! # FTS5 table layout
-//!
-//! ```sql
-//! CREATE VIRTUAL TABLE fts_{key} USING fts5(
-//!     subject_id UNINDEXED,
-//!     kind UNINDEXED,
-//!     title,
-//!     body,
-//!     tags UNINDEXED,
-//!     namespace UNINDEXED,
-//!     metadata UNINDEXED,
-//!     updated_at UNINDEXED
-//! );
-//! ```
-//!
-//! Only `title` and `body` are full-text indexed. The remaining columns are
-//! stored for retrieval and filtering but do not participate in FTS ranking.
-//!
-//! # Connection strategy
-//!
-//! Follows the same dual-mode pattern as `SqliteVecStore`:
-//! - **File-backed**: Opens standalone connections per operation.
-//! - **In-memory**: Acquires pool connections via `spawn_blocking`.
-//!
-//! # Score normalization
-//!
-//! FTS5 `rank` values are negative (more negative = more relevant). We
-//! normalize within each result set so scores span `(0.05, 1.0]`, preserving
-//! relative ordering across all tokenizers (including trigram, which produces
-//! a narrow absolute range that the old `1/(1+|rank|)` formula collapsed into
-//! near-uniform noise). The best hit in a result set receives score `1.0`;
-//! the worst receives `0.05`. When all hits have the same rank (single hit or
-//! degenerate match), score is `1.0`.
+//! FTS5-backed `TextSearch`: one virtual table per model, scores normalized to `(0.05, 1.0]`.
 
 use std::sync::Arc;
 
@@ -48,8 +9,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, TextDocument, TextFilter, TextIndexStats, TextQueryMode,
-    TextSearchHit, TextSearchRequest,
+    BatchWriteSummary, IndexRebuildScope, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
+    TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
+    TextTermStatsRequest,
 };
 use khive_storage::StorageCapability;
 use khive_storage::TextSearch;
@@ -737,6 +699,123 @@ impl TextSearch for Fts5TextSearch {
         .await
     }
 
+    async fn search_with_options(
+        &self,
+        request: TextSearchRequest,
+        options: TextSearchOptions,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        match options.gather_mode {
+            TextGatherMode::Ranked => self.search(request).await,
+            TextGatherMode::Unranked => self.search_unranked(request).await,
+            TextGatherMode::RankWithinCap => {
+                let gather_limit = options
+                    .gather_limit
+                    .unwrap_or(request.top_k)
+                    .max(request.top_k);
+                self.search_rank_within_cap(request, gather_limit).await
+            }
+        }
+    }
+
+    async fn term_stats(
+        &self,
+        request: TextTermStatsRequest,
+    ) -> Result<Vec<TextTermStats>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_term_stats", move |conn| {
+            let filter = request.filter.as_ref();
+
+            // Document count uses params starting at ?1 (no MATCH expression).
+            let (count_filter_clause, count_filter_params) = if let Some(f) = filter {
+                build_filter_clause(f, &table, 1)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            let document_count: u64 = {
+                let count_sql = if count_filter_clause.is_empty() {
+                    format!("SELECT COUNT(*) FROM {table}")
+                } else {
+                    let where_part = count_filter_clause.trim_start_matches(" AND ");
+                    format!("SELECT COUNT(*) FROM {table} WHERE {where_part}")
+                };
+                let mut stmt = conn.prepare(&count_sql)?;
+                for (i, param) in count_filter_params.iter().enumerate() {
+                    param
+                        .to_sql()
+                        .map(|val| stmt.raw_bind_parameter(1 + i, val))
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+                }
+                let mut rows = stmt.raw_query();
+                match rows.next()? {
+                    Some(row) => {
+                        let c: i64 = row.get(0)?;
+                        c as u64
+                    }
+                    None => 0,
+                }
+            };
+
+            let mut results = Vec::with_capacity(request.terms.len());
+            for term in &request.terms {
+                let sanitized = sanitize_fts5_query(term);
+                if sanitized.is_empty() {
+                    results.push(TextTermStats {
+                        term: term.clone(),
+                        sanitized_term: sanitized,
+                        document_frequency: 0,
+                        document_count,
+                        inverse_document_frequency: 0.0,
+                    });
+                    continue;
+                }
+
+                // Per-term count: MATCH is ?1, so filter params start at ?2.
+                let (term_filter_clause, term_filter_params) = if let Some(f) = filter {
+                    build_filter_clause(f, &table, 2)
+                } else {
+                    (String::new(), Vec::new())
+                };
+
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1{term_filter_clause}"
+                );
+                let mut stmt = conn.prepare(&count_sql)?;
+                stmt.raw_bind_parameter(1, &sanitized)?;
+                for (i, param) in term_filter_params.iter().enumerate() {
+                    param
+                        .to_sql()
+                        .map(|val| stmt.raw_bind_parameter(2 + i, val))
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+                }
+
+                let df: u64 = {
+                    let mut rows = stmt.raw_query();
+                    match rows.next()? {
+                        Some(row) => {
+                            let c: i64 = row.get(0)?;
+                            c as u64
+                        }
+                        None => 0,
+                    }
+                };
+
+                let idf = Fts5TextSearch::bm25_idf(df, document_count);
+                results.push(TextTermStats {
+                    term: term.clone(),
+                    sanitized_term: sanitized,
+                    document_frequency: df,
+                    document_count,
+                    inverse_document_frequency: idf,
+                });
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
     async fn rebuild(&self, _scope: IndexRebuildScope) -> Result<TextIndexStats, StorageError> {
         let table = self.table_name.clone();
 
@@ -759,6 +838,246 @@ impl TextSearch for Fts5TextSearch {
 }
 
 impl Fts5TextSearch {
+    /// Robertson-Walker BM25 IDF: ln(((N - df + 0.5) / (df + 0.5)) + 1)
+    fn bm25_idf(df: u64, document_count: u64) -> f64 {
+        let n = document_count as f64;
+        let f = df as f64;
+        ((n - f + 0.5) / (f + 0.5) + 1.0).ln()
+    }
+
+    /// Build the OR match expression from a query string (shared logic).
+    fn build_any_term_expr(query: &str) -> Option<String> {
+        let parts: Vec<String> = query
+            .split_whitespace()
+            .map(sanitize_fts5_query)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" OR "))
+        }
+    }
+
+    /// Gather candidates without BM25 ranking; return with uniform score 1.0.
+    async fn search_unranked(
+        &self,
+        request: TextSearchRequest,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_search_unranked", move |conn| {
+            let match_expr = match request.mode {
+                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
+                    Some(e) => e,
+                    None => return Ok(Vec::new()),
+                },
+                _ => {
+                    let sanitized = sanitize_fts5_query(&request.query);
+                    if sanitized.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    match request.mode {
+                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
+                        TextQueryMode::Plain => sanitized,
+                        TextQueryMode::AnyTerm => unreachable!(),
+                    }
+                }
+            };
+
+            let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
+                build_filter_clause(filter, &table, 3)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            // No rank column, no ORDER BY — avoids BM25 computation entirely.
+            let sql = format!(
+                "SELECT subject_id, title \
+                 FROM {table} WHERE {table} MATCH ?1{filter_clause} \
+                 LIMIT ?2",
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.raw_bind_parameter(1, &match_expr)?;
+            stmt.raw_bind_parameter(2, request.top_k as i64)?;
+
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+            }
+
+            let mut results = Vec::new();
+            let mut rows = stmt.raw_query();
+            let mut rank_idx = 0u32;
+
+            while let Some(row) = rows.next()? {
+                let id_str: String = row.get(0)?;
+                let title: String = row.get(1)?;
+
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                rank_idx += 1;
+                results.push(TextSearchHit {
+                    subject_id,
+                    score: DeterministicScore::from_f64(1.0),
+                    rank: rank_idx,
+                    title: if title.is_empty() { None } else { Some(title) },
+                    snippet: None,
+                });
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
+    /// Two-stage gather: cheap unranked LIMIT gather_limit, then BM25-rank the subset.
+    async fn search_rank_within_cap(
+        &self,
+        request: TextSearchRequest,
+        gather_limit: u32,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_search_rank_within_cap", move |conn| {
+            let match_expr = match request.mode {
+                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
+                    Some(e) => e,
+                    None => return Ok(Vec::new()),
+                },
+                _ => {
+                    let sanitized = sanitize_fts5_query(&request.query);
+                    if sanitized.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    match request.mode {
+                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
+                        TextQueryMode::Plain => sanitized,
+                        TextQueryMode::AnyTerm => unreachable!(),
+                    }
+                }
+            };
+
+            let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
+                build_filter_clause(filter, &table, 3)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            // Stage 1: cheap unranked gather of rowids.
+            let gather_sql = format!(
+                "SELECT subject_id FROM {table} WHERE {table} MATCH ?1{filter_clause} LIMIT ?2"
+            );
+
+            let mut stmt = conn.prepare(&gather_sql)?;
+            stmt.raw_bind_parameter(1, &match_expr)?;
+            stmt.raw_bind_parameter(2, gather_limit as i64)?;
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+            }
+
+            let mut gathered_ids: Vec<String> = Vec::new();
+            let mut rows = stmt.raw_query();
+            while let Some(row) = rows.next()? {
+                gathered_ids.push(row.get::<_, String>(0)?);
+            }
+
+            if gathered_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Stage 2: BM25-rank only the gathered subset via subject_id IN (...).
+            let snippet_expr = if request.snippet_chars == 0 {
+                "NULL AS snippet".to_string()
+            } else {
+                let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
+                format!("snippet({table}, 3, '', '', '...', {chars})")
+            };
+
+            // Build IN clause for the gathered IDs.
+            let id_placeholders: Vec<String> = gathered_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", 3 + i))
+                .collect();
+            let in_clause = id_placeholders.join(", ");
+
+            let rank_sql = format!(
+                "SELECT subject_id, rank, title, {snippet_expr} \
+                 FROM {table} WHERE {table} MATCH ?1 AND subject_id IN ({in_clause}) \
+                 ORDER BY rank LIMIT ?2"
+            );
+
+            let mut stmt2 = conn.prepare(&rank_sql)?;
+            stmt2.raw_bind_parameter(1, &match_expr)?;
+            stmt2.raw_bind_parameter(2, request.top_k as i64)?;
+            for (i, id_str) in gathered_ids.iter().enumerate() {
+                stmt2.raw_bind_parameter(3 + i, id_str.as_str())?;
+            }
+
+            let mut hits = Vec::new();
+            let mut rows2 = stmt2.raw_query();
+            let mut rank_idx = 0u32;
+
+            while let Some(row) = rows2.next()? {
+                let id_str: String = row.get(0)?;
+                let fts_rank: f64 = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: Option<String> = row.get(3)?;
+
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                rank_idx += 1;
+                hits.push((subject_id, fts_rank, rank_idx, title, snippet));
+            }
+
+            // Normalize scores within the ranked subset (same formula as search()).
+            let min_rank = hits.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
+            let max_rank = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
+            let range = max_rank - min_rank;
+
+            let results = hits
+                .into_iter()
+                .map(|(subject_id, raw_rank, rank, title, snippet)| {
+                    let score = if range.abs() < 1e-12 {
+                        1.0
+                    } else {
+                        let t = (max_rank - raw_rank) / range;
+                        0.05 + 0.95 * t
+                    };
+                    TextSearchHit {
+                        subject_id,
+                        score: DeterministicScore::from_f64(score),
+                        rank,
+                        title: if title.is_empty() { None } else { Some(title) },
+                        snippet: snippet.filter(|s| !s.is_empty()),
+                    }
+                })
+                .collect();
+
+            Ok(results)
+        })
+        .await
+    }
+
     /// Move all FTS5 documents from `old_namespace` to `new_namespace` in a
     /// single transaction.
     ///
@@ -768,6 +1087,7 @@ impl Fts5TextSearch {
     /// Callers must invoke this after any SQL-level namespace change on the
     /// backing entity table so that FTS5 keyword search stays consistent with
     /// the entity store.
+    // REASON: reserved for namespace migration operations
     #[allow(dead_code)]
     pub(crate) async fn rename_namespace(
         &self,
@@ -857,949 +1177,5 @@ impl Fts5TextSearch {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pool::PoolConfig;
-
-    fn setup_memory_store(table_key: &str) -> Fts5TextSearch {
-        let config = PoolConfig {
-            path: None,
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(ConnectionPool::new(config).unwrap());
-
-        {
-            let writer = pool.writer().unwrap();
-            ensure_fts5_schema(writer.conn(), table_key).unwrap();
-        }
-
-        Fts5TextSearch::new(pool, false, table_key.to_string())
-    }
-
-    fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
-        TextDocument {
-            subject_id,
-            kind: SubstrateKind::Note,
-            title: if title.is_empty() {
-                None
-            } else {
-                Some(title.to_string())
-            },
-            body: body.to_string(),
-            tags: vec![],
-            namespace: "test_ns".to_string(),
-            metadata: None,
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn ns_filter(namespace: &str) -> TextFilter {
-        TextFilter {
-            namespaces: vec![namespace.to_string()],
-            ..TextFilter::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_upsert_and_search() {
-        let store = setup_memory_store("upsert_search");
-
-        let id = Uuid::new_v4();
-        let doc = TextDocument {
-            subject_id: id,
-            kind: SubstrateKind::Entity,
-            title: Some("Rust Programming".to_string()),
-            body: "Rust is a systems programming language focused on safety and performance."
-                .to_string(),
-            tags: vec!["rust".to_string(), "programming".to_string()],
-            namespace: "tech".to_string(),
-            metadata: None,
-            updated_at: Utc::now(),
-        };
-
-        store.upsert_document(doc).await.unwrap();
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "Rust programming".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("tech")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].subject_id, id);
-        assert_eq!(hits[0].rank, 1);
-        assert!(hits[0].score.to_f64() > 0.0);
-        assert!(hits[0].title.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_phrase_search() {
-        let store = setup_memory_store("phrase");
-
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-
-        store
-            .upsert_document(make_document(
-                id1,
-                "Animals",
-                "The quick brown fox jumps over the lazy dog.",
-            ))
-            .await
-            .unwrap();
-
-        store
-            .upsert_document(make_document(
-                id2,
-                "Colors",
-                "The brown paint was quick to dry, unlike the fox.",
-            ))
-            .await
-            .unwrap();
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "quick brown fox".to_string(),
-                mode: TextQueryMode::Phrase,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].subject_id, id1);
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "quick brown fox".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_delete_document() {
-        let store = setup_memory_store("delete");
-
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-
-        store
-            .upsert_document(make_document(id1, "Doc One", "First document content."))
-            .await
-            .unwrap();
-        store
-            .upsert_document(make_document(id2, "Doc Two", "Second document content."))
-            .await
-            .unwrap();
-
-        let stats = store.stats().await.unwrap();
-        assert_eq!(stats.document_count, 2);
-
-        let deleted = store.delete_document("test_ns", id1).await.unwrap();
-        assert!(deleted);
-
-        let stats = store.stats().await.unwrap();
-        assert_eq!(stats.document_count, 1);
-
-        let deleted_again = store.delete_document("test_ns", id1).await.unwrap();
-        assert!(!deleted_again);
-
-        let doc = store.get_document("test_ns", id2).await.unwrap();
-        assert!(doc.is_some());
-
-        let doc = store.get_document("test_ns", id1).await.unwrap();
-        assert!(doc.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_count_with_filter() {
-        let store = setup_memory_store("count_filter");
-        let ns = "test_ns".to_string();
-
-        for i in 0..5 {
-            let kind = if i % 2 == 0 {
-                SubstrateKind::Entity
-            } else {
-                SubstrateKind::Note
-            };
-            let doc = TextDocument {
-                subject_id: Uuid::new_v4(),
-                kind,
-                title: Some(format!("Doc {}", i)),
-                body: format!("Content for document number {}", i),
-                tags: vec![],
-                namespace: ns.clone(),
-                metadata: None,
-                updated_at: Utc::now(),
-            };
-            store.upsert_document(doc).await.unwrap();
-        }
-
-        let total = store
-            .count(TextFilter {
-                namespaces: vec![ns.clone()],
-                ..TextFilter::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 5);
-
-        let entities = store
-            .count(TextFilter {
-                namespaces: vec![ns.clone()],
-                kinds: vec![SubstrateKind::Entity],
-                ..TextFilter::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(entities, 3);
-
-        let notes = store
-            .count(TextFilter {
-                namespaces: vec![ns.clone()],
-                kinds: vec![SubstrateKind::Note],
-                ..TextFilter::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(notes, 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_document_roundtrip() {
-        let store = setup_memory_store("get_roundtrip");
-
-        let id = Uuid::new_v4();
-        let original = TextDocument {
-            subject_id: id,
-            kind: SubstrateKind::Note,
-            title: Some("Important Memo".to_string()),
-            body: "This memo contains critical information.".to_string(),
-            tags: vec!["important".to_string(), "memo".to_string()],
-            namespace: "work".to_string(),
-            metadata: Some(serde_json::json!({"priority": "high"})),
-            updated_at: Utc::now(),
-        };
-
-        store.upsert_document(original.clone()).await.unwrap();
-
-        let retrieved = store.get_document("work", id).await.unwrap().unwrap();
-        assert_eq!(retrieved.subject_id, id);
-        assert_eq!(retrieved.kind, SubstrateKind::Note);
-        assert_eq!(retrieved.title, Some("Important Memo".to_string()));
-        assert_eq!(retrieved.body, "This memo contains critical information.");
-        assert_eq!(retrieved.tags, vec!["important", "memo"]);
-        assert_eq!(retrieved.namespace, "work");
-    }
-
-    #[tokio::test]
-    async fn test_upsert_replaces_existing() {
-        let store = setup_memory_store("replace");
-
-        let id = Uuid::new_v4();
-        store
-            .upsert_document(make_document(id, "Original", "Original body text."))
-            .await
-            .unwrap();
-
-        store
-            .upsert_document(make_document(id, "Updated", "Updated body text."))
-            .await
-            .unwrap();
-
-        let stats = store.stats().await.unwrap();
-        assert_eq!(stats.document_count, 1);
-
-        let doc = store.get_document("test_ns", id).await.unwrap().unwrap();
-        assert_eq!(doc.title, Some("Updated".to_string()));
-        assert_eq!(doc.body, "Updated body text.");
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert() {
-        let store = setup_memory_store("batch");
-
-        let docs: Vec<TextDocument> = (0..50)
-            .map(|i| TextDocument {
-                subject_id: Uuid::new_v4(),
-                kind: SubstrateKind::Entity,
-                title: Some(format!("Item {}", i)),
-                body: format!("This is the body content for item number {}", i),
-                tags: vec![format!("tag_{}", i % 5)],
-                namespace: "batch_ns".to_string(),
-                metadata: None,
-                updated_at: Utc::now(),
-            })
-            .collect();
-
-        let summary = store.upsert_documents(docs).await.unwrap();
-        assert_eq!(summary.attempted, 50);
-        assert_eq!(summary.affected, 50);
-        assert_eq!(summary.failed, 0);
-
-        let stats = store.stats().await.unwrap();
-        assert_eq!(stats.document_count, 50);
-    }
-
-    #[tokio::test]
-    async fn test_empty_search() {
-        let store = setup_memory_store("empty");
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "nonexistent".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        assert!(hits.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_rebuild() {
-        let store = setup_memory_store("rebuild");
-
-        store
-            .upsert_document(make_document(
-                Uuid::new_v4(),
-                "Test",
-                "Test document for rebuild.",
-            ))
-            .await
-            .unwrap();
-
-        let stats = store.rebuild(IndexRebuildScope::Full).await.unwrap();
-        assert_eq!(stats.document_count, 1);
-        assert!(!stats.needs_rebuild);
-        assert!(stats.last_rebuild_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_search_with_kind_filter() {
-        let store = setup_memory_store("filter_kind");
-
-        let id_entity = Uuid::new_v4();
-        let id_note = Uuid::new_v4();
-
-        store
-            .upsert_document(TextDocument {
-                subject_id: id_entity,
-                kind: SubstrateKind::Entity,
-                title: Some("Rust Guide".to_string()),
-                body: "A comprehensive guide to Rust programming.".to_string(),
-                tags: vec![],
-                namespace: "test_ns".to_string(),
-                metadata: None,
-                updated_at: Utc::now(),
-            })
-            .await
-            .unwrap();
-
-        store
-            .upsert_document(TextDocument {
-                subject_id: id_note,
-                kind: SubstrateKind::Note,
-                title: Some("Rust Notes".to_string()),
-                body: "Quick notes about Rust concepts.".to_string(),
-                tags: vec![],
-                namespace: "test_ns".to_string(),
-                metadata: None,
-                updated_at: Utc::now(),
-            })
-            .await
-            .unwrap();
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "Rust".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    kinds: vec![SubstrateKind::Entity],
-                    namespaces: vec!["test_ns".to_string()],
-                    ..TextFilter::default()
-                }),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].subject_id, id_entity);
-    }
-
-    #[tokio::test]
-    async fn test_sanitize_fts5_query() {
-        assert_eq!(sanitize_fts5_query("hello world"), "hello world");
-        assert_eq!(sanitize_fts5_query("hello*world"), "helloworld");
-        assert_eq!(sanitize_fts5_query("\"quoted\""), "quoted");
-        assert_eq!(sanitize_fts5_query("(parens)"), "parens");
-        assert_eq!(sanitize_fts5_query("a + b - c"), "a b c");
-        assert_eq!(sanitize_fts5_query("col:value"), "col value");
-        assert_eq!(sanitize_fts5_query(""), "");
-        assert_eq!(sanitize_fts5_query("***"), "");
-        // M-C4: decimal numbers must not produce "syntax error near '.'"
-        assert_eq!(
-            sanitize_fts5_query("salience 0.9 vs 0.3"),
-            "salience 09 vs 03"
-        );
-        assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 123");
-        // H1: tilde and comma must be stripped to prevent FTS5 syntax errors
-        assert_eq!(sanitize_fts5_query("~hello"), "hello");
-        assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
-        assert_eq!(sanitize_fts5_query("NEAR(smile, 5)"), "smile 5");
-        assert_eq!(sanitize_fts5_query("a,b,c"), "a b c");
-        // #570: full operator-class matrix
-        // Apostrophe fix: single quote is an FTS5 string-literal delimiter in Plain mode.
-        assert_eq!(sanitize_fts5_query("Bob's tenant"), "Bobs tenant");
-        assert_eq!(
-            sanitize_fts5_query("tenant AND isolation"),
-            "tenant isolation"
-        );
-        assert_eq!(
-            sanitize_fts5_query("tenant OR isolation"),
-            "tenant isolation"
-        );
-        assert_eq!(
-            sanitize_fts5_query("tenant NOT isolation"),
-            "tenant isolation"
-        );
-        assert_eq!(
-            sanitize_fts5_query("tenant NEAR(isolation, 5)"),
-            "tenant isolation 5"
-        );
-        assert_eq!(sanitize_fts5_query("tenant:isolation"), "tenant isolation");
-        assert_eq!(
-            sanitize_fts5_query("tenant ^ isolation"),
-            "tenant isolation"
-        );
-        assert_eq!(
-            sanitize_fts5_query("(tenant isolation)"),
-            "tenant isolation"
-        );
-        // whitespace-only becomes empty
-        assert_eq!(sanitize_fts5_query("   "), "");
-        // operator-only after stripping becomes empty
-        assert_eq!(sanitize_fts5_query("AND OR NOT"), "");
-    }
-
-    /// H1 regression: queries with tilde (~) must not produce "fts5: syntax error near '~'".
-    #[tokio::test]
-    async fn test_search_with_tilde_does_not_crash() {
-        let store = setup_memory_store("tilde_query");
-
-        store
-            .upsert_document(make_document(Uuid::new_v4(), "smile", "smiling face"))
-            .await
-            .unwrap();
-
-        let result = store
-            .search(TextSearchRequest {
-                query: "~smile".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await;
-        assert!(
-            result.is_ok(),
-            "tilde query must not crash FTS5, got: {:?}",
-            result.err()
-        );
-    }
-
-    /// H1 regression: NEAR() queries must not produce "fts5: syntax error near ','".
-    #[tokio::test]
-    async fn test_search_with_near_operator_does_not_crash() {
-        let store = setup_memory_store("near_query");
-
-        store
-            .upsert_document(make_document(Uuid::new_v4(), "smile", "quokka smile happy"))
-            .await
-            .unwrap();
-
-        let result = store
-            .search(TextSearchRequest {
-                query: "quokka NEAR(smile, 5)".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await;
-        assert!(
-            result.is_ok(),
-            "NEAR() query must not crash FTS5, got: {:?}",
-            result.err()
-        );
-    }
-
-    /// M-C4 regression: searching with decimal numbers must succeed (not crash FTS5).
-    ///
-    /// Previously `.` was not stripped, causing FTS5 to return
-    /// "fts5: syntax error near '.'" when queries contained decimal literals like "0.9".
-    #[tokio::test]
-    async fn test_search_with_decimal_query_does_not_crash() {
-        let store = setup_memory_store("decimal_query");
-
-        // Insert a document that contains decimal-like content.
-        store
-            .upsert_document(make_document(
-                Uuid::new_v4(),
-                "salience thresholds",
-                "salience 09 vs 03 comparison",
-            ))
-            .await
-            .unwrap();
-
-        // Must not return an error — previously "fts5: syntax error near '.'"
-        let result = store
-            .search(TextSearchRequest {
-                query: "salience 0.9 vs 0.3".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await;
-        assert!(
-            result.is_ok(),
-            "decimal query must succeed, got error: {:?}",
-            result.err()
-        );
-
-        // Also test with version strings.
-        let result2 = store
-            .search(TextSearchRequest {
-                query: "salience 0.9 vs version 1.2.3".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await;
-        assert!(
-            result2.is_ok(),
-            "version-string query must succeed, got error: {:?}",
-            result2.err()
-        );
-    }
-
-    /// #570: all FTS5 operator classes must not crash the generic text search surface.
-    #[tokio::test]
-    async fn test_search_with_fts_operator_matrix_does_not_crash() {
-        let store = setup_memory_store("fts_operator_matrix");
-
-        store
-            .upsert_document(make_document(
-                Uuid::new_v4(),
-                "tenant isolation",
-                "multi-tenant isolation operator regression anchor content",
-            ))
-            .await
-            .unwrap();
-
-        let cases: &[&str] = &[
-            "\"tenant isolation\"",
-            "Bob \"quoted\" tenant",
-            "tenant AND isolation",
-            "tenant OR isolation",
-            "tenant NOT isolation",
-            "tenant NEAR(isolation, 5)",
-            "tenant*",
-            "***",
-            "tenant:isolation",
-            "tenant ^ isolation",
-            "(tenant isolation)",
-            "(\"+_~!\")",
-            "tenant:foo^bar*",
-            "multi-tenant isolation",
-            "   ",
-            "",
-        ];
-
-        for query in cases {
-            let result = store
-                .search(TextSearchRequest {
-                    query: query.to_string(),
-                    mode: TextQueryMode::Plain,
-                    filter: Some(ns_filter("test_ns")),
-                    top_k: 10,
-                    snippet_chars: 64,
-                })
-                .await;
-            assert!(
-                result.is_ok(),
-                "#570 DB search query {query:?} must not crash FTS5, got: {:?}",
-                result.err()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_score_is_bounded() {
-        let store = setup_memory_store("score_bounds");
-
-        for i in 0..5 {
-            store
-                .upsert_document(make_document(
-                    Uuid::new_v4(),
-                    &format!("Doc {}", i),
-                    &format!("This document discusses topic number {}", i),
-                ))
-                .await
-                .unwrap();
-        }
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "document topic".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        for hit in &hits {
-            let score = hit.score.to_f64();
-            assert!(
-                score > 0.0 && score <= 1.0,
-                "score out of (0, 1] range: {}",
-                score
-            );
-        }
-
-        for (i, hit) in hits.iter().enumerate() {
-            assert_eq!(hit.rank, (i + 1) as u32);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rename_namespace() {
-        let store = setup_memory_store("rename_ns");
-
-        let id = Uuid::new_v4();
-        let doc = TextDocument {
-            subject_id: id,
-            kind: SubstrateKind::Note,
-            title: Some("Rename test".to_string()),
-            body: "keyword_unique_xyz".to_string(),
-            tags: vec![],
-            namespace: "old_ns".to_string(),
-            metadata: None,
-            updated_at: Utc::now(),
-        };
-        store.upsert_document(doc).await.unwrap();
-
-        let before = store
-            .search(TextSearchRequest {
-                query: "keyword_unique_xyz".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("old_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-        assert_eq!(before.len(), 1);
-
-        let moved = store.rename_namespace("old_ns", "new_ns").await.unwrap();
-        assert_eq!(moved, 1);
-
-        let after_new = store
-            .search(TextSearchRequest {
-                query: "keyword_unique_xyz".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("new_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-        assert_eq!(after_new.len(), 1);
-
-        let after_old = store
-            .search(TextSearchRequest {
-                query: "keyword_unique_xyz".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("old_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-        assert!(after_old.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_metadata_none_roundtrip() {
-        let store = setup_memory_store("meta_none");
-        let id = uuid::Uuid::new_v4();
-        let doc = TextDocument {
-            subject_id: id,
-            kind: SubstrateKind::Note,
-            namespace: "test_ns".to_string(),
-            title: None,
-            body: "no metadata".to_string(),
-            tags: vec![],
-            metadata: None,
-            updated_at: Utc::now(),
-        };
-        store.upsert_document(doc).await.unwrap();
-        let fetched = store.get_document("test_ns", id).await.unwrap().unwrap();
-        assert!(fetched.metadata.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_rename_namespace_noop() {
-        let store = setup_memory_store("rename_noop");
-
-        let id = Uuid::new_v4();
-        let doc = TextDocument {
-            subject_id: id,
-            kind: SubstrateKind::Note,
-            title: None,
-            body: "noop_test_content".to_string(),
-            tags: vec![],
-            namespace: "same_ns".to_string(),
-            metadata: None,
-            updated_at: Utc::now(),
-        };
-        store.upsert_document(doc).await.unwrap();
-
-        let moved = store.rename_namespace("same_ns", "same_ns").await.unwrap();
-        assert_eq!(moved, 0);
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "noop_test_content".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("same_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-    }
-
-    /// snippet_chars=0 omits snippet computation without changing IDs, ranks, or scores.
-    ///
-    /// Regression for the snippet-free FTS optimization: verifies the `NULL AS snippet`
-    /// path returns identical candidate identity and ordering to the regular path, and
-    /// that every snippet field is None when snippet_chars=0.
-    #[tokio::test]
-    async fn search_snippet_chars_zero_omits_snippets_without_changing_rank() {
-        let store = setup_memory_store("snippet_zero");
-
-        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
-        let bodies = [
-            "alpha bravo charlie delta the quick fox jumped",
-            "bravo charlie delta echo the slow fox slept",
-            "charlie delta echo foxtrot the lazy dog barked",
-            "delta echo foxtrot golf a completely different document",
-        ];
-        for (id, body) in ids.iter().zip(bodies.iter()) {
-            store
-                .upsert_document(make_document(*id, "title", body))
-                .await
-                .unwrap();
-        }
-
-        let req_with = TextSearchRequest {
-            query: "bravo charlie".to_string(),
-            mode: TextQueryMode::AnyTerm,
-            filter: Some(ns_filter("test_ns")),
-            top_k: 10,
-            snippet_chars: 64,
-        };
-        let req_zero = TextSearchRequest {
-            snippet_chars: 0,
-            ..req_with.clone()
-        };
-
-        let hits_with = store.search(req_with).await.unwrap();
-        let hits_zero = store.search(req_zero).await.unwrap();
-
-        assert!(!hits_with.is_empty(), "snippet path must return hits");
-        assert_eq!(
-            hits_with.len(),
-            hits_zero.len(),
-            "hit count must be identical regardless of snippet_chars"
-        );
-
-        for (hw, hz) in hits_with.iter().zip(hits_zero.iter()) {
-            assert_eq!(hw.subject_id, hz.subject_id, "subject_id must match");
-            assert_eq!(hw.rank, hz.rank, "rank must match");
-            assert!(
-                (hw.score.to_f64() - hz.score.to_f64()).abs() < 1e-12,
-                "score must match: with={} zero={}",
-                hw.score.to_f64(),
-                hz.score.to_f64()
-            );
-            assert!(
-                hz.snippet.is_none(),
-                "snippet must be None when snippet_chars=0, got {:?}",
-                hz.snippet
-            );
-        }
-    }
-
-    // Boundary case: a hit ranked near the last position in a multi-result set
-    // must still have snippet=None when snippet_chars=0.
-    #[tokio::test]
-    async fn search_snippet_chars_zero_bottom_ranked_hit_has_no_snippet() {
-        let store = setup_memory_store("snippet_zero_boundary");
-
-        // Insert enough docs so the last-ranked result is a "boundary" case.
-        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-        for (i, id) in ids.iter().enumerate() {
-            let body = format!("keyword_boundary doc number {i} with varying relevance");
-            store
-                .upsert_document(make_document(*id, "t", &body))
-                .await
-                .unwrap();
-        }
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "keyword_boundary".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 0,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 5, "all 5 docs must match");
-        // The last-ranked hit (boundary) must also have no snippet.
-        let last = hits.last().unwrap();
-        assert!(
-            last.snippet.is_none(),
-            "bottom-ranked hit must have snippet=None when snippet_chars=0, got {:?}",
-            last.snippet
-        );
-    }
-
-    /// Score normalization: all scores stay in (0, 1], and a single-hit result
-    /// scores ≈ 1.0. This validates the normalization formula independent of
-    /// FTS5 rank ordering guarantees (which are already tested via `rank` field).
-    #[tokio::test]
-    async fn test_score_normalization_range() {
-        let store = setup_memory_store("score_range");
-
-        // Insert three documents; only two match the query.
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let id3 = Uuid::new_v4();
-        store
-            .upsert_document(make_document(
-                id1,
-                "normtest topic",
-                "normtest normtest normtest",
-            ))
-            .await
-            .unwrap();
-        store
-            .upsert_document(make_document(
-                id2,
-                "normtest light",
-                "other content without the keyword",
-            ))
-            .await
-            .unwrap();
-        store
-            .upsert_document(make_document(
-                id3,
-                "irrelevant title",
-                "completely different document content",
-            ))
-            .await
-            .unwrap();
-
-        let hits = store
-            .search(TextSearchRequest {
-                query: "normtest".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-
-        // id3 must not match; id1 and id2 should.
-        assert!(!hits.is_empty(), "at least one doc must match");
-        assert!(
-            hits.iter().all(|h| h.subject_id != id3),
-            "id3 must not appear"
-        );
-
-        // All scores must be in (0, 1].
-        for h in &hits {
-            let s = h.score.to_f64();
-            assert!(s > 0.0 && s <= 1.0, "score out of (0,1]: {s}");
-        }
-        // Rank field must be 1-indexed and contiguous.
-        for (i, h) in hits.iter().enumerate() {
-            assert_eq!(h.rank, (i + 1) as u32, "rank must equal position+1");
-        }
-        // Best hit (rank=1) must score ≈ 1.0 — normalization anchors the best
-        // rank to 1.0 regardless of absolute BM25 magnitude.
-        assert!(
-            hits[0].score.to_f64() > 0.99,
-            "top hit must score ≈ 1.0, got {}",
-            hits[0].score.to_f64()
-        );
-
-        // Single-hit result: the only match scores ≈ 1.0 (degenerate case:
-        // range == 0 → all hits get 1.0).
-        let single_id = Uuid::new_v4();
-        store
-            .upsert_document(make_document(
-                single_id,
-                "xqzplurp_unique_marker",
-                "xqzplurp_unique_marker body",
-            ))
-            .await
-            .unwrap();
-        let single = store
-            .search(TextSearchRequest {
-                query: "xqzplurp_unique_marker".to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(ns_filter("test_ns")),
-                top_k: 10,
-                snippet_chars: 64,
-            })
-            .await
-            .unwrap();
-        assert_eq!(single.len(), 1);
-        assert!(
-            single[0].score.to_f64() > 0.99,
-            "single-hit must score ≈ 1.0, got {}",
-            single[0].score.to_f64()
-        );
-    }
-}
+#[path = "text_tests.rs"]
+mod tests;

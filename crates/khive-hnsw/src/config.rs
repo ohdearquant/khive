@@ -1,22 +1,6 @@
 //! HNSW configuration types.
-//!
-//! See ADR-003 for recommended parameter values.
-//!
-//! # RETRIEVAL-05: Embedding Key Validation
-//!
-//! The current implementation uses `EmbeddingId` (from khive-db) as the key type,
-//! which provides type-safe, validated embedding identifiers. The validation occurs
-//! at ID construction time (in khive-db), not in HnswConfig.
-//!
-//! **Design decision**: Validation is NOT duplicated in HnswConfig because:
-//! 1. `EmbeddingId` is already a newtype that enforces validity
-//! 2. Double validation would add overhead without security benefit
-//! 3. The type system already prevents invalid keys at compile time
-//!
-//! If custom key types are needed in the future, add a `K: EmbeddingKey` trait
-//! bound with validation methods.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Result, RetrievalError};
 
@@ -26,7 +10,7 @@ use crate::error::{Result, RetrievalError};
 pub const MAX_LEVEL: usize = 64;
 
 /// Default threshold for triggering a rebuild (10% tombstones).
-/// Aligned with ADR-003: Index Management Strategy.
+/// At this ratio the index query recall degrades measurably; rebuild restores full quality.
 pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 
 // Re-export from canonical location (foundation/types).
@@ -34,64 +18,85 @@ pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 // Serde aliases on canonical handle backward compat: "euclidean" -> L2, "dot_product" -> Dot.
 pub use khive_types::vector::DistanceMetric;
 
-/// HNSW configuration parameters per ADR-003.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// HNSW index configuration parameters.
+/// Deserialization validates all invariants; invalid configs are rejected with a descriptive error.
+#[derive(Debug, Clone, Serialize)]
 pub struct HnswConfig {
-    /// Maximum number of connections per node per layer (M).
-    /// Higher = better recall, more memory, slower build.
-    /// Recommended: 16 (small), 32 (medium), 64 (large datasets).
+    /// Maximum connections per node per layer (M).
     pub m: usize,
 
     /// Maximum connections for layer 0 (typically 2*M).
-    /// Layer 0 is densest, needs more connections for good recall.
     pub m_max0: usize,
 
-    /// Size of dynamic candidate list during construction.
-    /// Higher = better graph quality, slower build.
-    /// Recommended: 100-500.
+    /// Dynamic candidate list size during construction.
     pub ef_construction: usize,
 
-    /// Normalization factor for level generation: 1/ln(M).
-    /// Controls how quickly layers thin out.
+    /// Level normalization factor: 1/ln(M).
     pub ml: f64,
 
-    /// Search ef (dynamic candidate list size during search).
-    /// Higher = better recall, slower search.
-    /// Recommended: 50-200.
+    /// Dynamic candidate list size during search.
     pub ef_search: usize,
 
     /// Vector dimensions (must match embedding model).
-    /// Default: 768 (BGE-base).
     pub dimensions: usize,
 
     /// Distance metric for similarity computation.
     pub metric: DistanceMetric,
 
-    /// Threshold for automatic rebuild (tombstone ratio).
-    /// When tombstones exceed this ratio, rebuild() is recommended.
+    /// Tombstone ratio threshold; above this, rebuild() is recommended.
     pub rebuild_threshold: f64,
 
-    /// Seed for reproducible level generation.
-    /// If None, uses OS entropy (non-deterministic).
-    /// If Some(seed), uses seeded RNG for reproducible index structure.
+    /// Seed for reproducible level generation; `None` uses OS entropy.
     #[serde(default)]
     pub seed: Option<u64>,
 
-    /// Maximum memory budget in bytes for the index.
-    /// If None, no memory limit is enforced (default).
-    /// If Some(limit), inserts that would exceed the budget are rejected
-    /// with `RetrievalError::BudgetExceeded`. Updates to existing entries
-    /// bypass the budget check.
+    /// Memory budget in bytes; inserts exceeding it return `BudgetExceeded`.
     #[serde(default)]
     pub memory_budget: Option<usize>,
 }
 
+/// Wire-format mirror for deserialization; validated in the `HnswConfig::Deserialize` impl.
+#[derive(Deserialize)]
+struct HnswConfigWire {
+    m: usize,
+    m_max0: usize,
+    ef_construction: usize,
+    ml: f64,
+    ef_search: usize,
+    dimensions: usize,
+    metric: DistanceMetric,
+    rebuild_threshold: f64,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    memory_budget: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for HnswConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HnswConfigWire::deserialize(deserializer)?;
+        let config = HnswConfig {
+            m: wire.m,
+            m_max0: wire.m_max0,
+            ef_construction: wire.ef_construction,
+            ml: wire.ml,
+            ef_search: wire.ef_search,
+            dimensions: wire.dimensions,
+            metric: wire.metric,
+            rebuild_threshold: wire.rebuild_threshold,
+            seed: wire.seed,
+            memory_budget: wire.memory_budget,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
 impl Default for HnswConfig {
-    /// Creates default configuration per ADR-003.
-    ///
     /// M=20, ef_construction=200, ef_search=80, dimensions=384.
-    /// M=20 is optimal for k=10 recall at 384d (empirically measured).
-    /// ef_search=80 sufficient for <100K corpus; 100 was overprovisioned.
     fn default() -> Self {
         Self {
             m: 20,
@@ -116,6 +121,37 @@ impl HnswConfig {
                 "dimensions: HNSW dimensions must be greater than zero".to_string(),
             ));
         }
+        if self.m == 0 {
+            return Err(RetrievalError::Configuration(
+                "m: must be greater than zero".to_string(),
+            ));
+        }
+        if self.m_max0 < self.m {
+            return Err(RetrievalError::Configuration(format!(
+                "m_max0 ({}) must be >= m ({})",
+                self.m_max0, self.m
+            )));
+        }
+        if self.ef_search == 0 {
+            return Err(RetrievalError::Configuration(
+                "ef_search: must be greater than zero".to_string(),
+            ));
+        }
+        if !self.ml.is_finite() || self.ml <= 0.0 {
+            return Err(RetrievalError::Configuration(format!(
+                "ml: must be a positive finite value, got {}",
+                self.ml
+            )));
+        }
+        if !self.rebuild_threshold.is_finite()
+            || self.rebuild_threshold < 0.0
+            || self.rebuild_threshold > 1.0
+        {
+            return Err(RetrievalError::Configuration(format!(
+                "rebuild_threshold: must be in [0.0, 1.0], got {}",
+                self.rebuild_threshold
+            )));
+        }
         Ok(())
     }
 
@@ -129,10 +165,7 @@ impl HnswConfig {
         Ok(config)
     }
 
-    /// Create config with custom dimensions, keeping ADR-003 defaults.
-    ///
-    /// # Panics
-    /// Panics if `dimensions` is 0.
+    /// Create config with custom dimensions. Panics if `dimensions` is 0.
     pub fn with_dimensions(dimensions: usize) -> Self {
         Self::try_with_dimensions(dimensions).expect("HNSW dimensions must be > 0")
     }
@@ -171,20 +204,13 @@ impl HnswConfig {
     }
 
     /// Set seed for reproducible level generation.
-    ///
-    /// With the same seed and insertion order, the index structure
-    /// will be identical across runs.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 
-    /// Set memory budget in bytes.
-    ///
-    /// When set, inserts that would cause the estimated memory usage
-    /// to exceed this limit are rejected with `BudgetExceeded`.
-    /// Updates to existing entries bypass the budget check.
+    /// Set memory budget in bytes; inserts exceeding it return `BudgetExceeded`.
     #[must_use]
     pub fn with_memory_budget(mut self, budget: usize) -> Self {
         self.memory_budget = Some(budget);
@@ -229,6 +255,86 @@ mod tests {
     fn test_try_with_dimensions_rejects_zero() {
         let result = HnswConfig::try_with_dimensions(0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_m_zero() {
+        let config = HnswConfig {
+            m: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_m_max0_less_than_m() {
+        let config = HnswConfig {
+            m: 20,
+            m_max0: 10,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_ef_search_zero() {
+        let config = HnswConfig {
+            ef_search: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_ml() {
+        let config = HnswConfig {
+            ml: f64::NAN,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        let config2 = HnswConfig {
+            ml: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(config2.validate().is_err());
+        let config3 = HnswConfig {
+            ml: -1.0,
+            ..Default::default()
+        };
+        assert!(config3.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_rebuild_threshold() {
+        let config = HnswConfig {
+            rebuild_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        let config2 = HnswConfig {
+            rebuild_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(config2.validate().is_err());
+        let config3 = HnswConfig {
+            rebuild_threshold: 1.1,
+            ..Default::default()
+        };
+        assert!(config3.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_boundary_rebuild_threshold() {
+        let config0 = HnswConfig {
+            rebuild_threshold: 0.0,
+            ..Default::default()
+        };
+        assert!(config0.validate().is_ok());
+        let config1 = HnswConfig {
+            rebuild_threshold: 1.0,
+            ..Default::default()
+        };
+        assert!(config1.validate().is_ok());
     }
 
     #[test]

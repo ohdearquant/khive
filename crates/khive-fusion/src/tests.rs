@@ -73,7 +73,6 @@ mod integration_tests {
 
     #[test]
     fn test_fuse_deterministic_with_many_ties() {
-        // Multiple documents all at same score
         let source: Vec<(&str, DeterministicScore)> = vec![
             ("delta", DeterministicScore::from_f64(0.5)),
             ("alpha", DeterministicScore::from_f64(0.5)),
@@ -82,10 +81,9 @@ mod integration_tests {
         ];
 
         for _ in 0..10 {
-            let fused = fuse(vec![source.clone()], &FusionStrategy::union(), 10);
+            let fused = fuse(vec![source.clone()], &FusionStrategy::union(), 10).unwrap();
 
             assert_eq!(fused.len(), 4);
-            // All have same score, should be in lexicographic order
             assert_eq!(fused[0].0, "alpha");
             assert_eq!(fused[1].0, "bravo");
             assert_eq!(fused[2].0, "charlie");
@@ -95,7 +93,6 @@ mod integration_tests {
 
     #[test]
     fn test_rrf_large_number_of_results() {
-        // Test with many results to ensure no overflow/precision issues
         let source: Vec<(String, DeterministicScore)> = (0..1000)
             .map(|i| {
                 (
@@ -105,7 +102,7 @@ mod integration_tests {
             })
             .collect();
 
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100).unwrap();
 
         assert_eq!(fused.len(), 100);
         assert_eq!(fused[0].0, "doc_0");
@@ -164,12 +161,8 @@ mod integration_tests {
     }
 }
 
-// =============================================================================
-// Property Tests (Issue #746)
-// TODO(port): proptest not yet added as a dev-dependency; the proptest macro
-// forms below have been converted to deterministic unit tests covering the same
-// properties. Re-introduce proptest once it is added to Cargo.toml [dev-dependencies].
-// =============================================================================
+// Property tests: deterministic coverage of RRF/union/weighted properties.
+// Proptest integration deferred (see issue #746).
 
 #[cfg(test)]
 mod property_tests {

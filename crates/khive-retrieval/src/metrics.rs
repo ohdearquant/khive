@@ -1,33 +1,7 @@
 //! Observability hooks for retrieval indices.
 //!
-//! Provides a lightweight, trait-based metrics abstraction that avoids coupling
-//! the retrieval crate to any specific observability stack (Prometheus, OpenTelemetry,
-//! etc.). Callers inject a [`MetricsSink`] implementation and the indices emit
-//! well-known [`MetricEvent`]s during their operations.
-//!
-//! # Design Rationale
-//!
-//! - **Trait-based sink** rather than a global registry keeps the library
-//!   dependency-free and testable. The [`NoopSink`] compiles to zero overhead
-//!   when no observability is needed.
-//! - **`Arc<dyn MetricsSink>`** allows sharing one sink across multiple indices
-//!   without lifetime gymnastics.
-//! - **Well-known metric names** are `&'static str` constants so dashboards
-//!   can be built once and never break on typos.
-//!
-//! # Quick Start
-//!
-//! ```rust,ignore
-//! use std::sync::Arc;
-//! use khive_retrieval::metrics::{MetricsSink, NoopSink, RecordingSink};
-//! use khive_retrieval::HnswIndex;
-//!
-//! // Production: no-op (zero overhead)
-//! let mut idx = HnswIndex::new(128);
-//!
-//! // Testing: capture events
-//! let sink = Arc::new(RecordingSink::new());
-//! let mut idx = HnswIndex::new(128).with_metrics(sink.clone());
+//! Pluggable MetricsSink trait; inject NoopSink for zero overhead or RecordingSink for tests.
+//! Decoupled from Prometheus/OpenTelemetry so the crate has no observability stack dependency.
 //! // ... perform operations ...
 //! let events = sink.events();
 //! assert!(!events.is_empty());
@@ -104,23 +78,7 @@ impl MetricsSink for NoopSink {
     }
 }
 
-/// Thread-safe recording sink for tests.
-///
-/// Collects every [`MetricEvent`] into an internal `Vec` guarded by a
-/// `Mutex`. Use [`events()`](Self::events) to snapshot the recorded events
-/// and [`clear()`](Self::clear) to reset.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::sync::Arc;
-/// use khive_retrieval::metrics::RecordingSink;
-///
-/// let sink = Arc::new(RecordingSink::new());
-/// // ... pass to index ...
-/// let events = sink.events();
-/// assert!(events.iter().any(|e| e.name == "hnsw.search.duration_ms"));
-/// ```
+/// Thread-safe recording sink for tests. Collects `MetricEvent`s into a `Mutex<Vec>`.
 #[derive(Debug, Default)]
 pub struct RecordingSink {
     events: Mutex<Vec<MetricEvent>>,

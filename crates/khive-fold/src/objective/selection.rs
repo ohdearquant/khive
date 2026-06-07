@@ -15,7 +15,7 @@ pub struct Selection<T> {
     /// Precision (inverse variance) of the score estimate. Default 1.0 (fully trusted).
     ///
     /// The effective ranking score is `score * precision`. When precision is 1.0 (the
-    /// default), ranking is identical to raw score ordering (ADR-059).
+    /// default), ranking is identical to raw score ordering.
     #[cfg_attr(feature = "serde", serde(default = "default_precision"))]
     pub precision: f64,
     /// Index in the original candidates

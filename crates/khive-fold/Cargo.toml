@@ -36,4 +36,11 @@ chrono = { workspace = true }
 # thiserror: proc-macro, zero runtime cost; acceptable per ADR-024.
 thiserror = { workspace = true }
 # blake3 for checkpoint hash computation/verification.
-blake3 = "1"
+blake3 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "fold_bench"
+harness = false

@@ -1,7 +1,4 @@
-//! Error types for alias operations.
-//!
-//! These errors cover the alias lifecycle: creation, swap, drain, and validation.
-//! They integrate with the parent `RetrievalError` via `From` conversion.
+//! Error types for alias operations (creation, swap, drain, validation).
 
 use std::fmt;
 use std::time::Duration;

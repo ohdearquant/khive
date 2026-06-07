@@ -1,11 +1,4 @@
-//! sqlite-vec backed `VectorStore` implementation.
-//!
-//! Each `SqliteVecStore` manages a single vec0 virtual table for one embedding
-//! model. The store is scoped to a namespace for tenant isolation.
-//!
-//! # Blob format
-//!
-//! sqlite-vec expects embeddings as contiguous little-endian f32 bytes.
+//! sqlite-vec backed `VectorStore`: one vec0 table per embedding model, scoped to namespace.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -681,7 +674,7 @@ impl SqliteVecStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vectors"))]
 mod batch_exists_tests {
     use std::collections::HashSet;
     use std::sync::Arc;

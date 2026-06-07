@@ -4,14 +4,7 @@ use super::HnswIndex;
 use crate::distance::{compute_ordering_distance, OrderedF32};
 
 impl HnswIndex {
-    /// Select neighbors using diversified heuristic (Algorithm 4 from HNSW paper).
-    ///
-    /// Takes candidates as (distance, internal_id) pairs.
-    /// Returns internal IDs of selected neighbors.
-    ///
-    /// Candidates are sorted by distance once upfront, then iterated in order.
-    /// This avoids the O(N^2) cost of repeated min-scan + Vec::remove on the
-    /// unsorted candidate list.
+    /// Select neighbors using the diversified heuristic; O(N log N) sort upfront avoids O(N²) repeated min-scan.
     pub(crate) fn select_neighbors(&self, candidates: &[(f32, usize)], m: usize) -> Vec<usize> {
         if candidates.len() <= m {
             return candidates.iter().map(|(_, id)| *id).collect();

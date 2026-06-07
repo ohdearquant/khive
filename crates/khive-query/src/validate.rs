@@ -1,22 +1,4 @@
-//! AST validation per ADR-008 §Validation Rules.
-//!
-//! `validate` normalises an AST in place and rejects queries that violate the
-//! closed edge ontology or attempt to subvert namespace scoping:
-//!
-//! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
-//!    variants (ADR-002). Aliases and case differences are normalised to the
-//!    canonical snake_case form stored in the database. Applies to edge
-//!    patterns *and* `WHERE e.relation = '…'` constraints.
-//! 2. **Node kinds** pass through unchanged — the query layer is pack-agnostic
-//!    (ADR-025). Kind validation is the responsibility of the service boundary,
-//!    not the query compiler.
-//! 3. **Namespace scoping is a trusted parameter only.** Queries must not name
-//!    `namespace` in node property maps or `WHERE` conditions — the only valid
-//!    source of namespace filtering is `CompileOptions::scopes`. This matches
-//!    ADR-008 §Validation: "never trust query strings to set namespaces."
-//! 4. **Traversal depth** is limited to [`MAX_DEPTH`] (10 hops). Requests that
-//!    exceed the cap are rejected with [`QueryError::InvalidInput`] at validation
-//!    time (ADR-008 §"Depth limits").
+//! AST validation: relation normalization, namespace guard, depth cap.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -26,24 +8,54 @@ use khive_types::EdgeRelation;
 use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
-/// Maximum traversal depth allowed by the query layer (ADR-008 §Validation).
+/// Valid synthetic relations; unknown `observed_as_*` strings are rejected.
+const SYNTHETIC_RELATIONS: &[&str] = &[
+    "observed_as_candidate",
+    "observed_as_selected",
+    "observed_as_target",
+    "observed_as_signal",
+];
+
+/// Maximum traversal depth allowed by the query layer.
 pub const MAX_DEPTH: usize = 10;
 
 /// Validate and normalise an AST in place.
-///
-/// Canonicalizes edge relation strings to their snake_case form (closed set).
-/// Node kind strings pass through unchanged (pack-agnostic).
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     validate_with_warnings(query).map(|_| ())
 }
 
+/// Validate that a pattern alternates Node/Edge/Node correctly.
+pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryError> {
+    if elements.is_empty() {
+        // Empty pattern: caught separately by the compiler as "empty pattern".
+        return Ok(());
+    }
+    if elements.len().is_multiple_of(2) {
+        return Err(QueryError::Validation(
+            "pattern must alternate Node, Edge, Node, … (even element count is invalid)".into(),
+        ));
+    }
+    for (i, element) in elements.iter().enumerate() {
+        match (i % 2, element) {
+            (0, PatternElement::Node(_)) => {}
+            (1, PatternElement::Edge(_)) => {}
+            _ => {
+                return Err(QueryError::Validation(
+                    "pattern must alternate Node, Edge, Node, … (wrong element type at position)"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate and normalise an AST in place, returning any warnings generated.
-///
-/// Returns an empty `Vec<String>` for forward compatibility; no warning paths
-/// are currently emitted.  The F048 depth-cap path now returns `InvalidInput`
-/// rather than clamping and warning.
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
+
+    // Structural shape check: must alternate Node/Edge/Node.
+    validate_pattern_shape(&query.pattern.elements)?;
 
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in
@@ -86,11 +98,21 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(edge) => {
                 for relation in edge.relations.iter_mut() {
-                    // Synthetic ADR-041 relations (observed_as_*) do not exist
-                    // in the closed EdgeRelation enum — skip taxonomy validation
-                    // for them and leave the string unchanged.  The SQL compiler
-                    // handles them via the event_observations join path.
+                    // Synthetic observed_as_* relations do not exist in the
+                    // closed EdgeRelation enum — skip taxonomy validation and
+                    // leave the string unchanged.  The SQL compiler handles them
+                    // via the event_observations join path.
+                    // Only the four known synthetic relations are valid; an unknown
+                    // observed_as_* string must be rejected (closes the bypass that
+                    // allowed arbitrary observed_as_bogus strings to compile as
+                    // canonical graph_edges queries).
                     if relation.starts_with("observed_as_") {
+                        if !SYNTHETIC_RELATIONS.contains(&relation.as_str()) {
+                            return Err(QueryError::Validation(format!(
+                                "unknown synthetic relation '{relation}'; valid synthetic relations: {}",
+                                SYNTHETIC_RELATIONS.join(", ")
+                            )));
+                        }
                         continue;
                     }
                     let parsed = EdgeRelation::from_str(relation)
@@ -121,7 +143,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                         edge.min_hops, MAX_DEPTH
                     )));
                 }
-                // Reject max_hops above the depth cap (ADR-008 §"Depth limits").
+                // Reject max_hops above the depth cap.
                 if edge.max_hops > MAX_DEPTH {
                     return Err(QueryError::InvalidInput(format!(
                         "max_hops {} exceeds the depth cap of {}; reduce the range or use a smaller bound",
@@ -199,275 +221,5 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parsers::gql;
-
-    #[test]
-    fn node_kind_passes_through_unchanged() {
-        // Entity kinds are pack-agnostic strings — no normalization at the query layer.
-        let mut q = gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        let kinds: Vec<_> = q
-            .pattern
-            .nodes()
-            .map(|n| n.kind.as_deref().unwrap_or(""))
-            .collect();
-        assert_eq!(kinds, vec!["paper", "concept"]);
-    }
-
-    #[test]
-    fn normalises_relation_case_and_hyphens() {
-        let mut q = gql::parse("MATCH (a)-[:Introduced_By]->(b) RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        let rels: Vec<_> = q
-            .pattern
-            .edges()
-            .flat_map(|e| e.relations.iter().cloned())
-            .collect();
-        assert_eq!(rels, vec!["introduced_by".to_string()]);
-    }
-
-    #[test]
-    fn rejects_unknown_relation() {
-        let mut q = gql::parse("MATCH (a)-[:not_a_relation]->(b) RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("not_a_relation"), "msg: {msg}");
-    }
-
-    #[test]
-    fn unknown_kind_passes_through() {
-        // Entity kinds are pack-agnostic strings — any string is accepted at the query layer.
-        let mut q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
-        validate(&mut q).unwrap();
-    }
-
-    #[test]
-    fn rejects_depth_above_max() {
-        // ADR-008 §"Depth limits": exceeding MAX_DEPTH is an InvalidInput error,
-        // not a silent clamp.
-        let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::InvalidInput(_)),
-            "expected InvalidInput, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("50"),
-            "error should mention requested depth: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_depth_above_max_warnings_path() {
-        // validate_with_warnings must also reject (not clamp + warn).
-        let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
-        let err = validate_with_warnings(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::InvalidInput(_)),
-            "expected InvalidInput, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn multi_relation_all_normalised() {
-        let mut q = gql::parse("MATCH (a)-[:Extends|VARIANT_OF]->(b) RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        let edge = q.pattern.edges().next().unwrap();
-        assert_eq!(
-            edge.relations,
-            vec!["extends".to_string(), "variant_of".to_string()]
-        );
-    }
-
-    #[test]
-    fn rejects_namespace_in_where() {
-        let mut q =
-            gql::parse("MATCH (a:concept)-[:extends]->(b) WHERE a.namespace = 'other' RETURN a")
-                .unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(err.to_string().contains("namespace"), "msg: {err}");
-    }
-
-    #[test]
-    fn rejects_namespace_in_node_properties() {
-        let mut q =
-            gql::parse("MATCH (a:concept {namespace: 'other'})-[:extends]->(b) RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(err.to_string().contains("namespace"), "msg: {err}");
-    }
-
-    #[test]
-    fn rejects_unknown_relation_in_where() {
-        let mut q =
-            gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'related_to' RETURN a")
-                .unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(err.to_string().contains("related_to"), "msg: {err}");
-    }
-
-    fn first_condition_string_value(q: &GqlQuery) -> String {
-        match q.where_clause.conditions().next().unwrap().value {
-            ConditionValue::String(ref s) => s.clone(),
-            _ => panic!("expected string condition value"),
-        }
-    }
-
-    #[test]
-    fn unknown_kind_in_where_passes_through() {
-        // Entity kinds are pack-agnostic strings — any kind string is accepted.
-        let mut q =
-            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'gizmo' RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        assert_eq!(first_condition_string_value(&q), "gizmo");
-    }
-
-    #[test]
-    fn kind_in_where_passes_through_unchanged() {
-        // Pack-agnostic: 'paper' is not normalized to 'document'; strings pass through as-is.
-        let mut q =
-            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        assert_eq!(first_condition_string_value(&q), "paper");
-    }
-
-    #[test]
-    fn normalises_relation_alias_in_where() {
-        let mut q =
-            gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'Introduced_By' RETURN a")
-                .unwrap();
-        validate(&mut q).unwrap();
-        assert_eq!(first_condition_string_value(&q), "introduced_by");
-    }
-
-    #[test]
-    fn rejects_zero_hop_range_gql_wide() {
-        let mut q = gql::parse("MATCH (a)-[:extends*0..3]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_zero_hop_range_gql_narrow() {
-        // *0..1 has max_hops=1 so has_variable_length() is false, but the
-        // fixed-length compiler also can't produce zero-hop rows — reject at
-        // validation regardless of compile path.
-        let mut q = gql::parse("MATCH (a)-[:extends*0..1]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_zero_hop_sparql_explicit_range() {
-        use crate::parsers::sparql;
-        let mut q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends{0,3} ?b . }").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_repeated_node_var_cycle_gql() {
-        let mut q = gql::parse("MATCH (a)-[:extends]->(b)-[:variant_of]->(a) RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_repeated_node_var_self_reach_variable_length() {
-        let mut q = gql::parse("MATCH (a)-[:extends*1..3]->(a) RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_repeated_node_var_cycle_sparql() {
-        use crate::parsers::sparql;
-        let mut q =
-            sparql::parse("SELECT ?a WHERE { ?a :extends ?b . ?b :variant_of ?a . }").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_repeated_edge_var() {
-        let mut q = gql::parse("MATCH (a)-[e:extends]->(b)-[e:variant_of]->(c) RETURN c").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_inverted_range() {
-        // *3..1 is an inverted range — must error, not silently rewrite to *1..1.
-        let mut q = gql::parse("MATCH (a)-[:extends*3..1]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Validation(_)),
-            "expected Validation error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_min_hops_above_depth_cap() {
-        // min=50, max=100 — the lower bound exceeds MAX_DEPTH so the query
-        // can never produce results within our cap.
-        let mut q = gql::parse("MATCH (a)-[:extends*50..100]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_max_above_depth_cap_with_satisfiable_min() {
-        // *2..50 — min 2 is satisfiable but max 50 exceeds MAX_DEPTH; must error.
-        let mut q = gql::parse("MATCH (a)-[:extends*2..50]->(b) RETURN b").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(
-            matches!(err, QueryError::InvalidInput(_)),
-            "expected InvalidInput, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn node_property_named_relation_allowed() {
-        // `relation` on a node variable is a free-form JSON property, not the
-        // edge relation column — taxonomy enforcement should not apply.
-        let mut q =
-            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.relation = 'external' RETURN a").unwrap();
-        validate(&mut q).unwrap();
-        assert_eq!(first_condition_string_value(&q), "external");
-    }
-
-    #[test]
-    fn edge_relation_still_validated() {
-        // `relation` on an edge variable must still go through EdgeRelation
-        // taxonomy validation.
-        let mut q = gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'not_real' RETURN a")
-            .unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(err.to_string().contains("not_real"), "msg: {err}");
-    }
-}
+#[path = "validate_tests.rs"]
+mod tests;

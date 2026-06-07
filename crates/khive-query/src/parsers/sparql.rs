@@ -1,21 +1,4 @@
-//! SPARQL-inspired syntax parser.
-//!
-//! Parses a practical subset of SPARQL into the same AST as the GQL parser,
-//! so the SQL compiler works unchanged.
-//!
-//! Supported:
-//!   SELECT ?a ?b WHERE { ?a a :concept . ?a :extends+ ?b . } LIMIT 10
-//!   SELECT ?a WHERE { ?a :name "LoRA" . ?a :extends{1,3} ?b . } LIMIT 5
-//!
-//! Grammar:
-//!   query     = SELECT vars WHERE '{' triples '}' [LIMIT number]
-//!   vars      = var+
-//!   var       = '?' ident
-//!   triples   = triple ('.' triple)* '.'?
-//!   triple    = var predicate object
-//!   predicate = 'a' | ':' ident [path_mod]
-//!   path_mod  = '+' | '*' | '?' | '{' min ',' max '}'
-//!   object    = var | ':' ident | string_literal | number
+//! SPARQL-inspired syntax parser producing the same AST as the GQL parser.
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -338,14 +321,7 @@ impl SparqlParser {
     }
 }
 
-/// Reconstruct GQL-style AST from SPARQL triples.
-///
-/// Classifies triples into:
-/// - Kind filters: `?a a :concept` → node kind
-/// - Property filters: `?a :name "LoRA"` → node property
-/// - Edge patterns: `?a :extends ?b` → directed edge between nodes
-///
-/// Then chains edge triples into a path pattern.
+/// Reconstruct GQL-style AST from SPARQL triples, chaining edges into a path pattern.
 fn triples_to_ast(
     triples: Vec<Triple>,
     return_items: Vec<String>,
@@ -556,6 +532,7 @@ fn triples_to_ast(
     })
 }
 
+/// Parse a SPARQL query string into a [`GqlQuery`] AST. Errors on invalid or unsupported syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = SparqlParser::new(input.trim());
     parser.parse_query()

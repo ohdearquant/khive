@@ -5,18 +5,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// Union fusion: take max score for each ID.
-///
-/// Useful when you want the best score any retriever assigned to each document.
-///
-/// # Arguments
-///
-/// * `sources` - Vector of result lists.
-///
-/// # Returns
-///
-/// A vector sorted by max score descending, with ties broken by ID
-/// for deterministic cross-platform ordering.
+/// Union fusion: take max score per ID, sorted descending with ID tie-breaking.
 pub fn union_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
 ) -> Vec<(Id, DeterministicScore)> {

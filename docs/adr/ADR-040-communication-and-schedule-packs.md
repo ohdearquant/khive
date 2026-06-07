@@ -165,7 +165,8 @@ impl PackRuntime for CommPack {
         SchemaPlan {
             pack: "comm",
             statements: &[
-                // No auxiliary tables in v1 — message indexing via FTS5 on the notes table.
+                // idx_comm_message_direction — covers inbox direction + read-status queries.
+                // idx_comm_message_thread    — covers thread scans by thread_id.
             ],
         }
     }
@@ -175,9 +176,23 @@ impl PackRuntime for CommPack {
 `default_backend="main"` keeps messages on the same backend as kg and gtd data. `Hot` tier
 because inbox reads are interactive and latency-sensitive.
 
-No auxiliary schema in v1. Message retrieval via `inbox` uses a filtered scan on notes where
-`kind="message"` and `properties.direction="inbound"`. Full-text search over message bodies
-uses the existing notes FTS5 pipeline.
+#### Comm auxiliary indexes (v1 amendment)
+
+The comm pack registers two partial indexes on the shared notes table to keep `inbox` and
+`thread` queries off a full-table scan on high-volume deployments:
+
+| Index | Covers | Partial condition |
+|---|---|---|
+| `idx_comm_message_direction` | `inbox` direction + read-status scans | `WHERE deleted_at IS NULL` |
+| `idx_comm_message_thread` | `thread` scans by `thread_id` | `WHERE deleted_at IS NULL` |
+
+Both indexes use `WHERE deleted_at IS NULL` (not `WHERE kind = 'message'`) so that SQLite's
+query planner can match them when the `kind = ?N` predicate is parameterised. A literal-value
+partial index on `kind` cannot be used for a parameterised comparison; the planner sees
+different predicates and falls back to a table scan. `deleted_at IS NULL` is present in all
+filtered queries, so the partial condition is always satisfied and the index is eligible.
+
+Statements are idempotent (`CREATE INDEX IF NOT EXISTS`) and no auxiliary tables are created.
 
 ---
 

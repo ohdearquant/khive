@@ -5,14 +5,7 @@ use std::sync::Arc;
 
 use crate::{FoldContext, FoldOutcome};
 
-/// Core fold trait for deriving state from entries.
-///
-/// A fold is the "measurement operator" that collapses a sequence of
-/// entries into a derived state. The fold is parameterized by:
-/// - L: The entry type (LogEntry, AtomEntry, MemoryEntry, etc.)
-/// - S: The derived state type
-///
-/// Folds are deterministic: same entries + same context = same state.
+/// Core fold trait: collapses a sequence of entries into deterministic derived state.
 pub trait Fold<L, S>: Send + Sync {
     /// Get the initial state before any entries are processed.
     fn init(&self, context: &FoldContext) -> S;
@@ -20,17 +13,13 @@ pub trait Fold<L, S>: Send + Sync {
     /// Process a single entry and return the new state.
     fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S;
 
-    /// Finalize the state after all entries are processed.
-    ///
-    /// Default implementation returns state unchanged.
+    /// Finalize the state after all entries are processed; default returns state unchanged.
     #[inline]
     fn finalize(&self, state: S, _context: &FoldContext) -> S {
         state
     }
 
     /// Derive state from an iterator of entries.
-    ///
-    /// This is the main entry point for using a fold.
     fn derive<'a, I>(&self, entries: I, context: &FoldContext) -> FoldOutcome<S>
     where
         Self: Sized,
@@ -430,10 +419,7 @@ impl CommonFoldState {
     }
 }
 
-/// Enum-dispatch fold for common patterns that would otherwise use `Box<dyn Fold>`.
-///
-/// This is intentionally limited to a few hot, allocation-free cases so callers
-/// can avoid vtable dispatch in heterogeneous fold collections.
+/// Enum-dispatch fold for common allocation-free patterns without vtable overhead.
 #[derive(Clone)]
 pub enum CommonFold<L> {
     /// Count every entry.
@@ -529,10 +515,7 @@ impl<L> Fold<L, CommonFoldState> for CommonFold<L> {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if `state` does not match the variant expected by `self`.
-    /// Use [`TryFold::try_step`] to handle the mismatch as an error instead.
+    /// Panics if `state` variant does not match `self`; use `try_step` for fallible version.
     #[inline]
     fn reduce(&self, state: CommonFoldState, entry: &L, context: &FoldContext) -> CommonFoldState {
         self.try_step(state, entry, context)
@@ -584,6 +567,8 @@ mod tests {
 
     #[test]
     fn test_boxed_fold_derive() {
+        // REASON: box_default fires because CountFold implements Default, but the test
+        // explicitly exercises the BoxedFold type alias which requires Box::new().
         #[allow(clippy::box_default)]
         let counter: BoxedFold<i32, usize> = Box::new(CountFold::new());
         let entries = [1, 2, 3, 4];

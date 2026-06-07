@@ -1,15 +1,9 @@
-//! Batch build for HNSW index.
-//!
-//! Builds an HNSW index from a batch of vectors using a two-phase approach:
-//!
-//! 1. **Seed phase** (sequential): Insert sqrt(N) nodes normally to establish
-//!    the upper-layer graph structure and entry point.
-//!
-//! 2. **Search phase**: For remaining nodes, find neighbors against the frozen
-//!    seed graph, then merge results sequentially.
+//! Batch build for HNSW: sequential seed phase (sqrt(N) nodes) then parallel neighbor search.
+
+use std::collections::HashSet;
 
 use super::HnswIndex;
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::node::HnswNode;
 use crate::NodeId;
 use rayon::prelude::*;
@@ -26,43 +20,16 @@ struct PrecomputedInsert {
 }
 
 impl HnswIndex {
-    /// Build an index from a batch of vectors.
-    ///
-    /// This is faster than individual insertions for large batches because
-    /// validation, level assignment, and merging are handled in one pass.
-    ///
-    /// # Algorithm
-    ///
-    /// 1. **Seed phase**: The first `sqrt(N)` nodes are inserted sequentially.
-    ///    This builds the upper-layer structure that guides all subsequent searches.
-    ///
-    /// 2. **Level assignment**: Levels for remaining nodes are pre-generated
-    ///    sequentially to preserve deterministic RNG consumption order.
-    ///
-    /// 3. **Search**: Each remaining node searches the current frozen graph for
-    ///    its neighbors.
-    ///
-    /// 4. **Sequential merge**: Nodes are inserted with their pre-computed
-    ///    neighbors, adding bidirectional connections and updating the graph.
-    ///
-    /// # Quality Notes
-    ///
-    /// Because the parallel phase searches a "frozen" graph (the seed nodes),
-    /// the neighbor quality for non-seed nodes depends only on the seed graph,
-    /// not on other parallel insertions. This means recall may differ slightly
-    /// from fully sequential construction. In practice, with sqrt(N) seeds the
-    /// difference is negligible for typical workloads.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any vector has incorrect dimensions or if the memory
-    /// budget would be exceeded.
+    /// Build from a batch (seed sequential, then parallel search + sequential merge). Errors on bad dims.
     pub fn build_batch(&mut self, items: Vec<(NodeId, Vec<f32>)>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
 
-        // Validate dimensions upfront to avoid partial builds
+        // Pre-scan for duplicates within the input batch before any mutation.
+        // Duplicate IDs in items would corrupt id_to_internal (last writer wins,
+        // but multiple internal nodes would exist for the same external ID).
+        let mut seen_in_batch: HashSet<NodeId> = HashSet::with_capacity(items.len());
         for (id, vector) in &items {
             if vector.len() != self.config.dimensions {
                 return Err(RetrievalError::DimensionMismatch {
@@ -70,20 +37,28 @@ impl HnswIndex {
                     actual: vector.len(),
                 });
             }
+            validate_finite_vector(vector)?;
             // Check for duplicates against existing index
             if self.id_to_internal.contains_key(id) {
                 return Err(RetrievalError::hnsw(format!(
                     "build_batch does not support updates: ID {id:?} already exists"
                 )));
             }
+            // Check for duplicates within the batch itself
+            if !seen_in_batch.insert(*id) {
+                return Err(RetrievalError::hnsw(format!(
+                    "build_batch: duplicate ID {id:?} within the input batch"
+                )));
+            }
         }
 
-        // Budget check for entire batch
+        // Budget check for entire batch -- use checked arithmetic to avoid overflow.
         if let Some(limit) = self.config.memory_budget {
             let current = self.memory_usage();
             let cost_per_node = self.estimate_insert_cost();
-            let total_cost = cost_per_node * items.len();
-            if current + total_cost > limit {
+            // cost_per_node * items.len() can overflow for very large batches.
+            let total_cost = cost_per_node.saturating_mul(items.len());
+            if current.saturating_add(total_cost) > limit {
                 return Err(RetrievalError::budget_exceeded(current, total_cost, limit));
             }
         }
@@ -180,10 +155,7 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Insert a node using pre-computed neighbor candidates.
-    ///
-    /// This performs the same operations as `insert_inner`, but skips the
-    /// neighbor search phase since candidates were already found in parallel.
+    /// Insert a node using pre-computed neighbor candidates; skips the search phase.
     fn insert_with_precomputed(&mut self, pc: PrecomputedInsert) -> Result<()> {
         let internal_id = self.nodes.len();
 

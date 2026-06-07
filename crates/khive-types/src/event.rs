@@ -1,8 +1,4 @@
-//! Event substrate — universal system log.
-//!
-//! Every verb execution produces an Event. Audit, usage metering, derived
-//! state, and evolutionary learning (edge reinforcement, traversal history)
-//! are all computed via Fold over the Event stream.
+//! Event substrate — append-only log produced by every verb execution.
 
 extern crate alloc;
 use alloc::string::String;
@@ -35,17 +31,22 @@ pub struct Event {
     pub aggregate: Option<AggregateRef>,
 }
 
+/// Outcome of a verb execution recorded in an event log entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EventOutcome {
+    /// The verb executed successfully.
     #[default]
     Success,
+    /// The verb was denied by a policy check.
     Denied,
+    /// The verb encountered a runtime error.
     Error,
 }
 
 impl EventOutcome {
+    /// Return the canonical lowercase string for this outcome.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -61,39 +62,67 @@ impl fmt::Display for EventOutcome {
     }
 }
 
+/// Discriminant for the 26 typed event variants produced by the verb dispatch path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EventKind {
+    /// Generic audit event with no structured payload.
     Audit,
+    /// A `recall` verb was executed and results were returned.
     RecallExecuted,
+    /// A rerank pass was applied to search candidates.
     RerankExecuted,
+    /// A `search` verb was executed.
     SearchExecuted,
+    /// A new directed edge was created between two nodes.
     LinkCreated,
+    /// A new entity was created.
     EntityCreated,
+    /// An existing entity was patched.
     EntityUpdated,
+    /// An entity was soft- or hard-deleted.
     EntityDeleted,
+    /// Two entities were merged (deduplication).
     EntityMerged,
+    /// A new note was created.
     NoteCreated,
+    /// An existing note was patched.
     NoteUpdated,
+    /// A note was soft- or hard-deleted.
     NoteDeleted,
+    /// An edge's relation or weight was updated.
     EdgeUpdated,
+    /// An edge was removed.
     EdgeDeleted,
+    /// A GTD task moved between lifecycle states.
     TaskTransitioned,
+    /// An explicit user feedback signal was recorded.
     FeedbackExplicit,
+    /// The brain recommended a profile resolution update.
     ProfileResolutionRecommended,
+    /// Two brain profiles were merged.
     ProfileMerged,
+    /// The active embedding model was changed.
     EmbeddingModelChanged,
+    /// An embedding migration batch completed successfully.
     EmbeddingMigrationCompleted,
+    /// An embedding migration batch failed.
     EmbeddingMigrationFailed,
+    /// Drift was detected between stored and live embeddings.
     EmbeddingDriftDetected,
+    /// A proposal was submitted for review.
     ProposalCreated,
+    /// A reviewer accepted, rejected, or commented on a proposal.
     ProposalReviewed,
+    /// A proposal was applied to the graph.
     ProposalApplied,
+    /// A proposal was withdrawn before it was applied.
     ProposalWithdrawn,
 }
 
 impl EventKind {
+    /// All 26 event kind variants in declaration order.
     pub const ALL: [Self; 26] = [
         Self::Audit,
         Self::RecallExecuted,
@@ -123,6 +152,7 @@ impl EventKind {
         Self::ProposalWithdrawn,
     ];
 
+    /// Return the canonical snake_case string for this event kind.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Audit => "audit",
@@ -230,13 +260,24 @@ impl core::str::FromStr for EventKind {
     }
 }
 
+/// A reference to the logical aggregate that an event belongs to.
+///
+/// Used to thread related events (e.g. proposal lifecycle events) into a
+/// single auditable chain identified by `kind` and `id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AggregateRef {
+    /// The aggregate type string (e.g. `"proposal"`).
     pub kind: String,
+    /// The aggregate instance identifier.
     pub id: Id128,
 }
 
+/// Typed payload for an [`Event`], dispatched by [`EventKind`].
+///
+/// The `Json` variant is a catch-all for events whose payload has not yet
+/// been promoted to a structured type. All other variants carry a concrete
+/// typed struct that can be pattern-matched without round-tripping through JSON.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -244,12 +285,18 @@ pub struct AggregateRef {
     serde(tag = "kind", content = "payload", rename_all = "snake_case")
 )]
 pub enum EventPayload {
+    /// Raw JSON payload for untyped events.
     Json(String),
+    /// Structured payload for a rerank pass event.
     RerankExecuted(RerankExecutedPayload),
+    /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
+    /// Structured payload for a proposal-reviewed event.
     ProposalReviewed(ProposalReviewedPayload),
+    /// Structured payload for a proposal-applied event.
     ProposalApplied(ProposalAppliedPayload),
+    /// Structured payload for a proposal-withdrawn event.
     ProposalWithdrawn(ProposalWithdrawnPayload),
 }
 
@@ -259,17 +306,91 @@ impl Default for EventPayload {
     }
 }
 
+/// Payload for a rerank pass event, recording per-candidate scores.
+///
+/// All score values (`reranked` section scores, `final_scores`) must be finite.
+/// When the `serde` feature is enabled, deserialization rejects non-finite scores.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RerankExecutedPayload {
+    /// Brain profile that served this rerank, if any.
     pub served_by_profile_id: Option<String>,
+    /// Model used for reranking.
     pub model_id: Id128,
+    /// Candidate IDs in input order.
     pub candidates: Vec<Id128>,
+    /// Per-candidate named sub-scores from the reranker.
     pub reranked: Vec<(Id128, Vec<(String, f32)>)>,
+    /// Final aggregated score per candidate.
     pub final_scores: Vec<(Id128, f32)>,
+    /// Wall-clock latency of the rerank operation in microseconds.
     pub latency_us: u64,
+    /// Whether a brain hook was applied during this rerank.
     pub hook_applied: bool,
+    /// Whether the hook matched the intended target.
     pub hook_target_match: bool,
+}
+
+impl RerankExecutedPayload {
+    /// Return `true` if all score values are finite.
+    pub fn is_valid(&self) -> bool {
+        let reranked_ok = self
+            .reranked
+            .iter()
+            .all(|(_, scores)| scores.iter().all(|(_, s)| s.is_finite()));
+        let final_ok = self.final_scores.iter().all(|(_, s)| s.is_finite());
+        reranked_ok && final_ok
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            served_by_profile_id: Option<String>,
+            model_id: Id128,
+            candidates: Vec<Id128>,
+            reranked: Vec<(Id128, Vec<(String, f32)>)>,
+            final_scores: Vec<(Id128, f32)>,
+            latency_us: u64,
+            hook_applied: bool,
+            hook_target_match: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        for (_, score) in &raw.final_scores {
+            if !score.is_finite() {
+                return Err(serde::de::Error::custom(alloc::format!(
+                    "RerankExecutedPayload final_scores must be finite, got {score}"
+                )));
+            }
+        }
+        for (_, sections) in &raw.reranked {
+            for (section_name, score) in sections {
+                if !score.is_finite() {
+                    return Err(serde::de::Error::custom(alloc::format!(
+                        "RerankExecutedPayload reranked section '{section_name}' score must be finite, got {score}"
+                    )));
+                }
+            }
+        }
+
+        Ok(RerankExecutedPayload {
+            served_by_profile_id: raw.served_by_profile_id,
+            model_id: raw.model_id,
+            candidates: raw.candidates,
+            reranked: raw.reranked,
+            final_scores: raw.final_scores,
+            latency_us: raw.latency_us,
+            hook_applied: raw.hook_applied,
+            hook_target_match: raw.hook_target_match,
+        })
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -285,14 +406,14 @@ pub struct ProposalCreatedPayload {
     pub parent_id: Option<Id128>,
 }
 
-/// Structured draft for adding a new entity via a proposal (ADR-046:100).
+/// Structured draft for adding a new entity via a proposal.
 ///
 /// Fields mirror the `create(kind=<entity kind>)` verb surface; `kind` is
-/// validated against the closed 8-kind taxonomy (ADR-001) at apply time.
+/// validated against the closed 8-kind entity taxonomy at apply time.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityDraft {
-    /// Entity kind — must be one of the 8 closed ADR-001 values.
+    /// Entity kind — must be one of the 8 closed entity kind values.
     pub kind: String,
     /// Human-readable name (required).
     pub name: String,
@@ -307,7 +428,7 @@ pub struct EntityDraft {
     pub tags: Vec<String>,
 }
 
-/// Structured patch for modifying an existing entity via a proposal (ADR-046:101).
+/// Structured patch for modifying an existing entity via a proposal.
 ///
 /// Absent fields mean "leave unchanged". Setting `description` to `null` clears it.
 #[cfg(feature = "serde")]
@@ -328,7 +449,7 @@ pub struct ProposalEntityPatch {
     pub tags: Option<Vec<String>>,
 }
 
-/// Structured draft for adding a new note via a proposal (ADR-046:106).
+/// Structured draft for adding a new note via a proposal.
 ///
 /// Fields mirror the `create(kind=<note kind>)` verb surface.
 #[cfg(feature = "serde")]
@@ -373,10 +494,10 @@ mod serde_opt_opt {
 }
 
 #[cfg(feature = "serde")]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalChangeset {
-    /// Add a new entity. `entity.kind` validated against ADR-001 at apply time.
+    /// Add a new entity. `entity.kind` validated at apply time.
     AddEntity {
         entity: EntityDraft,
     },
@@ -385,6 +506,7 @@ pub enum ProposalChangeset {
         id: Id128,
         patch: ProposalEntityPatch,
     },
+    /// Add a typed edge. `weight` must be finite and in `[0.0, 1.0]` if present.
     AddEdge {
         source: Id128,
         target: Id128,
@@ -406,6 +528,103 @@ pub enum ProposalChangeset {
     Compound {
         steps: Vec<ProposalChangeset>,
     },
+}
+
+#[cfg(feature = "serde")]
+impl ProposalChangeset {
+    fn validate(&self) -> Result<(), alloc::string::String> {
+        match self {
+            Self::AddEdge { weight, .. } => {
+                if let Some(w) = weight {
+                    if !w.is_finite() {
+                        return Err(alloc::format!(
+                            "ProposalChangeset AddEdge weight must be finite, got {w}"
+                        ));
+                    }
+                    if !(*w >= 0.0 && *w <= 1.0) {
+                        return Err(alloc::format!(
+                            "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Compound { steps } => {
+                for step in steps {
+                    step.validate()?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ProposalChangeset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum ProposalChangesetRaw {
+            AddEntity {
+                entity: EntityDraft,
+            },
+            UpdateEntity {
+                id: Id128,
+                patch: ProposalEntityPatch,
+            },
+            AddEdge {
+                source: Id128,
+                target: Id128,
+                relation: crate::EdgeRelation,
+                weight: Option<f32>,
+            },
+            AddNote {
+                note: NoteDraft,
+            },
+            MergeEntities {
+                into: Id128,
+                from: Id128,
+            },
+            SupersedeEntity {
+                old: Id128,
+                new: Id128,
+            },
+            Compound {
+                steps: Vec<ProposalChangeset>,
+            },
+        }
+
+        let raw = ProposalChangesetRaw::deserialize(deserializer)?;
+        let cs = match raw {
+            ProposalChangesetRaw::AddEntity { entity } => Self::AddEntity { entity },
+            ProposalChangesetRaw::UpdateEntity { id, patch } => Self::UpdateEntity { id, patch },
+            ProposalChangesetRaw::AddEdge {
+                source,
+                target,
+                relation,
+                weight,
+            } => Self::AddEdge {
+                source,
+                target,
+                relation,
+                weight,
+            },
+            ProposalChangesetRaw::AddNote { note } => Self::AddNote { note },
+            ProposalChangesetRaw::MergeEntities { into, from } => {
+                Self::MergeEntities { into, from }
+            }
+            ProposalChangesetRaw::SupersedeEntity { old, new } => {
+                Self::SupersedeEntity { old, new }
+            }
+            ProposalChangesetRaw::Compound { steps } => Self::Compound { steps },
+        };
+        cs.validate().map_err(serde::de::Error::custom)?;
+        Ok(cs)
+    }
 }
 
 #[cfg(not(feature = "serde"))]
@@ -439,13 +658,18 @@ pub struct ProposalReviewedPayload {
     pub comment: Option<String>,
 }
 
+/// A reviewer's decision on a proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum ProposalDecision {
+    /// The reviewer approved the proposal for application.
     Approve,
+    /// The reviewer rejected the proposal; it will not be applied.
     Reject,
+    /// The reviewer left a comment without blocking the proposal.
     Comment,
+    /// The reviewer requested changes before the proposal can proceed.
     RequestChanges,
 }
 
@@ -507,6 +731,7 @@ pub struct EventBuilder {
 }
 
 impl EventBuilder {
+    /// Create a new builder for an event produced by `verb` acting on `substrate` as `actor`.
     pub fn new(
         verb: impl Into<String>,
         substrate: SubstrateKind,
@@ -524,31 +749,37 @@ impl EventBuilder {
         }
     }
 
+    /// Override the event kind discriminant.
     pub fn kind(mut self, kind: EventKind) -> Self {
         self.kind = kind;
         self
     }
 
+    /// Set the typed payload for this event.
     pub fn payload(mut self, payload: EventPayload) -> Self {
         self.payload = payload;
         self
     }
 
+    /// Set the payload schema version (defaults to 1).
     pub fn payload_schema_version(mut self, version: u32) -> Self {
         self.payload_schema_version = version;
         self
     }
 
+    /// Record the brain profile state version observed at emit time.
     pub fn profile_state_version(mut self, version: u64) -> Self {
         self.profile_state_version = Some(version);
         self
     }
 
+    /// Thread this event into an aggregate chain.
     pub fn aggregate(mut self, aggregate: AggregateRef) -> Self {
         self.aggregate = Some(aggregate);
         self
     }
 
+    /// Consume the builder and produce an [`Event`] with the given `header`.
     pub fn build(self, header: Header) -> Event {
         Event {
             header,
@@ -570,6 +801,8 @@ mod tests {
 
     use super::*;
     use crate::{Namespace, Timestamp};
+    #[cfg(feature = "serde")]
+    use alloc::string::ToString;
 
     fn header() -> Header {
         Header::new(
@@ -679,5 +912,88 @@ mod tests {
             matches!(cs, ProposalChangeset::SupersedeEntity { .. }),
             "expected SupersedeEntity"
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn proposal_changeset_rejects_invalid_edge_weight() {
+        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
+        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
+
+        let v = serde_json::json!({
+            "kind": "add_edge",
+            "source": uuid, "target": uuid2,
+            "relation": "extends", "weight": 2.0
+        });
+        let result: Result<ProposalChangeset, _> = serde_json::from_value(v);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("[0.0, 1.0]"),
+            "error should mention range: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn proposal_changeset_accepts_null_edge_weight() {
+        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
+        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
+
+        let v = serde_json::json!({
+            "kind": "add_edge",
+            "source": uuid, "target": uuid2,
+            "relation": "extends", "weight": null
+        });
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("null weight should be accepted");
+        assert!(matches!(
+            cs,
+            ProposalChangeset::AddEdge { weight: None, .. }
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rerank_payload_serde_rejects_non_finite_score() {
+        let json = serde_json::json!({
+            "served_by_profile_id": null,
+            "model_id": "00000000-0000-0000-0000-000000000001",
+            "candidates": [],
+            "reranked": [],
+            "final_scores": [["00000000-0000-0000-0000-000000000001", "Infinity"]],
+            "latency_us": 100,
+            "hook_applied": false,
+            "hook_target_match": false
+        });
+        let result: Result<RerankExecutedPayload, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rerank_payload_is_valid_checks_finite() {
+        let p = RerankExecutedPayload {
+            served_by_profile_id: None,
+            model_id: Id128::from_u128(1),
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: alloc::vec![(Id128::from_u128(1), 0.5)],
+            latency_us: 100,
+            hook_applied: false,
+            hook_target_match: false,
+        };
+        assert!(p.is_valid());
+
+        let p_inf = RerankExecutedPayload {
+            served_by_profile_id: None,
+            model_id: Id128::from_u128(1),
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: alloc::vec![(Id128::from_u128(1), f32::INFINITY)],
+            latency_us: 100,
+            hook_applied: false,
+            hook_target_match: false,
+        };
+        assert!(!p_inf.is_valid());
     }
 }

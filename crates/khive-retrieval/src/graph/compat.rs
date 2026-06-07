@@ -222,6 +222,8 @@ pub fn test_context() -> StorageContext {
 // ---------------------------------------------------------------------------
 
 /// Adapt a `String` error into a `RetrievalError::GraphTraversal`.
+// REASON: used selectively by BFS/DFS/shortest-path helpers under `graph-legacy`; without that
+// feature the call sites are compiled out, making this function appear dead to rustc.
 #[allow(dead_code)]
 pub(crate) fn graph_err(msg: impl std::fmt::Display) -> RetrievalError {
     RetrievalError::GraphTraversal(msg.to_string())

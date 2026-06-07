@@ -9,19 +9,12 @@ impl HnswIndex {
     }
 
     /// Set or clear the memory budget at runtime.
-    ///
-    /// Pass `Some(bytes)` to enforce a limit, or `None` to remove it.
     pub fn set_memory_budget(&mut self, budget: Option<usize>) {
         self.config.memory_budget = budget;
     }
 
     /// Estimate the current memory usage of the index in bytes.
-    ///
-    /// Formula: `nodes * (dims * 4 + node_overhead) + neighbor_entries * 8
-    ///           + per_layer_overhead + vec_overhead + id_mapping_overhead + tombstone_overhead`
-    ///
-    /// This is a conservative estimate. Actual usage may differ due to
-    /// allocator overhead and alignment.
+    /// Conservative estimate; actual usage may differ due to allocator overhead and alignment.
     pub fn memory_usage(&self) -> usize {
         let num_nodes = self.nodes.len();
         let dims = self.config.dimensions;
@@ -61,10 +54,7 @@ impl HnswIndex {
         nodes_total + neighbors_total + mapping_overhead + tombstone_overhead + quantized_overhead
     }
 
-    /// Estimate the memory cost of inserting a new vector.
-    ///
-    /// This is the incremental cost of one new node, including its vector
-    /// storage, node metadata, and expected neighbor connections.
+    /// Estimate the incremental memory cost of inserting one new vector.
     pub fn estimate_insert_cost(&self) -> usize {
         let dims = self.config.dimensions;
 

@@ -1,14 +1,4 @@
-//! BFS (Breadth-First Search) traversal.
-//!
-//! # Formal Verification
-//!
-//! This implementation corresponds to the formal proofs in
-//! `proofs/Lion/Retrieval/Graph.lean`. Key theorems:
-//!
-//! - `bfs_terminates`: BFS always terminates (queue eventually empty)
-//! - `bfs_complete`: all reachable vertices are visited
-//! - `visited_mono`: visited set grows monotonically
-//! - `reachable_trans`: reachability is transitive
+//! BFS (Breadth-First Search) traversal over the graph legacy layer.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -19,49 +9,7 @@ use crate::error::Result;
 use super::helpers::{get_edge_weight, get_neighbor_entity, get_neighbors, matches_link_type};
 use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS};
 
-/// Perform BFS traversal from a starting entity.
-///
-/// BFS explores nodes level by level, guaranteeing that nodes at depth N
-/// are visited before nodes at depth N+1. This makes it ideal for:
-///
-/// - Finding all entities within N hops
-/// - Social network expansion (friends of friends)
-/// - Entity neighborhood exploration
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `start` - Starting entity reference
-/// * `options` - Traversal options (depth, direction, filters)
-///
-/// # Returns
-///
-/// Vector of [`PathNode`] in BFS order. The first element is always the start node.
-///
-/// # Complexity
-///
-/// - Time: O(V + E) where V = vertices, E = edges
-/// - Space: O(V) for visited set and queue
-///
-/// # Example
-///
-/// ```ignore
-/// let options = TraversalOptions::new(3)
-///     .with_direction(Direction::Out)
-///     .with_link_types(["KNOWS"]);
-///
-/// let nodes = bfs_traverse(&store, &ctx, start_ref, &options).await?;
-/// for node in &nodes {
-///     println!("Entity {:?} at depth {}", node.entity_id, node.depth);
-/// }
-/// ```
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.bfs_terminates`
-/// Queue shrinks each iteration; visited set prevents re-enqueue; terminates when queue empty.
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.bfs_complete`
-/// All reachable vertices within max_depth are visited; BFS explores level-by-level.
+/// BFS traversal from `start`. Returns [`PathNode`]s in level order, start node first.
 pub async fn bfs_traverse<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,
@@ -74,6 +22,12 @@ pub async fn bfs_traverse<S: LinkStore>(
         .unwrap_or(MAX_TRAVERSAL_RESULTS)
         .min(MAX_TRAVERSAL_RESULTS);
     let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
+
+    // An explicit limit of 0 means "return nothing" — return immediately so
+    // the start node is never pushed into results.
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
 
     // **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.visited_mono`
     // Visited set only grows (insert-only); never shrinks during traversal.
@@ -108,14 +62,21 @@ pub async fn bfs_traverse<S: LinkStore>(
                 continue;
             }
 
-            // Get edge weight and filter
+            // Get edge weight and filter.
+            // Reject NaN/Inf: non-finite weights propagate into path_weight and
+            // corrupt ranking. NaN comparisons are always false, so the
+            // min_weight check alone would silently let NaN through.
             let edge_weight = get_edge_weight(&link);
-            if edge_weight < min_weight {
+            if !edge_weight.is_finite() || edge_weight < min_weight {
                 continue;
             }
 
-            // Determine neighbor entity based on direction
-            let neighbor = get_neighbor_entity(&link, &current, &options.direction);
+            // Determine neighbor entity based on direction.
+            // Returns None when current is not a valid endpoint for this link
+            // (e.g., a backend returned a link that doesn't involve current).
+            let Some(neighbor) = get_neighbor_entity(&link, &current, &options.direction) else {
+                continue;
+            };
 
             // Skip if already visited (EntityRef implements Hash + Eq)
             if visited.contains(&neighbor) {

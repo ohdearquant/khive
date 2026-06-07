@@ -5,14 +5,7 @@ use uuid::Uuid;
 
 use khive_score::{cmp_asc_then_id, cmp_desc_then_id, DeterministicScore};
 
-/// Compare two scored candidates in descending score order with UUID tie-breaking.
-///
-/// Converts f64 scores to `DeterministicScore` for cross-platform determinism.
-///
-/// Ordering:
-/// 1. Score descending (higher scores first)
-/// 2. UUID ascending (lower UUIDs first) for tie-breaking
-/// 3. NaN scores map to `DeterministicScore::ZERO` (sort after all positives)
+/// Descending score order with UUID tie-breaking; NaN maps to ZERO.
 #[inline]
 pub fn cmp_desc_score_then_id(score_a: f64, id_a: Uuid, score_b: f64, id_b: Uuid) -> Ordering {
     cmp_desc_then_id(
@@ -23,14 +16,7 @@ pub fn cmp_desc_score_then_id(score_a: f64, id_a: Uuid, score_b: f64, id_b: Uuid
     )
 }
 
-/// Compare two scored candidates in ascending score order with UUID tie-breaking.
-///
-/// Converts f64 scores to `DeterministicScore` for cross-platform determinism.
-///
-/// Ordering:
-/// 1. Score ascending (lower scores first)
-/// 2. UUID ascending (lower UUIDs first) for tie-breaking
-/// 3. NaN scores map to `DeterministicScore::ZERO`
+/// Ascending score order with UUID tie-breaking; NaN maps to ZERO.
 #[inline]
 pub fn cmp_asc_score_then_id(score_a: f64, id_a: Uuid, score_b: f64, id_b: Uuid) -> Ordering {
     cmp_asc_then_id(

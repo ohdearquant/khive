@@ -8,16 +8,7 @@ use khive_score::DeterministicScore;
 
 use super::has_id::HasId;
 
-/// A wrapper for scored candidates that implements deterministic `Ord`.
-///
-/// This struct caches the score as a `DeterministicScore` (i64 fixed-point) for
-/// cross-platform deterministic ordering, along with the UUID for tie-breaking.
-///
-/// # Ordering
-///
-/// `ScoredEntry` orders by:
-/// 1. Score descending (higher scores first)
-/// 2. UUID ascending (lower UUIDs first for tie-breaking)
+/// Scored candidate with deterministic `Ord`: score descending, UUID ascending on tie.
 #[derive(Debug, Clone, Copy)]
 pub struct ScoredEntry<T> {
     /// The candidate being scored
@@ -96,9 +87,6 @@ impl<T> PartialEq for ScoredEntry<T> {
 impl<T> Ord for ScoredEntry<T> {
     /// Compare entries for use with BinaryHeap and sorted collections.
     ///
-    /// Higher scores are "greater" (popped first from max-heap).
-    /// On equal scores, lower UUIDs are "greater" (popped first from max-heap).
-    /// NaN scores map to DeterministicScore::ZERO and sort after all normal values.
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.det_score

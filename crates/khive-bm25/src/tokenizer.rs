@@ -1,77 +1,18 @@
-//! Tokenization for BM25.
-//!
-//! Provides a pluggable tokenizer system with a simple default implementation.
-//!
-//! # RETRIEVAL-10: Advanced Tokenization (Deferred)
-//!
-//! The following advanced tokenization features are **intentionally deferred**
-//! to future iterations:
-//!
-//! | Feature | Status | Rationale |
-//! |---------|--------|-----------|
-//! | CJK segmentation | Deferred | Requires jieba/mecab integration |
-//! | Arabic normalization | Deferred | Requires ICU or custom rules |
-//! | Stemming | Deferred | Language-specific (Snowball, Porter) |
-//! | Lemmatization | Deferred | Requires NLP models |
-//! | Stop word removal | Deferred | Language and domain specific |
-//! | N-gram support | Deferred | Memory/performance tradeoffs |
-//!
-//! **Current scope**: English whitespace tokenization with optional lowercase
-//! and minimum length filtering. This covers the primary use case.
-//!
-//! **Extension point**: Implement the [`Tokenizer`] trait for custom tokenization.
-//! The trait is designed to be language-agnostic and composable.
-//!
-//! # Examples
-//!
-//! Using the default SimpleTokenizer:
-//! ```rust
-//! use khive_bm25::{Tokenizer, SimpleTokenizer};
-//!
-//! let tokenizer = SimpleTokenizer::default();
-//! let tokens = tokenizer.tokenize("Hello, World!");
-//! assert_eq!(tokens, vec!["hello", "world"]);
-//! ```
-//!
-//! Custom tokenizer with minimum length:
-//! ```rust
-//! use khive_bm25::{Tokenizer, SimpleTokenizer};
-//!
-//! let tokenizer = SimpleTokenizer::new(true, 3);
-//! let tokens = tokenizer.tokenize("I am a cat");
-//! assert_eq!(tokens, vec!["cat"]); // "I", "am", "a" filtered out (< 3 chars)
-//! ```
+//! Pluggable tokenizer trait with a simple English whitespace default.
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-/// Tokenizer trait for extensible text tokenization.
-///
-/// Implement this trait to provide custom tokenization for BM25 search.
-/// This enables:
-/// - Language-specific tokenization (CJK, Arabic, etc.)
-/// - Stemming/lemmatization
-/// - Stop word removal
-/// - N-gram support
+/// Extensible text tokenization for BM25 indexing.
 pub trait Tokenizer: Send + Sync {
-    /// Tokenize the input text into a list of tokens.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - Input text to tokenize
-    ///
-    /// # Returns
-    ///
-    /// Vector of tokens (strings). Empty vector for empty input.
+    /// Tokenize text into terms. Returns empty vec for empty input.
     fn tokenize(&self, text: &str) -> Vec<String>;
 }
 
 /// Box type for tokenizers (enables dynamic dispatch).
 pub type BoxedTokenizer = Arc<dyn Tokenizer>;
 
-/// English stop words — high-frequency terms that add noise to BM25 postings
-/// without improving retrieval quality. Removing these reduces BM25 memory by
-/// ~170 MB at 15K docs (each stop word creates N postings × 64 bytes).
+/// English stop words filtered from BM25 postings to reduce index size.
 static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
         "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "did",
@@ -85,12 +26,7 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     ])
 });
 
-/// Simple whitespace tokenizer with optional lowercase, minimum length,
-/// and stop-word filtering.
-///
-/// This is the default tokenizer suitable for English text.
-/// For production use with non-English text, consider implementing
-/// a custom tokenizer with proper segmentation for your language.
+/// Default tokenizer: whitespace split with lowercase and stop-word filtering.
 #[derive(Debug, Clone)]
 pub struct SimpleTokenizer {
     /// Whether to lowercase tokens.
@@ -113,11 +49,6 @@ impl Default for SimpleTokenizer {
 
 impl SimpleTokenizer {
     /// Create a new SimpleTokenizer with specified options.
-    ///
-    /// # Arguments
-    ///
-    /// * `lowercase` - Whether to convert tokens to lowercase
-    /// * `min_length` - Minimum token length (shorter tokens are filtered out)
     pub fn new(lowercase: bool, min_length: usize) -> Self {
         Self {
             lowercase,
@@ -170,9 +101,7 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
-/// Convenience function for simple tokenization (backwards compatibility).
-///
-/// Uses the default SimpleTokenizer configuration.
+/// Tokenize text using the default SimpleTokenizer.
 pub fn tokenize(text: &str) -> Vec<String> {
     SimpleTokenizer::default().tokenize(text)
 }

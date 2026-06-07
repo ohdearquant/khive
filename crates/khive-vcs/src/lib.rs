@@ -1,17 +1,7 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
-//
-//! KG versioning — content-addressed snapshot hashing, git-native core types,
-//! and the NDJSON-to-SQLite sync library boundary.
+//! KG versioning — content-addressed snapshot hashing and NDJSON-to-SQLite sync.
 //!
-//! v1 versioning is git-native (ADR-010, ADR-020): KG state lives as sorted
-//! NDJSON files in a git repository. The legacy snapshot/branch/merge pipeline
-//! (`KgSnapshot`, `KgBranch`, `RemoteConfig`, custom push/pull) was superseded
-//! by ADR-020. This crate retains:
-//!
-//! - [`types`] — `SnapshotId`, `SnapshotCoverage`, `VcsState`
-//! - [`hash`] — canonical JSON serialization + SHA-256 snapshot hashing
-//! - [`sync`] — NDJSON-to-SQLite rebuild library (ADR-010/ADR-020, F106)
-//! - [`error`] — `VcsError` type
+//! Git-native v1: KG state lives as sorted NDJSON files in a git repo. Retains
+//! `types` (snapshot IDs), `hash` (SHA-256), `sync` (rebuild library), and `error`.
 
 pub mod error;
 pub mod hash;

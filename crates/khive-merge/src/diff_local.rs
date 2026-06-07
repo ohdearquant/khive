@@ -1,9 +1,9 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Minimal entity+edge diff computation for the merge use case (ADR-043 §3).
+//! Minimal entity+edge diff computation for the merge use case.
 //!
 //! This is a private implementation used only by `khive-merge`. It does NOT
-//! implement the full `GraphDiff` format from ADR-017 — it produces the
+//! implement a full bidirectional graph diff format — it produces the
 //! categorized entity/edge change sets that the merge algorithm needs.
 //!
 //! When `khive-diff` ships in v0.4, this can be replaced by a dep on that crate.
@@ -11,13 +11,9 @@
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
-use khive_vcs::VcsError;
 use uuid::Uuid;
 
-/// Snapshot reader trait for `find_lca` (so the algorithm can be tested independently).
-pub trait SnapshotReader: Send + Sync {
-    fn parent_of(&self, id: &str) -> Option<String>;
-}
+use crate::types::MergeError;
 
 /// Per-entity change classification between base and a branch.
 #[derive(Debug, Clone)]
@@ -30,6 +26,10 @@ pub enum EntityChange {
     Deleted,
     /// Modified in branch (fields differ from base).
     Modified {
+        // REASON: base is retained for future conflict-resolution UX (show "was → now").
+        // Currently only `branch` is read in merge patterns; `base` is present for
+        // completeness and will be used when we add a diff display path.
+        #[allow(dead_code)]
         base: ExportedEntity,
         branch: ExportedEntity,
     },
@@ -46,6 +46,9 @@ pub enum EdgeChange {
     Deleted,
     /// Weight modified.
     WeightModified {
+        // REASON: base_weight is retained for future diff display (show "was → now").
+        // Currently only `branch_weight` is read in merge patterns.
+        #[allow(dead_code)]
         base_weight: f64,
         branch_weight: f64,
     },
@@ -77,9 +80,12 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
         branch.entities.iter().map(|e| (e.id, e)).collect();
 
     let all_ids: HashSet<Uuid> = base_map.keys().chain(branch_map.keys()).copied().collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_ids_sorted: Vec<Uuid> = all_ids.into_iter().collect();
+    all_ids_sorted.sort();
     let mut result = HashMap::new();
 
-    for id in all_ids {
+    for id in all_ids_sorted {
         let change = match (base_map.get(&id), branch_map.get(&id)) {
             (None, Some(b)) => EntityChange::Added((*b).clone()),
             (Some(_), None) => EntityChange::Deleted,
@@ -104,12 +110,12 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 /// Compute edge changes between `base` and `branch`.
 ///
 /// The maps retain full `ExportedEdge` values (not just weights) so that
-/// `edge_id` is preserved in `EdgeChange::Added` entries. This is required by
-/// ADR-048 D1: edge identity must survive merge/diff cycles.
+/// `edge_id` is preserved in `EdgeChange::Added` entries. Edge identity must
+/// survive merge/diff cycles — callers must not regenerate a fresh UUID.
 pub fn diff_edges(
     base: &KgArchive,
     branch: &KgArchive,
-) -> Result<HashMap<EdgeKey, EdgeChange>, VcsError> {
+) -> Result<HashMap<EdgeKey, EdgeChange>, MergeError> {
     let base_map: HashMap<EdgeKey, &ExportedEdge> = base
         .edges
         .iter()
@@ -122,9 +128,17 @@ pub fn diff_edges(
         .collect();
 
     let all_keys: HashSet<EdgeKey> = base_map.keys().chain(branch_map.keys()).cloned().collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_keys_sorted: Vec<EdgeKey> = all_keys.into_iter().collect();
+    all_keys_sorted.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then(a.target.cmp(&b.target))
+            .then(a.relation.cmp(&b.relation))
+    });
     let mut result = HashMap::new();
 
-    for key in all_keys {
+    for key in all_keys_sorted {
         let change = match (base_map.get(&key), branch_map.get(&key)) {
             // Added in branch: carry the branch edge verbatim to preserve edge_id.
             (None, Some(branch_e)) => EdgeChange::Added((*branch_e).clone()),
@@ -197,6 +211,7 @@ mod tests {
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_type: None,
         }
     }
 

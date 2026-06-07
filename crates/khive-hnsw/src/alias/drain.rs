@@ -1,17 +1,4 @@
-//! Reader tracking and drain detection for zero-downtime index swaps.
-//!
-//! The drain protocol ensures that after an alias swap, the old index is not
-//! deallocated until all in-flight queries have completed. This is implemented
-//! via an `AtomicU64` reader counter and an RAII `ReaderGuard` that decrements
-//! on drop.
-//!
-//! # Design
-//!
-//! - Each collection has an associated `AtomicU64` reader count.
-//! - `search_via_alias` increments the count and returns a `ReaderGuard`.
-//! - The guard holds an `Arc<HnswIndex>` snapshot, so the index stays alive
-//!   even if the alias is swapped while the query is in flight.
-//! - `drain_and_remove` polls the reader count until it reaches zero or timeout.
+//! RAII `ReaderGuard` and drain polling for zero-downtime HNSW index swaps.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,12 +43,8 @@ impl ReaderCounter {
     }
 }
 
-/// RAII guard that holds a snapshot of the index and decrements the reader
-/// count on drop.
-///
-/// The caller gets `&HnswIndex` access via `Deref`. The index is guaranteed
-/// to remain alive for the lifetime of this guard, even if the alias is
-/// swapped to a different collection in the meantime.
+/// RAII guard holding an index snapshot; decrements reader count on drop.
+/// Index stays alive for the guard lifetime even if the alias is swapped.
 pub struct ReaderGuard {
     /// Snapshot of the index at the time the guard was acquired.
     index: Arc<HnswIndex>,
@@ -96,10 +79,7 @@ impl std::ops::Deref for ReaderGuard {
     }
 }
 
-/// Wait for all readers on a counter to finish, polling at `poll_interval`.
-///
-/// Returns `Ok(())` when the reader count reaches zero, or `Err(DrainTimeout)`
-/// if the timeout is exceeded.
+/// Poll `counter` until zero readers remain or timeout is exceeded.
 pub(crate) async fn drain_readers(
     counter: &Arc<ReaderCounter>,
     timeout: Duration,

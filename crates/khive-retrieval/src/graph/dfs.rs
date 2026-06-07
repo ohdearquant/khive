@@ -1,13 +1,4 @@
-//! DFS (Depth-First Search) traversal.
-//!
-//! # Formal Verification
-//!
-//! This implementation corresponds to the formal proofs in
-//! `proofs/Lion/Retrieval/Graph.lean`. Key theorems:
-//!
-//! - `dfs_terminates_bound`: DFS bounded by |V| vertices
-//! - `visited_mono`: visited set grows monotonically
-//! - `reachable_trans`: reachability is transitive
+//! DFS (Depth-First Search) traversal over the graph legacy layer.
 
 use std::collections::HashSet;
 
@@ -18,42 +9,7 @@ use crate::error::Result;
 use super::helpers::{get_edge_weight, get_neighbor_entity, get_neighbors, matches_link_type};
 use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS};
 
-/// Perform DFS traversal from a starting entity.
-///
-/// DFS explores as far as possible along each branch before backtracking.
-/// This makes it ideal for:
-///
-/// - Deep chain exploration
-/// - Path existence checking
-/// - Exhaustive graph exploration with limited results
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `start` - Starting entity reference
-/// * `options` - Traversal options (depth, direction, filters)
-///
-/// # Returns
-///
-/// Vector of [`PathNode`] in DFS pre-order (parent before children).
-///
-/// # Complexity
-///
-/// - Time: O(V + E) where V = vertices, E = edges
-/// - Space: O(V) for visited set + O(h) stack where h = max depth
-///
-/// # Example
-///
-/// ```ignore
-/// let options = TraversalOptions::new(5)
-///     .with_direction(Direction::Out);
-///
-/// let nodes = dfs_traverse(&store, &ctx, start_ref, &options).await?;
-/// ```
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.dfs_terminates_bound`
-/// Each vertex visited at most once; |visited| bounded by |V|; stack pops exceed pushes eventually.
+/// DFS traversal from `start`. Returns [`PathNode`]s in pre-order (parent before children).
 pub async fn dfs_traverse<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,
@@ -67,14 +23,28 @@ pub async fn dfs_traverse<S: LinkStore>(
         .min(MAX_TRAVERSAL_RESULTS);
     let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
 
+    // An explicit limit of 0 means "return nothing" — return immediately so
+    // the start node is never pushed into results.
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     // **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.visited_mono`
     // Visited set only grows (insert-only); never shrinks during traversal.
     // EntityRef implements Hash + Eq, enabling direct use as HashMap key.
     let mut visited: HashSet<EntityRef> = HashSet::new();
     let mut results: Vec<PathNode> = Vec::new();
 
+    // `discovered` prevents pushing the same unvisited node multiple times onto
+    // the stack.  Without it, a high fan-in DAG can push the same node once per
+    // parent, leading to O(parents) redundant stack entries and unnecessary link
+    // clones.  `visited` handles the pop-side skip, but `discovered` avoids the
+    // wasted stack space and clone cost before the node is ever popped.
+    let mut discovered: HashSet<EntityRef> = HashSet::new();
+
     // Stack: (entity_ref, depth, path_weight, via_link)
     let mut stack: Vec<(EntityRef, usize, f64, Option<Link>)> = Vec::new();
+    discovered.insert(start.clone());
     stack.push((start, 0, 0.0, None));
 
     while let Some((current, depth, path_weight, via_link)) = stack.pop() {
@@ -112,19 +82,29 @@ pub async fn dfs_traverse<S: LinkStore>(
                 continue;
             }
 
-            // Get edge weight and filter
+            // Get edge weight and filter.
+            // Reject NaN/Inf: non-finite weights propagate into path_weight and
+            // corrupt ranking. NaN comparisons are always false, so the
+            // min_weight check alone would silently let NaN through.
             let edge_weight = get_edge_weight(&link);
-            if edge_weight < min_weight {
+            if !edge_weight.is_finite() || edge_weight < min_weight {
                 continue;
             }
 
-            // Determine neighbor entity
-            let neighbor = get_neighbor_entity(&link, &current, &options.direction);
+            // Determine neighbor entity.
+            // Returns None when current is not a valid endpoint for this link
+            // (e.g., a backend returned a link that doesn't involve current).
+            let Some(neighbor) = get_neighbor_entity(&link, &current, &options.direction) else {
+                continue;
+            };
 
-            // Skip if already visited (EntityRef implements Hash + Eq)
-            if visited.contains(&neighbor) {
+            // Skip if already discovered or visited.
+            // `discovered` prevents the same unvisited node from being pushed
+            // multiple times by different parents (high fan-in DAG protection).
+            if visited.contains(&neighbor) || discovered.contains(&neighbor) {
                 continue;
             }
+            discovered.insert(neighbor.clone());
 
             let new_weight = path_weight + edge_weight;
             stack.push((neighbor, depth + 1, new_weight, Some(link)));

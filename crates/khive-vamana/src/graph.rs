@@ -1,3 +1,5 @@
+//! Vamana graph construction and greedy-search implementation.
+
 use std::collections::HashSet;
 
 use rand::prelude::*;
@@ -13,12 +15,18 @@ const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
 
+/// Output of a single greedy-search traversal over the Vamana graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GreedySearchResult {
+    /// Top-k neighbors sorted by distance (ascending), ties broken by node ID.
     pub results: Vec<(u32, f32)>,
+    /// All nodes expanded during the traversal, in expansion order.
     pub expanded: Vec<(u32, f32)>,
 }
 
+/// Generation-based visited-node tracker for greedy search.
+///
+/// Avoids clearing a `Vec<bool>` on every query by incrementing a generation counter.
 #[derive(Debug, Clone)]
 pub struct VisitedSet {
     marks: Vec<u64>,
@@ -26,6 +34,7 @@ pub struct VisitedSet {
 }
 
 impl VisitedSet {
+    /// Create a new `VisitedSet` with pre-allocated capacity for `capacity` nodes.
     pub fn new(capacity: usize) -> Self {
         Self {
             marks: vec![0; capacity],
@@ -33,6 +42,7 @@ impl VisitedSet {
         }
     }
 
+    /// Reset the visited state for all nodes in O(1) by advancing the generation.
     #[inline]
     pub fn clear(&mut self) {
         self.generation = self.generation.wrapping_add(1);
@@ -42,6 +52,7 @@ impl VisitedSet {
         }
     }
 
+    /// Grow the internal buffer if `node` would be out of range.
     #[inline]
     pub fn ensure_capacity(&mut self, node: usize) {
         if node >= self.marks.len() {
@@ -49,6 +60,9 @@ impl VisitedSet {
         }
     }
 
+    /// Mark `node` as visited if it has not been visited in this generation.
+    ///
+    /// Returns `true` on first visit, `false` on subsequent calls for the same node.
     #[inline]
     pub fn mark_if_new(&mut self, node: usize) -> bool {
         if node >= self.marks.len() {
@@ -62,6 +76,7 @@ impl VisitedSet {
         }
     }
 
+    /// Return `true` if `node` has been marked in the current generation.
     #[inline]
     pub fn is_marked(&self, node: usize) -> bool {
         node < self.marks.len() && self.marks[node] == self.generation
@@ -76,6 +91,7 @@ impl VisitedSet {
     }
 }
 
+/// The Vamana proximity graph over `u32` node IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VamanaGraph {
     adjacency: Vec<Vec<u32>>,
@@ -83,6 +99,7 @@ pub struct VamanaGraph {
 }
 
 impl VamanaGraph {
+    /// Create an empty graph. Errors if `num_nodes == 0` or `medoid >= num_nodes`.
     pub fn new(num_nodes: usize, medoid: u32) -> Result<Self> {
         if num_nodes == 0 {
             return Err(VamanaError::EmptyInput);
@@ -99,6 +116,7 @@ impl VamanaGraph {
         })
     }
 
+    /// Build a Vamana graph from `vectors` using the given `config`.
     pub fn build(vectors: &[f32], config: &VamanaConfig) -> Result<Self> {
         config.validate()?;
         let num_vectors = validate_vectors(vectors, config.dimensions)?;
@@ -204,6 +222,7 @@ impl VamanaGraph {
         Ok(Self { adjacency, medoid })
     }
 
+    /// Append a new node with no neighbors and return its `u32` ID.
     pub fn add_node(&mut self) -> Result<u32> {
         let new_id = self.adjacency.len();
         if new_id >= u32::MAX as usize {
@@ -213,14 +232,17 @@ impl VamanaGraph {
         Ok(new_id as u32)
     }
 
+    /// Return the number of nodes in this graph.
     pub fn node_count(&self) -> usize {
         self.adjacency.len()
     }
 
+    /// Return the medoid node ID (start node for greedy search).
     pub fn medoid(&self) -> u32 {
         self.medoid
     }
 
+    /// Return a slice of all adjacency lists, one per node.
     pub fn adjacency(&self) -> &[Vec<u32>] {
         &self.adjacency
     }
@@ -229,6 +251,7 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
+    /// Return the neighbor list for `node`, or an error if out of range.
     pub fn neighbors(&self, node: u32) -> Result<&[u32]> {
         let idx = node as usize;
         if idx >= self.adjacency.len() {
@@ -239,6 +262,7 @@ impl VamanaGraph {
         Ok(&self.adjacency[idx])
     }
 
+    /// Run greedy beam search from the medoid and return the `k` nearest candidates.
     pub fn greedy_search(
         &self,
         vectors: &[f32],
@@ -260,6 +284,7 @@ impl VamanaGraph {
                 actual: vectors.len() % dimensions,
             });
         }
+        validate_graph_vectors(vectors, dimensions, self.adjacency.len())?;
         if k == 0 {
             return Err(VamanaError::invalid_config("k must be > 0".into()));
         }
@@ -281,6 +306,7 @@ impl VamanaGraph {
         ))
     }
 
+    /// Apply the DiskANN robust-prune heuristic to select at most `max_degree` neighbors for `node`.
     pub fn robust_prune(
         &self,
         vectors: &[f32],
@@ -300,6 +326,13 @@ impl VamanaGraph {
                 expected: dimensions,
                 actual: vectors.len() % dimensions,
             });
+        }
+        validate_graph_vectors(vectors, dimensions, self.adjacency.len())?;
+        if !alpha.is_finite() {
+            return Err(VamanaError::invalid_config("alpha must be finite".into()));
+        }
+        if alpha < 1.0 {
+            return Err(VamanaError::invalid_config("alpha must be >= 1.0".into()));
         }
 
         let mut all: Vec<u32> = candidates
@@ -322,6 +355,9 @@ struct Candidate {
     expanded: bool,
 }
 
+// REASON: greedy_search_inner requires all eight parameters (vectors, dimensions,
+// adjacency, query, start, k, search_list_size, visited) to avoid bundling them
+// into a struct that would add allocation overhead on the hot search path.
 #[allow(clippy::too_many_arguments)]
 fn greedy_search_inner(
     vectors: &[f32],
@@ -461,6 +497,24 @@ fn validate_vectors(vectors: &[f32], dimensions: usize) -> Result<usize> {
     Ok(vectors.len() / dimensions)
 }
 
+/// Validate that `vectors` contains at least `graph_nodes` rows of `dimensions` floats.
+/// Used to guard public-facing graph operations against out-of-bounds row accesses.
+fn validate_graph_vectors(vectors: &[f32], dimensions: usize, graph_nodes: usize) -> Result<()> {
+    if !vectors.len().is_multiple_of(dimensions) {
+        return Err(VamanaError::DimensionMismatch {
+            expected: dimensions,
+            actual: vectors.len() % dimensions,
+        });
+    }
+    let vector_count = vectors.len() / dimensions;
+    if vector_count < graph_nodes {
+        return Err(VamanaError::invalid_format(format!(
+            "vectors has {vector_count} rows but graph has {graph_nodes} nodes"
+        )));
+    }
+    Ok(())
+}
+
 fn row(vectors: &[f32], dimensions: usize, node: u32) -> &[f32] {
     let start = node as usize * dimensions;
     &vectors[start..start + dimensions]
@@ -523,6 +577,8 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
     let count = max_degree.min(num_vectors - 1);
     let mut pool: Vec<u32> = (0..num_vectors as u32).collect();
 
+    let mut shuffle_swaps: Vec<(usize, usize)> = Vec::with_capacity(count);
+
     let adjacency: Vec<Vec<u32>> = (0..num_vectors)
         .map(|i| {
             // Move i out of the active range by swapping with the last element.
@@ -530,15 +586,23 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
             pool.swap(i, last);
 
             // Partial Fisher-Yates over pool[0..last] (excludes i).
+            // Record every swap so we can undo them and restore the shared pool.
             let available = last; // == num_vectors - 1
             let mut neighbors: Vec<u32> = Vec::with_capacity(count);
+            shuffle_swaps.clear();
             for k in 0..count {
                 let j = rng.gen_range(k..available);
                 pool.swap(k, j);
+                shuffle_swaps.push((k, j));
                 neighbors.push(pool[k]);
             }
 
-            // Restore pool[i] so subsequent iterations see a full pool.
+            // Undo the partial Fisher-Yates swaps in reverse order.
+            for &(k, j) in shuffle_swaps.iter().rev() {
+                pool.swap(k, j);
+            }
+
+            // Restore pool[i] so subsequent iterations see a full, intact pool.
             pool.swap(i, last);
 
             neighbors.sort_unstable();
@@ -554,6 +618,11 @@ fn sort_dedup_u32(values: &mut Vec<u32>) {
     values.dedup();
 }
 
+// INLINE TEST JUSTIFICATION: Tests here require direct access to `adjacency` (private field)
+// and internal helpers (`initial_random_adjacency`, `validate_graph_vectors`) that are not
+// exposed in the public API. Moving them to `tests/` would require pub(crate) re-exports
+// that would bloat the public surface. The graph.rs build logic is complex enough that
+// keeping unit tests close to the code they cover outweighs the file-size cost.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +856,8 @@ mod tests {
         }
     }
 
+    // REASON: test helper kept for future graph traversal tests that need a
+    // simple chain topology with known distances.
     #[allow(dead_code)]
     fn make_line_graph_test(n: usize) -> (Vec<f32>, VamanaGraph) {
         let vectors = make_line_vectors(n);
@@ -800,5 +871,93 @@ mod tests {
             }
         }
         (vectors, g)
+    }
+
+    // ---- Regression tests for P0/P1 fixes ----
+
+    /// P0: initial_random_adjacency must never produce self-loops.
+    #[test]
+    fn initial_random_adjacency_has_no_self_edges() {
+        for num_vectors in [2usize, 5, 10, 100] {
+            let max_degree = (num_vectors - 1).min(8);
+            let adjacency = initial_random_adjacency(num_vectors, max_degree).unwrap();
+            for (i, neighbors) in adjacency.iter().enumerate() {
+                assert!(
+                    !neighbors.contains(&(i as u32)),
+                    "self-loop found at node {i} with num_vectors={num_vectors}"
+                );
+            }
+        }
+    }
+
+    /// P0: initial_random_adjacency neighbors must all be distinct.
+    #[test]
+    fn initial_random_adjacency_neighbors_are_unique() {
+        let adjacency = initial_random_adjacency(20, 8).unwrap();
+        for (i, neighbors) in adjacency.iter().enumerate() {
+            let mut sorted = neighbors.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                neighbors.len(),
+                "duplicate neighbors at node {i}"
+            );
+        }
+    }
+
+    /// P0: greedy_search rejects vectors with fewer rows than graph node count.
+    #[test]
+    fn greedy_search_rejects_graph_vector_count_mismatch() {
+        // Graph has 3 nodes but vectors only has 2 rows (dim=2).
+        let vectors = vec![0.0f32, 1.0, 2.0, 3.0]; // 2 rows × 2 dims
+        let g = VamanaGraph::new(3, 0).unwrap();
+        let mut visited = VisitedSet::new(3);
+        let query = [0.5f32, 0.5];
+        let err = g.greedy_search(&vectors, 2, &query, 1, 5, &mut visited);
+        assert!(
+            matches!(err, Err(VamanaError::InvalidFormat { .. })),
+            "expected InvalidFormat, got {err:?}"
+        );
+    }
+
+    /// P1: robust_prune must reject NaN alpha.
+    #[test]
+    fn robust_prune_rejects_nan_alpha() {
+        let vectors: Vec<f32> = vec![0.0, 0.5, 1.0];
+        let g = VamanaGraph::new(3, 0).unwrap();
+        let candidates: Vec<u32> = vec![1, 2];
+        let err = g.robust_prune(&vectors, 1, 0, &candidates, f64::NAN, 4);
+        assert!(
+            matches!(err, Err(VamanaError::InvalidConfig { .. })),
+            "expected InvalidConfig for NaN alpha, got {err:?}"
+        );
+    }
+
+    /// P1: robust_prune must reject alpha < 1.0.
+    #[test]
+    fn robust_prune_rejects_alpha_below_one() {
+        let vectors: Vec<f32> = vec![0.0, 0.5, 1.0];
+        let g = VamanaGraph::new(3, 0).unwrap();
+        let candidates: Vec<u32> = vec![1, 2];
+        let err = g.robust_prune(&vectors, 1, 0, &candidates, 0.5, 4);
+        assert!(
+            matches!(err, Err(VamanaError::InvalidConfig { .. })),
+            "expected InvalidConfig for alpha < 1.0, got {err:?}"
+        );
+    }
+
+    /// P1: robust_prune rejects vectors with fewer rows than graph node count.
+    #[test]
+    fn robust_prune_rejects_graph_vector_count_mismatch() {
+        // Graph has 4 nodes but only 2 rows supplied (dim=2 → 2 rows).
+        let vectors = vec![0.0f32, 0.5, 1.0, 1.5]; // 4 scalars × dim=2 → 2 rows
+        let g = VamanaGraph::new(4, 0).unwrap();
+        let candidates: Vec<u32> = vec![1, 2];
+        let err = g.robust_prune(&vectors, 2, 0, &candidates, 1.2, 4);
+        assert!(
+            matches!(err, Err(VamanaError::InvalidFormat { .. })),
+            "expected InvalidFormat, got {err:?}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Objective registry for dynamic dispatch.
 //!
 //! Runtime infrastructure: named registration, lookup, defaults.
-//! Lives in khive-runtime (not khive-fold) per ADR-058.
+//! Lives in khive-runtime (not khive-fold) because it depends on runtime types.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,6 +30,7 @@ impl<T: Send + Sync> fmt::Debug for RegisteredObjective<T> {
 }
 
 impl<T: Send + Sync> RegisteredObjective<T> {
+    /// Create a new registered objective with the given name and no description.
     pub fn new(name: impl Into<String>, objective: Box<dyn Objective<T>>) -> Self {
         Self {
             name: name.into(),
@@ -38,17 +39,20 @@ impl<T: Send + Sync> RegisteredObjective<T> {
         }
     }
 
+    /// Attach a human-readable description to this registered objective.
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
         self
     }
 
-    /// Raw score (no precision weighting). Use `select()` for ranked selection
-    /// that applies `score * precision` per ADR-059.
+    /// Raw score (no precision weighting). Use `select()` for ranked selection with salience boost.
     pub fn score(&self, candidate: &T, context: &ObjectiveContext) -> f64 {
         self.objective.score(candidate, context)
     }
 
+    /// Select the best candidate according to this objective's ranking.
+    ///
+    /// Returns `ObjectiveError::NoMatch` when the candidate slice is empty.
     pub fn select<'a>(
         &self,
         candidates: &'a [T],
@@ -91,6 +95,7 @@ impl<T: Send + Sync> Default for ObjectiveRegistry<T> {
 }
 
 impl<T: Send + Sync> ObjectiveRegistry<T> {
+    /// Create an empty registry with no objectives and no default set.
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(RegistryInner {
@@ -100,6 +105,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         }
     }
 
+    /// Register a named objective; returns the previous entry if the name was already taken.
     pub fn register(
         &self,
         name: impl Into<String>,
@@ -110,6 +116,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         self.inner.write().objectives.insert(name, registered)
     }
 
+    /// Register a named objective with a human-readable description.
     pub fn register_with_desc(
         &self,
         name: impl Into<String>,
@@ -123,6 +130,9 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         self.inner.write().objectives.insert(name, registered)
     }
 
+    /// Set the named objective as the registry default.
+    ///
+    /// Returns `ObjectiveError::NotFound` when no objective with that name is registered.
     pub fn set_default(&self, name: impl Into<String>) -> ObjectiveResult<()> {
         let name = name.into();
         let mut inner = self.inner.write();
@@ -133,6 +143,9 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         Ok(())
     }
 
+    /// Retrieve a registered objective by name.
+    ///
+    /// Returns `ObjectiveError::NotFound` when the name is not registered.
     pub fn get(&self, name: &str) -> ObjectiveResult<Arc<RegisteredObjective<T>>> {
         self.inner
             .read()
@@ -142,6 +155,9 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
             .ok_or_else(|| ObjectiveError::NotFound(name.to_string()))
     }
 
+    /// Retrieve the current default objective.
+    ///
+    /// Returns `ObjectiveError::NotFound` when no default has been set.
     pub fn get_default(&self) -> ObjectiveResult<Arc<RegisteredObjective<T>>> {
         let inner = self.inner.read();
         match inner.default.as_ref() {
@@ -154,6 +170,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         }
     }
 
+    /// List all registered objective names in sorted order.
     pub fn list(&self) -> Vec<String> {
         let inner = self.inner.read();
         let mut names: Vec<String> = inner.objectives.keys().cloned().collect();
@@ -161,6 +178,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         names
     }
 
+    /// Return `true` if an objective with the given name is registered.
     pub fn contains(&self, name: &str) -> bool {
         self.inner.read().objectives.contains_key(name)
     }
@@ -176,6 +194,9 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         Ok(objective.score(candidate, context))
     }
 
+    /// Select the best candidate using the named objective.
+    ///
+    /// Returns `ObjectiveError::NoMatch` when the candidate slice is empty.
     pub fn select<'a>(
         &self,
         name: &str,
@@ -190,6 +211,9 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
             .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
     }
 
+    /// Select the best candidate using the current default objective.
+    ///
+    /// Returns `ObjectiveError::NotFound` when no default is set.
     pub fn select_default<'a>(
         &self,
         candidates: &'a [T],

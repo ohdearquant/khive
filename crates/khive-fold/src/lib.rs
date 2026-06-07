@@ -1,29 +1,4 @@
-//! khive-fold: Cognitive primitives — Fold, Anchor, Objective, Selector.
-//!
-//! Four cognitive primitives that form the "paper-folding" operation:
-//!
-//! - **Fold**: `entries → derived state` (deterministic reduce)
-//! - **Anchor**: causal graph traversal (provenance chains)
-//! - **Objective**: score candidates and select best
-//! - **Selector**: budget-constrained pack (many → subset)
-//!
-//! Plus deterministic ordering primitives, composition combinators,
-//! and common strategies (Recency, Relevance, Weighted, etc.).
-//!
-//! # Quick Start
-//!
-//! ```
-//! use khive_fold::{fold_fn, Fold, FoldContext};
-//!
-//! let counter = fold_fn(
-//!     |_ctx| 0usize,
-//!     |count, _entry: &i32, _ctx| count + 1,
-//! );
-//!
-//! let entries = [1, 2, 3, 4, 5];
-//! let result = counter.derive(entries.iter(), &FoldContext::new());
-//! assert_eq!(result.state, 5);
-//! ```
+//! Fold, Anchor, Objective, and Selector primitives with deterministic ordering and composition.
 
 // ── Core fold ───────────────────────────────────────────────────────────
 
@@ -85,30 +60,5 @@ pub use ordering::{
 
 // ── ComposePipeline ─────────────────────────────────────────────────────
 
-/// Pipeline that scores candidates with an objective then packs to budget via a selector.
-pub struct ComposePipeline<T> {
-    pub anchor: Box<dyn Anchor>,
-    pub objective: Box<dyn Objective<T>>,
-    pub selector: Box<dyn Selector<T>>,
-}
-
-impl<T: Clone + Send + Sync + 'static> ComposePipeline<T> {
-    /// Score candidates with the objective, then pack under budget with the selector.
-    pub fn execute(
-        &self,
-        _graph: &AnchorGraph,
-        candidates: Vec<SelectorInput<T>>,
-        budget: usize,
-        weights: &SelectorWeights,
-        context: &ObjectiveContext,
-    ) -> Result<SelectorOutput<T>, FoldError> {
-        let scored = candidates
-            .into_iter()
-            .map(|mut candidate| {
-                candidate.score = self.objective.score(&candidate.content, context) as f32;
-                candidate
-            })
-            .collect();
-        self.selector.select(scored, budget, weights)
-    }
-}
+mod pipeline;
+pub use pipeline::ComposePipeline;

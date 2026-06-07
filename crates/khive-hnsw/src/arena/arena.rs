@@ -1,56 +1,11 @@
-//! Core bump arena allocator.
-//!
-//! Pre-allocates a contiguous memory slab and bumps a pointer for each
-//! allocation. Reset is O(1) -- just set the bump offset back to zero.
-//!
-//! # Memory Layout
-//!
-//! ```text
-//! [---- slab (1 MiB default) ----]
-//!  ^                ^             ^
-//!  base             offset        capacity
-//! ```
-//!
-//! Each `alloc<T>(count)` bumps `offset` by `count * size_of::<T>()` (with
-//! alignment padding). If `offset` would exceed `capacity`, the arena grows
-//! by allocating a new, larger slab.
-//!
-//! # Safety Invariants
-//!
-//! 1. The slab is a `Vec<u8>` owned by the arena. All pointers derived from
-//!    it are valid as long as the arena is alive and has not been reset or grown.
-//! 2. `ArenaVec` and `ArenaBinaryHeap` hold an `&SearchArena` reference,
-//!    tying their lifetime to the arena. After `reset()`, all prior allocations
-//!    are logically invalid -- the type system enforces this via lifetimes.
-//! 3. Growth invalidates all prior pointers. This is safe because growth only
-//!    happens during `alloc`, and all live `ArenaVec`/`ArenaBinaryHeap` objects
-//!    manage their own pointer + length, requesting new allocations as needed
-//!    via copy-on-grow.
+//! Bump arena allocator for HNSW search operations. Reset is O(1).
 
 use std::cell::Cell;
 
-/// Default arena size: 1 MiB. More than sufficient for ef=256 searches.
-///
-/// Worst-case per-search memory for ef=256, M=16:
-///
-/// - candidates heap: 256 * 12 = 3,072 bytes
-/// - results heap:    256 * 12 = 3,072 bytes
-/// - batch buffer:    16 * 32 = 512 bytes
-/// - result\_buf:      256 * 12 = 3,072 bytes
-/// - overhead/alignment: ~1,000 bytes
-///
-/// Total: ~10,728 bytes (~10 KiB)
-///
-/// 1 MiB gives ~100x headroom.
+/// Default arena size: 1 MiB. Sufficient for ef=256 searches (~10 KiB worst-case).
 pub const DEFAULT_ARENA_SIZE: usize = 1 << 20; // 1 MiB
 
-/// Bump arena allocator for HNSW search operations.
-///
-/// All allocations within a search query bump from this arena. Between
-/// queries, call `reset()` to reclaim all memory in O(1).
-///
-/// The arena uses interior mutability (`Cell`) for the bump offset so that
-/// multiple `ArenaVec` instances can allocate from the same `&SearchArena`.
+/// Bump arena allocator for HNSW search operations. Uses interior mutability for shared allocation.
 pub struct SearchArena {
     /// Backing memory slab.
     slab: Cell<Vec<u8>>,
@@ -73,10 +28,7 @@ impl SearchArena {
         Self::new(DEFAULT_ARENA_SIZE)
     }
 
-    /// Reset the arena in O(1). All prior allocations become invalid.
-    ///
-    /// This is the key performance win: no deallocation, no destructors,
-    /// no zeroing. Just reset the bump pointer.
+    /// Reset the arena in O(1); all prior allocations become invalid.
     #[inline]
     pub fn reset(&self) {
         self.offset.set(0);
@@ -99,22 +51,14 @@ impl SearchArena {
         cap
     }
 
-    /// Allocate `count` elements of type `T` from the arena.
-    ///
-    /// Returns a pointer to the allocated memory. The caller is responsible
-    /// for writing to this memory before reading.
-    ///
-    /// # Panics
-    ///
-    /// Never panics. If the arena is full, it grows automatically.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer is valid until `reset()` is called or the arena
-    /// is dropped. The caller must not use the pointer after either event.
-    /// This is enforced by the lifetime parameter on `ArenaVec`.
+    /// Allocate `count` elements of type `T`; grows automatically.
+    /// The returned pointer is valid until `reset()` is called or the arena is dropped.
     pub(super) fn alloc<T>(&self, count: usize) -> *mut T {
-        let size = std::mem::size_of::<T>() * count;
+        // Use checked arithmetic to avoid overflow: size_of::<T>() * count can
+        // overflow for large `count` values on 32-bit platforms or huge allocations.
+        let size = std::mem::size_of::<T>()
+            .checked_mul(count)
+            .expect("arena alloc size overflow");
         let align = std::mem::align_of::<T>();
 
         if size == 0 {
@@ -150,10 +94,8 @@ impl SearchArena {
         ptr
     }
 
-    /// Copy `src` slice into the arena and return a mutable pointer to the copy.
-    ///
-    /// Useful for bulk-copying data into the arena. Allocates space for
-    /// `src.len()` elements, copies them in, and returns a pointer to the copy.
+    /// Copy `src` into the arena and return a mutable pointer to the copy.
+    // REASON: convenience primitive for future arena consumers; avoids re-implementing unsafe copy.
     #[allow(dead_code)]
     pub(super) fn alloc_copy<T: Copy>(&self, src: &[T]) -> *mut T {
         if src.is_empty() {

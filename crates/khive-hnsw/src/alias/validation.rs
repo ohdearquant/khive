@@ -1,40 +1,19 @@
 //! Pre-swap validation for index migrations.
-//!
-//! Before committing an alias swap, the system can optionally run a validation
-//! function to verify that the new index meets quality requirements. The primary
-//! validator is `RecallValidator`, which checks recall@k against a set of
-//! golden queries with known ground-truth results.
 
 use super::error::AliasError;
 use crate::HnswIndex;
 use crate::NodeId;
 
-/// Trait for validating an index before an alias swap.
-///
-/// Implementations should be stateless or cheaply cloneable, as they may be
-/// called from within a `spawn_blocking` context.
+/// Validate an index before an alias swap; implementations should be stateless or cheaply cloneable.
 pub trait IndexValidator: Send + Sync {
     /// Validate the new index. Return `Ok(())` to proceed with the swap,
     /// or `Err(AliasError::ValidationFailed)` to abort.
     fn validate(&self, new_index: &HnswIndex) -> Result<(), AliasError>;
 }
 
-/// Validates a new index by running recall@k against golden queries.
+/// Validates recall@k against golden queries before an alias swap.
 ///
-/// Golden queries are `(query_vector, expected_result_ids)` pairs where the
-/// expected results are the true nearest neighbors (typically computed via
-/// brute-force on the same dataset).
-///
-/// # Recall Computation
-///
-/// For each golden query, we search the new index for `k` results and compute:
-///
-/// ```text
-/// recall = |returned ∩ expected| / |expected|
-/// ```
-///
-/// The overall recall is the mean across all golden queries. The swap is
-/// approved if `mean_recall >= min_recall`.
+/// Swap is approved when `mean_recall >= min_recall` across all golden queries.
 pub struct RecallValidator {
     /// Golden queries: `(query_vector, expected_nearest_ids)`.
     pub golden_queries: Vec<(Vec<f32>, Vec<NodeId>)>,
@@ -104,8 +83,7 @@ impl IndexValidator for RecallValidator {
     }
 }
 
-/// A validator that always passes. Useful for testing or when validation
-/// is not needed.
+/// A validator that always passes; useful for testing or when validation is not needed.
 pub struct NoopValidator;
 
 impl IndexValidator for NoopValidator {

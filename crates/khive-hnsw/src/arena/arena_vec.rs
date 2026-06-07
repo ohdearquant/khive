@@ -1,21 +1,4 @@
-//! Arena-backed growable vector.
-//!
-//! `ArenaVec<'a, T>` is a vector that allocates from a `SearchArena` instead
-//! of the global allocator. It supports push, pop, clear, len, iter, and drain.
-//!
-//! # Growth Strategy
-//!
-//! When capacity is exceeded, `ArenaVec` allocates a new (larger) region from
-//! the arena and copies existing elements. The old region is "leaked" in the
-//! arena -- this is fine because the arena will be reset between queries,
-//! reclaiming all memory at once.
-//!
-//! # Lifetime
-//!
-//! The `'a` lifetime ties this vec to its arena. The vec cannot outlive the
-//! arena, and `reset()` on the arena logically invalidates all vecs. In
-//! practice, the search code creates vecs at the start of a query and drops
-//! them before calling `reset()`.
+//! Arena-backed growable vector (`ArenaVec<'a, T>`) — allocates from `SearchArena`, reset is O(1).
 
 use super::arena::SearchArena;
 
@@ -93,12 +76,7 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
         self.len = 0;
     }
 
-    /// Get a reference to the element at `index`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index >= len`. Uses `assert!` (not `debug_assert!`) so
-    /// bounds enforcement is never compiled out in release builds (#2530).
+    /// Get element at `index`. Panics if out of bounds (assert, not debug_assert).
     #[inline]
     pub fn get(&self, index: usize) -> &T {
         assert!(index < self.len, "ArenaVec index out of bounds");
@@ -106,11 +84,7 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
         unsafe { &*self.ptr.add(index) }
     }
 
-    /// Get an optional reference to the element at `index` (issue #2530).
-    ///
-    /// Returns `None` instead of panicking when `index >= len`. Prefer this
-    /// over `get()` when the caller cannot statically guarantee the index is
-    /// within bounds.
+    /// Get an optional reference at `index`; returns `None` instead of panicking when out of bounds.
     #[inline]
     pub fn try_get(&self, index: usize) -> Option<&T> {
         if index < self.len {
@@ -121,12 +95,7 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
         }
     }
 
-    /// Get a mutable reference to the element at `index`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index >= len`. Uses `assert!` (not `debug_assert!`) so
-    /// bounds enforcement is never compiled out in release builds (#2530).
+    /// Get mutable reference at `index`. Panics if out of bounds (assert, not debug_assert).
     #[inline]
     pub fn get_mut(&mut self, index: usize) -> &mut T {
         assert!(index < self.len, "ArenaVec index out of bounds");
@@ -134,9 +103,7 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
         unsafe { &mut *self.ptr.add(index) }
     }
 
-    /// Get an optional mutable reference to the element at `index` (issue #2530).
-    ///
-    /// Returns `None` instead of panicking when `index >= len`.
+    /// Get an optional mutable reference at `index`; returns `None` instead of panicking.
     #[inline]
     pub fn try_get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len {
@@ -218,12 +185,14 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
         self.as_mut_slice().sort_by(compare);
     }
 
-    /// Grow the allocation by doubling capacity (minimum 8).
-    ///
-    /// Allocates a new region from the arena and copies existing elements.
-    /// The old region is leaked in the arena -- reclaimed on reset().
+    /// Double capacity (minimum 8); old region is leaked in the arena and reclaimed on reset.
     fn grow(&mut self) {
-        let new_cap = if self.cap == 0 { 8 } else { self.cap * 2 };
+        let new_cap = if self.cap == 0 {
+            8
+        } else {
+            // Use saturating_mul to avoid overflow on pathologically large arenas.
+            self.cap.saturating_mul(2)
+        };
         let new_ptr = self.arena.alloc::<T>(new_cap);
         if self.len > 0 {
             // SAFETY: copying len elements from old region (ptr, len elements)

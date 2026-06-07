@@ -8,10 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-/// Shared JSON value backed by `Arc<serde_json::Value>`.
-///
-/// Keeps clones of large JSON payloads cheap in hot paths like
-/// `FoldOutcome` construction and sequential fold context mapping.
+/// Arc-backed shared JSON value; cheap to clone in hot paths.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SharedJson(Arc<serde_json::Value>);
 
@@ -95,14 +92,7 @@ impl<'de> Deserialize<'de> for SharedJson {
     }
 }
 
-/// Context for fold operations.
-///
-/// The context parameterizes fold behavior — same entries with
-/// different contexts may produce different derived states.
-///
-/// `as_of` defaults to the Unix epoch (`DateTime::<Utc>::default()`).
-/// Callers that need "now" must pass it explicitly via [`FoldContext::at`].
-/// This preserves the ADR-024 "no clock" invariant for the foundation layer.
+/// Context for fold operations; `as_of` defaults to Unix epoch.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FoldContext {
@@ -114,18 +104,12 @@ pub struct FoldContext {
     pub correlation_id: Option<Uuid>,
 
     /// Additional context as shared JSON.
-    ///
-    /// Uses `SharedJson` (Arc-backed) so clones are cheap in hot paths.
     #[cfg_attr(feature = "serde", serde(default))]
     pub extra: SharedJson,
 }
 
 impl FoldContext {
     /// Create a new context with the Unix epoch as `as_of`.
-    ///
-    /// Per ADR-024 ("no clock"), the foundation layer does not call `Utc::now()`.
-    /// Pass an explicit timestamp via [`FoldContext::at`] when a real wall-clock
-    /// instant is needed.
     pub fn new() -> Self {
         Self::default()
     }

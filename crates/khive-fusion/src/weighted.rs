@@ -1,44 +1,11 @@
-//! Weighted linear combination fusion.
-//!
-//! # Weight Normalization (RETRIEVAL-07)
-//!
-//! Weights are automatically normalized to sum to 1.0 before fusion.
-//! This ensures consistent behavior regardless of the input weight scale.
-//!
-//! ## Normalization Behavior
-//!
-//! | Input Weights | Normalized Weights | Behavior |
-//! |--------------|-------------------|----------|
-//! | `[0.7, 0.3]` | `[0.7, 0.3]` | Already normalized |
-//! | `[7.0, 3.0]` | `[0.7, 0.3]` | Scaled to sum to 1.0 |
-//! | `[1.0, 1.0, 1.0]` | `[0.333, 0.333, 0.333]` | Equal distribution |
-//! | `[0.0, 0.0]` | `[0.5, 0.5]` | Fallback to equal |
-//! | `[1.0, -0.5]` | `[1.0, 0.0]` | Negatives treated as 0 |
-//!
-//! ## Example
-//!
-//! ```rust
-//! use khive_fusion::weighted_fusion;
-//! use khive_score::DeterministicScore;
-//!
-//! let semantic = vec![("doc1", DeterministicScore::from_f64(0.9))];
-//! let keyword = vec![("doc1", DeterministicScore::from_f64(0.8))];
-//!
-//! // These produce identical results due to normalization:
-//! let result1 = weighted_fusion(vec![semantic.clone(), keyword.clone()], &[0.6, 0.4]);
-//! let result2 = weighted_fusion(vec![semantic, keyword], &[6.0, 4.0]);
-//! // result1 == result2
-//! ```
+//! Weighted linear combination fusion with per-source min-max normalization.
 
 use khive_score::{weighted_sum, DeterministicScore};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// Min-max normalize a single source's scores to [0, 1] for cross-source fusion (#2496).
-///
-/// When all scores are equal (or the source has one element) every entry
-/// receives 1.0 so it still contributes to the weighted combination.
+/// Min-max normalize scores to `[0, 1]`; equal/single-element sources map to 1.0.
 const SCORE_SCALE: i128 = 4_294_967_296; // 2^32 — represents 1.0 in DeterministicScore
 
 fn min_max_normalize_source<Id>(
@@ -66,43 +33,8 @@ fn min_max_normalize_source<Id>(
         .collect()
 }
 
-/// Weighted linear combination of scores.
-///
-/// Combines scores using weighted averaging. Weights are automatically normalized
-/// to sum to 1.0, allowing flexible input ranges (see module documentation).
-///
-/// # Weight Normalization (RETRIEVAL-07)
-///
-/// Weights are normalized as follows:
-/// 1. Negative weights are treated as 0.0
-/// 2. If all weights are <= 0, equal distribution is used
-/// 3. Otherwise, weights are divided by their sum to normalize to 1.0
-///
-/// This normalization ensures:
-/// - Consistent results regardless of weight scale
-/// - Graceful handling of edge cases (all zeros, negatives)
-/// - No need for callers to pre-normalize weights
-///
-/// # Warning
-///
-/// This requires score normalization before calling, as different retrievers
-/// may produce scores on different scales (e.g., cosine similarity 0-1 vs BM25 0-infinity).
-/// Consider using min-max normalization or z-score normalization on individual
-/// retriever results before fusion.
-///
-/// # Arguments
-///
-/// * `sources` - Vector of result lists with scores.
-/// * `weights` - Weights for each source. Will be normalized to sum to 1.0.
-///
-/// # Returns
-///
-/// A vector sorted by weighted score descending, with ties broken by ID
-/// for deterministic cross-platform ordering.
-///
-/// # Panics
-///
-/// Does not panic. Returns empty vector if sources is empty.
+/// Weighted linear combination of per-source min-max-normalized scores.
+/// Negatives/NaN weights → 0; all-zero falls back to equal distribution.
 pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     weights: &[f64],
@@ -111,35 +43,76 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
         return Vec::new();
     }
 
-    // Normalize weights
-    let weight_sum: f64 = weights.iter().filter(|w| **w > 0.0).sum();
+    // Treat non-finite weights as 0.0 before normalization to avoid NaN/inf
+    // propagating into DeterministicScore arithmetic (finding #3).
+    let sanitized: Vec<f64> = weights
+        .iter()
+        .map(|&w| if w.is_finite() && w > 0.0 { w } else { 0.0 })
+        .collect();
+
+    // Normalize weights. Only consider entries that correspond to an actual source
+    // (extra weight entries beyond sources.len() do not correspond to any source
+    // and must not steal probability mass — finding #1).
+    let active_count = sources.len().min(sanitized.len());
+    let weight_sum: f64 = sanitized[..active_count].iter().sum();
+
     let normalized: Vec<f64> = if weight_sum <= 0.0 {
-        // All zero/negative weights -> equal distribution
+        // All zero/negative/non-finite weights -> equal distribution across sources
         vec![1.0 / sources.len() as f64; sources.len()]
     } else {
-        weights
-            .iter()
-            .map(|w| if *w > 0.0 { w / weight_sum } else { 0.0 })
+        // Build a per-source normalized weight vector of length == sources.len().
+        // Sources beyond the weights array receive 0.0 (excluded from output).
+        (0..sources.len())
+            .map(|i| sanitized.get(i).map(|&w| w / weight_sum).unwrap_or(0.0))
             .collect()
     };
 
-    // Estimate capacity
-    let estimated_capacity: usize = sources.iter().map(|s| s.len()).sum();
+    // Estimate capacity (safe saturating sum to avoid usize overflow — finding #6).
+    let estimated_capacity: usize = sources
+        .iter()
+        .map(|s| s.len())
+        .fold(0usize, |acc, n| acc.saturating_add(n));
     let mut combined: HashMap<Id, DeterministicScore> = HashMap::with_capacity(estimated_capacity);
 
     for (source_idx, results) in sources.into_iter().enumerate() {
-        // Sources beyond the weights array get weight 0.0 (silently ignored).
-        let weight = normalized.get(source_idx).copied().unwrap_or(0.0);
+        let weight = normalized[source_idx];
+
+        // Skip zero-weight sources entirely — they must not inject documents
+        // with zero scores into the output (finding #2).
+        if weight == 0.0 {
+            continue;
+        }
 
         // Normalize each source to [0,1] before weighted combination so that
         // BM25 unbounded scores and cosine [0,1] scores contribute proportionally
         // to their configured weights (#2496/#2639).
+        //
+        // Deduplicate IDs within the source before merging: keep the maximum
+        // normalized score for each ID so one retriever cannot double-count a
+        // document (finding #4).
         let norm_results = min_max_normalize_source(results);
+        let mut source_best: HashMap<Id, DeterministicScore> =
+            HashMap::with_capacity(norm_results.len());
         for (id, score) in norm_results {
+            source_best
+                .entry(id)
+                .and_modify(|existing| {
+                    if score > *existing {
+                        *existing = score;
+                    }
+                })
+                .or_insert(score);
+        }
+
+        for (id, score) in source_best {
             // weighted_sum converts weight to DeterministicScore internally and
             // accumulates in i128 — no float arithmetic in the hot path.
-            let w = weighted_sum(&[score], &[weight])
-                .expect("single score and weight have matching lengths");
+            // weight is finite and > 0 here (checked above), so weighted_sum
+            // cannot return NonFiniteWeight.
+            let w = match weighted_sum(&[score], &[weight]) {
+                Ok(s) => s,
+                Err(_) => continue, // defensive: skip on unexpected error
+            };
             let entry = combined.entry(id).or_insert(DeterministicScore::ZERO);
             *entry = *entry + w;
         }
@@ -157,47 +130,14 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     fused
 }
 
-/// Check if weights are already normalized (sum to approximately 1.0).
-///
-/// This is a utility function for callers who want to verify or log
-/// whether their weights needed normalization.
-///
-/// # Arguments
-///
-/// * `weights` - The weights to check.
-/// * `tolerance` - How close to 1.0 is acceptable (e.g., 1e-6).
-///
-/// # Returns
-///
-/// `true` if the sum of positive weights is within `tolerance` of 1.0.
-///
-/// # Example
-///
-/// ```rust
-/// use khive_fusion::weights_are_normalized;
-///
-/// assert!(weights_are_normalized(&[0.6, 0.4], 1e-6));
-/// assert!(!weights_are_normalized(&[6.0, 4.0], 1e-6));
-/// ```
+/// Returns `true` if positive weights sum to within `tolerance` of 1.0.
 #[inline]
 pub fn weights_are_normalized(weights: &[f64], tolerance: f64) -> bool {
     let sum: f64 = weights.iter().filter(|w| **w > 0.0).sum();
     (sum - 1.0).abs() <= tolerance
 }
 
-/// Normalize weights to sum to 1.0.
-///
-/// This is the same normalization logic used internally by `weighted_fusion`,
-/// exposed for callers who want to inspect or use the normalized weights.
-///
-/// # Arguments
-///
-/// * `weights` - Input weights (may be any positive scale).
-///
-/// # Returns
-///
-/// Normalized weights that sum to 1.0. Negative weights become 0.0.
-/// If all weights are <= 0, returns equal distribution.
+/// Normalize weights to sum to 1.0. Negative weights become 0.0; all-zero gives equal distribution.
 pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
     if weights.is_empty() {
         return Vec::new();
@@ -213,6 +153,16 @@ pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
             .map(|w| if *w > 0.0 { w / weight_sum } else { 0.0 })
             .collect()
     }
+}
+
+/// Normalize weights with strict validation. Returns `Err(index)` if any weight is non-finite.
+pub fn try_normalize_weights(weights: &[f64]) -> Result<Vec<f64>, usize> {
+    for (i, &w) in weights.iter().enumerate() {
+        if !w.is_finite() {
+            return Err(i);
+        }
+    }
+    Ok(normalize_weights(weights))
 }
 
 #[cfg(test)]

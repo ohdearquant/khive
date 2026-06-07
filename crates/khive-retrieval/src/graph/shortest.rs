@@ -8,45 +8,7 @@ use crate::error::{Result, RetrievalError};
 
 use super::types::{PathNode, MAX_TRAVERSAL_DEPTH};
 
-/// Find the shortest path between two entities using bidirectional BFS.
-///
-/// Bidirectional BFS searches from both start and end simultaneously,
-/// meeting in the middle. This reduces search space from O(b^d) to O(b^(d/2))
-/// where b = branching factor and d = path depth.
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `from` - Starting entity reference
-/// * `to` - Target entity reference
-/// * `max_depth` - Maximum path length (clamped to [`MAX_TRAVERSAL_DEPTH`])
-///
-/// # Returns
-///
-/// - `Some(Vec<PathNode>)` - Path from source to target (inclusive)
-///   - `path[0]` is the start node (via_link = None)
-///   - `path[i].via_link` is the edge from `path[i-1]` to `path[i]`
-/// - `None` - No path exists within max_depth
-///
-/// # Complexity
-///
-/// - Time: O(b^(d/2)) vs O(b^d) for standard BFS
-/// - Space: O(b^(d/2)) for both frontiers
-///
-/// # Example
-///
-/// ```ignore
-/// let path = find_shortest_path(&store, &ctx, alice_ref, bob_ref, 5).await?;
-/// if let Some(path) = path {
-///     println!("Found path of {} hops", path.len() - 1);
-///     for node in &path {
-///         if let Some(link) = &node.via_link {
-///             println!("  via {} to {:?}", link.relation, node.entity_id);
-///         }
-///     }
-/// }
-/// ```
+/// Bidirectional BFS shortest path. Returns `Some(path)` inclusive of endpoints, or `None` if unreachable within `max_depth`.
 pub async fn find_shortest_path<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,
@@ -85,7 +47,9 @@ pub async fn find_shortest_path<S: LinkStore>(
     // find the meeting node with the smallest total distance, not just the
     // first one encountered (which depends on HashMap iteration order).
     while !forward_queue.is_empty() || !backward_queue.is_empty() {
-        if current_depth > max_depth {
+        // Stop expanding once we've reached max_depth — any neighbor would be
+        // at depth current_depth + 1 = max_depth + 1, exceeding the budget.
+        if current_depth >= max_depth {
             break;
         }
 
@@ -109,10 +73,13 @@ pub async fn find_shortest_path<S: LinkStore>(
                         );
                         forward_queue.push_back(neighbor.clone());
 
-                        // Check if we've met the backward search
+                        // Check if we've met the backward search.
+                        // Only accept meetings whose total path length ≤ max_depth.
                         if let Some((bwd_dist, _, _)) = backward_visited.get(&neighbor) {
                             let total = fwd_dist + bwd_dist;
-                            if best_meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                            if total <= max_depth
+                                && best_meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                            {
                                 best_meeting = Some((neighbor, total));
                             }
                         }
@@ -148,10 +115,13 @@ pub async fn find_shortest_path<S: LinkStore>(
                         );
                         backward_queue.push_back(neighbor.clone());
 
-                        // Check if we've met the forward search
+                        // Check if we've met the forward search.
+                        // Only accept meetings whose total path length ≤ max_depth.
                         if let Some((fwd_dist, _, _)) = forward_visited.get(&neighbor) {
                             let total = fwd_dist + bwd_dist;
-                            if best_meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                            if total <= max_depth
+                                && best_meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                            {
                                 best_meeting = Some((neighbor, total));
                             }
                         }
@@ -226,7 +196,7 @@ fn reconstruct_path(
         // lacked an entry for `current` (shouldn't happen in a consistent
         // graph, but guards against any map skew), include `current` so
         // the target node is never silently dropped.
-        if backward_entities.last().map_or(true, |e| e != &current) {
+        if backward_entities.last() != Some(&current) {
             backward_entities.push(current.clone());
         }
     }

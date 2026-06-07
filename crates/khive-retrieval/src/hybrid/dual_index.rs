@@ -1,45 +1,4 @@
 //! Dual-index query routing for embedding model migration.
-//!
-//! During an embedding model migration, both old and new embedding indexes coexist.
-//! The retrieval system must query both indexes and merge results to maintain search
-//! quality throughout the transition. This module provides a routing layer that
-//! decides which indexes to query and fuses the results using the fusion system.
-//!
-//! # Migration Lifecycle
-//!
-//! ```text
-//! Phase 1 (start):  Both → query old + new, fuse with RRF
-//! Phase 2 (mid):    Weighted → prefer new, still query old
-//! Phase 3 (end):    PrimaryOnly → new index fully populated
-//! ```
-//!
-//! # Example
-//!
-//! ```rust
-//! use khive_retrieval::hybrid::dual_index::{DualIndexConfig, DualIndexRouter, DualIndexStrategy};
-//! use khive_score::DeterministicScore;
-//!
-//! // During migration: query both indexes, fuse with RRF
-//! let config = DualIndexConfig::default();
-//! let router = DualIndexRouter::<String>::new(config);
-//!
-//! assert!(router.should_query_primary(None));
-//! assert!(router.should_query_legacy(None));
-//!
-//! // Merge results from both indexes
-//! let primary = vec![
-//!     ("doc_a".to_string(), DeterministicScore::from_f64(0.9)),
-//!     ("doc_b".to_string(), DeterministicScore::from_f64(0.8)),
-//! ];
-//! let legacy = vec![
-//!     ("doc_b".to_string(), DeterministicScore::from_f64(0.95)),
-//!     ("doc_c".to_string(), DeterministicScore::from_f64(0.7)),
-//! ];
-//!
-//! let merged = router.merge_results(primary, legacy, 10);
-//! // doc_b appears in both, gets highest RRF score
-//! assert_eq!(merged[0].0, "doc_b");
-//! ```
 
 use std::hash::Hash;
 
@@ -140,16 +99,7 @@ impl DualIndexConfig {
     }
 }
 
-/// Routes queries between primary (new) and legacy (old) vector indexes.
-///
-/// During embedding model migration, this router ensures search quality
-/// by querying both indexes and fusing results. It is generic over the
-/// document ID type, matching the [`VectorSearch`](crate::hybrid::VectorSearch) trait.
-///
-/// # Type Parameters
-///
-/// * `Id` - The identifier type for search results. Must implement `Eq + Hash + Clone + Ord`
-///   for deterministic fusion (same bounds as [`fuse`]).
+/// Routes queries between primary (new) and legacy (old) vector indexes during migration.
 pub struct DualIndexRouter<Id> {
     config: DualIndexConfig,
     _marker: std::marker::PhantomData<Id>,
@@ -168,16 +118,11 @@ where
     }
 
     /// Determine whether the primary (new) index should be queried.
-    ///
-    /// Returns `false` only for [`DualIndexStrategy::LegacyOnly`].
     pub fn should_query_primary(&self, _migration_progress: Option<f64>) -> bool {
         !matches!(self.config.strategy, DualIndexStrategy::LegacyOnly)
     }
 
     /// Determine whether the legacy (old) index should be queried.
-    ///
-    /// Returns `false` for [`DualIndexStrategy::PrimaryOnly`], and also returns
-    /// `false` when migration progress exceeds the auto-switch threshold.
     pub fn should_query_legacy(&self, migration_progress: Option<f64>) -> bool {
         match &self.config.strategy {
             DualIndexStrategy::PrimaryOnly => false,
@@ -195,26 +140,12 @@ where
         }
     }
 
-    /// Get the candidate pool size for each index.
-    ///
-    /// Returns `top_k * pool_multiplier`.
+    /// Get the candidate pool size for each index (`top_k * pool_multiplier`).
     pub fn pool_size(&self, top_k: usize) -> usize {
-        top_k * self.config.pool_multiplier
+        top_k.saturating_mul(self.config.pool_multiplier)
     }
 
-    /// Merge results from primary and legacy indexes.
-    ///
-    /// Applies the configured strategy to combine results:
-    /// - `PrimaryOnly`: returns primary results (truncated)
-    /// - `LegacyOnly`: returns legacy results (truncated)
-    /// - `Both`: fuses both result sets using the configured fusion strategy
-    /// - `Weighted`: fuses with per-index weights
-    ///
-    /// # Arguments
-    ///
-    /// * `primary_results` - Results from the new embedding index
-    /// * `legacy_results` - Results from the old embedding index
-    /// * `top_k` - Number of results to return after merging
+    /// Merge results from primary and legacy indexes using the configured strategy.
     pub fn merge_results(
         &self,
         primary_results: Vec<(Id, DeterministicScore)>,
@@ -234,13 +165,17 @@ where
             }
             DualIndexStrategy::Both { fusion } => {
                 let sources = vec![primary_results, legacy_results];
-                fuse(sources, fusion, top_k)
+                let safe = match fusion {
+                    FusionStrategy::Custom { .. } => &FusionStrategy::default(),
+                    s => s,
+                };
+                fuse(sources, safe, top_k).expect("non-Custom strategies are infallible")
             }
             DualIndexStrategy::Weighted { primary_weight } => {
                 let w = primary_weight.clamp(0.0, 1.0);
                 let strategy = FusionStrategy::weighted(vec![w, 1.0 - w]);
                 let sources = vec![primary_results, legacy_results];
-                fuse(sources, &strategy, top_k)
+                fuse(sources, &strategy, top_k).expect("Weighted is infallible")
             }
         }
     }

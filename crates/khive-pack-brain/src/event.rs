@@ -1,3 +1,5 @@
+//! Brain event interpretation — maps raw `Event` records to typed `BrainSignal` values.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,7 @@ use khive_types::EventOutcome;
 
 use crate::state::SectionType;
 
-/// Feedback signal values for the `brain.feedback` verb (ADR-032 §3).
+/// Feedback signal values for the `brain.feedback` verb.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackSignal {
@@ -83,11 +85,11 @@ impl FeedbackEventKind {
     }
 }
 
-/// Interpreted brain signal extracted from a raw Event (ADR-032 §4).
+/// Interpreted brain signal extracted from a raw Event.
 ///
 /// `interpret()` is the single mapping layer from the shared event log to
 /// brain-internal signals. No parallel event enum is needed; the Event
-/// substrate IS the source of truth.
+/// substrate is the source of truth.
 #[derive(Debug)]
 pub enum BrainSignal {
     /// A recall verb succeeded — positive signal for the recalled entity.
@@ -120,15 +122,14 @@ pub enum BrainSignal {
     Irrelevant,
 }
 
-/// Extract a brain signal from a raw storage Event (ADR-032 §4).
+/// Extract a brain signal from a raw storage Event.
 ///
 /// `brain.emit` is no longer handled here — it was renamed to `brain.feedback`
-/// per ADR-032 §11 (`brain.feedback` is the `FeedbackExplicit` event emitter).
-/// Any `brain.emit` event that predates this ADR is treated as Irrelevant so
+/// (`brain.feedback` is the `FeedbackExplicit` event emitter).
+/// Any `brain.emit` event that predates this rename is treated as Irrelevant so
 /// that old event log entries do not cause spurious feedback updates.
 ///
-/// To add a new signal source: add one match arm to this function. That is
-/// the entire extension surface (ADR-032 §4).
+/// To add a new signal source: add one match arm to this function.
 pub fn interpret(event: &Event) -> BrainSignal {
     match event.verb.as_str() {
         "recall" => match event.outcome {
@@ -144,8 +145,8 @@ pub fn interpret(event: &Event) -> BrainSignal {
         "search" => BrainSignal::SearchCompleted {
             latency_us: event.duration_us,
         },
-        // brain.feedback is the ADR-032 §11 verb for FeedbackExplicit events.
-        // (brain.emit predates this ADR; treated as Irrelevant for old replays.)
+        // brain.feedback is the verb for FeedbackExplicit events.
+        // (brain.emit predates this rename; treated as Irrelevant for old replays.)
         "brain.feedback" => {
             let target = match event.target_id {
                 Some(t) => t,
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn brain_emit_legacy_is_irrelevant() {
-        // brain.emit predates ADR-032; old log entries must not trigger feedback.
+        // brain.emit predates brain.feedback; old log entries must not trigger feedback.
         let id = Uuid::new_v4();
         let mut e = make_event("brain.emit", EventOutcome::Success, Some(id));
         e.payload = serde_json::json!({"signal": "useful"});

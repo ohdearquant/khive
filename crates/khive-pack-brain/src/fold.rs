@@ -1,3 +1,5 @@
+//! Beta-posterior fold implementations for brain profiles.
+
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
 
@@ -6,14 +8,7 @@ use crate::event::{
 };
 use crate::state::{BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP};
 
-/// Fold for the `BalancedRecallProfile` state (ADR-032 §5a).
-///
-/// The predecessor design had this fold update a flat `HashMap<String, BetaPosterior>`
-/// on the brain's core `BrainState`. Per ADR-032, the three-scalar Bayesian state
-/// now lives entirely inside `BalancedRecallProfile` — brain's `BrainState` holds
-/// profile registry metadata; posteriors are opaque to brain.
-///
-/// Deterministic: same events in same order → same `BalancedRecallState`.
+/// Fold for the `balanced-recall-v1` three-scalar Beta-posterior state.
 pub struct BalancedRecallFold {
     entity_capacity: usize,
 }
@@ -87,11 +82,10 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
         // Rationale for 50 ms (codex P12 Low): local SQLite FTS5 recall
         // completes in 1–20 ms under normal conditions. 50 ms provides
         // headroom for contention while remaining well below the 250 ms
-        // rerank budget (ADR-042 §SLO). A recall that exceeds 50 ms on a
-        // local store indicates either a cold cache or index degradation —
-        // both of which are valid negative temporal signals. Operators who
-        // need a different threshold should configure a custom profile
-        // (ADR-032 §future: threshold-as-config).
+        // rerank budget. A recall that exceeds 50 ms on a local store
+        // indicates either a cold cache or index degradation — both of
+        // which are valid negative temporal signals. Operators who need
+        // a different threshold should configure a custom profile.
         const FAST_US: i64 = 50_000;
         match &signal {
             BrainSignal::RecallHit { latency_us, .. } => {
@@ -142,12 +136,7 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
     }
 }
 
-/// Fold for section posteriors (ADR-048 Phase 1).
-///
-/// Only processes Feedback events that carry section_signals.
-/// Update rules: useful → alpha += 1, not_useful → beta += 1, wrong → beta += 2.
-/// ESS cap applied per section after each update.
-/// Exploration epoch decrements once per feedback event (floored at 0).
+/// Fold for per-profile section posteriors.
 pub struct SectionPosteriorFold;
 
 impl SectionPosteriorFold {
@@ -303,7 +292,7 @@ mod tests {
 
     #[test]
     fn brain_emit_legacy_does_not_update_entity() {
-        // brain.emit is now Irrelevant (ADR-032 migration boundary)
+        // brain.emit predates brain.feedback; now treated as Irrelevant
         let fold = BalancedRecallFold::new(100);
         let ctx = FoldContext::new();
         let mut state = fold.init(&ctx);

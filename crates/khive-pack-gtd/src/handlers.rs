@@ -2,6 +2,14 @@
 //!
 //! Each handler: deserialize params from Value → validate → mutate via runtime
 //! → serialize a stable response shape (`id` short hex + `full_id` UUID).
+//!
+//! FILE SIZE JUSTIFICATION: All five GTD verb handlers (`assign`, `next`, `complete`,
+//! `tasks`, `transition`) share internal helpers (`load_task`, `atomic_gtd_transition`,
+//! `ensure_audit_schema`, `write_audit_record`) that access `pub(crate)` symbols and
+//! must stay co-located to avoid circular imports within the crate. Splitting by verb
+//! would require either making those helpers `pub` (which widens the API surface) or
+//! duplicating them. The file is reviewed against this invariant at each significant
+//! change; see docs/design.md for the GTD lifecycle contract.
 
 use std::str::FromStr;
 
@@ -20,7 +28,7 @@ use crate::schema::{
 };
 use crate::GtdPack;
 
-// ── lifecycle audit schema (ADR-019 §schema_plan) ───────────────────────────
+// ── lifecycle audit schema ────────────────────────────────────────────────────
 
 /// Ensure `gtd_lifecycle_audit` and its index exist on the given runtime.
 ///
@@ -39,11 +47,6 @@ async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     };
     for stmt in &crate::GTD_SCHEMA_PLAN_STMTS {
         if let Err(e) = w.execute_script(stmt.to_string()).await {
-            // Swallow "duplicate column name" from the idempotent ALTER on existing DBs.
-            let msg = e.to_string();
-            if msg.contains("duplicate column name") {
-                continue;
-            }
             tracing::warn!(error = %e, stmt, "gtd: failed to apply lifecycle_audit schema stmt (non-fatal)");
         }
     }
@@ -498,26 +501,26 @@ impl GtdPack {
         }
 
         // Pre-validate each dependency target before any storage write. The GTD
-        // pack's ADR-031 edge rule only allows `depends_on` between two task
-        // notes — if a caller passes a non-task UUID, fail upfront so we don't
-        // leave an orphaned task row whose post-write `link` is rejected (the
-        // ADR-030 contract makes after_create non-propagating, so propagating a
-        // link failure here would diverge `assign` from `create(note_kind="task")`
-        // and violate the "no failure after successful write" rule).
+        // pack edge rule only allows `depends_on` between two task notes — if a
+        // caller passes a non-task UUID, fail upfront so we don't leave an orphaned
+        // task row whose post-write `link` is rejected (after_create is
+        // non-propagating, so propagating a link failure here would diverge `assign`
+        // from `create(note_kind="task")` and violate the "no failure after
+        // successful write" rule).
         for dep_uuid in &resolved_deps {
             match self.runtime().resolve(token, *dep_uuid).await? {
                 Some(Resolved::Note(n)) if n.kind == "task" => {}
                 Some(Resolved::Note(n)) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "depends_on target {dep_uuid} must be a task note for relation depends_on \
-                         (got note kind {:?}); the GTD pack's ADR-031 edge rule is task→task only",
+                         (got note kind {:?}); the GTD pack edge rule is task→task only",
                         n.kind
                     )));
                 }
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "depends_on target {dep_uuid} must be a task note for relation depends_on \
-                         (got non-note substrate); the GTD pack's ADR-031 edge rule is task→task only"
+                         (got non-note substrate); the GTD pack edge rule is task→task only"
                     )));
                 }
                 None => {
@@ -594,13 +597,13 @@ impl GtdPack {
             )
             .await?;
 
-        // Record `depends_on` as `depends_on` graph edges (ADR-031: the GTD
-        // pack's `EDGE_RULES` extends the entity-default contract to allow
-        // task→task here). Endpoints were pre-validated above, so the only way
-        // this fails is a storage hiccup after the task is already persisted —
-        // per ADR-030, log and continue rather than mislead the caller with
-        // `ok: false` for a task that's already on disk. The property captures
-        // the same dependency information for queries that bypass the graph.
+        // Record `depends_on` as graph edges (the GTD pack's `EDGE_RULES` extends
+        // the entity-default contract to allow task→task). Endpoints were
+        // pre-validated above, so the only way this fails is a storage hiccup
+        // after the task is already persisted — log and continue rather than
+        // mislead the caller with `ok: false` for a task that's already on disk.
+        // The property captures the same dependency information for queries that
+        // bypass the graph.
         for dep_uuid in resolved_deps {
             if let Err(e) = self
                 .runtime()
@@ -611,7 +614,7 @@ impl GtdPack {
                     from = %note.id,
                     to = %dep_uuid,
                     error = %e,
-                    "assign: depends_on edge failed after task write (non-fatal, ADR-030)"
+                    "assign: depends_on edge failed after task write (non-fatal, best-effort)"
                 );
             }
         }
@@ -726,11 +729,15 @@ impl GtdPack {
             })
             .collect();
 
-        // Sort: priority ascending (p0 first), then created_at descending (recent first).
+        // Sort: priority ascending (p0 first), then created_at descending (recent first),
+        // then UUID ascending as a deterministic tie-breaker for equal-priority equal-timestamp
+        // tasks so callers always observe a stable ordering.
         actionable.sort_by(|a, b| {
             let ap = priority_rank(a.properties.as_ref());
             let bp = priority_rank(b.properties.as_ref());
-            ap.cmp(&bp).then(b.created_at.cmp(&a.created_at))
+            ap.cmp(&bp)
+                .then(b.created_at.cmp(&a.created_at))
+                .then(a.id.cmp(&b.id))
         });
         actionable.truncate(limit as usize);
 
@@ -814,7 +821,7 @@ impl GtdPack {
             return Err(RuntimeError::InvalidInput(message));
         }
 
-        // ADR-019: write lifecycle audit record (best-effort).
+        // Write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
         write_audit_record(
             self.runtime(),
@@ -998,7 +1005,7 @@ impl GtdPack {
             )));
         }
 
-        // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
+        // Write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
         write_audit_record(
             self.runtime(),

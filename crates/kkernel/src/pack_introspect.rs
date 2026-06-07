@@ -5,16 +5,15 @@
 //! set. They return data — JSON for machines, a table for humans — without
 //! invoking any handler.
 //!
-//! ADR-076 establishes that pack registration eventually lives in the kernel.
-//! For now both binaries collect the same set via `inventory!`; this module
-//! consumes whatever is registered and prints it.
+//! Pack registration uses dynamic self-registration via `inventory!`. This
+//! module consumes whatever is registered and prints it.
 
 use anyhow::{anyhow, Context, Result};
 use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder, Visibility};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde::Serialize;
 
-/// Visibility tier of a registered handler (ADR-017 §Visibility).
+/// Visibility tier of a registered handler.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VerbVisibility {
@@ -33,7 +32,7 @@ impl From<&Visibility> for VerbVisibility {
     }
 }
 
-/// Description of a single registered handler (ADR-017 §Introspection, F126).
+/// Description of a single registered handler.
 ///
 /// Includes `visibility` and `category` alongside `name` and `description`
 /// so introspection clients can distinguish MCP-exposed verbs from internal
@@ -163,12 +162,11 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // ADR-024 requires 11 KG verbs; ADR-046 adds propose/review/withdraw → 14 total;
-        // Wave 4 J-fix adds `verbs` discovery endpoint → 15 total; #280 adds `stats` → 16 total
+        // kg pack ships 16 verbs: 11 base + propose/review/withdraw (3) + verbs + stats (2)
         assert_eq!(
             info.verbs.len(),
             16,
-            "kg pack must expose 16 verbs (ADR-024 + ADR-046 + verbs discovery + stats); got {}: {:?}",
+            "kg pack must expose 16 verbs; got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );

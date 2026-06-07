@@ -1,18 +1,7 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
-//
 //! KG export / import — portable JSON archive for namespace-scoped knowledge graphs.
 //!
-//! Implements the v1 portability format described in ADR-010. Embeddings are
-//! intentionally excluded: they are regenerable from the embedding model + text
-//! and their inclusion would lock the format to a specific model.
-//!
-//! # Edge namespace enumeration
-//!
-//! `GraphStore::query_edges` has no namespace column — edges are linked to entities,
-//! not namespaces. Export collects all entity IDs in the namespace first, then
-//! queries edges where source_id is in that set. This covers every edge whose
-//! source entity belongs to the namespace, which is the correct definition of
-//! "edges in a namespace" for an export that preserves referential integrity.
+//! Embeddings are excluded (regenerable from text + model). Edges are collected by
+//! querying all entity IDs in the namespace first, then fetching incident edges.
 
 use std::collections::HashSet;
 
@@ -65,7 +54,7 @@ pub struct ExportedEntity {
 /// A directed edge record in the portable archive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportedEdge {
-    /// Stable edge identity across export/import cycles (ADR-048 D1).
+    /// Stable edge identity across export/import cycles.
     ///
     /// Old archives (pre-0.2) omit this field. `serde(default)` assigns a fresh
     /// UUID on import so backward-compatible archives are accepted as-is.
@@ -73,7 +62,7 @@ pub struct ExportedEdge {
     pub edge_id: Uuid,
     pub source: Uuid,
     pub target: Uuid,
-    /// One of the 13 canonical relations defined in ADR-002.
+    /// One of the 15 canonical edge relations.
     pub relation: EdgeRelation,
     pub weight: f64,
 }
@@ -218,10 +207,11 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str().to_owned();
 
-        // Import entities.
+        // Import entities — validate kind against pack registry.
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         for ee in &archive.entities {
+            self.validate_entity_kind(&ee.kind)?;
             let created_micros = ee.created_at.timestamp_micros();
             let updated_micros = ee.updated_at.timestamp_micros();
             let entity = khive_storage::entity::Entity {
@@ -257,6 +247,7 @@ impl KhiveRuntime {
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
         for ee in &archive.edges {
+            crate::operations::validate_edge_weight(ee.weight)?;
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
                 Err(RuntimeError::NotFound(_)) => false,
@@ -326,6 +317,9 @@ impl KhiveRuntime {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: tests here exercise portability serialisation
+// helpers and byte-level round-trip invariants that access private encoding
+// functions. Moving them to tests/ would require pub-exporting those helpers.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,7 +774,7 @@ mod tests {
         );
     }
 
-    // ── edge_id contract tests (ADR-048 D1) ──────────────────────────────────
+    // ── edge_id contract tests ────────────────────────────────────────────────
 
     /// 10. export_kg sets edge_id in the archive to the LinkId returned by link.
     #[tokio::test]
