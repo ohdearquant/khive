@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "khive stdio MCP server — the only user-facing Rust binary"
+description = "khive MCP server library — served via the kkernel binary"
 
 [dependencies]
 khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
@@ -40,7 +40,3 @@ async-trait = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.2.8", path = "../khive-pack-knowledge" }
-
-[[bin]]
-name = "khive-mcp"
-path = "src/main.rs"

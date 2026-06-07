@@ -1,20 +1,15 @@
-//! CLI argument definition and namespace resolution for `khive-mcp`.
+//! Serve-time argument definition and namespace resolution for `kkernel mcp`.
 //!
-//! Extracted from `main.rs` so integration tests can exercise the real `Args`
-//! parser with `Args::try_parse_from` without spawning the binary.
+//! These are the args the `kkernel mcp` subcommand flattens. Logging is owned by
+//! the binary's global `--log`, so it is intentionally absent here.
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use khive_runtime::Namespace;
 
-/// Parsed command-line arguments for the `khive-mcp` binary.
+/// Parsed serve-time arguments for the `kkernel mcp` subcommand.
 #[derive(Parser, Debug)]
-#[command(
-    name = "khive-mcp",
-    version,
-    about = "khive MCP server (stdio) — the only user-facing Rust binary"
-)]
 pub struct Args {
     /// Path to the khive database. Use \":memory:\" for an ephemeral in-memory database.
     #[arg(long, env = "KHIVE_DB")]
@@ -46,10 +41,6 @@ pub struct Args {
     #[arg(long, env = "KHIVE_NO_EMBED")]
     pub no_embed: bool,
 
-    /// Log level for stderr output (stdout is reserved for the MCP protocol).
-    #[arg(long, env = "KHIVE_LOG", default_value = "warn")]
-    pub log: String,
-
     /// Pack to load into the verb registry. Repeat for multiple
     /// (e.g. `--pack kg --pack gtd`). Falls back to `KHIVE_PACKS` env
     /// (comma- or whitespace-separated) or `["kg"]` if neither is set.
@@ -70,13 +61,24 @@ pub struct Args {
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Run as a persistent daemon over a Unix socket instead of stdio.
+    /// Run as a persistent daemon over a Unix socket instead of a foreground transport.
     ///
     /// The daemon owns the warm pack registry (ANN indexes) and serves request
     /// frames from thin stdio clients that auto-spawn it. Bound to
-    /// `~/.khive/khived.sock`.
+    /// `~/.khive/khived.sock`. Takes precedence over `--transport`.
     #[arg(long)]
     pub daemon: bool,
+
+    /// Foreground serving transport (registry name). Defaults to `stdio`.
+    ///
+    /// Additional transports (e.g. Streamable HTTP) can be registered before
+    /// serving; an unknown name errors with the registered set.
+    #[arg(long)]
+    pub transport: Option<String>,
+
+    /// Bind address for network transports (e.g. `0.0.0.0:8080`). Ignored by stdio.
+    #[arg(long)]
+    pub bind: Option<String>,
 }
 
 /// Resolve CLI namespace from `Args`. Returns `(explicit, namespace)`; errors on invalid namespace string.

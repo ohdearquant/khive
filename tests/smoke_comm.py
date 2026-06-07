@@ -17,8 +17,8 @@ import os
 import uuid
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"),
+    "KKERNEL_BINARY",
+    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
 )
 
 request_id = 0
@@ -110,7 +110,7 @@ def init_proc(proc, client_name="comm-smoke"):
 def spawn():
     """Spawn the MCP binary with kg + comm packs loaded."""
     return subprocess.Popen(
-        [BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+        [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
          "--pack", "kg", "--pack", "comm"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

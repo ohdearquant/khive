@@ -179,16 +179,11 @@ function getBinaryPath(binaryName) {
   process.exit(1);
 }
 
-// `khive mcp [args]` dispatches to the khive-mcp binary (MCP stdio server).
-// All other subcommands dispatch to kkernel (admin CLI).
-const subcommand = process.argv[2];
-const isMcp = subcommand === "mcp";
-const binaryName = isMcp ? "khive-mcp" : "kkernel";
-const args = isMcp ? process.argv.slice(3) : process.argv.slice(2);
-
+// Every subcommand dispatches to the single `kkernel` binary. `khive mcp [args]`
+// maps to `kkernel mcp [args]` — the MCP server lives under the `mcp` subcommand.
 try {
-  const binary = getBinaryPath(binaryName);
-  execFileSync(binary, args, {
+  const binary = getBinaryPath("kkernel");
+  execFileSync(binary, process.argv.slice(2), {
     stdio: "inherit",
     env: process.env,
   });

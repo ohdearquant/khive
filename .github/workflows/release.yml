@@ -97,7 +97,7 @@ jobs:
         if: ${{ !matrix.cross }}
         working-directory: crates
         run: |
-          cargo build --release --target ${{ matrix.target }} -p kkernel -p khive-mcp
+          cargo build --release --target ${{ matrix.target }} -p kkernel
 
       - name: Build binaries (zigbuild cross)
         if: ${{ matrix.cross }}
@@ -109,7 +109,7 @@ jobs:
           CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
           CFLAGS_aarch64_unknown_linux_gnu: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: |
-          cargo zigbuild --release --target ${{ matrix.target }} -p kkernel -p khive-mcp
+          cargo zigbuild --release --target ${{ matrix.target }} -p kkernel
 
       - name: Stage binaries into subpackage bin/
         shell: bash
@@ -119,12 +119,10 @@ jobs:
           # Remove the placeholder so it is not shipped in the published tarball (MIN-1).
           rm -f "${PKG_DIR}/.gitkeep"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp "${SRC}/kkernel.exe"    "${PKG_DIR}/kkernel.exe"
-            cp "${SRC}/khive-mcp.exe" "${PKG_DIR}/khive-mcp.exe"
+            cp "${SRC}/kkernel.exe" "${PKG_DIR}/kkernel.exe"
           else
-            cp "${SRC}/kkernel"    "${PKG_DIR}/kkernel"
-            cp "${SRC}/khive-mcp" "${PKG_DIR}/khive-mcp"
-            chmod +x "${PKG_DIR}/kkernel" "${PKG_DIR}/khive-mcp"
+            cp "${SRC}/kkernel" "${PKG_DIR}/kkernel"
+            chmod +x "${PKG_DIR}/kkernel"
           fi
 
       - name: Upload subpackage artifact

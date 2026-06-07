@@ -1,26 +1,49 @@
-//! khive-mcp binary entry point — parses CLI args, builds a `KhiveRuntime`,
-//! and serves over stdio (or runs as a daemon with `--daemon` on Unix).
+//! Build the runtime + server from CLI args and serve over the selected transport.
+//!
+//! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
+//! initialized by the binary, not here.
 
 use std::path::PathBuf;
 
-use clap::Parser;
-use khive_mcp::args::{resolve_cli_namespace, Args};
-use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
     config_from_env, runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, RuntimeConfig,
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+use crate::args::{resolve_cli_namespace, Args};
+use crate::server::KhiveMcpServer;
+use crate::transport::{ServeOptions, TransportRegistry};
 
-    // Tracing goes to stderr — stdout is MCP JSON-RPC.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(args.log.clone())
-        .with_ansi(false)
-        .init();
+/// Build a server from `args`, then serve it over `--daemon` or the named transport.
+pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    let server = build_server(&args)?;
 
+    #[cfg(unix)]
+    if args.daemon {
+        khive_runtime::daemon::run_daemon(server).await?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    if args.daemon {
+        anyhow::bail!(
+            "--daemon mode requires Unix (macOS/Linux). On Windows, use the stdio transport."
+        );
+    }
+
+    let transport_name = args.transport.as_deref().unwrap_or("stdio");
+    let transport = registry.get(transport_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown transport {transport_name:?}; registered: {}",
+            registry.names().join(", ")
+        )
+    })?;
+    let opts = ServeOptions {
+        bind: args.bind.clone(),
+    };
+    transport.serve(server, &opts).await
+}
+
+/// Build a fully-configured server from parsed args (without serving).
+pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     let db_path = match args.db.as_deref() {
         Some(":memory:") => None,
         Some(path) => Some(PathBuf::from(path)),
@@ -30,18 +53,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Namespace resolution — see resolve_cli_namespace in khive_mcp::args for semantics.
     let (cli_namespace_explicit, cli_namespace) =
-        resolve_cli_namespace(&args).map_err(|e| anyhow::anyhow!("{e}"))?;
+        resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // CLI `--pack` overrides env-derived default. Empty means "use default".
     let packs = if args.pack.is_empty() {
         RuntimeConfig::default().packs
     } else {
-        args.pack
+        args.pack.clone()
     };
 
-    // Build base config before embedding engine resolution.
     let base_config = RuntimeConfig {
         db_path,
         default_namespace: cli_namespace,
@@ -49,10 +69,7 @@ async fn main() -> anyhow::Result<()> {
         ..RuntimeConfig::default()
     };
 
-    // Resolve full config: embedding engines + actor namespace from config file.
     let config = if args.no_embed {
-        // --no-embed takes priority: zero out embedding.
-        // Still apply config-file actor if no CLI actor was given.
         let no_embed_base = RuntimeConfig {
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -68,18 +85,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let runtime = KhiveRuntime::new(config)?;
-    let server = KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?;
-    #[cfg(unix)]
-    if args.daemon {
-        khive_runtime::daemon::run_daemon(server).await?;
-        return Ok(());
-    }
-    #[cfg(not(unix))]
-    if args.daemon {
-        anyhow::bail!("--daemon mode requires Unix (macOS/Linux). On Windows, khive-mcp runs in stdio mode only.");
-    }
-    server.serve_stdio().await?;
-    Ok(())
+    KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Resolve the full config (embedding engines + actor namespace) from file or env.
@@ -101,7 +107,6 @@ fn resolve_config(
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
-            // Config file present — check if env vars are also set and warn.
             let env_primary = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
             let env_additional = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS").ok();
             if env_primary.is_some() || env_additional.is_some() {
@@ -111,9 +116,6 @@ fn resolve_config(
                 );
             }
 
-            // When the caller supplied --actor or --namespace, the CLI value wins
-            // over [actor] id in the config file. Nullify config actor so
-            // runtime_config_from_khive_config does not overwrite the base namespace.
             let effective_cfg = if cli_namespace_explicit {
                 let mut c = khive_cfg;
                 c.actor.id = None;
@@ -125,7 +127,6 @@ fn resolve_config(
             Ok(runtime_config_from_khive_config(&effective_cfg, base))
         }
         None => {
-            // No config file — fall back to env-var embedding path.
             let env_cfg = config_from_env();
             if env_cfg.engines.is_empty() {
                 Ok(base)
@@ -137,9 +138,6 @@ fn resolve_config(
 }
 
 /// Resolve only the actor namespace from a config file (no-embed path).
-///
-/// Used when `--no-embed` zeroed out embedding; we still want config-file
-/// `[actor] id` to apply if no CLI actor was given.
 fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
@@ -152,10 +150,6 @@ fn resolve_actor_from_config(
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
-            // KhiveConfig::validate() already ran inside load_with_home_fallback,
-            // so actor.id is guaranteed valid here. runtime_config_from_khive_config
-            // applies the actor, but we zero out embedding fields after the fact to
-            // preserve the --no-embed contract.
             let resolved = runtime_config_from_khive_config(&khive_cfg, base);
             Ok(RuntimeConfig {
                 embedding_model: None,

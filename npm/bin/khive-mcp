@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 
-// khive-mcp — per-platform binary shim for the MCP stdio server (ADR-026)
+// khive-mcp — compat shim aliasing `kkernel mcp` (ADR-026)
 //
-// Resolves the host platform to the matching @khive-ai/kernel-{platform}
-// optional dependency and execs the khive-mcp binary from its bin/ directory.
-// Falls back to a local cargo build directory for monorepo development.
+// The MCP server was folded into the single `kkernel` binary. This shim
+// resolves the host platform's `kkernel` (from the @khive-ai/kernel-{platform}
+// optional dependency, or a local cargo build) and execs `kkernel mcp [args]`.
 //
-// This shim is the companion to npm/bin/khive. Both use the same
-// `getBinaryPath()` logic — see npm/bin/khive for comments and rationale.
-// Keep detection order and platform mapping in sync between the two shims.
+// It is the companion to npm/bin/khive and shares the same `getBinaryPath()`
+// logic — keep detection order and platform mapping in sync between the two.
 //
 // Users configure this binary in Claude Code's MCP config:
 //   {"mcpServers": {"khive": {"command": "khive-mcp"}}}
@@ -147,9 +146,12 @@ function getBinaryPath(binaryName) {
   process.exit(1);
 }
 
+// Compat shim: `khive-mcp` is now an alias for `kkernel mcp`. The MCP server
+// was folded into the single `kkernel` binary; this preserves existing MCP
+// configs that spawn `khive-mcp` directly.
 try {
-  const binary = getBinaryPath("khive-mcp");
-  execFileSync(binary, process.argv.slice(2), {
+  const binary = getBinaryPath("kkernel");
+  execFileSync(binary, ["mcp", ...process.argv.slice(2)], {
     stdio: "inherit",
     env: process.env,
   });

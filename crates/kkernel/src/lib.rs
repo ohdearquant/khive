@@ -2,6 +2,7 @@
 
 pub mod coordinator;
 pub mod engine;
+pub mod exec;
 pub mod kg;
 pub mod pack_introspect;
 pub mod reindex;

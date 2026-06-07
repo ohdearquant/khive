@@ -73,8 +73,11 @@ fn map_response(resp: DaemonResponseFrame) -> Option<Result<String, McpError>> {
 
 fn spawn_daemon() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
+    // The binary is `kkernel`; the MCP server (and its daemon mode) live under
+    // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--daemon")
+    cmd.arg("mcp")
+        .arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -11,6 +11,8 @@
 //! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
 //! - `vector`  — vector store capabilities and orphan sweep
 //! - `reindex` — rebuild embedding vectors for entities and notes
+//! - `exec`    — run a verb DSL expression through the pack registry
+//! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
@@ -22,7 +24,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig};
-use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, reindex, sync, vector};
+use kkernel::{
+    coordinator::BackendRegistry, engine, exec, kg, pack_introspect, reindex, sync, vector,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,6 +70,13 @@ enum Command {
 
     /// Re-embed all entities and notes using the configured embedding model.
     Reindex(reindex::ReindexArgs),
+
+    /// Execute a verb DSL expression (same syntax as MCP `request` tool).
+    Exec(exec::ExecArgs),
+
+    /// Serve the MCP `request` surface (stdio by default; `--daemon` for the
+    /// warm Unix-socket server; `--transport` selects a registered transport).
+    Mcp(khive_mcp::args::Args),
 
     /// Inspect registered backends.
     #[command(subcommand)]
@@ -193,6 +204,11 @@ async fn main() -> Result<()> {
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
+        Command::Exec(e) => exec::run_exec(e).await,
+        Command::Mcp(a) => {
+            khive_mcp::serve::run(a, &khive_mcp::transport::TransportRegistry::with_builtins())
+                .await
+        }
         Command::Backend(b) => cmd_backend(b),
     }
 }

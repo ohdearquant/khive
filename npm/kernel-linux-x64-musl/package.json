@@ -17,8 +17,7 @@
     "musl"
   ],
   "bin": {
-    "kkernel": "bin/kkernel",
-    "khive-mcp": "bin/khive-mcp"
+    "kkernel": "bin/kkernel"
   },
   "files": [
     "bin/"

@@ -49,9 +49,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 BINARY = os.environ.get(
-    "KHIVE_MCP_BINARY",
+    "KKERNEL_BINARY",
     os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "khive-mcp"
+        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
     ),
 )
 
@@ -187,7 +187,7 @@ def _start_server(db_path: str) -> subprocess.Popen:
     """Spawn a fresh khive-mcp process backed by a temp SQLite file."""
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
-        [BINARY, "--db", db_path, "--no-embed", "--log", "error"],
+        [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -848,7 +848,7 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
 def main() -> int:
     assert os.path.exists(BINARY), (
         f"Binary not found at {BINARY!r}.\n"
-        f"Build with: cd crates && cargo build --release -p khive-mcp"
+        f"Build with: cd crates && cargo build --release -p kkernel"
     )
     print(f"Binary: {BINARY}")
     print()
