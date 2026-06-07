@@ -1,7 +1,7 @@
 {
   "name": "comm",
   "description": "Inter-agent messaging for khive — send messages, check inbox, reply in threads, and view conversation history.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

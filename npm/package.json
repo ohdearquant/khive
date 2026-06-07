@@ -1,6 +1,6 @@
 {
   "name": "khive",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "Research knowledge graph CLI — git-native KG versioning",
   "license": "Apache-2.0",
   "repository": {
@@ -36,11 +36,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@khive-ai/kernel-darwin-arm64": "0.2.6",
-    "@khive-ai/kernel-darwin-x64": "0.2.6",
-    "@khive-ai/kernel-linux-x64-gnu": "0.2.6",
-    "@khive-ai/kernel-linux-x64-musl": "0.2.6",
-    "@khive-ai/kernel-linux-arm64": "0.2.6",
-    "@khive-ai/kernel-win32-x64": "0.2.6"
+    "@khive-ai/kernel-darwin-arm64": "0.2.8",
+    "@khive-ai/kernel-darwin-x64": "0.2.8",
+    "@khive-ai/kernel-linux-x64-gnu": "0.2.8",
+    "@khive-ai/kernel-linux-x64-musl": "0.2.8",
+    "@khive-ai/kernel-linux-arm64": "0.2.8",
+    "@khive-ai/kernel-win32-x64": "0.2.8"
   }
 }

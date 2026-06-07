@@ -11,7 +11,7 @@ categories.workspace = true
 description = "Rank fusion strategies (RRF, Weighted, Union) with deterministic scoring"
 
 [dependencies]
-khive-score = { version = "0.2.5", path = "../khive-score" }
+khive-score = { version = "0.2.8", path = "../khive-score" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

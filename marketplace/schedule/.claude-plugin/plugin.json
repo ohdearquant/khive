@@ -1,7 +1,7 @@
 {
   "name": "schedule",
   "description": "Time-based scheduling for khive — set reminders, schedule future verb dispatches, view agenda, and cancel events.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

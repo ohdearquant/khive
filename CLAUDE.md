@@ -3,7 +3,7 @@
 **What this is**: A research knowledge graph runtime. Typed entities, closed edge ontology,
 hybrid search, GQL/SPARQL queries — all in a single 7.7MB Rust binary over MCP stdio.
 
-**v0.2.3** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
+**v0.2.8** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
 
 ---
 

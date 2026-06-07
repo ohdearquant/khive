@@ -46,6 +46,7 @@ CRATES=(
     khive-score
     khive-vamana
     khive-fold
+    khive-text
     khive-storage
     khive-bm25
     khive-fusion

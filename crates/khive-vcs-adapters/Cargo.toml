@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "KG import/export format adapters — CSV, JSON, and future format support (ADR-036)"
 
 [dependencies]
-khive-types = { version = "0.2.5", path = "../khive-types" }
+khive-types = { version = "0.2.8", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
