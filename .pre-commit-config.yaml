@@ -48,6 +48,12 @@ repos:
         language: system
         files: ^crates/.*\.rs$
         pass_filenames: false
+      - id: lint-sql
+        name: lint sql
+        entry: sh scripts/lint-sql.sh
+        language: system
+        files: ^crates/.*\.sql$
+        pass_filenames: false
 
   # TypeScript / Next.js: eslint + prettier (run via pnpm)
   - repo: local
