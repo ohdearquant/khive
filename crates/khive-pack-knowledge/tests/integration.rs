@@ -528,9 +528,9 @@ async fn upsert_atoms_creates_new_atoms() {
             "knowledge.upsert_atoms",
             json!({
                 "atoms": [
-                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                    { "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation of LLMs — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["fine-tuning", "adapter"] },
-                    { "slug": "flash-attention", "name": "FlashAttention", "description": "Memory-efficient attention — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["attention"] },
+                    { "slug": "rag", "name": "RAG", "content": "RAG retrieves relevant passages before generating. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "tags": ["retrieval", "rag"] },
+                    { "slug": "lora", "name": "LoRA", "content": "Low-Rank Adaptation of LLMs — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["fine-tuning", "adapter"] },
+                    { "slug": "flash-attention", "name": "FlashAttention", "content": "Memory-efficient attention — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["attention"] },
                 ]
             }),
         )
@@ -661,7 +661,7 @@ async fn get_returns_atom_by_slug() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+        json!({ "atoms": [{ "slug": "lora", "name": "LoRA", "content": "Low-Rank Adaptation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
     )
     .await
     .expect("upsert");
@@ -953,16 +953,16 @@ async fn fold_respects_min_score_filter() {
 async fn seed_search_corpus(f: &Fixture) {
     let atoms = json!({
         "atoms": [
-            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-            { "slug": "lora",            "name": "LoRA",              "description": "Low-Rank Adaptation of large language models — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "adapter"] },
-            { "slug": "flash-attention", "name": "FlashAttention",    "description": "Memory-efficient attention using tiling — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["attention", "gpu"] },
-            { "slug": "gqa",             "name": "GQA",               "description": "Grouped Query Attention reduces KV cache — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["attention", "inference"] },
-            { "slug": "rope",            "name": "RoPE",              "description": "Rotary Position Embedding for transformers — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["embedding", "position"] },
-            { "slug": "agent",           "name": "Agent",             "description": "Autonomous agent using LLM tool calls — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["agent", "tool-use"] },
-            { "slug": "chain-of-thought","name": "Chain-of-Thought",  "description": "Prompting technique for step-by-step reasoning — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["reasoning", "prompting"] },
-            { "slug": "speculative",     "name": "Speculative Decoding", "description": "Draft model accelerates inference via speculation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["inference", "draft"] },
-            { "slug": "quantization",    "name": "Quantization",     "description": "Reduce model size by lowering numerical precision — covering concepts techniques algorithms implementations applications use cases and design patterns in", "tags": ["compression", "inference"] },
-            { "slug": "dpo",             "name": "DPO",               "description": "Direct Preference Optimization for RLHF alignment — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "alignment"] },
+            { "slug": "rag",             "name": "RAG",               "content": "Retrieval-Augmented Generation combines retrieval with generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail RAG retrieves relevant passages before generating text dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "tags": ["retrieval", "rag"] },
+            { "slug": "lora",            "name": "LoRA",              "content": "Low-Rank Adaptation of large language models — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "adapter"] },
+            { "slug": "flash-attention", "name": "FlashAttention",    "content": "Memory-efficient attention using tiling — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["attention", "gpu"] },
+            { "slug": "gqa",             "name": "GQA",               "content": "Grouped Query Attention reduces KV cache — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["attention", "inference"] },
+            { "slug": "rope",            "name": "RoPE",              "content": "Rotary Position Embedding for transformers — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["embedding", "position"] },
+            { "slug": "agent",           "name": "Agent",             "content": "Autonomous agent using LLM tool calls — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["agent", "tool-use"] },
+            { "slug": "chain-of-thought","name": "Chain-of-Thought",  "content": "Prompting technique for step-by-step reasoning — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["reasoning", "prompting"] },
+            { "slug": "speculative",     "name": "Speculative Decoding", "content": "Draft model accelerates inference via speculation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["inference", "draft"] },
+            { "slug": "quantization",    "name": "Quantization",     "content": "Reduce model size by lowering numerical precision — covering concepts techniques algorithms implementations applications use cases and design patterns in", "tags": ["compression", "inference"] },
+            { "slug": "dpo",             "name": "DPO",               "content": "Direct Preference Optimization for RLHF alignment — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "alignment"] },
         ]
     });
     f.dispatch("knowledge.upsert_atoms", atoms)
@@ -1050,7 +1050,7 @@ async fn search_weight_override_changes_ranking() {
             "knowledge.search",
             json!({
                 "query": "attention",
-                "weights": { "w_tags": 50.0, "w_name": 1.0, "w_description": 0.1 },
+                "weights": { "w_tags": 50.0, "w_name": 1.0, "w_content": 0.1 },
                 "rerank": false
             }),
         )

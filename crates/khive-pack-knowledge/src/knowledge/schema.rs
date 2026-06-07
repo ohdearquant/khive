@@ -221,13 +221,9 @@ pub(crate) struct Domain {
 pub(crate) struct AtomInput {
     pub slug: String,
     pub name: String,
-    /// The atom's content text (>= 20 words). Also accepted under the legacy
-    /// key `description`, normalized to `content` before validation.
+    /// The atom's content text (>= 20 words).
     #[serde(default)]
     pub content: Option<String>,
-    /// Legacy alias for `content`; folded into `content` at handler entry.
-    #[serde(default)]
-    pub description: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
@@ -384,7 +380,6 @@ pub(crate) struct SearchParams {
 pub(crate) struct SearchWeights {
     pub w_exact_name: Option<f64>,
     pub w_name: Option<f64>,
-    pub w_description: Option<f64>,
     pub w_tags: Option<f64>,
     pub w_content: Option<f64>,
     pub expand_discount: Option<f64>,

@@ -14,8 +14,8 @@ use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
 use super::util::{
     atom_embed_text, atom_from_row, deser, domain_from_row, explicitly_requested_status, is_stop,
     row_bool, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
-    CANDIDATE_POOL, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_DESCRIPTION,
-    D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, MIN_TERM_LEN,
+    CANDIDATE_POOL, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME,
+    D_W_NAME, D_W_TAGS, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -25,7 +25,6 @@ use super::KnowledgeHandlers;
 struct Weights {
     w_exact_name: f32,
     w_name: f32,
-    w_description: f32,
     w_tags: f32,
     w_content: f32,
     expand_discount: f32,
@@ -38,7 +37,6 @@ impl Default for Weights {
         Self {
             w_exact_name: D_W_EXACT_NAME,
             w_name: D_W_NAME,
-            w_description: D_W_DESCRIPTION,
             w_tags: D_W_TAGS,
             w_content: D_W_CONTENT,
             expand_discount: D_EXPAND_DISCOUNT,
@@ -56,9 +54,6 @@ impl Weights {
                 .and_then(|w| w.w_exact_name)
                 .map_or(D_W_EXACT_NAME, |v| v as f32),
             w_name: w.and_then(|w| w.w_name).map_or(D_W_NAME, |v| v as f32),
-            w_description: w
-                .and_then(|w| w.w_description)
-                .map_or(D_W_DESCRIPTION, |v| v as f32),
             w_tags: w.and_then(|w| w.w_tags).map_or(D_W_TAGS, |v| v as f32),
             w_content: w
                 .and_then(|w| w.w_content)
@@ -80,7 +75,7 @@ struct ScoredHit {
     id: String,
     slug: String,
     name: String,
-    description: Option<String>,
+    content: Option<String>,
     tags: Option<String>,
     finalized: bool,
     is_domain: bool,
@@ -134,7 +129,7 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
                 id,
                 slug: String::new(),
                 name: String::new(),
-                description: None,
+                content: None,
                 tags: None,
                 finalized: false,
                 is_domain: false,
@@ -151,13 +146,12 @@ struct Candidate {
     id: String,
     slug: String,
     name_raw: String,
-    description_raw: Option<String>,
+    content_raw: Option<String>,
     tags_raw: Option<String>,
     status_raw: Option<String>,
     finalized: bool,
     is_domain: bool,
     name: Vec<String>,
-    description: Vec<String>,
     tags: Vec<String>,
     content: Vec<String>,
 }
@@ -181,13 +175,12 @@ fn load_candidates_from_atoms(atoms: &[Atom], type_filter: Option<&str>) -> Vec<
                 id: atom.id.to_string(),
                 slug: atom.slug.clone(),
                 name_raw: atom.name.clone(),
-                description_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
+                content_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
                 tags_raw: Some(tags_str.clone()),
                 status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
                 name: matching::tokenize_field(&atom.name),
-                description: matching::tokenize_field(&atom.content),
                 tags: matching::tokenize_field(&tags_str),
                 content: matching::tokenize_field(&atom.content),
             })
@@ -209,7 +202,6 @@ fn compute_idf(
         for term in terms {
             if matching::has_in_tokens(&cand.content, term)
                 || matching::has_in_tokens(&cand.name, term)
-                || matching::has_in_tokens(&cand.description, term)
                 || matching::has_in_tokens(&cand.tags, term)
             {
                 if let Some(d) = df.get_mut(term) {
@@ -284,13 +276,11 @@ fn score_candidate(
     w: &Weights,
 ) -> f32 {
     let bigrams = bigram_bonus_field(&cand.name, query_order)
-        + bigram_bonus_field(&cand.description, query_order)
         + bigram_bonus_field(&cand.tags, query_order)
         + bigram_bonus_field(&cand.content, query_order);
 
     let base = exact_name_bonus(&cand.name_raw, raw_query, w.w_exact_name)
         + w.w_name * score_field(&cand.name, terms, idf)
-        + w.w_description * score_field(&cand.description, terms, idf)
         + w.w_tags * score_field(&cand.tags, terms, idf)
         + w.w_content * score_field(&cand.content, terms, idf)
         + w.w_bigram * bigrams;
@@ -303,7 +293,6 @@ fn score_candidate(
             .iter()
             .filter(|orig| {
                 let has_exact = matching::has_in_tokens(&cand.name, orig)
-                    || matching::has_in_tokens(&cand.description, orig)
                     || matching::has_in_tokens(&cand.tags, orig)
                     || matching::has_in_tokens(&cand.content, orig);
                 if has_exact {
@@ -311,7 +300,6 @@ fn score_candidate(
                 }
                 terms.iter().filter(|t| *t != *orig).any(|exp| {
                     matching::has_in_tokens(&cand.name, exp)
-                        || matching::has_in_tokens(&cand.description, exp)
                         || matching::has_in_tokens(&cand.tags, exp)
                         || matching::has_in_tokens(&cand.content, exp)
                 })
@@ -587,7 +575,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
             id: cand.id.clone(),
             slug: cand.slug.clone(),
             name: cand.name_raw.clone(),
-            description: cand.description_raw.clone(),
+            content: cand.content_raw.clone(),
             tags: cand.tags_raw.clone(),
             status: cand.status_raw.clone(),
             finalized: cand.finalized,
@@ -716,7 +704,7 @@ async fn rerank_with_embeddings(
     }
     let texts: Vec<String> = hits
         .iter()
-        .map(|h| format!("{} {}", h.name, h.description.as_deref().unwrap_or("")))
+        .map(|h| format!("{} {}", h.name, h.content.as_deref().unwrap_or("")))
         .collect();
     if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await {
         let max_tfidf = hits
@@ -807,7 +795,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
         if let Some(row) = atom_rows_by_id.get(&hit.id) {
             hit.slug = row_str(row, "slug").unwrap_or_default();
             hit.name = row_str(row, "name").unwrap_or_default();
-            hit.description = row_str(row, "content");
+            hit.content = row_str(row, "content");
             hit.tags = row_str(row, "tags");
             hit.finalized = row_bool(row, "finalized");
             hit.status = row_str(row, "status");
@@ -860,7 +848,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
         if let Some(row) = domain_rows_by_id.get(&hit.id) {
             hit.slug = row_str(row, "slug").unwrap_or_default();
             hit.name = row_str(row, "name").unwrap_or_default();
-            hit.description = row_str(row, "description");
+            hit.content = row_str(row, "description");
             hit.tags = row_str(row, "tags");
             hit.finalized = false;
             hit.is_domain = true;
@@ -1045,7 +1033,6 @@ impl KnowledgeHandlers {
             let pairs: &[(&str, Option<f64>)] = &[
                 ("w_exact_name", w.w_exact_name),
                 ("w_name", w.w_name),
-                ("w_description", w.w_description),
                 ("w_tags", w.w_tags),
                 ("w_content", w.w_content),
                 ("expand_discount", w.expand_discount),
@@ -1130,7 +1117,7 @@ impl KnowledgeHandlers {
                     "id": h.id,
                     "slug": h.slug,
                     "name": h.name,
-                    "description": h.description,
+                    "content": h.content,
                     "tags": h.tags,
                     "status": h.status,
                     "finalized": h.finalized,

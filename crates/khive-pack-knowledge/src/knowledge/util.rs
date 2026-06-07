@@ -14,9 +14,8 @@ use super::schema::{Atom, Domain};
 
 pub(super) const D_W_EXACT_NAME: f32 = 5.0;
 pub(super) const D_W_NAME: f32 = 3.0;
-pub(super) const D_W_DESCRIPTION: f32 = 1.5;
 pub(super) const D_W_TAGS: f32 = 1.25;
-pub(super) const D_W_CONTENT: f32 = 1.0;
+pub(super) const D_W_CONTENT: f32 = 1.5;
 pub(super) const D_EXPAND_DISCOUNT: f32 = 0.35;
 pub(super) const D_COVERAGE_ALPHA: f32 = 0.5;
 pub(super) const D_W_BIGRAM: f32 = 2.0;

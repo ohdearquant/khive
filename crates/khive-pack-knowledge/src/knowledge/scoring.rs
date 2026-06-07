@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use super::matching;
 use super::schema::{Atom, SearchParams};
 use super::util::{
-    D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_DESCRIPTION,
-    D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, STOP_WORDS,
+    D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME, D_W_NAME,
+    D_W_TAGS, STOP_WORDS,
 };
 
 fn is_stop(w: &str) -> bool {
@@ -19,7 +19,6 @@ fn is_stop(w: &str) -> bool {
 pub(super) struct Weights {
     pub w_exact_name: f32,
     pub w_name: f32,
-    pub w_description: f32,
     pub w_tags: f32,
     pub w_content: f32,
     pub expand_discount: f32,
@@ -32,7 +31,6 @@ impl Default for Weights {
         Self {
             w_exact_name: D_W_EXACT_NAME,
             w_name: D_W_NAME,
-            w_description: D_W_DESCRIPTION,
             w_tags: D_W_TAGS,
             w_content: D_W_CONTENT,
             expand_discount: D_EXPAND_DISCOUNT,
@@ -50,9 +48,6 @@ impl Weights {
                 .and_then(|w| w.w_exact_name)
                 .map_or(D_W_EXACT_NAME, |v| v as f32),
             w_name: w.and_then(|w| w.w_name).map_or(D_W_NAME, |v| v as f32),
-            w_description: w
-                .and_then(|w| w.w_description)
-                .map_or(D_W_DESCRIPTION, |v| v as f32),
             w_tags: w.and_then(|w| w.w_tags).map_or(D_W_TAGS, |v| v as f32),
             w_content: w
                 .and_then(|w| w.w_content)
@@ -72,13 +67,12 @@ pub(super) struct Candidate {
     pub id: String,
     pub slug: String,
     pub name_raw: String,
-    pub description_raw: Option<String>,
+    pub content_raw: Option<String>,
     pub tags_raw: Option<String>,
     pub status_raw: Option<String>,
     pub finalized: bool,
     pub is_domain: bool,
     pub name: Vec<String>,
-    pub description: Vec<String>,
     pub tags: Vec<String>,
     pub content: Vec<String>,
 }
@@ -105,13 +99,12 @@ pub(super) fn load_candidates_from_atoms(
                 id: atom.id.to_string(),
                 slug: atom.slug.clone(),
                 name_raw: atom.name.clone(),
-                description_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
+                content_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
                 tags_raw: Some(tags_str.clone()),
                 status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
                 name: matching::tokenize_field(&atom.name),
-                description: matching::tokenize_field(&atom.content),
                 tags: matching::tokenize_field(&tags_str),
                 content: matching::tokenize_field(&atom.content),
             })
@@ -131,7 +124,6 @@ pub(super) fn compute_idf(
         for term in terms {
             if matching::has_in_tokens(&cand.content, term)
                 || matching::has_in_tokens(&cand.name, term)
-                || matching::has_in_tokens(&cand.description, term)
                 || matching::has_in_tokens(&cand.tags, term)
             {
                 if let Some(d) = df.get_mut(term) {
@@ -210,13 +202,11 @@ pub(super) fn score_candidate(
     w: &Weights,
 ) -> f32 {
     let bigrams = bigram_bonus_field(&cand.name, query_order)
-        + bigram_bonus_field(&cand.description, query_order)
         + bigram_bonus_field(&cand.tags, query_order)
         + bigram_bonus_field(&cand.content, query_order);
 
     let base = exact_name_bonus(&cand.name_raw, raw_query, w.w_exact_name)
         + w.w_name * score_field(&cand.name, terms, idf)
-        + w.w_description * score_field(&cand.description, terms, idf)
         + w.w_tags * score_field(&cand.tags, terms, idf)
         + w.w_content * score_field(&cand.content, terms, idf)
         + w.w_bigram * bigrams;
@@ -226,7 +216,6 @@ pub(super) fn score_candidate(
             .iter()
             .filter(|orig| {
                 let has_exact = matching::has_in_tokens(&cand.name, orig)
-                    || matching::has_in_tokens(&cand.description, orig)
                     || matching::has_in_tokens(&cand.tags, orig)
                     || matching::has_in_tokens(&cand.content, orig);
                 if has_exact {
@@ -234,7 +223,6 @@ pub(super) fn score_candidate(
                 }
                 terms.iter().filter(|t| *t != *orig).any(|exp| {
                     matching::has_in_tokens(&cand.name, exp)
-                        || matching::has_in_tokens(&cand.description, exp)
                         || matching::has_in_tokens(&cand.tags, exp)
                         || matching::has_in_tokens(&cand.content, exp)
                 })

@@ -48,17 +48,7 @@ impl KnowledgeHandlers {
                 ));
             }
 
-            // Content is the atom body (also its description). Required, >= 20 words.
-            // `description` is a legacy synonym; take whichever field is fuller.
-            let c_content = atom_in.content.as_deref().unwrap_or("").trim();
-            let c_desc = atom_in.description.as_deref().unwrap_or("").trim();
-            let content =
-                if c_content.split_whitespace().count() >= c_desc.split_whitespace().count() {
-                    c_content
-                } else {
-                    c_desc
-                }
-                .to_string();
+            let content = atom_in.content.as_deref().unwrap_or("").trim().to_string();
             validate_atom_content(&content)?;
 
             let tags_json = tags_to_json(atom_in.tags.as_ref());

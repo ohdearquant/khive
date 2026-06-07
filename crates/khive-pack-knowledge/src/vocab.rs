@@ -197,7 +197,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 name: "weights",
                 param_type: "object",
                 required: false,
-                description: "TF-IDF weight overrides: {w_name, w_description, w_tags, w_content, w_exact_name, w_bigram, expand_discount, coverage_alpha}",
+                description: "TF-IDF weight overrides: {w_name, w_tags, w_content, w_exact_name, w_bigram, expand_discount, coverage_alpha}",
             },
             ParamDef {
                 name: "decompose",
