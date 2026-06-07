@@ -12,8 +12,8 @@ categories.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-khive-score = { version = "0.2.5", path = "../khive-score" }
-khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
+khive-score = { version = "0.2.8", path = "../khive-score" }
+khive-types = { version = "0.2.8", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

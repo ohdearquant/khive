@@ -5,7 +5,7 @@
 
 [package]
 name = "khive-merge"
-version = "0.2.6"
+version = "0.2.8"
 edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
@@ -14,8 +14,8 @@ homepage = "https://github.com/ohdearquant"
 description = "KG three-way merge with conflict detection (ADR-039)"
 
 [dependencies]
-khive-runtime = { version = "0.2.6", path = "../khive-runtime" }
-khive-storage = { version = "0.2.6", path = "../khive-storage" }
+khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
+khive-storage = { version = "0.2.8", path = "../khive-storage" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

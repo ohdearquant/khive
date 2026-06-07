@@ -1,7 +1,7 @@
 {
   "name": "knowledge",
   "description": "Research concept management for AI agents — register concepts, record provenance, and browse by domain on top of the kg substrate.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

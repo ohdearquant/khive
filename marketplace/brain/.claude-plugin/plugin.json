@@ -1,7 +1,7 @@
 {
   "name": "brain",
   "description": "Bayesian adaptive tuning for khive — profile-oriented auto-tuning of recall weights. Inspect current posteriors, emit explicit feedback, and manage profiles that shape how memory recall is scored.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

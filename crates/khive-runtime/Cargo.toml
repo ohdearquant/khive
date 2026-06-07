@@ -11,14 +11,14 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [dependencies]
-khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
-khive-storage = { version = "0.2.5", path = "../khive-storage" }
-khive-score = { version = "0.2.5", path = "../khive-score" }
-khive-fusion = { version = "0.2.5", path = "../khive-fusion" }
-khive-fold = { version = "0.2.5", path = "../khive-fold" }
-khive-db = { version = "0.2.5", path = "../khive-db", features = ["vectors"] }
-khive-query = { version = "0.2.5", path = "../khive-query" }
-khive-gate = { version = "0.2.5", path = "../khive-gate" }
+khive-types = { version = "0.2.8", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.2.8", path = "../khive-storage" }
+khive-score = { version = "0.2.8", path = "../khive-score" }
+khive-fusion = { version = "0.2.8", path = "../khive-fusion" }
+khive-fold = { version = "0.2.8", path = "../khive-fold" }
+khive-db = { version = "0.2.8", path = "../khive-db", features = ["vectors"] }
+khive-query = { version = "0.2.8", path = "../khive-query" }
+khive-gate = { version = "0.2.8", path = "../khive-gate" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

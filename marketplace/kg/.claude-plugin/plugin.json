@@ -1,7 +1,7 @@
 {
   "name": "kg",
   "description": "Persistent knowledge graph for AI agents — typed entities, closed edge ontology, hybrid search, GQL queries.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

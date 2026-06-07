@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/cli",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "Alias for the khive package — research knowledge graph runtime",
   "license": "Apache-2.0",
   "repository": {
@@ -8,7 +8,7 @@
     "url": "https://github.com/ohdearquant/khive"
   },
   "dependencies": {
-    "khive": "0.2.6"
+    "khive": "0.2.8"
   },
   "bin": {
     "khive": "./node_modules/khive/bin/khive",

@@ -1,7 +1,7 @@
 {
   "name": "gtd",
   "description": "GTD-style task lifecycle for AI agents — assign, next, complete, transition. Tasks live alongside your knowledge graph; `search(kind=\"note\", ...)` surfaces them like any other note.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

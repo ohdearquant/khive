@@ -1,7 +1,7 @@
 {
   "name": "memory",
   "description": "Persistent agent memory for khive — remember durable context and recall it with decay-aware ranking.",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

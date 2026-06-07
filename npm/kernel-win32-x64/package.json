@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/kernel-win32-x64",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "khive Rust binaries for Windows x86_64",
   "license": "Apache-2.0",
   "repository": {

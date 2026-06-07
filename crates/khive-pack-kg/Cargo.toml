@@ -11,11 +11,11 @@ categories.workspace = true
 description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search for research knowledge graphs"
 
 [dependencies]
-khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.2.5", path = "../khive-runtime" }
-khive-query = { version = "0.2.5", path = "../khive-query" }
+khive-types = { version = "0.2.8", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
+khive-query = { version = "0.2.8", path = "../khive-query" }
 inventory = { workspace = true }
-khive-storage = { version = "0.2.5", path = "../khive-storage" }
+khive-storage = { version = "0.2.8", path = "../khive-storage" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

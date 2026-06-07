@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/kernel-linux-arm64",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "khive Rust binaries for Linux ARM64 glibc",
   "license": "Apache-2.0",
   "repository": {
