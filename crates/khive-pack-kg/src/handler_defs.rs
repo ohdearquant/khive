@@ -96,7 +96,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 param_type: "bool",
                 required: false,
                 description:
-                    "If true, return soft-deleted entities (with deleted_at populated). Default false.",
+                    "If true, return soft-deleted entities (with deleted_at populated). Default false. \
+                     Requires a full UUID — short prefix resolution filters deleted records; \
+                     the delete response always returns the full UUID for this purpose.",
             },
         ],
     },

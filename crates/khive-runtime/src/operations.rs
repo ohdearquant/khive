@@ -588,6 +588,11 @@ impl KhiveRuntime {
         target_id: Uuid,
         relation: EdgeRelation,
     ) -> RuntimeResult<()> {
+        if source_id == target_id {
+            return Err(RuntimeError::InvalidInput(
+                "self-loop edges are not allowed: source_id and target_id must be different".into(),
+            ));
+        }
         if relation == EdgeRelation::Annotates {
             // Source must be a note in namespace.
             match self.resolve(token, source_id).await? {
@@ -3661,7 +3666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_phantom_self_loop_returns_not_found() {
+    async fn link_phantom_self_loop_returns_invalid_input() {
         let rt = rt();
         let tok = NamespaceToken::local();
         let phantom = Uuid::new_v4();
@@ -3670,13 +3675,13 @@ mod tests {
             .link(&tok, phantom, phantom, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
-            Err(RuntimeError::NotFound(msg)) => {
+            Err(RuntimeError::InvalidInput(msg)) => {
                 assert!(
-                    msg.contains("source"),
-                    "self-loop must fail on source first: {msg}"
+                    msg.contains("self-loop"),
+                    "self-loop must be rejected with self-loop message: {msg}"
                 );
             }
-            other => panic!("expected NotFound for phantom self-loop, got {other:?}"),
+            other => panic!("expected InvalidInput for self-loop, got {other:?}"),
         }
     }
 

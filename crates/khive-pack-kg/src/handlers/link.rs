@@ -156,11 +156,6 @@ impl KgPack {
         })?;
         let source = resolve_uuid_async(&source_id_str, &self.runtime, token).await?;
         let target = resolve_uuid_async(&target_id_str, &self.runtime, token).await?;
-        if source == target {
-            return Err(RuntimeError::InvalidInput(
-                "self-loop edges are not allowed: source_id and target_id must be different".into(),
-            ));
-        }
         let weight = validate_weight(p.weight)?;
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;

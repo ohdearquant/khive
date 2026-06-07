@@ -285,14 +285,20 @@ pub(crate) async fn handle_schedule(
     // Validate that each verb in the action string is registered. This catches
     // nonexistent verbs at schedule-creation time rather than at trigger time
     // when nobody is watching.
+    //
+    // The DSL allows bare verb names (e.g. "remind(...)") as shorthand for
+    // pack-prefixed verbs (e.g. "schedule.remind(...)"). Try the bare form
+    // first, then the "schedule.{verb}" form, so both are accepted.
     for op in &parsed.ops {
-        registry.describe_verb(&op.tool).map_err(|_| {
-            RuntimeError::InvalidInput(format!(
+        let qualified = format!("schedule.{}", op.tool);
+        if registry.describe_verb(&op.tool).is_err() && registry.describe_verb(&qualified).is_err()
+        {
+            return Err(RuntimeError::InvalidInput(format!(
                 "schedule.action: verb {:?} is not registered; \
-                 provide a valid verb call (e.g. \"remind(content=\\\"hello\\\")\")",
+                 provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")",
                 op.tool
-            ))
-        })?;
+            )));
+        }
     }
 
     // Validate RFC 3339 and reject past timestamps (C3).
