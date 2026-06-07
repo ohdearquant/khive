@@ -16,6 +16,7 @@ khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
 khive-fusion = { version = "0.2.8", path = "../khive-fusion" }
 khive-retrieval = { version = "0.2.8", path = "../khive-retrieval" }
 khive-score = { version = "0.2.8", path = "../khive-score" }
+khive-brain-core = { version = "0.2.8", path = "../khive-brain-core" }
 khive-pack-brain = { version = "0.2.8", path = "../khive-pack-brain" }
 khive-vamana = { version = "0.2.8", path = "../khive-vamana" }
 inventory = { workspace = true }

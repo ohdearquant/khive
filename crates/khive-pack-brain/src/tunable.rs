@@ -5,7 +5,7 @@ use khive_runtime::RuntimeError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::state::{BalancedRecallState, BetaPosterior};
+use khive_brain_core::{BalancedRecallState, BetaPosterior};
 
 /// Packs that want auto-tuning implement this trait.
 ///

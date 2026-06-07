@@ -5,10 +5,11 @@ use std::sync::Mutex;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_types::{HandlerDef, Pack};
 
+use khive_brain_core::BrainState;
+
 use crate::fold::{BalancedRecallFold, SectionPosteriorFold};
 use crate::handlers::BRAIN_HANDLERS;
 use crate::persist;
-use crate::state::BrainState;
 
 pub const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
@@ -72,7 +73,7 @@ impl BrainPack {
     }
 
     /// Public snapshot of the current `BrainState`.
-    pub fn snapshot(&self) -> crate::state::BrainStateSnapshot {
+    pub fn snapshot(&self) -> khive_brain_core::BrainStateSnapshot {
         self.state.lock().unwrap().to_snapshot()
     }
 }

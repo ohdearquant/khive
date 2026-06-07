@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use rand::Rng;
 
-use crate::state::{SectionPosteriorState, SectionType};
+use khive_brain_core::{SectionPosteriorState, SectionType};
 
 /// Derive section weights from a SectionPosteriorState.
 ///
@@ -25,7 +25,7 @@ pub fn derive_deterministic_weights(state: &SectionPosteriorState) -> HashMap<Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::SectionPosteriorState;
+    use khive_brain_core::SectionPosteriorState;
 
     #[test]
     fn derive_weights_sums_to_one() {
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn higher_alpha_gets_higher_average_weight() {
-        use crate::state::BetaPosterior;
+        use khive_brain_core::BetaPosterior;
         let mut priors = SectionPosteriorState::default_priors();
         priors.insert(
             SectionType::OperationalGuidance,

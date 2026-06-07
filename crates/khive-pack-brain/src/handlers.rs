@@ -16,11 +16,11 @@ use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::HandlerDef;
 
-use crate::section::derive_deterministic_weights;
-use crate::state::{
+use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
+use khive_brain_core::derive_deterministic_weights;
+use khive_brain_core::{
     ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
 };
-use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 
 // ── Handler table ─────────────────────────────────────────────────────────────
 
@@ -865,7 +865,7 @@ impl BrainPack {
                         effective_profile
                     )));
                 }
-                Some(rec) if rec.lifecycle == crate::state::ProfileLifecycle::Archived => {
+                Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "serving profile {:?} is archived; feedback cannot credit archived profiles",
                         effective_profile
@@ -915,7 +915,7 @@ impl BrainPack {
             if serving_profile == "balanced-recall-v1" {
                 let current_recall = std::mem::replace(
                     &mut state.balanced_recall,
-                    crate::state::BalancedRecallState::new(0),
+                    khive_brain_core::BalancedRecallState::new(0),
                 );
                 let updated = self.fold.reduce(current_recall, &event, &ctx);
                 state.balanced_recall = updated;
@@ -938,7 +938,7 @@ impl BrainPack {
             } else {
                 let current_recall = std::mem::replace(
                     &mut state.balanced_recall,
-                    crate::state::BalancedRecallState::new(0),
+                    khive_brain_core::BalancedRecallState::new(0),
                 );
                 let updated = self.fold.reduce(current_recall, &event, &ctx);
                 state.balanced_recall = updated;
@@ -1263,7 +1263,7 @@ impl BrainPack {
 
         // Initialize live BalancedRecallState for this profile so that reset and
         // feedback can route to its actual posteriors rather than a metadata-only record.
-        let ps = crate::state::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
+        let ps = khive_brain_core::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
         let snap = serde_json::to_value(ps.to_snapshot()).ok();
 
         let record = ProfileRecord {
@@ -1302,7 +1302,7 @@ impl BrainPack {
                             "alpha and beta must be positive for section {key:?}; got alpha={alpha}, beta={beta}"
                         )));
                     }
-                    priors.insert(st, crate::state::BetaPosterior::new(alpha, beta));
+                    priors.insert(st, khive_brain_core::BetaPosterior::new(alpha, beta));
                 }
                 SectionPosteriorState::from_priors(priors)
             } else {
@@ -1382,7 +1382,7 @@ impl DispatchHook for BrainPack {
         let mut state = self.state.lock().unwrap();
         let current = std::mem::replace(
             &mut state.balanced_recall,
-            crate::state::BalancedRecallState::new(0),
+            khive_brain_core::BalancedRecallState::new(0),
         );
         let updated = self.fold.reduce(current, &view.event, &ctx);
         state.balanced_recall = updated;

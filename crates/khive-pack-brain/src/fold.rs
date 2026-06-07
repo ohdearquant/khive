@@ -6,7 +6,9 @@ use khive_storage::event::Event;
 use crate::event::{
     entity_signal, interpret, is_recall_positive, BrainSignal, FeedbackEventKind, FeedbackSignal,
 };
-use crate::state::{BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP};
+use khive_brain_core::{
+    BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP,
+};
 
 /// Fold for the `balanced-recall-v1` three-scalar Beta-posterior state.
 pub struct BalancedRecallFold {
@@ -558,7 +560,7 @@ mod tests {
 
     // ── SectionPosteriorFold tests ───────────────────────────────────────────
 
-    use crate::state::SectionType as ST;
+    use khive_brain_core::SectionType as ST;
 
     fn make_section_feedback_event(section_signals: serde_json::Value) -> Event {
         let id = Uuid::new_v4();

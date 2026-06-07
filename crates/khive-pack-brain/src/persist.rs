@@ -9,7 +9,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
 use serde_json::Value;
 
-use crate::state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
+use khive_brain_core::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
 
 const SNAPSHOT_PROFILE_ID: &str = "__brain__";
 const DEFAULT_SNAPSHOT_BATCH_SIZE: u64 = 5;
@@ -279,7 +279,7 @@ pub async fn ensure_loaded(
             for event in &replay_events {
                 let current = std::mem::replace(
                     &mut bs.balanced_recall,
-                    crate::state::BalancedRecallState::new(0),
+                    khive_brain_core::BalancedRecallState::new(0),
                 );
                 bs.balanced_recall = fold.reduce(current, event, &ctx);
 
@@ -315,7 +315,7 @@ pub async fn ensure_loaded(
             // Clone current state for saving; we'll swap below.
             let saved_current = BrainState {
                 profiles: current_state.profiles.clone(),
-                balanced_recall: crate::state::BalancedRecallState::from_snapshot(
+                balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
                     current_state.balanced_recall.to_snapshot(),
                     entity_capacity,
                 ),
@@ -325,7 +325,7 @@ pub async fn ensure_loaded(
                     .map(|(k, v)| {
                         (
                             k.clone(),
-                            crate::state::BalancedRecallState::from_snapshot(
+                            khive_brain_core::BalancedRecallState::from_snapshot(
                                 v.to_snapshot(),
                                 entity_capacity,
                             ),
@@ -339,7 +339,7 @@ pub async fn ensure_loaded(
                     .map(|(k, v)| {
                         (
                             k.clone(),
-                            crate::state::SectionPosteriorState::from_snapshot(v.to_snapshot()),
+                            khive_brain_core::SectionPosteriorState::from_snapshot(v.to_snapshot()),
                         )
                     })
                     .collect(),

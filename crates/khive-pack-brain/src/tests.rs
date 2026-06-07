@@ -1356,7 +1356,7 @@ async fn w4_c3_resolve_skips_archived_binding() {
     // a pre-existing binding that was created before the profile was archived.
     {
         let mut state = pack.state.lock().unwrap();
-        state.bindings.push(crate::state::ProfileBinding {
+        state.bindings.push(khive_brain_core::ProfileBinding {
             actor: "*".into(),
             namespace: "*".into(),
             consumer_kind: "recall".into(),
@@ -1369,7 +1369,7 @@ async fn w4_c3_resolve_skips_archived_binding() {
             .profiles
             .get_mut("balanced-recall-v1")
             .unwrap()
-            .lifecycle = crate::state::ProfileLifecycle::Archived;
+            .lifecycle = khive_brain_core::ProfileLifecycle::Archived;
     }
 
     // Resolve must NOT return the archived profile.
@@ -1679,7 +1679,7 @@ async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     // Insert a high-priority exact binding pointing at the default profile.
     {
         let mut state = pack.state.lock().unwrap();
-        state.bindings.push(crate::state::ProfileBinding {
+        state.bindings.push(khive_brain_core::ProfileBinding {
             actor: "*".into(),
             namespace: "*".into(),
             consumer_kind: "search".into(),
@@ -1692,7 +1692,7 @@ async fn r2_archived_exact_binding_defers_to_live_wildcard() {
             .profiles
             .get_mut("balanced-recall-v1")
             .unwrap()
-            .lifecycle = crate::state::ProfileLifecycle::Archived;
+            .lifecycle = khive_brain_core::ProfileLifecycle::Archived;
     }
 
     // Add a lower-priority wildcard binding pointing at the live profile.

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use khive_storage::event::Event;
 use khive_types::EventOutcome;
 
-use crate::state::SectionType;
+use khive_brain_core::SectionType;
 
 /// Feedback signal values for the `brain.feedback` verb.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn feedback_with_section_signals() {
-        use crate::state::SectionType;
+        use khive_brain_core::SectionType;
         let id = Uuid::new_v4();
         let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
         e.payload = serde_json::json!({
