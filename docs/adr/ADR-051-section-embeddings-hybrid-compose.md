@@ -20,9 +20,9 @@ compose scores sections by static weights only (`section_type + edge + quality`)
 The `retrieval` objective weight that was meant to carry section similarity is
 defined but unapplied. This is a regression, not merely an un-run backfill.
 
-An archived implementation spec (`.khive/archive/.../section_embeddings/
-khive_section_embeddings_spec/`) defines the intended design: breadcrumb-enriched
-section embedding text, hash-incremental backfill, and a hybrid compose score.
+A pre-OSS implementation spec defines the intended design — breadcrumb-enriched
+section embedding text, hash-incremental backfill, and a hybrid compose score —
+tracked for the read side in issue #6.
 
 ## Decision
 
