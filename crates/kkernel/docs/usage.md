@@ -85,44 +85,48 @@ Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`.
 
 ---
 
-## Reindex workflows
+## Reindex — `kkernel reindex`
 
-Embeddings/FTS are rebuilt by two distinct paths, because entity/note vectors and
-knowledge atoms live in different stores:
-
-### Entities + notes — `kkernel reindex`
-
-Walks all entities and notes and (re-)embeds them. Namespace-scoped, so run once per
-namespace your data spans.
+`kkernel reindex` re-embeds **entities, notes, and the knowledge corpus** in one
+pass (namespace-scoped — run once per namespace your data spans). Progress prints
+to stderr; the JSON/`--human` report goes to stdout.
 
 ```bash
-kkernel reindex --db ~/.khive/khive.db --namespace local
+kkernel reindex --db ~/.khive/khive.db --namespace local   # entities + notes + knowledge
 kkernel reindex --db ~/.khive/khive.db --namespace khive
-# flags: --model, --batch-size (default 100), --keep-existing, --human
 ```
 
-`--keep-existing` skips records that already have a vector (incremental top-up).
-Omit it to drop-and-rebuild.
+| Flag               | Effect                                                                         |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                |
+| `--no-knowledge`   | only entities/notes (skip knowledge)                                           |
+| `--model <name>`   | entities/notes use this single engine instead of fanning out                   |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild |
+| `--batch-size <n>` | records per embedding batch (default 100, max 500)                             |
+| `--human`          | readable report instead of JSON                                                |
 
-### Knowledge atoms — `kkernel exec 'knowledge.index(...)'`
+**Multi-engine semantics.** Entities and notes embed with **every registered
+engine** (e.g. `all-minilm-l6-v2` + `paraphrase-multilingual-minilm-l12-v2`),
+one vector record per engine — matching the runtime's create/update write path.
+`--model` narrows to a single engine. **Knowledge is single-model**: knowledge
+search retrieves via the default embedder's ANN, so the knowledge pass always
+uses the default embedder (fanning out would write vectors search never reads).
 
-The knowledge corpus is reindexed through its own handler. It embeds atoms and
-(optionally) rebuilds the Vamana ANN. Also namespace-scoped via `--namespace`.
+The knowledge pass calls the `khive_pack_knowledge::reindex_knowledge` library
+entry directly (the full-corpus `knowledge.index` handler) and rebuilds the
+Vamana ANN snapshot — no verb-DSL shell required.
 
 ```bash
-# embed all atoms in a namespace + rebuild the ANN snapshot
-kkernel exec 'knowledge.index(rebuild_ann=true)' --db ~/.khive/khive.db --namespace local
-
-# embed only specific atoms (by slug or id), no ANN rebuild
-kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
-
-# batch sizing (clamped 1..1000, default 500)
-kkernel exec 'knowledge.index(batch_size=1000, rebuild_ann=true)' --db ~/.khive/khive.db
+kkernel reindex --db ~/.khive/khive.db --knowledge-only      # just the corpus
+kkernel reindex --db ~/.khive/khive.db --no-knowledge        # just graph substrate
 ```
 
-`knowledge.index` indexes **atoms** (not sections) and reports
-`{indexed, skipped, total, ann_vectors}`. It is a no-op returning
-`"no embedding model configured"` when no embedder is set.
+For ad-hoc / scoped knowledge indexing (specific atoms, no ANN rebuild) the
+low-level verb is still available via `exec`:
+
+```bash
+kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
+```
 
 > Stop the MCP daemon before a large reindex to avoid SQLite write contention:
 > `pkill -f 'kkernel.*--daemon'` (or `KHIVE_NO_DAEMON=1`), then reindex, then let
