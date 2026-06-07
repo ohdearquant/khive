@@ -1827,4 +1827,28 @@ mod embed_failure_tests {
             "embed Err must not appear in skipped: {result:?}"
         );
     }
+
+    /// Result JSON always carries `ann_failed` key. When the ANN block does not
+    /// run (rebuild_ann=false, which is the default), `ann_failed` must be false.
+    /// Embed failures that prevent vector writes also must not set ann_failed —
+    /// atom-level and ANN-level failures are distinct failure dimensions.
+    #[tokio::test]
+    async fn index_result_carries_ann_failed_false_when_ann_block_skipped() {
+        // Use count-mismatch provider: embed fails, no vectors stored, ANN block
+        // never entered (ann_vectors stays empty), so ann_failed must be false.
+        let f = fixture_with_two_atoms(rt_with_fake(OneDimProvider)).await;
+        let result = f
+            .dispatch("knowledge.index", json!({}))
+            .await
+            .expect("index ok");
+
+        assert!(
+            result.get("ann_failed").is_some(),
+            "result JSON must carry ann_failed key: {result:?}"
+        );
+        assert!(
+            !result["ann_failed"].as_bool().unwrap_or(true),
+            "ann_failed must be false when ANN block did not run: {result:?}"
+        );
+    }
 }

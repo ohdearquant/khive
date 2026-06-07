@@ -117,12 +117,15 @@ serves recall from. `--namespace` is the explicit per-namespace target and
 always wins over any config `[actor] id`.
 
 **Fail-closed.** By default reindex returns a **non-zero exit** if any requested
-engine failed, the knowledge pass errored, or any knowledge atom vector insert
-failed — a partial rebuild leaves stale recall/search state, so automation must
-not see success. Pass `--best-effort` to downgrade failures to a warning and
-exit 0. The report (JSON and `--human`) always reports attempted/indexed/failed
-counts honestly (`errors_skipped`, `knowledge_atoms_failed`,
-`knowledge_pass_errored`).
+engine failed, the knowledge pass errored, any knowledge atom vector insert
+failed, or the Vamana ANN build/snapshot persist failed — a partial rebuild
+leaves stale recall/search state, so automation must not see success. Pass
+`--best-effort` to downgrade failures to a warning and exit 0. The report (JSON
+and `--human`) always reports attempted/indexed/failed counts honestly
+(`errors_skipped`, `knowledge_atoms_failed`, `knowledge_pass_errored`,
+`knowledge_ann_failed`). Note: `knowledge_ann_failed` is a distinct failure
+dimension from `knowledge_atoms_failed` — atom vectors may have persisted
+successfully while the ANN rebuild or snapshot persist failed.
 
 **Multi-engine semantics.** Entities and notes embed with **every registered
 engine** (e.g. `all-minilm-l6-v2` + `paraphrase-multilingual-minilm-l12-v2`),
