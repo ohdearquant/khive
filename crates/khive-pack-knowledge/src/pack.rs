@@ -1,8 +1,11 @@
 //! `KnowledgePack` struct, factory, and `PackRuntime` impl.
 
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
+use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack};
@@ -15,6 +18,7 @@ use crate::vocab::KNOWLEDGE_HANDLERS;
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
     pub(crate) ann: vamana::SharedAnn,
+    pub(crate) section_posteriors: Mutex<SectionPosteriorState>,
 }
 
 impl Pack for KnowledgePack {
@@ -31,6 +35,7 @@ impl KnowledgePack {
         Self {
             runtime,
             ann: vamana::new_shared(),
+            section_posteriors: Mutex::new(SectionPosteriorState::new()),
         }
     }
 }
@@ -127,6 +132,7 @@ impl PackRuntime for KnowledgePack {
             "knowledge.learn" => self.handle_learn(token, params).await,
             "knowledge.cite" => self.handle_cite(token, params).await,
             "knowledge.topic" => self.handle_topic(token, params).await,
+            "knowledge.feedback" => self.handle_feedback(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "knowledge pack does not handle verb {verb:?}"
             ))),

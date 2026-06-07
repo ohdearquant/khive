@@ -1,0 +1,26 @@
+//! Section posterior updates for the knowledge pack.
+
+use khive_brain_core::{FeedbackSignal, SectionPosteriorState, SectionType, DEFAULT_ESS_CAP};
+
+/// Update section posteriors based on explicit per-section feedback signals.
+pub fn on_section_feedback(
+    state: &mut SectionPosteriorState,
+    signals: &[(SectionType, FeedbackSignal)],
+) {
+    state.total_events += 1;
+    for (section_type, feedback_signal) in signals {
+        if let Some(posterior) = state.posteriors.get_mut(section_type) {
+            match feedback_signal {
+                FeedbackSignal::Useful => posterior.alpha += 1.0,
+                FeedbackSignal::NotUseful => posterior.beta += 1.0,
+                FeedbackSignal::Wrong => posterior.beta += 2.0,
+            }
+            if let Some(prior) = state.priors.get(section_type).cloned() {
+                posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP);
+            }
+        }
+    }
+    if state.exploration_epoch > 0 {
+        state.exploration_epoch -= 1;
+    }
+}
