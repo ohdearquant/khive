@@ -41,15 +41,17 @@ fn truncate_bytes(t: &str) -> String {
 /// Embed sections in `token`'s namespace into `knowledge_sections.embedding`.
 ///
 /// With `drop_existing`, every section is re-embedded; otherwise only sections
-/// whose `embedding` is currently NULL are filled. Returns `(indexed, skipped)`.
+/// whose `embedding` is currently NULL are filled. Returns `(indexed, skipped,
+/// failed)`. Genuine skips (blank section text) go to `skipped`; embed errors
+/// and vector-count mismatches go to `failed` (fail-closed contract).
 pub(crate) async fn embed_sections(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     drop_existing: bool,
     batch_size: usize,
-) -> Result<(usize, usize), RuntimeError> {
+) -> Result<(usize, usize, usize), RuntimeError> {
     if runtime.default_embedder_name().is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     let ns = token.namespace().as_str().to_owned();
     let sql = runtime.sql();
@@ -57,6 +59,7 @@ pub(crate) async fn embed_sections(
 
     let mut indexed = 0usize;
     let mut skipped = 0usize;
+    let mut failed = 0usize;
     let mut offset = 0i64;
 
     loop {
@@ -117,8 +120,17 @@ pub(crate) async fn embed_sections(
             let texts: Vec<String> = chunk.iter().map(|(_, t)| truncate_bytes(t)).collect();
             let embeddings = match runtime.embed_batch(&texts).await {
                 Ok(e) if e.len() == chunk.len() => e,
-                _ => {
-                    skipped += chunk.len();
+                Ok(_) => {
+                    tracing::warn!(
+                        batch = chunk.len(),
+                        "section embed_batch returned wrong vector count; counting as failed"
+                    );
+                    failed += chunk.len();
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, batch = chunk.len(), "section embed_batch failed; counting as failed");
+                    failed += chunk.len();
                     continue;
                 }
             };
@@ -129,7 +141,7 @@ pub(crate) async fn embed_sections(
             let now = now_us();
             for ((id, _), mut emb) in chunk.iter().zip(embeddings.into_iter()) {
                 unit_normalize(&mut emb);
-                writer
+                if let Err(e) = writer
                     .execute(SqlStatement {
                         sql: "UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 \
                               WHERE id = ?3"
@@ -142,8 +154,12 @@ pub(crate) async fn embed_sections(
                         label: None,
                     })
                     .await
-                    .map_err(|e| sql_err("section embedding update", e))?;
-                indexed += 1;
+                {
+                    tracing::warn!(id = %id, error = %e, "section embedding UPDATE failed; counting as failed");
+                    failed += 1;
+                } else {
+                    indexed += 1;
+                }
             }
         }
 
@@ -153,5 +169,5 @@ pub(crate) async fn embed_sections(
         offset += n as i64;
     }
 
-    Ok((indexed, skipped))
+    Ok((indexed, skipped, failed))
 }

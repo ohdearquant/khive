@@ -103,6 +103,10 @@ struct ReindexReport {
     /// knowledge pass. Distinct from atom-level failures: atom vectors DID
     /// persist; the ANN snapshot is the failure dimension.
     knowledge_ann_failed: bool,
+    /// Section-level embed or SQL-write failures during the knowledge pass.
+    /// Distinct from atom-level failures; sections still index atoms even if
+    /// section embedding fails.
+    knowledge_sections_failed: u64,
     models_used: Vec<String>,
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
@@ -116,6 +120,7 @@ impl ReindexReport {
             || self.knowledge_atoms_failed > 0
             || self.knowledge_pass_errored
             || self.knowledge_ann_failed
+            || self.knowledge_sections_failed > 0
     }
 }
 
@@ -278,6 +283,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                         knowledge_atoms_failed: 0,
                         knowledge_pass_errored: false,
                         knowledge_ann_failed: false,
+                        knowledge_sections_failed: 0,
                         models_used: vec![],
                         elapsed_ms: 0,
                         errors_skipped: 0,
@@ -413,6 +419,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut knowledge_atoms_failed: u64 = 0;
     let mut knowledge_pass_errored = false;
     let mut knowledge_ann_failed = false;
+    let mut knowledge_sections_failed: u64 = 0;
     if do_atoms || do_sections {
         eprintln!("  indexing knowledge corpus (this can take a while)…");
         let opts = khive_pack_knowledge::KnowledgeReindexOptions {
@@ -439,6 +446,10 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                             .and_then(|n| n.as_u64())
                             .unwrap_or(0),
                     );
+                    knowledge_sections_failed = v
+                        .get("sections_failed")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
                 }
             }
             Err(e) => {
@@ -459,6 +470,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         knowledge_atoms_failed,
         knowledge_pass_errored,
         knowledge_ann_failed,
+        knowledge_sections_failed,
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
@@ -579,6 +591,12 @@ fn print_report(report: &ReindexReport, human: bool) {
                 report.knowledge_atoms_failed
             );
         }
+        if report.knowledge_sections_failed > 0 {
+            println!(
+                "Knowledge sections: {} section embed/write failures",
+                report.knowledge_sections_failed
+            );
+        }
         if report.knowledge_ann_failed {
             println!("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)");
         }
@@ -690,6 +708,7 @@ mod tests {
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
             knowledge_ann_failed: false,
+            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
@@ -723,6 +742,7 @@ mod tests {
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: true,
+            knowledge_sections_failed: 0,
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
@@ -738,6 +758,35 @@ mod tests {
         assert!(
             decide_result(report.has_failures(), true).is_ok(),
             "best-effort downgrades knowledge_ann_failed to exit 0"
+        );
+    }
+
+    #[test]
+    fn has_failures_flags_knowledge_sections_failed() {
+        let report = ReindexReport {
+            entities_processed: 0,
+            notes_processed: 0,
+            knowledge_atoms_indexed: None,
+            knowledge_sections_indexed: Some(0),
+            knowledge_atoms_failed: 0,
+            knowledge_pass_errored: false,
+            knowledge_ann_failed: false,
+            knowledge_sections_failed: 3,
+            models_used: vec![],
+            elapsed_ms: 0,
+            errors_skipped: 0,
+        };
+        assert!(
+            report.has_failures(),
+            "knowledge_sections_failed > 0 alone must drive has_failures() = true"
+        );
+        assert!(
+            decide_result(report.has_failures(), false).is_err(),
+            "knowledge_sections_failed must fail closed (non-zero exit)"
+        );
+        assert!(
+            decide_result(report.has_failures(), true).is_ok(),
+            "best-effort downgrades knowledge_sections_failed to exit 0"
         );
     }
 

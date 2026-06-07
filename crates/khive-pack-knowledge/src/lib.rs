@@ -32,7 +32,8 @@ pub struct KnowledgeReindexOptions {
 /// Library entry for `kkernel reindex` — callable without an MCP server.
 /// Knowledge is single-model (search retrieves via the default embedder's ANN),
 /// so this does not fan out across registered models the way entity/note
-/// reindex does. Returns `{atoms_indexed, sections_indexed, failed, ann_failed}`.
+/// reindex does. Returns `{atoms_indexed, sections_indexed, failed, ann_failed,
+/// sections_failed}`.
 pub async fn reindex_knowledge(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -63,12 +64,14 @@ pub async fn reindex_knowledge(
     }
 
     let mut sections_indexed = 0u64;
+    let mut sections_failed = 0u64;
     if opts.sections {
         let batch = opts.batch_size.unwrap_or(500) as usize;
-        let (indexed, _skipped) =
+        let (indexed, _skipped, sec_failed) =
             knowledge::sections_index::embed_sections(runtime, token, opts.drop_existing, batch)
                 .await?;
         sections_indexed = indexed as u64;
+        sections_failed = sec_failed as u64;
     }
 
     Ok(json!({
@@ -76,5 +79,6 @@ pub async fn reindex_knowledge(
         "sections_indexed": sections_indexed,
         "failed": failed,
         "ann_failed": ann_failed,
+        "sections_failed": sections_failed,
     }))
 }

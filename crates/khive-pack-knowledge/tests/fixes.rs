@@ -1851,4 +1851,122 @@ mod embed_failure_tests {
             "ann_failed must be false when ANN block did not run: {result:?}"
         );
     }
+
+    // ── Section embed failure regression (codex round-1 HIGH) ────────────────
+    //
+    // Mirrors the atom failure tests above but exercises the SECTION path via
+    // `reindex_knowledge(sections:true, atoms:false)`. Blank-text sections are
+    // genuine `skipped`; embed_batch Err and count-mismatch are `failed`.
+
+    /// Seed two sections via `knowledge.edit` and return the fixture. The atom
+    /// must exist before sections can be attached.
+    async fn fixture_with_two_sections(rt: KhiveRuntime) -> Fixture {
+        let f = pack(rt);
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "sec-embed-fail",
+                    "name": "Section Embed Fail",
+                    "content": "atom content for section embed failure regression test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        // Two distinct sections so the batch has size 2.
+        f.dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "sec-embed-fail",
+                "sections": [
+                    {
+                        "section_type": "overview",
+                        "content": "Overview content for section embed failure regression test. This text is long enough to satisfy the 80-character minimum section length requirement — dense sparse retrieval corpus benchmark search latency."
+                    },
+                    {
+                        "section_type": "formalism",
+                        "content": "Formalism content for section embed failure regression test. This text is long enough to satisfy the 80-character minimum section length requirement — gradient descent transformer attention vector index."
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("edit sections");
+        f
+    }
+
+    /// count-mismatch branch on the SECTION path: embed_batch returns 1 vector
+    /// for a 2-section batch. Must count both sections as `sections_failed`, not
+    /// `skipped`; `reindex_knowledge` must surface this in its result JSON.
+    #[tokio::test]
+    async fn section_embed_count_mismatch_counts_as_sections_failed() {
+        let f = fixture_with_two_sections(rt_with_fake(OneDimProvider)).await;
+        let rt = f.rt.clone();
+        let token = rt
+            .authorize(khive_types::Namespace::local())
+            .expect("authorize");
+
+        let result = khive_pack_knowledge::reindex_knowledge(
+            &rt,
+            &token,
+            khive_pack_knowledge::KnowledgeReindexOptions {
+                atoms: false,
+                sections: true,
+                drop_existing: true,
+                rebuild_ann: false,
+                batch_size: None,
+            },
+        )
+        .await
+        .expect("reindex_knowledge ok");
+
+        assert_eq!(
+            result["sections_failed"].as_u64().unwrap_or(0),
+            2,
+            "count-mismatch must report both sections as sections_failed: {result:?}"
+        );
+        assert_eq!(
+            result["sections_indexed"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "no sections must be indexed on count-mismatch: {result:?}"
+        );
+    }
+
+    /// Err branch on the SECTION path: embed_batch returns Err for every batch.
+    /// Must count all sections as `sections_failed`, not `skipped`.
+    #[tokio::test]
+    async fn section_embed_error_counts_as_sections_failed() {
+        let f = fixture_with_two_sections(rt_with_fake(AlwaysFailProvider)).await;
+        let rt = f.rt.clone();
+        let token = rt
+            .authorize(khive_types::Namespace::local())
+            .expect("authorize");
+
+        let result = khive_pack_knowledge::reindex_knowledge(
+            &rt,
+            &token,
+            khive_pack_knowledge::KnowledgeReindexOptions {
+                atoms: false,
+                sections: true,
+                drop_existing: true,
+                rebuild_ann: false,
+                batch_size: None,
+            },
+        )
+        .await
+        .expect("reindex_knowledge ok");
+
+        assert_eq!(
+            result["sections_failed"].as_u64().unwrap_or(0),
+            2,
+            "embed Err must report both sections as sections_failed: {result:?}"
+        );
+        assert_eq!(
+            result["sections_indexed"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "no sections must be indexed on embed error: {result:?}"
+        );
+    }
 }
