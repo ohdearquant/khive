@@ -181,10 +181,10 @@ because inbox reads are interactive and latency-sensitive.
 The comm pack registers two partial indexes on the shared notes table to keep `inbox` and
 `thread` queries off a full-table scan on high-volume deployments:
 
-| Index | Covers | Partial condition |
-|---|---|---|
+| Index                        | Covers                                | Partial condition          |
+| ---------------------------- | ------------------------------------- | -------------------------- |
 | `idx_comm_message_direction` | `inbox` direction + read-status scans | `WHERE deleted_at IS NULL` |
-| `idx_comm_message_thread` | `thread` scans by `thread_id` | `WHERE deleted_at IS NULL` |
+| `idx_comm_message_thread`    | `thread` scans by `thread_id`         | `WHERE deleted_at IS NULL` |
 
 Both indexes use `WHERE deleted_at IS NULL` (not `WHERE kind = 'message'`) so that SQLite's
 query planner can match them when the `kind = ?N` predicate is parameterised. A literal-value
