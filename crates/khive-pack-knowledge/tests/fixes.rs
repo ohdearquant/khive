@@ -788,6 +788,48 @@ async fn w10_import_without_references_sets_source_type_imported() {
     );
 }
 
+#[tokio::test]
+async fn w10_import_section_only_markdown_synthesizes_atom_content() {
+    let f = pack(rt());
+    let dir = std::env::temp_dir().join("khive_fixes_test_w10_section_only");
+    std::fs::create_dir_all(&dir).ok();
+    let md_path = dir.join("section-only.md");
+    // All useful text lives under `##` sections; the pre-section body is empty.
+    std::fs::write(
+        &md_path,
+        "# Section Only\n\n## Overview\n\nThis overview section is long enough to satisfy the eighty character minimum section length requirement, covering dense sparse retrieval corpus benchmark search latency.\n\n## Formalism\n\nThe formalism section also exceeds eighty characters with gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity.\n",
+    )
+    .expect("write md");
+
+    let resp = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": md_path.to_str().unwrap(), "chunk_strategy": "section" }),
+        )
+        .await
+        .expect("section-only import should succeed");
+    assert_eq!(
+        resp["imported_atoms"].as_i64().unwrap_or(0),
+        1,
+        "atom must be imported even though the pre-section body is empty"
+    );
+    assert!(
+        resp["imported_sections"].as_i64().unwrap_or(0) >= 2,
+        "section bodies must be imported"
+    );
+
+    // Atom content is synthesized from the section bodies (>= 20 words).
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "section-only" }))
+        .await
+        .expect("get");
+    let content = atom["content"].as_str().unwrap_or("");
+    assert!(
+        content.split_whitespace().count() >= 20,
+        "atom content should be synthesized from sections: {content:?}"
+    );
+}
+
 // ── S4: namespace guard on UPDATE WHERE clauses ───────────────────────────────
 
 #[tokio::test]

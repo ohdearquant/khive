@@ -37,7 +37,9 @@ driven through brain profile state and feedback events.
 repeated section types with differing content coexist as sibling rows. Existing sibling
 sections — including verified ones — are never overwritten. `knowledge.import` supports
 `atlas_md` file/directory import and, with the default section chunk strategy, parses
-section headings into section rows.
+section headings into section rows. For a section-only document (an empty or short
+pre-section body), import synthesizes the atom's `content` from its section bodies so the
+atom satisfies the content minimum and remains searchable at the atom level.
 
 ### Atom and section content constraints
 

@@ -398,6 +398,22 @@ impl KnowledgeHandlers {
                 atom_name
             };
 
+            // Atom content is its description. A section-only document (e.g.
+            // `# Title` followed entirely by `##` sections) has an empty/short
+            // pre-section body, which would fail the atom content minimum before
+            // the sections are imported. Synthesize atom content from the section
+            // bodies in that case so the atom carries meaningful text.
+            let atom_content =
+                if atom_body.split_whitespace().count() >= super::util::MIN_ATOM_CONTENT_WORDS {
+                    atom_body
+                } else {
+                    sections
+                        .iter()
+                        .map(|(_, _, body)| body.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+
             let atlas_id = extract_atlas_id(&content);
             let citation_count = sections
                 .iter()
@@ -419,7 +435,7 @@ impl KnowledgeHandlers {
                 "atoms": [{
                     "slug": slug,
                     "name": name,
-                    "content": atom_body,
+                    "content": atom_content,
                     "properties": Value::Object(properties),
                     "source_uri": source_uri,
                     "source_type": source_type,

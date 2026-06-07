@@ -111,6 +111,13 @@ The canonical ledger of database schema migration versions. Migration versions a
 > ledger table is retained as a record of how the schema evolved, not as a live application
 > sequence. Future schema changes append `V2`, `V3`, … as normal; the consolidation is a
 > one-time baseline reset, not a new model.
+>
+> A database that still carries the **pre-consolidation ledger** (recorded version
+> `2..=22`) is ahead of the single known migration. `run_migrations` detects
+> `current_version > latest_version` and **fails with an explicit error** rather than
+> silently skipping `V1` and leaving the process on the stale schema. Such a database must
+> be recreated from the current `schema.sql`; in-place downgrade across the reset is not
+> supported.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

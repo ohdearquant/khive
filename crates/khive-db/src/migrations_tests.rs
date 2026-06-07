@@ -37,6 +37,27 @@ fn fresh_db_migrates_to_latest() {
 }
 
 #[test]
+fn rejects_pre_consolidation_ledger() {
+    let mut conn = open_memory();
+    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
+        [],
+    )
+    .unwrap();
+
+    let err = run_migrations(&mut conn).expect_err("must reject a version ahead of latest");
+    match err {
+        SqliteError::InvalidData(msg) => assert!(
+            msg.contains("ahead of the latest known migration"),
+            "unexpected message: {msg}"
+        ),
+        other => panic!("expected InvalidData, got {other:?}"),
+    }
+}
+
+#[test]
 fn core_tables_exist() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations");

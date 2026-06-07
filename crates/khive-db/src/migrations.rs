@@ -162,6 +162,21 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
         )
         .unwrap_or(0);
 
+    // A database whose recorded version is ahead of the latest known migration
+    // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
+    // pre-consolidation V2..V22 ledger — or was written by a newer build. Either
+    // way the baseline schema would be silently skipped, leaving the process on a
+    // stale schema. Fail loudly instead of corrupting silently.
+    let latest_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    if current_version > latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "database schema version {current_version} is ahead of the latest known migration \
+             {latest_version}. This database predates the consolidated baseline (ADR-015) or was \
+             written by a newer build. Recreate it from the current schema; in-place downgrade is \
+             not supported."
+        )));
+    }
+
     let mut applied_version = current_version;
 
     for migration in MIGRATIONS {
