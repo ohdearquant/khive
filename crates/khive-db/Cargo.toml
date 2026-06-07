@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
 crossbeam-queue = "0.3"
 parking_lot = { workspace = true }
+sha2 = { workspace = true }
 sqlite-vec = { version = "0.1.9", optional = true }
 
 [dev-dependencies]

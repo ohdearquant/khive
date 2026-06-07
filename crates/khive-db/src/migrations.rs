@@ -410,80 +410,9 @@ const V15_PROPOSALS_OPEN: &str = "\
     CREATE INDEX IF NOT EXISTS idx_proposals_open_updated ON proposals_open(namespace, updated_at DESC);\
 ";
 
-// V18: knowledge pack — atoms table (slug-keyed knowledge corpus) and domains
-// (named groupings of atoms). FTS5 full-text index over name + description +
-// content + tags. Separate from the notes/entities tables so the knowledge
-// corpus can scale to hundreds of thousands of atoms without polluting the
-// general-purpose note store.
-const V19_KNOWLEDGE_ATOMS_AND_DOMAINS: &str = "\
-    CREATE TABLE IF NOT EXISTS knowledge_atoms (\
-        id TEXT PRIMARY KEY,\
-        namespace TEXT NOT NULL,\
-        slug TEXT NOT NULL,\
-        name TEXT NOT NULL,\
-        description TEXT,\
-        content TEXT NOT NULL DEFAULT '',\
-        tags TEXT NOT NULL DEFAULT '[]',\
-        properties TEXT,\
-        finalized INTEGER NOT NULL DEFAULT 0,\
-        created_at INTEGER NOT NULL,\
-        updated_at INTEGER NOT NULL,\
-        deleted_at INTEGER\
-    );\
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_atoms_ns_slug \
-        ON knowledge_atoms(namespace, slug);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_atoms_ns \
-        ON knowledge_atoms(namespace);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_atoms_ns_created \
-        ON knowledge_atoms(namespace, created_at DESC);\
-    CREATE TABLE IF NOT EXISTS knowledge_domains (\
-        id TEXT PRIMARY KEY,\
-        namespace TEXT NOT NULL,\
-        slug TEXT NOT NULL,\
-        name TEXT NOT NULL,\
-        description TEXT,\
-        tags TEXT NOT NULL DEFAULT '[]',\
-        members TEXT NOT NULL DEFAULT '[]',\
-        created_at INTEGER NOT NULL,\
-        updated_at INTEGER NOT NULL,\
-        deleted_at INTEGER\
-    );\
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_domains_ns_slug \
-        ON knowledge_domains(namespace, slug);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_domains_ns \
-        ON knowledge_domains(namespace);\
-    CREATE VIRTUAL TABLE IF NOT EXISTS fts_knowledge \
-        USING fts5(\
-            id UNINDEXED,\
-            namespace UNINDEXED,\
-            slug,\
-            name,\
-            description,\
-            content,\
-            content=knowledge_atoms,\
-            content_rowid=rowid,\
-            tokenize='trigram case_sensitive 0'\
-        );\
-    CREATE TRIGGER IF NOT EXISTS fts_knowledge_ai \
-        AFTER INSERT ON knowledge_atoms \
-        WHEN new.deleted_at IS NULL BEGIN \
-        INSERT INTO fts_knowledge(rowid, id, namespace, slug, name, description, content) \
-            VALUES(new.rowid, new.id, new.namespace, new.slug, new.name, new.description, new.content); \
-    END; \
-    CREATE TRIGGER IF NOT EXISTS fts_knowledge_ad \
-        AFTER DELETE ON knowledge_atoms BEGIN \
-        INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, slug, name, description, content) \
-            VALUES('delete', old.rowid, old.id, old.namespace, old.slug, old.name, old.description, old.content); \
-    END; \
-    CREATE TRIGGER IF NOT EXISTS fts_knowledge_au \
-        AFTER UPDATE ON knowledge_atoms BEGIN \
-        INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, slug, name, description, content) \
-            VALUES('delete', old.rowid, old.id, old.namespace, old.slug, old.name, old.description, old.content); \
-        INSERT INTO fts_knowledge(rowid, id, namespace, slug, name, description, content) \
-            SELECT new.rowid, new.id, new.namespace, new.slug, new.name, new.description, new.content \
-            WHERE new.deleted_at IS NULL; \
-    END;\
-";
+// V19: knowledge pack schema — atoms, domains, sections, and all FTS5 indexes.
+// All knowledge tables land in a single migration; no ALTER TABLE incrementalism.
+const KNOWLEDGE_SCHEMA: &str = include_str!("../sql/knowledge_schema.sql");
 
 // V20: brain pack — profile snapshots and event log tables (Phase 1).
 //
@@ -509,103 +438,6 @@ const V20_BRAIN_PROFILE_PERSISTENCE: &str = "\
     );\
     CREATE INDEX IF NOT EXISTS idx_brain_events_profile \
         ON brain_event_log(profile_id, namespace, created_at);\
-";
-
-// V22: knowledge lifecycle status columns.
-//
-// Extends knowledge_atoms with:
-//   status      — workflow state, NOT NULL DEFAULT 'draft'
-//                 (draft | reviewed | verified | deprecated).
-//   source_uri  — provenance URI (e.g. "atlas:<id>" for atlas imports).
-//   source_type — provenance kind ("paper" | "imported" | user-defined).
-//
-// Extends knowledge_sections and knowledge_domains each with a status column
-// (NOT NULL DEFAULT 'draft') for the challenge/adjudicate workflow.
-//
-// Indexes accelerate status-filtered list/search paths.
-// Backfill: atoms already finalized are marked 'reviewed'.
-//
-// This is the superset migration; it subsumes the earlier
-// knowledge_status_and_source draft by adding NOT NULL defaults, domains.status,
-// the section/domain status indexes, and the finalized→reviewed backfill.
-const V22_KNOWLEDGE_LIFECYCLE_STATUS: &str = "\
-    ALTER TABLE knowledge_atoms ADD COLUMN status TEXT NOT NULL DEFAULT 'draft';\
-    ALTER TABLE knowledge_atoms ADD COLUMN source_uri TEXT;\
-    ALTER TABLE knowledge_atoms ADD COLUMN source_type TEXT;\
-    ALTER TABLE knowledge_sections ADD COLUMN status TEXT NOT NULL DEFAULT 'draft';\
-    ALTER TABLE knowledge_domains ADD COLUMN status TEXT NOT NULL DEFAULT 'draft';\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_atoms_ns_status \
-        ON knowledge_atoms(namespace, status);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_sections_status \
-        ON knowledge_sections(status);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_domains_ns_status \
-        ON knowledge_domains(namespace, status);\
-    UPDATE knowledge_atoms SET status = 'reviewed' WHERE finalized = 1;\
-";
-
-// V21: knowledge_sections — section-typed content rows for knowledge atoms.
-//
-// Each row holds one section (e.g. "overview", "formalism") for a given atom.
-// The UNIQUE(atom_id, section_type) constraint enforces the closed-enum invariant:
-// at most one row per section type per atom. Editing a section is an upsert on
-// this constraint, leaving sibling sections untouched.
-//
-// `embedding` is nullable BLOB — filled lazily by `knowledge.index` after edit.
-// `heading` is the markdown heading text parsed from the source content.
-// `sort_order` mirrors the order sections appear in the source document.
-//
-// FTS5 section index (`fts_sections`) enables sub-atom search by body content.
-const V21_KNOWLEDGE_SECTIONS: &str = "\
-    CREATE TABLE IF NOT EXISTS knowledge_sections (\
-        id           TEXT PRIMARY KEY,\
-        atom_id      TEXT NOT NULL,\
-        namespace    TEXT NOT NULL,\
-        section_type TEXT NOT NULL,\
-        heading      TEXT NOT NULL DEFAULT '',\
-        content      TEXT NOT NULL DEFAULT '',\
-        tokens       INTEGER NOT NULL DEFAULT 0,\
-        sort_order   INTEGER NOT NULL DEFAULT 0,\
-        embedding    BLOB,\
-        created_at   INTEGER NOT NULL,\
-        updated_at   INTEGER NOT NULL,\
-        FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id),\
-        UNIQUE(atom_id, section_type)\
-    );\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_sections_atom \
-        ON knowledge_sections(atom_id);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_sections_ns_type \
-        ON knowledge_sections(namespace, section_type);\
-    CREATE INDEX IF NOT EXISTS idx_knowledge_sections_ns_atom \
-        ON knowledge_sections(namespace, atom_id);\
-    CREATE VIRTUAL TABLE IF NOT EXISTS fts_sections \
-        USING fts5(\
-            id UNINDEXED,\
-            namespace UNINDEXED,\
-            atom_id UNINDEXED,\
-            section_type UNINDEXED,\
-            heading,\
-            content,\
-            content=knowledge_sections,\
-            content_rowid=rowid,\
-            tokenize='trigram case_sensitive 0'\
-        );\
-    CREATE TRIGGER IF NOT EXISTS fts_sections_ai \
-        AFTER INSERT ON knowledge_sections BEGIN \
-        INSERT INTO fts_sections(rowid, id, namespace, atom_id, section_type, heading, content) \
-            VALUES(new.rowid, new.id, new.namespace, new.atom_id, new.section_type, new.heading, new.content); \
-    END; \
-    CREATE TRIGGER IF NOT EXISTS fts_sections_ad \
-        AFTER DELETE ON knowledge_sections BEGIN \
-        INSERT INTO fts_sections(fts_sections, rowid, id, namespace, atom_id, section_type, heading, content) \
-            VALUES('delete', old.rowid, old.id, old.namespace, old.atom_id, old.section_type, old.heading, old.content); \
-    END; \
-    CREATE TRIGGER IF NOT EXISTS fts_sections_au \
-        AFTER UPDATE ON knowledge_sections BEGIN \
-        INSERT INTO fts_sections(fts_sections, rowid, id, namespace, atom_id, section_type, heading, content) \
-            VALUES('delete', old.rowid, old.id, old.namespace, old.atom_id, old.section_type, old.heading, old.content); \
-        INSERT INTO fts_sections(rowid, id, namespace, atom_id, section_type, heading, content) \
-            VALUES(new.rowid, new.id, new.namespace, new.atom_id, new.section_type, new.heading, new.content); \
-    END;\
 ";
 
 /// All versioned migrations in ascending order, applied by `run_migrations`.
@@ -716,33 +548,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "proposals_open_add_applying_status",
         up: "__v18_computed_at_runtime__",
     },
-    // V19: knowledge pack — atoms and domains tables + FTS5 index.
+    // V19: knowledge pack — atoms, domains, sections, and FTS5 indexes in one shot.
     VersionedMigration {
         version: 19,
-        name: "knowledge_atoms_and_domains",
-        up: V19_KNOWLEDGE_ATOMS_AND_DOMAINS,
+        name: "knowledge_schema",
+        up: KNOWLEDGE_SCHEMA,
     },
     VersionedMigration {
         version: 20,
         name: "brain_profile_persistence",
         up: V20_BRAIN_PROFILE_PERSISTENCE,
-    },
-    // V21: knowledge_sections table (knowledge pack Phase 2).
-    // Stores section-typed content for knowledge atoms: 10-value SectionType enum,
-    // per-section FK to knowledge_atoms, UNIQUE(atom_id, section_type) constraint.
-    VersionedMigration {
-        version: 21,
-        name: "knowledge_sections",
-        up: V21_KNOWLEDGE_SECTIONS,
-    },
-    // V22: knowledge lifecycle status columns — superset migration.
-    // Adds: knowledge_atoms.status (NOT NULL DEFAULT 'draft'), source_uri,
-    //       source_type; knowledge_sections.status; knowledge_domains.status;
-    //       status indexes; and a finalized→reviewed backfill.
-    VersionedMigration {
-        version: 22,
-        name: "knowledge_lifecycle_status",
-        up: V22_KNOWLEDGE_LIFECYCLE_STATUS,
     },
 ];
 

@@ -8,17 +8,17 @@ fn open_memory() -> Connection {
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
-    // Verify the tracking table has rows for V1 through V22.
+    // Verify the tracking table has rows for V1 through V20.
     let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-    assert_eq!(count, 22);
+    assert_eq!(count, 20);
 
     // Verify the entities table was created.
     let tbl_count: i64 = conn
@@ -212,7 +212,7 @@ fn fresh_db_migrates_to_latest() {
         .unwrap();
     assert_eq!(log_tbl, 1, "V20 must create brain_event_log table");
 
-    // Verify V21 created the knowledge_sections table.
+    // Verify V19 created the knowledge_sections table (all knowledge tables in one shot).
     let sections_tbl: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='knowledge_sections'",
@@ -220,13 +220,14 @@ fn fresh_db_migrates_to_latest() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(sections_tbl, 1, "V21 must create knowledge_sections table");
+    assert_eq!(sections_tbl, 1, "V19 must create knowledge_sections table");
 
-    // Verify V21 indexes on knowledge_sections.
+    // Verify V19 indexes on knowledge_sections.
     for idx in [
         "idx_knowledge_sections_atom",
         "idx_knowledge_sections_ns_type",
         "idx_knowledge_sections_ns_atom",
+        "idx_knowledge_sections_status",
     ] {
         let exists: bool = conn
             .query_row(
@@ -235,10 +236,10 @@ fn fresh_db_migrates_to_latest() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(exists, "V21 must create index {idx}");
+        assert!(exists, "V19 must create index {idx}");
     }
 
-    // Verify knowledge_sections columns.
+    // Verify knowledge_sections columns including content_hash and status.
     for col in [
         "id",
         "atom_id",
@@ -246,6 +247,8 @@ fn fresh_db_migrates_to_latest() {
         "section_type",
         "heading",
         "content",
+        "content_hash",
+        "status",
         "tokens",
         "sort_order",
         "embedding",
@@ -259,8 +262,31 @@ fn fresh_db_migrates_to_latest() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(exists, "V21 must add knowledge_sections.{col}");
+        assert!(exists, "V19 knowledge_sections must have column {col}");
     }
+
+    // Verify knowledge_atoms does NOT have a content column (content lives in sections).
+    let atoms_has_content: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('knowledge_atoms') WHERE name = 'content'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !atoms_has_content,
+        "knowledge_atoms must NOT have a content column"
+    );
+
+    // Verify knowledge_atoms has status column.
+    let atoms_has_status: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('knowledge_atoms') WHERE name = 'status'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(atoms_has_status, "knowledge_atoms must have status column");
 }
 
 #[test]
@@ -268,16 +294,16 @@ fn run_migrations_twice_is_idempotent() {
     let mut conn = open_memory();
     let v1 = run_migrations(&mut conn).expect("first run");
     let v2 = run_migrations(&mut conn).expect("second run");
-    assert_eq!(v1, 22);
-    assert_eq!(v2, 22);
+    assert_eq!(v1, 20);
+    assert_eq!(v2, 20);
 
-    // Should still have exactly twenty-two rows in the tracking table (V1..V22).
+    // Should still have exactly twenty rows in the tracking table (V1..V20).
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 22);
+    assert_eq!(count, 20);
 }
 
 // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -287,8 +313,8 @@ fn migration_v9_adds_target_backend_index() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
     assert_eq!(
-        version, 22,
-        "F052: latest migration must be V22 (knowledge_lifecycle_status)"
+        version, 20,
+        "F052: latest migration must be V20 (brain_profile_persistence)"
     );
     let col: i64 = conn
         .query_row(
@@ -324,14 +350,14 @@ fn failed_migration_rolls_back() {
 
     let mut conn = open_memory();
 
-    // Apply all real migrations (V1..V22) so the DB is at V22.
-    run_migrations(&mut conn).expect("V1..V22 should apply cleanly");
+    // Apply all real migrations (V1..V20) so the DB is at V20.
+    run_migrations(&mut conn).expect("V1..V20 should apply cleanly");
 
     // Now manually drive the bad V23 migration to check rollback behaviour.
     let result = apply_single_migration(&mut conn, &bad_v23);
     assert!(result.is_err(), "bad migration should return error");
 
-    // DB should still be at V22 — no V23 row in tracking.
+    // DB should still be at V20 — no V23 row in tracking.
     let v23_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _schema_migrations WHERE version = 23",
@@ -341,17 +367,17 @@ fn failed_migration_rolls_back() {
         .unwrap();
     assert_eq!(v23_count, 0, "V23 must not be recorded after rollback");
 
-    // V1..V22 should all be recorded.
+    // V1..V20 should all be recorded.
     let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
     assert_eq!(
-        applied_count, 22,
-        "V1..V22 must still be recorded after V23 rollback"
+        applied_count, 20,
+        "V1..V20 must still be recorded after V23 rollback"
     );
 }
 
@@ -390,12 +416,10 @@ fn store_ddl_then_migrations_is_idempotent() {
     // V16 adds embedding_model column to regular vec_ tables;
     // V17 is a no-op when no old-schema vec0 tables exist;
     // V18 adds 'applying' to proposals_open status CHECK;
-    // V19 creates knowledge_atoms/knowledge_domains tables;
-    // V20 creates brain_profile_snapshots and brain_event_log tables;
-    // V21 creates knowledge_sections table (knowledge pack Phase 2);
-    // V22 adds status/source_uri/source_type columns.
+    // V19 creates all knowledge tables (atoms, domains, sections, FTS indexes);
+    // V20 creates brain_profile_snapshots and brain_event_log tables.
     let version = run_migrations(&mut conn).expect("migrations after store DDL");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
     // V2 should be recorded as applied (skipped but tracked).
     let v2_count: i64 = conn
@@ -515,17 +539,17 @@ fn store_ddl_then_migrations_is_idempotent() {
         "V15 must be recorded after store-DDL + migrations"
     );
 
-    // V21 (knowledge_sections) must be recorded.
-    let v21_count: i64 = conn
+    // V19 (knowledge schema) must be recorded.
+    let v19_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM _schema_migrations WHERE version = 21",
+            "SELECT COUNT(*) FROM _schema_migrations WHERE version = 19",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
-        v21_count, 1,
-        "V21 must be recorded after store-DDL + migrations"
+        v19_count, 1,
+        "V19 must be recorded after store-DDL + migrations"
     );
 }
 
@@ -598,9 +622,9 @@ fn v1_to_v12_allows_null_salience() {
         )
         .unwrap();
 
-    // Run V2-V21 migrations.
+    // Run V2-V20 migrations.
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
     // After V12, salience must be nullable (notnull=0).
     let notnull: i64 = conn
@@ -644,7 +668,7 @@ fn store_ddl_then_event_migration_is_idempotent() {
     ensure_events_schema(&conn).expect("store DDL should create events");
 
     let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-    assert_eq!(version, 22, "must reach V22 even when events DDL ran first");
+    assert_eq!(version, 20, "must reach V20 even when events DDL ran first");
 
     let v13_count: i64 = conn
         .query_row(
@@ -685,8 +709,8 @@ fn migration_v14_creates_embedding_model_registry() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
     assert_eq!(
-        version, 22,
-        "F227: latest migration must be V22 (knowledge_lifecycle_status)"
+        version, 20,
+        "F227: latest migration must be V20 (brain_profile_persistence)"
     );
 
     // Verify _embedding_models table exists.
@@ -783,7 +807,7 @@ fn migration_v14_adds_embedding_model_id_to_existing_regular_vec_tables() {
     // Run the full migration suite — V14 should add embedding_model_id to the
     // regular vec_legacy_model table.
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
     // The embedding_model_id column must now exist.
     let col_exists: bool = conn
@@ -800,7 +824,7 @@ fn migration_v14_adds_embedding_model_id_to_existing_regular_vec_tables() {
 
     // Running migrations again must be idempotent (column already present).
     let version2 = run_migrations(&mut conn).expect("second run must succeed");
-    assert_eq!(version2, 22);
+    assert_eq!(version2, 20);
 }
 
 /// CRIT-2 regression: V14 discovery filter must NOT match sqlite-vec internal
@@ -832,7 +856,7 @@ fn migration_v14_does_not_alter_sqlite_vec_shadow_tables() {
     // Run the full migration suite — V14 must not add `embedding_model_id` to
     // any of the four shadow tables above.
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
     for shadow in [
         "vec_test_chunks",
@@ -1011,7 +1035,7 @@ fn v17_infer_model_fallback_for_unknown_suffix() {
 fn v17_migration_is_noop_on_fresh_db() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations must succeed on fresh DB");
-    assert_eq!(version, 22);
+    assert_eq!(version, 20);
 
     // V17 and V18 are recorded.
     let v17: i64 = conn

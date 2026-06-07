@@ -95,7 +95,7 @@ async fn learn_creates_concept_with_name_and_domain() {
             "knowledge.learn",
             json!({
                 "name": "LoRA",
-                "description": "Low-Rank Adaptation of large language models",
+                "description": "Low-Rank Adaptation of large language models — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "domain": "fine-tuning",
                 "tags": ["adapter"]
             }),
@@ -248,7 +248,7 @@ async fn cite_creates_introduced_by_edge() {
             json!({
                 "kind": "document",
                 "name": "Hu et al. 2021",
-                "description": "LoRA: Low-Rank Adaptation paper"
+                "description": "LoRA: Low-Rank Adaptation paper — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering"
             }),
         )
         .await
@@ -338,7 +338,7 @@ async fn topic_lists_all_concepts_without_filter() {
         .await
         .expect("topic ok");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     assert_eq!(items.len(), 3, "expected 3 concepts, got: {}", items.len());
 }
 
@@ -369,7 +369,7 @@ async fn topic_filters_by_domain() {
         .await
         .expect("topic filtered");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     assert_eq!(
         items.len(),
         2,
@@ -400,7 +400,7 @@ async fn topic_returns_empty_for_unknown_domain() {
         .await
         .expect("topic ok");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     assert!(items.is_empty(), "expected 0 items for unknown domain");
 }
 
@@ -418,7 +418,7 @@ async fn topic_respects_limit() {
         .await
         .expect("topic ok");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     assert!(
         items.len() <= 2,
         "expected <= 2 items, got: {}",
@@ -453,7 +453,7 @@ async fn topic_domain_filter_is_case_insensitive_listing_path() {
         .await
         .expect("topic ok");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     let names: Vec<&str> = items.iter().filter_map(|v| v["name"].as_str()).collect();
     assert_eq!(items.len(), 1, "expected 1 match, got: {names:?}");
     assert!(
@@ -498,7 +498,7 @@ async fn topic_search_path_total_is_bounded_by_candidate_window() {
         .await
         .expect("topic search ok");
 
-    let items = resp["items"].as_array().expect("items array");
+    let items = resp["results"].as_array().expect("results array");
     let total = resp["total"].as_u64().expect("total field present");
 
     assert!(
@@ -528,9 +528,9 @@ async fn upsert_atoms_creates_new_atoms() {
             "knowledge.upsert_atoms",
             json!({
                 "atoms": [
-                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating." },
-                    { "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation of LLMs", "tags": ["fine-tuning", "adapter"] },
-                    { "slug": "flash-attention", "name": "FlashAttention", "description": "Memory-efficient attention", "tags": ["attention"] },
+                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating." },
+                    { "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation of LLMs — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["fine-tuning", "adapter"] },
+                    { "slug": "flash-attention", "name": "FlashAttention", "description": "Memory-efficient attention — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["attention"] },
                 ]
             }),
         )
@@ -607,7 +607,7 @@ async fn upsert_domains_creates_and_updates() {
             "knowledge.upsert_domains",
             json!({
                 "domains": [
-                    { "slug": "retrieval", "name": "Retrieval", "description": "Retrieval techniques", "members": ["rag", "dense-retrieval"] }
+                    { "slug": "retrieval", "name": "Retrieval", "description": "Retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "members": ["rag", "dense-retrieval"] }
                 ]
             }),
         )
@@ -661,7 +661,7 @@ async fn get_returns_atom_by_slug() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation" }] }),
+        json!({ "atoms": [{ "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
     )
     .await
     .expect("upsert");
@@ -953,16 +953,16 @@ async fn fold_respects_min_score_filter() {
 async fn seed_search_corpus(f: &Fixture) {
     let atoms = json!({
         "atoms": [
-            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text" },
-            { "slug": "lora",            "name": "LoRA",              "description": "Low-Rank Adaptation of large language models", "tags": ["fine-tuning", "adapter"] },
-            { "slug": "flash-attention", "name": "FlashAttention",    "description": "Memory-efficient attention using tiling", "tags": ["attention", "gpu"] },
-            { "slug": "gqa",             "name": "GQA",               "description": "Grouped Query Attention reduces KV cache", "tags": ["attention", "inference"] },
-            { "slug": "rope",            "name": "RoPE",              "description": "Rotary Position Embedding for transformers", "tags": ["embedding", "position"] },
-            { "slug": "agent",           "name": "Agent",             "description": "Autonomous agent using LLM tool calls", "tags": ["agent", "tool-use"] },
-            { "slug": "chain-of-thought","name": "Chain-of-Thought",  "description": "Prompting technique for step-by-step reasoning", "tags": ["reasoning", "prompting"] },
-            { "slug": "speculative",     "name": "Speculative Decoding", "description": "Draft model accelerates inference via speculation", "tags": ["inference", "draft"] },
-            { "slug": "quantization",    "name": "Quantization",     "description": "Reduce model size by lowering numerical precision", "tags": ["compression", "inference"] },
-            { "slug": "dpo",             "name": "DPO",               "description": "Direct Preference Optimization for RLHF alignment", "tags": ["fine-tuning", "alignment"] },
+            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text" },
+            { "slug": "lora",            "name": "LoRA",              "description": "Low-Rank Adaptation of large language models — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "adapter"] },
+            { "slug": "flash-attention", "name": "FlashAttention",    "description": "Memory-efficient attention using tiling — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["attention", "gpu"] },
+            { "slug": "gqa",             "name": "GQA",               "description": "Grouped Query Attention reduces KV cache — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["attention", "inference"] },
+            { "slug": "rope",            "name": "RoPE",              "description": "Rotary Position Embedding for transformers — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["embedding", "position"] },
+            { "slug": "agent",           "name": "Agent",             "description": "Autonomous agent using LLM tool calls — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["agent", "tool-use"] },
+            { "slug": "chain-of-thought","name": "Chain-of-Thought",  "description": "Prompting technique for step-by-step reasoning — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "tags": ["reasoning", "prompting"] },
+            { "slug": "speculative",     "name": "Speculative Decoding", "description": "Draft model accelerates inference via speculation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["inference", "draft"] },
+            { "slug": "quantization",    "name": "Quantization",     "description": "Reduce model size by lowering numerical precision — covering concepts techniques algorithms implementations applications use cases and design patterns in", "tags": ["compression", "inference"] },
+            { "slug": "dpo",             "name": "DPO",               "description": "Direct Preference Optimization for RLHF alignment — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "alignment"] },
         ]
     });
     f.dispatch("knowledge.upsert_atoms", atoms)
@@ -983,8 +983,7 @@ async fn search_basic_returns_ranked_results() {
         .await
         .expect("search ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "expected some results");
 
     // RAG should rank highly for "retrieval generation".
@@ -1008,7 +1007,7 @@ async fn search_exact_name_bonus_surfaces_exact_match_first() {
         .await
         .expect("search ok");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "expected results for LoRA");
     let first_name = results[0]["name"].as_str().unwrap_or("");
     assert_eq!(
@@ -1031,7 +1030,7 @@ async fn search_query_expansion_matches_related_form() {
         .await
         .expect("search ok");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     // Agent atom should appear in results.
     let names: Vec<&str> = results.iter().filter_map(|v| v["name"].as_str()).collect();
     assert!(
@@ -1058,7 +1057,7 @@ async fn search_weight_override_changes_ranking() {
         .await
         .expect("search ok with weights");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "expected results");
     // FlashAttention or GQA have tag "attention".
     let first_name = results[0]["name"].as_str().unwrap_or("");
@@ -1081,7 +1080,7 @@ async fn search_limit_is_respected() {
         .await
         .expect("search ok");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(
         results.len() <= 2,
         "expected at most 2 results, got {}",
@@ -1101,7 +1100,7 @@ async fn search_empty_corpus_returns_empty_results() {
         .await
         .expect("search ok on empty corpus");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(results.is_empty(), "empty corpus should return no results");
 }
 
@@ -1124,7 +1123,7 @@ async fn search_type_filter_returns_only_atoms() {
     seed_search_corpus(&f).await;
     f.dispatch(
         "knowledge.upsert_domains",
-        json!({ "domains": [{ "slug": "attention-domain", "name": "Attention Domain", "description": "covers attention methods" }] }),
+        json!({ "domains": [{ "slug": "attention-domain", "name": "Attention Domain", "description": "covers attention methods — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts" }] }),
     )
     .await
     .expect("upsert domain");
@@ -1137,7 +1136,7 @@ async fn search_type_filter_returns_only_atoms() {
         .await
         .expect("search filtered ok");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     for r in results {
         assert_eq!(
             r["kind"].as_str().unwrap_or(""),
@@ -1153,7 +1152,7 @@ async fn search_type_domain_finds_upserted_domains() {
     f.dispatch(
         "knowledge.upsert_domains",
         json!({ "domains": [
-            { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "Dense and sparse retrieval techniques" }
+            { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "Dense and sparse retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —" }
         ]}),
     )
     .await
@@ -1167,7 +1166,7 @@ async fn search_type_domain_finds_upserted_domains() {
         .await
         .expect("search domain ok");
 
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(
         !results.is_empty(),
         "domain search should find the upserted domain"
@@ -1185,8 +1184,8 @@ async fn suggest_returns_domains_for_query() {
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques" },
-                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts" },
+                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —" },
+                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts" },
             ]
         }),
     )
@@ -1198,8 +1197,7 @@ async fn suggest_returns_domains_for_query() {
         .await
         .expect("suggest ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(
         !results.is_empty(),
         "suggest should return at least one domain"
@@ -1260,7 +1258,6 @@ async fn compose_returns_markdown_for_atoms() {
         .await
         .expect("compose ok");
 
-    assert_eq!(resp["status"], "ok");
     let md = resp["data"]["markdown"].as_str().expect("markdown");
     assert!(
         md.contains("Knowledge Briefing"),
@@ -1319,7 +1316,6 @@ async fn compose_returns_markdown_for_domain() {
         .await
         .expect("compose from domain ok");
 
-    assert_eq!(resp["status"], "ok");
     let atoms = resp["data"]["atoms"].as_array().expect("atoms");
     assert!(
         !atoms.is_empty(),
@@ -1364,8 +1360,7 @@ async fn suggest_returns_empty_when_no_domains_present() {
         .dispatch("knowledge.suggest", json!({ "query": "anything" }))
         .await
         .expect("suggest on empty corpus must not crash");
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     assert!(
         results.is_empty(),
         "no domains in corpus → empty results, got: {results:?}"
@@ -1380,9 +1375,9 @@ async fn suggest_honors_limit_param() {
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval" },
-                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search" },
-                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing" },
+                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
+                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
+                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
             ]
         }),
     )
@@ -1397,8 +1392,7 @@ async fn suggest_honors_limit_param() {
         .await
         .expect("suggest with limit=1");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results array");
+    let results = resp["results"].as_array().expect("results array");
     // All 3 seeded domains match the FTS phrase "domain"; suggest truncates to
     // exactly `limit` via hits.truncate(limit) before returning.
     assert_eq!(
@@ -1456,7 +1450,6 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
         .await
         .expect("compose with mix of domain_ids and atom_ids");
 
-    assert_eq!(resp["status"], "ok");
     let atoms = resp["data"]["atoms"].as_array().expect("atoms array");
     assert_eq!(
         atoms.len(),

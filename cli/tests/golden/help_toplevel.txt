@@ -1,4 +1,4 @@
-khive 0.2.6 — research knowledge graph CLI
+khive 0.2.8 — research knowledge graph CLI
 
 Usage:
   khive mcp [flags]         Start the MCP stdio server (auto-spawns daemon)

@@ -181,17 +181,13 @@ fn load_candidates_from_atoms(atoms: &[Atom], type_filter: Option<&str>) -> Vec<
                 id: atom.id.to_string(),
                 slug: atom.slug.clone(),
                 name_raw: atom.name.clone(),
-                description_raw: atom.description.clone(),
+                description_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
                 tags_raw: Some(tags_str.clone()),
                 status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
                 name: matching::tokenize_field(&atom.name),
-                description: atom
-                    .description
-                    .as_deref()
-                    .map(matching::tokenize_field)
-                    .unwrap_or_default(),
+                description: matching::tokenize_field(&atom.content),
                 tags: matching::tokenize_field(&tags_str),
                 content: matching::tokenize_field(&atom.content),
             })
@@ -994,13 +990,6 @@ fn format_compose_markdown(query: &str, domains: &[Domain], atoms: &[(&Atom, f32
         out.push_str(&format!("\n## {}\n\n", atom.name));
         out.push_str(&format!("Source: {}\n", atom.slug));
         out.push_str(&format!("Score: {:.4}\n", score));
-        if let Some(ref desc) = atom.description {
-            if !desc.is_empty() {
-                out.push('\n');
-                out.push_str(desc);
-                out.push('\n');
-            }
-        }
         if !atom.content.is_empty() {
             out.push('\n');
             out.push_str(&atom.content);
@@ -1152,10 +1141,7 @@ impl KnowledgeHandlers {
             .collect();
         let count = results.len();
 
-        Ok(json!({
-            "status": "ok",
-            "data": { "results": results, "count": count },
-        }))
+        Ok(json!({ "results": results, "total": count }))
     }
 
     pub(crate) async fn suggest(
@@ -1209,10 +1195,7 @@ impl KnowledgeHandlers {
             .collect();
         let count = results.len();
 
-        Ok(json!({
-            "status": "ok",
-            "data": { "results": results, "count": count },
-        }))
+        Ok(json!({ "results": results, "total": count }))
     }
 
     pub(crate) async fn compose(

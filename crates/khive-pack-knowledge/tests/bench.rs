@@ -217,5 +217,5 @@ async fn bench_infrastructure_smoke_test() {
         )
         .await
         .expect("smoke search ok");
-    assert_eq!(resp["status"], "ok");
+    assert!(resp["results"].is_array(), "search returns results array");
 }

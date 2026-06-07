@@ -108,7 +108,7 @@ async fn w5_search_excludes_deprecated_by_default() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique term xyzqwerty",
+                "description": "retrieval augmented content unique term xyzqwerty — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "content": "retrieval unique xyzqwerty deprecated content"
             }]
         }),
@@ -129,7 +129,7 @@ async fn w5_search_excludes_deprecated_by_default() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         !names.contains(&"Deprecated Atom"),
@@ -146,7 +146,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique qwertyzyx",
+                "description": "retrieval augmented content unique qwertyzyx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                 "content": "retrieval unique qwertyzyx deprecated content"
             }]
         }),
@@ -167,7 +167,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"Deprecated Atom"),
@@ -185,13 +185,13 @@ async fn w5_status_multiplier_verified_beats_draft() {
                 {
                     "slug": "veri-atom",
                     "name": "Verified Atom",
-                    "description": "neural network learning gradient descent unique zzzxxx",
+                    "description": "neural network learning gradient descent unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                     "content": "neural network gradient descent unique zzzxxx learning"
                 },
                 {
                     "slug": "draft-atom",
                     "name": "Draft Atom",
-                    "description": "neural network learning gradient unique zzzxxx",
+                    "description": "neural network learning gradient unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                     "content": "neural network gradient unique zzzxxx learning"
                 },
             ]
@@ -218,7 +218,7 @@ async fn w5_status_multiplier_verified_beats_draft() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
 
     let verified_score = results
         .iter()
@@ -287,7 +287,7 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
             "atoms": [{
                 "slug": "retrieval-domain",
                 "name": "Retrieval Domain",
-                "description": "domain organizing retrieval technique families xyzabc",
+                "description": "domain organizing retrieval technique families xyzabc — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "tags": ["type:domain", "retrieval"],
                 "content": "retrieval domain techniques xyzabc organization"
             }]
@@ -303,7 +303,7 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     let hit = results
         .iter()
         .find(|r| r["name"].as_str() == Some("Retrieval Domain"))
@@ -324,7 +324,7 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
             "domains": [{
                 "slug": "ml-techniques",
                 "name": "ML Techniques",
-                "description": "machine learning techniques domain organization"
+                "description": "machine learning techniques domain organization — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —"
             }]
         }),
     )
@@ -338,7 +338,7 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
         )
         .await
         .expect("search ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         !results.is_empty(),
         "domain search should return the upserted domain"
@@ -375,15 +375,16 @@ async fn w8_editing_verified_section_transitions_to_reviewed() {
     // Insert section with status='verified' directly.
     f.sql_exec(
         "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         (id, atom_id, namespace, section_type, heading, content, content_hash, tokens, sort_order, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         vec![
             SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000001".into()),
             SqlValue::Text(atom_uuid.to_string()),
             SqlValue::Text(ns.to_string()),
             SqlValue::Text("overview".into()),
             SqlValue::Text("Overview".into()),
-            SqlValue::Text("original section".into()),
+            SqlValue::Text("original section content that is long enough to satisfy constraints padding.".into()),
+            SqlValue::Text("aabbccdd00000001".into()),
             SqlValue::Integer(2),
             SqlValue::Integer(0),
             SqlValue::Text("verified".into()),
@@ -397,7 +398,7 @@ async fn w8_editing_verified_section_transitions_to_reviewed() {
         "knowledge.edit",
         json!({
             "id": "edit-atom",
-            "sections": [{ "section_type": "overview", "content": "updated content after edit" }]
+            "sections": [{ "section_type": "overview", "content": "Updated content after edit — this text is long enough to satisfy the 80-character minimum section length requirement." }]
         }),
     )
     .await
@@ -440,15 +441,16 @@ async fn w8_editing_non_verified_section_leaves_status_unchanged() {
 
     f.sql_exec(
         "INSERT INTO knowledge_sections \
-         (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         (id, atom_id, namespace, section_type, heading, content, content_hash, tokens, sort_order, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         vec![
             SqlValue::Text("aaaaaaaa-0000-0000-0000-000000000002".into()),
             SqlValue::Text(atom_uuid.to_string()),
             SqlValue::Text(ns.to_string()),
             SqlValue::Text("examples".into()),
             SqlValue::Text("Examples".into()),
-            SqlValue::Text("example content".into()),
+            SqlValue::Text("example content that is sufficiently long to satisfy the minimum length constraint.".into()),
+            SqlValue::Text("aabbccdd00000002".into()),
             SqlValue::Integer(2),
             SqlValue::Integer(0),
             SqlValue::Text("reviewed".into()),
@@ -462,7 +464,7 @@ async fn w8_editing_non_verified_section_leaves_status_unchanged() {
         "knowledge.edit",
         json!({
             "id": "edit-atom2",
-            "sections": [{ "section_type": "examples", "content": "updated examples content" }]
+            "sections": [{ "section_type": "examples", "content": "Updated examples content — this text is long enough to satisfy the 80-character minimum section length requirement." }]
         }),
     )
     .await
@@ -503,7 +505,7 @@ async fn w9_challenge_increments_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "challenge-atom",
-            "sections": [{ "section_type": "overview", "content": "section content" }]
+            "sections": [{ "section_type": "overview", "content": "Section content for challenge test — this text is sufficiently long to satisfy the 80-character minimum." }]
         }),
     )
     .await
@@ -542,7 +544,7 @@ async fn w9_challenge_on_atom_with_no_prior_dispute_count_starts_at_one() {
         "knowledge.edit",
         json!({
             "id": "fresh-atom",
-            "sections": [{ "section_type": "formalism", "content": "formalism content" }]
+            "sections": [{ "section_type": "formalism", "content": "Formalism content for fresh-atom challenge test — this text satisfies the 80-character minimum length requirement." }]
         }),
     )
     .await
@@ -581,7 +583,7 @@ async fn w9_adjudicate_decrements_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "adjud-atom",
-            "sections": [{ "section_type": "core_model", "content": "core model content" }]
+            "sections": [{ "section_type": "core_model", "content": "Core model content for adjudication test — this text satisfies the 80-character minimum length requirement." }]
         }),
     )
     .await
@@ -632,7 +634,7 @@ async fn w9_double_challenge_is_rejected() {
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "some content" }] }),
+        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "Some content for double-challenge test — this text is sufficiently long to satisfy the 80-character minimum." }] }),
     )
     .await
     .expect("edit");
@@ -683,7 +685,7 @@ async fn w9_adjudicate_non_disputed_section_is_rejected() {
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "content" }] }),
+        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "Content for adjudicate-non-disputed test — this text is long enough to satisfy the 80-character minimum requirement." }] }),
     )
     .await
     .expect("edit");
@@ -969,9 +971,9 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method", "content": "rrf fusion scoring alpha" },
-                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta", "content": "rrf fusion scoring beta" },
-                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma", "content": "rrf fusion scoring gamma" },
+                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "content": "rrf fusion scoring alpha" },
+                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring beta" },
+                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring gamma" },
             ]
         }),
     )
@@ -986,8 +988,7 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         .await
         .expect("search ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(!results.is_empty(), "fusion pipeline must produce results");
 
     for r in results {
@@ -1019,7 +1020,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
             "atoms": [{
                 "slug": "rrf-single",
                 "name": "Single Result",
-                "description": "unique sentinel zzzyyyxxx term for exact match",
+                "description": "unique sentinel zzzyyyxxx term for exact match — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                 "content": "unique sentinel zzzyyyxxx exact match content"
             }]
         }),
@@ -1035,7 +1036,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
         .await
         .expect("search ok");
 
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         !results.is_empty(),
         "single-result search must return the atom"
@@ -1146,7 +1147,7 @@ async fn fts_query_special_characters_do_not_crash() {
             "atoms": [{
                 "slug": "tenant-isolation",
                 "name": "Tenant Isolation",
-                "description": "multi-tenant isolation handles Bob's tenant",
+                "description": "multi-tenant isolation handles Bob's tenant — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                 "content": "multi-tenant isolation and Bob's data separation"
             }]
         }),
@@ -1155,14 +1156,13 @@ async fn fts_query_special_characters_do_not_crash() {
     .expect("seed atom");
 
     for query in ["multi-tenant isolation", "Bob's tenant"] {
-        let resp = f
+        let _resp = f
             .dispatch(
                 "knowledge.search",
                 json!({ "query": query, "rerank": false }),
             )
             .await
             .expect("search should not crash on FTS5 special characters");
-        assert_eq!(resp["status"], "ok");
     }
 }
 
@@ -1176,7 +1176,7 @@ async fn fts_operator_matrix_does_not_crash() {
             "atoms": [{
                 "slug": "fts-matrix-anchor",
                 "name": "FTS Matrix Anchor",
-                "description": "tenant isolation multi-concept search operator regression anchor",
+                "description": "tenant isolation multi-concept search operator regression anchor — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                 "content": "tenant isolation operator regression matrix anchor"
             }]
         }),
@@ -1222,9 +1222,9 @@ async fn fts_operator_matrix_does_not_crash() {
             .unwrap_or_else(|err| {
                 panic!("#570 query {label} {query:?} must not crash FTS5: {err}")
             });
-        assert_eq!(
-            resp["status"], "ok",
-            "#570 query {label} {query:?} must return status=ok, got: {resp:?}"
+        assert!(
+            resp["results"].is_array(),
+            "#570 query {label} {query:?} must return results array, got: {resp:?}"
         );
     }
 }
@@ -1323,19 +1323,19 @@ async fn search_scores_are_normalized_without_rank_inversion() {
                 {
                     "slug": "norm-high",
                     "name": "Normalization High",
-                    "description": "normalization unique qzxqzx alpha scoring",
+                    "description": "normalization unique qzxqzx alpha scoring — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                     "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon"
                 },
                 {
                     "slug": "norm-mid",
                     "name": "Normalization Mid",
-                    "description": "normalization unique qzxqzx beta",
+                    "description": "normalization unique qzxqzx beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering",
                     "content": "normalization unique qzxqzx beta scoring"
                 },
                 {
                     "slug": "norm-low",
                     "name": "Normalization Low",
-                    "description": "normalization unique qzxqzx",
+                    "description": "normalization unique qzxqzx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts",
                     "content": "normalization qzxqzx"
                 },
             ]
@@ -1359,8 +1359,7 @@ async fn search_scores_are_normalized_without_rank_inversion() {
         .await
         .expect("search ok");
 
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     assert!(
         results.len() >= 2,
         "expected at least 2 results: {results:?}"
@@ -1401,8 +1400,8 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv", "content": "cosine similarity embedding rerank vector" },
-                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta", "content": "cosine similarity embedding rerank" },
+                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "cosine similarity embedding rerank vector" },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta — covering concepts techniques algorithms implementations applications use cases and design patterns in", "content": "cosine similarity embedding rerank" },
             ]
         }),
     )
@@ -1417,8 +1416,7 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         )
         .await
         .expect("default rerank search ok");
-    assert_eq!(resp_default["status"], "ok");
-    let results_default = resp_default["data"]["results"].as_array().expect("results");
+    let results_default = resp_default["results"].as_array().expect("results");
     assert!(
         !results_default.is_empty(),
         "expected results with default rerank"
@@ -1441,10 +1439,7 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         )
         .await
         .expect("explicit rerank=false search ok");
-    assert_eq!(resp_norerank["status"], "ok");
-    let results_norerank = resp_norerank["data"]["results"]
-        .as_array()
-        .expect("results");
+    let results_norerank = resp_norerank["results"].as_array().expect("results");
     assert!(
         !results_norerank.is_empty(),
         "expected results with rerank=false"
@@ -1474,7 +1469,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx", "content": "opt out rerank test" },
+                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "opt out rerank test" },
             ]
         }),
     )
@@ -1489,8 +1484,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         )
         .await
         .expect("rerank=false search ok");
-    assert_eq!(resp["status"], "ok");
-    let results = resp["data"]["results"].as_array().expect("results");
+    let results = resp["results"].as_array().expect("results");
     for r in results {
         let score = r["score"].as_f64().expect("score");
         assert!(
@@ -1507,7 +1501,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard", "content": "multi-concept tenant isolation decompose guard" },
+                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "multi-concept tenant isolation decompose guard" },
             ]
         }),
     )
@@ -1526,5 +1520,8 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         )
         .await
         .expect("default rerank + decompose must not crash");
-    assert_eq!(resp["status"], "ok", "expected ok status, got: {resp:?}");
+    assert!(
+        resp["results"].is_array(),
+        "expected results array, got: {resp:?}"
+    );
 }

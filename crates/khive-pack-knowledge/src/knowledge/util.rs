@@ -2,9 +2,10 @@
 
 use chrono::Utc;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{Atom, Domain};
@@ -33,6 +34,46 @@ pub(super) static STOP_WORDS: &[&str] = &[
 
 pub(super) fn is_stop(w: &str) -> bool {
     STOP_WORDS.contains(&w)
+}
+
+// ─── content hash and validation ─────────────────────────────────────────────
+
+/// Minimum section content length in bytes.
+pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
+
+/// Minimum atom description length in words.
+pub(super) const MIN_ATOM_DESCRIPTION_WORDS: usize = 20;
+
+/// Compute sha256(content)[:16] as a hex string for dedup keying.
+pub(super) fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let hash = hasher.finalize();
+    format!("{hash:x}")[..16].to_string()
+}
+
+/// Validate that section content meets the 80-character minimum.
+pub(super) fn validate_section_content(content: &str) -> Result<(), RuntimeError> {
+    if content.len() < MIN_SECTION_CONTENT_LEN {
+        return Err(RuntimeError::InvalidInput(format!(
+            "section content must be at least {} characters (got {})",
+            MIN_SECTION_CONTENT_LEN,
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that atom description meets the 20-word minimum.
+pub(super) fn validate_atom_description(description: &str) -> Result<(), RuntimeError> {
+    let word_count = description.split_whitespace().count();
+    if word_count < MIN_ATOM_DESCRIPTION_WORDS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "atom description must be at least {} words (got {})",
+            MIN_ATOM_DESCRIPTION_WORDS, word_count
+        )));
+    }
+    Ok(())
 }
 
 // ─── error helpers ───────────────────────────────────────────────────────────
@@ -88,8 +129,7 @@ pub(super) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> 
         namespace: row_str(row, "namespace")?,
         slug: row_str(row, "slug")?,
         name: row_str(row, "name")?,
-        description: row_str(row, "description"),
-        content: row_str(row, "content").unwrap_or_default(),
+        content: row_str(row, "description").unwrap_or_default(),
         tags: row_str(row, "tags").unwrap_or_else(|| "[]".into()),
         properties: row_str(row, "properties"),
         status: row_str(row, "status"),
@@ -124,7 +164,7 @@ pub(super) fn atom_to_json(atom: &Atom) -> Value {
         "namespace": atom.namespace,
         "slug": atom.slug,
         "name": atom.name,
-        "description": atom.description,
+        "description": atom.content,
         "content": atom.content,
         "tags": serde_json::from_str::<Value>(&atom.tags).unwrap_or(Value::Array(vec![])),
         "properties": atom.properties.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
@@ -133,8 +173,8 @@ pub(super) fn atom_to_json(atom: &Atom) -> Value {
         "source_type": atom.source_type,
         "finalized": atom.finalized,
         "kind": "atom",
-        "created_at": atom.created_at,
-        "updated_at": atom.updated_at,
+        "created_at": micros_to_iso(atom.created_at),
+        "updated_at": micros_to_iso(atom.updated_at),
     })
 }
 
@@ -148,8 +188,8 @@ pub(super) fn domain_to_json(domain: &Domain) -> Value {
         "tags": serde_json::from_str::<Value>(&domain.tags).unwrap_or(Value::Array(vec![])),
         "members": serde_json::from_str::<Value>(&domain.members).unwrap_or(Value::Array(vec![])),
         "kind": "domain",
-        "created_at": domain.created_at,
-        "updated_at": domain.updated_at,
+        "created_at": micros_to_iso(domain.created_at),
+        "updated_at": micros_to_iso(domain.updated_at),
     })
 }
 
@@ -227,14 +267,9 @@ pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
 // ─── embed text helper ────────────────────────────────────────────────────────
 
 pub(super) fn atom_embed_text(atom: &Atom) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
     if !atom.name.is_empty() {
         parts.push(&atom.name);
-    }
-    if let Some(ref desc) = atom.description {
-        if !desc.is_empty() {
-            parts.push(desc.as_str());
-        }
     }
     if !atom.content.is_empty() {
         parts.push(&atom.content);

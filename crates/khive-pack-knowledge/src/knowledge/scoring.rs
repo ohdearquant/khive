@@ -105,17 +105,13 @@ pub(super) fn load_candidates_from_atoms(
                 id: atom.id.to_string(),
                 slug: atom.slug.clone(),
                 name_raw: atom.name.clone(),
-                description_raw: atom.description.clone(),
+                description_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
                 tags_raw: Some(tags_str.clone()),
                 status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
                 name: matching::tokenize_field(&atom.name),
-                description: atom
-                    .description
-                    .as_deref()
-                    .map(matching::tokenize_field)
-                    .unwrap_or_default(),
+                description: matching::tokenize_field(&atom.content),
                 tags: matching::tokenize_field(&tags_str),
                 content: matching::tokenize_field(&atom.content),
             })

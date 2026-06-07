@@ -10,7 +10,9 @@ use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
 };
 use super::util::resolve_atom_id;
-use super::util::{deser, new_id, now_us, row_str, sql_err};
+use super::util::{
+    content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content,
+};
 use super::KnowledgeHandlers;
 
 // ─── section helpers ──────────────────────────────────────────────────────────
@@ -43,6 +45,8 @@ fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
         section_type,
         heading: row_str(row, "heading").unwrap_or_default(),
         content: row_str(row, "content").unwrap_or_default(),
+        content_hash: row_str(row, "content_hash").unwrap_or_default(),
+        status: row_str(row, "status").unwrap_or_else(|| "draft".into()),
         tokens: super::util::row_i64(row, "tokens").unwrap_or(0),
         sort_order: super::util::row_i64(row, "sort_order").unwrap_or(0),
         created_at: super::util::row_i64(row, "created_at").unwrap_or(0),
@@ -208,6 +212,7 @@ impl KnowledgeHandlers {
 
         for su in &p.sections {
             let stype = parse_section_type(&su.section_type)?;
+            validate_section_content(&su.content)?;
             let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
             let sort_order = su.sort_order.unwrap_or_else(|| {
@@ -216,14 +221,19 @@ impl KnowledgeHandlers {
                     .position(|&t| t == stype)
                     .unwrap_or(9) as i64
             });
+            let hash = content_hash(&su.content);
 
+            // Look up existing section by section_type (the semantic key per atom).
             let mut reader = sql
                 .reader()
                 .await
                 .map_err(|e| sql_err("edit section reader", e))?;
             let existing_section = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, status FROM knowledge_sections WHERE atom_id = ?1 AND section_type = ?2 LIMIT 1".into(),
+                    sql: "SELECT id, status FROM knowledge_sections \
+                          WHERE atom_id = ?1 AND section_type = ?2 \
+                          ORDER BY sort_order ASC, created_at ASC LIMIT 1"
+                        .into(),
                     params: vec![
                         SqlValue::Text(atom_id.clone()),
                         SqlValue::Text(stype.as_str().to_string()),
@@ -247,40 +257,63 @@ impl KnowledgeHandlers {
                 .writer()
                 .await
                 .map_err(|e| sql_err("edit section writer", e))?;
-            writer
-                .execute(SqlStatement {
-                    sql: "INSERT INTO knowledge_sections \
-                          (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, created_at, updated_at) \
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-                          ON CONFLICT(atom_id, section_type) DO UPDATE SET \
-                            heading=excluded.heading, \
-                            content=excluded.content, \
-                            tokens=excluded.tokens, \
-                            sort_order=excluded.sort_order, \
-                            embedding=NULL, \
-                            updated_at=excluded.updated_at"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(section_id.clone()),
-                        SqlValue::Text(atom_id.clone()),
-                        SqlValue::Text(ns.clone()),
-                        SqlValue::Text(stype.as_str().to_string()),
-                        SqlValue::Text(heading.clone()),
-                        SqlValue::Text(su.content.clone()),
-                        SqlValue::Integer(tokens),
-                        SqlValue::Integer(sort_order),
-                        SqlValue::Integer(now),
-                        SqlValue::Integer(now),
-                    ],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("edit section upsert", e))?;
+
+            if existing_section.is_some() {
+                // UPDATE path: section exists for this section_type.
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE knowledge_sections SET \
+                              heading=?1, content=?2, content_hash=?3, tokens=?4, \
+                              sort_order=?5, embedding=NULL, updated_at=?6 \
+                              WHERE id=?7"
+                            .into(),
+                        params: vec![
+                            SqlValue::Text(heading.clone()),
+                            SqlValue::Text(su.content.clone()),
+                            SqlValue::Text(hash.clone()),
+                            SqlValue::Integer(tokens),
+                            SqlValue::Integer(sort_order),
+                            SqlValue::Integer(now),
+                            SqlValue::Text(section_id.clone()),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit section update", e))?;
+            } else {
+                // INSERT path: new section.
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO knowledge_sections \
+                              (id, atom_id, namespace, section_type, heading, content, \
+                               content_hash, tokens, sort_order, created_at, updated_at) \
+                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                            .into(),
+                        params: vec![
+                            SqlValue::Text(section_id.clone()),
+                            SqlValue::Text(atom_id.clone()),
+                            SqlValue::Text(ns.clone()),
+                            SqlValue::Text(stype.as_str().to_string()),
+                            SqlValue::Text(heading.clone()),
+                            SqlValue::Text(su.content.clone()),
+                            SqlValue::Text(hash.clone()),
+                            SqlValue::Integer(tokens),
+                            SqlValue::Integer(sort_order),
+                            SqlValue::Integer(now),
+                            SqlValue::Integer(now),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit section insert", e))?;
+            }
 
             if was_verified {
                 writer
                     .execute(SqlStatement {
-                        sql: "UPDATE knowledge_sections SET status='reviewed' WHERE atom_id=?1 AND section_type=?2 AND status='verified'".into(),
+                        sql: "UPDATE knowledge_sections SET status='reviewed' \
+                              WHERE atom_id=?1 AND section_type=?2 AND status='verified'"
+                            .into(),
                         params: vec![
                             SqlValue::Text(atom_id.clone()),
                             SqlValue::Text(stype.as_str().to_string()),
@@ -298,6 +331,7 @@ impl KnowledgeHandlers {
                 "section_type": stype.as_str(),
                 "heading": heading,
                 "tokens": tokens,
+                "content_hash": hash,
             }));
         }
 
@@ -415,8 +449,11 @@ impl KnowledgeHandlers {
             imported_atoms += 1;
 
             if chunk_strategy == "section" && !sections.is_empty() {
+                // Filter out stub sections below the 80-char minimum to avoid
+                // errors during import of markdown files with short sections.
                 let section_updates: Vec<Value> = sections
                     .iter()
+                    .filter(|(_, _, body)| body.len() >= super::util::MIN_SECTION_CONTENT_LEN)
                     .map(|(stype, heading, body)| {
                         json!({
                             "section_type": stype.as_str(),
@@ -425,13 +462,15 @@ impl KnowledgeHandlers {
                         })
                     })
                     .collect();
-                let edit_params = json!({
-                    "id": slug,
-                    "sections": section_updates,
-                });
-                let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
-                if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
-                    imported_sections += n as usize;
+                if !section_updates.is_empty() {
+                    let edit_params = json!({
+                        "id": slug,
+                        "sections": section_updates,
+                    });
+                    let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
+                    if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
+                        imported_sections += n as usize;
+                    }
                 }
             }
         }

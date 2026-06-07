@@ -152,6 +152,8 @@ pub(crate) struct Section {
     pub section_type: SectionType,
     pub heading: String,
     pub content: String,
+    pub content_hash: String,
+    pub status: String,
     pub tokens: i64,
     pub sort_order: i64,
     pub created_at: i64,
@@ -166,7 +168,9 @@ pub(crate) struct Atom {
     pub namespace: String,
     pub slug: String,
     pub name: String,
-    pub description: Option<String>,
+    /// Description text — the canonical content for this atom.  Downstream
+    /// callers access it via `atom.content`; the `description` SQL column is
+    /// the source and this field is its single Rust representation.
     pub content: String,
     /// JSON array string e.g. `["rag","retrieval"]`
     pub tags: String,
@@ -220,6 +224,9 @@ pub(crate) struct AtomInput {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    // REASON: accepted from callers for API backward-compatibility; content now
+    // lives in knowledge_sections and is not written to knowledge_atoms.
+    #[allow(dead_code)]
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]

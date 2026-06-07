@@ -12,7 +12,7 @@ use super::schema::{
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
     domain_to_json, new_id, now_us, row_str, sql_err, status_sql_clause, status_values,
-    tags_to_json,
+    tags_to_json, validate_atom_description,
 };
 use super::KnowledgeHandlers;
 
@@ -48,8 +48,15 @@ impl KnowledgeHandlers {
                 ));
             }
 
+            // Validate description word count if provided.
+            if let Some(ref desc) = atom_in.description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    validate_atom_description(trimmed)?;
+                }
+            }
+
             let tags_json = tags_to_json(atom_in.tags.as_ref());
-            let content = atom_in.content.as_deref().unwrap_or("").to_string();
             let props_json = atom_in
                 .properties
                 .as_ref()
@@ -89,14 +96,13 @@ impl KnowledgeHandlers {
                 writer
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom, mirroring
-                        // the V22 backfill (finalized=1 => reviewed). Never demote an already
-                        // reviewed/verified row, and leave status untouched when not finalizing
-                        // (codex #527 round 2). ?8 (finalized) is reused in the CASE.
-                        sql: "UPDATE knowledge_atoms SET name=?1, description=?2, content=?3, tags=?4, properties=?5, source_uri=?6, source_type=?7, finalized=?8, status = CASE WHEN ?8 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?9 WHERE id=?10 AND namespace=?11".into(),
+                        // the finalized=1 => reviewed logic. Never demote an already
+                        // reviewed/verified row, and leave status untouched when not finalizing.
+                        // No content column — content lives in knowledge_sections.
+                        sql: "UPDATE knowledge_atoms SET name=?1, description=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
                             SqlValue::Text(atom_in.name.clone()),
                             atom_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(content.clone()),
                             SqlValue::Text(tags_json.clone()),
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
                             source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
@@ -115,20 +121,20 @@ impl KnowledgeHandlers {
                 let id = new_id();
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)".into(),
+                        // No content column — content lives in knowledge_sections.
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
                             SqlValue::Text(slug.clone()),
                             SqlValue::Text(atom_in.name.clone()),
                             atom_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(content.clone()),
                             SqlValue::Text(tags_json.clone()),
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
                             source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             // status mirrors the lifecycle backfill (finalized => reviewed) so a
-                            // freshly-finalized atom is never left at the 'draft' default (codex #527).
+                            // freshly-finalized atom is never left at the 'draft' default.
                             SqlValue::Text(if atom_in.finalized.unwrap_or(false) { "reviewed" } else { "draft" }.to_string()),
                             SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
                             SqlValue::Integer(now),
@@ -233,18 +239,18 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("upsert_domains update", e))?;
                 // Dual-write: sync the mirror atom in knowledge_atoms for FTS.
+                // No content column — content lives in knowledge_sections.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, status, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'reviewed',1,?9,?10) \
-                              ON CONFLICT(namespace, slug) DO UPDATE SET name=?4, description=?5, content=?6, tags=?7, properties=?8, status='reviewed', updated_at=?10".into(),
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, tags, properties, status, finalized, created_at, updated_at) \
+                              VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
+                              ON CONFLICT(namespace, slug) DO UPDATE SET name=?4, description=?5, tags=?6, properties=?7, status='reviewed', updated_at=?9".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
                             SqlValue::Text(slug.clone()),
                             SqlValue::Text(name.clone()),
                             domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(String::new()),
                             SqlValue::Text(tags_json.clone()),
                             SqlValue::Text(properties_json.clone()),
                             SqlValue::Integer(now),
@@ -276,17 +282,17 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("upsert_domains insert", e))?;
                 // Dual-write: mirror atom in knowledge_atoms for FTS indexing.
+                // No content column — content lives in knowledge_sections.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, status, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'reviewed',1,?9,?10)".into(),
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, tags, properties, status, finalized, created_at, updated_at) \
+                              VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9)".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
                             SqlValue::Text(slug.clone()),
                             SqlValue::Text(name.clone()),
                             domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(String::new()),
                             SqlValue::Text(tags_json.clone()),
                             SqlValue::Text(properties_json.clone()),
                             SqlValue::Integer(now),
