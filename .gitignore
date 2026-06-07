@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Next.js / Node
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+.pnpm-store/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+ehthumbs.db
+
+# khive runtime data (working databases, not committed)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# khive KG layout:
+#   .khive/kg/       — committed (NDJSON + schema.yaml)
+#   .khive/config.toml — committed (project config)
+#   .khive/state/    — gitignored (working.db, derived from NDJSON)
+.khive/state/
+
+# Test artifacts
+test_models/
+test_data/
+.benchmarks/
+
+# Documentation build
+docs/_build/
+docs/.next/
+
+docs/adr/_review/
+
+# Compiled CLI binaries (built by scripts/compile.sh, not committed)
+npm/bin/khive-*
+# Exception: npm/bin/khive-mcp is the Node shim for the MCP binary, not a compiled binary.
+!npm/bin/khive-mcp
+
+# Codex review artifacts (local working notes, not part of the codebase)
+codex_review_*.md
+
+# Real-data recall benchmark corpus (extracted from khive-graph.db, never commit)
+crates/khive-pack-memory/tests/fixtures/
+
+uv.lock
+pyproject.toml
+
+*results.json
