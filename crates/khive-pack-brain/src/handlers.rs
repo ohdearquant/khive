@@ -174,7 +174,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "signal",
                 param_type: "string",
                 required: true,
-                description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\".",
+                description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\" | \"explicit_positive\" | \"explicit_negative\" | \"implicit_positive\" | \"implicit_negative\" | \"correction\".",
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",

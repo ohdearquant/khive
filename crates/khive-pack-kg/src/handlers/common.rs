@@ -209,6 +209,7 @@ pub(crate) struct CreateParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
     pub(crate) id: String,
+    pub(crate) include_deleted: Option<bool>,
 }
 
 #[derive(Deserialize)]

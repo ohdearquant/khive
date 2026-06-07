@@ -391,6 +391,31 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
+    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace isolation.
+    ///
+    /// Returns `Ok(Some(entity))` when the entity exists in the caller's namespace
+    /// regardless of `deleted_at`. Returns `Ok(None)` when the UUID was never created
+    /// or belongs to a different namespace. Callers use this to distinguish
+    /// "soft-deleted" from "never existed".
+    pub async fn get_entity_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Entity>> {
+        let entity = match self
+            .entities(token)?
+            .get_entity_including_deleted(id)
+            .await?
+        {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        if entity.namespace != token.namespace().as_str() {
+            return Ok(None);
+        }
+        Ok(Some(entity))
+    }
+
     /// Fetch multiple entities by ID, returning only those that exist in the
     /// caller's namespace.  Missing or namespace-mismatched IDs are silently
     /// omitted so that batch lookups don't abort on a single stale reference.

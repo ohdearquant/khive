@@ -35,8 +35,30 @@ impl KgPack {
             return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
         };
 
-        if let Ok(entity) = self.runtime.get_entity(graph_token, id).await {
-            return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?));
+        let include_deleted = p.include_deleted.unwrap_or(false);
+
+        match self.runtime.get_entity(graph_token, id).await {
+            Ok(entity) => {
+                return flatten_get_result(
+                    "entity",
+                    normalize_entity_timestamps(to_json(&entity)?),
+                );
+            }
+            Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => {
+                if include_deleted {
+                    if let Some(deleted) = self
+                        .runtime
+                        .get_entity_including_deleted(graph_token, id)
+                        .await?
+                    {
+                        return flatten_get_result(
+                            "entity",
+                            normalize_entity_timestamps(to_json(&deleted)?),
+                        );
+                    }
+                }
+            }
+            Err(e) => return Err(e),
         }
 
         if let Some(note) = self

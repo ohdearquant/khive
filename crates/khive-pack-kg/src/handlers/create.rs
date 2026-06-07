@@ -156,6 +156,9 @@ impl KgPack {
                 let name = p.name.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=entity requires 'name'".into())
                 })?;
+                if name.trim().is_empty() {
+                    return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+                }
                 let tags = p.tags.unwrap_or_default();
                 let validated_type = validate_entity_type(&canonical, p.entity_type.as_deref())?;
                 let entity = self

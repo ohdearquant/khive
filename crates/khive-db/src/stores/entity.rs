@@ -459,6 +459,24 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn get_entity_including_deleted(&self, id: Uuid) -> Result<Option<Entity>, StorageError> {
+        let id_str = id.to_string();
+
+        self.with_reader("get_entity_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
+                 FROM entities WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_entity(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     async fn count_entities(
         &self,
         namespace: &str,
