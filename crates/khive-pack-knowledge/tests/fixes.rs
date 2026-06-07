@@ -108,7 +108,6 @@ async fn w5_search_excludes_deprecated_by_default() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique term xyzqwerty — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "content": "retrieval unique xyzqwerty deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
@@ -146,7 +145,6 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
             "atoms": [{
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
-                "description": "retrieval augmented content unique qwertyzyx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                 "content": "retrieval unique qwertyzyx deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
@@ -185,13 +183,11 @@ async fn w5_status_multiplier_verified_beats_draft() {
                 {
                     "slug": "veri-atom",
                     "name": "Verified Atom",
-                    "description": "neural network learning gradient descent unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                     "content": "neural network gradient descent unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "draft-atom",
                     "name": "Draft Atom",
-                    "description": "neural network learning gradient unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                     "content": "neural network gradient unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
@@ -287,7 +283,6 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
             "atoms": [{
                 "slug": "retrieval-domain",
                 "name": "Retrieval Domain",
-                "description": "domain organizing retrieval technique families xyzabc — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "tags": ["type:domain", "retrieval"],
                 "content": "retrieval domain techniques xyzabc organization dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
@@ -971,9 +966,9 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-a", "name": "RRF Alpha", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-b", "name": "RRF Beta",  "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-c", "name": "RRF Gamma", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1020,7 +1015,6 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
             "atoms": [{
                 "slug": "rrf-single",
                 "name": "Single Result",
-                "description": "unique sentinel zzzyyyxxx term for exact match — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                 "content": "unique sentinel zzzyyyxxx exact match content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
@@ -1147,7 +1141,6 @@ async fn fts_query_special_characters_do_not_crash() {
             "atoms": [{
                 "slug": "tenant-isolation",
                 "name": "Tenant Isolation",
-                "description": "multi-tenant isolation handles Bob's tenant — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                 "content": "multi-tenant isolation and Bob's data separation dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
@@ -1176,7 +1169,6 @@ async fn fts_operator_matrix_does_not_crash() {
             "atoms": [{
                 "slug": "fts-matrix-anchor",
                 "name": "FTS Matrix Anchor",
-                "description": "tenant isolation multi-concept search operator regression anchor — covering concepts techniques algorithms implementations applications use cases and design patterns in",
                 "content": "tenant isolation operator regression matrix anchor dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
@@ -1323,19 +1315,16 @@ async fn search_scores_are_normalized_without_rank_inversion() {
                 {
                     "slug": "norm-high",
                     "name": "Normalization High",
-                    "description": "normalization unique qzxqzx alpha scoring — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
                     "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-mid",
                     "name": "Normalization Mid",
-                    "description": "normalization unique qzxqzx beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering",
                     "content": "normalization unique qzxqzx beta scoring dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-low",
                     "name": "Normalization Low",
-                    "description": "normalization unique qzxqzx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts",
                     "content": "normalization qzxqzx dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
@@ -1400,8 +1389,8 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta — covering concepts techniques algorithms implementations applications use cases and design patterns in", "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rerank-a", "name": "Cosine Alpha", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1469,7 +1458,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "opt out rerank test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "optout-a", "name": "Opt Out Alpha", "content": "opt out rerank test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1501,7 +1490,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "multi-concept tenant isolation decompose guard dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "decompose-guard", "name": "Decompose Guard", "content": "multi-concept tenant isolation decompose guard dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
