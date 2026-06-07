@@ -94,6 +94,7 @@ to stderr; the JSON/`--human` report goes to stdout.
 ```bash
 kkernel reindex --db ~/.khive/khive.db --namespace local   # entities + notes + knowledge
 kkernel reindex --db ~/.khive/khive.db --namespace khive
+kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only section embeddings
 ```
 
 | Flag               | Effect                                                                          |
@@ -102,6 +103,8 @@ kkernel reindex --db ~/.khive/khive.db --namespace khive
 | `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`    |
 | `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                 |
 | `--no-knowledge`   | only entities/notes (skip knowledge)                                            |
+| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)    |
+| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                   |
 | `--model <name>`   | entities/notes use this single engine instead of fanning out                    |
 | `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild  |
 | `--batch-size <n>` | records per embedding batch (default 100, max 500)                              |
@@ -126,6 +129,18 @@ and `--human`) always reports attempted/indexed/failed counts honestly
 `knowledge_ann_failed`). Note: `knowledge_ann_failed` is a distinct failure
 dimension from `knowledge_atoms_failed` — atom vectors may have persisted
 successfully while the ANN rebuild or snapshot persist failed.
+=======
+| Flag               | Effect                                                                         |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                |
+| `--no-knowledge`   | only entities/notes (skip knowledge)                                           |
+| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)   |
+| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                  |
+| `--model <name>`   | entities/notes use this single engine instead of fanning out                   |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild |
+| `--batch-size <n>` | records per embedding batch (default 100, max 500)                             |
+| `--human`          | readable report instead of JSON                                                |
+>>>>>>> b99b655 (docs(adr-051,kkernel): mark read-side deferred; document section flags)
 
 **Multi-engine semantics.** Entities and notes embed with **every registered
 engine** (e.g. `all-minilm-l6-v2` + `paraphrase-multilingual-minilm-l12-v2`),

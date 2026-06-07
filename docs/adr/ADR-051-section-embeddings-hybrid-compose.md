@@ -67,6 +67,13 @@ incremental.
 
 ### Read — hybrid compose scoring
 
+> **Status: deferred to Phase 2 (issue #6).** Phase 1 ships the **write** side only —
+> section embeddings populated by `kkernel reindex`. The read-side scoring described
+> below is the accepted design, not yet implemented; `knowledge.compose` remains
+> atom-level until #6 lands. The `type_prior` term is served by brain profile section
+> posteriors (ADR-048 §4), which requires the brain primitives to move into a shared
+> crate first (issue #5) — `knowledge` cannot depend on the `brain` pack.
+
 Compose scores each candidate section with the spec's hybrid formula:
 
 ```
@@ -94,9 +101,11 @@ feature flag.
 
 ## Consequences
 
-- `knowledge_sections.embedding` becomes load-bearing; `knowledge.stats`
-  embedding coverage gains a section dimension.
-- Compose gains a semantic signal (synonym/paraphrase recall) over keyword-only.
+- `knowledge_sections.embedding` becomes load-bearing once the read side lands.
+  Surfacing section coverage in `knowledge.stats` is part of the deferred read-side
+  work (issue #6); Phase 1 reports atom coverage only.
+- Compose gains a semantic signal (synonym/paraphrase recall) over keyword-only
+  — delivered by the deferred read side (issue #6).
 - No schema migration is required for v1 (the column exists); adding
   `atom_section_state` later is additive.
 - Reindex cost grows: sections outnumber atoms ~5× (358k vs 68k locally), all
@@ -107,7 +116,6 @@ feature flag.
 
 ## References
 
-- Archived spec: `.khive/archive/khive-internal/.khive/workspaces/20260401/
-  skills-engine-research/responses_2/section_embeddings/khive_section_embeddings_spec/`
-- `engine_v1/src/engine/sections.rs` (archived `search_sections`)
+- Issue #6 — hybrid section scoring + compose pipeline (the read-side work this ADR specifies)
+- Issue #5 — extract brain posterior/profile primitives into a shared crate (unblocks the `type_prior` term)
 - [ADR-021](ADR-021-memory-pack.md), [ADR-048](ADR-048-knowledge-section-profiles.md)
