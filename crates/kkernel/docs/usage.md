@@ -18,7 +18,7 @@ kkernel <command> [flags]
   db        Schema migration lifecycle (migrate, check)
   engine    Embedding model lifecycle (list, status, migrate, drift-check)
   vector    Vector store capabilities and orphan sweep
-  reindex   Re-embed all entities and notes
+  reindex   Re-embed entities, notes, and the knowledge corpus (multi-engine)
   exec      Run a verb DSL expression through the pack registry
   mcp       Serve the MCP `request` surface (stdio / daemon / transports)
   backend   Inspect registered backends (list, info <name>)
@@ -96,14 +96,33 @@ kkernel reindex --db ~/.khive/khive.db --namespace local   # entities + notes + 
 kkernel reindex --db ~/.khive/khive.db --namespace khive
 ```
 
-| Flag               | Effect                                                                         |
-| ------------------ | ------------------------------------------------------------------------------ |
-| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                |
-| `--no-knowledge`   | only entities/notes (skip knowledge)                                           |
-| `--model <name>`   | entities/notes use this single engine instead of fanning out                   |
-| `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild |
-| `--batch-size <n>` | records per embedding batch (default 100, max 500)                             |
-| `--human`          | readable report instead of JSON                                                |
+| Flag               | Effect                                                                          |
+| ------------------ | ------------------------------------------------------------------------------- |
+| `--db <path>`      | database (env `KHIVE_DB`; `:memory:` for ephemeral) — parity with `mcp`/`exec`  |
+| `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`    |
+| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                 |
+| `--no-knowledge`   | only entities/notes (skip knowledge)                                            |
+| `--model <name>`   | entities/notes use this single engine instead of fanning out                    |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild  |
+| `--batch-size <n>` | records per embedding batch (default 100, max 500)                              |
+| `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
+| `--human`          | readable report instead of JSON                                                 |
+
+**Config resolution.** Engines, db path, and config file are resolved with the
+**same precedence as `kkernel mcp`** — config-file `[[engines]]` (via `--config`
+/ `KHIVE_CONFIG` / `./khive.toml` / `./.khive/config.toml` / `~/.khive/config.toml`)
+win over the `KHIVE_EMBEDDING_MODEL` env vars and over `RuntimeConfig` defaults.
+This guarantees reindex writes vectors for the SAME engine set the MCP server
+serves recall from. `--namespace` is the explicit per-namespace target and
+always wins over any config `[actor] id`.
+
+**Fail-closed.** By default reindex returns a **non-zero exit** if any requested
+engine failed, the knowledge pass errored, or any knowledge atom vector insert
+failed — a partial rebuild leaves stale recall/search state, so automation must
+not see success. Pass `--best-effort` to downgrade failures to a warning and
+exit 0. The report (JSON and `--human`) always reports attempted/indexed/failed
+counts honestly (`errors_skipped`, `knowledge_atoms_failed`,
+`knowledge_pass_errored`).
 
 **Multi-engine semantics.** Entities and notes embed with **every registered
 engine** (e.g. `all-minilm-l6-v2` + `paraphrase-multilingual-minilm-l12-v2`),
