@@ -1,0 +1,34 @@
+khive 0.2.6 — research knowledge graph CLI
+
+Usage:
+  khive mcp [flags]         Start the MCP stdio server (auto-spawns daemon)
+  khive kg <subcommand>     Manage the git-native knowledge graph
+  khive pack <subcommand>   Author and validate declarative packs (ADR-050)
+
+KG subcommands:
+  init          Initialise .khive/kg/ in the current git repo
+  validate      Validate NDJSON files + rules.yaml (ADR-056)
+  commit        Validate NDJSON files + git commit (Phase C1; DB export is Phase C2)
+  sync          Validate NDJSON + create working.db placeholder (Phase C1; DB rebuild is Phase C2)
+  status        Show entity/edge counts and uncommitted changes (file-level; DB diff is Phase C2)
+  config        Show or modify .khive/config.toml (ADR-057)
+  embed         Plan / run entity embedding (ADR-057; Phase C1 plans, Phase C2 runs)
+  export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
+  import        Import a KgArchive JSON file into NDJSON files
+  resolve       Resolve NDJSON merge conflicts (ADR-053)
+  hook          Manage the pre-commit validation hook (install/uninstall/status)
+  migrate       Apply schema migrations from .khive/kg/migrations/ (ADR-054)
+  diff          Entity-aware diff between two NDJSON states
+  log           Show KG change history (commits touching .khive/kg/ files)
+  stats         Show entity/edge counts, kind breakdown, schema coverage
+  doctor        Validate KG integrity: syntax, refs, duplicates, orphans
+  update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
+
+Pack subcommands (ADR-050):
+  init          Scaffold a new declarative pack
+  check         Validate a pack.yaml manifest
+
+All 7 built-in packs (kg, gtd, memory, brain, comm, schedule, knowledge)
+load by default — no --pack flags needed.
+
+Run 'khive <group> <subcommand> --help' for detailed usage.

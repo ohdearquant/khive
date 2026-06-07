@@ -1,0 +1,10 @@
+Usage: khive pack <subcommand>
+
+Subcommands (ADR-050):
+  init           Scaffold a new declarative pack (creates ./pack.yaml)
+  check <path>   Validate a pack.yaml manifest
+
+Planned:
+  install        Install a pack from registry/local/git
+  remove         Uninstall a pack
+  publish        Publish to a pack registry

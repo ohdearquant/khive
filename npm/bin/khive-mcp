@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+
+// khive-mcp — per-platform binary shim for the MCP stdio server (ADR-026)
+//
+// Resolves the host platform to the matching @khive-ai/kernel-{platform}
+// optional dependency and execs the khive-mcp binary from its bin/ directory.
+// Falls back to a local cargo build directory for monorepo development.
+//
+// This shim is the companion to npm/bin/khive. Both use the same
+// `getBinaryPath()` logic — see npm/bin/khive for comments and rationale.
+// Keep detection order and platform mapping in sync between the two shims.
+//
+// Users configure this binary in Claude Code's MCP config:
+//   {"mcpServers": {"khive": {"command": "khive-mcp"}}}
+
+"use strict";
+
+const { execFileSync } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+
+/**
+ * Detect whether the Linux runtime links against glibc or musl.
+ * Detection order (most-reliable first):
+ *   1. `ldd --version` — invokes the actual system linker
+ *   2. `/lib/ld-musl-*` glob — fast filesystem check
+ * Returns "gnu" or "musl". Defaults to "gnu" if detection is inconclusive.
+ *
+ * NOTE: npm/bin/khive and cli/lib/kernel.ts use the same detection order.
+ * Keep all three in sync.
+ */
+function detectLibc() {
+  try {
+    const ldd = require("child_process")
+      .execFileSync("ldd", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+      .toLowerCase();
+    if (ldd.includes("musl")) return "musl";
+    return "gnu";
+  } catch (_) {
+    try {
+      const libs = fs.readdirSync("/lib");
+      if (libs.some((f) => f.startsWith("ld-musl-"))) return "musl";
+    } catch (_) {}
+    return "gnu";
+  }
+}
+
+const SUPPORTED_PLATFORMS = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-x64-gnu",
+  "linux-x64-musl",
+  "linux-arm64",
+  "win32-x64",
+];
+
+function getPlatformKey() {
+  return `${os.platform()}-${os.arch()}`;
+}
+
+function resolvePlatformSuffix() {
+  const platformKey = getPlatformKey();
+  if (platformKey === "linux-x64") {
+    const libc = detectLibc();
+    return libc === "musl" ? "linux-x64-musl" : "linux-x64-gnu";
+  }
+  if (platformKey === "linux-arm64") {
+    const libc = detectLibc();
+    if (libc === "musl") return null; // unsupported, caller emits clear error
+    return "linux-arm64";
+  }
+  const PLATFORM_MAP = {
+    "darwin-arm64": "darwin-arm64",
+    "darwin-x64": "darwin-x64",
+    "win32-x64": "win32-x64",
+  };
+  return PLATFORM_MAP[platformKey];
+}
+
+function getBinaryPath(binaryName) {
+  const isWindows = os.platform() === "win32";
+  const exe = isWindows ? `${binaryName}.exe` : binaryName;
+
+  const envVar = binaryName === "kkernel" ? "KKERNEL_BINARY" : "KHIVE_MCP_BINARY";
+  const override = process.env[envVar];
+  if (override && fs.existsSync(override)) return override;
+
+  const platformSuffix = resolvePlatformSuffix();
+
+  if (platformSuffix === null) {
+    const platformKey = getPlatformKey();
+    const libc = detectLibc();
+    console.error(`khive-mcp: unsupported platform: ${platformKey} (libc: ${libc})`);
+    console.error("linux-arm64 with musl is not in the v1 release matrix.");
+    console.error("Supported: " + SUPPORTED_PLATFORMS.join(", "));
+    console.error(
+      "File an issue at https://github.com/ohdearquant/khive/issues if you need this target.",
+    );
+    process.exit(1);
+  }
+
+  if (platformSuffix === undefined) {
+    const platformKey = getPlatformKey();
+    console.error(`khive-mcp: unsupported platform: ${platformKey}`);
+    console.error("Supported: " + SUPPORTED_PLATFORMS.join(", "));
+    console.error(
+      "File an issue at https://github.com/ohdearquant/khive/issues if you need this target.",
+    );
+    process.exit(1);
+  }
+
+  const pkgName = `@khive-ai/kernel-${platformSuffix}`;
+
+  // Package-manager-agnostic resolution (npm, yarn, pnpm isolated-store).
+  try {
+    const pkgJsonPath = require.resolve(`${pkgName}/package.json`);
+    const pkgDir = path.dirname(pkgJsonPath);
+    const candidate = path.join(pkgDir, "bin", exe);
+    if (fs.existsSync(candidate)) return candidate;
+  } catch (_) {}
+
+  // Dev fallback: cargo build directory inside the monorepo.
+  const devCandidates = [];
+  let search = path.join(__dirname, "..");
+  for (let i = 0; i < 8; i++) {
+    const cratesDir = path.join(search, "crates");
+    if (fs.existsSync(cratesDir)) {
+      devCandidates.push(path.join(cratesDir, "target", "release", exe));
+      devCandidates.push(path.join(cratesDir, "target", "debug", exe));
+      break;
+    }
+    const parent = path.dirname(search);
+    if (parent === search) break;
+    search = parent;
+  }
+  for (const c of devCandidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  console.error(`khive-mcp: ${pkgName} not installed or ${binaryName} binary not found.`);
+  console.error(`Expected: ${pkgName}/bin/${exe}`);
+  console.error(
+    "Run 'npm install -g khive' to install platform binaries, or set " +
+      `${envVar} to point to a local build.`,
+  );
+  process.exit(1);
+}
+
+try {
+  const binary = getBinaryPath("khive-mcp");
+  execFileSync(binary, process.argv.slice(2), {
+    stdio: "inherit",
+    env: process.env,
+  });
+} catch (err) {
+  if (err.status !== undefined) {
+    process.exit(err.status);
+  }
+  throw err;
+}

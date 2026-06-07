@@ -1,0 +1,26 @@
+{
+  "name": "@khive-ai/kernel-darwin-arm64",
+  "version": "0.2.6",
+  "description": "khive Rust binaries for macOS Apple Silicon (arm64)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ohdearquant/khive"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "bin": {
+    "kkernel": "bin/kkernel",
+    "khive-mcp": "bin/khive-mcp"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
