@@ -121,13 +121,23 @@ impl KnowledgeHandlers {
 
             let embeddings = match runtime.embed_batch(&texts).await {
                 Ok(e) => e,
-                Err(_) => {
-                    skipped += staged.len();
+                Err(e) => {
+                    tracing::warn!(
+                        batch_size = staged.len(),
+                        error = %e,
+                        "embed_batch failed; atoms cannot be recalled until reindexed"
+                    );
+                    failed += staged.len();
                     continue;
                 }
             };
             if embeddings.len() != staged.len() {
-                skipped += staged.len();
+                tracing::warn!(
+                    expected = staged.len(),
+                    got = embeddings.len(),
+                    "embed_batch returned wrong number of vectors; atoms cannot be recalled until reindexed"
+                );
+                failed += staged.len();
                 continue;
             }
 

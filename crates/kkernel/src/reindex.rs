@@ -53,9 +53,11 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub keep_existing: bool,
 
-    /// Namespace to operate on.
-    #[arg(long, default_value = "local")]
-    pub namespace: String,
+    /// Namespace to operate on. When omitted, the config file `[actor] id` (if
+    /// any) is honored — matching the same precedence as `kkernel mcp`. An
+    /// explicit `--namespace` / `KHIVE_NAMESPACE` overrides the config tier.
+    #[arg(long, env = "KHIVE_NAMESPACE")]
+    pub namespace: Option<String>,
 
     /// Only reindex the knowledge corpus (skip entities and notes).
     #[arg(long, conflicts_with = "no_knowledge")]
@@ -207,23 +209,29 @@ async fn filter_unembedded(
 /// MCP server serves recall from. Fails closed on any partial failure unless
 /// `--best-effort` is set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
-    // `--namespace` is the operator's explicit per-namespace target (reindex is
-    // run once per namespace), so it always wins over any config `[actor] id`;
-    // the config tier still supplies engines + db path.
-    let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Namespace precedence mirrors `kkernel mcp`:
+    //   1. --namespace / KHIVE_NAMESPACE (explicit CLI/env) — skips config tier
+    //   2. [actor] id in the config file
+    //   3. Default "local"
+    let explicit = args.namespace.is_some();
+    let raw = args.namespace.as_deref().unwrap_or("local");
+    let ns = Namespace::parse(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
     let cfg = resolve_runtime_config(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
         namespace: ns,
-        namespace_explicit: true,
+        namespace_explicit: explicit,
         no_embed: false,
         packs: None,
     })?;
 
+    // Capture the resolved namespace BEFORE `new` consumes cfg — when
+    // `!explicit`, `resolve_runtime_config` may have applied `[actor] id` from
+    // the config file, making `cfg.default_namespace` differ from the CLI value.
+    let resolved_ns = cfg.default_namespace.clone();
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
     let token = rt
-        .authorize(ns)
+        .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
@@ -706,6 +714,82 @@ mod tests {
         assert_eq!(
             args.config.as_deref(),
             Some(std::path::Path::new("/tmp/kkernel-reindex.toml"))
+        );
+    }
+
+    // Namespace resolution parity with `kkernel mcp`: when --namespace is omitted,
+    // the config file `[actor] id` must set the effective namespace — same as the
+    // MCP path. When --namespace is explicit, it must override the config tier.
+    #[test]
+    #[serial]
+    fn namespace_absent_honors_config_actor_id() {
+        use std::io::Write;
+        std::env::remove_var("KHIVE_NAMESPACE");
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("khive.toml");
+        let mut f = std::fs::File::create(&config_path).expect("create config");
+        f.write_all(b"[actor]\nid = \"lambda:prod\"\n")
+            .expect("write config");
+
+        // No --namespace: must pick up [actor] id from config file.
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+        })
+        .expect("resolve config");
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "lambda:prod",
+            "omitted --namespace must defer to config [actor] id"
+        );
+
+        // Explicit --namespace must override [actor] id.
+        let resolved_explicit = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::parse("explicit-ns").expect("ns"),
+            namespace_explicit: true,
+            no_embed: false,
+            packs: None,
+        })
+        .expect("resolve config explicit");
+        assert_eq!(
+            resolved_explicit.default_namespace.as_str(),
+            "explicit-ns",
+            "explicit --namespace must override config [actor] id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn namespace_env_var_sets_explicit_flag() {
+        std::env::set_var("KHIVE_NAMESPACE", "env-ns");
+        let args = ReindexArgs::parse_from(["reindex"]);
+        std::env::remove_var("KHIVE_NAMESPACE");
+        assert_eq!(
+            args.namespace.as_deref(),
+            Some("env-ns"),
+            "KHIVE_NAMESPACE env var must bind to --namespace"
+        );
+        assert!(
+            args.namespace.is_some(),
+            "env var binding must make namespace Some (explicit)"
+        );
+    }
+
+    #[test]
+    fn namespace_absent_defaults_to_none() {
+        let args = ReindexArgs::parse_from(["reindex"]);
+        assert!(
+            args.namespace.is_none(),
+            "omitted --namespace must be None (not a String default)"
         );
     }
 }

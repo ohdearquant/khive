@@ -1628,3 +1628,203 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         "expected results array, got: {resp:?}"
     );
 }
+
+// ── embed_batch failure / count-mismatch counted as `failed` ─────────────────
+//
+// Regression for codex round-2 HIGH finding: embed_batch Err and count-mismatch
+// were both mapped to `skipped` (exit 0); they must map to `failed` (exit non-0
+// without --best-effort).  The knowledge index handler cannot call embed_batch
+// without a non-empty default_embedder_name, so these tests use a fake provider
+// registered under the default model key.
+
+mod embed_failure_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+
+    /// Returns exactly one vector regardless of how many texts are passed.
+    /// Triggers the count-mismatch branch in the index handler.
+    struct OneDimService;
+
+    #[async_trait]
+    impl EmbeddingService for OneDimService {
+        async fn embed(
+            &self,
+            _texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(vec![vec![1.0_f32; 4]])
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "one-dim"
+        }
+    }
+
+    struct OneDimProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for OneDimProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(OneDimService))
+        }
+    }
+
+    /// Always returns Err(InferenceFailed) to trigger the Err branch.
+    struct AlwaysFailService;
+
+    #[async_trait]
+    impl EmbeddingService for AlwaysFailService {
+        async fn embed(
+            &self,
+            _texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Err(EmbedError::InferenceFailed("synthetic test failure".into()))
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "always-fail"
+        }
+    }
+
+    struct AlwaysFailProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for AlwaysFailProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(AlwaysFailService))
+        }
+    }
+
+    /// Build a runtime whose default_embedder_name is non-empty (required for
+    /// the index handler to attempt embedding) but whose provider is replaced
+    /// with the given fake.
+    fn rt_with_fake(fake: impl EmbedderProvider + 'static) -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+        })
+        .expect("runtime");
+        // Override the lattice provider with our fake — same key, last-writer wins.
+        rt.register_embedder(fake);
+        rt
+    }
+
+    /// Seed two atoms and return the fixture.
+    async fn fixture_with_two_atoms(rt: KhiveRuntime) -> Fixture {
+        let f = pack(rt);
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    {
+                        "slug": "embed-fail-a",
+                        "name": "Embed Fail A",
+                        "content": "first atom content for embed failure regression test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector"
+                    },
+                    {
+                        "slug": "embed-fail-b",
+                        "name": "Embed Fail B",
+                        "content": "second atom content for embed failure regression test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector"
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atoms");
+        f
+    }
+
+    /// count-mismatch branch: embed_batch returns 1 vector for a 2-atom batch.
+    /// Must count both atoms as `failed`, not `skipped`.
+    #[tokio::test]
+    async fn index_embed_count_mismatch_counts_as_failed() {
+        let f = fixture_with_two_atoms(rt_with_fake(OneDimProvider)).await;
+        let result = f
+            .dispatch("knowledge.index", json!({}))
+            .await
+            .expect("index ok");
+
+        assert_eq!(
+            result["failed"].as_u64().unwrap_or(0),
+            2,
+            "count-mismatch must report both atoms as failed: {result:?}"
+        );
+        assert_eq!(
+            result["indexed"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "no atoms must be indexed on count-mismatch: {result:?}"
+        );
+        assert_eq!(
+            result["skipped"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "count-mismatch must not appear in skipped: {result:?}"
+        );
+    }
+
+    /// Err branch: embed_batch returns Err for every batch.
+    /// Must count all atoms as `failed`, not `skipped`.
+    #[tokio::test]
+    async fn index_embed_error_counts_as_failed() {
+        let f = fixture_with_two_atoms(rt_with_fake(AlwaysFailProvider)).await;
+        let result = f
+            .dispatch("knowledge.index", json!({}))
+            .await
+            .expect("index ok");
+
+        assert_eq!(
+            result["failed"].as_u64().unwrap_or(0),
+            2,
+            "embed Err must report both atoms as failed: {result:?}"
+        );
+        assert_eq!(
+            result["indexed"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "no atoms must be indexed on embed error: {result:?}"
+        );
+        assert_eq!(
+            result["skipped"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "embed Err must not appear in skipped: {result:?}"
+        );
+    }
+}
