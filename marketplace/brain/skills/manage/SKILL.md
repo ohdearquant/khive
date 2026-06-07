@@ -67,7 +67,7 @@ request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\")")
 Inspect the frozen state:
 
 ```
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.profile(profile_id=\"balanced-recall-v1\")")
 ```
 
 Reactivate:

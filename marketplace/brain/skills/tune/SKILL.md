@@ -13,30 +13,49 @@ drifted and you want to return to the prior.
 ### 1. Emit explicit feedback on a recalled memory
 
 After a `recall` call returns a memory, note its `note_id` from the result. Emit feedback with one
-of three signals: `useful`, `not_useful`, or `wrong`.
+of eight signals:
+
+| Signal | Meaning |
+| --- | --- |
+| `useful` | Memory was relevant and helpful |
+| `not_useful` | Memory was returned but unhelpful |
+| `wrong` | Memory content was incorrect (strongest negative) |
+| `explicit_positive` | Strong positive signal (equivalent to `useful`) |
+| `explicit_negative` | Strong negative signal (equivalent to `not_useful`) |
+| `implicit_positive` | Weak positive signal inferred from agent behavior |
+| `implicit_negative` | Weak negative signal inferred from agent behavior |
+| `correction` | Memory was returned with errors that were corrected |
+
+`target_id` must be the **full UUID** of the memory note — short prefix IDs are not accepted.
 
 Mark a memory as useful:
 
 ```
-request(ops="brain.feedback(target_id=\"<note-uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\")")
 ```
 
 Mark a memory as not useful:
 
 ```
-request(ops="brain.feedback(target_id=\"<note-uuid>\", signal=\"not_useful\")")
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"not_useful\")")
 ```
 
 Mark a memory as wrong (strongest negative signal):
 
 ```
-request(ops="brain.feedback(target_id=\"<note-uuid>\", signal=\"wrong\")")
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"wrong\")")
 ```
 
 Optional: attribute the feedback to a specific profile (useful when multiple profiles are in play):
 
 ```
-request(ops="brain.feedback(target_id=\"<note-uuid>\", signal=\"useful\", served_by_profile_id=\"balanced-recall-v1\")")
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\", served_by_profile_id=\"balanced-recall-v1\")")
+```
+
+Optional: send per-section signals (object mapping section names to signal strings):
+
+```
+request(ops="brain.feedback(target_id=\"<full-note-uuid>\", signal=\"useful\", section_signals={relevance: \"explicit_positive\", salience: \"implicit_negative\"})")
 ```
 
 The response includes `emitted: true`, the event ID, and the signal that was recorded.
@@ -46,7 +65,7 @@ The response includes `emitted: true`, the event ID, and the signal that was rec
 Inspect the profile to confirm the state snapshot updated:
 
 ```
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.profile(profile_id=\"balanced-recall-v1\")")
 ```
 
 Read the `state_snapshot.balanced_recall` field. Weight means should have shifted toward the
@@ -70,13 +89,13 @@ Reset does not affect profile bindings or lifecycle state.
 ### Feedback loop after a recall session
 
 ```
-request(ops="[brain.feedback(target_id=\"<id-1>\", signal=\"useful\"), brain.feedback(target_id=\"<id-2>\", signal=\"not_useful\")]")
+request(ops="[brain.feedback(target_id=\"<full-uuid-1>\", signal=\"useful\"), brain.feedback(target_id=\"<full-uuid-2>\", signal=\"not_useful\")]")
 ```
 
 ### Verify posterior state before and after reset
 
 ```
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.profile(profile_id=\"balanced-recall-v1\")")
 ```
 
 Record the `exploration_epoch`. Then reset:
@@ -91,8 +110,8 @@ prior (~0.7 for relevance, ~0.2 for salience, ~0.1 for temporal with the default
 
 ## Anti-patterns
 
-- **Emitting feedback on the wrong target.** Use the `note_id` from the recall response, not an
-  entity UUID.
+- **Using a short UUID prefix for `target_id`.** `brain.feedback` requires the full UUID — short
+  prefix IDs are rejected. Use the complete `note_id` from the recall response.
 - **Resetting during an active session.** Reset discards posteriors accumulated during the current
   session. Use it between sessions or after deliberate behavioral experiments.
 - **Over-emitting wrong signal.** A single `wrong` event is sufficient; duplicate signals on the

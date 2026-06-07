@@ -31,7 +31,7 @@ for each profile.
 Get the full record including the latest state snapshot:
 
 ```
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.profile(profile_id=\"balanced-recall-v1\")")
 ```
 
 The `state_snapshot` field contains the current posterior means and variances for each weight

@@ -21,7 +21,7 @@ to verbose JSON — readable prose is a CLI-layer concern, not an MCP-layer one.
 
 | Verb                                                                                                     | What it does                                                                                    |
 | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `gtd.assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults: `status=inbox`, `priority=p2`.                                         |
+| `gtd.assign(title, priority?, status?, assignee?, due?, depends_on?, context_entity_id?, tags?)` | Create a task. Defaults: `status=inbox`, `priority=p2`. `depends_on` is an array of UUIDs that creates real `depends_on` graph edges. `context_entity_id` links the task to a KG entity at creation time. |
 | `gtd.next(limit?, assignee?)`                                                                            | Actionable tasks (status in `{next, active}`), sorted by priority (p0 first) then most-recent.  |
 | `gtd.complete(id, result?, status?)`                                                                     | Mark done (or `status="cancelled"`). Records `completed_at`. Terminal — no further transitions. |
 | `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                              | Filtered listing.                                                                               |

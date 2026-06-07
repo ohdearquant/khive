@@ -157,7 +157,7 @@ gtd.complete(id="<your-task-id>", result="Ingested N entities, M edges, K notes.
 
 - Reading multiple source files into context simultaneously
 - Bulk-creating entities without intermediate search
-- Using ad-hoc edge relations outside the closed 13
+- Using ad-hoc edge relations outside the closed 15
 - Skipping density verification because "the source looked thin"
 - Inflating note salience to make findings stand out
 - Storing relationships as property strings ("authored_by_paper" = property name)

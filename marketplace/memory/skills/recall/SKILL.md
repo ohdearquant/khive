@@ -45,17 +45,16 @@ Each recall result includes:
 - `raw_score` — pre-fusion vector cosine similarity (`[0.0, 1.0]`), or `null` for text-only hits.
 - `salience`, `decay_factor`, `memory_type`, `created_at`, `content`.
 
-All three score fields are bounded to `[0.0, 1.0]`. Pass `presentation="verbose"` to include a
-per-component `breakdown` field (relevance, salience contributions, temporal). `presentation`
-defaults to `"agent"` when omitted.
+All three score fields are bounded to `[0.0, 1.0]`. Pass `include_breakdown=true` to include a
+per-component `breakdown` field (relevance, salience contributions, temporal).
 
 Treat higher-ranked hits as more relevant, not automatically true. When a hit matters, carry forward
 its `note_id` in your notes or response so it can be inspected later.
 
 ### 4. Adjust thresholds only after the first pass
 
-Recall scores are decay-aware hybrid scores (combining RRF fusion, salience with decay, and temporal
-recency — weighted 0.70 / 0.20 / 0.10 by default). Recent notes with normal salience typically score
+Recall scores are decay-aware hybrid scores (combining weighted fusion of relevance, salience with
+decay, and temporal recency by default). Recent notes with normal salience typically score
 0.10–0.25; older or low-salience notes may drop to 0.02–0.08. Start without `min_score` and inspect
 the returned scores before setting a threshold:
 
@@ -108,6 +107,35 @@ If memories were tagged with source or domain words, include them:
 
 ```
 request(ops="memory.recall(query=\"ADR-036 memory recall decay ranking\", memory_type=\"semantic\", limit=5)")
+```
+
+### Boost results for known entities
+
+Pass `entity_names` to apply a 1.3× boost to memories associated with those entity names:
+
+```
+request(ops="memory.recall(query=\"project decisions\", entity_names=[\"khive-mcp\",\"ADR-036\"], limit=10)")
+```
+
+### Filter by tag
+
+```
+request(ops="memory.recall(query=\"user preference\", tags=[\"user-preference\"], tag_mode=\"all\", limit=10)")
+```
+
+### Choose a fusion strategy
+
+Default is `weighted`. Switch to `vector_only` when keyword matches are noisy, or `rrf` for
+balanced precision:
+
+```
+request(ops="memory.recall(query=\"embedding recall decay\", fusion_strategy=\"vector_only\", limit=5)")
+```
+
+### Get per-component score breakdown
+
+```
+request(ops="memory.recall(query=\"project context\", include_breakdown=true, limit=5)")
 ```
 
 ## Anti-patterns

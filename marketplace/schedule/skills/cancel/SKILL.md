@@ -12,7 +12,7 @@ in storage for audit purposes but no longer appears in `agenda`.
 ### 1. Cancel an event
 
 ```
-request(ops="schedule.cancel(id=\"<event-full-id>\")")
+request(ops="schedule.cancel(id=\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\")")
 ```
 
 Response:
@@ -26,15 +26,7 @@ Response:
 }
 ```
 
-### 2. Cancel by short prefix
-
-```
-request(ops="schedule.cancel(id=\"a1b2c3d4\")")
-```
-
-The 8-char prefix is resolved to the full UUID.
-
-### 3. Verify cancellation
+### 2. Verify cancellation
 
 After cancelling, confirm it no longer appears in agenda:
 
@@ -44,14 +36,15 @@ request(ops="schedule.agenda()")
 
 ## Parameters
 
-| Parameter | Type   | Required | Description                                        |
-| --------- | ------ | -------- | -------------------------------------------------- |
-| `id`      | string | yes      | Full UUID or 8-char prefix of the scheduled event. |
+| Parameter | Type   | Required | Description                          |
+| --------- | ------ | -------- | ------------------------------------ |
+| `id`      | string | yes      | Full UUID of the scheduled event.    |
 
 ## Anti-patterns
 
+- **Using a short UUID prefix.** `cancel` requires a full UUID — short prefixes are rejected.
 - **Cancelling a non-scheduled-event note.** `cancel` only works on notes with
   `kind="scheduled_event"`. Cancelling a task or observation returns an error.
 - **Cancelling a nonexistent ID.** Returns "not found".
-- **Note:** Cancelling an already-cancelled event is currently idempotent (no error, overwrites
-  `cancelled_at`). See issue #544.
+- **Cancelling an already-cancelled event.** Returns an error — use `agenda` first to confirm
+  the event is still pending before cancelling.

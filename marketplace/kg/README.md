@@ -50,22 +50,22 @@ request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
 request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\")]")  # parallel batch
 ```
 
-| Verb        | What it does                                |
-| ----------- | ------------------------------------------- |
-| `create`    | Create entities or notes                    |
-| `get`       | Fetch any record by UUID (or 8-char prefix) |
-| `list`      | Browse with filters                         |
-| `update`    | Patch entity, note, or edge fields          |
-| `delete`    | Soft or hard delete                         |
-| `merge`     | Deduplicate two entities                    |
-| `search`    | Hybrid FTS5 + vector search                 |
-| `link`      | Create typed directed edges                 |
-| `neighbors` | Immediate graph neighbors                   |
-| `traverse`  | Multi-hop BFS                               |
-| `query`     | GQL/SPARQL pattern matching                 |
-| `propose`   | Create an event-sourced change proposal     |
-| `review`    | Review a proposal                           |
-| `withdraw`  | Withdraw an open proposal                   |
+| Verb        | Key params                                                                                                          | What it does                                |
+| ----------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `create`    | `kind` (req), `name?`, `entity_kind?`, `note_kind?`, `content?`, `description?`, `tags?`, `properties?`, `annotates?` | Create entities or notes                    |
+| `get`       | `id` (req, UUID)                                                                                                    | Fetch any record by UUID                    |
+| `list`      | `kind` (req), `limit?`, `offset?`, `entity_kind?`, `tags?`, `note_kind?`, `source_id?`, `target_id?`, `relations?`, `min_weight?`, `max_weight?`, `direction?` | Browse with filters                         |
+| `update`    | `id` (req), `kind?`, `name?`, `description?`, `content?`, `relation?`, `weight?`, `properties?`, `tags?`           | Patch entity, note, or edge fields          |
+| `delete`    | `id` (req), `kind?`, `hard?`                                                                                        | Soft (default) or hard delete               |
+| `merge`     | `into_id` (req), `from_id` (req)                                                                                    | Deduplicate two entities                    |
+| `search`    | `kind` (req), `query` (req), `limit?`, `entity_kind?`, `note_kind?`, `tags?`, `properties?`, `include_superseded?`, `min_score?` | Hybrid FTS5 + vector search                 |
+| `link`      | `source_id` (req), `target_id` (req), `relation` (req), `weight?`                                                  | Create typed directed edge (self-loops rejected) |
+| `neighbors` | `node_id` (req), `direction?` (default `"out"`), `relations?`, `min_weight?`                                        | Immediate graph neighbors                   |
+| `traverse`  | `roots` (req, array), `max_depth?` (default 3), `relations?`, `direction?`                                          | Multi-hop BFS                               |
+| `query`     | `query` (req, GQL string), `limit?` (default 500, cap 10000)                                                        | GQL/SPARQL pattern matching                 |
+| `propose`   | `title` (req), `description` (req), `changeset` (req), `reviewers?`, `expiry?`, `parent_id?`                        | Create an event-sourced change proposal     |
+| `review`    | `proposal_id` (req), `decision` (req), `comment?`                                                                   | Review a proposal                           |
+| `withdraw`  | `proposal_id` (req), `rationale?`                                                                                   | Withdraw an open proposal                   |
 
 **Proposal lifecycle**: `open → approved → applying → applied` (happy path). Terminal states:
 `rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while the
