@@ -1,0 +1,78 @@
+# khive.toml — example configuration
+#
+# Save at .khive/config.toml in your project root (project-local default),
+# or pass an explicit path via --config / KHIVE_CONFIG.
+# ~/.khive/config.toml is reserved for personal/global settings and is NOT
+# searched automatically.
+#
+# This file configures the embedding engines available at runtime.
+# The [[engines]] array replaces the env-var two-tier hack:
+#   KHIVE_EMBEDDING_MODEL (primary)
+#   KHIVE_ADDITIONAL_EMBEDDING_MODELS (comma-separated list)
+#
+# If this file is absent, the env-var path is used as a backward-compat fallback.
+# If both file and env vars are present, the file wins.
+#
+# ADR reference: ADR-031 §D3 (Multi-Engine Retrieval — [[engines]] TOML schema)
+# ADR reference: ADR-035 §1  (Unified khive.toml — one file per scope)
+
+# ── Embedding engines ──────────────────────────────────────────────────────────
+
+# Exactly one [[engines]] entry must set `default = true`.
+# That engine becomes the primary embedding model used for entity indexing
+# and single-model retrieval paths.
+
+[[engines]]
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+# fusion_weight applies to weighted multi-engine RRF fusion.
+# For RRF (rank-based) fusion this weight scales the engine's contribution.
+# Must be > 0 when present.
+fusion_weight = 0.5
+# dims is optional — for documentation only. The actual dimension is derived
+# from the model via EmbeddingModel::dimensions(). A mismatch produces a
+# warning, not an error.
+# dims = 384
+
+[[engines]]
+name = "paraphrase"
+model = "paraphrase-multilingual-minilm-l12-v2"
+fusion_weight = 0.5
+# dims = 384
+
+# Additional examples (uncomment to activate):
+
+# [[engines]]
+# name = "bge-small"
+# model = "bge-small-en-v1.5"
+# fusion_weight = 0.8
+
+# [[engines]]
+# name = "bge-base"
+# model = "bge-base-en-v1.5"
+# fusion_weight = 0.6
+
+# ── Notes on fusion_weight ─────────────────────────────────────────────────────
+#
+# fusion_weight controls the relative contribution of each engine during
+# weighted RRF fusion in multi-engine recall queries (ADR-031 §D5).
+#
+# For RRF: weights scale the per-engine contribution proportionally.
+#   score contribution ∝ fusion_weight / (k + rank)
+#
+# For unweighted RRF (FusionStrategy::Rrf without weights): fusion_weight is
+# ignored — all engines contribute equally regardless of this setting.
+#
+# For linear-score fusion (FusionStrategy::Linear): fusion_weight is the
+# mixing coefficient applied to normalized per-engine cosine scores.
+#
+# ── Notes on the env-var fallback ──────────────────────────────────────────────
+#
+# When this file is absent, the legacy env-var path is used automatically:
+#
+#   KHIVE_EMBEDDING_MODEL=all-minilm-l6-v2
+#   KHIVE_ADDITIONAL_EMBEDDING_MODELS=paraphrase,bge-small-en-v1.5
+#
+# This is equivalent to the config above with default=true on the primary model.
+# The env-var path will emit an info-level log suggesting migration to this file.
