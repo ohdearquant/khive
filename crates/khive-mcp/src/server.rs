@@ -20,11 +20,47 @@ use serde_json::{json, Value};
 
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, KhiveRuntime, PackLoadError, PackRegistry, PresentationMode, RuntimeError,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    present, KhiveRuntime, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
+    RuntimeError, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 
 use crate::tools::request::RequestParams;
+
+/// Fingerprint the dispatch-affecting parts of a resolved [`RuntimeConfig`].
+///
+/// Two servers produce the same id iff they would dispatch identically: same
+/// pack set (order-independent), same storage target, and same embedders. The
+/// daemon compares this against each forwarded request's `config_id` and rejects
+/// mismatches so a restricted client (e.g. `--pack kg`, `--db :memory:`) cannot
+/// execute through the broader default daemon. Namespace is carried separately.
+pub fn compute_config_id(config: &RuntimeConfig) -> String {
+    let mut packs = config.packs.clone();
+    packs.sort();
+    let db = config
+        .db_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ":memory:".to_string());
+    let primary = config
+        .embedding_model
+        .as_ref()
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_else(|| "none".to_string());
+    let mut extra: Vec<String> = config
+        .additional_embedding_models
+        .iter()
+        .map(|m| format!("{m:?}"))
+        .collect();
+    extra.sort();
+    format!(
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?}",
+        packs.join(","),
+        db,
+        primary,
+        extra.join(","),
+        config.backend_id,
+    )
+}
 
 /// Build a sorted, human-readable verb catalog from `(pack_name, verb_name, description)` triples.
 ///
@@ -78,6 +114,11 @@ pub struct KhiveMcpServer {
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
+    /// Fingerprint of the resolved runtime config (packs, db target, embedders).
+    /// The stdio client passes it to the daemon; a config mismatch triggers
+    /// local-dispatch fallback so a restricted client never runs through the
+    /// broader default daemon.
+    config_id: String,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -156,6 +197,7 @@ impl KhiveMcpServer {
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
+        let config_id = compute_config_id(runtime.config());
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
@@ -193,6 +235,7 @@ impl KhiveMcpServer {
         Ok(Self {
             registry,
             default_namespace: default_namespace.as_str().to_string(),
+            config_id,
         })
     }
 
@@ -206,12 +249,21 @@ impl KhiveMcpServer {
         Self {
             registry,
             default_namespace: "local".to_string(),
+            // A registry injected directly has no resolved RuntimeConfig; use a
+            // sentinel that matches no real daemon so such servers always
+            // dispatch locally rather than forward.
+            config_id: "registry-only".to_string(),
         }
     }
 
     /// Namespace this server's registry was built for.
     pub fn default_namespace(&self) -> &str {
         &self.default_namespace
+    }
+
+    /// Fingerprint of the runtime config this server's registry was built for.
+    pub fn config_id(&self) -> &str {
+        &self.config_id
     }
 
     /// Warm every pack's in-memory state. Called by the daemon in a background
@@ -674,6 +726,7 @@ result (e.g. create then link with the new entity's id)."#)]
                 presentation: p.presentation.clone(),
                 presentation_per_op: p.presentation_per_op.clone(),
                 namespace: self.default_namespace.clone(),
+                config_id: self.config_id.clone(),
             };
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;

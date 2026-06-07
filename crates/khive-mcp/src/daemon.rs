@@ -45,6 +45,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
     fn namespace(&self) -> &str {
         self.default_namespace()
     }
+
+    fn config_id(&self) -> &str {
+        crate::server::KhiveMcpServer::config_id(self)
+    }
 }
 
 // ── client ────────────────────────────────────────────────────────────────────
@@ -58,7 +62,7 @@ async fn try_forward(frame: &DaemonRequestFrame) -> Option<DaemonResponseFrame> 
 }
 
 fn map_response(resp: DaemonResponseFrame) -> Option<Result<String, McpError>> {
-    if resp.namespace_mismatch {
+    if resp.namespace_mismatch || resp.config_mismatch {
         return None;
     }
     if resp.ok {
@@ -181,6 +185,19 @@ mod tests {
             result: None,
             error: None,
             namespace_mismatch: true,
+            config_mismatch: false,
+        };
+        assert!(map_response(resp).is_none());
+    }
+
+    #[test]
+    fn map_response_config_mismatch_yields_none() {
+        let resp = DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: true,
         };
         assert!(map_response(resp).is_none());
     }
@@ -192,6 +209,7 @@ mod tests {
             result: Some("the-result".to_string()),
             error: None,
             namespace_mismatch: false,
+            config_mismatch: false,
         };
         match map_response(resp) {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
@@ -206,6 +224,7 @@ mod tests {
             result: None,
             error: None,
             namespace_mismatch: false,
+            config_mismatch: false,
         };
         match map_response(resp) {
             Some(Ok(s)) => assert_eq!(s, ""),
@@ -220,6 +239,7 @@ mod tests {
             result: None,
             error: Some("boom: bad verb".to_string()),
             namespace_mismatch: false,
+            config_mismatch: false,
         };
         match map_response(resp) {
             Some(Err(McpError { message, .. })) => {
@@ -236,6 +256,7 @@ mod tests {
             result: None,
             error: None,
             namespace_mismatch: false,
+            config_mismatch: false,
         };
         match map_response(resp) {
             Some(Err(McpError { message, .. })) => {
@@ -262,6 +283,7 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            config_id: "test".to_string(),
         };
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
@@ -284,6 +306,7 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
 
         let reference = make_test_server();
+        let config_id = reference.config_id().to_string();
         let daemon_server = reference.clone();
 
         let handle = tokio::spawn(async move {
@@ -293,16 +316,18 @@ mod tests {
         let _ready = connect_when_ready(&sock).await;
         drop(_ready);
 
-        // (a) valid same-namespace op
+        // (a) valid same-namespace, same-config op
         let req = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             namespace: "test".to_string(),
+            config_id: config_id.clone(),
         };
         let resp = exchange(&sock, &req).await;
         assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
         assert!(!resp.namespace_mismatch);
+        assert!(!resp.config_mismatch);
 
         let reference_result = reference
             .dispatch_request_local(RequestParams {
@@ -315,16 +340,34 @@ mod tests {
         assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
         assert!(reference_result.contains("\"entities\""));
 
-        // (b) different namespace → namespace_mismatch
+        // (b) different namespace → namespace_mismatch (config matches)
         let other = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "other".to_string(),
+            config_id: config_id.clone(),
         };
         let resp_other = exchange(&sock, &other).await;
         assert!(resp_other.namespace_mismatch);
         assert!(!resp_other.ok);
+
+        // (c) same namespace but different config (e.g. a `--pack kg` client
+        // hitting the broader daemon) → config_mismatch, no dispatch.
+        let mismatched_config = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
+        };
+        let resp_cfg = exchange(&sock, &mismatched_config).await;
+        assert!(
+            resp_cfg.config_mismatch,
+            "differing config must be rejected"
+        );
+        assert!(!resp_cfg.namespace_mismatch);
+        assert!(!resp_cfg.ok);
 
         handle.abort();
         let _ = handle.await;

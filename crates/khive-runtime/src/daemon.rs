@@ -65,6 +65,12 @@ pub struct DaemonRequestFrame {
     pub presentation: Option<String>,
     pub presentation_per_op: Option<Vec<Option<String>>>,
     pub namespace: String,
+    /// Fingerprint of the client's resolved runtime config (packs, db target,
+    /// embedders). The daemon rejects a request whose `config_id` differs from
+    /// its own so a restricted client (e.g. `--pack kg`, `--db :memory:`) never
+    /// dispatches through the broader default daemon. See ADR-027 / ADR-049.
+    #[serde(default)]
+    pub config_id: String,
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -74,6 +80,11 @@ pub struct DaemonResponseFrame {
     pub result: Option<String>,
     pub error: Option<String>,
     pub namespace_mismatch: bool,
+    /// Set when the request's `config_id` does not match the daemon's. Like
+    /// `namespace_mismatch`, this signals the client to fall back to local
+    /// dispatch rather than execute under a different runtime/config.
+    #[serde(default)]
+    pub config_mismatch: bool,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -133,6 +144,12 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
 
     /// The namespace this dispatcher was configured for.
     fn namespace(&self) -> &str;
+
+    /// Fingerprint of this dispatcher's resolved runtime config (packs, db
+    /// target, embedders). Used to reject forwarded requests from clients whose
+    /// config differs, so a restricted client cannot dispatch through a broader
+    /// daemon.
+    fn config_id(&self) -> &str;
 }
 
 // ── server ────────────────────────────────────────────────────────────────────
@@ -159,6 +176,15 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             result: None,
             error: None,
             namespace_mismatch: true,
+            config_mismatch: false,
+        }
+    } else if frame.config_id != dispatcher.config_id() {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: true,
         }
     } else {
         match dispatcher
@@ -170,12 +196,14 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 result: Some(result),
                 error: None,
                 namespace_mismatch: false,
+                config_mismatch: false,
             },
             Err(e) => DaemonResponseFrame {
                 ok: false,
                 result: None,
                 error: Some(e),
                 namespace_mismatch: false,
+                config_mismatch: false,
             },
         }
     };
