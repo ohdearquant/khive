@@ -309,9 +309,8 @@ impl StorageBackend {
             if !has_field || !has_embedding_model {
                 return Err(SqliteError::InvalidData(format!(
                     "vec0 table '{}' is missing required column(s) (field={}, \
-                     embedding_model={}); run `kkernel db migrate` to apply V17 \
-                     (vector_embedding_model_tag_preserving_rebuild) before opening \
-                     this vector store",
+                     embedding_model={}); this is a pre-v0.2.8 vector schema and is \
+                     not supported — recreate the database",
                     table, has_field, has_embedding_model,
                 )));
             }

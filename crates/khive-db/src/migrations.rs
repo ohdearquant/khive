@@ -111,10 +111,9 @@ const V1_UP: &str = include_str!("../sql/schema.sql");
 
 /// DDL for the `_embedding_models` registry table.
 ///
-/// Shared between the V14 migration (`build_v14_embedding_model_registry_sql`) and
-/// the belt-and-suspenders creation in `StorageBackend::vectors_for_namespace`.
-/// Both sites reference this constant so the schema cannot silently diverge if the
-/// registry evolves.
+/// Shared between the V1 schema and the belt-and-suspenders creation in
+/// `StorageBackend::vectors_for_namespace`. Both sites reference this constant so
+/// the schema cannot silently diverge if the registry evolves.
 pub const EMBEDDING_MODELS_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _embedding_models (\
         id              BLOB PRIMARY KEY,\

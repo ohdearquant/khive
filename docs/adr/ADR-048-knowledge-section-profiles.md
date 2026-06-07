@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS knowledge_sections (
     section_type TEXT NOT NULL,
     heading      TEXT NOT NULL DEFAULT '',
     content      TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
     tokens       INTEGER NOT NULL DEFAULT 0,
     sort_order   INTEGER NOT NULL DEFAULT 0,
     embedding    BLOB,
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS knowledge_sections (
     updated_at   INTEGER NOT NULL,
     status       TEXT NOT NULL DEFAULT 'draft',
     FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id),
-    UNIQUE(atom_id, section_type)
+    UNIQUE(atom_id, content_hash)
 );
 ```
 
@@ -1038,8 +1039,8 @@ Implement section posterior initialization from caller-provided priors.
   is a follow-up.
 - `knowledge.upsert_atoms` / `knowledge.upsert_domains`: corpus tables only; graph
   entity dual-write is deferred.
-- V21 migration: `knowledge_sections` table with section type enum, nullable section
-  embeddings, FK to atom, `UNIQUE(atom_id, section_type)`, indexes, and FTS5 triggers.
+- `knowledge_sections` table with section type enum, nullable section embeddings, FK to
+  atom, `content_hash` + `UNIQUE(atom_id, content_hash)`, indexes, and FTS5 triggers.
 - `knowledge.edit`: shipped section-level upsert without wiping siblings; verified edits
   downgrade to `reviewed`.
 - `knowledge.import`: shipped atlas markdown ingestion with section parsing.
@@ -1107,14 +1108,15 @@ columns, constraints, and indexes are:
 - `section_type TEXT NOT NULL`
 - `heading TEXT NOT NULL DEFAULT ''`
 - `content TEXT NOT NULL DEFAULT ''`
+- `content_hash TEXT NOT NULL DEFAULT ''` (sha256(content)[:16])
 - `tokens INTEGER NOT NULL DEFAULT 0`
 - `sort_order INTEGER NOT NULL DEFAULT 0`
 - `embedding BLOB` (nullable)
 - `created_at INTEGER NOT NULL`
 - `updated_at INTEGER NOT NULL`
-- `status TEXT NOT NULL DEFAULT 'draft'` (added by V22)
+- `status TEXT NOT NULL DEFAULT 'draft'`
 - `FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id)`
-- `UNIQUE(atom_id, section_type)`
+- `UNIQUE(atom_id, content_hash)`
 
 Indexes: `idx_knowledge_sections_atom`, `idx_knowledge_sections_ns_type`,
 `idx_knowledge_sections_ns_atom`, `idx_knowledge_sections_status`.
