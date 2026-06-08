@@ -3,6 +3,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use khive_storage::EdgeRelation;
+use khive_types::EntityKind;
 use serde::Deserialize;
 
 use super::types::{
@@ -95,7 +97,96 @@ fn structural_checks(entities_path: &Path, edges_path: &Path) -> Vec<RuleResult>
         check_no_duplicate_uuids(entities_path),
         check_sort_order(entities_path, edges_path),
         check_referential_integrity(entities_path, edges_path),
+        check_valid_entity_kinds(entities_path),
+        check_valid_edge_relations(edges_path),
     ]
+}
+
+fn check_valid_entity_kinds(entities_path: &Path) -> RuleResult {
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(entities_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(kind_str) = v.get("kind").and_then(|k| k.as_str()) {
+                    if kind_str.parse::<EntityKind>().is_err() {
+                        let id = v
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        violations.push(Violation {
+                            entity_id: if id.is_empty() { None } else { Some(id) },
+                            entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                            entity_kind: Some(kind_str.to_string()),
+                            rule_id: "valid-entity-kinds".into(),
+                            severity: "error",
+                            message: format!(
+                                "unknown entity_kind: {kind_str:?}. \
+                                 Valid: concept | document | dataset | project | \
+                                 person | org | artifact | service"
+                            ),
+                            fixable: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "valid-entity-kinds".into(),
+        severity: "error",
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(edges_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) {
+                    if rel_str.parse::<EdgeRelation>().is_err() {
+                        let edge_id = v
+                            .get("edge_id")
+                            .and_then(|i| i.as_str())
+                            .or_else(|| v.get("id").and_then(|i| i.as_str()))
+                            .unwrap_or("")
+                            .to_string();
+                        violations.push(Violation {
+                            entity_id: if edge_id.is_empty() {
+                                None
+                            } else {
+                                Some(edge_id)
+                            },
+                            entity_name: None,
+                            entity_kind: None,
+                            rule_id: "valid-edge-relations".into(),
+                            severity: "error",
+                            message: format!(
+                                "unknown edge relation: {rel_str:?}. \
+                                 Valid: contains | part_of | instance_of | extends | \
+                                 variant_of | introduced_by | supersedes | derived_from | \
+                                 precedes | depends_on | enables | implements | \
+                                 competes_with | composed_with | annotates"
+                            ),
+                            fixable: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "valid-edge-relations".into(),
+        severity: "error",
+        passed: violations.is_empty(),
+        violations,
+    }
 }
 
 fn check_no_duplicate_uuids(entities_path: &Path) -> RuleResult {
@@ -870,5 +961,166 @@ message = "bad"
             &kg_dir.join("edges.ndjson"),
         );
         assert!(result.passed, "sort-order should pass after fix");
+    }
+
+    #[test]
+    fn invalid_entity_kind_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "nonsense", "B"),
+            ],
+        );
+        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"));
+        assert!(!result.passed, "invalid entity kind must fail");
+        assert_eq!(result.violations.len(), 1);
+        assert!(
+            result.violations[0].message.contains("nonsense"),
+            "violation message should name the bad kind: {}",
+            result.violations[0].message
+        );
+        assert!(
+            result.violations[0].message.contains("concept"),
+            "violation message should list valid kinds: {}",
+            result.violations[0].message
+        );
+    }
+
+    #[test]
+    fn valid_entity_kinds_all_pass() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "document", "B"),
+                ("cccccccc-0000-0000-0000-000000000003", "dataset", "C"),
+                ("dddddddd-0000-0000-0000-000000000004", "project", "D"),
+                ("eeeeeeee-0000-0000-0000-000000000005", "person", "E"),
+                ("ffffffff-0000-0000-0000-000000000006", "org", "F"),
+                ("11111111-0000-0000-0000-000000000007", "artifact", "G"),
+                ("22222222-0000-0000-0000-000000000008", "service", "H"),
+            ],
+        );
+        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"));
+        assert!(result.passed, "all 8 canonical kinds must pass");
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn invalid_edge_relation_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[
+                (
+                    "aaaaaaaa-0000-0000-0000-000000000001",
+                    "bbbbbbbb-0000-0000-0000-000000000002",
+                    "extends",
+                ),
+                (
+                    "aaaaaaaa-0000-0000-0000-000000000001",
+                    "bbbbbbbb-0000-0000-0000-000000000002",
+                    "not_a_real_relation",
+                ),
+            ],
+        );
+        let result = check_valid_edge_relations(&kg_dir.join("edges.ndjson"));
+        assert!(!result.passed, "invalid edge relation must fail");
+        assert_eq!(result.violations.len(), 1);
+        assert!(
+            result.violations[0].message.contains("not_a_real_relation"),
+            "violation message should name the bad relation: {}",
+            result.violations[0].message
+        );
+        assert!(
+            result.violations[0].message.contains("extends"),
+            "violation message should list valid relations: {}",
+            result.violations[0].message
+        );
+    }
+
+    #[test]
+    fn valid_edge_relations_all_pass() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[
+                (
+                    "aaaaaaaa-0000-0000-0000-000000000001",
+                    "bbbbbbbb-0000-0000-0000-000000000002",
+                    "extends",
+                ),
+                (
+                    "aaaaaaaa-0000-0000-0000-000000000001",
+                    "bbbbbbbb-0000-0000-0000-000000000002",
+                    "annotates",
+                ),
+            ],
+        );
+        let result = check_valid_edge_relations(&kg_dir.join("edges.ndjson"));
+        assert!(result.passed, "valid edge relations must pass");
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn structural_checks_include_taxonomy_rules() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "nonsense", "Bad")],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "not_valid",
+            )],
+        );
+        let results = structural_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+        );
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"valid-entity-kinds"),
+            "structural_checks must include valid-entity-kinds"
+        );
+        assert!(
+            ids.contains(&"valid-edge-relations"),
+            "structural_checks must include valid-edge-relations"
+        );
+        let entity_kind_result = results
+            .iter()
+            .find(|r| r.id == "valid-entity-kinds")
+            .unwrap();
+        assert!(!entity_kind_result.passed, "nonsense kind must fail");
+        let edge_rel_result = results
+            .iter()
+            .find(|r| r.id == "valid-edge-relations")
+            .unwrap();
+        assert!(!edge_rel_result.passed, "invalid relation must fail");
     }
 }
