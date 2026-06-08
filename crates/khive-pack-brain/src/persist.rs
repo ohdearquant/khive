@@ -267,65 +267,85 @@ pub async fn ensure_loaded(
         Some(bs)
     };
 
-    let new_state = {
-        // Lock order: tracker → state (always in this sequence).
-        // Reversing this order anywhere would risk deadlock; do not change.
+    // Lock order: tracker → state (always in this sequence).
+    // Reversing this order anywhere would risk deadlock; do not change.
+    //
+    // Publication must be atomic: active_namespace, *state, and
+    // loaded_namespaces are all updated inside a single tracker-held
+    // critical section so no concurrent dispatch can observe
+    // active=true with stale state, and no concurrent cross-namespace
+    // load can snapshot the wrong active state.
+    {
         let mut t = tracker.lock().unwrap();
         let current_ns = t.active_namespace.clone();
-        let current_state = state.lock().unwrap();
 
-        if let Some(from_ns) = current_ns {
-            let saved_current = BrainState {
-                profiles: current_state.profiles.clone(),
-                balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
-                    current_state.balanced_recall.to_snapshot(),
-                    entity_capacity,
-                ),
-                profile_states: current_state
-                    .profile_states
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            khive_brain_core::BalancedRecallState::from_snapshot(
-                                v.to_snapshot(),
-                                entity_capacity,
-                            ),
-                        )
-                    })
-                    .collect(),
-                bindings: current_state.bindings.clone(),
-                section_states: current_state
-                    .section_states
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            khive_brain_core::SectionPosteriorState::from_snapshot(v.to_snapshot()),
-                        )
-                    })
-                    .collect(),
-            };
-            drop(current_state);
+        // Clone the parts of the current shared state we need for save-restore,
+        // then immediately release the state lock so we can re-acquire it for
+        // the final write (Rust Mutexes are not reentrant).
+        let new_state = {
+            let current_state = state.lock().unwrap();
 
-            let restored = t.swap_namespace(&from_ns, saved_current, namespace.clone());
-            brain_state
-                .or(restored)
-                .unwrap_or_else(|| BrainState::new(entity_capacity))
-        } else {
-            drop(current_state);
+            if let Some(ref from_ns) = current_ns {
+                let saved_current = BrainState {
+                    profiles: current_state.profiles.clone(),
+                    balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
+                        current_state.balanced_recall.to_snapshot(),
+                        entity_capacity,
+                    ),
+                    profile_states: current_state
+                        .profile_states
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                khive_brain_core::BalancedRecallState::from_snapshot(
+                                    v.to_snapshot(),
+                                    entity_capacity,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    bindings: current_state.bindings.clone(),
+                    section_states: current_state
+                        .section_states
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                khive_brain_core::SectionPosteriorState::from_snapshot(
+                                    v.to_snapshot(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                };
+                // Release the state guard before mutating the tracker (save-restore
+                // path) so the re-acquire below cannot deadlock.
+                drop(current_state);
+
+                let restored = t.swap_namespace(from_ns, saved_current, namespace.clone());
+                brain_state
+                    .or(restored)
+                    .unwrap_or_else(|| BrainState::new(entity_capacity))
+            } else {
+                drop(current_state);
+                // No active namespace yet — first load.  active_namespace is set
+                // below together with the state write and loaded_namespaces mark.
+                brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
+            }
+        };
+
+        // Write the new state while the tracker lock is still held.
+        // After this line active_namespace, *state, and loaded_namespaces are
+        // all consistent; no concurrent dispatch can observe a partial view.
+        *state.lock().unwrap() = new_state;
+
+        // For the no-active-namespace (first-load) path swap_namespace was not
+        // called, so we set active_namespace here before marking loaded.
+        if current_ns.is_none() {
             t.active_namespace = Some(namespace.clone());
-            brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
         }
-    };
 
-    {
-        let mut s = state.lock().unwrap();
-        *s = new_state;
-    }
-
-    {
-        let mut t = tracker.lock().unwrap();
         t.loaded_namespaces.insert(namespace, ());
     }
 

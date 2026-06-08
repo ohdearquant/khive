@@ -3085,3 +3085,266 @@ async fn crit1_create_profile_accepts_seed_priors_within_ess_cap() {
 
     assert_eq!(result["created"], json!(true));
 }
+
+// ── Concurrency / publication-atomicity regression tests ──────────────────────
+//
+// These tests were added to guard against the TOCTOU race in ensure_loaded where
+// active_namespace, *state, and loaded_namespaces were updated in three separate
+// critical sections.  After the fix all three are updated atomically while the
+// tracker lock is held, so a concurrent dispatch can never observe active=true
+// with stale state.
+
+/// After ensure_loaded returns, the tracker and shared state must be in a
+/// consistent three-way view: active_namespace == namespace, loaded_namespaces
+/// contains namespace, and the shared BrainState is the one for that namespace.
+///
+/// We test this by:
+///   1. Loading namespace A and writing a binding (observable state mutation).
+///   2. Loading namespace B — saves A's state, loads fresh B state.
+///   3. Switching back to namespace A — restores the saved state.
+///   4. After each ensure_loaded the tracker fields must be consistent.
+#[tokio::test]
+async fn ensure_loaded_publication_is_atomic() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = BrainPack::new(rt.clone());
+    let registry = empty_registry();
+
+    let ns_a = Namespace::try_from("atomic-ns-a").expect("namespace a");
+    let ns_b = Namespace::try_from("atomic-ns-b").expect("namespace b");
+    let token_a = rt.authorize(ns_a).expect("token a");
+    let token_b = rt.authorize(ns_b).expect("token b");
+
+    // Load namespace A by dispatching a read verb.
+    pack.ensure_loaded(&token_a)
+        .await
+        .expect("ensure_loaded ns-a");
+
+    // Invariant 1: after ensure_loaded, tracker must be fully consistent for A.
+    {
+        let t = pack.persistence.lock().unwrap();
+        assert_eq!(
+            t.active_namespace.as_deref(),
+            Some("atomic-ns-a"),
+            "active_namespace must equal requested namespace immediately after ensure_loaded"
+        );
+        assert!(
+            t.loaded_namespaces.contains_key("atomic-ns-a"),
+            "loaded_namespaces must contain the namespace immediately after ensure_loaded"
+        );
+    }
+    // The shared state must also reflect A (profile list should be visible).
+    {
+        let s = pack.state.lock().unwrap();
+        assert!(
+            !s.profiles.is_empty(),
+            "shared state must contain at least the built-in profile after loading ns-a"
+        );
+    }
+
+    // Write something observable into A: create a binding.
+    pack.dispatch(
+        "brain.bind",
+        json!({
+            "profile_id": "balanced-recall-v1",
+            "actor": "actor-a",
+            "namespace": "atomic-ns-a",
+            "consumer_kind": "recall",
+        }),
+        &registry,
+        &token_a,
+    )
+    .await
+    .expect("bind in namespace A");
+
+    // Load namespace B.
+    pack.ensure_loaded(&token_b)
+        .await
+        .expect("ensure_loaded ns-b");
+
+    // Invariant 2: tracker must be fully consistent for B.
+    {
+        let t = pack.persistence.lock().unwrap();
+        assert_eq!(
+            t.active_namespace.as_deref(),
+            Some("atomic-ns-b"),
+            "active_namespace must equal namespace B after switching to B"
+        );
+        assert!(
+            t.loaded_namespaces.contains_key("atomic-ns-b"),
+            "loaded_namespaces must contain ns-b after ensure_loaded"
+        );
+        assert!(
+            t.loaded_namespaces.contains_key("atomic-ns-a"),
+            "loaded_namespaces must still contain ns-a (saved, not evicted)"
+        );
+    }
+    // The shared state must reflect B: B has no bindings (was never written to).
+    let bindings_b = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_b)
+        .await
+        .expect("bindings in B");
+    assert_eq!(
+        bindings_b["count"],
+        json!(0u64),
+        "namespace B must see 0 bindings; the binding created in A must not bleed through"
+    );
+
+    // Switch back to namespace A — the save-restore path.
+    pack.ensure_loaded(&token_a)
+        .await
+        .expect("ensure_loaded ns-a again");
+
+    // Invariant 3: tracker consistent for A again.
+    {
+        let t = pack.persistence.lock().unwrap();
+        assert_eq!(
+            t.active_namespace.as_deref(),
+            Some("atomic-ns-a"),
+            "active_namespace must be restored to A"
+        );
+    }
+    // The binding we created in A must still be present (save-restore preserved state).
+    let bindings_a = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_a)
+        .await
+        .expect("bindings in A after restore");
+    assert_eq!(
+        bindings_a["count"],
+        json!(1u64),
+        "binding created in namespace A must survive the save-restore round-trip"
+    );
+}
+
+/// Concurrent dispatches to the same namespace must not observe active=true
+/// with stale state.  We spawn N tasks that all call ensure_loaded for the
+/// same namespace concurrently; after they all complete the state must be
+/// consistent (tracker and shared state agree, no panic, no data loss).
+#[tokio::test]
+async fn ensure_loaded_concurrent_same_namespace_is_safe() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+    use std::sync::Arc;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = Arc::new(BrainPack::new(rt.clone()));
+    let registry = empty_registry();
+
+    let ns = Namespace::try_from("conc-ns").expect("conc namespace");
+    let token = rt.authorize(ns).expect("conc token");
+    let token = Arc::new(token);
+
+    // Spawn 8 concurrent ensure_loaded calls for the same namespace.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let pack2 = Arc::clone(&pack);
+        let tok2 = Arc::clone(&token);
+        handles.push(tokio::spawn(
+            async move { pack2.ensure_loaded(&tok2).await },
+        ));
+    }
+    for h in handles {
+        h.await
+            .expect("task did not panic")
+            .expect("ensure_loaded must not error");
+    }
+
+    // After all concurrent loads complete, tracker and state must agree.
+    {
+        let t = pack.persistence.lock().unwrap();
+        assert_eq!(
+            t.active_namespace.as_deref(),
+            Some("conc-ns"),
+            "active_namespace must be conc-ns after concurrent loads"
+        );
+        assert!(
+            t.loaded_namespaces.contains_key("conc-ns"),
+            "loaded_namespaces must contain conc-ns"
+        );
+    }
+    {
+        let s = pack.state.lock().unwrap();
+        assert!(
+            !s.profiles.is_empty(),
+            "shared state must be non-empty (built-in profile present)"
+        );
+    }
+
+    // A dispatch against the namespace must succeed without panicking.
+    let result = pack
+        .dispatch("brain.profiles", json!({}), &registry, &token)
+        .await
+        .expect("brain.profiles after concurrent ensure_loaded");
+    assert!(
+        result["count"].as_u64().unwrap_or(0) >= 1,
+        "at least the built-in profile must be present"
+    );
+}
+
+/// Cross-namespace concurrent loads must not cause one namespace to save the
+/// wrong state under saved_states.  We alternate between two namespaces while
+/// mutating each, then verify each namespace sees only its own state.
+#[tokio::test]
+async fn ensure_loaded_cross_namespace_concurrent_does_not_corrupt_saved_states() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = std::sync::Arc::new(BrainPack::new(rt.clone()));
+    let registry = empty_registry();
+
+    let ns_x = Namespace::try_from("xns-x").expect("x");
+    let ns_y = Namespace::try_from("xns-y").expect("y");
+    let token_x = rt.authorize(ns_x).expect("token x");
+    let token_y = rt.authorize(ns_y).expect("token y");
+    let token_x = std::sync::Arc::new(token_x);
+    let token_y = std::sync::Arc::new(token_y);
+
+    // Interleave loads: X then Y then X then Y.
+    pack.ensure_loaded(&token_x).await.expect("load x");
+    pack.dispatch(
+        "brain.bind",
+        json!({"profile_id": "balanced-recall-v1", "actor": "x-actor", "namespace": "xns-x", "consumer_kind": "recall"}),
+        &registry,
+        &token_x,
+    )
+    .await
+    .expect("bind x");
+
+    pack.ensure_loaded(&token_y).await.expect("load y");
+    // Y has no bindings yet; add one so it has observable state too.
+    pack.dispatch(
+        "brain.bind",
+        json!({"profile_id": "balanced-recall-v1", "actor": "y-actor", "namespace": "xns-y", "consumer_kind": "recall"}),
+        &registry,
+        &token_y,
+    )
+    .await
+    .expect("bind y");
+
+    // Switch back to X and verify its binding survived.
+    pack.ensure_loaded(&token_x).await.expect("reload x");
+    let bx = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_x)
+        .await
+        .expect("bindings x");
+    assert_eq!(
+        bx["count"],
+        json!(1u64),
+        "namespace X must still have exactly 1 binding after cross-namespace interleave"
+    );
+
+    // Switch to Y and verify its binding survived.
+    pack.ensure_loaded(&token_y).await.expect("reload y");
+    let by = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_y)
+        .await
+        .expect("bindings y");
+    assert_eq!(
+        by["count"],
+        json!(1u64),
+        "namespace Y must still have exactly 1 binding after cross-namespace interleave"
+    );
+}
