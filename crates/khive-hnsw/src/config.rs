@@ -132,6 +132,11 @@ impl HnswConfig {
                 self.m_max0, self.m
             )));
         }
+        if self.ef_construction == 0 {
+            return Err(RetrievalError::Configuration(
+                "ef_construction: must be greater than zero".to_string(),
+            ));
+        }
         if self.ef_search == 0 {
             return Err(RetrievalError::Configuration(
                 "ef_search: must be greater than zero".to_string(),
@@ -274,6 +279,28 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_ef_construction_zero() {
+        let config = HnswConfig {
+            ef_construction: 0,
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "ef_construction = 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_serde_rejects_ef_construction_zero() {
+        let json = r#"{"m":20,"m_max0":40,"ef_construction":0,"ml":0.2886751345948129,"ef_search":80,"dimensions":384,"metric":"cosine","rebuild_threshold":0.1}"#;
+        let result: std::result::Result<HnswConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "ef_construction = 0 must be rejected at deserialization"
+        );
     }
 
     #[test]
