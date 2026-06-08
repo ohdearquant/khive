@@ -1,13 +1,11 @@
-//! pack-brain — profile-oriented Bayesian auto-tuning for khive.
+//! pack-brain — profile management registry for khive.
 
-pub mod event;
 pub mod fold;
 pub mod handlers;
 pub mod persist;
-pub mod section;
-pub mod state;
 pub mod tunable;
 
+mod event;
 mod pack;
 
 pub(crate) use pack::sync_balanced_recall_record;

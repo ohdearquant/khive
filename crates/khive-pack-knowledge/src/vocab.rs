@@ -1,8 +1,8 @@
-//! Static verb descriptor table for the knowledge pack (18 verbs).
+//! Static verb descriptor table for the knowledge pack (19 verbs).
 
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
+pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -479,5 +479,18 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 description: "Max results; defaults to 20, capped at 100",
             },
         ],
+    },
+    // ── feedback tier ─────────────────────────────────────────────────────────
+    HandlerDef {
+        name: "knowledge.feedback",
+        description: "Apply per-section feedback signals to update section posterior weights",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[ParamDef {
+            name: "section_signals",
+            param_type: "object",
+            required: true,
+            description: "Map of section_type → signal string: {\"overview\": \"useful\", \"formalism\": \"not_useful\"}. Valid signals: useful | not_useful | wrong",
+        }],
     },
 ];

@@ -5,10 +5,10 @@ use std::sync::Mutex;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_types::{HandlerDef, Pack};
 
-use crate::fold::{BalancedRecallFold, SectionPosteriorFold};
+use khive_brain_core::BrainState;
+
 use crate::handlers::BRAIN_HANDLERS;
 use crate::persist;
-use crate::state::BrainState;
 
 pub const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
@@ -22,15 +22,11 @@ pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     }
 }
 
-/// Brain pack — profile-oriented auto-tuning.
+/// Brain pack — profile-management registry.
 pub struct BrainPack {
     pub(crate) runtime: KhiveRuntime,
     /// Profile registry + active balanced-recall state.
     pub(crate) state: Mutex<BrainState>,
-    /// Fold for the built-in `balanced-recall-v1` profile.
-    pub(crate) fold: BalancedRecallFold,
-    /// Fold for per-profile section posteriors.
-    pub(crate) section_fold: SectionPosteriorFold,
     /// Tracks which namespaces are loaded from DB and dirty event counts.
     pub(crate) persistence: Mutex<persist::PersistenceTracker>,
 }
@@ -46,14 +42,10 @@ impl Pack for BrainPack {
 impl BrainPack {
     /// Create a new pack bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
-        let fold = BalancedRecallFold::new(ENTITY_CACHE_CAPACITY);
-        let section_fold = SectionPosteriorFold::new();
         let state = BrainState::new(ENTITY_CACHE_CAPACITY);
         Self {
             runtime,
             state: Mutex::new(state),
-            fold,
-            section_fold,
             persistence: Mutex::new(persist::PersistenceTracker::new()),
         }
     }
@@ -64,15 +56,13 @@ impl BrainPack {
             token,
             &self.persistence,
             &self.state,
-            &self.fold,
-            &self.section_fold,
             ENTITY_CACHE_CAPACITY,
         )
         .await
     }
 
     /// Public snapshot of the current `BrainState`.
-    pub fn snapshot(&self) -> crate::state::BrainStateSnapshot {
+    pub fn snapshot(&self) -> khive_brain_core::BrainStateSnapshot {
         self.state.lock().unwrap().to_snapshot()
     }
 }

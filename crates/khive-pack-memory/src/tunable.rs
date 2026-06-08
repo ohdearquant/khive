@@ -1,7 +1,7 @@
 //! Brain-tunable parameter surface for the memory pack's recall scoring pipeline.
 
-use khive_pack_brain::state::BalancedRecallState;
-use khive_pack_brain::tunable::{PackTunable, ParameterDef, ParameterSpace};
+use khive_brain_core::BalancedRecallState;
+use khive_brain_core::{PackTunable, ParameterDef, ParameterSpace};
 use khive_runtime::RuntimeError;
 use serde_json::Value;
 
@@ -87,7 +87,7 @@ impl PackTunable for MemoryPack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_pack_brain::state::{BalancedRecallState, BetaPosterior};
+    use khive_brain_core::{BalancedRecallState, BetaPosterior};
     use khive_runtime::KhiveRuntime;
 
     fn make_pack() -> MemoryPack {

@@ -2,125 +2,11 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
 use khive_storage::event::Event;
 use khive_types::EventOutcome;
 
-use crate::state::SectionType;
-
-/// Feedback signal values for the `brain.feedback` verb.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum FeedbackSignal {
-    Useful,
-    NotUseful,
-    Wrong,
-}
-
-/// Semantic event taxonomy for brain fold updates (issue #268).
-///
-/// Captures the *kind* of feedback event so that the fold can apply
-/// different update magnitudes to posteriors. Explicit signals carry
-/// stronger evidence than implicit ones; corrections are strongest of all.
-///
-/// Update magnitude guidelines (applied by `FeedbackEventKind::update_weight`):
-///   - `Correction`        → 2.0× (strongest — user actively corrected output)
-///   - `ExplicitPositive`  → 1.5× (user explicitly marked as good)
-///   - `ExplicitNegative`  → 1.5× (user explicitly marked as bad)
-///   - `ImplicitPositive`  → 0.5× (user expanded / interacted — weaker signal)
-///   - `ImplicitNegative`  → 0.5× (user skipped / ignored — weaker signal)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum FeedbackEventKind {
-    /// User explicitly rated a result as good (e.g., clicked "thumbs up").
-    ExplicitPositive,
-    /// User explicitly rated a result as bad (e.g., clicked "thumbs down").
-    ExplicitNegative,
-    /// User implicitly signalled satisfaction (e.g., expanded a section, dwell time).
-    ImplicitPositive,
-    /// User implicitly signalled dissatisfaction (e.g., skipped result, quick dismiss).
-    ImplicitNegative,
-    /// User corrected the output — strongest signal; overrides relevance posterior.
-    Correction,
-}
-
-impl FeedbackEventKind {
-    /// Magnitude multiplier for posterior updates.
-    ///
-    /// The fold multiplies the standard Beta update step (+1 to α or β) by this
-    /// weight to produce fractional updates. Explicit evidence counts more than
-    /// implicit; corrections count most (2×).
-    pub fn update_weight(&self) -> f64 {
-        match self {
-            FeedbackEventKind::Correction => 2.0,
-            FeedbackEventKind::ExplicitPositive | FeedbackEventKind::ExplicitNegative => 1.5,
-            FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative => 0.5,
-        }
-    }
-
-    /// Whether this event kind represents a positive signal.
-    pub fn is_positive(&self) -> bool {
-        matches!(
-            self,
-            FeedbackEventKind::ExplicitPositive | FeedbackEventKind::ImplicitPositive
-        )
-    }
-
-    /// Parse from the `signal` string in a `brain.feedback` event payload.
-    ///
-    /// Accepts the semantic event kind names. Falls back to `None` when the
-    /// string is not a recognised `FeedbackEventKind` (callers can then try
-    /// parsing as the legacy `FeedbackSignal` enum).
-    pub fn from_signal_str(s: &str) -> Option<Self> {
-        match s {
-            "explicit_positive" => Some(FeedbackEventKind::ExplicitPositive),
-            "explicit_negative" => Some(FeedbackEventKind::ExplicitNegative),
-            "implicit_positive" => Some(FeedbackEventKind::ImplicitPositive),
-            "implicit_negative" => Some(FeedbackEventKind::ImplicitNegative),
-            "correction" => Some(FeedbackEventKind::Correction),
-            _ => None,
-        }
-    }
-}
-
-/// Interpreted brain signal extracted from a raw Event.
-///
-/// `interpret()` is the single mapping layer from the shared event log to
-/// brain-internal signals. No parallel event enum is needed; the Event
-/// substrate is the source of truth.
-#[derive(Debug)]
-pub enum BrainSignal {
-    /// A recall verb succeeded — positive signal for the recalled entity.
-    RecallHit { target_id: Uuid, latency_us: i64 },
-    /// A recall verb returned no results — miss signal for tuning.
-    RecallMiss,
-    /// A search verb completed.
-    SearchCompleted { latency_us: i64 },
-    /// Explicit feedback on a specific entity, emitted by `brain.feedback`.
-    Feedback {
-        target_id: Uuid,
-        signal: FeedbackSignal,
-        /// Profile that served the event being rated, if known.
-        served_by_profile_id: Option<String>,
-        section_signals: Option<HashMap<SectionType, FeedbackSignal>>,
-    },
-    /// Semantic feedback with event kind (issue #268).
-    ///
-    /// Produced when the `signal` field in a `brain.feedback` event is one of
-    /// the `FeedbackEventKind` names (`explicit_positive`, `correction`, etc.).
-    /// The fold uses `event_kind.update_weight()` to scale the posterior update.
-    SemanticFeedback {
-        target_id: Uuid,
-        event_kind: FeedbackEventKind,
-        served_by_profile_id: Option<String>,
-    },
-    /// Any other note-substrate access (get, list on notes).
-    NoteAccessed { target_id: Uuid },
-    /// Event is not relevant to the brain.
-    Irrelevant,
-}
+pub use khive_brain_core::BrainSignal;
+use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType};
 
 /// Extract a brain signal from a raw storage Event.
 ///
@@ -198,38 +84,12 @@ pub fn interpret(event: &Event) -> BrainSignal {
     }
 }
 
-/// Extract (entity_id, positive_signal) for per-entity posterior updates.
-pub fn entity_signal(signal: &BrainSignal) -> Option<(Uuid, bool)> {
-    match signal {
-        BrainSignal::RecallHit { target_id, .. } => Some((*target_id, true)),
-        BrainSignal::NoteAccessed { target_id } => Some((*target_id, true)),
-        BrainSignal::Feedback {
-            target_id, signal, ..
-        } => Some((*target_id, matches!(signal, FeedbackSignal::Useful))),
-        BrainSignal::SemanticFeedback {
-            target_id,
-            event_kind,
-            ..
-        } => Some((*target_id, event_kind.is_positive())),
-        BrainSignal::RecallMiss | BrainSignal::SearchCompleted { .. } | BrainSignal::Irrelevant => {
-            None
-        }
-    }
-}
-
-/// Is this signal positive for the global recall parameter?
-pub fn is_recall_positive(signal: &BrainSignal) -> Option<bool> {
-    match signal {
-        BrainSignal::RecallHit { .. } => Some(true),
-        BrainSignal::RecallMiss => Some(false),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_brain_core::{entity_signal, is_recall_positive};
     use khive_types::{EventKind, SubstrateKind};
+    use uuid::Uuid;
 
     fn make_event(verb: &str, outcome: EventOutcome, target: Option<Uuid>) -> Event {
         let mut e = Event::new("test", verb, EventKind::Audit, SubstrateKind::Note, "brain");
@@ -421,7 +281,7 @@ mod tests {
 
     #[test]
     fn feedback_with_section_signals() {
-        use crate::state::SectionType;
+        use khive_brain_core::SectionType;
         let id = Uuid::new_v4();
         let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
         e.payload = serde_json::json!({

@@ -5,6 +5,7 @@ pub mod config;
 pub mod handlers;
 mod pack;
 pub(crate) mod query_cache;
+pub mod recall_feedback;
 pub mod rerank;
 pub mod scoring;
 #[doc(hidden)]

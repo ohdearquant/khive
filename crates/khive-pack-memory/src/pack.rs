@@ -9,6 +9,8 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
+use khive_brain_core::BalancedRecallState;
+
 use crate::ann::{new_shared, SharedAnn};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
@@ -22,6 +24,13 @@ pub struct MemoryPack {
     pub(crate) ann: SharedAnn,
     /// Bounded exact-match query embedding cache (model_name, query_text) → Vec<f32>.
     pub(crate) query_cache: QueryEmbeddingCache,
+    /// In-memory Beta-posterior state for recall-domain feedback.
+    ///
+    /// Updated by `on_recall_hit`, `on_recall_miss`, and `on_explicit_feedback` in
+    /// `recall_feedback`. Posteriors flow into `RecallConfig` via `PackTunable`.
+    ///
+    /// Persistence is deferred — state is rebuilt from actions on restart.
+    pub(crate) recall_state: Mutex<BalancedRecallState>,
 }
 
 impl MemoryPack {
@@ -39,6 +48,7 @@ impl MemoryPack {
             config: Mutex::new(RecallConfig::default()),
             ann: new_shared(),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
+            recall_state: Mutex::new(BalancedRecallState::new(10_000)),
         }
     }
 
@@ -59,7 +69,7 @@ impl Pack for MemoryPack {
 // Illocutionary classification (Searle 1976):
 //   Commissive — commits caller to a persistent change
 //   Assertive  — retrieves/presents state of affairs
-static MEMORY_HANDLERS: [HandlerDef; 7] = [
+static MEMORY_HANDLERS: [HandlerDef; 8] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "memory.remember",
@@ -108,6 +118,27 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 param_type: "array",
                 required: false,
                 description: "Tag values to filter by. Matched against properties.tags on stored memories.",
+            },
+        ],
+    },
+    // Commissive: explicit feedback on a recalled memory — updates recall-domain posteriors
+    HandlerDef {
+        name: "memory.feedback",
+        description: "Emit explicit feedback on a recalled entity; updates recall-domain posteriors",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "target_id",
+                param_type: "string",
+                required: true,
+                description: "UUID of the recalled entity or memory being rated.",
+            },
+            ParamDef {
+                name: "signal",
+                param_type: "string",
+                required: true,
+                description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\" | \"explicit_positive\" | \"explicit_negative\" | \"implicit_positive\" | \"implicit_negative\" | \"correction\".",
             },
         ],
     },
@@ -302,6 +333,7 @@ impl PackRuntime for MemoryPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "memory.remember" => self.handle_remember(token, params).await,
+            "memory.feedback" => self.handle_feedback(params).await,
             "memory.recall" => self.handle_recall(token, params, registry).await,
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,

@@ -1,12 +1,14 @@
-//! Concept-tier verb handlers: `learn`, `cite`, `topic`.
+//! Concept-tier verb handlers: `learn`, `cite`, `topic`, `feedback`.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_brain_core::{FeedbackSignal, SectionType};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
 
+use crate::knowledge::section_feedback::on_section_feedback;
 use crate::KnowledgePack;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -304,5 +306,50 @@ impl KnowledgePack {
 
             Ok(json!({ "results": results, "total": total }))
         }
+    }
+
+    /// Apply per-section feedback signals to the pack's section posterior state.
+    pub(crate) async fn handle_feedback(&self, params: Value) -> Result<Value, RuntimeError> {
+        let raw = params
+            .get("section_signals")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "section_signals is required and must be an object".to_string(),
+                )
+            })?;
+
+        let mut signals: Vec<(SectionType, FeedbackSignal)> = Vec::with_capacity(raw.len());
+        for (key, val) in raw {
+            let section_type = SectionType::from_str_loose(key).ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("unknown section_type: {key:?}"))
+            })?;
+            let signal_str = val.as_str().ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("section signal for {key:?} must be a string"))
+            })?;
+            let signal = match signal_str {
+                "useful" => FeedbackSignal::Useful,
+                "not_useful" => FeedbackSignal::NotUseful,
+                "wrong" => FeedbackSignal::Wrong,
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "unknown feedback signal {other:?}; expected useful | not_useful | wrong"
+                    )))
+                }
+            };
+            signals.push((section_type, signal));
+        }
+
+        let mut state = self
+            .section_posteriors
+            .lock()
+            .map_err(|_| RuntimeError::Internal("section_posteriors lock poisoned".to_string()))?;
+        on_section_feedback(&mut state, &signals);
+
+        Ok(json!({
+            "ok": true,
+            "total_events": state.total_events,
+            "signals_applied": signals.len(),
+        }))
     }
 }

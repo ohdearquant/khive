@@ -7,7 +7,6 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use khive_fold::{Fold, FoldContext};
 use khive_runtime::{
     micros_to_iso, DispatchHook, EventView, KhiveRuntime, NamespaceToken, RuntimeError,
     VerbRegistry,
@@ -16,11 +15,12 @@ use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::HandlerDef;
 
-use crate::section::derive_deterministic_weights;
-use crate::state::{
+use crate::event::interpret;
+use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
+use khive_brain_core::derive_deterministic_weights;
+use khive_brain_core::{
     ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
 };
-use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 
 // ── Handler table ─────────────────────────────────────────────────────────────
 
@@ -865,7 +865,7 @@ impl BrainPack {
                         effective_profile
                     )));
                 }
-                Some(rec) if rec.lifecycle == crate::state::ProfileLifecycle::Archived => {
+                Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "serving profile {:?} is archived; feedback cannot credit archived profiles",
                         effective_profile
@@ -908,48 +908,32 @@ impl BrainPack {
             .to_string();
 
         {
-            let ctx = FoldContext::new();
+            let signal = interpret(&event);
             let mut state = self.state.lock().unwrap();
             let serving_profile = serving_profile_owned.as_str();
 
             if serving_profile == "balanced-recall-v1" {
-                let current_recall = std::mem::replace(
-                    &mut state.balanced_recall,
-                    crate::state::BalancedRecallState::new(0),
-                );
-                let updated = self.fold.reduce(current_recall, &event, &ctx);
-                state.balanced_recall = updated;
+                state.balanced_recall.apply_signal(&signal);
                 sync_balanced_recall_record(&mut state);
             } else if state.profile_states.contains_key(serving_profile) {
-                let current = state
+                let ps = state
                     .profile_states
-                    .remove(serving_profile)
+                    .get_mut(serving_profile)
                     .expect("key checked above");
-                let updated = self.fold.reduce(current, &event, &ctx);
-                let snap = serde_json::to_value(updated.to_snapshot()).ok();
-                let total = updated.total_events;
-                state
-                    .profile_states
-                    .insert(serving_profile.to_string(), updated);
+                ps.apply_signal(&signal);
+                let snap = serde_json::to_value(ps.to_snapshot()).ok();
+                let total = ps.total_events;
                 if let Some(record) = state.profiles.get_mut(serving_profile) {
                     record.total_events = total;
                     record.state_snapshot = snap;
                 }
             } else {
-                let current_recall = std::mem::replace(
-                    &mut state.balanced_recall,
-                    crate::state::BalancedRecallState::new(0),
-                );
-                let updated = self.fold.reduce(current_recall, &event, &ctx);
-                state.balanced_recall = updated;
+                state.balanced_recall.apply_signal(&signal);
                 sync_balanced_recall_record(&mut state);
             }
 
-            if let Some(section_state) = state.section_states.remove(serving_profile) {
-                let updated = self.section_fold.reduce(section_state, &event, &ctx);
-                state
-                    .section_states
-                    .insert(serving_profile.to_string(), updated);
+            if let Some(section_state) = state.section_states.get_mut(serving_profile) {
+                section_state.apply_signal(&signal);
             }
         }
 
@@ -1263,7 +1247,7 @@ impl BrainPack {
 
         // Initialize live BalancedRecallState for this profile so that reset and
         // feedback can route to its actual posteriors rather than a metadata-only record.
-        let ps = crate::state::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
+        let ps = khive_brain_core::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
         let snap = serde_json::to_value(ps.to_snapshot()).ok();
 
         let record = ProfileRecord {
@@ -1302,7 +1286,7 @@ impl BrainPack {
                             "alpha and beta must be positive for section {key:?}; got alpha={alpha}, beta={beta}"
                         )));
                     }
-                    priors.insert(st, crate::state::BetaPosterior::new(alpha, beta));
+                    priors.insert(st, khive_brain_core::BetaPosterior::new(alpha, beta));
                 }
                 SectionPosteriorState::from_priors(priors)
             } else {
@@ -1372,20 +1356,15 @@ impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
         // Brain observes pack events only — it must never process its own
         // state-transition events. Skipping brain.* verbs here prevents
-        // double-counting: handle_feedback already calls fold.reduce directly,
+        // double-counting: handle_feedback already calls apply_signal directly,
         // so the hook firing afterward would increment total_events a second time.
         if view.event.verb.starts_with("brain.") {
             return;
         }
 
-        let ctx = FoldContext::new();
+        let signal = interpret(&view.event);
         let mut state = self.state.lock().unwrap();
-        let current = std::mem::replace(
-            &mut state.balanced_recall,
-            crate::state::BalancedRecallState::new(0),
-        );
-        let updated = self.fold.reduce(current, &view.event, &ctx);
-        state.balanced_recall = updated;
+        state.balanced_recall.apply_signal(&signal);
 
         // Sync profile record after every hook fire so that brain.profile
         // reflects the live total_events and state_snapshot.

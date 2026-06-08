@@ -11,6 +11,7 @@ categories.workspace = true
 description = "Brain pack — profile-oriented orchestration via Fold + Objective (ADR-032)"
 
 [dependencies]
+khive-brain-core = { version = "0.2.8", path = "../khive-brain-core" }
 khive-types = { version = "0.2.8", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
 khive-fold = { version = "0.2.8", path = "../khive-fold" }

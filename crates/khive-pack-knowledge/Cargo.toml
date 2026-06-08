@@ -12,6 +12,7 @@ description = "Knowledge verb pack — lore corpus (atoms/domains), TF-IDF retri
 
 [dependencies]
 khive-types = { version = "0.2.8", path = "../khive-types", features = ["serde"] }
+khive-brain-core = { version = "0.2.8", path = "../khive-brain-core" }
 khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
 khive-storage = { version = "0.2.8", path = "../khive-storage" }
 khive-fold = { version = "0.2.8", path = "../khive-fold" }
