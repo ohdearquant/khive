@@ -127,8 +127,9 @@ pub use khive_retrieval::{
 };
 ```
 
-`StorageVectorSearch` and `StorageKeywordSearch` implement the `VectorStore` and
-`TextSearch` traits from ADR-005 respectively. `khive-runtime` still has FTS5 + VectorStore RRF paths over storage. The retrieval port
+`StorageVectorSearch` adapts an ADR-005 `VectorStore` into the retrieval
+`VectorSearch` trait, and `StorageKeywordSearch` adapts an ADR-005 `TextSearch`
+into the retrieval `KeywordSearch` trait. `khive-runtime` still has FTS5 + VectorStore RRF paths over storage. The retrieval port
 crates ship alongside that path; replacing or retiring sqlite-vec remains explicit follow-up
 work, not completed current behavior.
 

@@ -12,7 +12,7 @@ namespace isolation are enforced at each step.
 - [ADR-023](../../../docs/adr/ADR-023-declarative-pack-format.md) — Declarative pack format and verb visibility
 - [ADR-027](../../../docs/adr/ADR-027-dynamic-pack-loading.md) — Dynamic pack loading via self-registration
 - [ADR-028](../../../docs/adr/ADR-028-pack-scoped-backends.md) — Pack-scoped backends and schema declaration
-- [ADR-007](../../../docs/adr/ADR-007-namespace-strategy.md) — Namespace strategy and isolation requirements
+- [ADR-007](../../../docs/adr/ADR-007-namespace.md) — Namespace strategy and isolation requirements
 - [ADR-050](../../../docs/adr/ADR-050-kg-token-namespace-contract.md) — NamespaceToken authority contract
 
 ## Dispatch Flow
