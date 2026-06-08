@@ -440,8 +440,8 @@ impl BrainPack {
                     "mean": posterior.mean(),
                     "variance": posterior.variance(),
                     "ess": posterior.effective_sample_size(),
-                    "alpha": posterior.alpha,
-                    "beta": posterior.beta,
+                    "alpha": posterior.alpha(),
+                    "beta": posterior.beta(),
                 }))
             }
             None => {
@@ -609,8 +609,8 @@ impl BrainPack {
                 sections_json.insert(
                     section.as_str().to_owned(),
                     json!({
-                        "alpha": posterior.alpha,
-                        "beta": posterior.beta,
+                        "alpha": posterior.alpha(),
+                        "beta": posterior.beta(),
                         "mean": posterior.mean(),
                         "variance": posterior.variance(),
                         "ess": posterior.effective_sample_size(),

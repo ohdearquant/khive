@@ -54,6 +54,12 @@ impl TryFrom<EdgeRaw> for Edge {
         if !raw.weight.is_finite() {
             return Err(format!("Edge: weight must be finite, got {}", raw.weight));
         }
+        if !(0.0..=1.0).contains(&raw.weight) {
+            return Err(format!(
+                "Edge: weight must be in [0.0, 1.0], got {}",
+                raw.weight
+            ));
+        }
         Ok(Self {
             id: raw.id,
             namespace: raw.namespace,
@@ -155,16 +161,27 @@ impl TryFrom<EdgeFilterRaw> for EdgeFilter {
 }
 
 impl EdgeFilter {
-    /// Validate that weight bounds are finite and ordered correctly. Returns first violation.
+    /// Validate that weight bounds are finite, within [0.0, 1.0], and ordered correctly.
+    /// Returns the first violation.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(w) = self.min_weight {
             if !w.is_finite() {
                 return Err(format!("EdgeFilter: min_weight is non-finite ({w})"));
             }
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!(
+                    "EdgeFilter: min_weight must be in [0.0, 1.0], got {w}"
+                ));
+            }
         }
         if let Some(w) = self.max_weight {
             if !w.is_finite() {
                 return Err(format!("EdgeFilter: max_weight is non-finite ({w})"));
+            }
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!(
+                    "EdgeFilter: max_weight must be in [0.0, 1.0], got {w}"
+                ));
             }
         }
         if let (Some(lo), Some(hi)) = (self.min_weight, self.max_weight) {
@@ -216,6 +233,11 @@ impl TryFrom<NeighborQueryRaw> for NeighborQuery {
         if let Some(w) = raw.min_weight {
             if !w.is_finite() {
                 return Err(format!("NeighborQuery: min_weight must be finite, got {w}"));
+            }
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!(
+                    "NeighborQuery: min_weight must be in [0.0, 1.0], got {w}"
+                ));
             }
         }
         Ok(Self {
@@ -279,6 +301,11 @@ impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
             if !w.is_finite() {
                 return Err(format!(
                     "TraversalOptions: min_weight must be finite, got {w}"
+                ));
+            }
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!(
+                    "TraversalOptions: min_weight must be in [0.0, 1.0], got {w}"
                 ));
             }
         }

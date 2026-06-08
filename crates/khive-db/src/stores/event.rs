@@ -374,12 +374,19 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         .into_iter()
         .enumerate()
     {
+        let position_u32 = u32::try_from(position).map_err(|_| {
+            invalid_payload(
+                event.kind,
+                "candidates[position]",
+                "position out of u32 range",
+            )
+        })?;
         rows.push(EventObservation {
             event_id: event.id,
             entity_id,
             referent_kind: ReferentKind::Note,
             role: ObservationRole::Candidate,
-            position: position as u32,
+            position: position_u32,
         });
     }
 
@@ -387,12 +394,19 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         .or_else(|_| payload_uuid_array(event, "reranked"))
         .or_else(|_| payload_uuid_array(event, "final_scores"))?;
     for (position, entity_id) in selected.into_iter().enumerate() {
+        let position_u32 = u32::try_from(position).map_err(|_| {
+            invalid_payload(
+                event.kind,
+                "selected[position]",
+                "position out of u32 range",
+            )
+        })?;
         rows.push(EventObservation {
             event_id: event.id,
             entity_id,
             referent_kind: ReferentKind::Note,
             role: ObservationRole::Selected,
-            position: position as u32,
+            position: position_u32,
         });
     }
 

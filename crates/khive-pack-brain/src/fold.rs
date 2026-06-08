@@ -97,14 +97,14 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
         // relevance prior Beta(7,3)
-        assert!((state.relevance.alpha - 7.0).abs() < 1e-12);
-        assert!((state.relevance.beta - 3.0).abs() < 1e-12);
+        assert!((state.relevance.alpha() - 7.0).abs() < 1e-12);
+        assert!((state.relevance.beta() - 3.0).abs() < 1e-12);
         // salience prior Beta(2,8)
-        assert!((state.salience.alpha - 2.0).abs() < 1e-12);
-        assert!((state.salience.beta - 8.0).abs() < 1e-12);
+        assert!((state.salience.alpha() - 2.0).abs() < 1e-12);
+        assert!((state.salience.beta() - 8.0).abs() < 1e-12);
         // temporal prior Beta(1,9)
-        assert!((state.temporal.alpha - 1.0).abs() < 1e-12);
-        assert!((state.temporal.beta - 9.0).abs() < 1e-12);
+        assert!((state.temporal.alpha() - 1.0).abs() < 1e-12);
+        assert!((state.temporal.beta() - 9.0).abs() < 1e-12);
     }
 
     #[test]
@@ -118,9 +118,9 @@ mod tests {
         state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
-        assert!((state.relevance.alpha - 8.0).abs() < 1e-12); // 7 + 1
+        assert!((state.relevance.alpha() - 8.0).abs() < 1e-12); // 7 + 1
         let ep = state.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha - 2.0).abs() < 1e-12); // 1 + 1
+        assert!((ep.alpha() - 2.0).abs() < 1e-12); // 1 + 1
     }
 
     #[test]
@@ -133,7 +133,7 @@ mod tests {
         state = fold.reduce(state, &event, &ctx);
 
         // target_id = None → RecallMiss → relevance failure
-        assert!((state.relevance.beta - 4.0).abs() < 1e-12); // 3 + 1
+        assert!((state.relevance.beta() - 4.0).abs() < 1e-12); // 3 + 1
         assert!(state.entity_posteriors.is_empty());
     }
 
@@ -147,7 +147,7 @@ mod tests {
         state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
-        assert!((state.relevance.alpha - 7.0).abs() < 1e-12); // unchanged
+        assert!((state.relevance.alpha() - 7.0).abs() < 1e-12); // unchanged
     }
 
     #[test]
@@ -163,8 +163,8 @@ mod tests {
 
         assert_eq!(state.total_events, 1);
         let ep = state.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha - 1.0).abs() < 1e-12);
-        assert!((ep.beta - 2.0).abs() < 1e-12);
+        assert!((ep.alpha() - 1.0).abs() < 1e-12);
+        assert!((ep.beta() - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -235,40 +235,40 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let sal_alpha_prior = state.salience.alpha; // 2.0
-        let sal_beta_prior = state.salience.beta; // 8.0
+        let sal_alpha_prior = state.salience.alpha(); // 2.0
+        let sal_beta_prior = state.salience.beta(); // 8.0
 
         let id = Uuid::new_v4();
         let event = make_semantic_feedback_event("explicit_positive", id);
         let state = fold.reduce(state, &event, &ctx);
 
-        // ExplicitPositive: weight=1.5, is_positive=true → salience.alpha += 1.5
+        // ExplicitPositive: weight=1.5, is_positive=true → salience.alpha() += 1.5
         assert!(
-            (state.salience.alpha - (sal_alpha_prior + 1.5)).abs() < 1e-12,
-            "explicit_positive must add 1.5 to salience.alpha: expected {}, got {}",
+            (state.salience.alpha() - (sal_alpha_prior + 1.5)).abs() < 1e-12,
+            "explicit_positive must add 1.5 to salience.alpha(): expected {}, got {}",
             sal_alpha_prior + 1.5,
-            state.salience.alpha
+            state.salience.alpha()
         );
         assert!(
-            (state.salience.beta - sal_beta_prior).abs() < 1e-12,
-            "explicit_positive must not change salience.beta"
+            (state.salience.beta() - sal_beta_prior).abs() < 1e-12,
+            "explicit_positive must not change salience.beta()"
         );
         // Correction branch must NOT fire
-        let rel_beta_prior = state.relevance.beta;
+        let rel_beta_prior = state.relevance.beta();
         // (relevance should not change for ExplicitPositive — only Correction updates relevance)
         let _ = rel_beta_prior;
 
         // Entity posterior: alpha += 1.5
         let ep = state.entity_posteriors.get(&id).unwrap();
         assert!(
-            (ep.alpha - 2.5).abs() < 1e-12,
+            (ep.alpha() - 2.5).abs() < 1e-12,
             "entity posterior alpha must be 1.0 + 1.5 = 2.5, got {}",
-            ep.alpha
+            ep.alpha()
         );
         assert!(
-            (ep.beta - 1.0).abs() < 1e-12,
+            (ep.beta() - 1.0).abs() < 1e-12,
             "entity posterior beta must remain at 1.0, got {}",
-            ep.beta
+            ep.beta()
         );
     }
 
@@ -278,36 +278,36 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let sal_alpha_prior = state.salience.alpha; // 2.0
-        let sal_beta_prior = state.salience.beta; // 8.0
+        let sal_alpha_prior = state.salience.alpha(); // 2.0
+        let sal_beta_prior = state.salience.beta(); // 8.0
 
         let id = Uuid::new_v4();
         let event = make_semantic_feedback_event("implicit_negative", id);
         let state = fold.reduce(state, &event, &ctx);
 
-        // ImplicitNegative: weight=0.5, is_positive=false → salience.beta += 0.5
+        // ImplicitNegative: weight=0.5, is_positive=false → salience.beta() += 0.5
         assert!(
-            (state.salience.alpha - sal_alpha_prior).abs() < 1e-12,
-            "implicit_negative must not change salience.alpha"
+            (state.salience.alpha() - sal_alpha_prior).abs() < 1e-12,
+            "implicit_negative must not change salience.alpha()"
         );
         assert!(
-            (state.salience.beta - (sal_beta_prior + 0.5)).abs() < 1e-12,
-            "implicit_negative must add 0.5 to salience.beta: expected {}, got {}",
+            (state.salience.beta() - (sal_beta_prior + 0.5)).abs() < 1e-12,
+            "implicit_negative must add 0.5 to salience.beta(): expected {}, got {}",
             sal_beta_prior + 0.5,
-            state.salience.beta
+            state.salience.beta()
         );
 
         // Entity posterior: beta += 0.5
         let ep = state.entity_posteriors.get(&id).unwrap();
         assert!(
-            (ep.alpha - 1.0).abs() < 1e-12,
+            (ep.alpha() - 1.0).abs() < 1e-12,
             "entity posterior alpha must remain at 1.0, got {}",
-            ep.alpha
+            ep.alpha()
         );
         assert!(
-            (ep.beta - 1.5).abs() < 1e-12,
+            (ep.beta() - 1.5).abs() < 1e-12,
             "entity posterior beta must be 1.0 + 0.5 = 1.5, got {}",
-            ep.beta
+            ep.beta()
         );
     }
 
@@ -317,50 +317,50 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let sal_alpha_prior = state.salience.alpha; // 2.0
-        let sal_beta_prior = state.salience.beta; // 8.0
-        let rel_alpha_prior = state.relevance.alpha; // 7.0
-        let rel_beta_prior = state.relevance.beta; // 3.0
+        let sal_alpha_prior = state.salience.alpha(); // 2.0
+        let sal_beta_prior = state.salience.beta(); // 8.0
+        let rel_alpha_prior = state.relevance.alpha(); // 7.0
+        let rel_beta_prior = state.relevance.beta(); // 3.0
 
         let id = Uuid::new_v4();
         let event = make_semantic_feedback_event("correction", id);
         let state = fold.reduce(state, &event, &ctx);
 
-        // Correction: weight=2.0, is_positive=false → salience.beta += 2.0
+        // Correction: weight=2.0, is_positive=false → salience.beta() += 2.0
         assert!(
-            (state.salience.alpha - sal_alpha_prior).abs() < 1e-12,
-            "correction must not change salience.alpha"
+            (state.salience.alpha() - sal_alpha_prior).abs() < 1e-12,
+            "correction must not change salience.alpha()"
         );
         assert!(
-            (state.salience.beta - (sal_beta_prior + 2.0)).abs() < 1e-12,
-            "correction must add 2.0 to salience.beta: expected {}, got {}",
+            (state.salience.beta() - (sal_beta_prior + 2.0)).abs() < 1e-12,
+            "correction must add 2.0 to salience.beta(): expected {}, got {}",
             sal_beta_prior + 2.0,
-            state.salience.beta
+            state.salience.beta()
         );
 
-        // Correction also updates relevance posterior → relevance.beta += 2.0
+        // Correction also updates relevance posterior → relevance.beta() += 2.0
         assert!(
-            (state.relevance.alpha - rel_alpha_prior).abs() < 1e-12,
-            "correction must not change relevance.alpha"
+            (state.relevance.alpha() - rel_alpha_prior).abs() < 1e-12,
+            "correction must not change relevance.alpha()"
         );
         assert!(
-            (state.relevance.beta - (rel_beta_prior + 2.0)).abs() < 1e-12,
-            "correction must add 2.0 to relevance.beta: expected {}, got {}",
+            (state.relevance.beta() - (rel_beta_prior + 2.0)).abs() < 1e-12,
+            "correction must add 2.0 to relevance.beta(): expected {}, got {}",
             rel_beta_prior + 2.0,
-            state.relevance.beta
+            state.relevance.beta()
         );
 
         // Entity posterior: beta += 2.0
         let ep = state.entity_posteriors.get(&id).unwrap();
         assert!(
-            (ep.alpha - 1.0).abs() < 1e-12,
+            (ep.alpha() - 1.0).abs() < 1e-12,
             "entity posterior alpha must remain at 1.0, got {}",
-            ep.alpha
+            ep.alpha()
         );
         assert!(
-            (ep.beta - 3.0).abs() < 1e-12,
+            (ep.beta() - 3.0).abs() < 1e-12,
             "entity posterior beta must be 1.0 + 2.0 = 3.0, got {}",
-            ep.beta
+            ep.beta()
         );
     }
 
@@ -374,10 +374,10 @@ mod tests {
         let state = fold.init(&ctx);
 
         // Baseline: domain-informed priors.
-        let sal_alpha_prior = state.salience.alpha; // 2.0
-        let sal_beta_prior = state.salience.beta; // 8.0
-        let tmp_alpha_prior = state.temporal.alpha; // 1.0
-        let tmp_beta_prior = state.temporal.beta; // 9.0
+        let sal_alpha_prior = state.salience.alpha(); // 2.0
+        let sal_beta_prior = state.salience.beta(); // 8.0
+        let tmp_alpha_prior = state.temporal.alpha(); // 1.0
+        let tmp_beta_prior = state.temporal.beta(); // 9.0
 
         // Useful feedback → salience success.
         let id = Uuid::new_v4();
@@ -386,14 +386,14 @@ mod tests {
         let state = fold.reduce(state, &fb_useful, &ctx);
 
         assert!(
-            (state.salience.alpha - (sal_alpha_prior + 1.0)).abs() < 1e-12,
-            "useful feedback must increment salience.alpha: expected {}, got {}",
+            (state.salience.alpha() - (sal_alpha_prior + 1.0)).abs() < 1e-12,
+            "useful feedback must increment salience.alpha(): expected {}, got {}",
             sal_alpha_prior + 1.0,
-            state.salience.alpha
+            state.salience.alpha()
         );
         assert!(
-            (state.salience.beta - sal_beta_prior).abs() < 1e-12,
-            "useful feedback must not change salience.beta"
+            (state.salience.beta() - sal_beta_prior).abs() < 1e-12,
+            "useful feedback must not change salience.beta()"
         );
 
         // Fast recall hit → temporal success (latency_us = 0 ≤ 50_000).
@@ -402,14 +402,14 @@ mod tests {
         let state = fold.reduce(state, &hit, &ctx);
 
         assert!(
-            (state.temporal.alpha - (tmp_alpha_prior + 1.0)).abs() < 1e-12,
-            "fast recall hit must increment temporal.alpha: expected {}, got {}",
+            (state.temporal.alpha() - (tmp_alpha_prior + 1.0)).abs() < 1e-12,
+            "fast recall hit must increment temporal.alpha(): expected {}, got {}",
             tmp_alpha_prior + 1.0,
-            state.temporal.alpha
+            state.temporal.alpha()
         );
         assert!(
-            (state.temporal.beta - tmp_beta_prior).abs() < 1e-12,
-            "fast recall hit must not change temporal.beta"
+            (state.temporal.beta() - tmp_beta_prior).abs() < 1e-12,
+            "fast recall hit must not change temporal.beta()"
         );
 
         // Slow recall hit → temporal failure (latency_us > 50_000).
@@ -418,8 +418,8 @@ mod tests {
         let state = fold.reduce(state, &slow_hit, &ctx);
 
         assert!(
-            (state.temporal.beta - (tmp_beta_prior + 1.0)).abs() < 1e-12,
-            "slow recall hit must increment temporal.beta"
+            (state.temporal.beta() - (tmp_beta_prior + 1.0)).abs() < 1e-12,
+            "slow recall hit must increment temporal.beta()"
         );
 
         // Not-useful feedback → salience failure.
@@ -428,8 +428,8 @@ mod tests {
         let state = fold.reduce(state, &fb_bad, &ctx);
 
         assert!(
-            (state.salience.beta - (sal_beta_prior + 1.0)).abs() < 1e-12,
-            "not_useful feedback must increment salience.beta"
+            (state.salience.beta() - (sal_beta_prior + 1.0)).abs() < 1e-12,
+            "not_useful feedback must increment salience.beta()"
         );
     }
 
@@ -453,7 +453,7 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let alpha_before = state.posteriors[&ST::Overview].alpha;
+        let alpha_before = state.posteriors[&ST::Overview].alpha();
 
         let event = make_section_feedback_event(serde_json::json!({
             "overview": "useful"
@@ -461,7 +461,7 @@ mod tests {
         let state = fold.reduce(state, &event, &ctx);
 
         assert!(
-            (state.posteriors[&ST::Overview].alpha - (alpha_before + 1.0)).abs() < 1e-12,
+            (state.posteriors[&ST::Overview].alpha() - (alpha_before + 1.0)).abs() < 1e-12,
             "useful must increment alpha"
         );
     }
@@ -472,7 +472,7 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let beta_before = state.posteriors[&ST::Formalism].beta;
+        let beta_before = state.posteriors[&ST::Formalism].beta();
 
         let event = make_section_feedback_event(serde_json::json!({
             "formalism": "not_useful"
@@ -480,7 +480,7 @@ mod tests {
         let state = fold.reduce(state, &event, &ctx);
 
         assert!(
-            (state.posteriors[&ST::Formalism].beta - (beta_before + 1.0)).abs() < 1e-12,
+            (state.posteriors[&ST::Formalism].beta() - (beta_before + 1.0)).abs() < 1e-12,
             "not_useful must increment beta by 1"
         );
     }
@@ -491,7 +491,7 @@ mod tests {
         let ctx = FoldContext::new();
         let state = fold.init(&ctx);
 
-        let beta_before = state.posteriors[&ST::Examples].beta;
+        let beta_before = state.posteriors[&ST::Examples].beta();
 
         let event = make_section_feedback_event(serde_json::json!({
             "examples": "wrong"
@@ -499,7 +499,7 @@ mod tests {
         let state = fold.reduce(state, &event, &ctx);
 
         assert!(
-            (state.posteriors[&ST::Examples].beta - (beta_before + 2.0)).abs() < 1e-12,
+            (state.posteriors[&ST::Examples].beta() - (beta_before + 2.0)).abs() < 1e-12,
             "wrong must increment beta by 2"
         );
     }
@@ -581,12 +581,12 @@ mod tests {
         assert_eq!(snap1.total_events, snap2.total_events);
         for st in ST::all() {
             assert!(
-                (snap1.posteriors[st].alpha - snap2.posteriors[st].alpha).abs() < 1e-12,
+                (snap1.posteriors[st].alpha() - snap2.posteriors[st].alpha()).abs() < 1e-12,
                 "replay alpha mismatch for {:?}",
                 st
             );
             assert!(
-                (snap1.posteriors[st].beta - snap2.posteriors[st].beta).abs() < 1e-12,
+                (snap1.posteriors[st].beta() - snap2.posteriors[st].beta()).abs() < 1e-12,
                 "replay beta mismatch for {:?}",
                 st
             );

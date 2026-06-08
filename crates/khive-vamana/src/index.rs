@@ -32,8 +32,55 @@ pub struct CorpusFingerprint {
     pub dimensions: u32,
 }
 
+/// Raw deserialization target for [`VamanaIndexSnapshot`].
+#[derive(Deserialize)]
+struct VamanaIndexSnapshotRaw {
+    num_vectors: u64,
+    dimensions: u32,
+    max_degree: u32,
+    search_list_size: u32,
+    alpha: f64,
+    medoid: u32,
+    adjacency: Vec<Vec<u32>>,
+    vectors: Vec<f32>,
+}
+
+impl TryFrom<VamanaIndexSnapshotRaw> for VamanaIndexSnapshot {
+    type Error = VamanaError;
+
+    fn try_from(raw: VamanaIndexSnapshotRaw) -> std::result::Result<Self, VamanaError> {
+        if !raw.alpha.is_finite() || raw.alpha < 1.0 {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: alpha must be finite and >= 1.0, got {}",
+                raw.alpha
+            )));
+        }
+        for (i, &v) in raw.vectors.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(VamanaError::non_finite(
+                    "VamanaIndexSnapshot.vectors",
+                    format!("index {i}: {v}"),
+                ));
+            }
+        }
+        Ok(Self {
+            num_vectors: raw.num_vectors,
+            dimensions: raw.dimensions,
+            max_degree: raw.max_degree,
+            search_list_size: raw.search_list_size,
+            alpha: raw.alpha,
+            medoid: raw.medoid,
+            adjacency: raw.adjacency,
+            vectors: raw.vectors,
+        })
+    }
+}
+
 /// Serialisable graph payload stored inside `VamanaSnapshot`.
+/// Deserialization validates that `alpha` is finite and >= 1.0, and that all
+/// vector values are finite. Use `from_snapshot` to reconstruct a live index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "VamanaIndexSnapshotRaw")]
 pub struct VamanaIndexSnapshot {
     /// Number of indexed vectors.
     pub num_vectors: u64,
@@ -53,8 +100,38 @@ pub struct VamanaIndexSnapshot {
     pub vectors: Vec<f32>,
 }
 
-/// Self-validating snapshot of a `VamanaIndex`.
+/// Raw deserialization target for [`VamanaSnapshot`].
+#[derive(Deserialize)]
+struct VamanaSnapshotRaw {
+    format: String,
+    version: u32,
+    namespace: String,
+    model: String,
+    fingerprint: CorpusFingerprint,
+    index: VamanaIndexSnapshot,
+    external_ids: Vec<String>,
+}
+
+impl TryFrom<VamanaSnapshotRaw> for VamanaSnapshot {
+    type Error = VamanaError;
+
+    fn try_from(raw: VamanaSnapshotRaw) -> std::result::Result<Self, VamanaError> {
+        Ok(Self {
+            format: raw.format,
+            version: raw.version,
+            namespace: raw.namespace,
+            model: raw.model,
+            fingerprint: raw.fingerprint,
+            index: raw.index,
+            external_ids: raw.external_ids,
+        })
+    }
+}
+
+/// Self-validating snapshot of a `VamanaIndex`. Deserialization validates
+/// vector finiteness and alpha range at the serde boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "VamanaSnapshotRaw")]
 pub struct VamanaSnapshot {
     pub format: String,
     pub version: u32,
@@ -1096,6 +1173,89 @@ mod tests {
                 Err(VamanaError::InvalidFormat { .. })
             ),
             "load must reject trailing bytes in graph.bin"
+        );
+    }
+
+    // ---- Serde-boundary NaN/Inf tests for snapshot types ----
+
+    /// VamanaIndexSnapshot deserialization must reject non-finite vectors via TryFrom.
+    /// JSON cannot encode NaN natively; the TryFrom<VamanaIndexSnapshotRaw> path is
+    /// the serde boundary invoked by #[serde(try_from = "...")].
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_nan_vector() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 2,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![0]],
+            vectors: vec![1.0, f32::NAN, 0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            matches!(result, Err(VamanaError::NonFiniteFloat { .. })),
+            "VamanaIndexSnapshot::try_from must reject NaN in vectors"
+        );
+    }
+
+    /// VamanaIndexSnapshot deserialization must reject non-finite alpha via TryFrom.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_nan_alpha() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: f64::NAN,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            result.is_err(),
+            "VamanaIndexSnapshot::try_from must reject NaN alpha"
+        );
+    }
+
+    /// VamanaIndexSnapshot must reject alpha below 1.0 at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_alpha_below_one() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: 0.5,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            result.is_err(),
+            "VamanaIndexSnapshot::try_from must reject alpha < 1.0"
+        );
+    }
+
+    /// VamanaIndexSnapshot with valid inputs must succeed TryFrom.
+    #[test]
+    fn vamana_index_snapshot_try_from_accepts_valid() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5_f32, 0.5_f32],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_ok(),
+            "valid VamanaIndexSnapshot raw must be accepted"
         );
     }
 

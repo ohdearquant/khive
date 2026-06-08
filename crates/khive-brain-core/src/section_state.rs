@@ -104,7 +104,8 @@ impl SectionPosteriorState {
 
         let mut samples: HashMap<SectionType, f64> = HashMap::new();
         for (&st, posterior) in &self.posteriors {
-            let theta = sample_beta_gamma(posterior.alpha.max(1e-6), posterior.beta.max(1e-6), rng);
+            let theta =
+                sample_beta_gamma(posterior.alpha().max(1e-6), posterior.beta().max(1e-6), rng);
             samples.insert(st, theta / tau);
         }
 
@@ -153,9 +154,9 @@ impl SectionPosteriorState {
             for (section_type, feedback_signal) in signals {
                 if let Some(posterior) = self.posteriors.get_mut(section_type) {
                     match feedback_signal {
-                        FeedbackSignal::Useful => posterior.alpha += 1.0,
-                        FeedbackSignal::NotUseful => posterior.beta += 1.0,
-                        FeedbackSignal::Wrong => posterior.beta += 2.0,
+                        FeedbackSignal::Useful => posterior.update_success(),
+                        FeedbackSignal::NotUseful => posterior.update_failure(),
+                        FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
                     }
                     if let Some(prior) = self.priors.get(section_type) {
                         posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP);

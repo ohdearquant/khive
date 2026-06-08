@@ -21,16 +21,23 @@ impl TryFrom<BetaPosteriorRaw> for BetaPosterior {
 }
 
 /// Beta-Binomial posterior. Deserialization rejects non-finite or non-positive parameters.
+/// Fields are private to prevent construction of invalid states without going through
+/// `try_new`. Use the accessor methods `alpha()` and `beta()` to read values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(try_from = "BetaPosteriorRaw")]
 pub struct BetaPosterior {
-    pub alpha: f64,
-    pub beta: f64,
+    alpha: f64,
+    beta: f64,
 }
 
 impl BetaPosterior {
+    /// Construct a `BetaPosterior` with the given parameters.
+    ///
+    /// # Panics
+    /// Panics in debug builds if `alpha` or `beta` is non-finite or non-positive.
+    /// Use [`try_new`](Self::try_new) when parameters come from untrusted input.
     pub fn new(alpha: f64, beta: f64) -> Self {
-        Self { alpha, beta }
+        Self::try_new(alpha, beta).unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn try_new(alpha: f64, beta: f64) -> Result<Self, String> {
@@ -45,6 +52,16 @@ impl BetaPosterior {
             ));
         }
         Ok(Self { alpha, beta })
+    }
+
+    /// Return the alpha (success pseudo-count) parameter.
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Return the beta (failure pseudo-count) parameter.
+    pub fn beta(&self) -> f64 {
+        self.beta
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -73,17 +90,17 @@ impl BetaPosterior {
     }
 
     pub fn update_success_weighted(&mut self, weight: f64) {
-        debug_assert!(
-            weight > 0.0,
-            "update_success_weighted: weight must be positive, got {weight}"
+        assert!(
+            weight.is_finite() && weight > 0.0,
+            "update_success_weighted: weight must be finite and positive, got {weight}"
         );
         self.alpha += weight;
     }
 
     pub fn update_failure_weighted(&mut self, weight: f64) {
-        debug_assert!(
-            weight > 0.0,
-            "update_failure_weighted: weight must be positive, got {weight}"
+        assert!(
+            weight.is_finite() && weight > 0.0,
+            "update_failure_weighted: weight must be finite and positive, got {weight}"
         );
         self.beta += weight;
     }
@@ -234,23 +251,35 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_nan_alpha() {
+    fn serde_rejects_null_alpha() {
+        // This tests that null (invalid f64) is rejected — NOT a NaN test.
         let json = r#"{"alpha": null, "beta": 1.0}"#;
-        // null is not a valid f64 for alpha
         let result: Result<BetaPosterior, _> = serde_json::from_str(json);
         assert!(result.is_err(), "null alpha must be rejected");
     }
 
+    /// Verify that NaN is rejected at the serde boundary via `try_from`.
+    /// JSON cannot encode NaN natively; this tests the `TryFrom<BetaPosteriorRaw>` path
+    /// which is the actual validation gate that `#[serde(try_from)]` invokes.
     #[test]
-    fn serde_rejects_nonfinite_alpha() {
-        // JSON does not represent Inf/NaN natively, but a crafted payload via
-        // serde_json::Value injection covers the try_from path:
+    fn serde_rejects_nan_alpha_via_try_from() {
         let raw_nan: BetaPosteriorRaw = BetaPosteriorRaw {
             alpha: f64::NAN,
             beta: 1.0,
         };
         let result = BetaPosterior::try_from(raw_nan);
         assert!(result.is_err(), "NaN alpha must be rejected via try_from");
+    }
+
+    /// Verify that NaN is rejected at the serde boundary via `try_from` for beta.
+    #[test]
+    fn serde_rejects_nan_beta_via_try_from() {
+        let raw_nan: BetaPosteriorRaw = BetaPosteriorRaw {
+            alpha: 1.0,
+            beta: f64::NAN,
+        };
+        let result = BetaPosterior::try_from(raw_nan);
+        assert!(result.is_err(), "NaN beta must be rejected via try_from");
     }
 
     #[test]

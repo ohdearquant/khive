@@ -45,6 +45,12 @@ impl TryFrom<EdgeRecordRaw> for EdgeRecord {
                 raw.weight
             ));
         }
+        if !(0.0..=1.0).contains(&raw.weight) {
+            return Err(format!(
+                "EdgeRecord: weight must be in [0.0, 1.0], got {}",
+                raw.weight
+            ));
+        }
         Ok(Self {
             edge_id: raw.edge_id,
             source: raw.source,

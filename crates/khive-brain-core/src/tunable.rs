@@ -50,8 +50,8 @@ mod tests {
             bounds: (0.0, 1.0),
         };
         let prior = def.prior();
-        assert!((prior.alpha - 2.0).abs() < 1e-12);
-        assert!((prior.beta - 8.0).abs() < 1e-12);
+        assert!((prior.alpha() - 2.0).abs() < 1e-12);
+        assert!((prior.beta() - 8.0).abs() < 1e-12);
         assert!((prior.mean() - 0.2).abs() < 1e-12);
     }
 
