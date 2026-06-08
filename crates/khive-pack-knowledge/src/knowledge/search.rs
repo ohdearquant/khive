@@ -879,8 +879,6 @@ async fn load_domain_by_id_or_slug(
         .await
         .map_err(|e| sql_err("compose domain reader", e))?;
     let id = id_or_slug.trim().to_string();
-    let is_hex_prefix =
-        !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
@@ -890,33 +888,43 @@ async fn load_domain_by_id_or_slug(
             })
             .await
             .map_err(|e| sql_err("compose domain by id", e))?
-    } else if is_hex_prefix && id.len() >= 8 {
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: "SELECT * FROM knowledge_domains WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
-                params: vec![
-                    SqlValue::Text(format!("{id}%")),
-                    SqlValue::Text(ns.to_owned()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("compose domain by prefix", e))?;
-        if rows.len() > 1 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "ambiguous domain prefix {id:?} matches multiple domains"
-            )));
-        }
-        rows.into_iter().next()
     } else {
-        reader
+        let by_slug = reader
             .query_row(SqlStatement {
                 sql: "SELECT * FROM knowledge_domains WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
             .await
-            .map_err(|e| sql_err("compose domain by slug", e))?
+            .map_err(|e| sql_err("compose domain by slug", e))?;
+        if by_slug.is_some() {
+            by_slug
+        } else {
+            let is_hex = id.len() >= 8
+                && id.len() <= 36
+                && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            if is_hex {
+                let rows = reader
+                    .query_all(SqlStatement {
+                        sql: "SELECT * FROM knowledge_domains WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
+                        params: vec![
+                            SqlValue::Text(format!("{id}%")),
+                            SqlValue::Text(ns.to_owned()),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("compose domain by prefix", e))?;
+                if rows.len() > 1 {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "ambiguous domain prefix {id:?} matches multiple domains"
+                    )));
+                }
+                rows.into_iter().next()
+            } else {
+                None
+            }
+        }
     };
     row.and_then(|r| domain_from_row(&r))
         .ok_or_else(|| RuntimeError::NotFound(format!("domain not found: {id:?}")))
@@ -933,8 +941,6 @@ async fn load_atom_by_id_or_slug(
         .await
         .map_err(|e| sql_err("compose atom reader", e))?;
     let id = id_or_slug.trim().to_string();
-    let is_hex_prefix =
-        !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
@@ -944,33 +950,43 @@ async fn load_atom_by_id_or_slug(
             })
             .await
             .map_err(|e| sql_err("compose atom by id", e))?
-    } else if is_hex_prefix && id.len() >= 8 {
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: "SELECT * FROM knowledge_atoms WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
-                params: vec![
-                    SqlValue::Text(format!("{id}%")),
-                    SqlValue::Text(ns.to_owned()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("compose atom by prefix", e))?;
-        if rows.len() > 1 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "ambiguous atom prefix {id:?} matches multiple atoms"
-            )));
-        }
-        rows.into_iter().next()
     } else {
-        reader
+        let by_slug = reader
             .query_row(SqlStatement {
                 sql: "SELECT * FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
             .await
-            .map_err(|e| sql_err("compose atom by slug", e))?
+            .map_err(|e| sql_err("compose atom by slug", e))?;
+        if by_slug.is_some() {
+            by_slug
+        } else {
+            let is_hex = id.len() >= 8
+                && id.len() <= 36
+                && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            if is_hex {
+                let rows = reader
+                    .query_all(SqlStatement {
+                        sql: "SELECT * FROM knowledge_atoms WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
+                        params: vec![
+                            SqlValue::Text(format!("{id}%")),
+                            SqlValue::Text(ns.to_owned()),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("compose atom by prefix", e))?;
+                if rows.len() > 1 {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "ambiguous atom prefix {id:?} matches multiple atoms"
+                    )));
+                }
+                rows.into_iter().next()
+            } else {
+                None
+            }
+        }
     };
     row.and_then(|r| atom_from_row(&r))
         .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id:?}")))
