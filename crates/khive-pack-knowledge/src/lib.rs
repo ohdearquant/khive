@@ -34,10 +34,14 @@ pub struct KnowledgeReindexOptions {
 /// so this does not fan out across registered models the way entity/note
 /// reindex does. Returns `{atoms_indexed, sections_indexed, failed, ann_failed,
 /// sections_failed}`.
+///
+/// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     opts: KnowledgeReindexOptions,
+    on_atom_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    on_section_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 ) -> Result<Value, RuntimeError> {
     let mut atoms_indexed = 0u64;
     let mut failed = 0u64;
@@ -50,12 +54,15 @@ pub async fn reindex_knowledge(
         if let Some(bs) = opts.batch_size {
             params.insert("batch_size".into(), Value::from(bs));
         }
-        let result =
-            knowledge::KnowledgeHandlers::index(runtime, token, Value::Object(params), &ann)
-                .await?;
+        let result = knowledge::KnowledgeHandlers::index(
+            runtime,
+            token,
+            Value::Object(params),
+            &ann,
+            on_atom_progress,
+        )
+        .await?;
         atoms_indexed = result.get("indexed").and_then(|n| n.as_u64()).unwrap_or(0);
-        // Preserve the index handler's fail-closed accounting so the caller can
-        // exit non-zero on partial atom/ANN failure (kkernel reindex contract).
         failed = result.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
         ann_failed = result
             .get("ann_failed")
@@ -67,9 +74,14 @@ pub async fn reindex_knowledge(
     let mut sections_failed = 0u64;
     if opts.sections {
         let batch = opts.batch_size.unwrap_or(500) as usize;
-        let (indexed, _skipped, sec_failed) =
-            knowledge::sections_index::embed_sections(runtime, token, opts.drop_existing, batch)
-                .await?;
+        let (indexed, _skipped, sec_failed) = knowledge::sections_index::embed_sections(
+            runtime,
+            token,
+            opts.drop_existing,
+            batch,
+            on_section_progress,
+        )
+        .await?;
         sections_indexed = indexed as u64;
         sections_failed = sec_failed as u64;
     }

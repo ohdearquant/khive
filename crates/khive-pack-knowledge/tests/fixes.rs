@@ -1918,6 +1918,8 @@ mod embed_failure_tests {
                 rebuild_ann: false,
                 batch_size: None,
             },
+            None,
+            None,
         )
         .await
         .expect("reindex_knowledge ok");
@@ -1954,6 +1956,8 @@ mod embed_failure_tests {
                 rebuild_ann: false,
                 batch_size: None,
             },
+            None,
+            None,
         )
         .await
         .expect("reindex_knowledge ok");
@@ -1994,6 +1998,8 @@ mod embed_failure_tests {
                 rebuild_ann: false,
                 batch_size: Some(1),
             },
+            None,
+            None,
         )
         .await
         .expect("reindex_knowledge must terminate, not loop");

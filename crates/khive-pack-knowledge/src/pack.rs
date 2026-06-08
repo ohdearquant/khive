@@ -111,7 +111,7 @@ impl PackRuntime for KnowledgePack {
             }
             "knowledge.stats" => KnowledgeHandlers::stats(&self.runtime, token, params).await,
             "knowledge.index" => {
-                KnowledgeHandlers::index(&self.runtime, token, params, &self.ann).await
+                KnowledgeHandlers::index(&self.runtime, token, params, &self.ann, None).await
             }
             "knowledge.fold" => KnowledgeHandlers::fold(&self.runtime, token, params).await,
             "knowledge.search" => {
