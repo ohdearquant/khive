@@ -169,10 +169,11 @@ pub async fn run_sync_remote(
 
         if !clone_out.status.success() {
             let stderr = String::from_utf8_lossy(&clone_out.stderr);
+            let safe = redact_git_stderr(stderr.trim());
             return Err(anyhow!(
                 "git clone failed for remote {:?}: {}",
                 remote.name,
-                stderr.trim()
+                safe
             ));
         }
 
@@ -276,6 +277,49 @@ pub async fn run_sync_remote(
     })
 }
 
+/// Redact URLs and embedded credentials from git stderr before surfacing in errors.
+///
+/// git on auth failure can include the full remote URL in stderr, which may carry
+/// a `user:token@host` credential form.  ADR-037 §157 prohibits leaking remote
+/// URLs in errors.  This function replaces any `scheme://[…@]host/path` token
+/// with `<url-redacted>` so the sanitised text is still useful for diagnostics
+/// while credentials stay out of logs.
+fn redact_git_stderr(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"://") {
+            // Walk back over the scheme characters already written.
+            let scheme_start = {
+                let mut s = i;
+                while s > 0 && {
+                    let b = bytes[s - 1];
+                    b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.'
+                } {
+                    s -= 1;
+                }
+                s
+            };
+            let already_appended = i - scheme_start;
+            out.truncate(out.len() - already_appended);
+            // Advance past "://" and consume until the next whitespace or EOL.
+            let rest_start = i + 3;
+            let url_end = bytes[rest_start..]
+                .iter()
+                .position(|&b| b.is_ascii_whitespace())
+                .map(|p| rest_start + p)
+                .unwrap_or(bytes.len());
+            out.push_str("<url-redacted>");
+            i = url_end;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Run a git command inside `dir`, returning an error if it fails.
 fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
     let out = Command::new("git")
@@ -285,7 +329,8 @@ fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
         .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("git {} failed: {}", args.join(" "), stderr.trim()));
+        let safe = redact_git_stderr(stderr.trim());
+        return Err(anyhow!("git {} failed: {}", args.join(" "), safe));
     }
     Ok(())
 }
@@ -1051,5 +1096,62 @@ mod tests {
         let cache = repo_dir.path().join(".khive/kg/remotes/repinned");
         assert!(cache.join("entities.ndjson").exists());
         assert!(cache.join("meta.json").exists());
+    }
+
+    // ── URL redaction tests ───────────────────────────────────────────────────
+
+    /// Credentials embedded in a URL must not survive redact_git_stderr.
+    #[test]
+    fn redact_strips_credential_url() {
+        let raw = "fatal: Authentication failed for 'https://user:token@host/repo.git'";
+        let out = redact_git_stderr(raw);
+        assert!(
+            !out.contains("user:token"),
+            "credential must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("host/repo.git"),
+            "host/path must be redacted, got: {out}"
+        );
+        assert!(
+            out.contains("<url-redacted>"),
+            "placeholder must be present, got: {out}"
+        );
+    }
+
+    /// Plain text without a URL must pass through unchanged.
+    #[test]
+    fn redact_passes_plain_text() {
+        let raw = "error: unable to read refs from remote";
+        assert_eq!(redact_git_stderr(raw), raw);
+    }
+
+    /// Multiple URLs in the same stderr string must all be redacted.
+    #[test]
+    fn redact_handles_multiple_urls() {
+        let raw = "fetch https://a:b@host1/r1.git and push https://c:d@host2/r2.git failed";
+        let out = redact_git_stderr(raw);
+        assert!(!out.contains("a:b"), "first credential must be redacted");
+        assert!(!out.contains("c:d"), "second credential must be redacted");
+        assert_eq!(
+            out.matches("<url-redacted>").count(),
+            2,
+            "both URLs must be replaced"
+        );
+    }
+
+    /// A bare URL without credentials is also redacted (the host is still sensitive).
+    #[test]
+    fn redact_handles_url_without_credentials() {
+        let raw = "fatal: repository 'https://github.com/org/private-repo.git/' not found";
+        let out = redact_git_stderr(raw);
+        assert!(
+            !out.contains("github.com/org/private-repo"),
+            "URL path must be redacted"
+        );
+        assert!(
+            out.contains("<url-redacted>"),
+            "placeholder must be present"
+        );
     }
 }
