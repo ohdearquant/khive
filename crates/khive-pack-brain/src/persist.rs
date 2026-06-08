@@ -3,6 +3,40 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// Test-only interleaving hook for ensure_loaded.
+//
+// When set, every cold ensure_loaded call (after the async DB load, before the
+// final tracker lock) will:
+//   1. Send () on `reached_tx` to signal the test controller "I am at the hook".
+//   2. Await `proceed_rx` before continuing.
+//
+// This lets a test precisely inject the following interleaving:
+//   - Loader B reaches hook  →  test controller receives reached signal
+//   - Test controller runs Loader A to completion and mutates state
+//   - Test controller sends on proceed_tx  →  Loader B continues
+//
+// With the old code (no re-check), Loader B then clobbered A's mutation.
+// With the fix (re-check under final guard), Loader B sees is_active=true
+// and returns early, preserving A's mutation.
+#[cfg(test)]
+pub(crate) struct LoadHook {
+    pub reached_tx: tokio::sync::oneshot::Sender<()>,
+    pub proceed_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static POST_LOAD_HOOK: std::sync::Mutex<Option<LoadHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_post_load_hook(hook: LoadHook) {
+    *POST_LOAD_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_post_load_hook() {
+    *POST_LOAD_HOOK.lock().unwrap() = None;
+}
+
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
@@ -267,16 +301,50 @@ pub async fn ensure_loaded(
         Some(bs)
     };
 
+    // In test builds, honour the injected interleaving hook (if any).
+    // The hook fires only for cold loads (brain_state.is_some() at this
+    // point) so warm-path and already-loaded early-returns are unaffected.
+    #[cfg(test)]
+    if brain_state.is_some() {
+        let hook = POST_LOAD_HOOK.lock().unwrap().take();
+        if let Some(h) = hook {
+            // Signal the test controller: "I am at the hook."
+            let _ = h.reached_tx.send(());
+            // Wait for the controller to give the go-ahead.
+            let _ = h.proceed_rx.await;
+        }
+    }
+
     // Lock order: tracker → state (always in this sequence).
     // Reversing this order anywhere would risk deadlock; do not change.
     //
-    // Publication must be atomic: active_namespace, *state, and
-    // loaded_namespaces are all updated inside a single tracker-held
-    // critical section so no concurrent dispatch can observe
-    // active=true with stale state, and no concurrent cross-namespace
-    // load can snapshot the wrong active state.
+    // Publication is atomic: active_namespace, *state, and loaded_namespaces
+    // are all updated inside a single tracker-held critical section.
+    //
+    // Re-check under the final guard: a concurrent loader may have completed
+    // the same namespace while this task awaited the async DB load.  If so,
+    // discard the stale brain_state we loaded and defer to the live slot.
     {
         let mut t = tracker.lock().unwrap();
+
+        // Re-check 1: another loader already published this namespace as active.
+        // The shared state slot already contains the live state; return without
+        // clobbering it with our stale cold-loaded copy.
+        if t.is_active(&namespace) {
+            return Ok(());
+        }
+
+        // Re-check 2: another loader completed a cold load for this namespace
+        // (it is now in saved_states) while this task was awaiting the DB.
+        // Our brain_state was derived from a snapshot that is now stale relative
+        // to any mutations that occurred after that loader published.  Discard
+        // it so the save-restore path below uses the live saved state instead.
+        let fresh_brain_state = if t.is_loaded(&namespace) {
+            None
+        } else {
+            brain_state
+        };
+
         let current_ns = t.active_namespace.clone();
 
         // Clone the parts of the current shared state we need for save-restore,
@@ -324,14 +392,14 @@ pub async fn ensure_loaded(
                 drop(current_state);
 
                 let restored = t.swap_namespace(from_ns, saved_current, namespace.clone());
-                brain_state
+                fresh_brain_state
                     .or(restored)
                     .unwrap_or_else(|| BrainState::new(entity_capacity))
             } else {
                 drop(current_state);
                 // No active namespace yet — first load.  active_namespace is set
                 // below together with the state write and loaded_namespaces mark.
-                brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
+                fresh_brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
             }
         };
 

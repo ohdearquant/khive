@@ -3348,3 +3348,126 @@ async fn ensure_loaded_cross_namespace_concurrent_does_not_corrupt_saved_states(
         "namespace Y must still have exactly 1 binding after cross-namespace interleave"
     );
 }
+
+/// Deterministic interleaving test for the concurrent cold-load race.
+///
+/// Interleaving manufactured by the test-only `POST_LOAD_HOOK` in persist.rs:
+///
+///   1. Loader B is spawned; it calls `ensure_loaded` for "race-ns", completes
+///      the async DB scan, then PAUSES at the hook before acquiring the final
+///      tracker lock (it signals "reached" on a oneshot and awaits "proceed").
+///   2. While B is paused, the test task runs Loader A to completion (no hook
+///      active for A — hook was already consumed by B's `.take()`).  A publishes
+///      "race-ns" as active.
+///   3. The test task mutates state via `brain.bind` (adds one binding to A's
+///      namespace).  Binding count is now 1.
+///   4. The test task sends "proceed" to B.  B resumes, enters the final
+///      tracker block, and:
+///        • OLD code: sees `current_ns = Some("race-ns")`, takes the
+///          `swap_namespace` path, and B's stale cold-loaded `brain_state`
+///          (binding count 0) overrides the live state.  Final binding
+///          count = 0.  TEST FAILS.
+///        • FIXED code: re-checks `is_active("race-ns")` — true — and
+///          returns early without touching `*state`.  Final binding
+///          count = 1.  TEST PASSES.
+///
+/// FAIL-before / PASS-after evidence is produced by running:
+///   cargo test -p khive-pack-brain -- concurrent_cold_load_does_not_clobber_live_state
+/// against the reverted commit and against the fixed commit.
+#[tokio::test]
+async fn concurrent_cold_load_does_not_clobber_live_state() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    // Always clean up the hook, even on panic.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            persist::clear_post_load_hook();
+        }
+    }
+    let _guard = HookGuard;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = Arc::new(BrainPack::new(rt.clone()));
+    let registry = empty_registry();
+
+    let ns = Namespace::try_from("race-ns-det").expect("race namespace");
+    let token = Arc::new(rt.authorize(ns).expect("race token"));
+
+    // ── Step 1: register the hook for Loader B ────────────────────────────────
+    // B will fire the hook once it has finished the cold DB load.
+    let (reached_tx, reached_rx) = oneshot::channel::<()>();
+    let (proceed_tx, proceed_rx) = oneshot::channel::<()>();
+    persist::set_post_load_hook(persist::LoadHook {
+        reached_tx,
+        proceed_rx,
+    });
+
+    // ── Step 2: spawn Loader B ────────────────────────────────────────────────
+    // B will pause at the hook (awaiting proceed_rx) once the hook fires.
+    let pack_b = Arc::clone(&pack);
+    let token_b = Arc::clone(&token);
+    let b_handle = tokio::spawn(async move { pack_b.ensure_loaded(&token_b).await });
+
+    // Wait for B to signal it has reached the hook (DB load done, not yet in
+    // the final tracker block).
+    reached_rx.await.expect("loader B must signal reached");
+
+    // ── Step 3: run Loader A to completion ────────────────────────────────────
+    // The hook was consumed by B's `.take()`, so A passes straight through.
+    // A publishes "race-ns-det" as active and returns.
+    pack.ensure_loaded(&token)
+        .await
+        .expect("loader A: ensure_loaded");
+
+    // ── Step 4: mutate state under A's namespace ──────────────────────────────
+    pack.dispatch(
+        "brain.bind",
+        json!({
+            "profile_id": "balanced-recall-v1",
+            "actor": "racer",
+            "namespace": "race-ns-det",
+            "consumer_kind": "recall",
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("brain.bind after A loaded");
+
+    // Binding count is now 1.
+    let before = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token)
+        .await
+        .expect("bindings before B resumes");
+    assert_eq!(
+        before["count"],
+        json!(1u64),
+        "binding must exist before B resumes"
+    );
+
+    // ── Step 5: release Loader B ──────────────────────────────────────────────
+    // B now enters the final tracker block.
+    // OLD code: B overwrites *state with its stale cold-loaded copy → count=0 → FAIL.
+    // FIXED code: B re-checks is_active("race-ns-det") → true → returns early → count=1 → PASS.
+    proceed_tx.send(()).expect("send proceed to B");
+    b_handle
+        .await
+        .expect("loader B task must not panic")
+        .expect("loader B ensure_loaded must not error");
+
+    // ── Step 6: assert the mutation survived ─────────────────────────────────
+    let after = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token)
+        .await
+        .expect("bindings after B resumes");
+    assert_eq!(
+        after["count"],
+        json!(1u64),
+        "concurrent cold-load race: Loader B must not clobber the binding \
+         created by Loader A (old code would return 0 here)"
+    );
+}
