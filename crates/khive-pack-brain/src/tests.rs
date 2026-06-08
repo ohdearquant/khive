@@ -3241,4 +3241,83 @@ mod brain_005_section_signals {
             .expect("valid section_signals must be accepted");
         assert_eq!(result["emitted"], json!(true));
     }
+
+    // ── New tests for Blocker fix (PR #46 re-review) ──────────────────────────
+
+    #[tokio::test]
+    async fn section_signals_empty_map_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // An empty {} carries no evidence and must not advance posterior state.
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": {}
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("section_signals"),
+                "error must mention section_signals; got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput for empty section_signals, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn section_signals_semantic_signal_value_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // Section fold (ADR-048) only handles useful|not_useful|wrong.
+        // Semantic event kinds belong to the profile-level signal, not section values.
+        for semantic_value in [
+            "explicit_positive",
+            "explicit_negative",
+            "implicit_positive",
+            "implicit_negative",
+            "correction",
+        ] {
+            let err = pack
+                .dispatch(
+                    "brain.feedback",
+                    json!({
+                        "target_id": target,
+                        "signal": "useful",
+                        "section_signals": {"overview": semantic_value}
+                    }),
+                    &registry,
+                    &token,
+                )
+                .await
+                .unwrap_err();
+            if let RuntimeError::InvalidInput(msg) = &err {
+                assert!(
+                    msg.contains(semantic_value),
+                    "error must name the invalid signal {semantic_value:?}; got: {msg}"
+                );
+                assert!(
+                    msg.contains("useful") || msg.contains("not_useful"),
+                    "error must list valid section signals; got: {msg}"
+                );
+            } else {
+                panic!(
+                    "expected InvalidInput for semantic section signal {semantic_value:?}, got {err:?}"
+                );
+            }
+        }
+    }
 }

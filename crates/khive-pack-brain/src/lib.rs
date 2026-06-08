@@ -11,5 +11,56 @@ mod pack;
 pub(crate) use pack::sync_balanced_recall_record;
 pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 
+/// Validate a `section_signals` JSON value before any state mutation.
+///
+/// Enforces the section fold contract (ADR-048): keys must be known `SectionType`
+/// names; values must be `useful`, `not_useful`, or `wrong`; and the map must not
+/// be empty (an empty map carries no evidence and must not advance posterior state).
+///
+/// Used by both `brain.feedback` live handler and replay to ensure a single,
+/// consistent contract.
+pub(crate) fn validate_section_signals(
+    ss: &serde_json::Value,
+) -> Result<(), khive_runtime::RuntimeError> {
+    let obj = ss.as_object().ok_or_else(|| {
+        khive_runtime::RuntimeError::InvalidInput(
+            "section_signals must be a JSON object mapping section names to signal strings".into(),
+        )
+    })?;
+    if obj.is_empty() {
+        return Err(khive_runtime::RuntimeError::InvalidInput(
+            "section_signals must not be empty; omit the field entirely to submit feedback \
+             without section evidence"
+                .into(),
+        ));
+    }
+    // Section fold (ADR-048) only handles useful | not_useful | wrong.
+    // Semantic event kinds (explicit_positive, correction, …) belong to the profile-level
+    // signal and are not valid per-section values.
+    let valid_signals = ["useful", "not_useful", "wrong"];
+    let valid_sections = khive_brain_core::SectionType::NAMES;
+    for (key, val) in obj {
+        if !valid_sections.contains(&key.as_str()) {
+            return Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                "section_signals: unknown section {key:?}; valid: {}",
+                valid_sections.join(", ")
+            )));
+        }
+        let sig = val.as_str().ok_or_else(|| {
+            khive_runtime::RuntimeError::InvalidInput(format!(
+                "section_signals: signal for section {key:?} must be a string"
+            ))
+        })?;
+        if !valid_signals.contains(&sig) {
+            return Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                "section_signals: invalid signal {sig:?} for section {key:?}; \
+                 valid: {}",
+                valid_signals.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

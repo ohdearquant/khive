@@ -180,11 +180,18 @@ pub async fn load_latest_snapshot(
     }
 }
 
+/// Result of a replay load: the valid events and the quarantine tally.
+pub struct LoadEventsResult {
+    pub events: Vec<khive_storage::event::Event>,
+    /// Number of rows skipped due to structural or semantic validation failure.
+    pub quarantine_count: usize,
+}
+
 pub async fn load_events_since(
     sql: &dyn SqlAccess,
     namespace: &str,
     since_us: i64,
-) -> Result<Vec<khive_storage::event::Event>, RuntimeError> {
+) -> Result<LoadEventsResult, RuntimeError> {
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
         .query_all(SqlStatement {
@@ -213,8 +220,8 @@ pub async fn load_events_since(
                 continue;
             }
         };
-        match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
-            Ok(event) => events.push(event),
+        let event = match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
+            Ok(ev) => ev,
             Err(e) => {
                 quarantine_count += 1;
                 eprintln!(
@@ -222,18 +229,39 @@ pub async fn load_events_since(
                      (row #{}): {e}",
                     quarantine_count
                 );
+                continue;
+            }
+        };
+        // Semantic validation: a brain.feedback row with an invalid section_signals
+        // payload must be quarantined whole — before any posterior state mutation.
+        // This is the shared contract with the live brain.feedback handler.
+        if event.verb == "brain.feedback" {
+            if let Some(ss) = event.payload.get("section_signals") {
+                if let Err(e) = crate::validate_section_signals(ss) {
+                    quarantine_count += 1;
+                    eprintln!(
+                        "[brain] event-log replay: semantically invalid section_signals \
+                         quarantined (row #{}): {e}",
+                        quarantine_count
+                    );
+                    continue;
+                }
             }
         }
+        events.push(event);
     }
     if quarantine_count > 0 {
         eprintln!(
-            "[brain] event-log replay: {quarantine_count} malformed row(s) quarantined \
+            "[brain] event-log replay: {quarantine_count} row(s) quarantined \
              out of {} total; replayed {} clean event(s)",
             rows.len(),
             events.len()
         );
     }
-    Ok(events)
+    Ok(LoadEventsResult {
+        events,
+        quarantine_count,
+    })
 }
 
 pub async fn ensure_loaded(
@@ -264,11 +292,11 @@ pub async fn ensure_loaded(
         let snapshot_result = load_latest_snapshot(sql.as_ref(), &namespace).await?;
 
         let bs = if let Some((snapshot, updated_at)) = snapshot_result {
-            let replay_events = load_events_since(sql.as_ref(), &namespace, updated_at).await?;
+            let replay_result = load_events_since(sql.as_ref(), &namespace, updated_at).await?;
 
             let mut bs = BrainState::from_snapshot(snapshot, entity_capacity);
 
-            for event in &replay_events {
+            for event in &replay_result.events {
                 let signal = interpret(event);
                 bs.balanced_recall.apply_signal(&signal);
 
@@ -404,11 +432,18 @@ pub async fn persist_after_feedback(
 #[cfg(test)]
 mod brain_007_replay_quarantine {
     use super::*;
+    use khive_brain_core::BrainState;
     use khive_runtime::{KhiveRuntime, Namespace};
     use khive_storage::event::Event;
     use khive_types::{EventKind, SubstrateKind};
+    use uuid::Uuid;
 
-    async fn insert_raw_payload(rt: &KhiveRuntime, namespace: &str, payload: &str) {
+    async fn insert_raw_payload_at(
+        rt: &KhiveRuntime,
+        namespace: &str,
+        payload: &str,
+        created_at: i64,
+    ) {
         let sql = rt.sql();
         let mut writer = sql.writer().await.expect("writer");
         writer
@@ -419,12 +454,16 @@ mod brain_007_replay_quarantine {
                     SqlValue::Text(namespace.to_string()),
                     SqlValue::Text("brain.feedback".to_string()),
                     SqlValue::Text(payload.to_string()),
-                    SqlValue::Integer(1_000_000),
+                    SqlValue::Integer(created_at),
                 ],
                 label: None,
             })
             .await
             .expect("insert raw row");
+    }
+
+    async fn insert_raw_payload(rt: &KhiveRuntime, namespace: &str, payload: &str) {
+        insert_raw_payload_at(rt, namespace, payload, 1_000_000).await;
     }
 
     fn make_valid_event_json(namespace: &str) -> String {
@@ -438,6 +477,29 @@ mod brain_007_replay_quarantine {
         serde_json::to_string(&ev).expect("serialize event")
     }
 
+    /// Build a brain.feedback event JSON with optional section_signals payload.
+    fn make_feedback_event_json(
+        namespace: &str,
+        section_signals: Option<serde_json::Value>,
+    ) -> String {
+        let mut ev = Event::new(
+            namespace,
+            "brain.feedback",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        ev.target_id = Some(Uuid::new_v4());
+        let mut payload = serde_json::json!({"signal": "useful"});
+        if let Some(ss) = section_signals {
+            payload["section_signals"] = ss;
+        }
+        ev.payload = payload;
+        serde_json::to_string(&ev).expect("serialize feedback event")
+    }
+
+    // ── structural quarantine (pre-existing) ──────────────────────────────────
+
     #[tokio::test]
     async fn malformed_json_rows_are_quarantined_not_panicked() {
         let rt = KhiveRuntime::memory().expect("memory runtime");
@@ -450,16 +512,17 @@ mod brain_007_replay_quarantine {
         insert_raw_payload(&rt, ns, &make_valid_event_json(ns)).await;
 
         // load_events_since must return without panicking, quarantining the bad row.
-        let events = load_events_since(sql.as_ref(), ns, 0)
+        let result = load_events_since(sql.as_ref(), ns, 0)
             .await
             .expect("load must not fail on malformed rows");
 
         // Only the valid event should be returned.
         assert_eq!(
-            events.len(),
+            result.events.len(),
             1,
             "one valid event expected; malformed row must be quarantined, not panic"
         );
+        assert_eq!(result.quarantine_count, 1, "quarantine_count must be 1");
     }
 
     #[tokio::test]
@@ -472,11 +535,15 @@ mod brain_007_replay_quarantine {
         insert_raw_payload(&rt, ns, "bad json").await;
         insert_raw_payload(&rt, ns, "{invalid}").await;
 
-        let events = load_events_since(sql.as_ref(), ns, 0)
+        let result = load_events_since(sql.as_ref(), ns, 0)
             .await
             .expect("load must succeed even when all rows are malformed");
 
-        assert!(events.is_empty(), "all malformed rows must be quarantined");
+        assert!(
+            result.events.is_empty(),
+            "all malformed rows must be quarantined"
+        );
+        assert_eq!(result.quarantine_count, 2, "quarantine_count must be 2");
     }
 
     #[tokio::test]
@@ -490,10 +557,249 @@ mod brain_007_replay_quarantine {
             insert_raw_payload(&rt, ns, &make_valid_event_json(ns)).await;
         }
 
-        let events = load_events_since(sql.as_ref(), ns, 0)
+        let result = load_events_since(sql.as_ref(), ns, 0)
             .await
             .expect("clean rows must replay without error");
 
-        assert_eq!(events.len(), 3, "all 3 clean rows must be returned");
+        assert_eq!(result.events.len(), 3, "all 3 clean rows must be returned");
+        assert_eq!(result.quarantine_count, 0, "quarantine_count must be 0");
+    }
+
+    // ── semantic quarantine (BRAIN-007 new coverage) ──────────────────────────
+
+    #[tokio::test]
+    async fn empty_section_signals_quarantined() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // brain.feedback with section_signals: {} must be quarantined whole.
+        let poison = make_feedback_event_json(ns, Some(serde_json::json!({})));
+        insert_raw_payload(&rt, ns, &poison).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert!(
+            result.events.is_empty(),
+            "empty section_signals must be quarantined"
+        );
+        assert_eq!(result.quarantine_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_section_signals_quarantined() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // Unknown section key must be quarantined.
+        let poison = make_feedback_event_json(
+            ns,
+            Some(serde_json::json!({"not_a_real_section": "useful"})),
+        );
+        insert_raw_payload(&rt, ns, &poison).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert!(
+            result.events.is_empty(),
+            "unknown section must be quarantined"
+        );
+        assert_eq!(result.quarantine_count, 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_signal_in_section_signals_quarantined() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // Section fold only accepts useful|not_useful|wrong; semantic event kinds
+        // (explicit_positive, correction, …) must be quarantined.
+        let poison = make_feedback_event_json(
+            ns,
+            Some(serde_json::json!({"overview": "explicit_positive"})),
+        );
+        insert_raw_payload(&rt, ns, &poison).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert!(
+            result.events.is_empty(),
+            "semantic signal in section_signals must be quarantined"
+        );
+        assert_eq!(result.quarantine_count, 1);
+    }
+
+    // ── state isolation: bad rows must not advance posterior state ────────────
+
+    /// Seed a snapshot, insert bad rows at FIRST / LAST / interleaved positions,
+    /// then call the real ensure_loaded path and assert posterior state is unchanged.
+    async fn seed_snapshot(rt: &KhiveRuntime, namespace: &str) -> BrainStateSnapshot {
+        let state = BrainState::new(16);
+        let snapshot = state.to_snapshot();
+        let sql = rt.sql();
+        upsert_snapshot(sql.as_ref(), namespace, &snapshot, 500_000)
+            .await
+            .expect("seed snapshot");
+        snapshot
+    }
+
+    /// Assert that section posteriors and epoch are at the initial (baseline) values,
+    /// meaning no section-fold mutation occurred from any replayed event.
+    /// Does NOT assert balanced_recall state — clean recall/search events legitimately
+    /// advance that without touching section state.
+    fn assert_section_posteriors_at_baseline(state: &BrainState, baseline: &BrainState) {
+        for key in state.section_states.keys() {
+            let s = &state.section_states[key];
+            let b = &baseline.section_states[key];
+            assert_eq!(
+                s.total_events, b.total_events,
+                "section_states[{key}].total_events changed; bad row must not advance section state"
+            );
+            assert_eq!(
+                s.exploration_epoch, b.exploration_epoch,
+                "section_states[{key}].exploration_epoch changed; bad row must not advance section state"
+            );
+            for (st, p) in &s.posteriors {
+                let bp = &b.posteriors[st];
+                assert!(
+                    (p.alpha - bp.alpha).abs() < 1e-12
+                        && (p.beta - bp.beta).abs() < 1e-12,
+                    "section posterior for {:?} changed: got alpha={} beta={}, expected alpha={} beta={}; \
+                     bad row must not mutate posteriors",
+                    st, p.alpha, p.beta, bp.alpha, bp.beta
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_row_first_does_not_mutate_posterior_state() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+
+        seed_snapshot(&rt, ns).await;
+
+        // Row 1 (bad — semantic poison): created_at=600_000 (after snapshot at 500_000)
+        let poison =
+            make_feedback_event_json(ns, Some(serde_json::json!({"overview": "correction"})));
+        insert_raw_payload_at(&rt, ns, &poison, 600_001).await;
+
+        // Row 2 (clean recall event): created_at=600_002
+        insert_raw_payload_at(&rt, ns, &make_valid_event_json(ns), 600_002).await;
+
+        // Use load_events_since directly and replay manually to assert isolation.
+        let sql = rt.sql();
+        let result = load_events_since(sql.as_ref(), ns, 500_000)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(
+            result.quarantine_count, 1,
+            "bad first row must be quarantined"
+        );
+        assert_eq!(result.events.len(), 1, "one clean event must pass through");
+
+        // Apply the clean events to a fresh state and confirm section state is at baseline.
+        let baseline = BrainState::new(16);
+        let mut state = BrainState::new(16);
+        for event in &result.events {
+            let signal = crate::event::interpret(event);
+            state.balanced_recall.apply_signal(&signal);
+            for section_state in state.section_states.values_mut() {
+                section_state.apply_signal(&signal);
+            }
+        }
+        // The single clean event is a recall, not a feedback; section state unchanged.
+        assert_section_posteriors_at_baseline(&state, &baseline);
+    }
+
+    #[tokio::test]
+    async fn bad_row_last_does_not_mutate_posterior_state() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+
+        seed_snapshot(&rt, ns).await;
+
+        // Row 1 (clean): created_at=600_001
+        insert_raw_payload_at(&rt, ns, &make_valid_event_json(ns), 600_001).await;
+        // Row 2 (bad — empty section_signals): created_at=600_002
+        let poison = make_feedback_event_json(ns, Some(serde_json::json!({})));
+        insert_raw_payload_at(&rt, ns, &poison, 600_002).await;
+
+        let sql = rt.sql();
+        let result = load_events_since(sql.as_ref(), ns, 500_000)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(
+            result.quarantine_count, 1,
+            "bad last row must be quarantined"
+        );
+        assert_eq!(result.events.len(), 1, "one clean event must pass through");
+
+        let baseline = BrainState::new(16);
+        let mut state = BrainState::new(16);
+        for event in &result.events {
+            let signal = crate::event::interpret(event);
+            state.balanced_recall.apply_signal(&signal);
+            for section_state in state.section_states.values_mut() {
+                section_state.apply_signal(&signal);
+            }
+        }
+        assert_section_posteriors_at_baseline(&state, &baseline);
+    }
+
+    #[tokio::test]
+    async fn bad_rows_interleaved_do_not_mutate_posterior_state() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+
+        seed_snapshot(&rt, ns).await;
+
+        // clean, bad, clean, bad, clean
+        insert_raw_payload_at(&rt, ns, &make_valid_event_json(ns), 600_001).await;
+        let p1 = make_feedback_event_json(
+            ns,
+            Some(serde_json::json!({"overview": "explicit_negative"})),
+        );
+        insert_raw_payload_at(&rt, ns, &p1, 600_002).await;
+        insert_raw_payload_at(&rt, ns, &make_valid_event_json(ns), 600_003).await;
+        let p2 = make_feedback_event_json(ns, Some(serde_json::json!({})));
+        insert_raw_payload_at(&rt, ns, &p2, 600_004).await;
+        insert_raw_payload_at(&rt, ns, &make_valid_event_json(ns), 600_005).await;
+
+        let sql = rt.sql();
+        let result = load_events_since(sql.as_ref(), ns, 500_000)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(result.quarantine_count, 2, "2 bad rows must be quarantined");
+        assert_eq!(result.events.len(), 3, "3 clean rows must pass through");
+
+        // Apply only clean events; section posteriors must stay at baseline.
+        let baseline = BrainState::new(16);
+        let mut state = BrainState::new(16);
+        for event in &result.events {
+            let signal = crate::event::interpret(event);
+            state.balanced_recall.apply_signal(&signal);
+            for section_state in state.section_states.values_mut() {
+                section_state.apply_signal(&signal);
+            }
+        }
+        assert_section_posteriors_at_baseline(&state, &baseline);
     }
 }

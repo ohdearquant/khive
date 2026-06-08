@@ -876,47 +876,10 @@ impl BrainPack {
             }
         }
 
-        // Validate section_signals up front: must be an object whose keys are valid
-        // SectionType names and whose values are valid feedback signal strings.
+        // Validate section_signals up front using the shared validator.
         // Malformed input is rejected here rather than silently dropped during replay.
         if let Some(ref ss) = p.section_signals {
-            let obj = ss.as_object().ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "section_signals must be a JSON object mapping section names to signal strings"
-                        .into(),
-                )
-            })?;
-            let valid_signals = [
-                "useful",
-                "not_useful",
-                "wrong",
-                "explicit_positive",
-                "explicit_negative",
-                "implicit_positive",
-                "implicit_negative",
-                "correction",
-            ];
-            let valid_sections = khive_brain_core::SectionType::NAMES;
-            for (key, val) in obj {
-                if !valid_sections.contains(&key.as_str()) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "section_signals: unknown section {key:?}; valid: {}",
-                        valid_sections.join(", ")
-                    )));
-                }
-                let sig = val.as_str().ok_or_else(|| {
-                    RuntimeError::InvalidInput(format!(
-                        "section_signals: signal for section {key:?} must be a string"
-                    ))
-                })?;
-                if !valid_signals.contains(&sig) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "section_signals: unknown signal {sig:?} for section {key:?}; \
-                         valid: {}",
-                        valid_signals.join(" | ")
-                    )));
-                }
-            }
+            crate::validate_section_signals(ss)?;
         }
 
         let mut data = json!({"signal": signal});
