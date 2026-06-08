@@ -33,7 +33,9 @@ docs-check:
 	deno fmt --check docs/
 
 check-fwd:
-	cargo check --manifest-path crates/khive-merge/Cargo.toml
+	RUSTFLAGS="-D warnings" cargo check --manifest-path crates/khive-merge/Cargo.toml --all-targets
+	cargo clippy --manifest-path crates/khive-merge/Cargo.toml --all-targets -- -D warnings
+	cargo test --manifest-path crates/khive-merge/Cargo.toml
 
 ci:
 	./scripts/ci.sh
