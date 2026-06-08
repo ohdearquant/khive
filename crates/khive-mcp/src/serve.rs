@@ -58,6 +58,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         } else {
             Some(args.pack.clone())
         },
+        brain_profile: args.brain_profile.clone(),
     })?;
 
     let runtime = KhiveRuntime::new(config)?;
@@ -81,6 +82,11 @@ pub struct RuntimeConfigInputs<'a> {
     pub no_embed: bool,
     /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
     pub packs: Option<Vec<String>>,
+    /// Explicit brain profile ID (highest-priority tier).
+    ///
+    /// `None` lets lower tiers (env var, config file, runtime fallback) handle
+    /// resolution. Pass `Some(id)` only when the caller holds an explicit CLI value.
+    pub brain_profile: Option<String>,
 }
 
 /// Resolve a [`RuntimeConfig`] from serve-time inputs, applying the SAME
@@ -104,10 +110,16 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         .packs
         .unwrap_or_else(|| RuntimeConfig::default().packs);
 
+    // CLI/env brain_profile (tier 1) wins over env-var default already in
+    // RuntimeConfig::default(). Provide it explicitly so the config-file tier
+    // cannot accidentally overwrite a value the user set via --brain-profile.
+    let cli_brain_profile = inputs.brain_profile.filter(|s| !s.trim().is_empty());
+
     let base_config = RuntimeConfig {
         db_path,
         default_namespace: inputs.namespace,
         packs,
+        brain_profile: cli_brain_profile.or_else(|| RuntimeConfig::default().brain_profile),
         ..RuntimeConfig::default()
     };
 
@@ -249,6 +261,7 @@ default = true
             namespace_explicit: false,
             no_embed: false,
             packs: None,
+            brain_profile: None,
         })
         .expect("resolve config");
 

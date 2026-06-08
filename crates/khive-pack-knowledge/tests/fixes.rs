@@ -1351,6 +1351,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
         gate: Arc::new(AllowAllGate),
         packs: vec!["kg".to_string(), "knowledge".to_string()],
         backend_id: BackendId::main(),
+        brain_profile: None,
     })
     .expect("runtime with default embedder")
 }
@@ -1742,6 +1743,7 @@ mod embed_failure_tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string(), "knowledge".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         })
         .expect("runtime");
         // Override the lattice provider with our fake — same key, last-writer wins.

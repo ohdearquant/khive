@@ -348,6 +348,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         namespace_explicit: explicit,
         no_embed: false,
         packs: None,
+        brain_profile: None,
     })?;
 
     // Capture the resolved namespace BEFORE `new` consumes cfg — when
@@ -1012,6 +1013,7 @@ mod tests {
             namespace_explicit: false,
             no_embed: false,
             packs: None,
+            brain_profile: None,
         })
         .expect("resolve config");
         assert_eq!(
@@ -1028,6 +1030,7 @@ mod tests {
             namespace_explicit: true,
             no_embed: false,
             packs: None,
+            brain_profile: None,
         })
         .expect("resolve config explicit");
         assert_eq!(

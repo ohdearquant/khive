@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_brain_core::{FeedbackSignal, SectionType};
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::EdgeRelation;
 
 use crate::knowledge::section_feedback::on_section_feedback;
@@ -309,7 +309,22 @@ impl KnowledgePack {
     }
 
     /// Apply per-section feedback signals to the pack's section posterior state.
-    pub(crate) async fn handle_feedback(&self, params: Value) -> Result<Value, RuntimeError> {
+    ///
+    /// 3-tier profile resolution (ADR-035):
+    /// 1. Explicit brain profile in config → also forward to `brain.feedback` (when target_id supplied)
+    /// 2. Namespace-bound profile via `brain.resolve` → also forward to `brain.feedback` (when target_id supplied)
+    /// 3. Global section_posteriors → update in-memory state directly (always applied)
+    pub(crate) async fn handle_feedback(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        let target_id_str = params
+            .get("target_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
         let raw = params
             .get("section_signals")
             .and_then(|v| v.as_object())
@@ -340,16 +355,67 @@ impl KnowledgePack {
             signals.push((section_type, signal));
         }
 
-        let mut state = self
-            .section_posteriors
-            .lock()
-            .map_err(|_| RuntimeError::Internal("section_posteriors lock poisoned".to_string()))?;
-        on_section_feedback(&mut state, &signals);
+        // Tier 3 (always): update the pack-local section_posteriors.
+        let total_events = {
+            let mut state = self.section_posteriors.lock().map_err(|_| {
+                RuntimeError::Internal("section_posteriors lock poisoned".to_string())
+            })?;
+            on_section_feedback(&mut state, &signals);
+            state.total_events
+        };
 
-        Ok(json!({
+        // Tiers 1 & 2: if a target_id is available, also forward to brain.feedback.
+        // This keeps the brain profile's section_states in sync with the global prior.
+        let mut brain_profile_used: Option<String> = None;
+        if let Some(ref tid) = target_id_str {
+            let ns = token.namespace().as_str().to_string();
+
+            // Tier 1: explicit profile from config.
+            let effective_profile = if let Some(ref p) = self.brain_profile {
+                Some(p.clone())
+            } else {
+                // Tier 2: namespace-bound profile via brain.resolve.
+                let resolve_params = json!({
+                    "namespace": ns,
+                    "consumer_kind": "knowledge.search",
+                });
+                match registry.dispatch("brain.resolve", resolve_params).await {
+                    Ok(v) => v
+                        .get("resolved_profile_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned),
+                    Err(_) => None,
+                }
+            };
+
+            if let Some(ref profile_id) = effective_profile {
+                let section_signals_val =
+                    params.get("section_signals").cloned().unwrap_or_default();
+                let brain_params = json!({
+                    "namespace": ns,
+                    "target_id": tid,
+                    "signal": "useful",
+                    "served_by_profile_id": profile_id,
+                    "section_signals": section_signals_val,
+                });
+                if registry
+                    .dispatch("brain.feedback", brain_params)
+                    .await
+                    .is_ok()
+                {
+                    brain_profile_used = effective_profile;
+                }
+            }
+        }
+
+        let mut resp = json!({
             "ok": true,
-            "total_events": state.total_events,
+            "total_events": total_events,
             "signals_applied": signals.len(),
-        }))
+        });
+        if let Some(ref p) = brain_profile_used {
+            resp["brain_profile"] = json!(p);
+        }
+        Ok(resp)
     }
 }

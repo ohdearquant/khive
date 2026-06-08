@@ -486,11 +486,19 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         description: "Apply per-section feedback signals to update section posterior weights",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[ParamDef {
-            name: "section_signals",
-            param_type: "object",
-            required: true,
-            description: "Map of section_type → signal string: {\"overview\": \"useful\", \"formalism\": \"not_useful\"}. Valid signals: useful | not_useful | wrong",
-        }],
+        params: &[
+            ParamDef {
+                name: "section_signals",
+                param_type: "object",
+                required: true,
+                description: "Map of section_type → signal string: {\"overview\": \"useful\", \"formalism\": \"not_useful\"}. Valid signals: useful | not_useful | wrong",
+            },
+            ParamDef {
+                name: "target_id",
+                param_type: "string",
+                required: false,
+                description: "Optional UUID of the atom or entity being rated. When provided alongside a configured brain profile, feedback is also forwarded to brain.feedback for profile-scoped section tracking.",
+            },
+        ],
     },
 ];

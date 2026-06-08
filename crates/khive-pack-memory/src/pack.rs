@@ -31,6 +31,12 @@ pub struct MemoryPack {
     ///
     /// Persistence is deferred — state is rebuilt from actions on restart.
     pub(crate) recall_state: Mutex<BalancedRecallState>,
+    /// Explicit brain profile ID from config (ADR-035 §Brain profile configuration).
+    ///
+    /// Tier-1 of the 3-tier feedback resolution: when set, `memory.feedback` directs
+    /// feedback to this profile via `brain.feedback`. When absent, tier-2
+    /// (namespace-bound profile) and tier-3 (global prior) are tried in order.
+    pub(crate) brain_profile: Option<String>,
 }
 
 impl MemoryPack {
@@ -43,12 +49,14 @@ impl MemoryPack {
 
     /// Create a new `MemoryPack` backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
             ann: new_shared(),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
             recall_state: Mutex::new(BalancedRecallState::new(10_000)),
+            brain_profile,
         }
     }
 
@@ -333,7 +341,7 @@ impl PackRuntime for MemoryPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "memory.remember" => self.handle_remember(token, params).await,
-            "memory.feedback" => self.handle_feedback(params).await,
+            "memory.feedback" => self.handle_feedback(token, params, registry).await,
             "memory.recall" => self.handle_recall(token, params, registry).await,
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
