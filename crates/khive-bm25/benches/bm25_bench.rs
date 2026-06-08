@@ -499,14 +499,18 @@ fn bench_remove_document(c: &mut Criterion) {
     let mut group: BenchmarkGroup<WallTime> = c.benchmark_group("remove_document");
     group.sample_size(50);
 
-    // Setup: build the 1K index outside the measured path so only the
-    // 100 remove_document calls are timed, not index construction.
+    // Setup: build the 1K index and pre-compute the 100 doc IDs outside the
+    // measured path so only the remove_document calls are timed.
     group.bench_function("1k_corpus", |b| {
         b.iter_batched(
-            || build_index(1_000, 200),
-            |mut idx| {
-                for i in 0..100 {
-                    black_box(idx.remove_document(black_box(&format!("doc{i}"))));
+            || {
+                let idx = build_index(1_000, 200);
+                let doc_ids: Vec<String> = (0..100).map(|i| format!("doc{i}")).collect();
+                (idx, doc_ids)
+            },
+            |(mut idx, doc_ids)| {
+                for id in &doc_ids {
+                    black_box(idx.remove_document(black_box(id.as_str())));
                 }
                 black_box(idx)
             },

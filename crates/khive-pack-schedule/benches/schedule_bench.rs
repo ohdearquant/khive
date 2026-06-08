@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use serde_json::json;
 
 use khive_pack_kg::KgPack;
@@ -141,34 +141,40 @@ fn bench_agenda(c: &mut Criterion) {
 // ── cancel ────────────────────────────────────────────────────────────────────
 
 fn bench_cancel(c: &mut Criterion) {
-    let fixture = build_fixture();
     let mut group = c.benchmark_group("schedule");
     group.sample_size(50);
-    let counter = std::sync::atomic::AtomicU64::new(0);
 
+    // Each iteration gets a fresh fixture and a pre-created event ID in setup;
+    // only schedule.cancel is timed.  No shared state accumulates across iters.
     group.bench_function("cancel", |b| {
-        b.to_async(&fixture.rt).iter(|| {
-            let registry = &fixture.registry;
-            let i = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            async move {
-                let year = 2100 + (i / 12);
-                let month = (i % 12) + 1;
-                let at = format!("{year}-{month:02}-01T00:00:00Z");
-                let created = registry
-                    .dispatch(
-                        "schedule.remind",
-                        json!({ "content": format!("c-{i}"), "at": at }),
-                    )
-                    .await
-                    .expect("remind");
-                let full_id = created["full_id"].as_str().expect("full_id");
-                let result = registry
-                    .dispatch("schedule.cancel", black_box(json!({ "id": full_id })))
-                    .await
-                    .expect("cancel ok");
-                black_box(result)
-            }
-        });
+        b.iter_batched(
+            || {
+                let fixture = build_fixture();
+                let full_id = fixture.rt.block_on(async {
+                    let created = fixture
+                        .registry
+                        .dispatch(
+                            "schedule.remind",
+                            json!({ "content": "cancel-target", "at": "2199-03-01T00:00:00Z" }),
+                        )
+                        .await
+                        .expect("setup remind");
+                    created["full_id"].as_str().expect("full_id").to_owned()
+                });
+                (fixture, full_id)
+            },
+            |(fixture, full_id)| {
+                fixture.rt.block_on(async {
+                    let result = fixture
+                        .registry
+                        .dispatch("schedule.cancel", black_box(json!({ "id": full_id })))
+                        .await
+                        .expect("cancel ok");
+                    black_box(result)
+                })
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
