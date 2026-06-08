@@ -124,7 +124,7 @@ impl RegoGate {
                 "entrypoint must begin with 'data.' (got: {trimmed:?})"
             )));
         }
-        Ok(self.with_entrypoint(ep))
+        Ok(self.with_entrypoint(trimmed))
     }
 }
 

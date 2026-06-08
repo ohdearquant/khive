@@ -306,6 +306,28 @@ fn deserialize_rejects_empty_deny_reason() {
     assert!(err.to_string().contains("deny reason must not be empty"));
 }
 
+// ---- GATE-006: Obligation::Audit rejects empty tag ----
+
+#[test]
+fn deserialize_rejects_empty_audit_tag() {
+    let json = r#"{"kind":"audit","tag":""}"#;
+    let err = serde_json::from_str::<Obligation>(json).unwrap_err();
+    assert!(
+        err.to_string().contains("audit tag must not be empty"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
+fn deserialize_accepts_nonempty_audit_tag() {
+    let json = r#"{"kind":"audit","tag":"verb.search"}"#;
+    let obligation = serde_json::from_str::<Obligation>(json).unwrap();
+    match obligation {
+        Obligation::Audit { tag } => assert_eq!(tag, "verb.search"),
+        other => panic!("expected Audit, got {other:?}"),
+    }
+}
+
 #[test]
 fn deserialize_rejects_zero_rate_limit_window() {
     let json = r#"{"kind":"rate_limit","window_secs":0,"max":10}"#;

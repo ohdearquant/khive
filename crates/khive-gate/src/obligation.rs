@@ -46,7 +46,12 @@ impl TryFrom<RawObligation> for Obligation {
 
     fn try_from(raw: RawObligation) -> Result<Self, Self::Error> {
         match raw {
-            RawObligation::Audit { tag } => Ok(Obligation::Audit { tag }),
+            RawObligation::Audit { tag } => {
+                if tag.is_empty() {
+                    return Err(GateValidationError::EmptyAuditTag);
+                }
+                Ok(Obligation::Audit { tag })
+            }
             RawObligation::RateLimit { window_secs, max } => {
                 Obligation::try_rate_limit(window_secs, max)
             }

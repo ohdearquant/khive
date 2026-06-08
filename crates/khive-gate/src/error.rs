@@ -16,6 +16,8 @@ pub enum GateValidationError {
     EmptyVerb,
     #[error("deny reason must not be empty")]
     EmptyDenyReason,
+    #[error("audit tag must not be empty")]
+    EmptyAuditTag,
     #[error("rate limit window_secs must be > 0")]
     ZeroRateLimitWindow,
     #[error("rate limit max must be > 0")]

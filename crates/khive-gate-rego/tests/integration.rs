@@ -175,6 +175,80 @@ fn default_entrypoint_constant_matches_doc() {
     assert_eq!(DEFAULT_ENTRYPOINT, "data.khive.gate.decision");
 }
 
+// ---- GATE-REGO-001: entrypoint trim/validation ----
+
+#[test]
+fn try_with_entrypoint_rejects_empty() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("").unwrap_err();
+    assert!(
+        format!("{err}").contains("empty or whitespace"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_rejects_whitespace_only() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("   ").unwrap_err();
+    assert!(
+        format!("{err}").contains("empty or whitespace"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_trims_whitespace_and_works() {
+    // The entrypoint has surrounding whitespace. After trim it must resolve
+    // to a valid data. path and the gate must evaluate correctly.
+    let policy = r#"
+        package khive.custom
+        import rego.v1
+        default verdict := {"decision": "deny", "reason": "custom default"}
+        verdict := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .try_with_entrypoint("  data.khive.custom.verdict  ")
+        .expect("padded but valid entrypoint must be accepted");
+    // Debug output must show the trimmed form, not the padded original.
+    assert!(
+        format!("{gate:?}").contains("data.khive.custom.verdict"),
+        "Debug output did not contain trimmed entrypoint: {:?}",
+        gate
+    );
+    // And the gate must resolve correctly.
+    assert!(gate.check(&request("search")).unwrap().is_allow());
+    assert!(matches!(
+        gate.check(&request("delete")).unwrap(),
+        GateDecision::Deny { .. }
+    ));
+}
+
+#[test]
+fn try_with_entrypoint_rejects_missing_data_prefix() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("khive.gate.decision").unwrap_err();
+    assert!(format!("{err}").contains("data."), "wrong error: {err}");
+}
+
 // ---------- helpers ----------
 
 struct TempDir {
