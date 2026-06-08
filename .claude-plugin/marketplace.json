@@ -1,0 +1,45 @@
+{
+  "name": "khive",
+  "description": "Knowledge graph runtime, structured memory, and agent coordination tools.",
+  "owner": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "plugins": [
+    {
+      "name": "kg",
+      "source": "./marketplace/kg",
+      "description": "Persistent knowledge graph — typed entities, closed edge ontology, hybrid search, GQL/SPARQL queries"
+    },
+    {
+      "name": "gtd",
+      "source": "./marketplace/gtd",
+      "description": "GTD-style task lifecycle (assign/next/complete/transition) over the notes substrate"
+    },
+    {
+      "name": "memory",
+      "source": "./marketplace/memory",
+      "description": "Persistent agent memory with decay-weighted recall (remember/recall verbs)"
+    },
+    {
+      "name": "knowledge",
+      "source": "./marketplace/knowledge",
+      "description": "Structured knowledge atoms and domains — suggest, compose, search, fold, section-level hybrid scoring"
+    },
+    {
+      "name": "brain",
+      "source": "./marketplace/brain",
+      "description": "Bayesian adaptive profiles — posteriors over section types, feedback signals, profile lifecycle"
+    },
+    {
+      "name": "comm",
+      "source": "./marketplace/comm",
+      "description": "Inter-agent messaging — send, inbox, reply, threaded conversations with read tracking"
+    },
+    {
+      "name": "schedule",
+      "source": "./marketplace/schedule",
+      "description": "Time-based scheduling — reminders, future verb dispatch, recurring events"
+    }
+  ]
+}
