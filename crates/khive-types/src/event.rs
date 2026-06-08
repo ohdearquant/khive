@@ -494,7 +494,7 @@ mod serde_opt_opt {
     }
 }
 
-/// The set of KG mutations a proposal intends to apply atomically.
+/// The set of KG mutations a proposal intends to apply as a proposal changeset.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

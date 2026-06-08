@@ -16,7 +16,8 @@ pub enum BrainSignal {
     RecallHit { target_id: Uuid, latency_us: i64 },
     /// A recall query returned no results for the given criteria.
     RecallMiss,
-    /// A hybrid search operation completed; used to update latency priors.
+    /// A hybrid search operation completed; latency is recorded but does not
+    /// currently update any brain posterior (only `RecallHit`/`RecallMiss` do).
     SearchCompleted { latency_us: i64 },
     /// An explicit feedback signal from the caller for a specific record.
     Feedback {

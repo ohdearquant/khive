@@ -5,7 +5,7 @@
 //! first use, and maps responses to MCP error types. Every failure path falls
 //! back to `None` so the caller can dispatch locally.
 //!
-//! Also provides the [`DaemonDispatch`] impl for [`KhiveMcpServer`].
+//! Also provides the [`khive_runtime::daemon::DaemonDispatch`] impl for [`crate::server::KhiveMcpServer`].
 
 use std::process::Stdio;
 

@@ -63,7 +63,7 @@ pub struct RetrievalPersistence {
     /// SQLite connection (thread-safe via async mutex).
     pub(crate) conn: Arc<Mutex<Connection>>,
     /// Namespace for multi-tenancy.
-    /// Uses Arc<str> for O(1) cloning in async spawn contexts.
+    /// Uses `Arc<str>` for O(1) cloning in async spawn contexts.
     pub(crate) namespace: Arc<str>,
 }
 

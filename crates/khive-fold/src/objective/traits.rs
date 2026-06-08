@@ -317,7 +317,7 @@ where
     ) -> Vec<Selection<&'a T>>;
 }
 
-/// Blanket implementation of DeterministicObjective for any Objective<T> where T: HasId.
+/// Blanket implementation of `DeterministicObjective` for any `Objective<T>` where `T: HasId`.
 impl<O, T> DeterministicObjective<T> for O
 where
     O: Objective<T>,

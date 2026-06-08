@@ -160,7 +160,7 @@ impl KhiveRuntime {
 
     /// Return the [`BackendId`] for this runtime's backend.
     ///
-    /// Used by the [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator)
+    /// Used by `SubstrateCoordinator` in `kkernel`
     /// to identify which backend owns a given node, and to detect cross-backend merges.
     pub fn backend_id(&self) -> &BackendId {
         &self.config.backend_id
@@ -301,7 +301,7 @@ impl KhiveRuntime {
 
     /// Mint an authorization token for the given namespace.
     ///
-    /// Consults the configured [`Gate`] before minting. With the default
+    /// Consults the configured [`crate::Gate`] before minting. With the default
     /// `AllowAllGate` this always succeeds. When a real policy-backed gate is
     /// installed, this method enforces it and returns `PermissionDenied` on
     /// denial.
@@ -506,9 +506,9 @@ impl KhiveRuntime {
     /// The provider is added to the shared [`EmbedderRegistry`] so all clones
     /// of this runtime see the new provider immediately. If a provider with the
     /// same name already exists it is replaced (last-writer wins — see
-    /// [`EmbedderRegistry::register`] for the rationale).
+    /// [`crate::EmbedderRegistry::register`] for the rationale).
     ///
-    /// Packs should call this from [`PackRuntime::register_embedders`] (the
+    /// Packs should call this from [`crate::PackRuntime::register_embedders`] (the
     /// hook is invoked by the transport during pack initialisation, before the
     /// first verb dispatch).
     ///
