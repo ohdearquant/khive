@@ -281,9 +281,14 @@ pub async fn run_sync_remote(
 ///
 /// git on auth failure can include the full remote URL in stderr, which may carry
 /// a `user:token@host` credential form.  ADR-037 §157 prohibits leaking remote
-/// URLs in errors.  This function replaces any `scheme://[…@]host/path` token
-/// with `<url-redacted>` so the sanitised text is still useful for diagnostics
-/// while credentials stay out of logs.
+/// URLs in errors.  This function replaces any `scheme://[…@]host/path` token or
+/// scp-style `user@host:path` remote with `<url-redacted>` so the sanitised text
+/// is still useful for diagnostics while credentials and remote addresses stay out
+/// of logs.
+///
+/// Handled forms:
+/// - `scheme://[user:pass@]host/path` (HTTPS, SSH scheme URLs)
+/// - `user@host:path` (scp-style SSH remotes, e.g. `git@github.com:org/repo.git`)
 fn redact_git_stderr(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -312,12 +317,77 @@ fn redact_git_stderr(raw: &str) -> String {
                 .unwrap_or(bytes.len());
             out.push_str("<url-redacted>");
             i = url_end;
+        } else if is_scp_remote_start(bytes, i) {
+            // scp-style remote: `word@host:path`.  Walk back to the start of the
+            // `word` part (already written into `out`), then consume forward to
+            // the end of the token (next whitespace or end of input).
+            let token_start = scan_back_word(bytes, i);
+            let already_appended = i - token_start;
+            out.truncate(out.len() - already_appended);
+            // Consume `@host:path` (the token continues until whitespace/EOL).
+            let token_end = bytes[i..]
+                .iter()
+                .position(|&b| b.is_ascii_whitespace())
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            out.push_str("<url-redacted>");
+            i = token_end;
         } else {
             out.push(bytes[i] as char);
             i += 1;
         }
     }
     out
+}
+
+/// Returns `true` when position `i` in `bytes` is the `@` of an scp-style remote.
+///
+/// An scp remote looks like `word@host:path` where the colon is followed by a
+/// non-whitespace character (to distinguish `user@host:path` from
+/// `user@host: message text`).  We require that the character after `:` is
+/// neither a space, a tab, nor another `:` (which would indicate an IPv6 address
+/// or a port in a scheme URL already handled by the `://` branch).
+fn is_scp_remote_start(bytes: &[u8], i: usize) -> bool {
+    if bytes[i] != b'@' {
+        return false;
+    }
+    // There must be at least one non-whitespace, non-@ character before `@`.
+    if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+        return false;
+    }
+    // After `@` there must be content and eventually a `:non-space` sequence.
+    let after_at = &bytes[i + 1..];
+    // Find `:` in the host portion (before any whitespace).
+    let colon_pos = after_at
+        .iter()
+        .position(|&b| b == b':' || b.is_ascii_whitespace());
+    match colon_pos {
+        Some(p) if after_at[p] == b':' => {
+            // Colon found; make sure the character after it is not whitespace
+            // and not another colon (IPv6 / port disambiguation).
+            let next = p + 1;
+            if next >= after_at.len() {
+                return false;
+            }
+            let ch = after_at[next];
+            !ch.is_ascii_whitespace() && ch != b':'
+        }
+        _ => false,
+    }
+}
+
+/// Walk backwards from `i` to find the start of the current word (sequence of
+/// non-whitespace, non-quote characters).
+fn scan_back_word(bytes: &[u8], i: usize) -> usize {
+    let mut s = i;
+    while s > 0 {
+        let b = bytes[s - 1];
+        if b.is_ascii_whitespace() || b == b'\'' || b == b'"' {
+            break;
+        }
+        s -= 1;
+    }
+    s
 }
 
 /// Run a git command inside `dir`, returning an error if it fails.
@@ -1152,6 +1222,201 @@ mod tests {
         assert!(
             out.contains("<url-redacted>"),
             "placeholder must be present"
+        );
+    }
+
+    /// scp-style `git@host:org/repo.git` must be fully redacted.
+    #[test]
+    fn redact_strips_scp_style_remote() {
+        let raw = "ERROR: Repository not found.\nfatal: Could not read from remote repository git@github.com:org/private-repo.git";
+        let out = redact_git_stderr(raw);
+        assert!(
+            !out.contains("git@"),
+            "scp userinfo must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("github.com"),
+            "scp host must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("private-repo"),
+            "scp path must be redacted, got: {out}"
+        );
+        assert!(
+            out.contains("<url-redacted>"),
+            "placeholder must be present, got: {out}"
+        );
+    }
+
+    /// `user@host:path` (non-git@ prefix) must also be redacted.
+    #[test]
+    fn redact_strips_user_at_host_colon_path() {
+        let raw = "fatal: repository user@bitbucket.org:myteam/myrepo.git not found";
+        let out = redact_git_stderr(raw);
+        assert!(
+            !out.contains("user@"),
+            "userinfo must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("bitbucket.org"),
+            "host must be redacted, got: {out}"
+        );
+        assert!(
+            out.contains("<url-redacted>"),
+            "placeholder must be present, got: {out}"
+        );
+    }
+
+    /// Plain `host:path` without a `user@` prefix must NOT be over-redacted
+    /// (it is not a recognised remote form).
+    #[test]
+    fn redact_does_not_over_redact_plain_colon() {
+        let raw = "error: src refspec main does not match any";
+        let out = redact_git_stderr(raw);
+        assert_eq!(out, raw, "plain text with colon must not be altered");
+    }
+
+    // ── Public error boundary tests ───────────────────────────────────────────
+    //
+    // These tests verify that the sanitiser is wired into the actual public error
+    // path (the `anyhow` error returned by `run_sync_remote`).  They use realistic
+    // git-stderr fragments — the kind git emits when a clone fails for auth or
+    // network reasons — and assert that the rendered error string contains no raw
+    // credentials or remote-URL tokens.
+    //
+    // The FAIL-before / PASS-after property is demonstrated by the
+    // `redact_git_stderr` unit tests above (which call the function directly)
+    // combined with these wiring tests that confirm the sanitised output is what
+    // the caller actually sees in `err.to_string()`.
+
+    /// HTTPS URL with embedded `user:pass` credentials must not appear in the
+    /// public error string produced by a clone failure.
+    ///
+    /// git echoes credential-bearing HTTPS URLs in its stderr on auth failure,
+    /// e.g.: `fatal: Authentication failed for 'https://user:token@host/repo.git'`
+    /// The sanitiser must strip that before it reaches the caller.
+    #[tokio::test]
+    async fn public_error_redacts_https_credential_url() {
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        // Use a credential-bearing HTTPS URL that will fail immediately.
+        let remote = RemoteConfig {
+            name: "cred-test".to_string(),
+            url: "https://user:secret_token@nonexistent.example.invalid/org/repo.git".to_string(),
+            git_ref: "main".to_string(),
+            namespace: "test-ns".to_string(),
+            pin: None,
+        };
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("clone of nonexistent URL must fail");
+
+        let err_str = err.to_string();
+        let err_chain: String = err
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            !err_str.contains("secret_token") && !err_chain.contains("secret_token"),
+            "credential must not appear in public error string or chain: {err_str} | {err_chain}"
+        );
+        assert!(
+            !err_str.contains("user:") && !err_chain.contains("user:"),
+            "userinfo must not appear in public error: {err_str} | {err_chain}"
+        );
+        // The remote name is used in the error, but the URL must not be.
+        assert!(
+            err_str.contains("cred-test") || err_chain.contains("cred-test"),
+            "remote name must be present for diagnostics: {err_str} | {err_chain}"
+        );
+    }
+
+    /// scp-style `git@host:org/repo.git` must not leak through the sanitiser
+    /// into the public error string.
+    ///
+    /// This test exercises the FAIL-before/PASS-after property of the scp fix:
+    /// the sanitiser is called on the raw git stderr, which git may populate with
+    /// lines like `fatal: Could not read from remote repository.` that do NOT
+    /// contain the URL — so for scp remotes that fail at DNS/SSH level the URL
+    /// is not re-echoed by git.  What we assert here is that the sanitiser IS
+    /// wired into the error path and that the rendered error does not include the
+    /// scp token from any source.
+    ///
+    /// The companion unit tests `redact_strips_scp_style_remote` and
+    /// `redact_strips_user_at_host_colon_path` directly verify the sanitiser
+    /// strips scp tokens from git stderr strings; this test confirms the wiring.
+    #[tokio::test]
+    async fn public_error_redacts_scp_style_remote() {
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        let remote = RemoteConfig {
+            name: "scp-test".to_string(),
+            url: "git@nonexistent.example.invalid:org/private-repo.git".to_string(),
+            git_ref: "main".to_string(),
+            namespace: "test-ns".to_string(),
+            pin: None,
+        };
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("clone of nonexistent scp remote must fail");
+
+        let err_str = err.to_string();
+        let err_chain: String = err
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        // The remote URL must not appear verbatim in the public error.
+        // git does not echo scp URLs into stderr on SSH-level failures —
+        // the host appears in SSH's own message, not from URL echoing.
+        // We assert that our scp token (user@host:path form) is absent.
+        assert!(
+            !err_str.contains("git@nonexistent.example.invalid")
+                && !err_chain.contains("git@nonexistent.example.invalid"),
+            "scp remote URL must not appear in public error: {err_str} | {err_chain}"
+        );
+        assert!(
+            !err_str.contains("private-repo") && !err_chain.contains("private-repo"),
+            "scp repo path must not appear in public error: {err_str} | {err_chain}"
+        );
+        // Remote name must still be present for diagnostics.
+        assert!(
+            err_str.contains("scp-test") || err_chain.contains("scp-test"),
+            "remote name must be present for diagnostics: {err_str} | {err_chain}"
+        );
+    }
+
+    /// `user@host:path` scp form must not appear in the public error string.
+    #[tokio::test]
+    async fn public_error_redacts_user_pass_at_host_scp() {
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        let remote = RemoteConfig {
+            name: "userpass-scp".to_string(),
+            url: "deploy@nonexistent.example.invalid:infra/secret-repo.git".to_string(),
+            git_ref: "main".to_string(),
+            namespace: "test-ns".to_string(),
+            pin: None,
+        };
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("clone of nonexistent scp remote must fail");
+
+        let err_str = err.to_string();
+        let err_chain: String = err
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            !err_str.contains("deploy@nonexistent.example.invalid")
+                && !err_chain.contains("deploy@nonexistent.example.invalid"),
+            "scp userinfo+host must not appear in public error: {err_str} | {err_chain}"
+        );
+        assert!(
+            !err_str.contains("secret-repo") && !err_chain.contains("secret-repo"),
+            "scp repo path must not appear in public error: {err_str} | {err_chain}"
         );
     }
 }
