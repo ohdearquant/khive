@@ -49,6 +49,11 @@ impl TryFrom<VamanaIndexSnapshotRaw> for VamanaIndexSnapshot {
     type Error = VamanaError;
 
     fn try_from(raw: VamanaIndexSnapshotRaw) -> std::result::Result<Self, VamanaError> {
+        if raw.num_vectors == 0 {
+            return Err(VamanaError::invalid_format(
+                "VamanaIndexSnapshot: num_vectors must be > 0".into(),
+            ));
+        }
         if !raw.alpha.is_finite() || raw.alpha < 1.0 {
             return Err(VamanaError::invalid_format(format!(
                 "VamanaIndexSnapshot: alpha must be finite and >= 1.0, got {}",
@@ -107,7 +112,7 @@ impl TryFrom<VamanaIndexSnapshotRaw> for VamanaIndexSnapshot {
                 ));
             }
         }
-        if num_vectors > 0 && raw.medoid as usize >= num_vectors {
+        if raw.medoid as usize >= num_vectors {
             return Err(VamanaError::invalid_format(format!(
                 "VamanaIndexSnapshot: medoid ({}) >= num_vectors ({num_vectors})",
                 raw.medoid
@@ -1511,6 +1516,24 @@ mod tests {
             "from_snapshot must reject duplicate neighbors"
         );
     }
+    #[test]
+    fn try_from_rejects_empty_snapshot() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 0,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![],
+            vectors: vec![],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject num_vectors = 0"
+        );
+    }
+
     #[test]
     fn try_from_rejects_medoid_out_of_range() {
         let raw = VamanaIndexSnapshotRaw {
