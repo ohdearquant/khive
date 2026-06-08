@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use khive_pack_brain::tunable::PackTunable;
+use khive_brain_core::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
 use khive_runtime::{

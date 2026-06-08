@@ -7,6 +7,7 @@ pub mod profile;
 pub mod section_state;
 pub mod section_type;
 pub mod signal;
+pub mod tunable;
 
 pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal};
 pub use brain_state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
@@ -21,3 +22,4 @@ pub use section_state::{
 };
 pub use section_type::SectionType;
 pub use signal::{FeedbackEventKind, FeedbackSignal};
+pub use tunable::{PackTunable, ParameterDef, ParameterSpace};
