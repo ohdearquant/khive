@@ -179,6 +179,13 @@ impl KnowledgeHandlers {
                     "domain name must not be empty".into(),
                 ));
             }
+            // Domain mirror atoms are written to knowledge_atoms with the description
+            // as content. Enforce the same 20-word minimum that normal atoms must satisfy
+            // so the FTS and embedding surfaces receive adequate content.
+            let mirror_content = domain_in.description.as_deref().unwrap_or("").trim();
+            validate_atom_content(mirror_content).map_err(|e| {
+                RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
+            })?;
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
             if !tags.iter().any(|t| t == "type:domain") {

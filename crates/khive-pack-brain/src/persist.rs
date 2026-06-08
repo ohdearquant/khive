@@ -199,15 +199,39 @@ pub async fn load_events_since(
         .map_err(|e| sql_err("load events", e))?;
 
     let mut events = Vec::with_capacity(rows.len());
+    let mut quarantine_count: usize = 0;
     for row in &rows {
         let payload_str = match row.get("payload") {
             Some(SqlValue::Text(s)) => s,
-            _ => continue,
+            _ => {
+                quarantine_count += 1;
+                eprintln!(
+                    "[brain] event-log replay: row missing or non-text payload column \
+                     (quarantined row #{})",
+                    quarantine_count
+                );
+                continue;
+            }
         };
         match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
             Ok(event) => events.push(event),
-            Err(_) => continue,
+            Err(e) => {
+                quarantine_count += 1;
+                eprintln!(
+                    "[brain] event-log replay: malformed event JSON quarantined \
+                     (row #{}): {e}",
+                    quarantine_count
+                );
+            }
         }
+    }
+    if quarantine_count > 0 {
+        eprintln!(
+            "[brain] event-log replay: {quarantine_count} malformed row(s) quarantined \
+             out of {} total; replayed {} clean event(s)",
+            rows.len(),
+            events.len()
+        );
     }
     Ok(events)
 }
@@ -373,4 +397,103 @@ pub async fn persist_after_feedback(
     }
 
     Ok(())
+}
+
+// ── BRAIN-007: event-log replay quarantine diagnostics ────────────────────────
+
+#[cfg(test)]
+mod brain_007_replay_quarantine {
+    use super::*;
+    use khive_runtime::{KhiveRuntime, Namespace};
+    use khive_storage::event::Event;
+    use khive_types::{EventKind, SubstrateKind};
+
+    async fn insert_raw_payload(rt: &KhiveRuntime, namespace: &str, payload: &str) {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO brain_event_log (profile_id, namespace, event_kind, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
+                params: vec![
+                    SqlValue::Text("test-profile".to_string()),
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text("brain.feedback".to_string()),
+                    SqlValue::Text(payload.to_string()),
+                    SqlValue::Integer(1_000_000),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert raw row");
+    }
+
+    fn make_valid_event_json(namespace: &str) -> String {
+        let ev = Event::new(
+            namespace,
+            "recall",
+            EventKind::Audit,
+            SubstrateKind::Note,
+            "brain",
+        );
+        serde_json::to_string(&ev).expect("serialize event")
+    }
+
+    #[tokio::test]
+    async fn malformed_json_rows_are_quarantined_not_panicked() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // Insert one malformed row (not valid JSON) and one valid serialized Event.
+        insert_raw_payload(&rt, ns, "this is not valid json {{").await;
+        insert_raw_payload(&rt, ns, &make_valid_event_json(ns)).await;
+
+        // load_events_since must return without panicking, quarantining the bad row.
+        let events = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail on malformed rows");
+
+        // Only the valid event should be returned.
+        assert_eq!(
+            events.len(),
+            1,
+            "one valid event expected; malformed row must be quarantined, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_malformed_rows_quarantined_returns_empty_vec() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        insert_raw_payload(&rt, ns, "bad json").await;
+        insert_raw_payload(&rt, ns, "{invalid}").await;
+
+        let events = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must succeed even when all rows are malformed");
+
+        assert!(events.is_empty(), "all malformed rows must be quarantined");
+    }
+
+    #[tokio::test]
+    async fn clean_rows_replay_without_quarantine() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        for _ in 0..3 {
+            insert_raw_payload(&rt, ns, &make_valid_event_json(ns)).await;
+        }
+
+        let events = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("clean rows must replay without error");
+
+        assert_eq!(events.len(), 3, "all 3 clean rows must be returned");
+    }
 }

@@ -3085,3 +3085,160 @@ async fn crit1_create_profile_accepts_seed_priors_within_ess_cap() {
 
     assert_eq!(result["created"], json!(true));
 }
+
+// ── BRAIN-005: section_signals validation ────────────────────────────────────
+
+#[cfg(test)]
+mod brain_005_section_signals {
+    use super::*;
+
+    #[tokio::test]
+    async fn section_signals_not_an_object_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": ["overview", "useful"]
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("section_signals"),
+                "error must mention section_signals; got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn section_signals_unknown_section_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": {"not_a_real_section": "useful"}
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("not_a_real_section"),
+                "error must name the bad key; got: {msg}"
+            );
+            assert!(
+                msg.contains("valid") || msg.contains("overview"),
+                "error must list valid sections; got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn section_signals_unknown_signal_value_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": {"overview": "garbage_signal"}
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("garbage_signal"),
+                "error must name the bad signal; got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn section_signals_non_string_value_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": {"overview": 42}
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("section_signals"),
+                "error must mention section_signals; got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn section_signals_valid_object_is_accepted() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "section_signals": {
+                        "overview": "useful",
+                        "formalism": "not_useful"
+                    }
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("valid section_signals must be accepted");
+        assert_eq!(result["emitted"], json!(true));
+    }
+}
