@@ -357,3 +357,68 @@ fn edge_filter_validate_inverted_bounds_err() {
     };
     assert!(f.validate().is_err());
 }
+
+// ── STORAGE-001/STORAGE-003 serde rejection tests ────────────────────────────
+
+/// A valid Edge must round-trip through serde without error.
+///
+/// Uses a full JSON fixture with all required fields so the test doesn't need
+/// to construct `EdgeRelation` or `LinkId` directly.
+#[test]
+fn edge_serde_roundtrip_valid() {
+    let id = uuid::Uuid::new_v4();
+    let src = uuid::Uuid::new_v4();
+    let tgt = uuid::Uuid::new_v4();
+    let json = format!(
+        r#"{{"id":"{id}","namespace":"default","source_id":"{src}","target_id":"{tgt}","relation":"extends","weight":0.8,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","deleted_at":null,"metadata":null,"target_backend":null}}"#
+    );
+    let result: Result<khive_storage::types::Edge, _> = serde_json::from_str(&json);
+    assert!(result.is_ok(), "valid Edge must deserialize without error");
+    let edge = result.unwrap();
+    assert!((edge.weight - 0.8).abs() < 1e-12);
+}
+
+/// TextSearchRequest with top_k = 0 must be rejected at deserialization.
+#[test]
+fn text_search_request_serde_rejects_zero_top_k() {
+    // Construct valid JSON except top_k = 0.
+    let json = r#"{"query":"hello","mode":"plain","filter":null,"top_k":0,"snippet_chars":100}"#;
+    let result: Result<khive_storage::types::TextSearchRequest, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "TextSearchRequest with top_k = 0 must be rejected by serde"
+    );
+}
+
+/// TextSearchRequest with top_k > 0 must succeed deserialization.
+#[test]
+fn text_search_request_serde_accepts_valid_top_k() {
+    let json = r#"{"query":"hello","mode":"plain","filter":null,"top_k":10,"snippet_chars":100}"#;
+    let result: Result<khive_storage::types::TextSearchRequest, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "TextSearchRequest with top_k = 10 must succeed"
+    );
+}
+
+/// SparseSearchRequest with top_k = 0 must be rejected at deserialization.
+#[test]
+fn sparse_search_request_serde_rejects_zero_top_k() {
+    let json = r#"{"query":{"indices":[0],"values":[1.0]},"top_k":0,"namespace":null,"kind":null}"#;
+    let result: Result<khive_storage::types::SparseSearchRequest, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "SparseSearchRequest with top_k = 0 must be rejected by serde"
+    );
+}
+
+/// SparseSearchRequest with top_k > 0 must succeed deserialization.
+#[test]
+fn sparse_search_request_serde_accepts_valid_top_k() {
+    let json = r#"{"query":{"indices":[0],"values":[1.0]},"top_k":5,"namespace":null,"kind":null}"#;
+    let result: Result<khive_storage::types::SparseSearchRequest, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "SparseSearchRequest with top_k = 5 must succeed"
+    );
+}

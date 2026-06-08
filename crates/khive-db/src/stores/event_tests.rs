@@ -435,3 +435,59 @@ async fn query_events_observed_filter_missing_projection_returns_clean_error() {
         "error should mention event_observations and run migrations, got: {err_msg}"
     );
 }
+
+// ── KDB-006 regression: i64 → u32 narrowing on payload_schema_version ──────
+
+/// KDB-006: payload_schema_version of 1 (normal) must round-trip without error.
+#[tokio::test]
+async fn read_event_with_valid_payload_schema_version() {
+    let store = setup_memory_store();
+    let event = make_event("default");
+    let id = event.id;
+    store.append_event(event).await.unwrap();
+
+    let fetched = store.get_event(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.payload_schema_version, 1,
+        "default payload_schema_version must round-trip as 1"
+    );
+}
+
+/// KDB-006: a row with a negative payload_schema_version stored directly via SQL
+/// must be rejected by read_event (try_into fails → StorageError).
+#[tokio::test]
+async fn read_event_rejects_negative_payload_schema_version() {
+    use crate::pool::PoolConfig;
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(EVENTS_DDL).unwrap();
+    }
+    let store = SqlEventStore::new_scoped(Arc::clone(&pool), false, "default");
+
+    // Insert a row with payload_schema_version = -1 directly.
+    let id = uuid::Uuid::new_v4();
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO events \
+                 (id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                  payload_schema_version, duration_us, created_at) \
+                 VALUES (?1,'default','test','entity','a','audit','success','{}', -1, 0, 0)",
+                rusqlite::params![id.to_string()],
+            )
+            .unwrap();
+    }
+
+    let result = store.get_event(id).await;
+    assert!(
+        result.is_err(),
+        "negative payload_schema_version must be rejected as a StorageError"
+    );
+}

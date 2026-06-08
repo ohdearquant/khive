@@ -78,8 +78,34 @@ pub struct SparseRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Parameters for a sparse nearest-neighbor similarity search.
+/// Raw deserialization target for [`SparseSearchRequest`].
+#[derive(Deserialize)]
+struct SparseSearchRequestRaw {
+    query: SparseVector,
+    top_k: u32,
+    namespace: Option<String>,
+    kind: Option<SubstrateKind>,
+}
+
+impl TryFrom<SparseSearchRequestRaw> for SparseSearchRequest {
+    type Error = String;
+
+    fn try_from(raw: SparseSearchRequestRaw) -> Result<Self, Self::Error> {
+        if raw.top_k == 0 {
+            return Err("SparseSearchRequest: top_k must be > 0".into());
+        }
+        Ok(Self {
+            query: raw.query,
+            top_k: raw.top_k,
+            namespace: raw.namespace,
+            kind: raw.kind,
+        })
+    }
+}
+
+/// Parameters for a sparse nearest-neighbor similarity search. Deserialization rejects top_k = 0.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "SparseSearchRequestRaw")]
 pub struct SparseSearchRequest {
     pub query: SparseVector,
     pub top_k: u32,

@@ -31,8 +31,48 @@ impl fmt::Display for LinkId {
     }
 }
 
-/// A directed edge in the graph.
+/// Raw deserialization target for [`Edge`].
+#[derive(Deserialize)]
+struct EdgeRaw {
+    id: LinkId,
+    namespace: String,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    deleted_at: Option<DateTime<Utc>>,
+    metadata: Option<Value>,
+    target_backend: Option<String>,
+}
+
+impl TryFrom<EdgeRaw> for Edge {
+    type Error = String;
+
+    fn try_from(raw: EdgeRaw) -> Result<Self, Self::Error> {
+        if !raw.weight.is_finite() {
+            return Err(format!("Edge: weight must be finite, got {}", raw.weight));
+        }
+        Ok(Self {
+            id: raw.id,
+            namespace: raw.namespace,
+            source_id: raw.source_id,
+            target_id: raw.target_id,
+            relation: raw.relation,
+            weight: raw.weight,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            deleted_at: raw.deleted_at,
+            metadata: raw.metadata,
+            target_backend: raw.target_backend,
+        })
+    }
+}
+
+/// A directed edge in the graph. Deserialization rejects non-finite weights.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "EdgeRaw")]
 pub struct Edge {
     pub id: LinkId,
     pub namespace: String,
@@ -160,8 +200,36 @@ pub struct SortOrder<F> {
     pub direction: SortDirection,
 }
 
-/// Parameters for a single-hop graph neighbor lookup.
+/// Raw deserialization target for [`NeighborQuery`].
+#[derive(Deserialize)]
+struct NeighborQueryRaw {
+    direction: Direction,
+    relations: Option<Vec<EdgeRelation>>,
+    limit: Option<u32>,
+    min_weight: Option<f64>,
+}
+
+impl TryFrom<NeighborQueryRaw> for NeighborQuery {
+    type Error = String;
+
+    fn try_from(raw: NeighborQueryRaw) -> Result<Self, Self::Error> {
+        if let Some(w) = raw.min_weight {
+            if !w.is_finite() {
+                return Err(format!("NeighborQuery: min_weight must be finite, got {w}"));
+            }
+        }
+        Ok(Self {
+            direction: raw.direction,
+            relations: raw.relations,
+            limit: raw.limit,
+            min_weight: raw.min_weight,
+        })
+    }
+}
+
+/// Parameters for a single-hop graph neighbor lookup. Deserialization rejects non-finite min_weight.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "NeighborQueryRaw")]
 pub struct NeighborQuery {
     pub direction: Direction,
     pub relations: Option<Vec<EdgeRelation>>,
@@ -191,8 +259,43 @@ pub struct NeighborHit {
     pub kind: Option<String>,
 }
 
+/// Raw deserialization target for [`TraversalOptions`].
+#[derive(Deserialize, Default)]
+struct TraversalOptionsRaw {
+    #[serde(default)]
+    max_depth: usize,
+    #[serde(default)]
+    direction: Direction,
+    relations: Option<Vec<EdgeRelation>>,
+    min_weight: Option<f64>,
+    limit: Option<u32>,
+}
+
+impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
+    type Error = String;
+
+    fn try_from(raw: TraversalOptionsRaw) -> Result<Self, Self::Error> {
+        if let Some(w) = raw.min_weight {
+            if !w.is_finite() {
+                return Err(format!(
+                    "TraversalOptions: min_weight must be finite, got {w}"
+                ));
+            }
+        }
+        Ok(Self {
+            max_depth: raw.max_depth,
+            direction: raw.direction,
+            relations: raw.relations,
+            min_weight: raw.min_weight,
+            limit: raw.limit,
+        })
+    }
+}
+
 /// BFS traversal configuration controlling depth, direction, and edge filters.
+/// Deserialization rejects non-finite min_weight.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(try_from = "TraversalOptionsRaw")]
 pub struct TraversalOptions {
     pub max_depth: usize,
     pub direction: Direction,
@@ -217,8 +320,29 @@ impl TraversalOptions {
     }
 }
 
+/// Raw deserialization target for [`TraversalRequest`].
+#[derive(Deserialize)]
+struct TraversalRequestRaw {
+    roots: Vec<Uuid>,
+    options: TraversalOptionsRaw,
+    include_roots: bool,
+}
+
+impl TryFrom<TraversalRequestRaw> for TraversalRequest {
+    type Error = String;
+
+    fn try_from(raw: TraversalRequestRaw) -> Result<Self, Self::Error> {
+        Ok(Self {
+            roots: raw.roots,
+            options: TraversalOptions::try_from(raw.options)?,
+            include_roots: raw.include_roots,
+        })
+    }
+}
+
 /// A graph traversal request from a set of root nodes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "TraversalRequestRaw")]
 pub struct TraversalRequest {
     pub roots: Vec<Uuid>,
     pub options: TraversalOptions,

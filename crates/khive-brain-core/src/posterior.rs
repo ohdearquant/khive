@@ -5,7 +5,24 @@ use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Raw wire format for [`BetaPosterior`]; validated via `TryFrom`.
+#[derive(Deserialize)]
+struct BetaPosteriorRaw {
+    alpha: f64,
+    beta: f64,
+}
+
+impl TryFrom<BetaPosteriorRaw> for BetaPosterior {
+    type Error = String;
+
+    fn try_from(raw: BetaPosteriorRaw) -> Result<Self, Self::Error> {
+        BetaPosterior::try_new(raw.alpha, raw.beta)
+    }
+}
+
+/// Beta-Binomial posterior. Deserialization rejects non-finite or non-positive parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(try_from = "BetaPosteriorRaw")]
 pub struct BetaPosterior {
     pub alpha: f64,
     pub beta: f64,
@@ -214,6 +231,58 @@ mod tests {
         assert!(BetaPosterior::try_new(1.0, -1.0).is_err());
         assert!(BetaPosterior::try_new(f64::NAN, 1.0).is_err());
         assert!(BetaPosterior::try_new(f64::INFINITY, 1.0).is_err());
+    }
+
+    #[test]
+    fn serde_rejects_nan_alpha() {
+        let json = r#"{"alpha": null, "beta": 1.0}"#;
+        // null is not a valid f64 for alpha
+        let result: Result<BetaPosterior, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "null alpha must be rejected");
+    }
+
+    #[test]
+    fn serde_rejects_nonfinite_alpha() {
+        // JSON does not represent Inf/NaN natively, but a crafted payload via
+        // serde_json::Value injection covers the try_from path:
+        let raw_nan: BetaPosteriorRaw = BetaPosteriorRaw {
+            alpha: f64::NAN,
+            beta: 1.0,
+        };
+        let result = BetaPosterior::try_from(raw_nan);
+        assert!(result.is_err(), "NaN alpha must be rejected via try_from");
+    }
+
+    #[test]
+    fn serde_rejects_nonfinite_beta() {
+        let raw = BetaPosteriorRaw {
+            alpha: 1.0,
+            beta: f64::INFINITY,
+        };
+        let result = BetaPosterior::try_from(raw);
+        assert!(result.is_err(), "Inf beta must be rejected via try_from");
+    }
+
+    #[test]
+    fn serde_rejects_negative_alpha() {
+        let raw = BetaPosteriorRaw {
+            alpha: -1.0,
+            beta: 1.0,
+        };
+        let result = BetaPosterior::try_from(raw);
+        assert!(
+            result.is_err(),
+            "negative alpha must be rejected via try_from"
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip_valid_posterior() {
+        let p = BetaPosterior::new(2.5, 3.5);
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: BetaPosterior = serde_json::from_str(&json).unwrap();
+        assert!((restored.alpha - 2.5).abs() < 1e-12);
+        assert!((restored.beta - 3.5).abs() < 1e-12);
     }
 
     #[test]

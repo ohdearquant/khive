@@ -219,6 +219,24 @@ fn read_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
     let target_id = target_str.as_deref().map(parse_uuid).transpose()?;
     let session_id = session_str.as_deref().map(parse_uuid).transpose()?;
     let aggregate_id = aggregate_str.as_deref().map(parse_uuid).transpose()?;
+    let payload_schema_version_u32: u32 = payload_schema_version.try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Integer,
+            format!("payload_schema_version {payload_schema_version} out of u32 range").into(),
+        )
+    })?;
+    let profile_state_version_u64: Option<u64> = profile_state_version
+        .map(|v| {
+            u64::try_from(v).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Integer,
+                    format!("profile_state_version {v} out of u64 range").into(),
+                )
+            })
+        })
+        .transpose()?;
 
     Ok(Event {
         id,
@@ -229,8 +247,8 @@ fn read_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
         kind,
         outcome,
         payload,
-        payload_schema_version: payload_schema_version as u32,
-        profile_state_version: profile_state_version.map(|v| v as u64),
+        payload_schema_version: payload_schema_version_u32,
+        profile_state_version: profile_state_version_u64,
         duration_us,
         target_id,
         session_id,

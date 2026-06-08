@@ -1281,12 +1281,13 @@ impl BrainPack {
                             "missing or invalid beta for section {key:?}"
                         ))
                     })?;
-                    if alpha <= 0.0 || beta <= 0.0 {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "alpha and beta must be positive for section {key:?}; got alpha={alpha}, beta={beta}"
-                        )));
-                    }
-                    priors.insert(st, khive_brain_core::BetaPosterior::new(alpha, beta));
+                    let posterior =
+                        khive_brain_core::BetaPosterior::try_new(alpha, beta).map_err(|e| {
+                            RuntimeError::InvalidInput(format!(
+                                "invalid seed_priors for section {key:?}: {e}"
+                            ))
+                        })?;
+                    priors.insert(st, posterior);
                 }
                 SectionPosteriorState::from_priors(priors)
             } else {
