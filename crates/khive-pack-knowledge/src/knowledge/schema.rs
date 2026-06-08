@@ -276,6 +276,8 @@ pub(crate) struct ComposeParams {
     pub query: String,
     #[serde(default)]
     pub auto_limit: Option<usize>,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 // ── edit ─────────────────────────────────────────────────────────────────────
