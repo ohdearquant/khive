@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use crate::brain_signal::BrainSignal;
 use crate::posterior::BetaPosterior;
 use crate::section_type::SectionType;
+use crate::signal::FeedbackSignal;
 
 pub const DEFAULT_ESS_CAP: f64 = 100.0;
 pub const DEFAULT_EXPLORATION_EPOCH: u64 = 50;
@@ -136,6 +138,35 @@ impl SectionPosteriorState {
 
     pub fn reset_posteriors(&mut self) {
         self.posteriors = self.priors.clone();
+    }
+
+    /// Apply a brain signal to update section posteriors in place.
+    /// Only `Feedback` events with `section_signals` affect section state.
+    pub fn apply_signal(&mut self, signal: &BrainSignal) {
+        if let BrainSignal::Feedback {
+            section_signals: Some(ref signals),
+            ..
+        } = signal
+        {
+            self.total_events += 1;
+
+            for (section_type, feedback_signal) in signals {
+                if let Some(posterior) = self.posteriors.get_mut(section_type) {
+                    match feedback_signal {
+                        FeedbackSignal::Useful => posterior.alpha += 1.0,
+                        FeedbackSignal::NotUseful => posterior.beta += 1.0,
+                        FeedbackSignal::Wrong => posterior.beta += 2.0,
+                    }
+                    if let Some(prior) = self.priors.get(section_type) {
+                        posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP);
+                    }
+                }
+            }
+
+            if self.exploration_epoch > 0 {
+                self.exploration_epoch -= 1;
+            }
+        }
     }
 }
 

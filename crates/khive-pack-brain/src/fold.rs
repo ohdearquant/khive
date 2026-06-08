@@ -3,12 +3,8 @@
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
 
-use crate::event::{
-    entity_signal, interpret, is_recall_positive, BrainSignal, FeedbackEventKind, FeedbackSignal,
-};
-use khive_brain_core::{
-    BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP,
-};
+use crate::event::interpret;
+use khive_brain_core::{BalancedRecallState, SectionPosteriorState};
 
 /// Fold for the `balanced-recall-v1` three-scalar Beta-posterior state.
 pub struct BalancedRecallFold {
@@ -33,103 +29,7 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
         _ctx: &FoldContext,
     ) -> BalancedRecallState {
         let signal = interpret(event);
-
-        state.total_events += 1;
-
-        // Global recall-relevance parameter update
-        if let Some(positive) = is_recall_positive(&signal) {
-            if positive {
-                state.relevance.update_success();
-            } else {
-                state.relevance.update_failure();
-            }
-        }
-
-        // Fix #355 (MAJ-001): salience posterior — driven by explicit feedback signal.
-        // Useful feedback = positive evidence that salience weighting helped recall.
-        // NotUseful / Wrong = negative evidence.
-        if let BrainSignal::Feedback { signal: ref fb, .. } = signal {
-            match fb {
-                FeedbackSignal::Useful => state.salience.update_success(),
-                FeedbackSignal::NotUseful | FeedbackSignal::Wrong => {
-                    state.salience.update_failure()
-                }
-            }
-        }
-
-        // Issue #268: semantic feedback events use weighted posterior updates.
-        // Correction and explicit signals have higher update_weight than implicit ones.
-        if let BrainSignal::SemanticFeedback {
-            event_kind: ref ek, ..
-        } = signal
-        {
-            let w = ek.update_weight();
-            if ek.is_positive() {
-                state.salience.update_success_weighted(w);
-            } else {
-                state.salience.update_failure_weighted(w);
-            }
-            // Corrections also update the relevance posterior (strongest signal).
-            if *ek == FeedbackEventKind::Correction {
-                state.relevance.update_failure_weighted(w);
-            }
-        }
-
-        // Fix #355 (MAJ-001): temporal posterior — driven by recall latency.
-        // A fast recall hit (≤ 50 ms) is positive evidence that temporal recency
-        // weighting is working; a slow hit or a miss is negative evidence.
-        //
-        // Threshold: 50 000 µs = 50 ms.
-        //
-        // Rationale for 50 ms (codex P12 Low): local SQLite FTS5 recall
-        // completes in 1–20 ms under normal conditions. 50 ms provides
-        // headroom for contention while remaining well below the 250 ms
-        // rerank budget. A recall that exceeds 50 ms on a local store
-        // indicates either a cold cache or index degradation — both of
-        // which are valid negative temporal signals. Operators who need
-        // a different threshold should configure a custom profile.
-        const FAST_US: i64 = 50_000;
-        match &signal {
-            BrainSignal::RecallHit { latency_us, .. } => {
-                if *latency_us <= FAST_US {
-                    state.temporal.update_success();
-                } else {
-                    state.temporal.update_failure();
-                }
-            }
-            BrainSignal::RecallMiss => state.temporal.update_failure(),
-            _ => {}
-        }
-
-        // Per-entity posterior updates.
-        // Semantic feedback (issue #268) applies a weighted update so that
-        // explicit/correction signals carry more evidence than implicit ones.
-        if let BrainSignal::SemanticFeedback {
-            target_id: eid,
-            event_kind: ref ek,
-            ..
-        } = signal
-        {
-            let posterior = state
-                .entity_posteriors
-                .get_or_insert(eid, || BetaPosterior::new(1.0, 1.0));
-            let w = ek.update_weight();
-            if ek.is_positive() {
-                posterior.update_success_weighted(w);
-            } else {
-                posterior.update_failure_weighted(w);
-            }
-        } else if let Some((entity_id, positive)) = entity_signal(&signal) {
-            let posterior = state
-                .entity_posteriors
-                .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
-            if positive {
-                posterior.update_success();
-            } else {
-                posterior.update_failure();
-            }
-        }
-
+        state.apply_signal(&signal);
         state
     }
 
@@ -165,32 +65,7 @@ impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
         _ctx: &FoldContext,
     ) -> SectionPosteriorState {
         let signal = interpret(event);
-
-        if let BrainSignal::Feedback {
-            section_signals: Some(ref signals),
-            ..
-        } = signal
-        {
-            state.total_events += 1;
-
-            for (section_type, feedback_signal) in signals {
-                if let Some(posterior) = state.posteriors.get_mut(section_type) {
-                    match feedback_signal {
-                        FeedbackSignal::Useful => posterior.alpha += 1.0,
-                        FeedbackSignal::NotUseful => posterior.beta += 1.0,
-                        FeedbackSignal::Wrong => posterior.beta += 2.0,
-                    }
-                    if let Some(prior) = state.priors.get(section_type) {
-                        posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP);
-                    }
-                }
-            }
-
-            if state.exploration_epoch > 0 {
-                state.exploration_epoch -= 1;
-            }
-        }
-
+        state.apply_signal(&signal);
         state
     }
 

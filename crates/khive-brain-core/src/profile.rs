@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::brain_signal::{entity_signal, is_recall_positive, BrainSignal};
 use crate::posterior::{BetaPosterior, EntityPosteriors};
+use crate::signal::{FeedbackEventKind, FeedbackSignal};
 
 /// Lifecycle states for a registered profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +118,86 @@ impl BalancedRecallState {
             ),
             total_events: snapshot.total_events,
             exploration_epoch: snapshot.exploration_epoch,
+        }
+    }
+
+    /// Apply a brain signal to update posteriors in place.
+    /// This is the core profile update logic — pure, deterministic, no IO.
+    pub fn apply_signal(&mut self, signal: &BrainSignal) {
+        self.total_events += 1;
+
+        // Global recall-relevance posterior
+        if let Some(positive) = is_recall_positive(signal) {
+            if positive {
+                self.relevance.update_success();
+            } else {
+                self.relevance.update_failure();
+            }
+        }
+
+        // Salience posterior — driven by explicit feedback signal
+        if let BrainSignal::Feedback { signal: ref fb, .. } = signal {
+            match fb {
+                FeedbackSignal::Useful => self.salience.update_success(),
+                FeedbackSignal::NotUseful | FeedbackSignal::Wrong => self.salience.update_failure(),
+            }
+        }
+
+        // Semantic feedback: weighted posterior updates
+        if let BrainSignal::SemanticFeedback {
+            event_kind: ref ek, ..
+        } = signal
+        {
+            let w = ek.update_weight();
+            if ek.is_positive() {
+                self.salience.update_success_weighted(w);
+            } else {
+                self.salience.update_failure_weighted(w);
+            }
+            if *ek == FeedbackEventKind::Correction {
+                self.relevance.update_failure_weighted(w);
+            }
+        }
+
+        // Temporal posterior — driven by recall latency
+        const FAST_US: i64 = 50_000;
+        match signal {
+            BrainSignal::RecallHit { latency_us, .. } => {
+                if *latency_us <= FAST_US {
+                    self.temporal.update_success();
+                } else {
+                    self.temporal.update_failure();
+                }
+            }
+            BrainSignal::RecallMiss => self.temporal.update_failure(),
+            _ => {}
+        }
+
+        // Per-entity posterior updates
+        if let BrainSignal::SemanticFeedback {
+            target_id: eid,
+            event_kind: ref ek,
+            ..
+        } = signal
+        {
+            let posterior = self
+                .entity_posteriors
+                .get_or_insert(*eid, || BetaPosterior::new(1.0, 1.0));
+            let w = ek.update_weight();
+            if ek.is_positive() {
+                posterior.update_success_weighted(w);
+            } else {
+                posterior.update_failure_weighted(w);
+            }
+        } else if let Some((entity_id, positive)) = entity_signal(signal) {
+            let posterior = self
+                .entity_posteriors
+                .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
+            if positive {
+                posterior.update_success();
+            } else {
+                posterior.update_failure();
+            }
         }
     }
 }

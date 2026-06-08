@@ -1,5 +1,6 @@
 //! Brain primitives — Beta posteriors, section types, profile state, weight derivation.
 
+pub mod brain_signal;
 pub mod brain_state;
 pub mod posterior;
 pub mod profile;
@@ -7,6 +8,7 @@ pub mod section_state;
 pub mod section_type;
 pub mod signal;
 
+pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal};
 pub use brain_state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
 pub use posterior::{BetaPosterior, EntityPosteriors};
 pub use profile::{
