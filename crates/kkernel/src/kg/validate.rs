@@ -150,7 +150,7 @@ fn structural_checks(
     let mut results = vec![
         check_no_duplicate_uuids(entities_path),
         check_sort_order(entities_path, edges_path),
-        check_referential_integrity(entities_path, edges_path),
+        check_referential_integrity(entities_path, notes_path, edges_path),
         check_valid_entity_kinds(entities_path, &taxonomy.entity_kinds),
         check_valid_edge_relations(edges_path),
     ];
@@ -442,11 +442,11 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
     }
 }
 
-fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleResult {
-    let mut violations = Vec::new();
-
-    let entity_ids: std::collections::HashSet<String> =
-        if let Ok(content) = std::fs::read_to_string(entities_path) {
+/// Collect all IDs from an NDJSON file into a set. Returns an empty set when
+/// the file is absent or unreadable.
+fn collect_ids(path: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|content| {
             content
                 .lines()
                 .filter(|l| !l.trim().is_empty())
@@ -456,16 +456,31 @@ fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleR
                         .and_then(|v| v.get("id")?.as_str().map(str::to_string))
                 })
                 .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
+        })
+        .unwrap_or_default()
+}
+
+/// Check that every edge endpoint resolves to a known record.
+///
+/// The known-ID set is the union of entities.ndjson and notes.ndjson because
+/// ADR-017 allows pack-extended edge endpoints between notes (e.g. the GTD
+/// pack permits `depends_on` between two `task` notes).
+fn check_referential_integrity(
+    entities_path: &Path,
+    notes_path: &Path,
+    edges_path: &Path,
+) -> RuleResult {
+    let mut violations = Vec::new();
+
+    let mut known_ids = collect_ids(entities_path);
+    known_ids.extend(collect_ids(notes_path));
 
     if let Ok(content) = std::fs::read_to_string(edges_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 for field in &["source_id", "target_id"] {
                     if let Some(id) = v.get(field).and_then(|i| i.as_str()) {
-                        if !entity_ids.contains(id) {
+                        if !known_ids.contains(id) {
                             violations.push(Violation {
                                 entity_id: Some(id.to_string()),
                                 entity_name: None,
@@ -473,7 +488,7 @@ fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleR
                                 rule_id: "referential-integrity".into(),
                                 severity: "error",
                                 message: format!(
-                                    "Edge {} references unknown entity: {id}",
+                                    "Edge {} references unknown record: {id}",
                                     if *field == "source_id" {
                                         "source"
                                     } else {
@@ -941,10 +956,48 @@ mod tests {
         );
         let result = check_referential_integrity(
             &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &kg_dir.join("edges.ndjson"),
         );
         assert!(!result.passed);
         assert_eq!(result.violations.len(), 1);
+    }
+
+    #[test]
+    fn task_note_depends_on_passes_referential_integrity() {
+        // Regression for ADR-017 + GTD pack: `depends_on` between two `task`
+        // notes is a valid pack-extended edge. The referential-integrity check
+        // must resolve note IDs from notes.ndjson, not only from entities.ndjson.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        // No entity records — the edge endpoints live in notes only.
+        std::fs::write(kg_dir.join("entities.ndjson"), "").unwrap();
+        write_notes(
+            &kg_dir,
+            &[
+                ("task-0001-0000-0000-0000-000000000001", "task"),
+                ("task-0002-0000-0000-0000-000000000002", "task"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "task-0001-0000-0000-0000-000000000001",
+                "task-0002-0000-0000-0000-000000000002",
+                "depends_on",
+            )],
+        );
+        let result = check_referential_integrity(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+        );
+        assert!(
+            result.passed,
+            "task note depends_on must pass referential integrity; violations: {:?}",
+            result.violations
+        );
+        assert!(result.violations.is_empty());
     }
 
     #[test]
