@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -20,6 +22,107 @@ use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
 
 const MAX_EMBED_BYTES: usize = 32_768;
+
+// ─── progress bar ─────────────────────────────────────────────────────────────
+
+struct ProgressBar {
+    label: &'static str,
+    start: Instant,
+    current: AtomicU64,
+    total: AtomicU64,
+    window_current: AtomicU64,
+    window_nanos: AtomicU64,
+    rate: std::sync::Mutex<f64>,
+}
+
+const RATE_WINDOW_SECS: f64 = 10.0;
+
+impl ProgressBar {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            start: Instant::now(),
+            current: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            window_current: AtomicU64::new(0),
+            window_nanos: AtomicU64::new(0),
+            rate: std::sync::Mutex::new(0.0),
+        }
+    }
+
+    fn update(&self, current: u64, total: u64) {
+        self.current.store(current, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+
+        let now_ns = self.start.elapsed().as_nanos() as u64;
+        let prev_ns = self.window_nanos.load(Ordering::Relaxed);
+        let delta_secs = (now_ns - prev_ns) as f64 / 1e9;
+
+        if delta_secs >= RATE_WINDOW_SECS {
+            let prev_current = self.window_current.load(Ordering::Relaxed);
+            let delta_items = current.saturating_sub(prev_current);
+            if delta_secs > 0.1 {
+                let window_rate = delta_items as f64 / delta_secs;
+                if let Ok(mut r) = self.rate.lock() {
+                    if *r < 0.1 {
+                        *r = window_rate;
+                    } else {
+                        *r = 0.3 * *r + 0.7 * window_rate;
+                    }
+                }
+            }
+            self.window_current.store(current, Ordering::Relaxed);
+            self.window_nanos.store(now_ns, Ordering::Relaxed);
+        }
+
+        self.render();
+    }
+
+    fn render(&self) {
+        use std::io::Write;
+        let current = self.current.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let pct = if total > 0 {
+            (current as f64 / total as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        const BAR_WIDTH: usize = 30;
+        let filled = (pct / 100.0 * BAR_WIDTH as f64) as usize;
+        let empty = BAR_WIDTH.saturating_sub(filled);
+        let bar: String = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),);
+
+        let rate = self.rate.lock().map(|r| *r).unwrap_or(0.0);
+        let eta = if rate > 0.1 && current < total {
+            let remaining = (total - current) as f64 / rate;
+            if remaining >= 60.0 {
+                format!(
+                    "ETA {}m {:02}s",
+                    remaining as u64 / 60,
+                    remaining as u64 % 60
+                )
+            } else {
+                format!("ETA {:.0}s", remaining)
+            }
+        } else if current >= total && total > 0 {
+            "done".into()
+        } else {
+            "warming up…".into()
+        };
+
+        eprint!(
+            "\r  {:<10} [{bar}] {pct:>5.1}% ({current}/{total}) {rate:>6.0}/s {eta}    ",
+            self.label,
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    fn finish(&self) {
+        self.render();
+        eprintln!();
+    }
+}
 
 /// Arguments for `kkernel reindex` — rebuilds embedding vectors for entities,
 /// notes, and the knowledge corpus, fanning out across every configured
@@ -308,6 +411,10 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     if do_graph {
+        let entity_total = rt.count_entities(&token, None).await.unwrap_or(0);
+        let entity_bar = ProgressBar::new("entities");
+        entity_bar.update(0, entity_total);
+
         let mut entity_offset: u32 = 0;
         loop {
             let batch = rt
@@ -344,20 +451,21 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 .await;
                 entities_processed += staged.len() as u64;
             }
-            progress(&format!("  entities: {entities_processed} embedded"));
+            entity_bar.update(entities_processed, entity_total);
 
             if n < batch_size as usize {
                 break;
             }
             entity_offset += n as u32;
         }
-        if entities_processed > 0 {
-            eprintln!();
-        }
+        entity_bar.finish();
 
         // ── notes ─────────────────────────────────────────────────────────────────
-        let mut note_offset: u32 = 0;
+        let note_total = count_notes(&rt, &ns_str).await;
+        let note_bar = ProgressBar::new("notes");
+        note_bar.update(0, note_total);
 
+        let mut note_offset: u32 = 0;
         loop {
             let batch = rt
                 .list_notes(&token, None, batch_size, note_offset)
@@ -370,9 +478,6 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
             let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
             for note in &batch {
-                // Embed note.content ONLY — matching the create/update write path
-                // (operations.rs / curation.rs embed `note.content`, never the
-                // name). Reindex must reproduce exactly what those paths embedded.
                 let text = note.content.clone();
                 if !text.trim().is_empty() {
                     staged.push((note.id, text));
@@ -393,16 +498,14 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 .await;
                 notes_processed += staged.len() as u64;
             }
-            progress(&format!("  notes: {notes_processed} embedded"));
+            note_bar.update(notes_processed, note_total);
 
             if n < batch_size as usize {
                 break;
             }
             note_offset += n as u32;
         }
-        if notes_processed > 0 {
-            eprintln!();
-        }
+        note_bar.finish();
 
         // Invalidate Vamana snapshots so the next warm-load triggers a rebuild
         // against the freshly re-embedded entity/note vectors.
@@ -421,7 +524,11 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut knowledge_ann_failed = false;
     let mut knowledge_sections_failed: u64 = 0;
     if do_atoms || do_sections {
-        eprintln!("  indexing knowledge corpus (this can take a while)…");
+        let atom_bar = ProgressBar::new("atoms");
+        let section_bar = ProgressBar::new("sections");
+        let on_atom = |c: u64, t: u64| atom_bar.update(c, t);
+        let on_section = |c: u64, t: u64| section_bar.update(c, t);
+
         let opts = khive_pack_knowledge::KnowledgeReindexOptions {
             atoms: do_atoms,
             sections: do_sections,
@@ -429,7 +536,15 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             rebuild_ann: true,
             batch_size: Some(batch_size),
         };
-        match khive_pack_knowledge::reindex_knowledge(&rt, &token, opts).await {
+        match khive_pack_knowledge::reindex_knowledge(
+            &rt,
+            &token,
+            opts,
+            if do_atoms { Some(&on_atom) } else { None },
+            if do_sections { Some(&on_section) } else { None },
+        )
+        .await
+        {
             Ok(v) => {
                 if do_atoms {
                     knowledge_atoms_indexed =
@@ -454,9 +569,15 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             }
             Err(e) => {
                 tracing::error!(error = %e, "knowledge reindex failed");
-                eprintln!("error: knowledge reindex failed: {e}");
+                eprintln!("\nerror: knowledge reindex failed: {e}");
                 knowledge_pass_errored = true;
             }
+        }
+        if do_atoms {
+            atom_bar.finish();
+        }
+        if do_sections {
+            section_bar.finish();
         }
     }
 
@@ -540,11 +661,27 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
     }
 }
 
-/// Emit an in-place progress line to stderr (stdout stays reserved for JSON).
-fn progress(msg: &str) {
-    use std::io::Write;
-    eprint!("\r{msg}");
-    let _ = std::io::stderr().flush();
+async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
+    use khive_storage::types::{SqlStatement, SqlValue};
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return 0;
+    };
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT count(*) AS cnt FROM notes WHERE namespace = ?1 AND deleted_at IS NULL"
+                .into(),
+            params: vec![SqlValue::Text(ns.to_owned())],
+            label: None,
+        })
+        .await;
+    match row {
+        Ok(Some(r)) => match r.get("cnt") {
+            Some(SqlValue::Integer(n)) => *n as u64,
+            _ => 0,
+        },
+        _ => 0,
+    }
 }
 
 fn truncate_text(t: &str) -> String {

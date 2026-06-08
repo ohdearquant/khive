@@ -1193,7 +1193,10 @@ async fn suggest_returns_domains_for_query() {
     .expect("upsert domains");
 
     let resp = f
-        .dispatch("knowledge.suggest", json!({ "query": "retrieval" }))
+        .dispatch(
+            "knowledge.suggest",
+            json!({ "query": "retrieval techniques for dense and sparse methods" }),
+        )
         .await
         .expect("suggest ok");
 
@@ -1357,7 +1360,10 @@ async fn suggest_returns_empty_when_no_domains_present() {
     let f = pack(rt());
     // Empty corpus: no domains upserted. suggest should succeed with an empty results array.
     let resp = f
-        .dispatch("knowledge.suggest", json!({ "query": "anything" }))
+        .dispatch(
+            "knowledge.suggest",
+            json!({ "query": "anything related to general knowledge retrieval methods" }),
+        )
         .await
         .expect("suggest on empty corpus must not crash");
     let results = resp["results"].as_array().expect("results array");
@@ -1387,7 +1393,7 @@ async fn suggest_honors_limit_param() {
     let resp = f
         .dispatch(
             "knowledge.suggest",
-            json!({ "query": "domain", "limit": 1 }),
+            json!({ "query": "domain retrieval search indexing methods and techniques", "limit": 1 }),
         )
         .await
         .expect("suggest with limit=1");

@@ -36,9 +36,9 @@ request(ops="schedule.agenda()")
 
 ## Parameters
 
-| Parameter | Type   | Required | Description                                                        |
-| --------- | ------ | -------- | ------------------------------------------------------------------ |
-| `id`      | string | yes      | Full UUID or unambiguous 8+ hex prefix of the scheduled event.    |
+| Parameter | Type   | Required | Description                                                    |
+| --------- | ------ | -------- | -------------------------------------------------------------- |
+| `id`      | string | yes      | Full UUID or unambiguous 8+ hex prefix of the scheduled event. |
 
 ## Anti-patterns
 

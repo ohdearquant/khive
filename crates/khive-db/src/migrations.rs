@@ -109,6 +109,10 @@ pub struct VersionedMigration {
 // Fresh-start repo (v0.2.8) — all schema in one migration, no incremental versions.
 const V1_UP: &str = include_str!("../sql/schema.sql");
 
+const V2_UP: &str = include_str!("../sql/002-narrow-fts-sections-update-trigger.sql");
+
+const V3_UP: &str = include_str!("../sql/003-backfill-domain-mirror-atoms.sql");
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -135,11 +139,23 @@ pub const EMBEDDING_MODELS_DDL: &str = "\
         ON _embedding_models(engine_name, status);";
 
 /// All versioned migrations in ascending order, applied by `run_migrations`.
-pub const MIGRATIONS: &[VersionedMigration] = &[VersionedMigration {
-    version: 1,
-    name: "initial_schema",
-    up: V1_UP,
-}];
+pub const MIGRATIONS: &[VersionedMigration] = &[
+    VersionedMigration {
+        version: 1,
+        name: "initial_schema",
+        up: V1_UP,
+    },
+    VersionedMigration {
+        version: 2,
+        name: "narrow_fts_sections_update_trigger",
+        up: V2_UP,
+    },
+    VersionedMigration {
+        version: 3,
+        name: "backfill_domain_mirror_atoms",
+        up: V3_UP,
+    },
+];
 
 const MIGRATION_TRACKING_TABLE: &str = "\
     CREATE TABLE IF NOT EXISTS _schema_migrations (\

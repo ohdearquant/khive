@@ -275,6 +275,7 @@ impl KhiveMcpServer {
     /// Serve over stdio (blocks until the connection closes).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::stdio;
+        self.warm_all().await;
         let service = self.serve(stdio()).await?;
         service.waiting().await?;
         Ok(())

@@ -58,6 +58,35 @@ All verbs are dispatched through the single MCP `request` tool.
 | `knowledge.search` | `query` (required), `type?` (`"atom"` or `"domain"`), `role?`, `limit?` (default 10, max 100), `min_score?`, `weights?`, `decompose?` (boolean), `decompose_threshold?`, `intersection_bonus?`, `rerank?` (default true), `rerank_alpha?` (default 0.7) | Hybrid FTS + embedding search over atoms/domains. `rerank=true` blends TF-IDF and embedding scores via `rerank_alpha` (0 = pure embedding, 1 = pure TF-IDF). |
 | `knowledge.stats`  | (none)                                                                                                                                                                                                                                                  | Atom, domain, and embedding counts.                                                                                                                          |
 
+### Suggest and compose (ADR-051)
+
+| Verb                | Params                                                                                                  | What it does                                                                                                                                                                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge.suggest` | `query` (required, **5+ words**), `role?`, `limit?` (default 8)                                         | Domain suggestion via FTS + Vamana ANN + embedding rerank. Returns domain IDs, names, and scores. Short queries cause disambiguation — use 5–12 words for best results.                                                                       |
+| `knowledge.compose` | `query` (required), `domain_ids?`, `atom_ids?`, `max_tokens?` (default 8000), `auto_limit?` (default 5) | Compose a knowledge briefing from domains/atoms with section-level hybrid scoring (ADR-051). **Auto-compose**: omit `domain_ids`/`atom_ids` to run suggest internally (query must be **10+ words**). Explicit IDs accept any non-empty query. |
+| `knowledge.index`   | `ids?` (slugs/UUIDs), `batch_size?` (default 500), `rebuild_ann?`, `insert_only?`                       | Embed atoms + build Vamana ANN. Without `ids`, indexes the full corpus.                                                                                                                                                                       |
+| `knowledge.fold`    | `candidates` (array of `{id, score, size}`), `budget` (tokens)                                          | Knapsack selection — pack candidates into a token budget by score/size ratio.                                                                                                                                                                 |
+
+#### Compose scoring formula
+
+```
+0.55 · cosine(query, section_embedding)
+0.20 · bm25(query, heading + content)
+0.10 · cosine(query, atom_embedding)
+0.10 · domain_membership
+0.05 · section_type_weight
+```
+
+Sections without embeddings score via BM25 + atom cosine + domain + type (section_cosine = 0).
+
+#### Query length guidelines
+
+| Verb                     | Minimum  | Sweet spot  | Rationale                                                                       |
+| ------------------------ | -------- | ----------- | ------------------------------------------------------------------------------- |
+| `suggest`                | 5 words  | 5–12 words  | Short queries cause disambiguation (e.g. "attention" matches ML and psychology) |
+| `compose` (auto)         | 10 words | 15–30 words | Longer queries improve section ranking score spread                             |
+| `compose` (explicit IDs) | 1 word   | any         | IDs already select the scope; query only ranks sections                         |
+
 ## Skills
 
 - **learn** — register a concept with domain and tags.

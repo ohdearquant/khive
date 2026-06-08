@@ -17,6 +17,7 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
         ann: &vamana::SharedAnn,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     ) -> Result<Value, RuntimeError> {
         let p: IndexParams = deser(params)?;
         let rebuild_ann = p.rebuild_ann.unwrap_or(false);
@@ -85,6 +86,10 @@ impl KnowledgeHandlers {
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
+
+        if let Some(cb) = on_progress {
+            cb(0, total as u64);
+        }
 
         let mut ann_vectors: Vec<f32> = Vec::new();
         let mut ann_ids: Vec<uuid::Uuid> = Vec::new();
@@ -196,6 +201,10 @@ impl KnowledgeHandlers {
             }
 
             indexed += chunk_ok.iter().filter(|ok| **ok).count();
+
+            if let Some(cb) = on_progress {
+                cb(indexed as u64, total as u64);
+            }
         }
 
         // Any vector write invalidates the existing snapshot — the corpus has changed.
@@ -208,6 +217,16 @@ impl KnowledgeHandlers {
         let mut ann_failed = false;
         let is_full_corpus = p.ids.is_none();
         if rebuild_ann && is_full_corpus && !ann_vectors.is_empty() && ann_dim > 0 {
+            let n_vecs = ann_ids.len();
+            tracing::info!(
+                vectors = n_vecs,
+                dim = ann_dim,
+                "building Vamana ANN index…"
+            );
+            if let Some(cb) = on_progress {
+                cb(total as u64, total as u64);
+            }
+            eprintln!("\n  building Vamana ANN ({n_vecs} vectors, dim={ann_dim})…");
             match vamana::AnnBridge::build(ann_vectors, ann_dim, ann_ids) {
                 Ok(bridge) => {
                     ann_count = Some(bridge.num_vectors());
@@ -229,11 +248,14 @@ impl KnowledgeHandlers {
                             ann_failed = true;
                         }
                     }
+                    let n = bridge.num_vectors();
                     let key = vamana::AnnKey::new(&ns, model_name);
                     vamana::insert_ann_if_absent(ann, key, bridge).await;
+                    eprintln!("  Vamana ANN built ({n} vectors)");
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Vamana ANN index");
+                    eprintln!("  Vamana ANN build failed: {e}");
                     ann_failed = true;
                 }
             }

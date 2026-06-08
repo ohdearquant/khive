@@ -26,14 +26,14 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 1, "single consolidated migration");
+    assert_eq!(version, 3, "latest migration version");
 
     let recorded: i64 = conn
         .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 1);
+    assert_eq!(recorded, 3);
 }
 
 #[test]
@@ -137,5 +137,5 @@ fn run_migrations_twice_is_idempotent() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 1, "no duplicate migration rows on re-run");
+    assert_eq!(recorded, 3, "no duplicate migration rows on re-run");
 }

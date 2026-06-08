@@ -49,6 +49,7 @@ pub(crate) async fn embed_sections(
     token: &NamespaceToken,
     drop_existing: bool,
     batch_size: usize,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 ) -> Result<(usize, usize, usize), RuntimeError> {
     if runtime.default_embedder_name().is_empty() {
         return Ok((0, 0, 0));
@@ -56,6 +57,40 @@ pub(crate) async fn embed_sections(
     let ns = token.namespace().as_str().to_owned();
     let sql = runtime.sql();
     let page = batch_size.clamp(1, 1000) as i64;
+
+    let total: u64 = {
+        let filter = if drop_existing {
+            ""
+        } else {
+            " AND embedding IS NULL"
+        };
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("section count reader", e))?;
+        let row = reader
+            .query_row(SqlStatement {
+                sql: format!(
+                    "SELECT count(*) AS cnt FROM knowledge_sections \
+                     WHERE namespace = ?1{filter}"
+                ),
+                params: vec![SqlValue::Text(ns.clone())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("section count", e))?;
+        match row {
+            Some(r) => match r.get("cnt") {
+                Some(SqlValue::Integer(n)) => *n as u64,
+                _ => 0,
+            },
+            None => 0,
+        }
+    };
+
+    if let Some(cb) = on_progress {
+        cb(0, total);
+    }
 
     let mut indexed = 0usize;
     let mut skipped = 0usize;
@@ -165,6 +200,10 @@ pub(crate) async fn embed_sections(
                     indexed += 1;
                 }
             }
+        }
+
+        if let Some(cb) = on_progress {
+            cb(indexed as u64, total);
         }
 
         if n < page as usize {

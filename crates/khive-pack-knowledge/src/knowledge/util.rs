@@ -265,12 +265,18 @@ pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
 // ─── embed text helper ────────────────────────────────────────────────────────
 
 pub(super) fn atom_embed_text(atom: &Atom) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(2);
+    let mut parts: Vec<String> = Vec::with_capacity(3);
     if !atom.name.is_empty() {
-        parts.push(&atom.name);
+        parts.push(atom.name.clone());
     }
     if !atom.content.is_empty() {
-        parts.push(&atom.content);
+        parts.push(atom.content.clone());
+    }
+    if let Ok(tags) = serde_json::from_str::<Vec<String>>(&atom.tags) {
+        let meaningful: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+        if !meaningful.is_empty() {
+            parts.push(format!("Tags: {}", meaningful.join(", ")));
+        }
     }
     parts.join("\n\n")
 }

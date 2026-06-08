@@ -111,7 +111,7 @@ impl PackRuntime for KnowledgePack {
             }
             "knowledge.stats" => KnowledgeHandlers::stats(&self.runtime, token, params).await,
             "knowledge.index" => {
-                KnowledgeHandlers::index(&self.runtime, token, params, &self.ann).await
+                KnowledgeHandlers::index(&self.runtime, token, params, &self.ann, None).await
             }
             "knowledge.fold" => KnowledgeHandlers::fold(&self.runtime, token, params).await,
             "knowledge.search" => {
@@ -120,7 +120,9 @@ impl PackRuntime for KnowledgePack {
             "knowledge.suggest" => {
                 KnowledgeHandlers::suggest(&self.runtime, token, params, &self.ann).await
             }
-            "knowledge.compose" => KnowledgeHandlers::compose(&self.runtime, token, params).await,
+            "knowledge.compose" => {
+                KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann).await
+            }
             "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
             "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,
             "knowledge.challenge" => {

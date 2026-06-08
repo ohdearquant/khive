@@ -274,6 +274,10 @@ pub(crate) struct ComposeParams {
     #[serde(default)]
     pub atom_ids: Option<Vec<String>>,
     pub query: String,
+    #[serde(default)]
+    pub auto_limit: Option<usize>,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 // ── edit ─────────────────────────────────────────────────────────────────────
