@@ -971,6 +971,43 @@ async fn rerank_text_items(
     Ok(())
 }
 
+fn format_section_compose_markdown(
+    query: &str,
+    domains: &[Domain],
+    atoms: &[Atom],
+    sections: &[super::compose::ComposeSectionResult],
+) -> String {
+    let mut out = String::from("# Knowledge Briefing\n\n");
+    out.push_str(&format!("Query: {query}\n"));
+
+    let mut by_atom: HashMap<&str, Vec<&super::compose::ComposeSectionResult>> = HashMap::new();
+    for s in sections {
+        by_atom.entry(s.atom_id.as_str()).or_default().push(s);
+    }
+
+    for atom in atoms {
+        let atom_id = atom.id.to_string();
+        if let Some(secs) = by_atom.get(atom_id.as_str()) {
+            out.push_str(&format!("\n## {}\n\n", atom.name));
+            out.push_str(&format!("Source: {}\n", atom.slug));
+            for s in secs {
+                out.push_str(&format!("\n### {} (score: {:.4})\n\n", s.heading, s.score));
+                if !s.content.is_empty() {
+                    out.push_str(&s.content);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    if !domains.is_empty() {
+        out.push_str("\n---\n\nDomains: ");
+        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
+        out.push_str(&names.join(", "));
+        out.push('\n');
+    }
+    out
+}
+
 fn format_compose_markdown(query: &str, domains: &[Domain], atoms: &[(&Atom, f32)]) -> String {
     let mut out = String::from("# Knowledge Briefing\n\n");
     out.push_str(&format!("Query: {query}\n"));
@@ -1269,17 +1306,118 @@ impl KnowledgeHandlers {
 
         rerank_text_items(runtime, &raw_query, &mut items).await?;
 
-        let sorted_atoms: Vec<(&Atom, f32)> = items
+        let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
+        let atom_cosine_scores: HashMap<String, f32> = items
             .iter()
-            .filter_map(|item| {
-                ordered_atoms
-                    .iter()
-                    .find(|a| a.id.to_string() == item.id)
-                    .map(|a| (a, item.score))
-            })
+            .map(|item| (item.id.clone(), item.score))
             .collect();
 
-        let markdown = format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms);
+        let section_map = super::compose::load_section_embeddings(runtime, &ns, &atom_ids).await?;
+
+        let has_sections = !section_map.is_empty();
+
+        let section_results = if has_sections {
+            let domain_member_ids: HashSet<String> = member_slugs
+                .iter()
+                .filter_map(|slug| {
+                    ordered_atoms
+                        .iter()
+                        .find(|a| a.slug == *slug)
+                        .map(|a| a.id.to_string())
+                })
+                .collect();
+
+            let domain_scores: HashMap<String, f32> = ordered_atoms
+                .iter()
+                .map(|a| {
+                    let id = a.id.to_string();
+                    let score = if domain_member_ids.contains(&id) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    (id, score)
+                })
+                .collect();
+
+            let section_state = khive_brain_core::SectionPosteriorState::default();
+            let type_weights: HashMap<String, f32> = section_state
+                .deterministic_weights()
+                .into_iter()
+                .map(|(st, w)| (st.as_str().to_string(), w as f32))
+                .collect();
+
+            let q_emb = runtime
+                .embed_batch(std::slice::from_ref(&raw_query))
+                .await
+                .ok()
+                .and_then(|mut v| {
+                    if v.len() == 1 {
+                        Some(v.remove(0))
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(qe) = q_emb {
+                super::compose::score_sections(
+                    &raw_query,
+                    &qe,
+                    &atom_cosine_scores,
+                    &section_map,
+                    &domain_scores,
+                    &type_weights,
+                    &super::compose::ComposeScoreWeights::default(),
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (markdown, section_json) = if !section_results.is_empty() {
+            let md = format_section_compose_markdown(
+                &raw_query,
+                &resolved_domains,
+                &ordered_atoms,
+                &section_results,
+            );
+            let sj: Vec<Value> = section_results
+                .iter()
+                .map(|s| {
+                    json!({
+                        "section_id": s.section_id,
+                        "atom_id": s.atom_id,
+                        "section_type": s.section_type,
+                        "heading": s.heading,
+                        "score": (s.score * 10000.0).round() / 10000.0,
+                        "breakdown": {
+                            "section_cosine": (s.score_breakdown.section_cosine * 10000.0).round() / 10000.0,
+                            "section_bm25": (s.score_breakdown.section_bm25 * 10000.0).round() / 10000.0,
+                            "atom_cosine": (s.score_breakdown.atom_cosine * 10000.0).round() / 10000.0,
+                            "domain_score": (s.score_breakdown.domain_score * 10000.0).round() / 10000.0,
+                            "type_weight": (s.score_breakdown.type_weight * 10000.0).round() / 10000.0,
+                        },
+                    })
+                })
+                .collect();
+            (md, sj)
+        } else {
+            let sorted_atoms: Vec<(&Atom, f32)> = items
+                .iter()
+                .filter_map(|item| {
+                    ordered_atoms
+                        .iter()
+                        .find(|a| a.id.to_string() == item.id)
+                        .map(|a| (a, item.score))
+                })
+                .collect();
+            (
+                format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms),
+                Vec::new(),
+            )
+        };
 
         let atom_json: Vec<Value> = items
             .iter()
@@ -1300,15 +1438,21 @@ impl KnowledgeHandlers {
 
         let count = atom_json.len();
 
+        let mut data = json!({
+            "query": raw_query,
+            "markdown": markdown,
+            "domains": domain_json,
+            "atoms": atom_json,
+            "count": count,
+        });
+        if !section_json.is_empty() {
+            data["sections"] = json!(section_json);
+            data["section_count"] = json!(section_json.len());
+        }
+
         Ok(json!({
             "status": "ok",
-            "data": {
-                "query": raw_query,
-                "markdown": markdown,
-                "domains": domain_json,
-                "atoms": atom_json,
-                "count": count,
-            },
+            "data": data,
         }))
     }
 }
