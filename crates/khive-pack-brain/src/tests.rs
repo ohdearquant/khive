@@ -1157,6 +1157,7 @@ async fn brain_reset_accepts_empty_params() {
 #[tokio::test]
 async fn test_355_posteriors_update_after_dispatch_via_hook() {
     let (pack, _rt) = make_pack();
+    pack.activate_namespace_for_test("local");
     let before = pack.snapshot();
     let tmp_alpha_before = before.balanced_recall.temporal.alpha();
     let tmp_beta_before = before.balanced_recall.temporal.beta();

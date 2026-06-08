@@ -82,6 +82,14 @@ impl BrainPack {
         }
     }
 
+    #[doc(hidden)]
+    pub fn activate_namespace_for_test(&self, namespace: &str) {
+        self.persistence
+            .lock()
+            .unwrap()
+            .mark_loaded(namespace.into());
+    }
+
     pub(crate) async fn ensure_loaded(&self, token: &NamespaceToken) -> Result<(), RuntimeError> {
         persist::ensure_loaded(
             &self.runtime,

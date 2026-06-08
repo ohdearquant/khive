@@ -1364,20 +1364,23 @@ pub(crate) async fn resolve_auto_feedback_target(
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
-        // Brain observes pack events only — it must never process its own
-        // state-transition events. Skipping brain.* verbs here prevents
-        // double-counting: handle_feedback already calls apply_signal directly,
-        // so the hook firing afterward would increment total_events a second time.
         if view.event.verb.starts_with("brain.") {
+            return;
+        }
+
+        let _gate = self.dispatch_gate.lock().await;
+
+        let active_ns = {
+            let tracker = self.persistence.lock().unwrap();
+            tracker.active_namespace.clone()
+        };
+        if active_ns.as_deref() != Some(&view.event.namespace) {
             return;
         }
 
         let signal = interpret(&view.event);
         let mut state = self.state.lock().unwrap();
         state.balanced_recall.apply_signal(&signal);
-
-        // Sync profile record after every hook fire so that brain.profile
-        // reflects the live total_events and state_snapshot.
         sync_balanced_recall_record(&mut state);
     }
 }

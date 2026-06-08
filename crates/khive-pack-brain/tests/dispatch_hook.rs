@@ -17,6 +17,7 @@ async fn brain_pack_dispatch_hook_records_real_dispatch_events() {
     // register it as a hook AND hold a reference to read its state afterward.
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let brain = Arc::new(BrainPack::new(rt.clone()));
+    brain.activate_namespace_for_test("local");
 
     let baseline = brain.snapshot();
 
