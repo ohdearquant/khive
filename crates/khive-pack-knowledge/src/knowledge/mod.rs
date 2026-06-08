@@ -5,6 +5,7 @@ pub(crate) mod schema;
 pub(crate) mod section_feedback;
 pub(crate) mod vamana;
 
+mod compose;
 mod crud;
 mod fold_handler;
 mod index_handler;
