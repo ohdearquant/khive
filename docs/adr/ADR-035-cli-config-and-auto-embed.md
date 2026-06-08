@@ -141,7 +141,10 @@ is valid TOML but will be warned against at startup: device selection should not
 ## CLI / env / config precedence
 
 For each runtime option, precedence is:
-**CLI flag > `KHIVE_*` env var > project khive.toml > global khive.toml > built-in default**.
+**CLI flag > project khive.toml > global khive.toml > `KHIVE_*` env var > built-in default**.
+A `KHIVE_*` env var is only a fallback default — when a TOML key resolves at either level it
+wins over the env var. This matches the runtime config loader (`engine_config.rs`) and the
+config docs (`docs/khive-config-example.toml`).
 
 | Option             | CLI flag          | Env var                  | Config key                | Default           |
 | ------------------ | ----------------- | ------------------------ | ------------------------- | ----------------- |
@@ -180,7 +183,7 @@ brain_profile = "project-recall-v1"
 1. **Explicit profile in config**: if `runtime.brain_profile` / `KHIVE_BRAIN_PROFILE` /
    `--brain-profile` resolves to a non-empty string, that profile ID is used directly.
 2. **Namespace-bound profile**: if no explicit profile is set but a namespace is configured,
-   the feedback handler calls `brain.resolve(consumer_kind="memory.recall")` for that
+   the feedback handler calls `brain.resolve(consumer_kind="recall")` for that
    namespace and uses the resolved profile.
 3. **Global tuning prior**: if neither explicit nor namespace-bound profile resolves, the
    pack-local in-memory state (`BalancedRecallState` for memory, `SectionPosteriorState` for
