@@ -224,7 +224,10 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
             .inner
             .read()
             .map_err(|e| FoldError::LockPoisoned(e.to_string()))?;
-        Ok(guard.keys().cloned().collect())
+        // Sort so callers get a stable, deterministic order regardless of HashMap seed.
+        let mut keys: Vec<String> = guard.keys().cloned().collect();
+        keys.sort();
+        Ok(keys)
     }
 }
 
@@ -430,5 +433,20 @@ mod tests {
         }
         let ids = store.list().unwrap();
         assert_eq!(ids.len(), n, "expected {n} checkpoints, got {}", ids.len());
+    }
+
+    /// list() must return keys in lexicographic order regardless of HashMap
+    /// insertion order or HashMap seed across processes.
+    #[test]
+    fn list_is_sorted() {
+        let store: InMemoryCheckpointStore<String> = InMemoryCheckpointStore::new();
+        // Insert in non-alphabetical order.
+        store.save(sample_checkpoint("z:ckpt-1", 1)).unwrap();
+        store.save(sample_checkpoint("a:ckpt-1", 2)).unwrap();
+        store.save(sample_checkpoint("m:ckpt-1", 3)).unwrap();
+        let ids = store.list().unwrap();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(ids, expected, "list() must return sorted keys");
     }
 }

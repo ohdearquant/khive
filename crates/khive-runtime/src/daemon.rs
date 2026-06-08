@@ -269,6 +269,9 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let shutdown = async {
+        // REASON: signal handler registration can only fail if the global Tokio runtime
+        // is not running or the OS rejects the signal number — both are unrecoverable
+        // at this point in startup, so panic is the correct response.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("install SIGTERM handler");
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())

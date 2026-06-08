@@ -268,6 +268,8 @@ pub async fn ensure_loaded(
     };
 
     let new_state = {
+        // Lock order: tracker → state (always in this sequence).
+        // Reversing this order anywhere would risk deadlock; do not change.
         let mut t = tracker.lock().unwrap();
         let current_ns = t.active_namespace.clone();
         let current_state = state.lock().unwrap();

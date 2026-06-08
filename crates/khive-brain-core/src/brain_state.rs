@@ -161,13 +161,18 @@ impl BrainState {
             }
         }
 
-        self.profiles.values().find_map(|p| {
-            if p.consumer_kind == consumer_kind && p.lifecycle == ProfileLifecycle::Active {
-                Some((p, p.consumer_kind.clone()))
-            } else {
-                None
-            }
-        })
+        // Sort by (created_at, id) before selecting so the fallback profile is
+        // deterministic across processes regardless of HashMap's randomised seed.
+        let mut candidates: Vec<&ProfileRecord> = self
+            .profiles
+            .values()
+            .filter(|p| p.consumer_kind == consumer_kind && p.lifecycle == ProfileLifecycle::Active)
+            .collect();
+        candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        candidates
+            .into_iter()
+            .next()
+            .map(|p| (p, p.consumer_kind.clone()))
     }
 }
 
@@ -229,4 +234,67 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::profile::ProfileLifecycle;
+
+    fn make_profile(id: &str, consumer_kind: &str, ts_secs: i64) -> ProfileRecord {
+        ProfileRecord {
+            id: id.to_owned(),
+            description: String::new(),
+            consumer_kind: consumer_kind.to_owned(),
+            state_class: "Bayesian".into(),
+            lifecycle: ProfileLifecycle::Active,
+            created_at: Utc.timestamp_opt(ts_secs, 0).unwrap(),
+            state_snapshot: None,
+            total_events: 0,
+            exploration_epoch: 0,
+        }
+    }
+
+    /// Same state must always select the same fallback profile regardless of
+    /// the order in which profiles were inserted into the HashMap.
+    #[test]
+    fn resolve_fallback_is_deterministic() {
+        // Build two BrainState instances with the same profiles inserted in
+        // different orders.  Both must resolve to the same (earliest created_at,
+        // then lowest id) profile.
+        let p_early = make_profile("alpha", "recall", 1_000);
+        let p_later = make_profile("zeta", "recall", 2_000);
+
+        let mut state_a = BrainState {
+            profiles: HashMap::new(),
+            balanced_recall: BalancedRecallState::new(8),
+            profile_states: HashMap::new(),
+            bindings: Vec::new(),
+            section_states: HashMap::new(),
+        };
+        state_a.profiles.insert(p_early.id.clone(), p_early.clone());
+        state_a.profiles.insert(p_later.id.clone(), p_later.clone());
+
+        let mut state_b = BrainState {
+            profiles: HashMap::new(),
+            balanced_recall: BalancedRecallState::new(8),
+            profile_states: HashMap::new(),
+            bindings: Vec::new(),
+            section_states: HashMap::new(),
+        };
+        // Insert in the opposite order.
+        state_b.profiles.insert(p_later.id.clone(), p_later.clone());
+        state_b.profiles.insert(p_early.id.clone(), p_early.clone());
+
+        let result_a = state_a.resolve(None, None, "recall");
+        let result_b = state_b.resolve(None, None, "recall");
+
+        // Both must resolve to the earliest-created profile ("alpha").
+        let id_a = result_a.map(|p| p.id.clone());
+        let id_b = result_b.map(|p| p.id.clone());
+        assert_eq!(id_a, Some("alpha".to_owned()));
+        assert_eq!(id_a, id_b, "fallback resolution must be deterministic");
+    }
 }
