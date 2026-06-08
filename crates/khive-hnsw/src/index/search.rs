@@ -1,3 +1,5 @@
+//! HNSW greedy search — beam search across graph layers to find approximate nearest neighbors.
+
 use crate::NodeId;
 use khive_score::DeterministicScore;
 

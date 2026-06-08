@@ -24,6 +24,7 @@ pub enum VectorCommand {
     Sweep(VectorSweepArgs),
 }
 
+/// CLI arguments for `kkernel vector capabilities`.
 #[derive(clap::Parser, Debug)]
 pub struct VectorCapabilitiesArgs {
     /// Print human-readable output instead of JSON.

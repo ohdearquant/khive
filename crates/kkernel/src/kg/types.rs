@@ -7,6 +7,7 @@ use serde::Serialize;
 
 // ── Subcommand tree ────────────────────────────────────────────────────────────
 
+/// Subcommands for `kkernel kg` — KG validation, sync, import/export, and hook management.
 #[derive(Subcommand, Debug)]
 pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
@@ -90,6 +91,7 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// CLI arguments for `kkernel kg init`.
 #[derive(clap::Parser, Debug)]
 pub struct InitArgs {
     /// Repository root to initialize.
@@ -105,6 +107,7 @@ pub struct InitArgs {
     pub add_hooks: bool,
 }
 
+/// CLI arguments for `kkernel kg fetch` (alias: `sync`).
 #[derive(clap::Parser, Debug)]
 pub struct FetchArgs {
     /// Remote name, used for cache path `.khive/kg/remotes/<remote>`.
@@ -135,6 +138,7 @@ pub struct FetchArgs {
     pub repin: bool,
 }
 
+/// CLI arguments for `kkernel kg export`.
 #[derive(clap::Parser, Debug)]
 pub struct ExportArgs {
     /// Output archive JSON path.
@@ -149,6 +153,7 @@ pub struct ExportArgs {
     pub namespace: String,
 }
 
+/// CLI arguments for `kkernel kg import`.
 #[derive(clap::Parser, Debug)]
 pub struct ImportArgs {
     /// Source archive or adapter input file.
@@ -171,6 +176,7 @@ pub struct ImportArgs {
     pub verbose: bool,
 }
 
+/// Supported input formats for `kkernel kg import`.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportFormat {
     Archive,
@@ -178,6 +184,7 @@ pub enum ImportFormat {
     Ndjson,
 }
 
+/// CLI arguments for `kkernel kg status`.
 #[derive(clap::Parser, Debug)]
 pub struct StatusArgs {
     /// Repository root containing `.khive/kg/{entities,edges}.ndjson`.
@@ -193,6 +200,7 @@ pub struct StatusArgs {
     pub namespace: String,
 }
 
+/// Subcommands for `kkernel kg hook` — install, remove, and check the pre-commit hook.
 #[derive(Subcommand, Debug)]
 pub enum HookCommand {
     /// Create `.git/hooks/pre-commit` symlink pointing to the tracked hook.
@@ -229,6 +237,7 @@ pub struct ValidationReport {
     pub summary: ValidationSummary,
 }
 
+/// Result for a single validation rule in a `kkernel kg validate` run.
 #[derive(Debug, Serialize)]
 pub struct RuleResult {
     pub id: String,
@@ -237,6 +246,7 @@ pub struct RuleResult {
     pub violations: Vec<Violation>,
 }
 
+/// A single rule violation with location metadata and a fixability flag.
 #[derive(Debug, Serialize)]
 pub struct Violation {
     pub entity_id: Option<String>,
@@ -248,6 +258,7 @@ pub struct Violation {
     pub fixable: bool,
 }
 
+/// Aggregate counts from a `kkernel kg validate` run.
 #[derive(Debug, Serialize)]
 pub struct ValidationSummary {
     pub errors: usize,

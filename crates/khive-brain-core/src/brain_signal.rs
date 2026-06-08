@@ -12,14 +12,13 @@ use crate::{FeedbackEventKind, FeedbackSignal, SectionType};
 /// `BalancedRecallState::apply_signal` and `SectionPosteriorState::apply_signal`.
 #[derive(Debug, Clone)]
 pub enum BrainSignal {
-    RecallHit {
-        target_id: Uuid,
-        latency_us: i64,
-    },
+    /// A memory or entity was returned and confirmed relevant by the caller.
+    RecallHit { target_id: Uuid, latency_us: i64 },
+    /// A recall query returned no results for the given criteria.
     RecallMiss,
-    SearchCompleted {
-        latency_us: i64,
-    },
+    /// A hybrid search operation completed; used to update latency priors.
+    SearchCompleted { latency_us: i64 },
+    /// An explicit feedback signal from the caller for a specific record.
     Feedback {
         target_id: Uuid,
         signal: FeedbackSignal,
@@ -28,6 +27,7 @@ pub enum BrainSignal {
         served_by_profile_id: Option<String>,
         section_signals: Option<HashMap<SectionType, FeedbackSignal>>,
     },
+    /// An implicit semantic feedback signal derived from user interaction patterns.
     SemanticFeedback {
         target_id: Uuid,
         event_kind: FeedbackEventKind,
@@ -35,9 +35,9 @@ pub enum BrainSignal {
         #[allow(dead_code)]
         served_by_profile_id: Option<String>,
     },
-    NoteAccessed {
-        target_id: Uuid,
-    },
+    /// A note record was accessed; counts as a positive signal for its entity.
+    NoteAccessed { target_id: Uuid },
+    /// Event did not produce a useful signal and should be discarded.
     Irrelevant,
 }
 

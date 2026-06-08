@@ -1,3 +1,5 @@
+//! Internal node storage for the HNSW graph — dense `Vec<HnswNode>` with per-layer neighbor lists.
+
 /// Internal node in the HNSW graph.
 ///
 /// Nodes are stored in a dense `Vec<HnswNode>` indexed by an internal `usize` ID.

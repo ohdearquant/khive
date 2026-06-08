@@ -1,9 +1,6 @@
-//! khive-pack-schedule — Schedule pack: stores time-triggered reminders and verb dispatches.
+//! Schedule pack — `schedule.remind`, `schedule.schedule`, `schedule.agenda`, `schedule.cancel`.
 //!
-//! The pack exposes four verbs: `schedule.remind`, `schedule.schedule`,
-//! `schedule.agenda`, and `schedule.cancel`. All operate on `scheduled_event`
-//! notes. Trigger evaluation is the execution environment's responsibility —
-//! the pack stores intent only.
+//! All verbs operate on `scheduled_event` notes; trigger evaluation is the execution environment's responsibility.
 pub mod handlers;
 mod pack;
 mod tests;

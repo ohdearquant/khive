@@ -393,6 +393,7 @@ impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
     }
 }
 
+/// Payload for the `ProposalCreated` event — captures the full initial proposal state.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProposalCreatedPayload {
@@ -493,6 +494,7 @@ mod serde_opt_opt {
     }
 }
 
+/// The set of KG mutations a proposal intends to apply atomically.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -649,6 +651,7 @@ pub enum ProposalChangeset {
     },
 }
 
+/// Payload for the `ProposalReviewed` event — records a single reviewer's decision.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProposalReviewedPayload {
@@ -688,6 +691,7 @@ impl ProposalDecision {
     }
 }
 
+/// Payload for the `ProposalApplied` event — records the outcome of the apply attempt.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProposalAppliedPayload {
@@ -697,6 +701,7 @@ pub struct ProposalAppliedPayload {
     pub result: ApplyResult,
 }
 
+/// Outcome of applying a proposal: either all steps succeeded or the apply failed with an error.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -710,6 +715,7 @@ pub enum ApplyResult {
     },
 }
 
+/// Payload for the `ProposalWithdrawn` event — records who withdrew and an optional reason.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProposalWithdrawnPayload {

@@ -18,11 +18,13 @@ pub trait PackTunable: PackRuntime {
     fn apply_config(&self, config: Value) -> Result<(), RuntimeError>;
 }
 
+/// A collection of named parameters with Beta priors and bounds, exposed to brain auto-tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParameterSpace {
     pub parameters: Vec<ParameterDef>,
 }
 
+/// A single tunable parameter with a Beta prior and a `[min, max]` bounds range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParameterDef {
     pub name: String,
@@ -32,6 +34,7 @@ pub struct ParameterDef {
 }
 
 impl ParameterDef {
+    /// Return the Beta prior as a `BetaPosterior` with the configured `alpha` and `beta`.
     pub fn prior(&self) -> BetaPosterior {
         BetaPosterior::new(self.prior_alpha, self.prior_beta)
     }

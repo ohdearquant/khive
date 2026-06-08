@@ -1,3 +1,5 @@
+//! Criterion benchmarks for Vamana index build, search, snapshot round-trip, and distance primitives.
+
 use criterion::measurement::WallTime;
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
 use khive_vamana::distance::{cosine_from_l2sq, try_l2_squared};

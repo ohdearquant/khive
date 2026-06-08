@@ -48,6 +48,7 @@ pub struct EngineListArgs {
     pub db: Option<PathBuf>,
 }
 
+/// CLI arguments for `kkernel engine status`.
 #[derive(clap::Parser, Debug)]
 pub struct EngineStatusArgs {
     /// Engine name to inspect (e.g. `mE5-small`).
@@ -62,6 +63,7 @@ pub struct EngineStatusArgs {
     pub db: Option<PathBuf>,
 }
 
+/// CLI arguments for `kkernel engine migrate`.
 #[derive(clap::Parser, Debug)]
 pub struct EngineMigrateArgs {
     /// Engine name to migrate (e.g. `mE5-small`).
@@ -84,6 +86,7 @@ pub struct EngineMigrateArgs {
     pub db: Option<PathBuf>,
 }
 
+/// CLI arguments for `kkernel engine drift-check`.
 #[derive(clap::Parser, Debug)]
 pub struct EngineDriftCheckArgs {
     /// Engine name to inspect (e.g. `mE5-small`).
@@ -116,6 +119,7 @@ pub struct EngineModelRecord {
     pub superseded_at: Option<i64>,
 }
 
+/// Active status for a single embedding engine, including any in-progress migration.
 #[derive(Debug, Serialize)]
 pub struct EngineStatus {
     pub engine_name: String,

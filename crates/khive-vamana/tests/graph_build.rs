@@ -1,3 +1,5 @@
+//! Integration tests for Vamana graph construction — covers valid builds, empty/small cases, and error paths.
+
 use khive_vamana::{VamanaConfig, VamanaError, VamanaGraph};
 use rand::{prelude::*, SeedableRng};
 

@@ -15,6 +15,7 @@ use std::collections::HashSet;
 ///
 /// Implementations provide the parent chain for a given snapshot ID.
 pub trait SnapshotReader: Send + Sync {
+    /// Return the parent snapshot ID for `id`, or `None` if `id` is a root.
     fn parent_of(&self, id: &str) -> Option<String>;
 }
 

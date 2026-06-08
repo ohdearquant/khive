@@ -1,10 +1,3 @@
-// REASON: format_args! inlining would break compatibility with older Rust toolchains in CI
-#![allow(clippy::uninlined_format_args)]
-// REASON: field_reassign_with_default is needed by the shadow-validation builder pattern in persist
-#![allow(clippy::field_reassign_with_default)]
-// REASON: benchmark helpers use hand-tuned constants close to Rust built-ins (e.g. 1.0/3.0)
-#![allow(clippy::approx_constant)]
-
 //! Hybrid search and ranking with deterministic scoring for khive.
 //!
 //! Combines HNSW vector search, BM25 keyword search, and RRF fusion into a unified
@@ -14,6 +7,12 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+// REASON: format_args! inlining would break compatibility with older Rust toolchains in CI
+#![allow(clippy::uninlined_format_args)]
+// REASON: field_reassign_with_default is needed by the shadow-validation builder pattern in persist
+#![allow(clippy::field_reassign_with_default)]
+// REASON: benchmark helpers use hand-tuned constants close to Rust built-ins (e.g. 1.0/3.0)
+#![allow(clippy::approx_constant)]
 
 #[cfg(feature = "storage-adapters")]
 pub mod adapters;
