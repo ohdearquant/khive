@@ -51,27 +51,32 @@ fn seed_events(fixture: &Fixture, n: usize) {
 // ── remind ────────────────────────────────────────────────────────────────────
 
 fn bench_remind(c: &mut Criterion) {
-    let fixture = build_fixture();
     let mut group = c.benchmark_group("schedule");
     group.sample_size(50);
 
+    // Use iter_batched with a fresh fixture per batch so the measured
+    // dispatch always writes into an empty store (no growing-store drift).
     group.bench_function("remind", |b| {
-        b.to_async(&fixture.rt).iter(|| {
-            let registry = &fixture.registry;
-            async move {
-                let result = registry
-                    .dispatch(
-                        "schedule.remind",
-                        black_box(json!({
-                            "content": "benchmark reminder",
-                            "at": "2199-01-01T00:00:00Z"
-                        })),
-                    )
-                    .await
-                    .expect("remind ok");
-                black_box(result)
-            }
-        });
+        b.iter_batched(
+            build_fixture,
+            |fixture| {
+                fixture.rt.block_on(async {
+                    let result = fixture
+                        .registry
+                        .dispatch(
+                            "schedule.remind",
+                            black_box(json!({
+                                "content": "benchmark reminder",
+                                "at": "2199-01-01T00:00:00Z"
+                            })),
+                        )
+                        .await
+                        .expect("remind ok");
+                    black_box(result)
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();

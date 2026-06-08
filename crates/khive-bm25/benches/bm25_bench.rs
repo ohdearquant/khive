@@ -1,5 +1,7 @@
 use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
+use criterion::{
+    criterion_group, criterion_main, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
+};
 use khive_bm25::{Bm25Config, Bm25Index, SearchContext};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -370,11 +372,16 @@ fn bench_single_insert(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("words", words), &words, |b, &words| {
             let mut rng = StdRng::seed_from_u64(99);
             let doc = gen_doc(&mut rng, words);
-            b.iter(|| {
-                let mut idx = base.clone();
-                idx.index_document("bench-doc", black_box(&doc)).unwrap();
-                black_box(idx)
-            });
+            // Setup: clone the pre-built base index outside the measured path.
+            // Only the single index_document call is timed.
+            b.iter_batched(
+                || base.clone(),
+                |mut idx| {
+                    idx.index_document("bench-doc", black_box(&doc)).unwrap();
+                    black_box(idx)
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 
@@ -492,14 +499,19 @@ fn bench_remove_document(c: &mut Criterion) {
     let mut group: BenchmarkGroup<WallTime> = c.benchmark_group("remove_document");
     group.sample_size(50);
 
+    // Setup: build the 1K index outside the measured path so only the
+    // 100 remove_document calls are timed, not index construction.
     group.bench_function("1k_corpus", |b| {
-        b.iter(|| {
-            let mut idx = build_index(1_000, 200);
-            for i in 0..100 {
-                black_box(idx.remove_document(black_box(&format!("doc{i}"))));
-            }
-            black_box(idx)
-        });
+        b.iter_batched(
+            || build_index(1_000, 200),
+            |mut idx| {
+                for i in 0..100 {
+                    black_box(idx.remove_document(black_box(&format!("doc{i}"))));
+                }
+                black_box(idx)
+            },
+            BatchSize::LargeInput,
+        );
     });
 
     group.finish();
