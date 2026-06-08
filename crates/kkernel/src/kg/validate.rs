@@ -1,15 +1,61 @@
 //! `kkernel kg validate` — structural and configurable rule-pass validation.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use khive_storage::EdgeRelation;
-use khive_types::EntityKind;
+use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde::Deserialize;
 
 use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
+
+/// Taxonomy sets derived from the loaded pack registry.
+struct KgTaxonomy {
+    entity_kinds: HashSet<String>,
+    note_kinds: HashSet<String>,
+}
+
+/// Build the merged entity-kind and note-kind sets from all registered packs.
+///
+/// Mirrors the `build_registry()` pattern in `pack_introspect`. No DB is
+/// opened — only pack metadata is needed.
+fn build_taxonomy() -> Result<KgTaxonomy> {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
+            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
+        embedding_model: None,
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).context("building taxonomy registry")?;
+    let mut builder = VerbRegistryBuilder::new();
+    let names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
+        .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
+    let registry = builder.build().context("building VerbRegistry")?;
+
+    let entity_kinds = registry
+        .all_entity_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let note_kinds = registry
+        .all_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    Ok(KgTaxonomy {
+        entity_kinds,
+        note_kinds,
+    })
+}
 
 pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
     let kg_dir = args.repo.join(".khive/kg");
@@ -22,13 +68,16 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
 
     let entities_path = kg_dir.join("entities.ndjson");
     let edges_path = kg_dir.join("edges.ndjson");
+    let notes_path = kg_dir.join("notes.ndjson");
 
     let entities = count_ndjson_lines(&entities_path).unwrap_or(0);
     let edges = count_ndjson_lines(&edges_path).unwrap_or(0);
 
     let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.toml"));
 
-    let mut rule_results: Vec<RuleResult> = structural_checks(&entities_path, &edges_path);
+    let taxonomy = build_taxonomy()?;
+    let mut rule_results: Vec<RuleResult> =
+        structural_checks(&entities_path, &edges_path, &notes_path, &taxonomy);
 
     if !args.no_rules && rules_path.exists() {
         let configurable = configurable_rule_checks(&entities_path, &edges_path, &rules_path)?;
@@ -92,39 +141,70 @@ fn count_ndjson_lines(path: &Path) -> Option<usize> {
     Some(content.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
-fn structural_checks(entities_path: &Path, edges_path: &Path) -> Vec<RuleResult> {
-    vec![
+fn structural_checks(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    taxonomy: &KgTaxonomy,
+) -> Vec<RuleResult> {
+    let mut results = vec![
         check_no_duplicate_uuids(entities_path),
         check_sort_order(entities_path, edges_path),
         check_referential_integrity(entities_path, edges_path),
-        check_valid_entity_kinds(entities_path),
+        check_valid_entity_kinds(entities_path, &taxonomy.entity_kinds),
         check_valid_edge_relations(edges_path),
-    ]
+    ];
+    if notes_path.exists() {
+        results.push(check_valid_note_kinds(notes_path, &taxonomy.note_kinds));
+    }
+    results
 }
 
-fn check_valid_entity_kinds(entities_path: &Path) -> RuleResult {
+/// Format a record identifier prefix from the available violation fields.
+///
+/// Produces `"[id name]"` when both are present, `"[id]"` or `"[name]"` when
+/// only one is available, and `""` when neither is set.
+fn record_prefix(entity_id: Option<&str>, entity_name: Option<&str>) -> String {
+    match (entity_id, entity_name) {
+        (Some(id), Some(name)) => format!("[{id} {name:?}] "),
+        (Some(id), None) => format!("[{id}] "),
+        (None, Some(name)) => format!("[{name:?}] "),
+        (None, None) => String::new(),
+    }
+}
+
+fn check_valid_entity_kinds(entities_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+    let valid_list = {
+        let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v.join(" | ")
+    };
     let mut violations = Vec::new();
 
     if let Ok(content) = std::fs::read_to_string(entities_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(kind_str) = v.get("kind").and_then(|k| k.as_str()) {
-                    if kind_str.parse::<EntityKind>().is_err() {
+                    if !valid_kinds.contains(kind_str) {
                         let id = v
                             .get("id")
                             .and_then(|i| i.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
+                        let prefix = record_prefix(
+                            if id.is_empty() { None } else { Some(&id) },
+                            name.as_deref(),
+                        );
                         violations.push(Violation {
                             entity_id: if id.is_empty() { None } else { Some(id) },
-                            entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                            entity_name: name,
                             entity_kind: Some(kind_str.to_string()),
                             rule_id: "valid-entity-kinds".into(),
                             severity: "error",
                             message: format!(
-                                "unknown entity_kind: {kind_str:?}. \
-                                 Valid: concept | document | dataset | project | \
-                                 person | org | artifact | service"
+                                "{prefix}unknown entity_kind: {kind_str:?}. \
+                                 Valid: {valid_list}"
                             ),
                             fixable: false,
                         });
@@ -142,7 +222,63 @@ fn check_valid_entity_kinds(entities_path: &Path) -> RuleResult {
     }
 }
 
+fn check_valid_note_kinds(notes_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+    let valid_list = {
+        let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v.join(" | ")
+    };
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(notes_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(kind_str) = v.get("kind").and_then(|k| k.as_str()) {
+                    if !valid_kinds.contains(kind_str) {
+                        let id = v
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
+                        let prefix = record_prefix(
+                            if id.is_empty() { None } else { Some(&id) },
+                            name.as_deref(),
+                        );
+                        violations.push(Violation {
+                            entity_id: if id.is_empty() { None } else { Some(id) },
+                            entity_name: name,
+                            entity_kind: Some(kind_str.to_string()),
+                            rule_id: "valid-note-kinds".into(),
+                            severity: "error",
+                            message: format!(
+                                "{prefix}unknown note_kind: {kind_str:?}. \
+                                 Valid: {valid_list}"
+                            ),
+                            fixable: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "valid-note-kinds".into(),
+        severity: "error",
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
 fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
+    use khive_storage::EdgeRelation;
+
+    let valid_list = {
+        let mut names = EdgeRelation::VALID_NAMES.to_vec();
+        names.sort_unstable();
+        names.join(" | ")
+    };
     let mut violations = Vec::new();
 
     if let Ok(content) = std::fs::read_to_string(edges_path) {
@@ -156,6 +292,28 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
                             .or_else(|| v.get("id").and_then(|i| i.as_str()))
                             .unwrap_or("")
                             .to_string();
+                        let src = v
+                            .get("source_id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let tgt = v
+                            .get("target_id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let id_display = if !edge_id.is_empty() {
+                            edge_id.clone()
+                        } else if !src.is_empty() && !tgt.is_empty() {
+                            format!("{src}→{tgt}")
+                        } else {
+                            String::new()
+                        };
+                        let prefix = if id_display.is_empty() {
+                            String::new()
+                        } else {
+                            format!("[{id_display}] ")
+                        };
                         violations.push(Violation {
                             entity_id: if edge_id.is_empty() {
                                 None
@@ -167,11 +325,8 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
                             rule_id: "valid-edge-relations".into(),
                             severity: "error",
                             message: format!(
-                                "unknown edge relation: {rel_str:?}. \
-                                 Valid: contains | part_of | instance_of | extends | \
-                                 variant_of | introduced_by | supersedes | derived_from | \
-                                 precedes | depends_on | enables | implements | \
-                                 competes_with | composed_with | annotates"
+                                "{prefix}unknown edge relation: {rel_str:?}. \
+                                 Valid: {valid_list}"
                             ),
                             fixable: false,
                         });
@@ -624,7 +779,13 @@ fn print_text_format(report: &ValidationReport, verbose: bool, quiet: bool) {
                     2.min(r.violations.len())
                 };
                 for v in &r.violations[..shown] {
-                    println!("    - {}", v.message);
+                    let prefix = record_prefix(v.entity_id.as_deref(), v.entity_name.as_deref());
+                    // Include record identifier when not already in the message.
+                    if prefix.is_empty() || v.message.starts_with(prefix.trim()) {
+                        println!("    - {}", v.message);
+                    } else {
+                        println!("    - {}{}", prefix, v.message);
+                    }
                 }
                 if !verbose && r.violations.len() > 2 {
                     println!("    + {} more (run with --verbose)", r.violations.len() - 2);
@@ -660,6 +821,40 @@ mod tests {
 
     use super::*;
 
+    // ── Taxonomy helpers ──────────────────────────────────────────────────────
+
+    /// Build the real pack-registry taxonomy. Tests that need it call this once.
+    fn real_taxonomy() -> KgTaxonomy {
+        build_taxonomy().expect("build_taxonomy must succeed in test environment")
+    }
+
+    /// Minimal entity-kind set covering the 8 base kinds + `resource` (ADR-048).
+    fn base_entity_kinds() -> HashSet<String> {
+        [
+            "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
+            "resource",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Minimal note-kind set covering base KG kinds + pack additions.
+    fn base_note_kinds() -> HashSet<String> {
+        [
+            "observation",
+            "insight",
+            "question",
+            "decision",
+            "reference",
+            "task",
+            "memory",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
     fn make_kg_dir(tmp: &TempDir) -> PathBuf {
         let kg_dir = tmp.path().join(".khive/kg");
         std::fs::create_dir_all(&kg_dir).unwrap();
@@ -685,6 +880,17 @@ mod tests {
             .join("\n");
         std::fs::write(kg_dir.join("edges.ndjson"), content + "\n").unwrap();
     }
+
+    fn write_notes(kg_dir: &std::path::Path, notes: &[(&str, &str)]) {
+        let content: String = notes
+            .iter()
+            .map(|(id, kind)| format!(r#"{{"id":"{id}","kind":"{kind}"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(kg_dir.join("notes.ndjson"), content + "\n").unwrap();
+    }
+
+    // ── Entity kind tests ─────────────────────────────────────────────────────
 
     #[test]
     fn duplicate_uuid_detected() {
@@ -963,6 +1169,8 @@ message = "bad"
         assert!(result.passed, "sort-order should pass after fix");
     }
 
+    // ── [High] Entity-kind registry source of truth ───────────────────────────
+
     #[test]
     fn invalid_entity_kind_is_rejected() {
         let tmp = TempDir::new().unwrap();
@@ -974,7 +1182,8 @@ message = "bad"
                 ("bbbbbbbb-0000-0000-0000-000000000002", "nonsense", "B"),
             ],
         );
-        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"));
+        let kinds = base_entity_kinds();
+        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"), &kinds);
         assert!(!result.passed, "invalid entity kind must fail");
         assert_eq!(result.violations.len(), 1);
         assert!(
@@ -987,6 +1196,33 @@ message = "bad"
             "violation message should list valid kinds: {}",
             result.violations[0].message
         );
+    }
+
+    #[test]
+    fn resource_kind_is_accepted_as_pack_registered() {
+        // ADR-048: `resource` is registered by the KG pack and must not be rejected.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "resource", "R"),
+            ],
+        );
+        let taxonomy = real_taxonomy();
+        assert!(
+            taxonomy.entity_kinds.contains("resource"),
+            "VerbRegistry must include 'resource' from KG pack (ADR-048)"
+        );
+        let result =
+            check_valid_entity_kinds(&kg_dir.join("entities.ndjson"), &taxonomy.entity_kinds);
+        assert!(
+            result.passed,
+            "pack-registered kind 'resource' must pass; violations: {:?}",
+            result.violations
+        );
+        assert!(result.violations.is_empty());
     }
 
     #[test]
@@ -1006,10 +1242,207 @@ message = "bad"
                 ("22222222-0000-0000-0000-000000000008", "service", "H"),
             ],
         );
-        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"));
+        let kinds = base_entity_kinds();
+        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"), &kinds);
         assert!(result.passed, "all 8 canonical kinds must pass");
         assert!(result.violations.is_empty());
     }
+
+    // ── [High] Note-kind validation ───────────────────────────────────────────
+
+    #[test]
+    fn invalid_note_kind_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_notes(
+            &kg_dir,
+            &[("note-0001", "observation"), ("note-0002", "bogus_kind")],
+        );
+        let kinds = base_note_kinds();
+        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &kinds);
+        assert!(!result.passed, "invalid note kind must fail");
+        assert_eq!(result.violations.len(), 1);
+        assert!(
+            result.violations[0].message.contains("bogus_kind"),
+            "violation message should name the bad kind: {}",
+            result.violations[0].message
+        );
+        assert!(
+            result.violations[0].message.contains("observation"),
+            "violation message should list valid kinds: {}",
+            result.violations[0].message
+        );
+    }
+
+    #[test]
+    fn valid_note_kinds_all_pass() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_notes(
+            &kg_dir,
+            &[
+                ("note-0001", "observation"),
+                ("note-0002", "insight"),
+                ("note-0003", "question"),
+                ("note-0004", "decision"),
+                ("note-0005", "reference"),
+                ("note-0006", "task"),
+                ("note-0007", "memory"),
+            ],
+        );
+        let kinds = base_note_kinds();
+        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &kinds);
+        assert!(result.passed, "all registered note kinds must pass");
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn note_kind_task_is_accepted_as_pack_registered() {
+        // `task` is registered by the GTD pack — must be accepted by the registry check.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_notes(&kg_dir, &[("note-0001", "task")]);
+        let taxonomy = real_taxonomy();
+        assert!(
+            taxonomy.note_kinds.contains("task"),
+            "VerbRegistry must include 'task' from GTD pack"
+        );
+        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
+        assert!(
+            result.passed,
+            "pack-registered note kind 'task' must pass; violations: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn note_kind_memory_is_accepted_as_pack_registered() {
+        // `memory` is registered by the memory pack — must be accepted by the registry check.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_notes(&kg_dir, &[("note-0001", "memory")]);
+        let taxonomy = real_taxonomy();
+        assert!(
+            taxonomy.note_kinds.contains("memory"),
+            "VerbRegistry must include 'memory' from memory pack"
+        );
+        let result = check_valid_note_kinds(&kg_dir.join("notes.ndjson"), &taxonomy.note_kinds);
+        assert!(
+            result.passed,
+            "pack-registered note kind 'memory' must pass; violations: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn structural_checks_skips_note_check_when_notes_file_absent() {
+        // Without notes.ndjson present, structural_checks must not add a note-kind rule.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let taxonomy = real_taxonomy();
+        let results = structural_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &taxonomy,
+        );
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"valid-note-kinds"),
+            "valid-note-kinds must not appear when notes.ndjson is absent"
+        );
+    }
+
+    #[test]
+    fn structural_checks_includes_note_check_when_notes_file_present() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        write_notes(&kg_dir, &[("note-0001", "observation")]);
+        let taxonomy = real_taxonomy();
+        let results = structural_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &taxonomy,
+        );
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"valid-note-kinds"),
+            "valid-note-kinds must appear when notes.ndjson is present"
+        );
+    }
+
+    // ── [Medium] Record identifier in rendered output ─────────────────────────
+
+    #[test]
+    fn violation_message_includes_entity_id_and_name() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[(
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "nonsense",
+                "BadEntity",
+            )],
+        );
+        let kinds = base_entity_kinds();
+        let result = check_valid_entity_kinds(&kg_dir.join("entities.ndjson"), &kinds);
+        assert!(!result.passed);
+        let msg = &result.violations[0].message;
+        assert!(
+            msg.contains("bbbbbbbb-0000-0000-0000-000000000002"),
+            "violation message must include entity id: {msg}"
+        );
+        assert!(
+            msg.contains("BadEntity"),
+            "violation message must include entity name: {msg}"
+        );
+    }
+
+    #[test]
+    fn edge_violation_message_includes_source_target() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "not_a_real_relation",
+            )],
+        );
+        let result = check_valid_edge_relations(&kg_dir.join("edges.ndjson"));
+        assert!(!result.passed);
+        let msg = &result.violations[0].message;
+        assert!(
+            msg.contains("aaaaaaaa-0000-0000-0000-000000000001"),
+            "edge violation message must include source_id: {msg}"
+        );
+        assert!(
+            msg.contains("bbbbbbbb-0000-0000-0000-000000000002"),
+            "edge violation message must include target_id: {msg}"
+        );
+    }
+
+    // ── Edge relation tests (preserved from prior PR) ─────────────────────────
 
     #[test]
     fn invalid_edge_relation_is_rejected() {
@@ -1099,9 +1532,12 @@ message = "bad"
                 "not_valid",
             )],
         );
+        let taxonomy = real_taxonomy();
         let results = structural_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &taxonomy,
         );
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         assert!(
