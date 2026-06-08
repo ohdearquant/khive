@@ -444,6 +444,8 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
 
 /// Collect all IDs from an NDJSON file into a set. Returns an empty set when
 /// the file is absent or unreadable.
+///
+/// Reads the `"id"` field — suitable for entities.ndjson and notes.ndjson.
 fn collect_ids(path: &Path) -> std::collections::HashSet<String> {
     std::fs::read_to_string(path)
         .map(|content| {
@@ -460,11 +462,40 @@ fn collect_ids(path: &Path) -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Collect edge record IDs from edges.ndjson into a set.
+///
+/// Edge records use `"edge_id"` as the canonical key (ADR-002 / portability
+/// layer). Older fixtures may use `"id"` instead; both are collected so the
+/// referential-integrity check accepts `annotates` targets that point at edges
+/// in either serialization form.
+fn collect_edge_ids(path: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    // Prefer the canonical `edge_id` field; fall back to `id`.
+                    v.get("edge_id")
+                        .or_else(|| v.get("id"))
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Check that every edge endpoint resolves to a known record.
 ///
-/// The known-ID set is the union of entities.ndjson and notes.ndjson because
-/// ADR-017 allows pack-extended edge endpoints between notes (e.g. the GTD
-/// pack permits `depends_on` between two `task` notes).
+/// The known-ID set is the union of:
+/// - entities.ndjson (entity records)
+/// - notes.ndjson (note records — pack-extended endpoints, e.g. GTD task→task)
+/// - edges.ndjson edge IDs (ADR-002: `annotates` target may be an edge record)
+///
+/// Events are not materialized in the git-native KG format and are therefore
+/// not included in the known-ID set.
 fn check_referential_integrity(
     entities_path: &Path,
     notes_path: &Path,
@@ -474,6 +505,7 @@ fn check_referential_integrity(
 
     let mut known_ids = collect_ids(entities_path);
     known_ids.extend(collect_ids(notes_path));
+    known_ids.extend(collect_edge_ids(edges_path));
 
     if let Ok(content) = std::fs::read_to_string(edges_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -995,6 +1027,44 @@ mod tests {
         assert!(
             result.passed,
             "task note depends_on must pass referential integrity; violations: {:?}",
+            result.violations
+        );
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn note_annotates_edge_passes_referential_integrity() {
+        // Regression for ADR-002: `annotates` source is a note, target may be an
+        // edge record. The referential-integrity check must include edge IDs
+        // (keyed by `edge_id`) in the known-ID set, not only entity/note IDs.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        // Two entity records connected by an `extends` edge that carries an edge_id.
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        // The extends edge with an explicit edge_id.
+        let edges = r#"{"edge_id":"eeeeeeee-0000-0000-0000-000000000001","source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"bbbbbbbb-0000-0000-0000-000000000002","relation":"extends"}
+{"source_id":"note-obs-0000-0000-0000-000000000001","target_id":"eeeeeeee-0000-0000-0000-000000000001","relation":"annotates"}
+"#;
+        std::fs::write(kg_dir.join("edges.ndjson"), edges).unwrap();
+        // The observation note that is the annotates source.
+        write_notes(
+            &kg_dir,
+            &[("note-obs-0000-0000-0000-000000000001", "observation")],
+        );
+        let result = check_referential_integrity(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+        );
+        assert!(
+            result.passed,
+            "note annotates edge must pass referential integrity; violations: {:?}",
             result.violations
         );
         assert!(result.violations.is_empty());
