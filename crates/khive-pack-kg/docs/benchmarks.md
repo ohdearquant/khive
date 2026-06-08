@@ -47,6 +47,7 @@ cd crates && cargo bench -p khive-pack-kg --bench kg_bench -- --test
 
 #### Create
 
+
 | Scenario         | Low      | Median   | High     | Outliers  |
 | ---------------- | -------- | -------- | -------- | --------- |
 | kg_create/entity | 6.311 ms | 6.798 ms | 7.236 ms | 2/50 (4%) |

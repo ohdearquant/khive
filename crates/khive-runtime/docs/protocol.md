@@ -64,11 +64,11 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 
 ## Failure Modes
 
-| Condition | Error |
-|-----------|-------|
-| Unknown verb | `RuntimeError::InvalidInput("unknown verb ...")`|
-| Gate deny | `RuntimeError::PermissionDenied { verb, reason }` |
-| Pack not loaded | `RuntimeError::InvalidInput` (unknown verb path) |
+| Condition          | Error                                                              |
+| ------------------ | ------------------------------------------------------------------ |
+| Unknown verb       | `RuntimeError::InvalidInput("unknown verb ...")`                   |
+| Gate deny          | `RuntimeError::PermissionDenied { verb, reason }`                  |
+| Pack not loaded    | `RuntimeError::InvalidInput` (unknown verb path)                   |
 | Namespace mismatch | `RuntimeError::NamespaceMismatch` (reported as NotFound to caller) |
 
 ## Extension Points

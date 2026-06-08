@@ -102,9 +102,14 @@ next      → active | waiting | someday | done | cancelled
 active    → next | waiting | done | cancelled
 waiting   → next | active | done | cancelled
 someday   → next | active | done | cancelled
-done      → next | active                              (reopen)
-cancelled → next | active                              (reopen)
+done      → (terminal — no outgoing transitions)
+cancelled → (terminal — no outgoing transitions)
 ```
+
+`done` and `cancelled` are **permanently terminal**: `allowed_transitions` returns `&[]`
+for both states, and tests assert no transitions are permitted out of them (decision
+GTD-AUD-001 / issue #273). Use `gtd.assign` to create a new task when reopening
+semantics are required.
 
 Transition validation lives in the `transition` verb handler. Illegal jumps (e.g.,
 `done → inbox`) return `RuntimeError::InvalidInput` with the allowed-set message.

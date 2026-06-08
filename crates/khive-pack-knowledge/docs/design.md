@@ -32,10 +32,11 @@
   fused via RRF (k=60). The index lifecycle is owned by `knowledge/vamana.rs`: warm-load from
   persistent snapshot, fingerprint validation, rebuild from sqlite-vec corpus on stale/miss.
 
-### ADR-049: Section Review Lifecycle
+### ADR-047: Section Review Lifecycle
 
 - `knowledge.challenge` marks a section as disputed and increments `dispute_count` on the parent
   atom. `knowledge.adjudicate` resolves the dispute: `accept` → `verified`, `reject` → `reviewed`.
+  This governance is specified in ADR-047 (Knowledge Pack) §section lifecycle governance.
 - The Vamana warm-start protocol (`ensure_ann_background`) fires at most once per
   `{namespace, model}` key using a `Mutex<HashSet>` single-flight guard.
 
@@ -73,15 +74,15 @@
 
 ## Module Boundaries
 
-| Module | Responsibility |
-|--------|---------------|
-| `lib.rs` | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim |
-| `vocab.rs` | `KNOWLEDGE_HANDLERS` static array — 18 verb descriptors |
-| `handlers.rs` | `learn`, `cite`, `topic` verbs (KG concept tier sugar) |
-| `knowledge/mod.rs` | Corpus handler implementations (18 verbs) and all shared SQL/scoring helpers |
-| `knowledge/schema.rs` | Param and record types for serde deserialization and SQL row mapping |
-| `knowledge/vamana.rs` | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion) |
-| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count) |
+| Module                  | Responsibility                                                               |
+| ----------------------- | ---------------------------------------------------------------------------- |
+| `lib.rs`                | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim           |
+| `vocab.rs`              | `KNOWLEDGE_HANDLERS` static array — 18 verb descriptors                      |
+| `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                       |
+| `knowledge/mod.rs`      | Corpus handler implementations (18 verbs) and all shared SQL/scoring helpers |
+| `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping         |
+| `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)    |
+| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)               |
 
 ## Namespace Isolation
 

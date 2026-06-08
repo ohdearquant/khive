@@ -58,9 +58,10 @@
   caller to write back to `schema.yaml`. The hash is always computed and written to
   `meta.json` for auditability even when no pin is present.
 
-### ADR-042: Canonical hash algorithm
+### ADR-020: Canonical hash algorithm
 
-- Canonical JSON sort order for hashing:
+- Canonical JSON sort order for hashing (ADR-020: Git-Native KG Implementation
+  §canonical NDJSON record shape and snapshot hash):
   1. Entities sorted by UUID string (case-insensitive ascending).
   2. Edges sorted by (source, target, relation) ascending.
   3. Property keys sorted alphabetically within each entity.

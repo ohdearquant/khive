@@ -2,22 +2,26 @@
 
 ## ADR Compliance
 
-### ADR-002: Edge Ontology
+### ADR-006: Deterministic Scoring — RRF rank indexing convention
+
 - The RRF implementation uses 1-indexed ranks throughout. Position 0 in an input list maps to
-  rank 1 in the RRF formula. This matches the convention stated in the edge ontology ADR where
-  rank positions are defined as 1-indexed.
+  rank 1 in the RRF formula, consistent with the `rrf_score` function in `khive-score`
+  (ADR-006: Deterministic Scoring).
 
 ### ADR-012: Retrieval Composition
+
 - This crate provides the fusion layer that combines ranked result lists from multiple retrieval
   sources. It is consumed by higher-level retrieval pipelines to aggregate dense (vector) and
   lexical (BM25) signals into a single ranked output.
 
 ### ADR-030: Hybrid Retrieval
+
 - The five `FusionStrategy` variants (RRF, Weighted, Union, VectorOnly, KeywordOnly) implement
   the hybrid retrieval strategy options specified for the system. RRF is the default as it is
   robust to score distribution differences between sources.
 
 ### ADR-031: Multi-Engine Retrieval
+
 - The `fuse()` dispatcher accepts results from any number of retrieval sources and routes them
   through the appropriate strategy. VectorOnly and KeywordOnly are single-source passthrough
   strategies — supplying multiple sources for these returns an empty vector so wiring errors are

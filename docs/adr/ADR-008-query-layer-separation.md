@@ -226,7 +226,7 @@ violating the separation between syntax compilation and semantic validation.
 - `crates/khive-query/src/parsers/gql.rs`: GQL parser.
 - `crates/khive-query/src/parsers/sparql.rs`: SPARQL parser.
 - `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type` field.
-- `crates/khive-query/src/validator.rs`: AST validation (relation via `EdgeRelation::from_str`,
+- `crates/khive-query/src/validate.rs`: AST validation (relation via `EdgeRelation::from_str`,
   depth limits).
 - `crates/khive-query/src/compilers/sql.rs`: AST → SQL compilation. `entity_type` maps to
   column predicate.

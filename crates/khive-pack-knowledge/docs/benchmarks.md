@@ -49,6 +49,7 @@ cargo test -p khive-pack-knowledge --test bench \
 
 #### `knowledge_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
 
+
 | Scenario                          | Low      | Median   | High     | Outliers   |
 | --------------------------------- | -------- | -------- | -------- | ---------- |
 | knowledge_learn/concept_create    | 1.030 ms | 1.368 ms | 1.774 ms | 4/50 (8%)  |

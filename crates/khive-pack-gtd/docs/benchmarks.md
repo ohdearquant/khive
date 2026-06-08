@@ -40,6 +40,7 @@ HTML reports land in `target/criterion/gtd/`.
 - Dataset: in-memory SQLite; task corpus seeded with 10 / 100 tasks; sample size 50
 - vs prior: first formal release ledger entry — no prior comparable baseline
 
+
 | Scenario                   | Low      | Median   | High     | Outliers   |
 | -------------------------- | -------- | -------- | -------- | ---------- |
 | gtd/assign                 | 2.787 ms | 3.030 ms | 3.272 ms | 2/50 (4%)  |

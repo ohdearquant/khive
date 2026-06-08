@@ -195,14 +195,18 @@ default install does not depend on RuVector.
 
 ### Feature flags
 
-The port inherits the internal crate's feature flag structure, rationalized for OSS:
+The port inherits the internal crate's feature flag structure, rationalized for OSS.
+`khive-retrieval` ships with `default = []` — no features are on by default. This is
+intentional for a public crate: consumers opt into exactly the capability surface they
+need and avoid pulling in optional heavy dependencies (e.g., `lattice-embed`) unless
+explicitly requested.
 
 | Feature            | Default | Notes                                                                  |
 | ------------------ | ------- | ---------------------------------------------------------------------- |
-| `checkpoint`       | on      | HNSW snapshot save/restore                                             |
-| `persist`          | on      | Index persistence to disk                                              |
-| `embed`            | on      | `lattice-embed` distance kernel integration                            |
-| `storage-adapters` | on      | `StorageVectorSearch`, `StorageKeywordSearch`                          |
+| `checkpoint`       | off     | HNSW snapshot save/restore                                             |
+| `persist`          | off     | Index persistence to disk                                              |
+| `embed`            | off     | `lattice-embed` distance kernel integration                            |
+| `storage-adapters` | off     | `StorageVectorSearch`, `StorageKeywordSearch`                          |
 | `policy`           | off     | Gate integration (khive-gate); opt-in until OSS gate story is complete |
 
 ## Rationale
