@@ -66,7 +66,7 @@ pub struct VectorSweepArgs {
 
 // ── Output types ───────────────────────────────────────────────────────────────
 
-/// JSON-serializable projection of [`VectorStoreCapabilities`].
+/// JSON-serializable projection of `VectorStoreCapabilities` capability flags.
 #[derive(Debug, Serialize)]
 pub struct CapabilitiesReport {
     pub engine_name: String,
