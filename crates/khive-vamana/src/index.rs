@@ -107,6 +107,44 @@ impl TryFrom<VamanaIndexSnapshotRaw> for VamanaIndexSnapshot {
                 ));
             }
         }
+        if num_vectors > 0 && raw.medoid as usize >= num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: medoid ({}) >= num_vectors ({num_vectors})",
+                raw.medoid
+            )));
+        }
+        let max_degree = usize::try_from(raw.max_degree).map_err(|_| {
+            VamanaError::invalid_format("VamanaIndexSnapshot: max_degree overflow".into())
+        })?;
+        for (node, neighbors) in raw.adjacency.iter().enumerate() {
+            if neighbors.len() > max_degree {
+                return Err(VamanaError::invalid_format(format!(
+                    "VamanaIndexSnapshot: node {node} degree {} exceeds max_degree {max_degree}",
+                    neighbors.len()
+                )));
+            }
+            for &nb in neighbors {
+                if nb as usize >= num_vectors {
+                    return Err(VamanaError::invalid_format(format!(
+                        "VamanaIndexSnapshot: neighbor {nb} >= num_vectors {num_vectors}"
+                    )));
+                }
+                if nb as usize == node {
+                    return Err(VamanaError::invalid_format(format!(
+                        "VamanaIndexSnapshot: self-loop at node {node}"
+                    )));
+                }
+            }
+            let mut sorted = neighbors.clone();
+            sorted.sort_unstable();
+            let before = sorted.len();
+            sorted.dedup();
+            if sorted.len() != before {
+                return Err(VamanaError::invalid_format(format!(
+                    "VamanaIndexSnapshot: node {node} has duplicate neighbors"
+                )));
+            }
+        }
         Ok(Self {
             num_vectors: raw.num_vectors,
             dimensions: raw.dimensions,
@@ -1473,6 +1511,96 @@ mod tests {
             "from_snapshot must reject duplicate neighbors"
         );
     }
+    #[test]
+    fn try_from_rejects_medoid_out_of_range() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 5, // >= num_vectors
+            adjacency: vec![vec![1], vec![0], vec![]],
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject medoid >= num_vectors"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_degree_exceeding_max() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 1, // max 1 neighbor
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1, 2], vec![0], vec![0]], // node 0 has 2 > max_degree
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject degree > max_degree"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_neighbor_out_of_range() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![99], vec![0]], // neighbor 99 >= num_vectors
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject neighbor >= num_vectors"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_self_loop() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![0], vec![0], vec![1]], // node 0 points to itself
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject self-loops"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_duplicate_neighbors_at_serde_boundary() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 3,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1, 1], vec![0], vec![0]], // node 0 has duplicate neighbor 1
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject duplicate neighbors at serde boundary"
+        );
+    }
+
     // ---- Non-finite float boundary tests (VAMANA-AUD-001) ----
 
     #[test]
