@@ -106,21 +106,46 @@ impl BetaPosterior {
     }
 
     /// Combine evidence from two independent observers sharing the same prior.
-    pub fn merge(&self, other: &BetaPosterior, prior: &BetaPosterior) -> BetaPosterior {
-        BetaPosterior {
-            alpha: self.alpha + other.alpha - prior.alpha,
-            beta: self.beta + other.beta - prior.beta,
-        }
+    ///
+    /// Returns an error if the merged parameters would be non-positive (which can happen when
+    /// `prior` exceeds the evidence in either posterior).
+    pub fn merge(
+        &self,
+        other: &BetaPosterior,
+        prior: &BetaPosterior,
+    ) -> Result<BetaPosterior, String> {
+        let alpha = self.alpha + other.alpha - prior.alpha;
+        let beta = self.beta + other.beta - prior.beta;
+        BetaPosterior::try_new(alpha, beta)
     }
 
     /// Cap ESS by scaling excess evidence back toward the prior.
+    ///
+    /// # Panics
+    /// Panics if `cap` is not finite and positive, if `cap` is less than or equal to
+    /// `prior.effective_sample_size()`, or if the resulting scaled parameters are non-positive.
+    /// These invariants must hold for a valid ESS cap operation.
     pub fn apply_ess_cap(&mut self, prior: &BetaPosterior, cap: f64) {
+        assert!(
+            cap.is_finite() && cap > 0.0,
+            "apply_ess_cap: cap must be finite and positive, got {cap}"
+        );
         let ess = self.effective_sample_size();
         if ess > cap {
             let prior_ess = prior.effective_sample_size();
+            assert!(
+                cap > prior_ess,
+                "apply_ess_cap: cap ({cap}) must be > prior ESS ({prior_ess})"
+            );
             let scale = (cap - prior_ess) / (ess - prior_ess);
-            self.alpha = prior.alpha + (self.alpha - prior.alpha) * scale;
-            self.beta = prior.beta + (self.beta - prior.beta) * scale;
+            let new_alpha = prior.alpha + (self.alpha - prior.alpha) * scale;
+            let new_beta = prior.beta + (self.beta - prior.beta) * scale;
+            assert!(
+                new_alpha > 0.0 && new_beta > 0.0,
+                "apply_ess_cap: scaled parameters must be positive, got alpha={new_alpha} beta={new_beta}"
+            );
+            self.alpha = new_alpha;
+            self.beta = new_beta;
         }
     }
 
@@ -229,9 +254,47 @@ mod tests {
         let prior = BetaPosterior::new(1.0, 1.0);
         let a = BetaPosterior::new(5.0, 3.0);
         let b = BetaPosterior::new(4.0, 6.0);
-        let merged = a.merge(&b, &prior);
+        let merged = a.merge(&b, &prior).expect("valid merge");
         assert!((merged.alpha - 8.0).abs() < 1e-12);
         assert!((merged.beta - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merge_returns_err_when_prior_exceeds_evidence() {
+        // If prior alpha > self.alpha + other.alpha, merged alpha would be non-positive.
+        let prior = BetaPosterior::new(10.0, 1.0);
+        let a = BetaPosterior::new(3.0, 1.0);
+        let b = BetaPosterior::new(3.0, 1.0);
+        // merged alpha = 3 + 3 - 10 = -4 → must be rejected
+        assert!(
+            a.merge(&b, &prior).is_err(),
+            "merge yielding non-positive alpha must be rejected"
+        );
+    }
+
+    #[test]
+    fn apply_ess_cap_validates_cap_arg() {
+        let prior = BetaPosterior::new(1.0, 1.0);
+        let mut p = BetaPosterior::new(60.0, 50.0);
+        // Valid cap must work.
+        p.apply_ess_cap(&prior, 100.0);
+        assert!((p.effective_sample_size() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    #[should_panic(expected = "cap must be finite and positive")]
+    fn apply_ess_cap_panics_on_zero_cap() {
+        let prior = BetaPosterior::new(1.0, 1.0);
+        let mut p = BetaPosterior::new(10.0, 10.0);
+        p.apply_ess_cap(&prior, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cap must be finite and positive")]
+    fn apply_ess_cap_panics_on_nan_cap() {
+        let prior = BetaPosterior::new(1.0, 1.0);
+        let mut p = BetaPosterior::new(10.0, 10.0);
+        p.apply_ess_cap(&prior, f64::NAN);
     }
 
     #[test]
@@ -256,6 +319,40 @@ mod tests {
         let json = r#"{"alpha": null, "beta": 1.0}"#;
         let result: Result<BetaPosterior, _> = serde_json::from_str(json);
         assert!(result.is_err(), "null alpha must be rejected");
+    }
+
+    /// JSON does not encode NaN as a token; serde_json parser rejects any literal NaN.
+    #[test]
+    fn serde_json_rejects_nan_literal_alpha() {
+        // "NaN" is not valid JSON; the parser fails before TryFrom is even reached.
+        let json = r#"{"alpha": NaN, "beta": 1.0}"#;
+        let result: Result<BetaPosterior, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "JSON literal NaN must be rejected by the parser"
+        );
+    }
+
+    /// JSON Infinity literal is not valid JSON; the parser rejects it.
+    #[test]
+    fn serde_json_rejects_infinity_literal_alpha() {
+        let json = r#"{"alpha": Infinity, "beta": 1.0}"#;
+        let result: Result<BetaPosterior, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "JSON literal Infinity must be rejected by the parser"
+        );
+    }
+
+    /// Very large exponent (1e400) overflows to f64::INFINITY; TryFrom rejects it.
+    #[test]
+    fn serde_json_rejects_overflow_to_infinity_alpha() {
+        let json = r#"{"alpha": 1e400, "beta": 1.0}"#;
+        let result: Result<BetaPosterior, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "1e400 overflowing to infinity must be rejected"
+        );
     }
 
     /// Verify that NaN is rejected at the serde boundary via `try_from`.

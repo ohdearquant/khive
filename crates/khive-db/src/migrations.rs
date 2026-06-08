@@ -256,6 +256,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     Ok(applied_version)
 }
 
+#[derive(Debug)]
 pub struct EmbeddingModelRegistryRecord {
     /// Vector engine name (e.g. `"paraphrase"`).
     pub engine_name: String,
@@ -291,8 +292,17 @@ pub fn query_embedding_models(
     if !path.exists() {
         return Ok(Vec::new());
     }
-
     let conn = Connection::open(path)?;
+    query_embedding_models_conn(&conn, engine_filter)
+}
+
+/// Query `_embedding_models` from an existing connection (testable without a file).
+///
+/// Returns an empty vec if the table does not exist.
+pub(crate) fn query_embedding_models_conn(
+    conn: &Connection,
+    engine_filter: Option<&str>,
+) -> Result<Vec<EmbeddingModelRegistryRecord>, SqliteError> {
     let exists: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM sqlite_master \
          WHERE type='table' AND name='_embedding_models'",
@@ -314,11 +324,22 @@ pub fn query_embedding_models(
     };
     let mut stmt = conn.prepare(sql)?;
     let map_row = |row: &rusqlite::Row<'_>| {
+        let dim_raw: i64 = row.get(3)?;
+        let dimensions = u32::try_from(dim_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::other(format!(
+                    "_embedding_models.dim value {dim_raw} is outside the valid u32 range [0, {}]",
+                    u32::MAX,
+                ))),
+            )
+        })?;
         Ok(EmbeddingModelRegistryRecord {
             engine_name: row.get(0)?,
             model_id: row.get(1)?,
             key_version: row.get(2)?,
-            dimensions: row.get::<_, i64>(3)? as u32,
+            dimensions,
             status: row.get(4)?,
             activated_at: row.get(5)?,
             superseded_at: row.get(6)?,

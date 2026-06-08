@@ -113,10 +113,58 @@ mod tests {
     }
 
     #[test]
+    fn edge_record_try_from_rejects_weight_below_range() {
+        assert!(
+            EdgeRecord::try_from(raw_with_weight(-0.1)).is_err(),
+            "weight -0.1 must be rejected (below [0.0, 1.0])"
+        );
+    }
+
+    #[test]
+    fn edge_record_try_from_rejects_weight_above_range() {
+        assert!(
+            EdgeRecord::try_from(raw_with_weight(1.1)).is_err(),
+            "weight 1.1 must be rejected (above [0.0, 1.0])"
+        );
+    }
+
+    #[test]
+    fn edge_record_serde_rejects_weight_below_range() {
+        let json = r#"{"edge_id":"00000000-0000-0000-0000-000000000000","source":"a","target":"b","relation":"extends","weight":-0.1}"#;
+        let result: Result<EdgeRecord, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "serde must reject weight < 0.0 at the JSON boundary"
+        );
+    }
+
+    #[test]
+    fn edge_record_serde_rejects_weight_above_range() {
+        let json = r#"{"edge_id":"00000000-0000-0000-0000-000000000000","source":"a","target":"b","relation":"extends","weight":2.0}"#;
+        let result: Result<EdgeRecord, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "serde must reject weight > 1.0 at the JSON boundary"
+        );
+    }
+
+    #[test]
     fn edge_record_try_from_accepts_finite_weight() {
         assert!(
             EdgeRecord::try_from(raw_with_weight(0.7)).is_ok(),
             "finite weight 0.7 must be accepted"
+        );
+    }
+
+    #[test]
+    fn edge_record_try_from_accepts_boundary_weights() {
+        assert!(
+            EdgeRecord::try_from(raw_with_weight(0.0)).is_ok(),
+            "weight 0.0 must be accepted (lower bound)"
+        );
+        assert!(
+            EdgeRecord::try_from(raw_with_weight(1.0)).is_ok(),
+            "weight 1.0 must be accepted (upper bound)"
         );
     }
 

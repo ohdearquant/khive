@@ -41,8 +41,12 @@ impl TryFrom<SparseVectorRaw> for SparseVector {
 }
 
 impl SparseVector {
-    /// Validate: equal-length arrays, strictly increasing indices, all values finite.
+    /// Validate: non-empty arrays, equal-length arrays, strictly increasing indices,
+    /// all values finite.
     pub fn validate(&self) -> Result<(), String> {
+        if self.indices.is_empty() {
+            return Err("SparseVector: indices must not be empty".into());
+        }
         if self.indices.len() != self.values.len() {
             return Err(format!(
                 "SparseVector: indices.len() ({}) != values.len() ({})",

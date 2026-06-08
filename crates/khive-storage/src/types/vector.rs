@@ -149,7 +149,8 @@ impl TryFrom<VectorSearchRequestRaw> for VectorSearchRequest {
 }
 
 impl VectorSearchRequest {
-    /// Validate: non-empty query vectors, finite values, non-zero `top_k`. Returns first violation.
+    /// Validate: non-empty query vectors, each inner vector non-empty, finite values,
+    /// non-zero `top_k`. Returns first violation.
     pub fn validate(&self) -> Result<(), String> {
         if self.query_vectors.is_empty() {
             return Err("VectorSearchRequest: query_vectors must not be empty".into());
@@ -158,6 +159,11 @@ impl VectorSearchRequest {
             return Err("VectorSearchRequest: top_k must be > 0".into());
         }
         for (qi, qvec) in self.query_vectors.iter().enumerate() {
+            if qvec.is_empty() {
+                return Err(format!(
+                    "VectorSearchRequest: query_vectors[{qi}] must not be empty"
+                ));
+            }
             for (vi, &v) in qvec.iter().enumerate() {
                 if !v.is_finite() {
                     return Err(format!(
