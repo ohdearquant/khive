@@ -64,7 +64,7 @@ Resist:
 | Situation                                               | Verb                                                                                                                                                                   |
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | "Can I act on this right now?" — actually start working | `gtd.transition(id=..., status="active")`                                                                                                                              |
-| "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` — note the blocker in the title or a `gtd.transition` note later                                                                  |
+| "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` — note the blocker in the title or a `gtd.transition` note later                                                                   |
 | "Maybe someday, not now"                                | `gtd.assign(..., status="someday")`                                                                                                                                    |
 | Need to record several together and link dependencies   | capture the blocker first, then `gtd.assign(..., depends_on=[blocker_full_id])` for the dependent task — the property and the `depends_on` graph edge both get written |
 
