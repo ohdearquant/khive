@@ -15,7 +15,7 @@ pub(super) struct ScoredSection {
     pub section_type: String,
     pub heading: String,
     pub content: String,
-    pub embedding: Vec<f32>,
+    pub embedding: Option<Vec<f32>>,
 }
 
 // ─── score weights ────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ pub(super) struct ComposeSectionResult {
 
 // ─── DB load ─────────────────────────────────────────────────────────────────
 
-pub(super) async fn load_section_embeddings(
+pub(super) async fn load_sections(
     runtime: &KhiveRuntime,
     ns: &str,
     atom_ids: &[String],
@@ -85,7 +85,7 @@ pub(super) async fn load_section_embeddings(
     let mut reader = sql
         .reader()
         .await
-        .map_err(|e| sql_err("load_section_embeddings reader", e))?;
+        .map_err(|e| sql_err("load_sections reader", e))?;
 
     let rows = reader
         .query_all(SqlStatement {
@@ -93,14 +93,13 @@ pub(super) async fn load_section_embeddings(
                 "SELECT id, atom_id, section_type, heading, content, embedding \
                  FROM knowledge_sections \
                  WHERE namespace = ?1 \
-                   AND atom_id IN ({placeholders}) \
-                   AND embedding IS NOT NULL"
+                   AND atom_id IN ({placeholders})"
             ),
             params,
             label: None,
         })
         .await
-        .map_err(|e| sql_err("load_section_embeddings query", e))?;
+        .map_err(|e| sql_err("load_sections query", e))?;
 
     let mut by_atom: HashMap<String, Vec<ScoredSection>> = HashMap::new();
     for row in &rows {
@@ -117,12 +116,16 @@ pub(super) async fn load_section_embeddings(
         let content = row_str(row, "content").unwrap_or_default();
 
         let embedding = match row.get("embedding") {
-            Some(SqlValue::Blob(bytes)) => decode_embedding(bytes),
-            _ => continue,
+            Some(SqlValue::Blob(bytes)) => {
+                let decoded = decode_embedding(bytes);
+                if decoded.is_empty() {
+                    None
+                } else {
+                    Some(decoded)
+                }
+            }
+            _ => None,
         };
-        if embedding.is_empty() {
-            continue;
-        }
 
         by_atom
             .entry(atom_id.clone())
@@ -170,10 +173,9 @@ pub(super) fn score_sections(
         .iter()
         .zip(bm25_raw.iter())
         .map(|(section, &bm25_unnorm)| {
-            let sec_cos = if section.embedding.is_empty() {
-                0.0
-            } else {
-                cosine_similarity(query_embedding, &section.embedding).max(0.0)
+            let sec_cos = match &section.embedding {
+                Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb).max(0.0),
+                _ => 0.0,
             };
 
             let atom_cos = atom_cosine_scores
@@ -389,7 +391,7 @@ mod tests {
             section_type: "overview".to_string(),
             heading: "Overview".to_string(),
             content: "introduction to the topic".to_string(),
-            embedding: vec![1.0, 0.0],
+            embedding: Some(vec![1.0, 0.0]),
         };
         let sec2 = ScoredSection {
             id: "s2".to_string(),
@@ -397,7 +399,7 @@ mod tests {
             section_type: "references".to_string(),
             heading: "References".to_string(),
             content: "unrelated bibliography content".to_string(),
-            embedding: vec![0.0, 1.0],
+            embedding: Some(vec![0.0, 1.0]),
         };
 
         let mut sections: HashMap<String, Vec<ScoredSection>> = HashMap::new();
@@ -427,5 +429,56 @@ mod tests {
         let sum =
             w.section_cosine + w.section_bm25 + w.atom_cosine + w.domain_score + w.type_weight;
         assert!((sum - 1.0).abs() < 1e-6, "weights sum to {sum}");
+    }
+
+    #[test]
+    fn unembedded_section_still_scored_via_keyword_signals() {
+        let query_emb: Vec<f32> = vec![1.0, 0.0];
+        let mut atom_cos: HashMap<String, f32> = HashMap::new();
+        atom_cos.insert("a1".to_string(), 0.8);
+
+        let embedded = ScoredSection {
+            id: "s1".to_string(),
+            atom_id: "a1".to_string(),
+            section_type: "overview".to_string(),
+            heading: "Overview".to_string(),
+            content: "topic introduction".to_string(),
+            embedding: Some(vec![1.0, 0.0]),
+        };
+        let unembedded = ScoredSection {
+            id: "s2".to_string(),
+            atom_id: "a1".to_string(),
+            section_type: "details".to_string(),
+            heading: "Details".to_string(),
+            content: "topic details and explanation".to_string(),
+            embedding: None,
+        };
+
+        let mut sections: HashMap<String, Vec<ScoredSection>> = HashMap::new();
+        sections.insert("a1".to_string(), vec![embedded, unembedded]);
+
+        let domain_scores: HashMap<String, f32> = HashMap::new();
+        let type_weights: HashMap<String, f32> = HashMap::new();
+
+        let results = score_sections(
+            "topic overview",
+            &query_emb,
+            &atom_cos,
+            &sections,
+            &domain_scores,
+            &type_weights,
+            &ComposeScoreWeights::default(),
+        );
+
+        assert_eq!(results.len(), 2, "both sections must be scored");
+        let unembedded_result = results.iter().find(|r| r.section_id == "s2").unwrap();
+        assert_eq!(
+            unembedded_result.score_breakdown.section_cosine, 0.0,
+            "unembedded section_cosine must be 0"
+        );
+        assert!(
+            unembedded_result.score > 0.0,
+            "unembedded section must still have positive score from other signals"
+        );
     }
 }

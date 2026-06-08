@@ -1312,7 +1312,7 @@ impl KnowledgeHandlers {
             .map(|item| (item.id.clone(), item.score))
             .collect();
 
-        let section_map = super::compose::load_section_embeddings(runtime, &ns, &atom_ids).await?;
+        let section_map = super::compose::load_sections(runtime, &ns, &atom_ids).await?;
 
         let has_sections = !section_map.is_empty();
 
