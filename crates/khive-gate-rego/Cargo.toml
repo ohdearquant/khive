@@ -14,7 +14,6 @@ readme = "README.md"
 [dependencies]
 khive-gate = { version = "0.2.8", path = "../khive-gate" }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 
 regorus = { workspace = true }
 

@@ -686,6 +686,9 @@ fn read_merge_entity(
 /// provenance.  Returns the updated `into` entity so the caller can do the async vec re-insert.
 ///
 /// When `dry_run` is true, all reads and computations are performed but no writes are issued.
+// REASON: merge requires both entity IDs, the namespace, FTS and vec table names, merge
+// policy, and dry-run flag — all are load-bearing; reducing to a struct would obscure
+// the sync/async boundary split that keeps this function off the async runtime.
 #[allow(clippy::too_many_arguments)]
 fn merge_entity_sql(
     conn: &rusqlite::Connection,
@@ -701,6 +704,9 @@ fn merge_entity_sql(
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
     // --- Collect edges incident to from_id ---
+    // REASON: EdgeRow fields are populated via rusqlite row mapping; the struct is fully
+    // constructed even though not all fields are read back after construction — the
+    // complete mapping guards against column-order bugs when the schema changes.
     #[allow(dead_code)]
     struct EdgeRow {
         id: Uuid,
@@ -1118,6 +1124,8 @@ fn append_merge_history(props: Option<Value>, entry: Value) -> Result<Option<Val
 /// re-embedding.
 ///
 /// When `dry_run` is true, all reads and computations are performed but no writes are issued.
+// REASON: note merge additionally requires a content_strategy parameter versus entity merge;
+// same sync/async boundary rationale as merge_entity_sql applies here.
 #[allow(clippy::too_many_arguments)]
 fn merge_note_sql(
     conn: &rusqlite::Connection,
@@ -1145,6 +1153,7 @@ fn merge_note_sql(
     let from_str = from_id.to_string();
 
     // Collect edges incident to from_id.
+    // REASON: same as merge_entity_sql — full field mapping prevents column-order bugs.
     #[allow(dead_code)]
     struct EdgeRow {
         id: Uuid,
