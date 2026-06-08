@@ -202,7 +202,7 @@ impl BalancedRecallState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BalancedRecallSnapshot {
     pub relevance: BetaPosterior,
     pub salience: BetaPosterior,
@@ -232,25 +232,12 @@ mod tests {
         let restored = BalancedRecallState::from_snapshot(snap.clone(), 100);
         let restored_snap = restored.to_snapshot();
 
+        // Full structural equality — covers every field including entity_posteriors.
+        // If any field (including a newly-added one) is not preserved by the
+        // round-trip, this assertion will catch it.
         assert_eq!(
-            snap.relevance, restored_snap.relevance,
-            "round-trip: relevance posterior changed"
-        );
-        assert_eq!(
-            snap.salience, restored_snap.salience,
-            "round-trip: salience posterior changed"
-        );
-        assert_eq!(
-            snap.temporal, restored_snap.temporal,
-            "round-trip: temporal posterior changed"
-        );
-        assert_eq!(
-            snap.total_events, restored_snap.total_events,
-            "round-trip: total_events changed"
-        );
-        assert_eq!(
-            snap.exploration_epoch, restored_snap.exploration_epoch,
-            "round-trip: exploration_epoch changed"
+            snap, restored_snap,
+            "ADR-048 Phase-1: snapshot != restored state"
         );
     }
 
