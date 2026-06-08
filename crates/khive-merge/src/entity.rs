@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use khive_runtime::portability::{ExportedEntity, KgArchive};
 use uuid::Uuid;
 
-use crate::diff_local::{diff_entities, EntityChange};
+use crate::diff_local::{diff_entities, properties_equal, EntityChange};
 use crate::types::{BranchSide, MergeConflict};
 
 /// Categorize all entity UUIDs across base, ours, theirs and produce:

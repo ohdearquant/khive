@@ -4,6 +4,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../crates"
 
+echo "=== Forward-Deployed Crates Check ==="
+# Excluded workspace crates (forward-deployed infrastructure) must still compile.
+cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml"
+
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 
