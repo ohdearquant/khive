@@ -879,6 +879,8 @@ async fn load_domain_by_id_or_slug(
         .await
         .map_err(|e| sql_err("compose domain reader", e))?;
     let id = id_or_slug.trim().to_string();
+    let is_hex_prefix =
+        !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
@@ -888,6 +890,18 @@ async fn load_domain_by_id_or_slug(
             })
             .await
             .map_err(|e| sql_err("compose domain by id", e))?
+    } else if is_hex_prefix && id.len() >= 4 {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_domains WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![
+                    SqlValue::Text(format!("{id}%")),
+                    SqlValue::Text(ns.to_owned()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose domain by prefix", e))?
     } else {
         reader
             .query_row(SqlStatement {
@@ -913,6 +927,8 @@ async fn load_atom_by_id_or_slug(
         .await
         .map_err(|e| sql_err("compose atom reader", e))?;
     let id = id_or_slug.trim().to_string();
+    let is_hex_prefix =
+        !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
@@ -922,6 +938,18 @@ async fn load_atom_by_id_or_slug(
             })
             .await
             .map_err(|e| sql_err("compose atom by id", e))?
+    } else if is_hex_prefix && id.len() >= 4 {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_atoms WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![
+                    SqlValue::Text(format!("{id}%")),
+                    SqlValue::Text(ns.to_owned()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose atom by prefix", e))?
     } else {
         reader
             .query_row(SqlStatement {
@@ -1179,6 +1207,13 @@ impl KnowledgeHandlers {
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
+        let word_count = raw_query.split_whitespace().count();
+        if word_count < 5 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "suggest query must be at least 5 words for meaningful domain matching \
+                 (got {word_count}). Use knowledge.search for short keyword queries."
+            )));
+        }
         let limit = p.limit.unwrap_or(8).clamp(1, 100);
         let ns = token.namespace().as_str().to_owned();
 
@@ -1226,14 +1261,22 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: ComposeParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
+        let word_count = raw_query.split_whitespace().count();
+        if word_count < 10 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "compose query must be at least 10 words for effective section scoring \
+                 (got {word_count}). Longer queries produce better atom and section ranking."
+            )));
+        }
 
-        let domain_ids: Vec<String> = p
+        let mut domain_ids: Vec<String> = p
             .domain_ids
             .unwrap_or_default()
             .into_iter()
@@ -1247,9 +1290,33 @@ impl KnowledgeHandlers {
             .collect();
 
         if domain_ids.is_empty() && atom_ids.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "domain_ids or atom_ids must be provided".into(),
-            ));
+            let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
+            let suggest_result = Self::suggest(
+                runtime,
+                token,
+                json!({ "query": &raw_query, "limit": auto_limit }),
+                ann,
+            )
+            .await?;
+            if let Some(results) = suggest_result.get("results").and_then(|v| v.as_array()) {
+                for r in results {
+                    if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
+                        domain_ids.push(id.to_string());
+                    }
+                }
+            }
+            if domain_ids.is_empty() {
+                return Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "query": raw_query,
+                        "markdown": "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
+                        "domains": [],
+                        "atoms": [],
+                        "count": 0,
+                    },
+                }));
+            }
         }
 
         let ns = token.namespace().as_str().to_owned();
