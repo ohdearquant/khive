@@ -7,6 +7,7 @@ mod graph;
 mod link;
 mod list;
 mod merge;
+mod params;
 mod proposal;
 mod search;
 mod stats;

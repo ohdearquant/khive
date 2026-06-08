@@ -2,6 +2,7 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+pub mod config;
 pub mod curation;
 #[cfg(unix)]
 pub mod daemon;

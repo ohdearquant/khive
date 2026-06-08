@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
+use crate::config::{parse_embedding_model_alias, sanitize_key};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::{parse_embedding_model_alias, sanitize_key, KhiveRuntime, NamespaceToken};
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,

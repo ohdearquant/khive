@@ -1,4 +1,7 @@
-//! Search, suggest, and compose handlers plus TF-IDF scoring infrastructure.
+//! Search, suggest, and compose handlers.
+//!
+//! TF-IDF scoring primitives live in `super::scoring`; this module owns the
+//! FTS/ANN pipeline, reranking, hydration, and handler dispatch.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,63 +14,17 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::matching;
 use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
+use super::scoring::{
+    compute_idf, exact_name_bonus, expand_terms, load_candidates_from_atoms, score_candidate,
+    Candidate, Weights,
+};
 use super::util::{
     atom_embed_text, atom_from_row, deser, domain_from_row, explicitly_requested_status, is_stop,
     row_bool, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
-    CANDIDATE_POOL, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME,
-    D_W_NAME, D_W_TAGS, MIN_TERM_LEN,
+    CANDIDATE_POOL, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
-
-// ─── TF-IDF weight container ─────────────────────────────────────────────────
-
-struct Weights {
-    w_exact_name: f32,
-    w_name: f32,
-    w_tags: f32,
-    w_content: f32,
-    expand_discount: f32,
-    coverage_alpha: f32,
-    w_bigram: f32,
-}
-
-impl Default for Weights {
-    fn default() -> Self {
-        Self {
-            w_exact_name: D_W_EXACT_NAME,
-            w_name: D_W_NAME,
-            w_tags: D_W_TAGS,
-            w_content: D_W_CONTENT,
-            expand_discount: D_EXPAND_DISCOUNT,
-            coverage_alpha: D_COVERAGE_ALPHA,
-            w_bigram: D_W_BIGRAM,
-        }
-    }
-}
-
-impl Weights {
-    fn from_opts(opts: &SearchParams) -> Self {
-        let w = opts.weights.as_ref();
-        Self {
-            w_exact_name: w
-                .and_then(|w| w.w_exact_name)
-                .map_or(D_W_EXACT_NAME, |v| v as f32),
-            w_name: w.and_then(|w| w.w_name).map_or(D_W_NAME, |v| v as f32),
-            w_tags: w.and_then(|w| w.w_tags).map_or(D_W_TAGS, |v| v as f32),
-            w_content: w
-                .and_then(|w| w.w_content)
-                .map_or(D_W_CONTENT, |v| v as f32),
-            expand_discount: w
-                .and_then(|w| w.expand_discount)
-                .map_or(D_EXPAND_DISCOUNT, |v| v as f32),
-            coverage_alpha: w
-                .and_then(|w| w.coverage_alpha)
-                .map_or(D_COVERAGE_ALPHA, |v| v as f32),
-            w_bigram: w.and_then(|w| w.w_bigram).map_or(D_W_BIGRAM, |v| v as f32),
-        }
-    }
-}
 
 // ─── scored hit (internal) ────────────────────────────────────────────────────
 
@@ -138,206 +95,6 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
             });
         }
     }
-}
-
-// ─── candidate (tokenized) ───────────────────────────────────────────────────
-
-struct Candidate {
-    id: String,
-    slug: String,
-    name_raw: String,
-    content_raw: Option<String>,
-    tags_raw: Option<String>,
-    status_raw: Option<String>,
-    finalized: bool,
-    is_domain: bool,
-    name: Vec<String>,
-    tags: Vec<String>,
-    content: Vec<String>,
-}
-
-fn load_candidates_from_atoms(atoms: &[Atom], type_filter: Option<&str>) -> Vec<Candidate> {
-    let want_domain = type_filter == Some("domain");
-    let want_atom = type_filter == Some("atom");
-
-    atoms
-        .iter()
-        .filter_map(|atom| {
-            let tags_str = atom.tags_display();
-            let is_domain = {
-                let tags_arr: Vec<String> = serde_json::from_str(&atom.tags).unwrap_or_default();
-                tags_arr.iter().any(|t| t == "type:domain")
-            };
-            if (want_domain && !is_domain) || (want_atom && is_domain) {
-                return None;
-            }
-            Some(Candidate {
-                id: atom.id.to_string(),
-                slug: atom.slug.clone(),
-                name_raw: atom.name.clone(),
-                content_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
-                tags_raw: Some(tags_str.clone()),
-                status_raw: atom.status.clone(),
-                finalized: atom.finalized,
-                is_domain,
-                name: matching::tokenize_field(&atom.name),
-                tags: matching::tokenize_field(&tags_str),
-                content: matching::tokenize_field(&atom.content),
-            })
-        })
-        .collect()
-}
-
-// ─── IDF computation ──────────────────────────────────────────────────────────
-
-fn compute_idf(
-    candidates: &[Candidate],
-    terms: &[String],
-    expanded: &HashSet<String>,
-    discount: f32,
-) -> HashMap<String, f32> {
-    let n = candidates.len() as f32;
-    let mut df: HashMap<String, usize> = terms.iter().map(|t| (t.clone(), 0)).collect();
-    for cand in candidates {
-        for term in terms {
-            if matching::has_in_tokens(&cand.content, term)
-                || matching::has_in_tokens(&cand.name, term)
-                || matching::has_in_tokens(&cand.tags, term)
-            {
-                if let Some(d) = df.get_mut(term) {
-                    *d += 1;
-                }
-            }
-        }
-    }
-    df.into_iter()
-        .map(|(term, d)| {
-            let raw = (n / (d as f32 + 1.0)).ln().max(0.1);
-            let idf = if expanded.contains(&term) {
-                raw * discount
-            } else {
-                raw
-            };
-            (term, idf)
-        })
-        .collect()
-}
-
-fn score_field(tokens: &[String], terms: &[String], idf: &HashMap<String, f32>) -> f32 {
-    let mut score = 0.0;
-    for term in terms {
-        let count = matching::count_in_tokens(tokens, term);
-        if count > 0 {
-            let tf = 1.0 + (count as f32).ln();
-            score += tf * idf.get(term).copied().unwrap_or(1.0);
-        }
-    }
-    score
-}
-
-fn bigram_bonus_field(tokens: &[String], query_order: &[String]) -> f32 {
-    if query_order.len() < 2 {
-        return 0.0;
-    }
-    let filtered: Vec<&str> = tokens
-        .iter()
-        .filter(|t| !is_stop(t))
-        .map(|t| t.as_str())
-        .collect();
-    let mut bonus = 0.0f32;
-    for window in query_order.windows(2) {
-        let (a, b) = (window[0].as_str(), window[1].as_str());
-        for w in filtered.windows(2) {
-            if w[0] == a && w[1] == b {
-                bonus += 1.0;
-                break;
-            }
-        }
-    }
-    bonus
-}
-
-fn exact_name_bonus(name: &str, raw_query: &str, bonus: f32) -> f32 {
-    let q = raw_query.trim().to_lowercase();
-    if !q.is_empty() && name.to_lowercase().contains(&q) {
-        bonus
-    } else {
-        0.0
-    }
-}
-
-fn score_candidate(
-    cand: &Candidate,
-    terms: &[String],
-    original_terms: &[String],
-    query_order: &[String],
-    idf: &HashMap<String, f32>,
-    raw_query: &str,
-    w: &Weights,
-) -> f32 {
-    let bigrams = bigram_bonus_field(&cand.name, query_order)
-        + bigram_bonus_field(&cand.tags, query_order)
-        + bigram_bonus_field(&cand.content, query_order);
-
-    let base = exact_name_bonus(&cand.name_raw, raw_query, w.w_exact_name)
-        + w.w_name * score_field(&cand.name, terms, idf)
-        + w.w_tags * score_field(&cand.tags, terms, idf)
-        + w.w_content * score_field(&cand.content, terms, idf)
-        + w.w_bigram * bigrams;
-
-    if w.coverage_alpha > 0.0 && !original_terms.is_empty() {
-        // For each original query term, check whether it OR any of its expanded
-        // variants matches the candidate. This ensures that "agents" → "agent"
-        // expansion still earns coverage credit.
-        let matched = original_terms
-            .iter()
-            .filter(|orig| {
-                let has_exact = matching::has_in_tokens(&cand.name, orig)
-                    || matching::has_in_tokens(&cand.tags, orig)
-                    || matching::has_in_tokens(&cand.content, orig);
-                if has_exact {
-                    return true;
-                }
-                terms.iter().filter(|t| *t != *orig).any(|exp| {
-                    matching::has_in_tokens(&cand.name, exp)
-                        || matching::has_in_tokens(&cand.tags, exp)
-                        || matching::has_in_tokens(&cand.content, exp)
-                })
-            })
-            .count();
-        let coverage = matched as f32 / original_terms.len() as f32;
-        base * coverage.powf(w.coverage_alpha)
-    } else {
-        base
-    }
-}
-
-fn expand_terms(terms: &mut Vec<String>) -> HashSet<String> {
-    let originals: HashSet<String> = terms.iter().cloned().collect();
-    let snapshot: Vec<String> = terms.clone();
-    for t in &snapshot {
-        if !t.ends_with('s') && t.len() >= 3 {
-            terms.push(format!("{t}s"));
-        }
-        if t.ends_with("ies") && t.len() > 4 {
-            let s = format!("{}y", &t[..t.len() - 3]);
-            if s.len() >= 3 {
-                terms.push(s);
-            }
-        } else if t.ends_with('s') && !t.ends_with("ss") && t.len() > 3 {
-            let s = t[..t.len() - 1].to_string();
-            if s.len() >= 3 {
-                terms.push(s);
-            }
-        }
-    }
-    terms.sort();
-    terms.dedup();
-    terms
-        .iter()
-        .filter(|t| !originals.contains(*t))
-        .cloned()
-        .collect()
 }
 
 // ─── status scoring ───────────────────────────────────────────────────────────
