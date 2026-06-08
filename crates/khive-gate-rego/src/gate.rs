@@ -103,15 +103,16 @@ impl RegoGate {
     }
 
     /// Override the rule path with validation, returning `Err` for empty,
-    /// whitespace-only, or non-`data.`-prefixed entrypoints.
+    /// whitespace-only, non-`data.`-prefixed, or malformed-segment entrypoints,
+    /// and for entrypoints that do not name an existing rule in the loaded policy.
     ///
     /// Prefer this over [`Self::with_entrypoint`] for operator-supplied
     /// configuration. A misconfigured entrypoint discovered at construction
     /// time produces a deterministic `GateError::Policy` rather than a
-    /// dispatch-time `GateError::Evaluation` — the gate dispatcher treats
-    /// evaluation errors as infrastructure failures and proceeds (fail-open),
-    /// so catching misconfigurations at boot prevents unintended access.
-    pub fn try_with_entrypoint(self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
+    /// dispatch-time evaluation failure. `RegoGate::check` converts evaluation
+    /// errors to `Ok(GateDecision::Deny)` (fail-closed), so construction-time
+    /// validation is defense-in-depth — not the primary safety net.
+    pub fn try_with_entrypoint(mut self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
         let ep = entrypoint.into();
         let trimmed = ep.trim();
         if trimmed.is_empty() {
@@ -124,7 +125,33 @@ impl RegoGate {
                 "entrypoint must begin with 'data.' (got: {trimmed:?})"
             )));
         }
-        Ok(self.with_entrypoint(trimmed))
+        // Validate path segments after the "data." prefix: no empty components
+        // (which arise from consecutive dots, a leading dot after "data.", or a
+        // trailing dot).  "data.a..b" and "data.a." are rejected here.
+        let suffix = &trimmed["data.".len()..];
+        if suffix.is_empty() || suffix.split('.').any(|seg| seg.is_empty()) {
+            return Err(GateError::Policy(format!(
+                "entrypoint has empty path segment (got: {trimmed:?})"
+            )));
+        }
+        // Confirm the rule exists in the currently-loaded policy.  eval_rule
+        // returns Err("not a valid rule path") when the path is not a compiled
+        // rule — catching misconfigurations at boot rather than at first request.
+        {
+            let mut engine = self.engine.lock().map_err(|e| {
+                GateError::Internal(format!("engine mutex poisoned during validation: {e}"))
+            })?;
+            // A dummy empty-object input is sufficient; we only care whether the
+            // rule path exists, not the evaluated value.
+            engine.set_input(regorus::Value::new_object());
+            if let Err(e) = engine.eval_rule(trimmed.to_string()) {
+                return Err(GateError::Policy(format!(
+                    "entrypoint {trimmed:?} is not a valid rule in the loaded policy: {e}"
+                )));
+            }
+        }
+        self.entrypoint = trimmed.to_string();
+        Ok(self)
     }
 }
 
@@ -140,20 +167,58 @@ impl Gate for RegoGate {
                 .lock()
                 .map_err(|e| GateError::Internal(format!("engine mutex poisoned: {e}")))?;
             engine.set_input(input_value);
-            engine
-                .eval_rule(self.entrypoint.clone())
-                .map_err(|e| GateError::Evaluation(format!("eval {}: {e}", self.entrypoint)))?
+            engine.eval_rule(self.entrypoint.clone())
         };
 
-        let decision_json = result
-            .to_json_str()
-            .map_err(|e| GateError::Evaluation(format!("decision to_json: {e}")))?;
+        // Fail closed: any evaluation failure (missing rule, undefined, engine
+        // error) becomes an explicit Deny rather than propagating an Err that the
+        // runtime's fail-open branch would treat as "allow".
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    error = %e,
+                    "rego eval failed — denying (fail-closed)"
+                );
+                return Ok(GateDecision::deny(format!(
+                    "policy evaluation failed for {}: {e}",
+                    self.entrypoint
+                )));
+            }
+        };
 
-        serde_json::from_str::<GateDecision>(&decision_json).map_err(|e| {
-            GateError::Evaluation(format!(
-                "policy returned shape that isn't a GateDecision: {e} (got: {decision_json})"
-            ))
-        })
+        // regorus returns Value::Undefined when the rule exists but no branch
+        // matched without a default.  Treat undefined as deny.
+        if value == regorus::Value::Undefined {
+            return Ok(GateDecision::deny(format!(
+                "policy rule {} is undefined for this input",
+                self.entrypoint
+            )));
+        }
+
+        let decision_json = value
+            .to_json_str()
+            .map_err(|e| GateError::Internal(format!("decision to_json: {e}")))?;
+
+        // A result that parses to a non-GateDecision shape (e.g. a boolean,
+        // plain string, or wrong object) is also treated as deny rather than
+        // propagating an Err.
+        match serde_json::from_str::<GateDecision>(&decision_json) {
+            Ok(decision) => Ok(decision),
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    got = %decision_json,
+                    error = %e,
+                    "policy returned non-GateDecision shape — denying (fail-closed)"
+                );
+                Ok(GateDecision::deny(format!(
+                    "policy rule {} returned unrecognized shape: {decision_json}",
+                    self.entrypoint
+                )))
+            }
+        }
     }
 
     fn impl_name(&self) -> &'static str {
