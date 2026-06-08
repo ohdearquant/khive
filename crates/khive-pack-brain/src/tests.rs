@@ -3471,3 +3471,210 @@ async fn concurrent_cold_load_does_not_clobber_live_state() {
          created by Loader A (old code would return 0 here)"
     );
 }
+
+/// Proves the dispatch atomicity race EXISTS without the gate.
+///
+/// Directly manufactures the interleaving that dispatch() without a gate
+/// would permit: A calls ensure_loaded(ns-a) → B calls ensure_loaded(ns-b)
+/// (swaps slot to ns-b) → A runs its handler against the now-ns-b slot.
+///
+/// This test does NOT go through dispatch() — it manually sequences the
+/// ensure_loaded + handler steps in the exact order that a scheduler can
+/// produce, giving a deterministic reproduction of the race.
+///
+/// Expected: A's brain.bind writes into the ns-b slot (wrong namespace).
+/// bindings(gate-ns-a) == 0  →  demonstrates the race.
+///
+/// This test runs against the PRODUCTION code (not a simulated removal)
+/// by calling ensure_loaded and the handler directly, bypassing the gate.
+/// It proves the gate is NECESSARY, not just incidental.
+#[tokio::test]
+async fn dispatch_gate_race_is_observable_without_gate() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = BrainPack::new(rt.clone());
+    let registry = empty_registry();
+
+    let ns_a = Namespace::try_from("bare-ns-a").expect("ns-a");
+    let ns_b = Namespace::try_from("bare-ns-b").expect("ns-b");
+    let token_a = rt.authorize(ns_a).expect("token a");
+    let token_b = rt.authorize(ns_b).expect("token b");
+
+    // Step 1: A calls ensure_loaded(ns-a). Slot is now ns-a.
+    pack.ensure_loaded(&token_a).await.expect("ensure_loaded a");
+
+    // Step 2: B calls ensure_loaded(ns-b). Slot is now ns-b.
+    // (This is the interleaving that happens between ensure_loaded and
+    // the handler in a concurrent dispatch — the gate prevents this.)
+    pack.ensure_loaded(&token_b).await.expect("ensure_loaded b");
+
+    // Step 3: A's handler now runs (binding for ns-a). But the slot is ns-b.
+    // WITHOUT the gate, dispatch() lets this happen after a concurrent swap.
+    // We reproduce it by calling handle_bind directly.
+    pack.handle_bind(json!({
+        "profile_id": "balanced-recall-v1",
+        "actor": "racer-a",
+        "namespace": "bare-ns-a",
+        "consumer_kind": "recall",
+    }))
+    .await
+    .expect("handle_bind for a");
+
+    // Step 4: Assert the binding landed in the WRONG namespace (ns-b slot).
+    // This is the race: ns-a has 0 bindings, ns-b has 1 (A's write went there).
+    let bindings_b_now = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_b)
+        .await
+        .expect("bindings ns-b");
+    assert_eq!(
+        bindings_b_now["count"],
+        json!(1u64),
+        "race reproduced: A's bind wrote into the ns-b slot (WRONG namespace)"
+    );
+
+    // ns-a's saved state was saved before any binding was added, so it has 0.
+    let bindings_a_now = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_a)
+        .await
+        .expect("bindings ns-a");
+    assert_eq!(
+        bindings_a_now["count"],
+        json!(0u64),
+        "race reproduced: ns-a has 0 bindings because A's write went to ns-b"
+    );
+}
+
+/// Proves the dispatch gate FIXES the race: with the gate held across
+/// ensure_loaded + handler, no concurrent namespace swap can occur between
+/// the two steps.
+///
+/// Interleaving manufactured by DISPATCH_INTERLEAVE_HOOK in pack.rs
+/// (cfg(test) only), which fires inside dispatch() AFTER ensure_loaded
+/// returns and BEFORE the handler acquires self.state.  While A is paused
+/// at the hook:
+///   - With the gate: B is blocked on dispatch_gate.lock().await.
+///   - Without the gate: B would run and swap the slot.
+///
+/// Test sequence:
+///   1. A enters dispatch(), acquires gate, calls ensure_loaded(ns-a), pauses.
+///   2. B tries to enter dispatch() — blocked on the gate.
+///   3. Test releases A — A's handler runs brain.bind for ns-a.
+///   4. A completes, releases gate.  B runs: ensure_loaded(ns-b) + brain.bind.
+///   5. Assert bindings(ns-a) == 1, bindings(ns-b) == 1.
+///
+/// PASS (gate present): each namespace sees exactly its own binding.
+/// FAIL (gate absent): see dispatch_gate_race_is_observable_without_gate.
+#[tokio::test]
+async fn dispatch_gate_prevents_cross_namespace_slot_swap() {
+    use core::convert::TryFrom;
+    use khive_runtime::Namespace;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    // Always clean up the hook, even on panic.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::pack::clear_dispatch_interleave_hook();
+        }
+    }
+    let _guard = HookGuard;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = Arc::new(BrainPack::new(rt.clone()));
+    let registry = Arc::new(empty_registry());
+
+    let ns_a = Namespace::try_from("gate-ns-a").expect("ns-a");
+    let ns_b = Namespace::try_from("gate-ns-b").expect("ns-b");
+    let token_a = Arc::new(rt.authorize(ns_a).expect("token a"));
+    let token_b = Arc::new(rt.authorize(ns_b).expect("token b"));
+
+    // ── Step 1: register the dispatch-gap hook for Dispatch A ─────────────────
+    let (reached_tx, reached_rx) = oneshot::channel::<()>();
+    let (proceed_tx, proceed_rx) = oneshot::channel::<()>();
+    crate::pack::set_dispatch_interleave_hook(crate::pack::DispatchHook {
+        reached_tx,
+        proceed_rx,
+    });
+
+    // ── Step 2: spawn Dispatch A (brain.bind for ns-a) ────────────────────────
+    // A will: acquire gate, ensure_loaded(ns-a), fire the hook, pause.
+    let pack_a = Arc::clone(&pack);
+    let token_a2 = Arc::clone(&token_a);
+    let registry_a = Arc::clone(&registry);
+    let a_handle = tokio::spawn(async move {
+        pack_a
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "racer-a",
+                    "namespace": "gate-ns-a",
+                    "consumer_kind": "recall",
+                }),
+                &registry_a,
+                &token_a2,
+            )
+            .await
+    });
+
+    // Wait for A to signal it is at the dispatch gap (gate held, ns-a loaded).
+    reached_rx.await.expect("dispatch A must reach hook");
+
+    // ── Step 3: spawn Dispatch B (brain.bind for ns-b) ────────────────────────
+    // B will attempt to acquire the dispatch gate → blocked until A releases.
+    let pack_b = Arc::clone(&pack);
+    let token_b2 = Arc::clone(&token_b);
+    let registry_b = Arc::clone(&registry);
+    let b_handle = tokio::spawn(async move {
+        pack_b
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "racer-b",
+                    "namespace": "gate-ns-b",
+                    "consumer_kind": "recall",
+                }),
+                &registry_b,
+                &token_b2,
+            )
+            .await
+    });
+
+    // ── Step 4: release A, then await both ───────────────────────────────────
+    // A's handler writes racer-a into ns-a, then releases the gate.
+    // B is then unblocked; it ensure_loaded(ns-b) and writes racer-b.
+    proceed_tx.send(()).expect("send proceed to A");
+    a_handle
+        .await
+        .expect("dispatch A task must not panic")
+        .expect("dispatch A must not error");
+    b_handle
+        .await
+        .expect("dispatch B task must not panic")
+        .expect("dispatch B must not error");
+
+    // ── Step 5: assert each namespace sees exactly its own binding ─────────────
+    let bindings_a = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_a)
+        .await
+        .expect("bindings for ns-a");
+    assert_eq!(
+        bindings_a["count"],
+        json!(1u64),
+        "gate: ns-a must have exactly 1 binding (racer-a)"
+    );
+
+    let bindings_b = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token_b)
+        .await
+        .expect("bindings for ns-b");
+    assert_eq!(
+        bindings_b["count"],
+        json!(1u64),
+        "gate: ns-b must have exactly 1 binding (racer-b)"
+    );
+}

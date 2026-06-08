@@ -1413,7 +1413,30 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        // Serialise the (ensure_loaded → handler) pair under the dispatch gate
+        // so no concurrent dispatch for a different namespace can swap the
+        // single shared BrainState slot between the two steps.
+        //
+        // Lock order: dispatch_gate (outermost) → persistence → state.
+        // Nothing inside ensure_loaded or any handler acquires dispatch_gate,
+        // so there is no lock-order cycle.
+        let _gate = self.dispatch_gate.lock().await;
+
         self.ensure_loaded(token).await?;
+
+        // In test builds, fire the interleaving hook (if any) between
+        // ensure_loaded returning and the handler acquiring self.state.
+        // This lets tests prove that without the gate a concurrent namespace
+        // swap would corrupt the handler's view.
+        #[cfg(test)]
+        {
+            let hook = crate::pack::DISPATCH_INTERLEAVE_HOOK.lock().unwrap().take();
+            if let Some(h) = hook {
+                let _ = h.reached_tx.send(());
+                let _ = h.proceed_rx.await;
+            }
+        }
+
         match verb {
             // Assertive
             "brain.state" => self.handle_state(params).await,
