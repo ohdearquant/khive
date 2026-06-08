@@ -198,16 +198,22 @@ default install does not depend on RuVector.
 The port inherits the internal crate's feature flag structure, rationalized for OSS.
 `khive-retrieval` ships with `default = []` — no features are on by default. This is
 intentional for a public crate: consumers opt into exactly the capability surface they
-need and avoid pulling in optional heavy dependencies (e.g., `lattice-embed`) unless
-explicitly requested.
+need.
 
-| Feature            | Default | Notes                                                                  |
-| ------------------ | ------- | ---------------------------------------------------------------------- |
-| `checkpoint`       | off     | HNSW snapshot save/restore                                             |
-| `persist`          | off     | Index persistence to disk                                              |
-| `embed`            | off     | `lattice-embed` distance kernel integration                            |
-| `storage-adapters` | off     | `StorageVectorSearch`, `StorageKeywordSearch`                          |
-| `policy`           | off     | Gate integration (khive-gate); opt-in until OSS gate story is complete |
+`lattice-embed` is an **unconditional** (non-optional) dependency of `khive-retrieval`:
+its core types (`EmbeddingModel`, `EmbeddingService`, `EmbedError`) are always available
+via the `khive_retrieval::embed` re-export module. What the `embed` feature gates is the
+**native model implementations** (`NativeEmbeddingService`, `CachedEmbeddingService`) that
+bundle a live inference backend; those are off by default to keep the base crate lightweight
+for consumers that supply their own embedding service.
+
+| Feature            | Default | Notes                                                                                             |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------- |
+| `checkpoint`       | off     | HNSW snapshot save/restore                                                                        |
+| `persist`          | off     | Index persistence to disk                                                                         |
+| `embed`            | off     | Native `lattice-embed` model implementations (`NativeEmbeddingService`, `CachedEmbeddingService`) |
+| `storage-adapters` | off     | `StorageVectorSearch`, `StorageKeywordSearch`; also enables sqlite-vec via `khive-db/vectors`     |
+| `policy`           | off     | Gate integration (khive-gate); opt-in until OSS gate story is complete                            |
 
 ## Rationale
 
@@ -244,12 +250,18 @@ packs let us offer these techniques without compromising the verified core. RuVe
 author benefits from khive-oss as an adoption story; khive-oss benefits from technique
 access without full implementation overhead.
 
-### Why drop sqlite-vec entirely
+### Why the ported HNSW is the preferred path over sqlite-vec
 
 The ported HNSW supersedes sqlite-vec on every axis: performance, quantization,
-deterministic scoring, formal verification. A dual-path (sqlite-vec + HNSW) would add
-maintenance with no benefit. One-time migration on upgrade is well-defined via
-`HnswIndex::rebuild`.
+deterministic scoring, formal verification. A dual-path (sqlite-vec + HNSW) adds
+maintenance with no benefit once migration is complete. The migration path is
+well-defined via `HnswIndex::rebuild`.
+
+sqlite-vec currently remains in `khive-db` as the active `VectorStore` compatibility
+implementation. Retiring it — routing `VectorStore` impls through `HnswIndex` and
+providing the `kkernel migrate-vectors` path — is tracked as a separate follow-up.
+No section of this ADR should be read as claiming that sqlite-vec has already been
+dropped; it has not.
 
 ### Why a standalone crate now (vs. ADR-012's deferral)
 
@@ -285,8 +297,10 @@ suite, and its own dependency surface (lattice-embed).
 
 - 2-3 weeks of focused porting work. Mitigated: the internal code is mature and well-tested;
   the port is mechanical except for dependency rewiring.
-- One-time migration for any OSS deployments with sqlite-vec data. Mitigated: the
-  `HnswIndex::rebuild` path is well-tested; migration is a single CLI command or startup path.
+- One-time migration for any OSS deployments with sqlite-vec data will be required when
+  sqlite-vec retirement ships. Mitigated: the `HnswIndex::rebuild` path is well-tested;
+  migration is planned as a single CLI command or startup path. Retirement itself is deferred
+  follow-up work (see the "sqlite-vec retirement (deferred)" section above).
 - Lean4 CI dependency added to workspace. Mitigated: `lake build` is isolated to the
   `proofs/` tree; Rust build and tests do not require it.
 
@@ -304,10 +318,11 @@ suite, and its own dependency surface (lattice-embed).
 1. Create `crates/khive-retrieval/` from `khive-internal/platform/retrieval/`.
 2. Rewire dependencies per the mapping table above.
 3. Replace `foundation::embed` calls with `lattice-embed`.
-4. Drop `sqlite-vec` from `khive-db`. Route `VectorStore` impls through `HnswIndex`
-   via `StorageVectorSearch`.
-5. Decide and implement the sqlite-vec migration path (`kkernel migrate-vectors` or
-   auto-rebuild on startup).
+4. **Deferred follow-up**: Retire `sqlite-vec` from `khive-db` by routing `VectorStore`
+   impls through `HnswIndex` via `StorageVectorSearch`. sqlite-vec remains the active
+   `VectorStore` implementation in current shipped code.
+5. **Deferred follow-up**: Decide and implement the sqlite-vec migration path
+   (`kkernel migrate-vectors` or auto-rebuild on startup).
 6. Migrate tests; verify all pass. Run smoke test against ported stack.
 
 ### Phase 2 — Proof relocation

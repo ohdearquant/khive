@@ -141,17 +141,17 @@ bare verb names (16 verbs total):
 
 | Verb        | Speech act  | Description                                                                      |
 | ----------- | ----------- | -------------------------------------------------------------------------------- |
-| `create`    | assertive   | Create an entity or note                                                         |
+| `create`    | commissive  | Create an entity or note                                                         |
 | `get`       | assertive   | Fetch any record by UUID                                                         |
 | `list`      | assertive   | Structured browse with pagination                                                |
-| `update`    | assertive   | Patch entity or edge fields                                                      |
-| `delete`    | assertive   | Soft or hard delete a record                                                     |
+| `update`    | declaration | Patch entity or edge fields                                                      |
+| `delete`    | declaration | Soft or hard delete a record                                                     |
 | `search`    | assertive   | Hybrid FTS + vector search                                                       |
-| `link`      | assertive   | Create a typed directed edge                                                     |
+| `link`      | commissive  | Create a typed directed edge                                                     |
 | `neighbors` | assertive   | Immediate graph neighbors                                                        |
 | `traverse`  | assertive   | Multi-hop BFS traversal                                                          |
 | `query`     | assertive   | GQL/SPARQL pattern matching                                                      |
-| `merge`     | assertive   | Deduplicate two entities                                                         |
+| `merge`     | declaration | Deduplicate two entities                                                         |
 | `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                      |
 | `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`. |
 | `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.             |

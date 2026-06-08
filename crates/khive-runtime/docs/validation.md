@@ -7,7 +7,7 @@ severity overrides work, and where rule configuration lives.
 
 ## ADR Links
 
-- [ADR-034](../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
+- [ADR-034](../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
 
 ## Rule Configuration File
 
