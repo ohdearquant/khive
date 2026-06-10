@@ -151,16 +151,16 @@ impl ScoreAdjustment {
 
 /// Default score adjustments: semantic age penalty and entity boost.
 ///
-/// H1 calibration (2026-06-10): the flat episodic recency bonus (+0.05) was removed because
-/// it stacked with the semantic age penalty (−0.05) to create a 0.10 score swing independent
-/// of content quality — the root cause of stratum-A failures where high-salience old semantics
-/// lost to low-salience fresh episodics. Salience weight increase (0.20→0.35) now carries the
-/// recency-vs-importance tradeoff without a content-blind flat bonus.
+/// H2 calibration (2026-06-10): the flat episodic recency bonus (+0.05) is removed (inherited
+/// from H1) — it stacked with the semantic age penalty to create a 0.10 score swing independent
+/// of content quality. Weights are reverted to baseline values (w_sal=0.20, w_temp=0.10,
+/// w_rel=0.70); only the flat-adjustment set changes. Semantic penalty reduced 0.05→0.02 to
+/// prevent over-penalising high-salience reference material.
 pub fn default_adjustments() -> Vec<ScoreAdjustment> {
     vec![
         // Semantic age penalty: light nudge to prevent old reference docs from crowding out
         // high-salience episodic content when the base score is near-equal. Reduced 0.05→0.02
-        // because w_salience now provides the main discriminator (H1 calibration).
+        // (H1/H2 calibration) so episodic bonus removal is the only flat-adjustment change.
         ScoreAdjustment {
             condition: AdjustmentCondition::All {
                 conditions: vec![
@@ -193,20 +193,20 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringWeights {
-    /// Multiplicative boost from salience in `(1 + w_imp × salience)`. Default: 0.35 (H1).
+    /// Multiplicative boost from salience in `(1 + w_imp × salience)`. Default: 0.20 (H2 baseline weights).
     pub salience: f32,
-    /// Multiplicative boost from recency in `(1 + w_temp × recency)`. Default: 0.05 (H1).
+    /// Multiplicative boost from recency in `(1 + w_temp × recency)`. Default: 0.10 (H2 baseline weights).
     pub temporal: f32,
-    /// Base multiplier applied to relevance. Default: 0.65 (H1).
+    /// Base multiplier applied to relevance. Default: 0.70 (H2 baseline weights).
     pub relevance: f32,
 }
 
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
-            salience: 0.35,
-            temporal: 0.05,
-            relevance: 0.65,
+            salience: 0.20,
+            temporal: 0.10,
+            relevance: 0.70,
         }
     }
 }
@@ -723,15 +723,16 @@ mod tests {
         assert!(s0 <= 1.0 && s2 >= 0.0, "scores must be in [0,1]");
     }
 
-    // ── H1 calibration regression tests (2026-06-10) ──────────────────────────
-    // Root cause: flat ±0.05 adjustments stacked into a 0.10 swing that overrode
-    // salience signal. Q02/Q03 failure class from the stratified golden eval (n=20).
+    // ── H2 calibration regression tests (2026-06-10) ──────────────────────────
+    // H2 = H1 flat-adjustment set (episodic bonus removed, semantic penalty 0.02)
+    //      + baseline weights (w_sal=0.20, w_temp=0.10, w_rel=0.70).
+    // All four properties from H1 still hold; anchor values recomputed for H2 constants.
 
-    /// H1 property: old high-salience semantic (sal=0.85, age=65d) must outrank
+    /// H2 property: old high-salience semantic (sal=0.85, age=65d) must outrank
     /// fresh low-salience episodic (sal=0.40, age=0.5d) at equal relevance advantage.
-    /// This is the exact failure class (Q02/Q03) fixed by removing the episodic bonus.
+    /// Episodic bonus removal still provides this separation at baseline weights.
     #[test]
-    fn h1_old_semantic_high_salience_beats_fresh_low_salience_episodic() {
+    fn h2_old_semantic_high_salience_beats_fresh_low_salience_episodic() {
         let config = ScoringConfig::default();
         let now_ms = 0i64;
         // Old semantic: 65 days old, sal=0.85, rel=0.70
@@ -764,15 +765,15 @@ mod tests {
         );
         assert!(
             old_semantic > fresh_episodic,
-            "H1 failure: old semantic (sal=0.85, age=65d) score={old_semantic:.5} \
+            "H2 failure: old semantic (sal=0.85, age=65d) score={old_semantic:.5} \
              must beat fresh episodic (sal=0.40, age=0.5d) score={fresh_episodic:.5}"
         );
     }
 
-    /// H1 property: at equal salience and type, fresher memory still outranks older.
+    /// H2 property: at equal salience and type, fresher memory still outranks older.
     /// Recency is preserved — just no longer dominant via a flat bonus.
     #[test]
-    fn h1_recency_preserved_at_equal_salience() {
+    fn h2_recency_preserved_at_equal_salience() {
         let config = ScoringConfig::default();
         let now_ms = 0i64;
         let fresh = calculate_score(
@@ -803,13 +804,13 @@ mod tests {
         );
         assert!(
             fresh > stale,
-            "H1: fresher memory (1d) score={fresh:.5} should outrank same-salience older (90d) score={stale:.5}"
+            "H2: fresher memory (1d) score={fresh:.5} should outrank same-salience older (90d) score={stale:.5}"
         );
     }
 
-    /// H1 property: salience monotonicity at fixed age — higher salience always scores higher.
+    /// H2 property: salience monotonicity at fixed age — higher salience always scores higher.
     #[test]
-    fn h1_salience_monotonicity_at_fixed_age() {
+    fn h2_salience_monotonicity_at_fixed_age() {
         let config = ScoringConfig::default();
         let now_ms = 0i64;
         let base_input = |sal: f32| ScoreInput {
@@ -831,18 +832,19 @@ mod tests {
         );
     }
 
-    /// H1 parity anchors: Rust f32 scores must match Python-computed values within f32
+    /// H2 parity anchors: Rust f32 scores must match Python-computed values within f32
     /// precision (1e-5). Python uses f64 arithmetic; Rust uses f32, so 1e-9 is not achievable
     /// cross-precision — asserting to 1e-5 which is tight enough to detect formula divergence.
     ///
-    /// Anchor values computed from eval_harness.py make_scorer() with config_h1.json constants.
+    /// Anchor values computed from the H2 formula: w_rel=0.70, w_temp=0.10, w_sal=0.20,
+    /// episodic bonus removed, semantic penalty −0.02 (age≥30d, sal≥0.85), entity match ×1.3.
     #[test]
-    fn h1_parity_anchors_match_python_harness() {
+    fn h2_parity_anchors_match_python_harness() {
         let config = ScoringConfig::default();
         let now_ms = 0i64;
 
         // Anchor A: old semantic, sal=0.85, age=65d, rel=0.70, df=0.01
-        // Python: 0.5857723125 (semantic_age_penalty −0.02 applies: age=65≥30, sal=0.85≥0.85)
+        // Python: 0.5832289 (semantic_age_penalty −0.02 applies: age=65≥30, sal=0.85≥0.85)
         let anchor_a = calculate_score(
             &ScoreInput {
                 salience: 0.85,
@@ -857,12 +859,12 @@ mod tests {
             &config,
         );
         assert!(
-            (anchor_a - 0.585_772_3f32).abs() < 1e-5,
-            "Anchor A mismatch: got {anchor_a:.8}, expected ~0.5857723"
+            (anchor_a - 0.583_228_9f32).abs() < 1e-5,
+            "Anchor A mismatch: got {anchor_a:.8}, expected ~0.5832289"
         );
 
         // Anchor B: fresh episodic, sal=0.40, age=0.5d, rel=0.60, df=0.01
-        // Python: 0.4667191274 (no adjustment — episodic bonus removed)
+        // Python: 0.4987338 (no adjustment — episodic bonus removed in H2)
         let anchor_b = calculate_score(
             &ScoreInput {
                 salience: 0.40,
@@ -877,12 +879,12 @@ mod tests {
             &config,
         );
         assert!(
-            (anchor_b - 0.466_719_1f32).abs() < 1e-5,
-            "Anchor B mismatch: got {anchor_b:.8}, expected ~0.4667191"
+            (anchor_b - 0.498_733_8f32).abs() < 1e-5,
+            "Anchor B mismatch: got {anchor_b:.8}, expected ~0.4987338"
         );
 
-        // Anchor C: episodic 90d, sal=0.60, rel=0.70 — fresher 1d same params must beat it
-        // Python C_old=0.5617418463, C_new=0.5778035968
+        // Anchor C: episodic 90d and 1d, sal=0.60, rel=0.70 — fresher 1d must beat 90d
+        // Python C_old=0.5711125, C_new=0.6031339
         let anchor_c_old = calculate_score(
             &ScoreInput {
                 salience: 0.60,
@@ -910,12 +912,12 @@ mod tests {
             &config,
         );
         assert!(
-            (anchor_c_old - 0.561_741_8f32).abs() < 1e-5,
-            "Anchor C_old mismatch: got {anchor_c_old:.8}, expected ~0.5617418"
+            (anchor_c_old - 0.571_112_5f32).abs() < 1e-5,
+            "Anchor C_old mismatch: got {anchor_c_old:.8}, expected ~0.5711125"
         );
         assert!(
-            (anchor_c_new - 0.577_803_6f32).abs() < 1e-5,
-            "Anchor C_new mismatch: got {anchor_c_new:.8}, expected ~0.5778036"
+            (anchor_c_new - 0.603_133_9f32).abs() < 1e-5,
+            "Anchor C_new mismatch: got {anchor_c_new:.8}, expected ~0.6031339"
         );
         assert!(
             anchor_c_new > anchor_c_old,
@@ -923,7 +925,8 @@ mod tests {
         );
 
         // Anchor D: salience monotonicity at 35d semantic
-        // Python D_low=0.5534621935, D_high=0.5994066251 (penalty applies at sal=0.90 but not 0.50)
+        // Python D_low=0.5769827 (sal=0.50, penalty does NOT apply: 0.50<0.85),
+        //         D_high=0.5989451 (sal=0.90, penalty applies: 0.90≥0.85)
         let anchor_d_low = calculate_score(
             &ScoreInput {
                 salience: 0.50,
@@ -951,12 +954,12 @@ mod tests {
             &config,
         );
         assert!(
-            (anchor_d_low - 0.553_462_2f32).abs() < 1e-5,
-            "Anchor D_low mismatch: got {anchor_d_low:.8}, expected ~0.5534622"
+            (anchor_d_low - 0.576_982_7f32).abs() < 1e-5,
+            "Anchor D_low mismatch: got {anchor_d_low:.8}, expected ~0.5769827"
         );
         assert!(
-            (anchor_d_high - 0.599_406_6f32).abs() < 1e-5,
-            "Anchor D_high mismatch: got {anchor_d_high:.8}, expected ~0.5994066"
+            (anchor_d_high - 0.598_945_1f32).abs() < 1e-5,
+            "Anchor D_high mismatch: got {anchor_d_high:.8}, expected ~0.5989451"
         );
         assert!(
             anchor_d_high > anchor_d_low,
