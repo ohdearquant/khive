@@ -81,6 +81,18 @@ repos:
         files: ^(docs/.*\.md|README\.md|CLAUDE\.md|AGENTS\.md)$
         pass_filenames: false
 
+  # JSON/JSONL data-leak guard
+  # Catches corpus files that check-added-large-files (<512KB) and gitleaks both miss:
+  # any .jsonl/.ndjson outside bench paths, and .json > 256KB that isn't a lockfile.
+  - repo: local
+    hooks:
+      - id: check-json-data
+        name: JSON/JSONL data-leak guard
+        entry: bash scripts/check-json-data.sh
+        language: system
+        files: '\.(json|jsonl|ndjson)$'
+        pass_filenames: false
+
   # Secrets scanning
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2
