@@ -37,14 +37,7 @@ pub struct ServiceSchemaPlan {
     pub postgres: &'static [Migration],
 }
 
-const SCHEMA_VERSION_TABLE: &str = "\
-    CREATE TABLE IF NOT EXISTS _schema_versions (\
-        service TEXT NOT NULL,\
-        migration_id TEXT NOT NULL,\
-        applied_at INTEGER NOT NULL,\
-        PRIMARY KEY (service, migration_id)\
-    );\
-";
+const SCHEMA_VERSION_TABLE: &str = include_str!("../sql/schema-version-table.sql");
 
 /// Apply a pack-scoped schema plan, tracking each migration in `_schema_versions`.
 pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<(), SqliteError> {
@@ -118,25 +111,7 @@ const V3_UP: &str = include_str!("../sql/003-backfill-domain-mirror-atoms.sql");
 /// Shared between the V1 schema and the belt-and-suspenders creation in
 /// `StorageBackend::vectors_for_namespace`. Both sites reference this constant so
 /// the schema cannot silently diverge if the registry evolves.
-pub const EMBEDDING_MODELS_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS _embedding_models (\
-        id              BLOB PRIMARY KEY,\
-        engine_name     TEXT NOT NULL,\
-        model_id        TEXT NOT NULL,\
-        key_version     TEXT NOT NULL,\
-        dim             INTEGER NOT NULL,\
-        output_dim      INTEGER,\
-        status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
-        activated_at    INTEGER,\
-        superseded_at   INTEGER,\
-        superseded_by   BLOB,\
-        canonical_key   BLOB NOT NULL UNIQUE,\
-        created_at      INTEGER NOT NULL\
-    );\
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
-        ON _embedding_models(engine_name) WHERE status = 'active';\
-    CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
-        ON _embedding_models(engine_name, status);";
+pub const EMBEDDING_MODELS_DDL: &str = include_str!("../sql/embedding-models-ddl.sql");
 
 /// All versioned migrations in ascending order, applied by `run_migrations`.
 pub const MIGRATIONS: &[VersionedMigration] = &[
@@ -157,13 +132,7 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
 ];
 
-const MIGRATION_TRACKING_TABLE: &str = "\
-    CREATE TABLE IF NOT EXISTS _schema_migrations (\
-        version   INTEGER PRIMARY KEY,\
-        name      TEXT NOT NULL,\
-        applied_at INTEGER NOT NULL\
-    );\
-";
+const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
 /// Apply all unapplied migrations in order. Idempotent; each migration runs in its own transaction.
 /// Errors on non-contiguous version array or failed migration.

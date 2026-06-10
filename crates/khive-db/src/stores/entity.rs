@@ -501,29 +501,7 @@ impl EntityStore for SqlEntityStore {
 // DDL
 // =============================================================================
 
-const ENTITIES_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS entities (\
-        id TEXT PRIMARY KEY,\
-        namespace TEXT NOT NULL,\
-        kind TEXT NOT NULL,\
-        entity_type TEXT,\
-        name TEXT NOT NULL,\
-        description TEXT,\
-        properties TEXT,\
-        tags TEXT NOT NULL DEFAULT '[]',\
-        created_at INTEGER NOT NULL,\
-        updated_at INTEGER NOT NULL,\
-        deleted_at INTEGER,\
-        merged_into TEXT,\
-        merge_event_id TEXT\
-    );\
-    CREATE INDEX IF NOT EXISTS idx_entities_namespace ON entities(namespace);\
-    CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);\
-    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);\
-    CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);\
-    CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);\
-    CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);\
-";
+const ENTITIES_DDL: &str = include_str!("../../sql/entities-ddl.sql");
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(ENTITIES_DDL)
