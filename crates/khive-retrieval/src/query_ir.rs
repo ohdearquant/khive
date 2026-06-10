@@ -79,7 +79,7 @@ pub enum QueryNode {
 
 /// Fusion strategy for combining sub-query result lists.
 ///
-/// Mirrors [`FusionStrategy`](crate::fusion::FusionStrategy) at the IR level
+/// Mirrors [`FusionStrategy`](crate::FusionStrategy) at the IR level
 /// so that the query plan is self-contained and serialisable without depending
 /// on runtime fusion internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]

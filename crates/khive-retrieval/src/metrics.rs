@@ -2,10 +2,6 @@
 //!
 //! Pluggable MetricsSink trait; inject NoopSink for zero overhead or RecordingSink for tests.
 //! Decoupled from Prometheus/OpenTelemetry so the crate has no observability stack dependency.
-//! // ... perform operations ...
-//! let events = sink.events();
-//! assert!(!events.is_empty());
-//! ```
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

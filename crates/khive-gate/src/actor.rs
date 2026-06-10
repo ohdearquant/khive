@@ -7,7 +7,7 @@ use crate::GateValidationError;
 /// Caller identity. `kind` distinguishes user vs agent vs lambda etc.
 ///
 /// Invariant: both `kind` and `id` must be non-empty. Enforced at construction
-/// and deserialization via [`serde(try_from)`].
+/// and deserialization via `serde(try_from)`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct ActorRef {
     pub kind: String,

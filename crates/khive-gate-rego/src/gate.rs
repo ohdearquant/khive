@@ -1,3 +1,5 @@
+//! Rego-backed [`Gate`] implementation powered by the `regorus` engine.
+
 use std::path::Path;
 use std::sync::Mutex;
 

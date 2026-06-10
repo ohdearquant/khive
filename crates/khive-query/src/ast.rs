@@ -93,6 +93,7 @@ pub struct MatchPattern {
 }
 
 impl MatchPattern {
+    /// Iterate over the `NodePattern` elements in this MATCH pattern.
     pub fn nodes(&self) -> impl Iterator<Item = &NodePattern> {
         self.elements.iter().filter_map(|e| match e {
             PatternElement::Node(n) => Some(n),
@@ -100,6 +101,7 @@ impl MatchPattern {
         })
     }
 
+    /// Iterate over the `EdgePattern` elements in this MATCH pattern.
     pub fn edges(&self) -> impl Iterator<Item = &EdgePattern> {
         self.elements.iter().filter_map(|e| match e {
             PatternElement::Edge(e) => Some(e),
@@ -130,6 +132,7 @@ pub struct NodePattern {
     pub properties: HashMap<String, String>,
 }
 
+/// An edge binding in the MATCH pattern with optional relation filters, direction, and hop bounds.
 #[derive(Debug, Clone)]
 pub struct EdgePattern {
     pub variable: Option<String>,
@@ -139,13 +142,18 @@ pub struct EdgePattern {
     pub max_hops: usize,
 }
 
+/// Traversal direction for an edge in the MATCH pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeDirection {
+    /// Outgoing only — `(a)-->(b)`.
     Out,
+    /// Incoming only — `(a)<--(b)`.
     In,
+    /// Either direction — `(a)--(b)`.
     Both,
 }
 
+/// A scalar comparison in the WHERE clause: `variable.property op value`.
 #[derive(Debug, Clone)]
 pub struct Condition {
     pub variable: String,
@@ -154,6 +162,7 @@ pub struct Condition {
     pub value: ConditionValue,
 }
 
+/// Comparison operator used in WHERE clause conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Eq,
@@ -165,6 +174,7 @@ pub enum CompareOp {
     Like,
 }
 
+/// Right-hand side value in a WHERE condition.
 #[derive(Debug, Clone)]
 pub enum ConditionValue {
     String(String),

@@ -1,3 +1,5 @@
+//! Schedule pack vocabulary — handler definitions, param schemas, and auxiliary SQL.
+
 use khive_types::{HandlerDef, ParamDef, Visibility};
 
 /// Pack-auxiliary index for agenda() efficiency.

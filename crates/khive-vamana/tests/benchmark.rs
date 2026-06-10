@@ -1,3 +1,5 @@
+//! Manual timing benchmarks for Vamana index build and search throughput.
+
 use std::time::Instant;
 
 use khive_vamana::{VamanaConfig, VamanaIndex};

@@ -26,7 +26,7 @@ pub enum GateValidationError {
 
 // ---------- Error ----------
 
-/// Errors returned by [`Gate::check`].
+/// Errors returned by [`crate::Gate::check`].
 #[derive(Error, Debug)]
 pub enum GateError {
     #[error("policy error: {0}")]

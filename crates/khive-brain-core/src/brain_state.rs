@@ -29,6 +29,7 @@ pub struct BrainState {
 }
 
 impl BrainState {
+    /// Create a fresh `BrainState` with a single default `balanced-recall-v1` profile.
     pub fn new(entity_capacity: usize) -> Self {
         let mut profiles = HashMap::new();
         let record = ProfileRecord::new_balanced_recall(entity_capacity);
@@ -44,6 +45,7 @@ impl BrainState {
         }
     }
 
+    /// Serialize the current state to a `BrainStateSnapshot` for persistence.
     pub fn to_snapshot(&self) -> BrainStateSnapshot {
         let extra: HashMap<String, BalancedRecallSnapshot> = self
             .profile_states
@@ -64,6 +66,7 @@ impl BrainState {
         }
     }
 
+    /// Rebuild live state from a persisted snapshot.
     pub fn from_snapshot(snapshot: BrainStateSnapshot, entity_capacity: usize) -> Self {
         let extra: HashMap<String, BalancedRecallState> = snapshot
             .profile_states
@@ -87,6 +90,7 @@ impl BrainState {
         }
     }
 
+    /// Reset all posteriors to their prior values and bump the exploration epoch.
     pub fn reset_posteriors(&mut self) {
         self.balanced_recall.reset_posteriors();
         if let Some(record) = self.profiles.get_mut("balanced-recall-v1") {
@@ -98,6 +102,7 @@ impl BrainState {
         }
     }
 
+    /// Reset posteriors for a single named profile, leaving other profiles unchanged.
     pub fn reset_profile_posteriors(&mut self, profile_id: &str) {
         if let Some(ps) = self.profile_states.get_mut(profile_id) {
             ps.reset_posteriors();
@@ -113,6 +118,7 @@ impl BrainState {
         }
     }
 
+    /// Resolve which `ProfileRecord` serves a given (actor, namespace, consumer_kind) triple.
     pub fn resolve(
         &self,
         actor: Option<&str>,

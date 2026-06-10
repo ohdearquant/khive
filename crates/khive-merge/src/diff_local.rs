@@ -63,6 +63,7 @@ pub struct EdgeKey {
 }
 
 impl EdgeKey {
+    /// Construct an `EdgeKey` from a `ExportedEdge` by cloning its identity fields.
     pub fn from_edge(e: &ExportedEdge) -> Self {
         Self {
             source: e.source,

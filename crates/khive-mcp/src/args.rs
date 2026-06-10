@@ -24,7 +24,7 @@ pub struct Args {
     /// Precedence (highest to lowest):
     ///   1. --actor (this flag)
     ///   2. --namespace / KHIVE_NAMESPACE (legacy alias)
-    ///   3. [actor] id in config file (--config / KHIVE_CONFIG / khive.toml / ~/.khive/config.toml)
+    ///   3. \[actor\] id in config file (--config / KHIVE_CONFIG / khive.toml / ~/.khive/config.toml)
     ///   4. Default: "local"
     #[arg(long, env = "KHIVE_ACTOR")]
     pub actor: Option<String>,

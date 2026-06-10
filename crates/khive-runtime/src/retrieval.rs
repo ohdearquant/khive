@@ -602,8 +602,8 @@ impl KhiveRuntime {
     /// hard-deletes because the vector store and SQL substrate are decoupled.
     ///
     /// Iterates over every registered embedding model and calls
-    /// [`VectorStore::orphan_sweep`] for the token's namespace. Models whose
-    /// backend returns [`StorageError::Unsupported`] are skipped without error —
+    /// [`khive_storage::VectorStore::orphan_sweep`] for the token's namespace. Models whose
+    /// backend returns [`khive_storage::StorageError::Unsupported`] are skipped without error —
     /// this preserves forward-compat when a newly registered model does not yet
     /// implement sweep.
     ///

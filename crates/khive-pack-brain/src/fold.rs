@@ -12,6 +12,7 @@ pub struct BalancedRecallFold {
 }
 
 impl BalancedRecallFold {
+    /// Create a fold with the given entity capacity for the `balanced-recall-v1` state.
     pub fn new(entity_capacity: usize) -> Self {
         Self { entity_capacity }
     }
@@ -42,6 +43,7 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
 pub struct SectionPosteriorFold;
 
 impl SectionPosteriorFold {
+    /// Create a default `SectionPosteriorFold`.
     pub fn new() -> Self {
         Self
     }

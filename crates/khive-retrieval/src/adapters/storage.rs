@@ -1,7 +1,7 @@
 //! Storage-trait adapters implementing retrieval search traits.
 //!
-//! StorageVectorSearch wraps Arc<dyn VectorStore> and StorageKeywordSearch wraps
-//! Arc<dyn TextSearch>, both implementing retrieval traits with Id = Uuid.
+//! `StorageVectorSearch` wraps `Arc<dyn VectorStore>` and `StorageKeywordSearch` wraps
+//! `Arc<dyn TextSearch>`, both implementing retrieval traits with `Id = Uuid`.
 
 use std::sync::Arc;
 

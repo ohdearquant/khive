@@ -84,6 +84,7 @@ impl Default for PersistenceTracker {
 }
 
 impl PersistenceTracker {
+    /// Create a fresh `PersistenceTracker` with no loaded namespaces.
     pub fn new() -> Self {
         Self {
             active_namespace: None,
@@ -95,19 +96,23 @@ impl PersistenceTracker {
         }
     }
 
+    /// Return `true` if `namespace` has been initialised (from DB or fresh default).
     pub fn is_loaded(&self, namespace: &str) -> bool {
         self.loaded_namespaces.contains_key(namespace)
     }
 
+    /// Return `true` if `namespace` is the currently active namespace slot.
     pub fn is_active(&self, namespace: &str) -> bool {
         self.active_namespace.as_deref() == Some(namespace)
     }
 
+    /// Register `namespace` as loaded and set it as the active namespace.
     pub fn mark_loaded(&mut self, namespace: String) {
         self.loaded_namespaces.insert(namespace.clone(), ());
         self.active_namespace = Some(namespace);
     }
 
+    /// Save `from_state` for `from_namespace`, then activate `to_namespace` (returning saved state if any).
     pub fn swap_namespace(
         &mut self,
         from_namespace: &str,
@@ -121,6 +126,7 @@ impl PersistenceTracker {
         saved
     }
 
+    /// Increment the dirty event count for `namespace`; return `true` when a snapshot is due.
     pub fn increment_dirty(&mut self, namespace: &str) -> bool {
         let count = self.dirty_counts.entry(namespace.to_string()).or_insert(0);
         *count += 1;

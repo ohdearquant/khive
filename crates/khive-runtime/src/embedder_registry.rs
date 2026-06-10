@@ -1,7 +1,7 @@
 //! EmbedderRegistry — pack-extensible embedding provider surface.
 //!
 //! Packs implement [`EmbedderProvider`] and register custom models via
-//! [`KhiveRuntime::register_embedder`]. Built-in lattice models are pre-registered
+//! [`crate::KhiveRuntime::register_embedder`]. Built-in lattice models are pre-registered
 //! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
@@ -67,7 +67,7 @@ impl Clone for EmbedderEntry {
 /// Registry of named [`EmbedderProvider`] instances.
 ///
 /// Built during `KhiveRuntime` construction and optionally extended by packs
-/// via [`KhiveRuntime::register_embedder`]. The registry is internally
+/// via [`crate::KhiveRuntime::register_embedder`]. The registry is internally
 /// reference-counted so `KhiveRuntime::clone()` shares the same providers
 /// and cached service instances.
 #[derive(Clone, Default)]
@@ -137,7 +137,7 @@ impl EmbedderRegistry {
     /// The first call for a given name triggers [`EmbedderProvider::build`];
     /// subsequent calls return the cached `Arc`.
     ///
-    /// Prefer [`KhiveRuntime::embedder`] over calling this directly from pack
+    /// Prefer [`crate::KhiveRuntime::embedder`] over calling this directly from pack
     /// handlers — the runtime method handles alias resolution and error mapping.
     pub async fn get_service(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let entry = self

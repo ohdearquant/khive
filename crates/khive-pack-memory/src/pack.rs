@@ -22,7 +22,7 @@ pub struct MemoryPack {
     pub(crate) config: Mutex<RecallConfig>,
     /// Per-`(namespace, model)` warm ANN indexes.
     pub(crate) ann: SharedAnn,
-    /// Bounded exact-match query embedding cache (model_name, query_text) → Vec<f32>.
+    /// Bounded exact-match query embedding cache (model_name, query_text) → `Vec<f32>`.
     pub(crate) query_cache: QueryEmbeddingCache,
     /// In-memory Beta-posterior state for recall-domain feedback.
     ///

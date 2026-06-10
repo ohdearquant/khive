@@ -89,7 +89,7 @@ pub struct HybridConfig {
     /// Optional timeout for the entire search operation.
     ///
     /// If set, the search will be cancelled if it exceeds this duration,
-    /// returning [`RetrievalError::QueryTimeout`].
+    /// returning [`crate::error::RetrievalError::QueryTimeout`].
     /// If None, no timeout is applied.
     #[serde(
         default,
@@ -166,7 +166,7 @@ impl HybridConfig {
     /// Set the search timeout.
     ///
     /// If the search operation exceeds this duration, it will return
-    /// [`RetrievalError::QueryTimeout`].
+    /// [`crate::error::RetrievalError::QueryTimeout`].
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

@@ -1,3 +1,5 @@
+//! Integration tests for Vamana snapshot serialization, deserialization, and corruption handling.
+
 use std::fs;
 
 use khive_vamana::{

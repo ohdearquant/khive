@@ -70,7 +70,7 @@ pub trait VectorStore: Send + Sync + 'static {
 
     /// Search with metadata pre-filter.
     ///
-    /// Default: delegates to [`search`] when the filter carries no predicates;
+    /// Default: delegates to [`Self::search`] when the filter carries no predicates;
     /// returns [`StorageError::Unsupported`] otherwise. Backends with native filter
     /// pushdown should override this method and set `supports_filter = true` in their
     /// [`VectorStoreCapabilities`].
@@ -101,7 +101,7 @@ pub trait VectorStore: Send + Sync + 'static {
 
     /// Search with N query vectors in one round-trip (HyDE fan-out, multi-query).
     ///
-    /// Default: sequential calls to [`search`], isolating per-query errors so one
+    /// Default: sequential calls to [`Self::search`], isolating per-query errors so one
     /// bad request does not abort the batch. Backends that support native batch
     /// search should override this and set `supports_batch_search = true`.
     async fn search_batch(

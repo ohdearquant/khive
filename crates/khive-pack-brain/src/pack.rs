@@ -10,6 +10,7 @@ use khive_brain_core::BrainState;
 use crate::handlers::BRAIN_HANDLERS;
 use crate::persist;
 
+/// Default entity cache capacity for the `balanced-recall-v1` per-entity posterior state.
 pub const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
 // Test-only hook that fires inside dispatch(), after ensure_loaded returns and

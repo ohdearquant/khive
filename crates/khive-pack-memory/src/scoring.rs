@@ -78,6 +78,7 @@ pub struct CandidateContext<'a> {
 }
 
 impl AdjustmentCondition {
+    /// Return `true` when this condition applies to the given candidate context.
     pub fn matches(&self, ctx: &CandidateContext<'_>) -> bool {
         match self {
             Self::MemoryType { kind } => ctx.memory_type == kind.as_str(),
@@ -127,6 +128,7 @@ impl AdjustmentCondition {
 }
 
 impl AdjustmentOp {
+    /// Apply this operation to `score` and return the adjusted value.
     pub fn apply(&self, score: f32) -> f32 {
         match self {
             Self::Add { value } => score + value,
@@ -137,6 +139,7 @@ impl AdjustmentOp {
 }
 
 impl ScoreAdjustment {
+    /// Apply this adjustment to `score` if the condition matches, otherwise return `score` unchanged.
     pub fn apply(&self, score: f32, ctx: &CandidateContext<'_>) -> f32 {
         if self.condition.matches(ctx) {
             self.operation.apply(score)

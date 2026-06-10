@@ -1,3 +1,5 @@
+//! `SchedulePack` implementation — registers schema, vocab, and verb handlers with the runtime.
+
 use async_trait::async_trait;
 use serde_json::Value;
 
