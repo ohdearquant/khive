@@ -34,7 +34,7 @@ impl BetaPosterior {
     /// Construct a `BetaPosterior` with the given parameters.
     ///
     /// # Panics
-    /// Panics in debug builds if `alpha` or `beta` is non-finite or non-positive.
+    /// Panics if `alpha` or `beta` is non-finite or non-positive.
     /// Use [`try_new`](Self::try_new) when parameters come from untrusted input.
     pub fn new(alpha: f64, beta: f64) -> Self {
         Self::try_new(alpha, beta).unwrap_or_else(|e| panic!("{e}"))
@@ -121,32 +121,34 @@ impl BetaPosterior {
 
     /// Cap ESS by scaling excess evidence back toward the prior.
     ///
-    /// # Panics
-    /// Panics if `cap` is not finite and positive, if `cap` is less than or equal to
+    /// Returns `Err` if `cap` is not finite and positive, if `cap` is less than or equal to
     /// `prior.effective_sample_size()`, or if the resulting scaled parameters are non-positive.
-    /// These invariants must hold for a valid ESS cap operation.
-    pub fn apply_ess_cap(&mut self, prior: &BetaPosterior, cap: f64) {
-        assert!(
-            cap.is_finite() && cap > 0.0,
-            "apply_ess_cap: cap must be finite and positive, got {cap}"
-        );
+    pub fn apply_ess_cap(&mut self, prior: &BetaPosterior, cap: f64) -> Result<(), String> {
+        if !cap.is_finite() || cap <= 0.0 {
+            return Err(format!(
+                "apply_ess_cap: cap must be finite and positive, got {cap}"
+            ));
+        }
         let ess = self.effective_sample_size();
         if ess > cap {
             let prior_ess = prior.effective_sample_size();
-            assert!(
-                cap > prior_ess,
-                "apply_ess_cap: cap ({cap}) must be > prior ESS ({prior_ess})"
-            );
+            if cap <= prior_ess {
+                return Err(format!(
+                    "apply_ess_cap: cap ({cap}) must be > prior ESS ({prior_ess})"
+                ));
+            }
             let scale = (cap - prior_ess) / (ess - prior_ess);
             let new_alpha = prior.alpha + (self.alpha - prior.alpha) * scale;
             let new_beta = prior.beta + (self.beta - prior.beta) * scale;
-            assert!(
-                new_alpha > 0.0 && new_beta > 0.0,
-                "apply_ess_cap: scaled parameters must be positive, got alpha={new_alpha} beta={new_beta}"
-            );
+            if new_alpha <= 0.0 || new_beta <= 0.0 {
+                return Err(format!(
+                    "apply_ess_cap: scaled parameters must be positive, got alpha={new_alpha} beta={new_beta}"
+                ));
+            }
             self.alpha = new_alpha;
             self.beta = new_beta;
         }
+        Ok(())
     }
 
     pub fn floored_mean(&self, floor: f64) -> f64 {
@@ -277,31 +279,51 @@ mod tests {
         let prior = BetaPosterior::new(1.0, 1.0);
         let mut p = BetaPosterior::new(60.0, 50.0);
         // Valid cap must work.
-        p.apply_ess_cap(&prior, 100.0);
+        p.apply_ess_cap(&prior, 100.0)
+            .expect("valid cap must succeed");
         assert!((p.effective_sample_size() - 100.0).abs() < 1e-9);
     }
 
     #[test]
-    #[should_panic(expected = "cap must be finite and positive")]
-    fn apply_ess_cap_panics_on_zero_cap() {
+    fn apply_ess_cap_returns_err_on_zero_cap() {
         let prior = BetaPosterior::new(1.0, 1.0);
         let mut p = BetaPosterior::new(10.0, 10.0);
-        p.apply_ess_cap(&prior, 0.0);
+        let result = p.apply_ess_cap(&prior, 0.0);
+        assert!(result.is_err(), "zero cap must return Err");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("cap must be finite and positive"),
+            "error message must name the constraint"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "cap must be finite and positive")]
-    fn apply_ess_cap_panics_on_nan_cap() {
+    fn apply_ess_cap_returns_err_on_nan_cap() {
         let prior = BetaPosterior::new(1.0, 1.0);
         let mut p = BetaPosterior::new(10.0, 10.0);
-        p.apply_ess_cap(&prior, f64::NAN);
+        let result = p.apply_ess_cap(&prior, f64::NAN);
+        assert!(result.is_err(), "NaN cap must return Err");
+    }
+
+    #[test]
+    fn apply_ess_cap_returns_err_when_cap_le_prior_ess() {
+        // prior ESS = 200.0; cap = 100.0 < prior ESS → must return Err, not panic
+        let prior = BetaPosterior::new(100.0, 100.0);
+        let mut p = BetaPosterior::new(200.0, 200.0);
+        let result = p.apply_ess_cap(&prior, 100.0);
+        assert!(result.is_err(), "cap <= prior_ess must return Err");
+        assert!(
+            result.unwrap_err().contains("must be > prior ESS"),
+            "error must state cap vs prior_ess constraint"
+        );
     }
 
     #[test]
     fn ess_cap() {
         let prior = BetaPosterior::new(2.0, 2.0);
         let mut p = BetaPosterior::new(60.0, 50.0);
-        p.apply_ess_cap(&prior, 100.0);
+        p.apply_ess_cap(&prior, 100.0).expect("valid cap");
         assert!((p.effective_sample_size() - 100.0).abs() < 1e-9);
     }
 

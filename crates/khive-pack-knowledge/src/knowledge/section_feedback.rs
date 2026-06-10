@@ -16,7 +16,12 @@ pub fn on_section_feedback(
                 FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
             }
             if let Some(prior) = state.priors.get(section_type).cloned() {
-                posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP);
+                if let Err(e) = posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP) {
+                    eprintln!(
+                        "[knowledge] apply_ess_cap failed for section {:?}: {e}",
+                        section_type
+                    );
+                }
             }
         }
     }

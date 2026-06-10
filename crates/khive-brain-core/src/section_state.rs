@@ -159,7 +159,12 @@ impl SectionPosteriorState {
                         FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
                     }
                     if let Some(prior) = self.priors.get(section_type) {
-                        posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP);
+                        if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
+                            eprintln!(
+                                "[brain-core] apply_ess_cap failed for section {:?}: {e}",
+                                section_type
+                            );
+                        }
                     }
                 }
             }

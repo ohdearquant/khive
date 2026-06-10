@@ -20,6 +20,7 @@ use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 use khive_brain_core::{
     ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
+    DEFAULT_ESS_CAP,
 };
 
 // ── Handler table ─────────────────────────────────────────────────────────────
@@ -1287,6 +1288,14 @@ impl BrainPack {
                                 "invalid seed_priors for section {key:?}: {e}"
                             ))
                         })?;
+                    let ess = posterior.effective_sample_size();
+                    if ess > DEFAULT_ESS_CAP {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "seed_priors for section {key:?}: alpha+beta ({ess}) exceeds \
+                             maximum allowed ESS ({DEFAULT_ESS_CAP}); use values where \
+                             alpha + beta <= {DEFAULT_ESS_CAP}"
+                        )));
+                    }
                     priors.insert(st, posterior);
                 }
                 SectionPosteriorState::from_priors(priors)

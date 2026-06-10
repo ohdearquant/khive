@@ -282,11 +282,9 @@ pub struct NeighborHit {
 }
 
 /// Raw deserialization target for [`TraversalOptions`].
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct TraversalOptionsRaw {
-    #[serde(default)]
     max_depth: usize,
-    #[serde(default)]
     direction: Direction,
     relations: Option<Vec<EdgeRelation>>,
     min_weight: Option<f64>,
