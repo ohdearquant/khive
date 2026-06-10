@@ -82,7 +82,7 @@ fn bench_snapshot_roundtrip(c: &mut Criterion) {
     });
 
     // Bench 4: full BrainState round-trip — both to_snapshot AND from_snapshot
-    // are timed inside the closure so the reported number reflects the real
+    // are inside the timed closure so the reported number reflects the real
     // serialise-then-restore cost, not restore-only.
     g.bench_function("brain_state/roundtrip", |b| {
         let mut brain = BrainState::new(100);
@@ -90,23 +90,10 @@ fn bench_snapshot_roundtrip(c: &mut Criterion) {
         for _ in 0..50 {
             brain.balanced_recall.apply_signal(&recall_hit(id, 20_000));
         }
-        b.iter_batched(
-            || brain.to_snapshot(),
-            |snap| {
-                let restored = BrainState::from_snapshot(snap, 100);
-                // Assert structural equality: snapshot of restored state must
-                // match the snapshot of the original to catch any field dropped
-                // by the round-trip.
-                let roundtrip_snap = restored.to_snapshot();
-                debug_assert_eq!(
-                    roundtrip_snap.balanced_recall,
-                    brain.to_snapshot().balanced_recall,
-                    "brain_state round-trip must preserve all fields"
-                );
-                black_box(restored)
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            let snap = black_box(&brain).to_snapshot();
+            black_box(BrainState::from_snapshot(snap, 100))
+        })
     });
 
     g.finish();
