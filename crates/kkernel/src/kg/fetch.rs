@@ -50,7 +50,10 @@ mod tests {
     use super::*;
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {
+        // Hermetic: machine-wide hooks (e.g. leak-guard via core.hooksPath)
+        // must not block commits inside throwaway test repos.
         let status = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .current_dir(dir)
             .status()
