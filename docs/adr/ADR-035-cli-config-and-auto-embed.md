@@ -141,7 +141,10 @@ is valid TOML but will be warned against at startup: device selection should not
 ## CLI / env / config precedence
 
 For each runtime option, precedence is:
-**CLI flag > `KHIVE_*` env var > project khive.toml > global khive.toml > built-in default**.
+**CLI flag > project khive.toml > global khive.toml > `KHIVE_*` env var > built-in default**.
+A `KHIVE_*` env var is only a fallback default — when a TOML key resolves at either level it
+wins over the env var. This matches the runtime config loader (`engine_config.rs`) and the
+config docs (`docs/khive-config-example.toml`).
 
 | Option             | CLI flag          | Env var                  | Config key                | Default           |
 | ------------------ | ----------------- | ------------------------ | ------------------------- | ----------------- |
@@ -153,10 +156,43 @@ For each runtime option, precedence is:
 | Embedding model    | `--embed-model`   | `KHIVE_EMBED_MODEL`      | `embed.model`             | `mE5-small`       |
 | Log level          | `--log-level`     | `KHIVE_LOG`              | `runtime.log_level`       | `info`            |
 | Authorization gate | `--gate`          | `KHIVE_GATE`             | `runtime.gate`            | `allow-all`       |
+| Brain profile      | `--brain-profile` | `KHIVE_BRAIN_PROFILE`    | `runtime.brain_profile`   | `None`            |
 
 Note: `recall(min_score)` has **no floor by default** on small tenants (per khive-remote MCP
 server docs). Operators should set `KHIVE_RECALL_MIN_SCORE=0.5` (or similar) in production
 deployments.
+
+### Brain profile configuration
+
+The `brain_profile` option designates which brain profile receives feedback from
+`memory.feedback` and `knowledge.feedback`, and from which profile recall-time score
+boosting reads. It is configured the same way namespace is — via `--brain-profile`,
+`KHIVE_BRAIN_PROFILE`, or `runtime.brain_profile` in `khive.toml`.
+
+**Configuration example** (`.khive/khive.toml`):
+
+```toml
+[runtime]
+namespace = "lambda:khive"
+brain_profile = "project-recall-v1"
+```
+
+**Feedback and recall-boost profile resolution order** (for `memory.feedback`,
+`knowledge.feedback`, and recall-time boosting):
+
+1. **Explicit profile in config**: if `runtime.brain_profile` / `KHIVE_BRAIN_PROFILE` /
+   `--brain-profile` resolves to a non-empty string, that profile ID is used directly.
+2. **Namespace-bound profile**: if no explicit profile is set but a namespace is configured,
+   the feedback handler calls `brain.resolve(consumer_kind="recall")` for that
+   namespace and uses the resolved profile.
+3. **Global tuning prior**: if neither explicit nor namespace-bound profile resolves, the
+   pack-local in-memory state (`BalancedRecallState` for memory, `SectionPosteriorState` for
+   knowledge) receives the update directly. This is the intended global fallback — it is
+   not a bug.
+
+This resolution is automatic: packs attempt tiers 1 and 2 silently and fall through to tier 3
+when nothing is bound. No configuration is required for the global-prior behavior to continue
+working as before.
 
 ### 3. `[embed]` and `[schema]` sections
 
@@ -456,6 +492,15 @@ as separating source files from build artifacts in a standard software project.
 | `embed.model` allowed as per-user override             | User flexibility            | Incompatible vectors across collaborators                             | Model is a project invariant; must be locked at project level      |
 
 ## Consequences
+
+### Positive (amendment: brain profile knob)
+
+- `memory.feedback` and `knowledge.feedback` can be directed to a specific brain profile
+  through the same config path used by namespace — no per-call parameter needed.
+- Deployments that bind a namespace to a brain profile via `brain.bind` benefit automatically
+  from tier-2 resolution without any `khive.toml` change.
+- The global tuning prior (tier 3) continues to work unchanged for deployments that do not
+  configure a profile. No existing behavior is removed.
 
 ### Positive
 
