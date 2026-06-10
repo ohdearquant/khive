@@ -211,6 +211,14 @@ pub enum RuntimeError {
         max_new_entries: u64,
         attempted_new_entries: u64,
     },
+
+    /// Write blocked: content matches a secret pattern.
+    ///
+    /// The `SecretMatch` carries the detector name and a masked excerpt
+    /// (`first6...Nchars`). The full candidate is never stored in the error.
+    /// Store a pointer (env-var name, keychain item) rather than the raw value.
+    #[error("write blocked: {0}")]
+    SecretDetected(crate::secret_gate::SecretMatch),
 }
 
 fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
