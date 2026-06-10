@@ -41,12 +41,20 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         description: "Fetch a single atom or domain by UUID or slug",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[ParamDef {
-            name: "id",
-            param_type: "string",
-            required: true,
-            description: "Atom/domain UUID or slug",
-        }],
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Atom/domain UUID or slug",
+            },
+            ParamDef {
+                name: "include_sections",
+                param_type: "boolean",
+                required: false,
+                description: "When true, include the atom's sections under a `sections` key, ordered by sort_order. Ignored for domains. Default: false.",
+            },
+        ],
     },
     HandlerDef {
         name: "knowledge.list",

@@ -27,6 +27,16 @@ impl Fixture {
     async fn dispatch(&self, verb: &str, args: Value) -> Result<Value, RuntimeError> {
         self.registry.dispatch(verb, args).await
     }
+
+    async fn dispatch_ns(
+        &self,
+        verb: &str,
+        ns: &str,
+        mut args: Value,
+    ) -> Result<Value, RuntimeError> {
+        args["namespace"] = json!(ns);
+        self.registry.dispatch(verb, args).await
+    }
 }
 
 fn pack(rt: KhiveRuntime) -> Fixture {
@@ -687,6 +697,168 @@ async fn get_returns_not_found_for_unknown_slug() {
         err.to_string().contains("not found") || err.to_string().contains("NotFound"),
         "expected not-found error, got: {err}"
     );
+}
+
+// ── knowledge.get + include_sections ─────────────────────────────────────────
+
+#[tokio::test]
+async fn get_include_sections_false_returns_no_sections_key() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "s-atom", "name": "SAtom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "s-atom", "sections": [{ "section_type": "overview", "content": "This section describes the overview of LoRA and its applications in fine-tuning large language models with low-rank matrix decompositions." }] }),
+    )
+    .await
+    .expect("edit");
+
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "s-atom" }))
+        .await
+        .expect("get without sections");
+
+    assert_eq!(got["kind"], "atom");
+    assert!(
+        got.get("sections").is_none(),
+        "sections key must not be present by default"
+    );
+}
+
+#[tokio::test]
+async fn get_include_sections_returns_all_sections_ordered() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "sec-atom", "name": "SecAtom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "sec-atom",
+            "sections": [
+                { "section_type": "overview", "content": "This is the overview section covering the main ideas and introduction to the topic in sufficient detail for embedding purposes." },
+                { "section_type": "formalism", "content": "Formal definitions go here including mathematical notation theorems proofs lemmas and corollaries that describe the system formally." },
+                { "section_type": "examples", "content": "Concrete examples illustrate the concepts with worked-through scenarios code samples and practical demonstrations of usage patterns." },
+            ]
+        }),
+    )
+    .await
+    .expect("edit");
+
+    let got = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "sec-atom", "include_sections": true }),
+        )
+        .await
+        .expect("get with sections");
+
+    assert_eq!(got["kind"], "atom");
+    let sections = got["sections"].as_array().expect("sections is array");
+    assert_eq!(sections.len(), 3, "expected 3 sections, got: {sections:?}");
+
+    let types: Vec<&str> = sections
+        .iter()
+        .filter_map(|s| s["section_type"].as_str())
+        .collect();
+    assert!(types.contains(&"overview"), "missing overview: {types:?}");
+    assert!(types.contains(&"formalism"), "missing formalism: {types:?}");
+    assert!(types.contains(&"examples"), "missing examples: {types:?}");
+
+    for s in sections {
+        assert!(
+            s["content"].as_str().is_some_and(|c| !c.is_empty()),
+            "section content empty"
+        );
+        assert!(s["section_type"].as_str().is_some(), "section_type missing");
+        assert!(s["sort_order"].as_i64().is_some(), "sort_order missing");
+    }
+}
+
+#[tokio::test]
+async fn get_include_sections_by_uuid() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "uuid-sec-atom", "name": "UuidSecAtom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "uuid-sec-atom", "sections": [{ "section_type": "overview", "content": "This section describes the overview of LoRA and its applications in fine-tuning large language models with low-rank matrix decompositions." }] }),
+    )
+    .await
+    .expect("edit");
+
+    let by_slug = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "uuid-sec-atom", "include_sections": true }),
+        )
+        .await
+        .expect("get by slug");
+    let atom_uuid = by_slug["id"].as_str().expect("id").to_owned();
+
+    let by_uuid = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": atom_uuid, "include_sections": true }),
+        )
+        .await
+        .expect("get by uuid");
+
+    let sections = by_uuid["sections"].as_array().expect("sections array");
+    assert_eq!(sections.len(), 1, "expected 1 section by UUID lookup");
+}
+
+#[tokio::test]
+async fn get_include_sections_namespace_isolation() {
+    let f = pack(rt());
+
+    f.dispatch_ns(
+        "knowledge.upsert_atoms",
+        "ns-a",
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "NSA", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert ns-a");
+
+    f.dispatch_ns(
+        "knowledge.edit",
+        "ns-a",
+        json!({ "id": "shared-slug", "sections": [{ "section_type": "overview", "content": "This section belongs exclusively to namespace A and must not be visible from namespace B under any circumstances." }] }),
+    )
+    .await
+    .expect("edit ns-a");
+
+    f.dispatch_ns(
+        "knowledge.upsert_atoms",
+        "ns-b",
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "NSB", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert ns-b");
+
+    let got_b = f
+        .dispatch_ns(
+            "knowledge.get",
+            "ns-b",
+            json!({ "id": "shared-slug", "include_sections": true }),
+        )
+        .await
+        .expect("get ns-b");
+
+    let sections_b = got_b["sections"].as_array().expect("sections array");
+    assert_eq!(sections_b.len(), 0, "ns-b atom must not see ns-a sections");
 }
 
 // ── knowledge.list ────────────────────────────────────────────────────────────
