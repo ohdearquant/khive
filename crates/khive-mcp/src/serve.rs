@@ -58,6 +58,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         } else {
             Some(args.pack.clone())
         },
+        brain_profile: args.brain_profile.clone(),
     })?;
 
     let runtime = KhiveRuntime::new(config)?;
@@ -81,6 +82,11 @@ pub struct RuntimeConfigInputs<'a> {
     pub no_embed: bool,
     /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
     pub packs: Option<Vec<String>>,
+    /// Explicit brain profile ID (highest-priority tier).
+    ///
+    /// `None` lets lower tiers (env var, config file, runtime fallback) handle
+    /// resolution. Pass `Some(id)` only when the caller holds an explicit CLI value.
+    pub brain_profile: Option<String>,
 }
 
 /// Resolve a [`RuntimeConfig`] from serve-time inputs, applying the SAME
@@ -104,23 +110,48 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         .packs
         .unwrap_or_else(|| RuntimeConfig::default().packs);
 
+    // Tier-1: explicit CLI --brain-profile only (not env — env is tier-3, after TOML).
+    // We must NOT read KHIVE_BRAIN_PROFILE here; RuntimeConfig::default() reads it, so
+    // we exclude brain_profile from the default spread and set it to None (CLI-only).
+    let cli_brain_profile = inputs.brain_profile.filter(|s| !s.trim().is_empty());
+
     let base_config = RuntimeConfig {
         db_path,
         default_namespace: inputs.namespace,
         packs,
+        // Explicit CLI flag only at this tier — env and config-file tiers are applied
+        // below in resolve_config / resolve_actor_from_config and apply_env_brain_profile.
+        brain_profile: cli_brain_profile,
         ..RuntimeConfig::default()
     };
 
-    if inputs.no_embed {
+    let resolved = if inputs.no_embed {
         let no_embed_base = RuntimeConfig {
             embedding_model: None,
             additional_embedding_models: vec![],
             ..base_config
         };
-        resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)
+        resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)?
     } else {
-        resolve_config(inputs.config, base_config, inputs.namespace_explicit)
+        resolve_config(inputs.config, base_config, inputs.namespace_explicit)?
+    };
+
+    // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
+    // config-file (tier-2) so that a project or global TOML always wins over the env var.
+    Ok(apply_env_brain_profile(resolved))
+}
+
+/// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
+///
+/// Called after CLI (tier-1) and config-file (tier-2) have already been applied.
+/// Only sets `brain_profile` when neither previous tier produced a value.
+fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
+    if cfg.brain_profile.is_none() {
+        cfg.brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
     }
+    cfg
 }
 
 /// Resolve the full config (embedding engines + actor namespace) from file or env.
@@ -249,6 +280,7 @@ default = true
             namespace_explicit: false,
             no_embed: false,
             packs: None,
+            brain_profile: None,
         })
         .expect("resolve config");
 
@@ -266,5 +298,119 @@ default = true
             "config file declares one engine; additional list must be empty (not the default's)"
         );
         assert_eq!(resolved.db_path, None, ":memory: must map to in-memory db");
+    }
+
+    /// Regression for BLOCKER-1 (PR #52 codex review): project-toml brain_profile
+    /// MUST win over KHIVE_BRAIN_PROFILE env var.
+    ///
+    /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
+    /// Before the fix, the env var was bound into the clap `brain_profile` arg and
+    /// placed at tier-1 via RuntimeConfig::default() in the base_config spread,
+    /// causing env to override TOML.
+    #[test]
+    #[serial]
+    fn brain_profile_config_beats_env() {
+        std::env::set_var("KHIVE_BRAIN_PROFILE", "env-profile");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[runtime]
+brain_profile = "project-profile"
+"#,
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None, // no explicit CLI flag
+        })
+        .expect("resolve config");
+
+        std::env::remove_var("KHIVE_BRAIN_PROFILE");
+
+        assert_eq!(
+            resolved.brain_profile.as_deref(),
+            Some("project-profile"),
+            "project TOML brain_profile must win over KHIVE_BRAIN_PROFILE env var"
+        );
+    }
+
+    /// Env var is used when no CLI flag and no TOML value are present.
+    #[test]
+    #[serial]
+    fn brain_profile_env_fallback_when_no_toml() {
+        std::env::set_var("KHIVE_BRAIN_PROFILE", "env-profile");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Config file without [runtime] brain_profile.
+        let path = write_config(
+            dir.path(),
+            r#"
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+"#,
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        std::env::remove_var("KHIVE_BRAIN_PROFILE");
+
+        assert_eq!(
+            resolved.brain_profile.as_deref(),
+            Some("env-profile"),
+            "env var must be used when no CLI flag and no TOML brain_profile is set"
+        );
+    }
+
+    /// CLI flag wins over both TOML and env var.
+    #[test]
+    #[serial]
+    fn brain_profile_cli_wins_over_all() {
+        std::env::set_var("KHIVE_BRAIN_PROFILE", "env-profile");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[runtime]
+brain_profile = "project-profile"
+"#,
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: Some("cli-profile".to_string()), // explicit CLI
+        })
+        .expect("resolve config");
+
+        std::env::remove_var("KHIVE_BRAIN_PROFILE");
+
+        assert_eq!(
+            resolved.brain_profile.as_deref(),
+            Some("cli-profile"),
+            "CLI --brain-profile must win over both TOML and KHIVE_BRAIN_PROFILE env var"
+        );
     }
 }

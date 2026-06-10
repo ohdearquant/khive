@@ -120,15 +120,23 @@ impl BrainState {
         consumer_kind: &str,
     ) -> Option<&ProfileRecord> {
         self.resolve_with_match(actor, namespace, consumer_kind)
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
 
+    /// Resolve a profile for the given context, returning the matched record,
+    /// the matched consumer_kind, and whether the result came from an explicit
+    /// binding (`matched_binding = true`) vs. a system-default fallback
+    /// (`matched_binding = false`).
+    ///
+    /// Callers that implement the ADR-035 tier-2 / tier-3 split MUST check
+    /// `matched_binding`: only a `true` result constitutes a real tier-2 hit.
+    /// When `false`, the caller should fall through to tier-3 (pack-local prior).
     pub fn resolve_with_match(
         &self,
         actor: Option<&str>,
         namespace: Option<&str>,
         consumer_kind: &str,
-    ) -> Option<(&ProfileRecord, String)> {
+    ) -> Option<(&ProfileRecord, String, bool)> {
         let actor_val = actor.unwrap_or("*");
         let namespace_val = namespace.unwrap_or("*");
 
@@ -157,7 +165,8 @@ impl BrainState {
 
         if let Some(binding) = best {
             if let Some(record) = self.profiles.get(&binding.profile_id) {
-                return Some((record, binding.consumer_kind.clone()));
+                // matched_binding = true: came from an explicit binding row.
+                return Some((record, binding.consumer_kind.clone(), true));
             }
         }
 
@@ -167,7 +176,8 @@ impl BrainState {
                     || consumer_kind == "*"
                     || default.consumer_kind == "*")
             {
-                return Some((default, default.consumer_kind.clone()));
+                // matched_binding = false: system-default fallback, not a binding match.
+                return Some((default, default.consumer_kind.clone(), false));
             }
         }
 
@@ -182,7 +192,8 @@ impl BrainState {
         candidates
             .into_iter()
             .next()
-            .map(|p| (p, p.consumer_kind.clone()))
+            // matched_binding = false: active-profile scan fallback, not a binding match.
+            .map(|p| (p, p.consumer_kind.clone(), false))
     }
 }
 

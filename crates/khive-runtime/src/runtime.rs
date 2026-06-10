@@ -166,6 +166,17 @@ pub struct RuntimeConfig {
     /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
     /// Single-backend deployments use the default `BackendId::MAIN`.
     pub backend_id: BackendId,
+    /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
+    /// recall-time score boosting (ADR-035 §Brain profile configuration).
+    ///
+    /// Resolution order (highest to lowest, ADR-035): CLI flag, then
+    /// `runtime.brain_profile` in project/global `khive.toml`, then the
+    /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
+    /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).
+    /// 1. `--brain-profile` CLI flag (explicit only)
+    /// 2. Namespace-bound profile resolved via `brain.resolve` at feedback time
+    /// 3. Pack-local global tuning prior (default fallback)
+    pub brain_profile: Option<String>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -210,6 +221,9 @@ impl Default for RuntimeConfig {
                 .map(String::from)
                 .collect()
             });
+        let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         Self {
             db_path,
             default_namespace: Namespace::local(),
@@ -218,6 +232,7 @@ impl Default for RuntimeConfig {
             gate: Arc::new(AllowAllGate),
             packs,
             backend_id: BackendId::main(),
+            brain_profile,
         }
     }
 }
@@ -355,6 +370,7 @@ impl KhiveRuntime {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         })
     }
 
@@ -926,9 +942,20 @@ pub fn runtime_config_from_khive_config(
         _ => base.default_namespace.clone(),
     };
 
+    // base.brain_profile must carry ONLY the explicit CLI tier — never an env
+    // value (env sits BELOW toml per ADR-035; the MCP resolver applies it after).
+    let brain_profile = base.brain_profile.clone().or_else(|| {
+        khive_cfg
+            .runtime
+            .brain_profile
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+    });
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
+            brain_profile,
             ..base
         };
     }
@@ -959,6 +986,7 @@ pub fn runtime_config_from_khive_config(
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,
+        brain_profile,
         ..base
     }
 }
@@ -1019,6 +1047,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -1036,6 +1065,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::new("lore"),
+            brain_profile: None,
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -1155,7 +1185,7 @@ mod tests {
 
     // ---- Actor config tests ----
 
-    use crate::engine_config::{ActorConfig, KhiveConfig};
+    use crate::engine_config::{ActorConfig, KhiveConfig, RuntimeSectionConfig};
 
     fn khive_cfg_with_actor(id: &str) -> KhiveConfig {
         KhiveConfig {
@@ -1164,6 +1194,7 @@ mod tests {
                 id: Some(id.to_string()),
                 display_name: None,
             },
+            runtime: RuntimeSectionConfig::default(),
         }
     }
 
@@ -1177,6 +1208,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -1193,6 +1225,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -1200,6 +1233,7 @@ mod tests {
                 id: Some(String::new()),
                 display_name: None,
             },
+            runtime: RuntimeSectionConfig::default(),
         };
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
@@ -1219,6 +1253,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -1239,6 +1274,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
+            brain_profile: None,
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -1252,6 +1288,7 @@ mod tests {
                 id: Some("lambda:test".to_string()),
                 display_name: None,
             },
+            runtime: RuntimeSectionConfig::default(),
         };
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(result.default_namespace.as_str(), "lambda:test");

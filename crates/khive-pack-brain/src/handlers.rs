@@ -652,15 +652,17 @@ impl BrainPack {
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let state = self.state.lock().unwrap();
-        // Return requested_consumer_kind + matched_consumer_kind separately so
-        // callers can distinguish a wildcard-binding match ("*") from an exact match.
+        // Return requested_consumer_kind + matched_consumer_kind + matched_binding so
+        // callers can distinguish a real binding match from a system-default fallback.
+        // ADR-035 tier-2 requires matched_binding=true; a false value means tier-3 fires.
         match state.resolve_with_match(p.actor.as_deref(), p.namespace.as_deref(), &p.consumer_kind)
         {
-            Some((record, matched_kind)) => Ok(json!({
+            Some((record, matched_kind, matched_binding)) => Ok(json!({
                 "resolved_profile_id": record.id,
                 "lifecycle": record.lifecycle,
                 "requested_consumer_kind": p.consumer_kind,
                 "matched_consumer_kind": matched_kind,
+                "matched_binding": matched_binding,
             })),
             None => Err(RuntimeError::NotFound(format!(
                 "no profile resolved for consumer_kind={:?}",

@@ -114,6 +114,7 @@ pub struct ActorConfig {
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
+/// - `[runtime]`: runtime knobs (namespace, brain_profile)
 ///
 /// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -131,6 +132,27 @@ pub struct KhiveConfig {
     /// authenticated token and ignores this field.
     #[serde(default)]
     pub actor: ActorConfig,
+
+    /// Runtime knobs: namespace overrides, brain profile, etc.
+    #[serde(default)]
+    pub runtime: RuntimeSectionConfig,
+}
+
+/// `[runtime]` section in `khive.toml`.
+///
+/// Carries runtime knobs that mirror the CLI flag / env var tier.
+/// All fields are optional; absent keys fall through to env vars or built-in
+/// defaults.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RuntimeSectionConfig {
+    /// Brain profile ID to use for `memory.feedback` / `knowledge.feedback`
+    /// and recall-time score boosting (ADR-035 §Brain profile configuration).
+    ///
+    /// Mirrors `--brain-profile` / `KHIVE_BRAIN_PROFILE`. When absent, the
+    /// namespace-bound profile (via `brain.resolve`) is tried, then the
+    /// global tuning prior is used as the final fallback.
+    #[serde(default)]
+    pub brain_profile: Option<String>,
 }
 
 impl KhiveConfig {
@@ -354,6 +376,7 @@ pub fn config_from_env() -> KhiveConfig {
     KhiveConfig {
         engines,
         actor: ActorConfig::default(),
+        runtime: RuntimeSectionConfig::default(),
     }
 }
 
@@ -514,6 +537,7 @@ fusion_weight = 0.0
         let cfg = KhiveConfig {
             engines,
             actor: ActorConfig::default(),
+            runtime: RuntimeSectionConfig::default(),
         };
         cfg.validate().expect("env-derived config should be valid");
         assert_eq!(cfg.engines.len(), 2);
@@ -773,6 +797,7 @@ id = "lambda:"
                 id: Some("lambda:test-actor".to_string()),
                 display_name: None,
             },
+            runtime: RuntimeSectionConfig::default(),
         };
         cfg.validate().expect("valid config");
 
@@ -798,6 +823,7 @@ id = "lambda:"
                 id: None,
                 display_name: None,
             },
+            runtime: RuntimeSectionConfig::default(),
         };
         cfg.validate().expect("valid config");
 

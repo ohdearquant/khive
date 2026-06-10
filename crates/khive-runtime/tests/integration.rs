@@ -569,6 +569,7 @@ async fn file_backed_runtime_persists() {
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
             additional_embedding_models: vec![],
+            brain_profile: None,
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -587,6 +588,7 @@ async fn file_backed_runtime_persists() {
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
             additional_embedding_models: vec![],
+            brain_profile: None,
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -959,6 +961,7 @@ mod embedder_registry_tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
         })
         .expect("in-memory runtime")
     }
@@ -1016,6 +1019,7 @@ mod embedder_registry_tests {
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
         })
         .expect("runtime with two models");
 

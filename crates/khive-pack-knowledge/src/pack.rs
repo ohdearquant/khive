@@ -19,6 +19,12 @@ pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
     pub(crate) ann: vamana::SharedAnn,
     pub(crate) section_posteriors: Mutex<SectionPosteriorState>,
+    /// Explicit brain profile ID from config (ADR-035 §Brain profile configuration).
+    ///
+    /// Tier-1 of the 3-tier feedback resolution: when set, `knowledge.feedback` directs
+    /// feedback to this profile via `brain.feedback`. When absent, tier-2
+    /// (namespace-bound profile) and tier-3 (global prior) are tried in order.
+    pub(crate) brain_profile: Option<String>,
 }
 
 impl Pack for KnowledgePack {
@@ -32,10 +38,12 @@ impl Pack for KnowledgePack {
 impl KnowledgePack {
     /// Create a new pack bound to the given runtime, initializing a shared ANN index.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             ann: vamana::new_shared(),
             section_posteriors: Mutex::new(SectionPosteriorState::new()),
+            brain_profile,
         }
     }
 }
@@ -94,7 +102,7 @@ impl PackRuntime for KnowledgePack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
@@ -134,7 +142,7 @@ impl PackRuntime for KnowledgePack {
             "knowledge.learn" => self.handle_learn(token, params).await,
             "knowledge.cite" => self.handle_cite(token, params).await,
             "knowledge.topic" => self.handle_topic(token, params).await,
-            "knowledge.feedback" => self.handle_feedback(params).await,
+            "knowledge.feedback" => self.handle_feedback(token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "knowledge pack does not handle verb {verb:?}"
             ))),

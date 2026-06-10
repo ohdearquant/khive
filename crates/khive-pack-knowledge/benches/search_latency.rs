@@ -33,6 +33,7 @@ fn rt_with_embedder() -> KhiveRuntime {
         gate: Arc::new(AllowAllGate),
         packs: vec!["kg".to_string(), "knowledge".to_string()],
         backend_id: BackendId::main(),
+        brain_profile: None,
     })
     .expect("runtime with embedder")
 }
