@@ -84,15 +84,18 @@ pub struct Args {
     /// Brain profile ID for feedback routing and recall-time score boosting.
     ///
     /// When set, `memory.feedback` and `knowledge.feedback` credit this profile.
-    /// Overrides any `[runtime] brain_profile` in the config file.
+    /// Takes the highest precedence in the resolution chain.
     ///
     /// Precedence (highest to lowest):
     ///   1. --brain-profile (this flag)
-    ///   2. KHIVE_BRAIN_PROFILE env var
-    ///   3. [runtime] brain_profile in config file
+    ///   2. [runtime] brain_profile in project khive.toml / global ~/.khive/config.toml
+    ///   3. KHIVE_BRAIN_PROFILE env var
     ///   4. Namespace-bound profile (resolved at feedback time via brain.resolve)
     ///   5. Pack-local global tuning prior
-    #[arg(long, env = "KHIVE_BRAIN_PROFILE")]
+    ///
+    /// Note: KHIVE_BRAIN_PROFILE is NOT bound here so that the env var resolves
+    /// AFTER the config-file tier (serve.rs reads it explicitly after TOML).
+    #[arg(long)]
     pub brain_profile: Option<String>,
 }
 

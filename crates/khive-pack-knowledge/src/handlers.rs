@@ -310,10 +310,10 @@ impl KnowledgePack {
 
     /// Apply per-section feedback signals to the pack's section posterior state.
     ///
-    /// 3-tier profile resolution (ADR-035):
-    /// 1. Explicit brain profile in config → also forward to `brain.feedback` (when target_id supplied)
-    /// 2. Namespace-bound profile via `brain.resolve` → also forward to `brain.feedback` (when target_id supplied)
-    /// 3. Global section_posteriors → update in-memory state directly (always applied)
+    /// 3-tier profile resolution (ADR-035) — exclusive flow (each tier returns early):
+    /// 1. Explicit brain profile in config (`self.brain_profile`) → route via `brain.feedback`
+    /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="recall")` → route via `brain.feedback`
+    /// 3. Global section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
     pub(crate) async fn handle_feedback(
         &self,
         token: &NamespaceToken,
@@ -355,7 +355,54 @@ impl KnowledgePack {
             signals.push((section_type, signal));
         }
 
-        // Tier 3 (always): update the pack-local section_posteriors.
+        let ns = token.namespace().as_str().to_string();
+        let section_signals_val = params.get("section_signals").cloned().unwrap_or_default();
+
+        // Tier 1: explicit profile from config — route exclusively to brain.feedback.
+        if let Some(ref profile_id) = self.brain_profile {
+            if let Some(ref tid) = target_id_str {
+                let brain_params = json!({
+                    "namespace": ns,
+                    "target_id": tid,
+                    "signal": "useful",
+                    "served_by_profile_id": profile_id,
+                    "section_signals": section_signals_val,
+                });
+                let result = registry.dispatch("brain.feedback", brain_params).await?;
+                return Ok(json!({
+                    "ok": true,
+                    "brain_profile": profile_id,
+                    "signals_applied": signals.len(),
+                    "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
+                }));
+            }
+        }
+
+        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="recall").
+        // Use "recall" (not "knowledge.search") — the brain contract registers recall
+        // bindings under consumer_kind="recall" (brain pack design.md §34).
+        if let Some(ref tid) = target_id_str {
+            if let Some(profile_id) =
+                knowledge_resolve_namespace_profile(registry, &ns, "recall").await
+            {
+                let brain_params = json!({
+                    "namespace": ns,
+                    "target_id": tid,
+                    "signal": "useful",
+                    "served_by_profile_id": profile_id,
+                    "section_signals": section_signals_val,
+                });
+                let result = registry.dispatch("brain.feedback", brain_params).await?;
+                return Ok(json!({
+                    "ok": true,
+                    "brain_profile": profile_id,
+                    "signals_applied": signals.len(),
+                    "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
+                }));
+            }
+        }
+
+        // Tier 3: global tuning prior — update pack-local section_posteriors directly.
         let total_events = {
             let mut state = self.section_posteriors.lock().map_err(|_| {
                 RuntimeError::Internal("section_posteriors lock poisoned".to_string())
@@ -364,58 +411,46 @@ impl KnowledgePack {
             state.total_events
         };
 
-        // Tiers 1 & 2: if a target_id is available, also forward to brain.feedback.
-        // This keeps the brain profile's section_states in sync with the global prior.
-        let mut brain_profile_used: Option<String> = None;
-        if let Some(ref tid) = target_id_str {
-            let ns = token.namespace().as_str().to_string();
-
-            // Tier 1: explicit profile from config.
-            let effective_profile = if let Some(ref p) = self.brain_profile {
-                Some(p.clone())
-            } else {
-                // Tier 2: namespace-bound profile via brain.resolve.
-                let resolve_params = json!({
-                    "namespace": ns,
-                    "consumer_kind": "knowledge.search",
-                });
-                match registry.dispatch("brain.resolve", resolve_params).await {
-                    Ok(v) => v
-                        .get("resolved_profile_id")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_owned),
-                    Err(_) => None,
-                }
-            };
-
-            if let Some(ref profile_id) = effective_profile {
-                let section_signals_val =
-                    params.get("section_signals").cloned().unwrap_or_default();
-                let brain_params = json!({
-                    "namespace": ns,
-                    "target_id": tid,
-                    "signal": "useful",
-                    "served_by_profile_id": profile_id,
-                    "section_signals": section_signals_val,
-                });
-                if registry
-                    .dispatch("brain.feedback", brain_params)
-                    .await
-                    .is_ok()
-                {
-                    brain_profile_used = effective_profile;
-                }
-            }
-        }
-
-        let mut resp = json!({
+        Ok(json!({
             "ok": true,
             "total_events": total_events,
             "signals_applied": signals.len(),
-        });
-        if let Some(ref p) = brain_profile_used {
-            resp["brain_profile"] = json!(p);
+        }))
+    }
+}
+
+/// Try to resolve the profile bound to `namespace` for `consumer_kind` via
+/// `brain.resolve`. Returns `None` when the brain pack is absent, the verb
+/// errors, no binding matches, or the result is only a system-default fallback
+/// (`matched_binding = false`).
+///
+/// Per ADR-035, tier-2 fires only on a real binding match. A system-default
+/// fallback must fall through to tier-3 (pack-local global prior).
+/// Mirrors `resolve_namespace_profile` in the memory pack handler.
+async fn knowledge_resolve_namespace_profile(
+    registry: &VerbRegistry,
+    namespace: &str,
+    consumer_kind: &str,
+) -> Option<String> {
+    let resolve_params = json!({
+        "namespace": namespace,
+        "consumer_kind": consumer_kind,
+    });
+    match registry.dispatch("brain.resolve", resolve_params).await {
+        Ok(v) => {
+            // Only treat as a tier-2 hit when brain.resolve confirms an explicit binding.
+            let matched_binding = v
+                .get("matched_binding")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if matched_binding {
+                v.get("resolved_profile_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
         }
-        Ok(resp)
+        Err(_) => None,
     }
 }

@@ -86,8 +86,13 @@ async fn route_to_brain(
 }
 
 /// Try to resolve the profile bound to `namespace` for `consumer_kind` via
-/// `brain.resolve`. Returns `None` when the brain pack is absent or no
-/// binding exists — callers fall through to the next tier.
+/// `brain.resolve`. Returns `None` when the brain pack is absent, the verb
+/// errors, no binding matches, or the result is only a system-default fallback
+/// (`matched_binding = false`).
+///
+/// Per ADR-035, tier-2 fires only on a real binding match. A system-default
+/// fallback (e.g. `balanced-recall-v1` active with no explicit binding) must
+/// fall through to tier-3 (pack-local global prior).
 async fn resolve_namespace_profile(
     registry: &VerbRegistry,
     namespace: &str,
@@ -98,10 +103,20 @@ async fn resolve_namespace_profile(
         "consumer_kind": consumer_kind,
     });
     match registry.dispatch("brain.resolve", resolve_params).await {
-        Ok(v) => v
-            .get("resolved_profile_id")
-            .and_then(|id| id.as_str())
-            .map(str::to_owned),
+        Ok(v) => {
+            // Only treat as a tier-2 hit when brain.resolve confirms an explicit binding.
+            let matched_binding = v
+                .get("matched_binding")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if matched_binding {
+                v.get("resolved_profile_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        }
         Err(_) => None,
     }
 }
@@ -545,9 +560,14 @@ mod tests {
         );
     }
 
-    /// Tier-3 global fallback: when no explicit profile is configured and no
+    /// Tier-3 global fallback: when no explicit profile is configured and no explicit
     /// namespace binding exists, feedback falls through to the pack-local global
-    /// tuning prior and returns ok=true with the signal echoed back.
+    /// tuning prior — even when the brain pack is loaded and balanced-recall-v1 is active.
+    ///
+    /// Before the matched_binding fix, resolve_namespace_profile treated the system-default
+    /// fallback (balanced-recall-v1 active, no binding rows) as a tier-2 hit. This test
+    /// verifies that the deactivation workaround is no longer needed: tier-3 fires in
+    /// the normal case (brain loaded, no explicit binding).
     #[tokio::test]
     async fn feedback_tier3_global_fallback_with_brain_loaded() {
         use khive_pack_brain::BrainPack;
@@ -572,11 +592,10 @@ mod tests {
             .await
             .expect("create note");
 
-        // Load brain pack but do NOT create any additional bindings.
-        // brain.resolve(consumer_kind="recall") will return balanced-recall-v1 (system default)
-        // but only when balanced-recall-v1 is Active. The system-default path in resolve_with_match
-        // requires lifecycle==Active. In this registry, balanced-recall-v1 starts Active,
-        // so tier-2 would pick it up — we deactivate it first to force the tier-3 path.
+        // Load brain pack but do NOT create any explicit bindings.
+        // brain.resolve returns balanced-recall-v1 as system-default (matched_binding=false).
+        // With the fix, resolve_namespace_profile returns None for matched_binding=false,
+        // so tier-2 is skipped and tier-3 fires WITHOUT needing to deactivate the default profile.
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -584,20 +603,7 @@ mod tests {
         builder.register(brain);
         let registry = builder.build().expect("registry");
 
-        // Deactivate balanced-recall-v1 so brain.resolve returns no profile (no bindings,
-        // default profile inactive) → tier-2 returns None → tier-3 fires.
-        registry
-            .dispatch(
-                "brain.deactivate",
-                serde_json::json!({
-                    "namespace": ns.as_str(),
-                    "profile_id": "balanced-recall-v1",
-                }),
-            )
-            .await
-            .expect("deactivate default profile");
-
-        // Confirm resolve returns nothing (tier-2 will be skipped).
+        // Confirm brain.resolve returns a system-default (matched_binding=false) — no explicit binding.
         let resolve_result = registry
             .dispatch(
                 "brain.resolve",
@@ -606,20 +612,15 @@ mod tests {
                     "consumer_kind": "recall",
                 }),
             )
-            .await;
-        // resolve may error or return a null profile — either way tier-2 falls through.
-        let tier2_would_fire = resolve_result
-            .as_ref()
-            .ok()
-            .and_then(|v| v.get("resolved_profile_id"))
-            .and_then(|v| v.as_str())
-            .is_some();
-        assert!(
-            !tier2_would_fire,
-            "no active binding should resolve when default profile is inactive"
+            .await
+            .expect("brain.resolve should succeed");
+        assert_eq!(
+            resolve_result["matched_binding"], false,
+            "no explicit binding exists: matched_binding must be false (system default)"
         );
 
-        // Tier-3: feedback must succeed and echo the signal back.
+        // Tier-3: feedback must succeed and echo the signal back (ok=true, signal echoed).
+        // balanced-recall-v1 is still Active, but tier-2 is skipped due to matched_binding=false.
         let r = registry
             .dispatch(
                 "memory.feedback",
@@ -639,6 +640,11 @@ mod tests {
         assert_eq!(
             r["signal"], "not_useful",
             "tier-3 path must echo the signal: {r:?}"
+        );
+        // No brain_profile key in the response (tier-3 does not route to brain).
+        assert!(
+            r.get("emitted").is_none(),
+            "tier-3 path must not produce an emitted key: {r:?}"
         );
     }
 }
