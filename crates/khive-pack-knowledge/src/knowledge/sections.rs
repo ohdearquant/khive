@@ -213,6 +213,8 @@ impl KnowledgeHandlers {
         for su in &p.sections {
             let stype = parse_section_type(&su.section_type)?;
             validate_section_content(&su.content)?;
+            // Secret gate: scan section content before any write.
+            khive_runtime::secret_gate::check(&su.content)?;
             let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
             let sort_order = su.sort_order.unwrap_or_else(|| {
