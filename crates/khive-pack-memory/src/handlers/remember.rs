@@ -35,7 +35,13 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            None => 0.5,
+            // episodic: lower default — session events decay quickly and should not
+            // crowd out timeless semantic memories in recall ranking.
+            // semantic: higher default — durable facts warrant stronger base weight.
+            None => match memory_type {
+                "semantic" => 0.5,
+                _ => 0.3,
+            },
         };
         let decay_factor = match p.decay_factor {
             Some(v) if !v.is_finite() || v < 0.0 => {
@@ -44,7 +50,12 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            None => 0.01,
+            // episodic: ~23-day half-life — short-lived session context ages out fast.
+            // semantic: ~139-day half-life — durable facts stay relevant much longer.
+            None => match memory_type {
+                "semantic" => 0.005,
+                _ => 0.02,
+            },
         };
 
         let mut props = json!({ "memory_type": memory_type });

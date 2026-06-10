@@ -95,13 +95,13 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
                 name: "salience",
                 param_type: "number",
                 required: false,
-                description: "Salience weight 0.0–1.0 (default 0.5).",
+                description: "Salience weight 0.0–1.0. Default is type-differentiated: episodic=0.3, semantic=0.5.",
             },
             ParamDef {
                 name: "decay_factor",
                 param_type: "number",
                 required: false,
-                description: "Decay rate >= 0 (default 0.01). Higher = faster decay. At 0.01 the effective half-life is ~69 days.",
+                description: "Decay rate >= 0. Default is type-differentiated: episodic=0.02 (~23d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.",
             },
             ParamDef {
                 name: "memory_type",

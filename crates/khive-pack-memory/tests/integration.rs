@@ -1642,7 +1642,6 @@ async fn test_remember_source_id_accepts_short_id() {
 }
 
 /// Fix 2: recall(help=true) must expose all params added in PRs #406/#421.
-/// Fix 3: remember(help=true) must show decay_factor default as 0.01.
 #[test]
 fn test_handler_def_recall_params_complete() {
     use khive_types::Pack;
@@ -1696,22 +1695,27 @@ fn test_handler_def_remember_params_complete() {
         "remember HandlerDef must expose embedding_model param; got: {param_names:?}"
     );
 
-    // Fix 3: decay_factor default must be documented as 0.01 (not 0.1)
+    // Issue #70: decay_factor defaults are now type-differentiated; description must
+    // document both episodic (0.02) and semantic (0.005) defaults, not the old flat 0.01.
     let decay_def = remember_def
         .params
         .iter()
         .find(|p| p.name == "decay_factor")
         .expect("decay_factor param must exist");
     assert!(
-        decay_def.description.contains("0.01"),
-        "decay_factor description must document default 0.01, got: {:?}",
+        decay_def.description.contains("0.02"),
+        "decay_factor description must document episodic default 0.02, got: {:?}",
         decay_def.description
     );
     assert!(
-        !decay_def.description.contains("0.1 ")
-            && !decay_def
-                .description
-                .starts_with("Decay rate 0.0–1.0 (default 0.1)"),
+        decay_def.description.contains("0.005"),
+        "decay_factor description must document semantic default 0.005, got: {:?}",
+        decay_def.description
+    );
+    assert!(
+        !decay_def
+            .description
+            .starts_with("Decay rate 0.0–1.0 (default 0.1)"),
         "decay_factor description must NOT say 'default 0.1', got: {:?}",
         decay_def.description
     );
