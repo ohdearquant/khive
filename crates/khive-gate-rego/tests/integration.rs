@@ -380,6 +380,38 @@ fn try_with_entrypoint_rejects_missing_data_prefix() {
     assert!(format!("{err}").contains("data."), "wrong error: {err}");
 }
 
+// ---- GATE-REGO-002: with_entrypoint trims whitespace ----
+
+#[test]
+fn with_entrypoint_trims_whitespace_and_allows() {
+    // with_entrypoint (infallible) must trim surrounding whitespace so that
+    // "  data.khive.gate  " behaves identically to "data.khive.gate.decision"
+    // when used with a matching policy.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+        decision := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .with_entrypoint("  data.khive.gate.decision  ");
+    // The stored entrypoint must be the trimmed form.
+    assert!(
+        format!("{gate:?}").contains("data.khive.gate.decision"),
+        "Debug output did not contain trimmed entrypoint: {:?}",
+        gate
+    );
+    // Evaluation must work correctly with the trimmed entrypoint.
+    assert!(gate.check(&request("search")).unwrap().is_allow());
+    assert!(matches!(
+        gate.check(&request("delete")).unwrap(),
+        GateDecision::Deny { .. }
+    ));
+}
+
 // ---------- helpers ----------
 
 struct TempDir {

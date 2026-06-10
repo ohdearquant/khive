@@ -1876,9 +1876,11 @@ mod tests {
     /// never to proceed to the pack handler.
     ///
     /// This is the runtime-level assertion for the fix to security issue #30.
-    /// `RegoGate::check` converts evaluation errors and undefined results to
-    /// `Ok(GateDecision::Deny)`, so the runtime's fail-open `Err(_)` branch
-    /// is never reached and dispatch is blocked.
+    /// `RegoGate::check` converts all evaluation failures (missing rule,
+    /// undefined result, serialization error, poisoned engine) to
+    /// `Ok(GateDecision::Deny)`, so dispatch is blocked. The runtime's
+    /// fail-open `Err(_)` branch remains for non-evaluation gate errors
+    /// (e.g. infrastructure faults from other `Gate` implementations).
     #[tokio::test]
     async fn rego_gate_missing_entrypoint_returns_permission_denied() {
         use khive_gate_rego::RegoGate;

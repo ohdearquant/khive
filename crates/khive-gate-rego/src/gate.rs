@@ -98,7 +98,7 @@ impl RegoGate {
     /// is installed — preventing a misconfigured entrypoint from causing
     /// fail-open dispatch errors at runtime.
     pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
-        self.entrypoint = entrypoint.into();
+        self.entrypoint = entrypoint.into().trim().to_string();
         self
     }
 
@@ -109,9 +109,12 @@ impl RegoGate {
     /// Prefer this over [`Self::with_entrypoint`] for operator-supplied
     /// configuration. A misconfigured entrypoint discovered at construction
     /// time produces a deterministic `GateError::Policy` rather than a
-    /// dispatch-time evaluation failure. `RegoGate::check` converts evaluation
-    /// errors to `Ok(GateDecision::Deny)` (fail-closed), so construction-time
-    /// validation is defense-in-depth — not the primary safety net.
+    /// dispatch-time evaluation failure. `RegoGate::check` converts all
+    /// evaluation failures (missing rule, undefined result, serialization
+    /// error, poisoned engine) to `Ok(GateDecision::Deny)` (fail-closed);
+    /// construction-time validation is defense-in-depth. The runtime's
+    /// `Err(_)` branch is reserved for non-evaluation gate errors (e.g.
+    /// infrastructure faults from other `Gate` implementations).
     pub fn try_with_entrypoint(mut self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
         let ep = entrypoint.into();
         let trimmed = ep.trim();
@@ -162,10 +165,23 @@ impl Gate for RegoGate {
         let input_value: regorus::Value = input.into();
 
         let result = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| GateError::Internal(format!("engine mutex poisoned: {e}")))?;
+            // A poisoned mutex means a prior eval_rule call panicked while
+            // holding the lock.  That is itself an evaluation failure: deny
+            // immediately rather than propagating Err into the runtime's
+            // fail-open branch.
+            let mut engine = match self.engine.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!(
+                        entrypoint = %self.entrypoint,
+                        "engine mutex poisoned — denying (fail-closed)"
+                    );
+                    return Ok(GateDecision::deny(format!(
+                        "engine mutex poisoned for {}",
+                        self.entrypoint
+                    )));
+                }
+            };
             engine.set_input(input_value);
             engine.eval_rule(self.entrypoint.clone())
         };
@@ -197,9 +213,22 @@ impl Gate for RegoGate {
             )));
         }
 
-        let decision_json = value
-            .to_json_str()
-            .map_err(|e| GateError::Internal(format!("decision to_json: {e}")))?;
+        // Serialization failure is treated as an evaluation failure: deny
+        // rather than propagating Err into the runtime's fail-open branch.
+        let decision_json = match value.to_json_str() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    error = %e,
+                    "decision value failed to serialize — denying (fail-closed)"
+                );
+                return Ok(GateDecision::deny(format!(
+                    "policy rule {} produced unserializable value: {e}",
+                    self.entrypoint
+                )));
+            }
+        };
 
         // A result that parses to a non-GateDecision shape (e.g. a boolean,
         // plain string, or wrong object) is also treated as deny rather than
@@ -223,5 +252,51 @@ impl Gate for RegoGate {
 
     fn impl_name(&self) -> &'static str {
         "RegoGate"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_gate::ActorRef;
+    use khive_types::Namespace;
+    use serde_json::json;
+
+    fn request(verb: &str) -> GateRequest {
+        GateRequest::new(ActorRef::anonymous(), Namespace::local(), verb, json!({}))
+    }
+
+    // ---- GATE-REGO-003: poisoned mutex → Deny, not Err ----
+
+    #[test]
+    fn poisoned_engine_mutex_returns_deny_not_err() {
+        use std::sync::Arc;
+
+        let policy = r#"
+            package khive.gate
+            import rego.v1
+            default decision := {"decision": "allow", "obligations": []}
+        "#;
+        let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+
+        // Poison the mutex by panicking inside a spawned thread while holding
+        // the lock.  After join() the mutex is permanently poisoned.
+        {
+            let gate_clone = Arc::clone(&gate);
+            let handle = std::thread::spawn(move || {
+                let _guard = gate_clone.engine.lock().unwrap();
+                panic!("intentional panic to poison the mutex");
+            });
+            // Join to ensure the panic has propagated and the mutex is poisoned.
+            let _ = handle.join();
+        }
+
+        // check() must return Ok(Deny), never Err.
+        let result = gate.check(&request("search"));
+        match result {
+            Ok(GateDecision::Deny { .. }) => {}
+            Ok(GateDecision::Allow { .. }) => panic!("expected Deny for poisoned mutex, got Allow"),
+            Err(e) => panic!("expected Ok(Deny) for poisoned mutex, got Err({e})"),
+        }
     }
 }

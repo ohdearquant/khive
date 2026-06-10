@@ -31,8 +31,6 @@ pub enum GateValidationError {
 pub enum GateError {
     #[error("policy error: {0}")]
     Policy(String),
-    #[error("evaluation error: {0}")]
-    Evaluation(String),
     #[error("internal gate error: {0}")]
     Internal(String),
     #[error("validation error: {0}")]
