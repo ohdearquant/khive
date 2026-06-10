@@ -9,6 +9,16 @@ use crate::profile::{
 };
 use crate::section_state::{SectionPosteriorSnapshot, SectionPosteriorState};
 
+/// Sort a slice of profile candidates in ascending `(created_at, id)` order.
+///
+/// This is the canonical fallback selection key: earliest creation time wins,
+/// with alphabetical `id` as a tiebreaker.  Extracted into a standalone helper
+/// so it can be unit-tested with intentionally unsorted input, providing
+/// fail-before/pass-after coverage that does not rely on `HashMap` randomisation.
+pub fn sort_fallback_candidates(candidates: &mut [&ProfileRecord]) {
+    candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+}
+
 /// Runtime brain state — profile registry + active state per profile.
 pub struct BrainState {
     pub profiles: HashMap<String, ProfileRecord>,
@@ -168,7 +178,7 @@ impl BrainState {
             .values()
             .filter(|p| p.consumer_kind == consumer_kind && p.lifecycle == ProfileLifecycle::Active)
             .collect();
-        candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        sort_fallback_candidates(&mut candidates);
         candidates
             .into_iter()
             .next()
@@ -257,13 +267,61 @@ mod tests {
         }
     }
 
-    /// Same state must always select the same fallback profile regardless of
-    /// the order in which profiles were inserted into the HashMap.
+    /// `sort_fallback_candidates` must produce `(created_at ASC, id ASC)` order
+    /// on an intentionally REVERSE-sorted input vector.
+    ///
+    /// This is a fail-before/pass-after unit test for the helper itself: the old
+    /// `HashMap.values().find_map()` implementation would have returned the first
+    /// element from HashMap iteration order (non-deterministic).  The helper under
+    /// test sorts its input in-place; passing a reverse-order slice guarantees the
+    /// test would fail against any implementation that skips the sort.
+    #[test]
+    fn sort_fallback_candidates_produces_created_at_then_id_order() {
+        // Three profiles inserted in DESCENDING created_at order (worst case for
+        // any unsorted implementation).
+        let p1 = make_profile("aardvark", "recall", 1_000); // earliest, lowest id
+        let p2 = make_profile("mango", "recall", 2_000);
+        let p3 = make_profile("zebra", "recall", 3_000); // latest, highest id
+
+        // Intentionally unsorted: reverse order.
+        let mut candidates = vec![&p3, &p2, &p1];
+        sort_fallback_candidates(&mut candidates);
+
+        // After sort: p1 (earliest) must be first, p3 (latest) must be last.
+        assert_eq!(
+            candidates[0].id, "aardvark",
+            "earliest profile must come first"
+        );
+        assert_eq!(candidates[1].id, "mango");
+        assert_eq!(candidates[2].id, "zebra", "latest profile must come last");
+    }
+
+    /// `sort_fallback_candidates` must break ties by `id` (ascending) when
+    /// `created_at` is equal.
+    #[test]
+    fn sort_fallback_candidates_breaks_ties_by_id() {
+        let ts = 5_000i64;
+        let p_z = make_profile("z-profile", "recall", ts);
+        let p_a = make_profile("a-profile", "recall", ts);
+        let p_m = make_profile("m-profile", "recall", ts);
+
+        // Deliberately insert in reverse alphabetical order.
+        let mut candidates = vec![&p_z, &p_m, &p_a];
+        sort_fallback_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates[0].id, "a-profile",
+            "lowest id must come first on equal timestamps"
+        );
+        assert_eq!(candidates[1].id, "m-profile");
+        assert_eq!(candidates[2].id, "z-profile");
+    }
+
+    /// End-to-end: `BrainState::resolve` must select the earliest-created profile
+    /// regardless of HashMap insertion order.  This is a secondary integration guard
+    /// that complements the helper unit tests above.
     #[test]
     fn resolve_fallback_is_deterministic() {
-        // Build two BrainState instances with the same profiles inserted in
-        // different orders.  Both must resolve to the same (earliest created_at,
-        // then lowest id) profile.
         let p_early = make_profile("alpha", "recall", 1_000);
         let p_later = make_profile("zeta", "recall", 2_000);
 
@@ -291,7 +349,6 @@ mod tests {
         let result_a = state_a.resolve(None, None, "recall");
         let result_b = state_b.resolve(None, None, "recall");
 
-        // Both must resolve to the earliest-created profile ("alpha").
         let id_a = result_a.map(|p| p.id.clone());
         let id_b = result_b.map(|p| p.id.clone());
         assert_eq!(id_a, Some("alpha".to_owned()));

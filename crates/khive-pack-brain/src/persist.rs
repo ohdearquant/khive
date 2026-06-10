@@ -115,6 +115,61 @@ impl PersistenceTracker {
     pub fn reset_dirty(&mut self, namespace: &str) {
         self.dirty_counts.insert(namespace.to_string(), 0);
     }
+
+    /// Return the total_events counter for any namespace stored in `saved_states`
+    /// (cold or saved-off namespaces).  Returns `None` when no state has been
+    /// initialised for the given namespace in the cold/saved bucket.
+    ///
+    /// Note: does NOT return the counter for the active namespace, which lives in
+    /// the shared `BrainState` slot, not in `saved_states`.
+    pub(crate) fn total_events_for(&self, namespace: &str) -> Option<u64> {
+        self.saved_states
+            .get(namespace)
+            .map(|s| s.balanced_recall.total_events)
+    }
+
+    /// Apply a signal to the state bucket that owns `namespace`.
+    ///
+    /// - Active namespace: returns `ApplyTarget::ActiveSlot` — caller must apply
+    ///   the signal to the shared `BrainState` lock while holding the dispatch gate.
+    /// - Saved namespace: applies directly to `saved_states` and returns `ApplyTarget::Done`.
+    /// - Cold/unknown namespace: initialises a fresh `BrainState`, applies the
+    ///   signal to it, stores it in `saved_states`, and returns `ApplyTarget::Done`.
+    ///
+    /// No event is silently dropped regardless of which slot is currently active.
+    pub(crate) fn route_signal(
+        &mut self,
+        namespace: &str,
+        signal: &khive_brain_core::BrainSignal,
+        entity_capacity: usize,
+    ) -> ApplyTarget {
+        if self.is_active(namespace) {
+            return ApplyTarget::ActiveSlot;
+        }
+
+        // Cold namespace: insert a fresh state and mark it loaded so future
+        // ensure_loaded calls skip the DB round-trip for this namespace.
+        if !self.saved_states.contains_key(namespace) {
+            self.loaded_namespaces.insert(namespace.to_string(), ());
+            self.saved_states
+                .insert(namespace.to_string(), BrainState::new(entity_capacity));
+        }
+        // Unwrap is safe: we just ensured the key exists.
+        let state = self.saved_states.get_mut(namespace).unwrap();
+
+        state.balanced_recall.apply_signal(signal);
+        crate::sync_balanced_recall_record(state);
+        ApplyTarget::Done
+    }
+}
+
+/// Indicates where a dispatched signal should be applied by the caller.
+pub(crate) enum ApplyTarget {
+    /// The namespace is active — the caller must apply the signal to the shared
+    /// `BrainState` slot (which the caller already holds behind the dispatch gate).
+    ActiveSlot,
+    /// Signal was applied inside `PersistenceTracker`; caller has nothing left to do.
+    Done,
 }
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {

@@ -82,7 +82,7 @@ impl BrainPack {
         }
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn activate_namespace_for_test(&self, namespace: &str) {
         self.persistence
             .lock()
@@ -104,6 +104,16 @@ impl BrainPack {
     /// Public snapshot of the current `BrainState`.
     pub fn snapshot(&self) -> khive_brain_core::BrainStateSnapshot {
         self.state.lock().unwrap().to_snapshot()
+    }
+
+    /// Return the `total_events` counter for a namespace stored in the cold/saved
+    /// state buckets inside `PersistenceTracker`.  Returns `None` when no state
+    /// has been initialised for the given namespace.
+    ///
+    /// Intended for test verification only.  Production code should access state
+    /// via `ensure_loaded` + `snapshot()`.
+    pub fn cold_namespace_total_events(&self, namespace: &str) -> Option<u64> {
+        self.persistence.lock().unwrap().total_events_for(namespace)
     }
 }
 

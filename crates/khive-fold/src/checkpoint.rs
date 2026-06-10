@@ -224,11 +224,19 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
             .inner
             .read()
             .map_err(|e| FoldError::LockPoisoned(e.to_string()))?;
-        // Sort so callers get a stable, deterministic order regardless of HashMap seed.
-        let mut keys: Vec<String> = guard.keys().cloned().collect();
-        keys.sort();
-        Ok(keys)
+        let keys: Vec<String> = guard.keys().cloned().collect();
+        Ok(sort_checkpoint_keys(keys))
     }
+}
+
+/// Sort a `Vec<String>` of checkpoint IDs into lexicographic order.
+///
+/// Extracted as a standalone helper so it can be unit-tested with intentionally
+/// unsorted input, giving fail-before/pass-after coverage independent of
+/// `HashMap` randomisation.
+pub fn sort_checkpoint_keys(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
 }
 
 #[cfg(test)]
@@ -435,8 +443,31 @@ mod tests {
         assert_eq!(ids.len(), n, "expected {n} checkpoints, got {}", ids.len());
     }
 
-    /// list() must return keys in lexicographic order regardless of HashMap
-    /// insertion order or HashMap seed across processes.
+    /// `sort_checkpoint_keys` must return lexicographic order on an intentionally
+    /// reverse-sorted input.
+    ///
+    /// This is a fail-before/pass-after unit test for the ordering helper itself:
+    /// the old `HashMap.keys().cloned().collect()` path returned keys in HashMap
+    /// iteration order (non-deterministic).  Passing a reversed vector guarantees
+    /// the test fails against any implementation that skips the sort step.
+    #[test]
+    fn sort_checkpoint_keys_produces_lexicographic_order() {
+        // Intentionally REVERSE alphabetical — worst case for unsorted implementations.
+        let unsorted = vec![
+            "z:ckpt-3".to_string(),
+            "m:ckpt-2".to_string(),
+            "a:ckpt-1".to_string(),
+        ];
+        let sorted = sort_checkpoint_keys(unsorted);
+        assert_eq!(
+            sorted,
+            vec!["a:ckpt-1", "m:ckpt-2", "z:ckpt-3"],
+            "sort_checkpoint_keys must produce lexicographic order; got {sorted:?}"
+        );
+    }
+
+    /// Integration: `InMemoryCheckpointStore::list` must return keys in
+    /// lexicographic order regardless of insertion order.
     #[test]
     fn list_is_sorted() {
         let store: InMemoryCheckpointStore<String> = InMemoryCheckpointStore::new();
@@ -445,8 +476,10 @@ mod tests {
         store.save(sample_checkpoint("a:ckpt-1", 2)).unwrap();
         store.save(sample_checkpoint("m:ckpt-1", 3)).unwrap();
         let ids = store.list().unwrap();
-        let mut expected = ids.clone();
-        expected.sort();
-        assert_eq!(ids, expected, "list() must return sorted keys");
+        assert_eq!(
+            ids,
+            vec!["a:ckpt-1", "m:ckpt-1", "z:ckpt-1"],
+            "list() must return sorted keys; got {ids:?}"
+        );
     }
 }

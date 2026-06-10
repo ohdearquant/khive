@@ -1370,18 +1370,22 @@ impl DispatchHook for BrainPack {
 
         let _gate = self.dispatch_gate.lock().await;
 
-        let active_ns = {
-            let tracker = self.persistence.lock().unwrap();
-            tracker.active_namespace.clone()
-        };
-        if active_ns.as_deref() != Some(&view.event.namespace) {
-            return;
-        }
-
         let signal = interpret(&view.event);
-        let mut state = self.state.lock().unwrap();
-        state.balanced_recall.apply_signal(&signal);
-        sync_balanced_recall_record(&mut state);
+
+        // Route the signal to the state bucket that owns view.event.namespace.
+        // No event is silently dropped: cold and saved namespaces are updated
+        // inside PersistenceTracker; only when the namespace is the active slot
+        // do we need to apply to the shared BrainState.
+        let target = {
+            let mut tracker = self.persistence.lock().unwrap();
+            tracker.route_signal(&view.event.namespace, &signal, ENTITY_CACHE_CAPACITY)
+        };
+
+        if matches!(target, crate::persist::ApplyTarget::ActiveSlot) {
+            let mut state = self.state.lock().unwrap();
+            state.balanced_recall.apply_signal(&signal);
+            sync_balanced_recall_record(&mut state);
+        }
     }
 }
 
