@@ -285,7 +285,7 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) {
-                    if rel_str.parse::<EdgeRelation>().is_err() {
+                    if !EdgeRelation::VALID_NAMES.contains(&rel_str) {
                         let edge_id = v
                             .get("edge_id")
                             .and_then(|i| i.as_str())
@@ -1630,7 +1630,7 @@ message = "bad"
                 (
                     "aaaaaaaa-0000-0000-0000-000000000001",
                     "bbbbbbbb-0000-0000-0000-000000000002",
-                    "annotates",
+                    "variant_of",
                 ),
             ],
         );
