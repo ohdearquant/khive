@@ -35,6 +35,14 @@ jobs:
           deno-version: v2.x
       - run: ../scripts/ci.sh
 
+  data-leak-guard:
+    name: JSON/JSONL data-leak guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan whole tree for corpus files
+        run: bash scripts/check-json-data.sh --all
+
   docs:
     name: Docs lint
     runs-on: ubuntu-latest
