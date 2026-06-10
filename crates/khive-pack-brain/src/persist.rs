@@ -251,7 +251,8 @@ pub async fn load_events_since(
 
         let mut push_quarantine = |reason: String, payload_raw: &str| {
             let snippet = if payload_raw.len() > 200 {
-                format!("{}…", &payload_raw[..200])
+                let end = payload_raw.floor_char_boundary(200);
+                format!("{}…", &payload_raw[..end])
             } else {
                 payload_raw.to_string()
             };
@@ -882,7 +883,8 @@ mod brain_007_replay_quarantine {
         );
         assert!(result.events.is_empty(), "no clean events expected");
 
-        // Each quarantined entry must carry a non-zero id and a non-empty reason.
+        // Each quarantined entry must carry a non-zero id, non-empty reason,
+        // correct profile_id, non-zero created_at, and non-empty payload_snippet.
         for qr in &result.quarantined {
             assert!(
                 qr.id > 0,
@@ -892,6 +894,20 @@ mod brain_007_replay_quarantine {
             assert!(
                 !qr.reason.is_empty(),
                 "quarantined row must carry a non-empty reason string"
+            );
+            assert_eq!(
+                qr.profile_id, "test-profile",
+                "quarantined row profile_id must match inserted value; got {:?}",
+                qr.profile_id
+            );
+            assert!(
+                qr.created_at > 0,
+                "quarantined row created_at must be non-zero; got {}",
+                qr.created_at
+            );
+            assert!(
+                !qr.payload_snippet.is_empty(),
+                "quarantined row payload_snippet must be non-empty"
             );
         }
 
@@ -903,12 +919,68 @@ mod brain_007_replay_quarantine {
             "first quarantine reason must describe malformed JSON; got: {:?}",
             result.quarantined[0].reason
         );
+        // First row payload_snippet must contain a recognizable fragment of the bad payload.
+        assert!(
+            result.quarantined[0].payload_snippet.contains("not json"),
+            "first row snippet must contain 'not json'; got: {:?}",
+            result.quarantined[0].payload_snippet
+        );
 
         // Second row: semantic poison (empty section_signals) — reason must mention section_signals.
         assert!(
             result.quarantined[1].reason.contains("section_signals"),
             "second quarantine reason must mention section_signals; got: {:?}",
             result.quarantined[1].reason
+        );
+        // Second row payload_snippet must be non-empty (it's valid JSON, so it has content).
+        assert!(
+            !result.quarantined[1].payload_snippet.is_empty(),
+            "second row payload_snippet must be non-empty; got: {:?}",
+            result.quarantined[1].payload_snippet
+        );
+    }
+
+    // ── char-boundary safety: multibyte payload does not panic ───────────────
+
+    #[tokio::test]
+    async fn payload_snippet_truncation_safe_on_multibyte_chars() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // '日' is 3 bytes in UTF-8; 250 repetitions = 750 bytes, well over the 200-byte limit.
+        // A naive &s[..200] would land mid-char and panic.
+        let long_multibyte: String = "日".repeat(250);
+        insert_raw_payload(&rt, ns, &long_multibyte).await;
+
+        // Must not panic.
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(result.quarantine_count(), 1);
+        let qr = &result.quarantined[0];
+
+        // Snippet must be valid UTF-8 (Rust strings are always valid UTF-8, but
+        // verify it is non-empty and ≤ 200 bytes as a byte-length check).
+        assert!(
+            !qr.payload_snippet.is_empty(),
+            "snippet must be non-empty for a non-empty payload"
+        );
+        // The trailing ellipsis is a multi-byte char itself; strip it before measuring.
+        let snippet_body = qr.payload_snippet.trim_end_matches('…');
+        assert!(
+            snippet_body.len() <= 200,
+            "snippet body (sans ellipsis) must be ≤200 bytes; got {} bytes",
+            snippet_body.len()
+        );
+        // The snippet body must itself be valid UTF-8 (Rust ensures this, but also
+        // assert it only contains the expected character).
+        assert!(
+            snippet_body.chars().all(|c| c == '日'),
+            "snippet body must contain only '日' chars; got: {:?}",
+            snippet_body
         );
     }
 }
