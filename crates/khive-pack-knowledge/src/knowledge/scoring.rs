@@ -1,4 +1,4 @@
-//! TF-IDF scoring, candidate tokenization, term expansion, and top-k selection.
+//! TF-IDF scoring, candidate tokenization, and term expansion.
 //!
 //! Pure computation extracted from the handler module to stay within the
 //! file-size gate (<700 LOC per file).
@@ -145,11 +145,7 @@ pub(super) fn compute_idf(
         .collect()
 }
 
-pub(super) fn score_field(
-    tokens: &[String],
-    terms: &[String],
-    idf: &HashMap<String, f32>,
-) -> f32 {
+pub(super) fn score_field(tokens: &[String], terms: &[String], idf: &HashMap<String, f32>) -> f32 {
     let mut score = 0.0;
     for term in terms {
         let count = matching::count_in_tokens(tokens, term);
@@ -261,18 +257,4 @@ pub(super) fn expand_terms(terms: &mut Vec<String>) -> HashSet<String> {
         .filter(|t| !originals.contains(*t))
         .cloned()
         .collect()
-}
-
-pub(super) fn top_k_sorted<T>(
-    items: &mut Vec<T>,
-    k: usize,
-    cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
-) {
-    if items.len() <= k {
-        items.sort_by(&cmp);
-        return;
-    }
-    items.select_nth_unstable_by(k, &cmp);
-    items.truncate(k);
-    items.sort_by(&cmp);
 }
