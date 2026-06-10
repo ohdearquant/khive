@@ -876,6 +876,12 @@ impl BrainPack {
             }
         }
 
+        // Validate section_signals up front using the shared validator.
+        // Malformed input is rejected here rather than silently dropped during replay.
+        if let Some(ref ss) = p.section_signals {
+            crate::validate_section_signals(ss)?;
+        }
+
         let mut data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {
             data["served_by_profile_id"] = json!(profile_id);

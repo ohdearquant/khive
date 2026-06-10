@@ -117,6 +117,7 @@ pub(crate) struct UpsertAtomsParams {
 // ── upsert_domains ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DomainInput {
     pub slug: String,
     pub name: String,
