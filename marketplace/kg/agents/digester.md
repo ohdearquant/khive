@@ -58,9 +58,16 @@ Before processing any source:
    numbers → `properties`. "Introduced by", "competes with", "depends on" → `link`. Do not encode
    relationships as property strings.
 
-5. **Anti-dupe via search before every create.** If `search(query=<name>)` returns a match with the
-   same kind, link to it. If a similar name returns a _different_ kind (e.g., "LoRA" the
-   paper-document vs "LoRA" the concept), they are intentionally separate — do not merge.
+5. **Anti-dupe via search before every create — across ALL prior batch tags, not just this run.**
+   If `search(query=<name>)` returns a match with the same kind, link to it. Different batch tags
+   do not make the same entity distinct: a class ingested under `batch:source-2026-05-21` and
+   again under `batch:module-2026-05-27` is one entity with one duplicate to merge.
+   Search by class/module name regardless of what batch tag the existing entity carries.
+   If a similar name returns a _different_ kind (e.g., "LoRA" the paper-document vs "LoRA" the
+   concept), they are intentionally separate — do not merge.
+
+   **Lesson (2026-06-09)**: 6 lionagi classes were double-ingested across two batch waves
+   ("source" 5/21 and "module" 5/27) and required manual merges by Leo.
 
 6. **Note salience honestly.** 0.85+ for cross-cutting insights, 0.5-0.75 for normal observations,
    <0.5 for context that doesn't matter long-term. Inflated salience poisons future recall.
@@ -162,3 +169,4 @@ gtd.complete(id="<your-task-id>", result="Ingested N entities, M edges, K notes.
 - Inflating note salience to make findings stand out
 - Storing relationships as property strings ("authored_by_paper" = property name)
 - Finishing without queueing the polish handoff — a digest with no follow-up is debt
+- Scoping dedup search to the current batch only — prior batch tags hide real duplicates

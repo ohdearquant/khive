@@ -55,7 +55,9 @@ drifts when context blurs across targets.
 
 2. **Citation discipline.** Every new entity needs a description sentence sourced from either (a)
    the parent concept's description, (b) a paper in the graph, (c) an existing project/code
-   reference. If you cannot quote a source, the entity becomes a `question` note.
+   reference. If you cannot quote a source, the entity becomes a `question` note. Before
+   creating any entity, search by name across all prior batch tags — different batch tags do
+   not make the same concept distinct; search first, create only on confirmed absence.
 
 3. **Hard ceilings**:
    - **Extend mode**: max 5 new entities per invocation

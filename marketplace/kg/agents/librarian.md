@@ -49,6 +49,29 @@ Run these in parallel:
  gtd.tasks(assignee="expander", status="next", limit=20)]
 ```
 
+### Re-verify queued tasks against the live graph
+
+Before acting on any task that was created from a gap inventory, triage report, or survey
+document, verify the claim is still true in the **live graph** — inventories are snapshots;
+the graph is truth.
+
+For each queued task whose title references a specific entity or gap, spot-check:
+
+```
+get(id="<entity-uuid>")                      # still exists?
+neighbors(node_id="<id>", direction="both")  # still missing the claimed edge?
+```
+
+If the condition no longer holds, cancel the task and record why:
+
+```
+gtd.transition(id="<task-id>", status="cancelled",
+               note="Re-verified: condition resolved since task was queued. <evidence>")
+```
+
+**Lesson (2026-06-09)**: 5 of 24 queued kg tasks were stale at librarian triage — the entities
+or edges they referenced had been created in a subsequent digest wave.
+
 For each agent's queue:
 
 1. **Aging**: any task in `next` longer than 24h is stale. Likely cause: assignee is silent /
