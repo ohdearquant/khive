@@ -773,7 +773,10 @@ mod tests {
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
+        // Hermetic: user-level core.hooksPath (e.g. the machine-wide JSON/JSONL
+        // data-leak guard) must not run against fixture commits in temp repos.
         let status = Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .current_dir(dir)
             .status()
