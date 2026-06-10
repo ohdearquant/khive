@@ -623,7 +623,7 @@ async fn upsert_domains_creates_and_updates() {
             "knowledge.upsert_domains",
             json!({
                 "domains": [
-                    { "slug": "retrieval", "name": "Retrieval updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["rag", "dense-retrieval", "bm25"] }
+                    { "slug": "retrieval", "name": "Retrieval updated", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["rag", "dense-retrieval", "bm25"] }
                 ]
             }),
         )
@@ -728,7 +728,7 @@ async fn list_domains_returns_only_domains() {
     .expect("upsert atom");
     f.dispatch(
         "knowledge.upsert_domains",
-        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert domain");
@@ -851,7 +851,7 @@ async fn stats_reflects_current_corpus() {
 
     f.dispatch(
         "knowledge.upsert_domains",
-        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert domain");
@@ -1293,7 +1293,7 @@ async fn compose_returns_markdown_for_domain() {
             "domains": [
                 {
                     "slug": "test-domain",
-                    "name": "Test Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+                    "name": "Test Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
                     "members": ["atom-a"]
                 }
             ]
@@ -1431,7 +1431,7 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "mix-domain", "name": "Mix Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["member-atom"] }
+                { "slug": "mix-domain", "name": "Mix Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["member-atom"] }
             ]
         }),
     )
@@ -1464,4 +1464,97 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
     );
     let count = resp["data"]["count"].as_u64().expect("count");
     assert_eq!(count, 2);
+}
+
+// ── KPK-002: DomainInput deny_unknown_fields + domain-mirror content-word minimum ──
+
+#[tokio::test]
+async fn kpk002_domain_input_rejects_unknown_fields() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "test-domain",
+                    "name": "Test Domain",
+                    "description": "A domain with enough words to pass the twenty word minimum content requirement for testing.",
+                    "unknown_field_xyz": "should cause rejection"
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown_field_xyz") || msg.contains("unknown field"),
+        "unknown field must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn kpk002_domain_mirror_atom_below_word_minimum_is_rejected() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "sparse-domain",
+                    "name": "Sparse Domain",
+                    "description": "Too short"
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("20") || msg.contains("words") || msg.contains("content"),
+        "description below 20-word minimum must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn kpk002_domain_mirror_atom_empty_description_is_rejected() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "empty-desc-domain",
+                    "name": "Empty Desc Domain"
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("20") || msg.contains("words") || msg.contains("content"),
+        "missing description must be rejected as below 20-word minimum; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn kpk002_domain_with_sufficient_description_is_accepted() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "rich-domain",
+                    "name": "Rich Domain",
+                    "description": "This domain covers retrieval augmented generation patterns for building scalable knowledge systems with structured graph storage and semantic search capabilities for AI agents.",
+                    "tags": ["rag", "retrieval"],
+                    "members": []
+                }]
+            }),
+        )
+        .await
+        .expect("domain with sufficient description must be accepted");
+    assert_eq!(resp["created"], json!(1u64));
+    assert_eq!(resp["updated"], json!(0u64));
 }

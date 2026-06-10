@@ -48,7 +48,17 @@ pub fn interpret(event: &Event) -> BrainSignal {
                 .get("served_by_profile_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
+            // Parse section_signals through the shared validator so that semantically
+            // poisoned entries (empty map, unknown section, out-of-contract signal value)
+            // produce None — identical treatment during both live handler and replay.
             let section_signals = event.payload.get("section_signals").and_then(|v| {
+                // Reject anything the shared validator would have rejected up front.
+                // This is the replay path: invalid entries yield None (→ Irrelevant for
+                // the section fold), and the caller (persist.rs) quarantines the whole
+                // event before calling apply_signal.
+                if crate::validate_section_signals(v).is_err() {
+                    return None;
+                }
                 serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v.clone()).ok()
             });
 

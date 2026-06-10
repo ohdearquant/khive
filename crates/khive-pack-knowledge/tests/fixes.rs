@@ -977,7 +977,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert alpha domain");
@@ -985,7 +985,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-beta",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert beta domain");
@@ -993,7 +993,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("update alpha domain");

@@ -7,7 +7,7 @@ search, sqlite-vec vector operations, and backend creation overhead.
 
 Defined in `benches/db_hot_path.rs`. Three benchmark groups:
 
-### `fts_benches` -- FTS5 text search
+### `fts_benches` — FTS5 text search
 
 | Function                             | Description                                   |
 | ------------------------------------ | --------------------------------------------- |
@@ -22,14 +22,14 @@ Defined in `benches/db_hot_path.rs`. Three benchmark groups:
 | `fts5_term_stats/five_terms`         | Term frequency stats, 5 terms                 |
 | `fts5_upsert_batch/docs/{N}`         | Batch upsert, N in {100, 500, 1000}           |
 
-### `vec_benches` -- sqlite-vec vector search
+### `vec_benches` — sqlite-vec vector search
 
 | Function                              | Description                             |
 | ------------------------------------- | --------------------------------------- |
 | `sqlite_vec_search/top_k/{N}`         | KNN search, N in {10, 50, 100}, 384-dim |
 | `sqlite_vec_insert_batch/records/{N}` | Batch insert, N in {100, 500, 1000}     |
 
-### `backend_benches` -- StorageBackend creation
+### `backend_benches` — StorageBackend creation
 
 | Function                          | Description                       |
 | --------------------------------- | --------------------------------- |
@@ -48,20 +48,22 @@ cargo bench -p khive-db --features vectors -- sqlite_vec
 cargo bench -p khive-db --features vectors -- storage_backend
 ```
 
-## Environment notes
+## Release Ledger
 
-- Corpus size: 10,000 documents / vectors (deterministic, seeded RNG)
-- Vector dimensions: 384 (matches all-MiniLM-L6-v2)
-- Sample size: 50 iterations (200 for backend creation)
-- Benchmarks use file-backed SQLite (tempdir), not in-memory
+### v0.2.8 - 2026-06-08
 
-## Baseline (2026-06-06, post-sweep)
+- Commit: `d3629501c550fd2f3bb7ed350a2b60309d596465`
+- Crate version: `0.2.8`
+- Khive version: `0.2.8`
+- Toolchain: `rustc 1.94.1 (e408947bf 2026-03-25)`, release profile (Criterion)
+- Machine: Apple M-series arm64, macOS Darwin 25.5.0, 16 GB
+- Feature flags: `vectors`
+- Command: `cd crates && cargo bench -p khive-db --bench db_hot_path --features khive-db/vectors`
+- Dataset: 10,000 documents / vectors, deterministic seeded RNG; vector dimensions 384 (matches
+  all-MiniLM-L6-v2); file-backed SQLite (tempdir); sample size 50 (200 for backend creation)
+- vs prior: first formal release ledger entry — no prior comparable baseline
 
-**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
-**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
-**Command:** `cargo bench -p khive-db --bench db_hot_path --features khive-db/vectors`
-
-### FTS5 Search (10K corpus, top-20)
+#### FTS5 Search (10K corpus, top-20)
 
 | Benchmark                            | Low      | Median   | High     |
 | ------------------------------------ | -------- | -------- | -------- |
@@ -77,15 +79,15 @@ cargo bench -p khive-db --features vectors -- storage_backend
 | `fts5_term_stats/single_term`        | 6.27 ms  | 6.34 ms  | 6.41 ms  |
 | `fts5_term_stats/five_terms`         | 21.37 ms | 21.58 ms | 21.80 ms |
 
-### FTS5 Upsert
+#### FTS5 Upsert
 
-| Benchmark                     | Low      | Median    | High      |
-| ----------------------------- | -------- | --------- | --------- |
-| `fts5_upsert_batch/docs/100`  | 7.15 ms  | 7.19 ms   | 7.25 ms   |
-| `fts5_upsert_batch/docs/500`  | 51.42 ms | 51.55 ms  | 51.69 ms  |
-| `fts5_upsert_batch/docs/1000` | 150.5 ms | 153.7 ms  | 158.1 ms  |
+| Benchmark                     | Low      | Median   | High     |
+| ----------------------------- | -------- | -------- | -------- |
+| `fts5_upsert_batch/docs/100`  | 7.15 ms  | 7.19 ms  | 7.25 ms  |
+| `fts5_upsert_batch/docs/500`  | 51.42 ms | 51.55 ms | 51.69 ms |
+| `fts5_upsert_batch/docs/1000` | 150.5 ms | 153.7 ms | 158.1 ms |
 
-### sqlite-vec Vector Search (10K corpus, 384-dim)
+#### sqlite-vec Vector Search (10K corpus, 384-dim)
 
 | Benchmark                     | Low      | Median   | High     |
 | ----------------------------- | -------- | -------- | -------- |
@@ -93,7 +95,7 @@ cargo bench -p khive-db --features vectors -- storage_backend
 | `sqlite_vec_search/top_k/50`  | 9.52 ms  | 9.58 ms  | 9.64 ms  |
 | `sqlite_vec_search/top_k/100` | 10.39 ms | 10.60 ms | 10.83 ms |
 
-### sqlite-vec Batch Insert
+#### sqlite-vec Batch Insert
 
 | Benchmark                              | Low      | Median   | High     |
 | -------------------------------------- | -------- | -------- | -------- |
@@ -101,18 +103,20 @@ cargo bench -p khive-db --features vectors -- storage_backend
 | `sqlite_vec_insert_batch/records/500`  | 12.25 ms | 12.58 ms | 12.93 ms |
 | `sqlite_vec_insert_batch/records/1000` | 25.13 ms | 27.24 ms | 29.50 ms |
 
-### Backend Creation
+#### Backend Creation
 
 | Benchmark                         | Low      | Median   | High     |
 | --------------------------------- | -------- | -------- | -------- |
 | `storage_backend_creation/memory` | 20.22 µs | 20.89 µs | 21.82 µs |
 | `storage_backend_creation/file`   | 1.076 ms | 1.084 ms | 1.093 ms |
 
+- Notes: none
+
 ## Regression policy
 
-- Any hot-path benchmark regressing >5% vs baseline requires investigation
-  before merge.
+- Any hot-path benchmark regressing >5% vs baseline requires investigation before merge.
 - Run `cargo bench -p khive-db --features vectors` in CI or locally before
   performance-sensitive PRs.
-- Update the baseline table after hardware changes or significant
-  optimizations.
+- Update the baseline table after hardware changes or significant optimizations.
+
+Last reviewed: v0.2.8 (2026-06-08)
