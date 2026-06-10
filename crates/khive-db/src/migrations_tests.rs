@@ -1,3 +1,4 @@
+use super::query_embedding_models_conn;
 use super::*;
 
 fn open_memory() -> Connection {
@@ -138,4 +139,66 @@ fn run_migrations_twice_is_idempotent() {
         })
         .unwrap();
     assert_eq!(recorded, 3, "no duplicate migration rows on re-run");
+}
+
+// ── _embedding_models.dim u32 range tests ───────────────────────────────────
+
+/// Helper: open a migrated in-memory DB and insert a row into `_embedding_models`
+/// with the given raw `dim` value (stored as i64 to exercise negative/overflow cases).
+fn insert_model_with_dim(conn: &Connection, dim: i64) {
+    // id and canonical_key are BLOBs; use distinct values per dim to avoid UNIQUE conflicts.
+    let id = dim.to_be_bytes();
+    let canonical_key = [(dim % 127) as u8; 8];
+    let now = 0i64;
+    conn.execute(
+        "INSERT INTO _embedding_models \
+         (id, engine_name, model_id, key_version, dim, status, canonical_key, created_at) \
+         VALUES (?1, 'engine', 'model', 'engine/model', ?2, 'active', ?3, ?4)",
+        rusqlite::params![id.as_slice(), dim, canonical_key.as_slice(), now],
+    )
+    .expect("insert model");
+}
+
+/// dim = -1 must be rejected: would silently become u32::MAX via `as u32`.
+#[test]
+fn embedding_model_dim_negative_is_rejected() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    insert_model_with_dim(&conn, -1);
+    let result = query_embedding_models_conn(&conn, None);
+    assert!(
+        result.is_err(),
+        "dim = -1 must be rejected; got: {:?}",
+        result
+    );
+}
+
+/// dim = u32::MAX + 1 must be rejected: would silently truncate to 0 via `as u32`.
+#[test]
+fn embedding_model_dim_u32_max_plus_one_is_rejected() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    insert_model_with_dim(&conn, i64::from(u32::MAX) + 1);
+    let result = query_embedding_models_conn(&conn, None);
+    assert!(
+        result.is_err(),
+        "dim = u32::MAX + 1 must be rejected; got: {:?}",
+        result
+    );
+}
+
+/// dim = u32::MAX (4 294 967 295) is a legal u32 value and must be accepted.
+#[test]
+fn embedding_model_dim_u32_max_is_accepted() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    insert_model_with_dim(&conn, i64::from(u32::MAX));
+    let result = query_embedding_models_conn(&conn, None);
+    assert!(
+        result.is_ok(),
+        "dim = u32::MAX must be accepted; got: {:?}",
+        result
+    );
+    let records = result.unwrap();
+    assert_eq!(records[0].dimensions, u32::MAX);
 }

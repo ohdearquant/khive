@@ -14,7 +14,7 @@ pub(crate) fn is_zero(val: &usize) -> bool {
 }
 
 /// Errors that can occur during snapshot verification.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum SnapshotError {
     /// Node count fields are inconsistent.
     #[error(
@@ -52,6 +52,19 @@ pub enum SnapshotError {
     TombstoneNotInIndex {
         /// The missing tombstone ID.
         id: NodeId,
+    },
+
+    /// An embedded vector contains a non-finite float value.
+    #[error(
+        "embedded vector for node {node_id:?} contains non-finite value at index {index}: {value}"
+    )]
+    NonFiniteVector {
+        /// The node whose vector contains a bad value.
+        node_id: NodeId,
+        /// Position within the vector where the bad value was found.
+        index: usize,
+        /// The non-finite value.
+        value: f32,
     },
 }
 
@@ -255,24 +268,25 @@ impl HnswSnapshot {
 
 /// Raw wire representation of [`HnswSnapshot`] for serde; normalizes and verifies on `TryFrom`.
 #[derive(Serialize, Deserialize)]
-struct RawHnswSnapshot {
+#[cfg_attr(test, derive(Debug))]
+pub(super) struct RawHnswSnapshot {
     #[serde(default, skip_serializing_if = "is_zero")]
-    vector_count: usize,
+    pub(super) vector_count: usize,
     #[serde(default)]
-    total_nodes: usize,
+    pub(super) total_nodes: usize,
     #[serde(default)]
-    live_nodes: usize,
+    pub(super) live_nodes: usize,
     #[serde(default)]
-    tombstone_count: usize,
-    max_layer: usize,
-    entry_point: Option<NodeId>,
-    config: HnswCheckpointConfig,
-    indexed_ids: Vec<NodeId>,
+    pub(super) tombstone_count: usize,
+    pub(super) max_layer: usize,
+    pub(super) entry_point: Option<NodeId>,
+    pub(super) config: HnswCheckpointConfig,
+    pub(super) indexed_ids: Vec<NodeId>,
     #[serde(default)]
-    tombstoned_ids: Vec<NodeId>,
-    layers: Vec<Vec<(NodeId, Vec<NodeId>)>>,
+    pub(super) tombstoned_ids: Vec<NodeId>,
+    pub(super) layers: Vec<Vec<(NodeId, Vec<NodeId>)>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    vectors: Vec<(NodeId, Vec<f32>)>,
+    pub(super) vectors: Vec<(NodeId, Vec<f32>)>,
 }
 
 impl TryFrom<RawHnswSnapshot> for HnswSnapshot {
@@ -293,6 +307,19 @@ impl TryFrom<RawHnswSnapshot> for HnswSnapshot {
         }
         if raw.tombstone_count == 0 && !raw.tombstoned_ids.is_empty() {
             raw.tombstone_count = raw.tombstoned_ids.len();
+        }
+
+        // Validate embedded vector finiteness before constructing the snapshot.
+        for (node_id, vec) in &raw.vectors {
+            for (index, &value) in vec.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(SnapshotError::NonFiniteVector {
+                        node_id: *node_id,
+                        index,
+                        value,
+                    });
+                }
+            }
         }
 
         let snap = HnswSnapshot {

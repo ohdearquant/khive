@@ -990,8 +990,8 @@ async fn test_295_reset_restores_domain_priors_not_uniform() {
     // Verify state before reset: posteriors have moved, total_events > 0.
     let before = pack.snapshot();
     assert!(
-        before.balanced_recall.salience.alpha > 2.0,
-        "salience.alpha must have grown past prior after useful feedback"
+        before.balanced_recall.salience.alpha() > 2.0,
+        "salience.alpha() must have grown past prior after useful feedback"
     );
     assert!(
         before.balanced_recall.total_events >= 9,
@@ -1038,32 +1038,32 @@ async fn test_295_reset_restores_domain_priors_not_uniform() {
 
     // salience prior = Beta(2,8)
     assert!(
-        (after.balanced_recall.salience.alpha - 2.0).abs() < 1e-12,
-        "#295: salience.alpha must be 2.0 after reset, got {}",
-        after.balanced_recall.salience.alpha
+        (after.balanced_recall.salience.alpha() - 2.0).abs() < 1e-12,
+        "#295: salience.alpha() must be 2.0 after reset, got {}",
+        after.balanced_recall.salience.alpha()
     );
     assert!(
-        (after.balanced_recall.salience.beta - 8.0).abs() < 1e-12,
-        "#295: salience.beta must be 8.0 after reset, got {}",
-        after.balanced_recall.salience.beta
+        (after.balanced_recall.salience.beta() - 8.0).abs() < 1e-12,
+        "#295: salience.beta() must be 8.0 after reset, got {}",
+        after.balanced_recall.salience.beta()
     );
 
     // temporal prior = Beta(1,9)
     assert!(
-        (after.balanced_recall.temporal.alpha - 1.0).abs() < 1e-12,
-        "#295: temporal.alpha must be 1.0 after reset, got {}",
-        after.balanced_recall.temporal.alpha
+        (after.balanced_recall.temporal.alpha() - 1.0).abs() < 1e-12,
+        "#295: temporal.alpha() must be 1.0 after reset, got {}",
+        after.balanced_recall.temporal.alpha()
     );
     assert!(
-        (after.balanced_recall.temporal.beta - 9.0).abs() < 1e-12,
-        "#295: temporal.beta must be 9.0 after reset, got {}",
-        after.balanced_recall.temporal.beta
+        (after.balanced_recall.temporal.beta() - 9.0).abs() < 1e-12,
+        "#295: temporal.beta() must be 9.0 after reset, got {}",
+        after.balanced_recall.temporal.beta()
     );
 
     // relevance prior = Beta(7,3)
     assert!(
-        (after.balanced_recall.relevance.alpha - 7.0).abs() < 1e-12,
-        "#295: relevance.alpha must be 7.0 after reset"
+        (after.balanced_recall.relevance.alpha() - 7.0).abs() < 1e-12,
+        "#295: relevance.alpha() must be 7.0 after reset"
     );
 
     // Step 5: brain.profile must reflect the reset state — ALL three fields.
@@ -1097,12 +1097,12 @@ async fn test_295_reset_restores_domain_priors_not_uniform() {
          reset result ({epoch_after})"
     );
 
-    // state_snapshot: salience.alpha must be the prior value.
+    // state_snapshot: salience.alpha() must be the prior value.
     let snap = &record["state_snapshot"];
     let sal_alpha = snap["salience"]["alpha"].as_f64().unwrap();
     assert!(
         (sal_alpha - 2.0).abs() < 1e-12,
-        "#295: brain.profile state_snapshot salience.alpha must be 2.0 after reset, \
+        "#295: brain.profile state_snapshot salience.alpha() must be 2.0 after reset, \
          got {sal_alpha}"
     );
 }
@@ -1153,13 +1153,13 @@ async fn brain_reset_accepts_empty_params() {
 // This test exercises the production wiring added in the P12 codex fix:
 // the runtime now embeds duration_us + target_id in the hook event for
 // "recall" verbs.  Simulates that by constructing the hook event the way
-// the runtime now would, then verifies temporal.alpha increments.
+// the runtime now would, then verifies temporal.alpha() increments.
 #[tokio::test]
 async fn test_355_posteriors_update_after_dispatch_via_hook() {
     let (pack, _rt) = make_pack();
     let before = pack.snapshot();
-    let tmp_alpha_before = before.balanced_recall.temporal.alpha;
-    let tmp_beta_before = before.balanced_recall.temporal.beta;
+    let tmp_alpha_before = before.balanced_recall.temporal.alpha();
+    let tmp_beta_before = before.balanced_recall.temporal.beta();
 
     // Simulate the runtime hook event for a fast recall hit:
     // duration_us ≤ 50_000 (fast) and target_id is present (hit).
@@ -1186,14 +1186,14 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
 
     let after_fast = pack.snapshot();
     assert!(
-        (after_fast.balanced_recall.temporal.alpha - (tmp_alpha_before + 1.0)).abs() < 1e-12,
-        "#355: fast recall hit must increment temporal.alpha via hook: expected {}, got {}",
+        (after_fast.balanced_recall.temporal.alpha() - (tmp_alpha_before + 1.0)).abs() < 1e-12,
+        "#355: fast recall hit must increment temporal.alpha() via hook: expected {}, got {}",
         tmp_alpha_before + 1.0,
-        after_fast.balanced_recall.temporal.alpha
+        after_fast.balanced_recall.temporal.alpha()
     );
     assert!(
-        (after_fast.balanced_recall.temporal.beta - tmp_beta_before).abs() < 1e-12,
-        "#355: fast hit must NOT increment temporal.beta"
+        (after_fast.balanced_recall.temporal.beta() - tmp_beta_before).abs() < 1e-12,
+        "#355: fast hit must NOT increment temporal.beta()"
     );
 
     // Simulate a slow recall hit (duration_us > 50_000) → temporal failure.
@@ -1219,10 +1219,10 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
 
     let after_slow = pack.snapshot();
     assert!(
-        (after_slow.balanced_recall.temporal.beta - (tmp_beta_before + 1.0)).abs() < 1e-12,
-        "#355: slow recall hit must increment temporal.beta via hook: expected {}, got {}",
+        (after_slow.balanced_recall.temporal.beta() - (tmp_beta_before + 1.0)).abs() < 1e-12,
+        "#355: slow recall hit must increment temporal.beta() via hook: expected {}, got {}",
         tmp_beta_before + 1.0,
-        after_slow.balanced_recall.temporal.beta
+        after_slow.balanced_recall.temporal.beta()
     );
 
     // Simulate a recall miss (no target_id) → temporal failure.
@@ -1247,10 +1247,10 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
 
     let after_miss = pack.snapshot();
     assert!(
-        (after_miss.balanced_recall.temporal.beta - (tmp_beta_before + 2.0)).abs() < 1e-12,
-        "#355: recall miss must further increment temporal.beta: expected {}, got {}",
+        (after_miss.balanced_recall.temporal.beta() - (tmp_beta_before + 2.0)).abs() < 1e-12,
+        "#355: recall miss must further increment temporal.beta(): expected {}, got {}",
         tmp_beta_before + 2.0,
-        after_miss.balanced_recall.temporal.beta
+        after_miss.balanced_recall.temporal.beta()
     );
 }
 
@@ -1985,7 +1985,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     .await
     .unwrap();
 
-    // Confirm salience.alpha increased above the prior (2.0).
+    // Confirm salience.alpha() increased above the prior (2.0).
     let mutated = pack
         .dispatch(
             "brain.profile",
@@ -1997,7 +1997,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
         .unwrap();
     let salience_alpha_before = mutated["state_snapshot"]["salience"]["alpha"]
         .as_f64()
-        .expect("state_snapshot.salience.alpha must be a number");
+        .expect("state_snapshot.salience.alpha() must be a number");
     assert!(
         salience_alpha_before > 2.0,
         "r3 fix 2: feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
@@ -2045,22 +2045,28 @@ async fn r2_user_profile_reset_mutates_posteriors() {
 
     let rel_alpha = snap["relevance"]["alpha"]
         .as_f64()
-        .expect("relevance.alpha");
-    let rel_beta = snap["relevance"]["beta"].as_f64().expect("relevance.beta");
+        .expect("relevance.alpha()");
+    let rel_beta = snap["relevance"]["beta"]
+        .as_f64()
+        .expect("relevance.beta()");
     assert!(
         (rel_alpha - 7.0).abs() < 1e-9 && (rel_beta - 3.0).abs() < 1e-9,
         "r3 fix 2: relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
     );
 
-    let sal_alpha = snap["salience"]["alpha"].as_f64().expect("salience.alpha");
-    let sal_beta = snap["salience"]["beta"].as_f64().expect("salience.beta");
+    let sal_alpha = snap["salience"]["alpha"]
+        .as_f64()
+        .expect("salience.alpha()");
+    let sal_beta = snap["salience"]["beta"].as_f64().expect("salience.beta()");
     assert!(
         (sal_alpha - 2.0).abs() < 1e-9 && (sal_beta - 8.0).abs() < 1e-9,
         "r3 fix 2: salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
     );
 
-    let tmp_alpha = snap["temporal"]["alpha"].as_f64().expect("temporal.alpha");
-    let tmp_beta = snap["temporal"]["beta"].as_f64().expect("temporal.beta");
+    let tmp_alpha = snap["temporal"]["alpha"]
+        .as_f64()
+        .expect("temporal.alpha()");
+    let tmp_beta = snap["temporal"]["beta"].as_f64().expect("temporal.beta()");
     assert!(
         (tmp_alpha - 1.0).abs() < 1e-9 && (tmp_beta - 9.0).abs() < 1e-9,
         "r3 fix 2: temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
@@ -3013,4 +3019,69 @@ mod help_tests {
             "brain.profiles must return profiles sorted by id"
         );
     }
+}
+
+// ── CRIT-1 regression tests: seed-prior ESS gate + no panic/poison path ──────
+
+#[tokio::test]
+async fn crit1_create_profile_rejects_seed_priors_exceeding_ess_cap() {
+    // alpha + beta = 1000 > DEFAULT_ESS_CAP (100.0) → must be rejected.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let err = pack
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "bad-ess-profile",
+                "consumer_kind": "search",
+                "seed_priors": {
+                    "section_posteriors": {
+                        "operational_guidance": {"alpha": 500.0, "beta": 500.0}
+                    }
+                }
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap_err();
+
+    if let RuntimeError::InvalidInput(msg) = &err {
+        assert!(
+            msg.contains("ESS") || msg.contains("alpha+beta") || msg.contains("exceeds"),
+            "error must mention the ESS constraint; got: {msg}"
+        );
+    } else {
+        panic!("expected InvalidInput, got {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn crit1_create_profile_accepts_seed_priors_within_ess_cap() {
+    // alpha + beta = 7.5 <= DEFAULT_ESS_CAP (100.0) → must succeed.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "ok-ess-profile",
+                "consumer_kind": "search",
+                "seed_priors": {
+                    "section_posteriors": {
+                        "operational_guidance": {"alpha": 6.0, "beta": 1.5}
+                    }
+                }
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("create with valid seed priors must succeed");
+
+    assert_eq!(result["created"], json!(true));
 }

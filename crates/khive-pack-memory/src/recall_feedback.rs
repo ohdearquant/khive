@@ -112,14 +112,14 @@ mod tests {
 
         assert_eq!(s.total_events, 1);
         // relevance prior Beta(7,3): alpha should become 8
-        assert!((s.relevance.alpha - 8.0).abs() < 1e-12);
-        assert!((s.relevance.beta - 3.0).abs() < 1e-12);
+        assert!((s.relevance.alpha() - 8.0).abs() < 1e-12);
+        assert!((s.relevance.beta() - 3.0).abs() < 1e-12);
         // temporal prior Beta(1,9): alpha should become 2
-        assert!((s.temporal.alpha - 2.0).abs() < 1e-12);
-        assert!((s.temporal.beta - 9.0).abs() < 1e-12);
+        assert!((s.temporal.alpha() - 2.0).abs() < 1e-12);
+        assert!((s.temporal.beta() - 9.0).abs() < 1e-12);
         // entity posterior: alpha 1+1=2
         let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha - 2.0).abs() < 1e-12);
+        assert!((ep.alpha() - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -128,10 +128,10 @@ mod tests {
         let id = Uuid::new_v4();
         on_recall_hit(&mut s, id, 100_000); // 100 ms — slow
 
-        assert!((s.relevance.alpha - 8.0).abs() < 1e-12);
+        assert!((s.relevance.alpha() - 8.0).abs() < 1e-12);
         // temporal failure → beta 9+1=10
-        assert!((s.temporal.beta - 10.0).abs() < 1e-12);
-        assert!((s.temporal.alpha - 1.0).abs() < 1e-12);
+        assert!((s.temporal.beta() - 10.0).abs() < 1e-12);
+        assert!((s.temporal.alpha() - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -140,8 +140,8 @@ mod tests {
         on_recall_miss(&mut s);
 
         assert_eq!(s.total_events, 1);
-        assert!((s.relevance.beta - 4.0).abs() < 1e-12); // 3+1
-        assert!((s.temporal.beta - 10.0).abs() < 1e-12); // 9+1
+        assert!((s.relevance.beta() - 4.0).abs() < 1e-12); // 3+1
+        assert!((s.temporal.beta() - 10.0).abs() < 1e-12); // 9+1
         assert!(s.entity_posteriors.is_empty());
     }
 
@@ -153,10 +153,10 @@ mod tests {
 
         assert_eq!(s.total_events, 1);
         // salience prior Beta(2,8): alpha 2+1=3
-        assert!((s.salience.alpha - 3.0).abs() < 1e-12);
-        assert!((s.salience.beta - 8.0).abs() < 1e-12);
+        assert!((s.salience.alpha() - 3.0).abs() < 1e-12);
+        assert!((s.salience.beta() - 8.0).abs() < 1e-12);
         let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha - 2.0).abs() < 1e-12);
+        assert!((ep.alpha() - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -165,9 +165,9 @@ mod tests {
         let id = Uuid::new_v4();
         on_explicit_feedback(&mut s, id, "not_useful");
 
-        assert!((s.salience.beta - 9.0).abs() < 1e-12); // 8+1
+        assert!((s.salience.beta() - 9.0).abs() < 1e-12); // 8+1
         let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.beta - 2.0).abs() < 1e-12);
+        assert!((ep.beta() - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         let id = Uuid::new_v4();
         on_explicit_feedback(&mut s, id, "wrong");
 
-        assert!((s.salience.beta - 9.0).abs() < 1e-12); // 8+1
+        assert!((s.salience.beta() - 9.0).abs() < 1e-12); // 8+1
     }
 
     #[test]
@@ -185,11 +185,11 @@ mod tests {
         let id = Uuid::new_v4();
         on_explicit_feedback(&mut s, id, "explicit_positive");
 
-        // ExplicitPositive: weight=1.5, positive → salience.alpha += 1.5
-        assert!((s.salience.alpha - 3.5).abs() < 1e-12); // 2+1.5
-        assert!((s.salience.beta - 8.0).abs() < 1e-12);
+        // ExplicitPositive: weight=1.5, positive → salience.alpha() += 1.5
+        assert!((s.salience.alpha() - 3.5).abs() < 1e-12); // 2+1.5
+        assert!((s.salience.beta() - 8.0).abs() < 1e-12);
         let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha - 2.5).abs() < 1e-12); // 1+1.5
+        assert!((ep.alpha() - 2.5).abs() < 1e-12); // 1+1.5
     }
 
     #[test]
@@ -198,24 +198,24 @@ mod tests {
         let id = Uuid::new_v4();
         on_explicit_feedback(&mut s, id, "correction");
 
-        // Correction: weight=2.0, negative → salience.beta += 2.0
-        assert!((s.salience.beta - 10.0).abs() < 1e-12); // 8+2
-                                                         // Correction also penalises relevance → relevance.beta += 2.0
-        assert!((s.relevance.beta - 5.0).abs() < 1e-12); // 3+2
+        // Correction: weight=2.0, negative → salience.beta() += 2.0
+        assert!((s.salience.beta() - 10.0).abs() < 1e-12); // 8+2
+                                                           // Correction also penalises relevance → relevance.beta() += 2.0
+        assert!((s.relevance.beta() - 5.0).abs() < 1e-12); // 3+2
         let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.beta - 3.0).abs() < 1e-12); // 1+2
+        assert!((ep.beta() - 3.0).abs() < 1e-12); // 1+2
     }
 
     #[test]
     fn explicit_feedback_unknown_signal_is_noop() {
         let mut s = fresh();
         let id = Uuid::new_v4();
-        let sal_before = (s.salience.alpha, s.salience.beta);
+        let sal_before = (s.salience.alpha(), s.salience.beta());
         on_explicit_feedback(&mut s, id, "bad_value");
 
         assert_eq!(s.total_events, 0);
-        assert!((s.salience.alpha - sal_before.0).abs() < 1e-12);
-        assert!((s.salience.beta - sal_before.1).abs() < 1e-12);
+        assert!((s.salience.alpha() - sal_before.0).abs() < 1e-12);
+        assert!((s.salience.beta() - sal_before.1).abs() < 1e-12);
         assert!(s.entity_posteriors.is_empty());
     }
 }

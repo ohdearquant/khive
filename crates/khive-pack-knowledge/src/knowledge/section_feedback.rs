@@ -11,12 +11,17 @@ pub fn on_section_feedback(
     for (section_type, feedback_signal) in signals {
         if let Some(posterior) = state.posteriors.get_mut(section_type) {
             match feedback_signal {
-                FeedbackSignal::Useful => posterior.alpha += 1.0,
-                FeedbackSignal::NotUseful => posterior.beta += 1.0,
-                FeedbackSignal::Wrong => posterior.beta += 2.0,
+                FeedbackSignal::Useful => posterior.update_success(),
+                FeedbackSignal::NotUseful => posterior.update_failure(),
+                FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
             }
             if let Some(prior) = state.priors.get(section_type).cloned() {
-                posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP);
+                if let Err(e) = posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP) {
+                    eprintln!(
+                        "[knowledge] apply_ess_cap failed for section {:?}: {e}",
+                        section_type
+                    );
+                }
             }
         }
     }

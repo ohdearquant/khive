@@ -604,6 +604,83 @@ fn canonicalize_preserves_neighbor_order() {
     assert_eq!(snap.layers[0][0].1, vec![id3, id2]);
 }
 
+// ── Non-finite embedded vector boundary tests ────────────────────────────
+
+/// TryFrom must reject a snapshot whose embedded vectors contain NaN.
+#[test]
+fn try_from_rejects_nan_in_embedded_vector() {
+    use super::snapshot::RawHnswSnapshot;
+    let id1 = make_id(1);
+    let raw = RawHnswSnapshot {
+        vector_count: 0,
+        total_nodes: 1,
+        live_nodes: 1,
+        tombstone_count: 0,
+        max_layer: 0,
+        entry_point: Some(id1),
+        config: sample_config(),
+        indexed_ids: vec![id1],
+        tombstoned_ids: vec![],
+        layers: vec![vec![(id1, vec![])]],
+        vectors: vec![(id1, vec![f32::NAN, 0.5])],
+    };
+    let result = HnswSnapshot::try_from(raw);
+    assert!(
+        matches!(result, Err(SnapshotError::NonFiniteVector { .. })),
+        "TryFrom must reject embedded vector containing NaN"
+    );
+}
+
+/// TryFrom must reject a snapshot whose embedded vectors contain Inf.
+#[test]
+fn try_from_rejects_inf_in_embedded_vector() {
+    use super::snapshot::RawHnswSnapshot;
+    let id1 = make_id(1);
+    let raw = RawHnswSnapshot {
+        vector_count: 0,
+        total_nodes: 1,
+        live_nodes: 1,
+        tombstone_count: 0,
+        max_layer: 0,
+        entry_point: Some(id1),
+        config: sample_config(),
+        indexed_ids: vec![id1],
+        tombstoned_ids: vec![],
+        layers: vec![vec![(id1, vec![])]],
+        vectors: vec![(id1, vec![0.5, f32::INFINITY])],
+    };
+    let result = HnswSnapshot::try_from(raw);
+    assert!(
+        matches!(result, Err(SnapshotError::NonFiniteVector { .. })),
+        "TryFrom must reject embedded vector containing Infinity"
+    );
+}
+
+/// Verify that valid embedded vectors round-trip through serde without error.
+/// NaN cannot be encoded in standard JSON; the TryFrom path is the serde boundary
+/// for non-finite values, covered by the try_from_rejects_* tests above.
+#[test]
+fn deserialize_valid_embedded_vectors_roundtrip() {
+    let id1 = make_id(1);
+    let valid_snap = HnswSnapshot {
+        vector_count: 0,
+        total_nodes: 1,
+        live_nodes: 1,
+        tombstone_count: 0,
+        max_layer: 0,
+        entry_point: Some(id1),
+        config: sample_config(),
+        indexed_ids: vec![id1],
+        tombstoned_ids: vec![],
+        layers: vec![vec![(id1, vec![])]],
+        vectors: vec![(id1, vec![0.5_f32, 0.5_f32])],
+    };
+    let json_str = serde_json::to_string(&valid_snap).expect("serialize");
+    let restored: HnswSnapshot = serde_json::from_str(&json_str).expect("deserialize valid");
+    assert!(restored.verify().is_ok());
+    assert_eq!(restored.vectors.len(), 1);
+}
+
 #[test]
 fn canonicalize_is_idempotent() {
     let id1 = make_id(1);

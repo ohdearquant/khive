@@ -88,8 +88,36 @@ pub enum TextQueryMode {
     AnyTerm,
 }
 
-/// Parameters for a full-text similarity search.
+/// Raw deserialization target for [`TextSearchRequest`].
+#[derive(Deserialize)]
+struct TextSearchRequestRaw {
+    query: String,
+    mode: TextQueryMode,
+    filter: Option<TextFilter>,
+    top_k: u32,
+    snippet_chars: usize,
+}
+
+impl TryFrom<TextSearchRequestRaw> for TextSearchRequest {
+    type Error = String;
+
+    fn try_from(raw: TextSearchRequestRaw) -> Result<Self, Self::Error> {
+        if raw.top_k == 0 {
+            return Err("TextSearchRequest: top_k must be > 0".into());
+        }
+        Ok(Self {
+            query: raw.query,
+            mode: raw.mode,
+            filter: raw.filter,
+            top_k: raw.top_k,
+            snippet_chars: raw.snippet_chars,
+        })
+    }
+}
+
+/// Parameters for a full-text similarity search. Deserialization rejects top_k = 0.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "TextSearchRequestRaw")]
 pub struct TextSearchRequest {
     pub query: String,
     pub mode: TextQueryMode,

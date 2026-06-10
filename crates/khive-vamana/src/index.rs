@@ -32,8 +32,142 @@ pub struct CorpusFingerprint {
     pub dimensions: u32,
 }
 
+/// Raw deserialization target for [`VamanaIndexSnapshot`].
+#[derive(Deserialize)]
+struct VamanaIndexSnapshotRaw {
+    num_vectors: u64,
+    dimensions: u32,
+    max_degree: u32,
+    search_list_size: u32,
+    alpha: f64,
+    medoid: u32,
+    adjacency: Vec<Vec<u32>>,
+    vectors: Vec<f32>,
+}
+
+impl TryFrom<VamanaIndexSnapshotRaw> for VamanaIndexSnapshot {
+    type Error = VamanaError;
+
+    fn try_from(raw: VamanaIndexSnapshotRaw) -> std::result::Result<Self, VamanaError> {
+        if raw.num_vectors == 0 {
+            return Err(VamanaError::invalid_format(
+                "VamanaIndexSnapshot: num_vectors must be > 0".into(),
+            ));
+        }
+        if !raw.alpha.is_finite() || raw.alpha < 1.0 {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: alpha must be finite and >= 1.0, got {}",
+                raw.alpha
+            )));
+        }
+        if raw.dimensions == 0 {
+            return Err(VamanaError::invalid_format(
+                "VamanaIndexSnapshot: dimensions must be > 0".into(),
+            ));
+        }
+        if raw.max_degree == 0 {
+            return Err(VamanaError::invalid_format(
+                "VamanaIndexSnapshot: max_degree must be > 0".into(),
+            ));
+        }
+        if raw.search_list_size == 0 {
+            return Err(VamanaError::invalid_format(
+                "VamanaIndexSnapshot: search_list_size must be > 0".into(),
+            ));
+        }
+        if raw.search_list_size < raw.max_degree {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: search_list_size ({}) must be >= max_degree ({})",
+                raw.search_list_size, raw.max_degree
+            )));
+        }
+        let num_vectors = usize::try_from(raw.num_vectors).map_err(|_| {
+            VamanaError::invalid_format("VamanaIndexSnapshot: num_vectors overflow".into())
+        })?;
+        let dimensions = usize::try_from(raw.dimensions).map_err(|_| {
+            VamanaError::invalid_format("VamanaIndexSnapshot: dimensions overflow".into())
+        })?;
+        let expected_floats = num_vectors.checked_mul(dimensions).ok_or_else(|| {
+            VamanaError::invalid_format(
+                "VamanaIndexSnapshot: num_vectors * dimensions overflow".into(),
+            )
+        })?;
+        if raw.vectors.len() != expected_floats {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: vectors.len() ({}) != num_vectors * dimensions ({num_vectors} * {dimensions} = {expected_floats})",
+                raw.vectors.len(),
+            )));
+        }
+        if raw.adjacency.len() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: adjacency.len() ({}) != num_vectors ({num_vectors})",
+                raw.adjacency.len(),
+            )));
+        }
+        for (i, &v) in raw.vectors.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(VamanaError::non_finite(
+                    "VamanaIndexSnapshot.vectors",
+                    format!("index {i}: {v}"),
+                ));
+            }
+        }
+        if raw.medoid as usize >= num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaIndexSnapshot: medoid ({}) >= num_vectors ({num_vectors})",
+                raw.medoid
+            )));
+        }
+        let max_degree = usize::try_from(raw.max_degree).map_err(|_| {
+            VamanaError::invalid_format("VamanaIndexSnapshot: max_degree overflow".into())
+        })?;
+        for (node, neighbors) in raw.adjacency.iter().enumerate() {
+            if neighbors.len() > max_degree {
+                return Err(VamanaError::invalid_format(format!(
+                    "VamanaIndexSnapshot: node {node} degree {} exceeds max_degree {max_degree}",
+                    neighbors.len()
+                )));
+            }
+            for &nb in neighbors {
+                if nb as usize >= num_vectors {
+                    return Err(VamanaError::invalid_format(format!(
+                        "VamanaIndexSnapshot: neighbor {nb} >= num_vectors {num_vectors}"
+                    )));
+                }
+                if nb as usize == node {
+                    return Err(VamanaError::invalid_format(format!(
+                        "VamanaIndexSnapshot: self-loop at node {node}"
+                    )));
+                }
+            }
+            let mut sorted = neighbors.clone();
+            sorted.sort_unstable();
+            let before = sorted.len();
+            sorted.dedup();
+            if sorted.len() != before {
+                return Err(VamanaError::invalid_format(format!(
+                    "VamanaIndexSnapshot: node {node} has duplicate neighbors"
+                )));
+            }
+        }
+        Ok(Self {
+            num_vectors: raw.num_vectors,
+            dimensions: raw.dimensions,
+            max_degree: raw.max_degree,
+            search_list_size: raw.search_list_size,
+            alpha: raw.alpha,
+            medoid: raw.medoid,
+            adjacency: raw.adjacency,
+            vectors: raw.vectors,
+        })
+    }
+}
+
 /// Serialisable graph payload stored inside `VamanaSnapshot`.
+/// Deserialization validates that `alpha` is finite and >= 1.0, and that all
+/// vector values are finite. Use `from_snapshot` to reconstruct a live index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "VamanaIndexSnapshotRaw")]
 pub struct VamanaIndexSnapshot {
     /// Number of indexed vectors.
     pub num_vectors: u64,
@@ -53,8 +187,47 @@ pub struct VamanaIndexSnapshot {
     pub vectors: Vec<f32>,
 }
 
-/// Self-validating snapshot of a `VamanaIndex`.
+/// Raw deserialization target for [`VamanaSnapshot`].
+#[derive(Deserialize)]
+struct VamanaSnapshotRaw {
+    format: String,
+    version: u32,
+    namespace: String,
+    model: String,
+    fingerprint: CorpusFingerprint,
+    index: VamanaIndexSnapshot,
+    external_ids: Vec<String>,
+}
+
+impl TryFrom<VamanaSnapshotRaw> for VamanaSnapshot {
+    type Error = VamanaError;
+
+    fn try_from(raw: VamanaSnapshotRaw) -> std::result::Result<Self, VamanaError> {
+        let num_vectors = usize::try_from(raw.index.num_vectors).map_err(|_| {
+            VamanaError::invalid_format("VamanaSnapshot: index.num_vectors overflow".into())
+        })?;
+        if raw.external_ids.len() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "VamanaSnapshot: external_ids.len() ({}) != num_vectors ({num_vectors})",
+                raw.external_ids.len(),
+            )));
+        }
+        Ok(Self {
+            format: raw.format,
+            version: raw.version,
+            namespace: raw.namespace,
+            model: raw.model,
+            fingerprint: raw.fingerprint,
+            index: raw.index,
+            external_ids: raw.external_ids,
+        })
+    }
+}
+
+/// Self-validating snapshot of a `VamanaIndex`. Deserialization validates
+/// vector finiteness and alpha range at the serde boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "VamanaSnapshotRaw")]
 pub struct VamanaSnapshot {
     pub format: String,
     pub version: u32,
@@ -1099,6 +1272,218 @@ mod tests {
         );
     }
 
+    // ---- Serde-boundary NaN/Inf tests for snapshot types ----
+
+    /// VamanaIndexSnapshot deserialization must reject non-finite vectors via TryFrom.
+    /// JSON cannot encode NaN natively; the TryFrom<VamanaIndexSnapshotRaw> path is
+    /// the serde boundary invoked by #[serde(try_from = "...")].
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_nan_vector() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 2,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![0]],
+            vectors: vec![1.0, f32::NAN, 0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            matches!(result, Err(VamanaError::NonFiniteFloat { .. })),
+            "VamanaIndexSnapshot::try_from must reject NaN in vectors"
+        );
+    }
+
+    /// VamanaIndexSnapshot deserialization must reject non-finite alpha via TryFrom.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_nan_alpha() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: f64::NAN,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            result.is_err(),
+            "VamanaIndexSnapshot::try_from must reject NaN alpha"
+        );
+    }
+
+    /// VamanaIndexSnapshot must reject alpha below 1.0 at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_alpha_below_one() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: 0.5,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5, 0.5],
+        };
+        let result = VamanaIndexSnapshot::try_from(raw);
+        assert!(
+            result.is_err(),
+            "VamanaIndexSnapshot::try_from must reject alpha < 1.0"
+        );
+    }
+
+    /// VamanaIndexSnapshot with valid inputs must succeed TryFrom.
+    #[test]
+    fn vamana_index_snapshot_try_from_accepts_valid() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 1,
+            dimensions: 2,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![]],
+            vectors: vec![0.5_f32, 0.5_f32],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_ok(),
+            "valid VamanaIndexSnapshot raw must be accepted"
+        );
+    }
+
+    /// TryFrom must reject dimensions = 0 at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_zero_dimensions() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 0,
+            dimensions: 0,
+            max_degree: 1,
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![],
+            vectors: vec![],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "dimensions = 0 must be rejected"
+        );
+    }
+
+    /// TryFrom must reject max_degree = 0 at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_zero_max_degree() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 0,
+            dimensions: 2,
+            max_degree: 0,
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![],
+            vectors: vec![],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "max_degree = 0 must be rejected"
+        );
+    }
+
+    /// TryFrom must reject search_list_size < max_degree at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_search_list_smaller_than_max_degree() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 0,
+            dimensions: 2,
+            max_degree: 8,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![],
+            vectors: vec![],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "search_list_size < max_degree must be rejected"
+        );
+    }
+
+    /// TryFrom must reject mismatched vectors length at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_vector_count_mismatch() {
+        // num_vectors=2, dimensions=2 → expect 4 floats; supply 3
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 2,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![0]],
+            vectors: vec![0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "vectors.len() != num_vectors * dimensions must be rejected"
+        );
+    }
+
+    /// TryFrom must reject mismatched adjacency length at the serde boundary.
+    #[test]
+    fn vamana_index_snapshot_try_from_rejects_adjacency_count_mismatch() {
+        // num_vectors=2 → adjacency must have 2 entries; supply 1
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 2,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1]],
+            vectors: vec![0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "adjacency.len() != num_vectors must be rejected"
+        );
+    }
+
+    /// VamanaSnapshot TryFrom must reject external_ids count mismatch.
+    #[test]
+    fn vamana_snapshot_try_from_rejects_external_ids_count_mismatch() {
+        let index_raw = VamanaIndexSnapshotRaw {
+            num_vectors: 2,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![0]],
+            vectors: vec![0.5, 0.5, 0.5, 0.5],
+        };
+        let index = VamanaIndexSnapshot::try_from(index_raw).expect("valid index");
+        let raw = VamanaSnapshotRaw {
+            format: VAMANA_SNAPSHOT_FORMAT.into(),
+            version: VAMANA_SNAPSHOT_VERSION,
+            namespace: "ns".into(),
+            model: "m".into(),
+            fingerprint: CorpusFingerprint {
+                vector_count: 2,
+                dimensions: 2,
+            },
+            index,
+            external_ids: vec!["id-0".into()], // only 1 but num_vectors = 2
+        };
+        assert!(
+            VamanaSnapshot::try_from(raw).is_err(),
+            "external_ids.len() != num_vectors must be rejected at serde boundary"
+        );
+    }
+
     /// P1: from_snapshot must reject duplicate neighbors.
     #[test]
     fn snapshot_rejects_duplicate_neighbors() {
@@ -1131,6 +1516,114 @@ mod tests {
             "from_snapshot must reject duplicate neighbors"
         );
     }
+    #[test]
+    fn try_from_rejects_empty_snapshot() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 0,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![],
+            vectors: vec![],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject num_vectors = 0"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_medoid_out_of_range() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 5, // >= num_vectors
+            adjacency: vec![vec![1], vec![0], vec![]],
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject medoid >= num_vectors"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_degree_exceeding_max() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 1, // max 1 neighbor
+            search_list_size: 2,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1, 2], vec![0], vec![0]], // node 0 has 2 > max_degree
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject degree > max_degree"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_neighbor_out_of_range() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1], vec![99], vec![0]], // neighbor 99 >= num_vectors
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject neighbor >= num_vectors"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_self_loop() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 2,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![0], vec![0], vec![1]], // node 0 points to itself
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject self-loops"
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_duplicate_neighbors_at_serde_boundary() {
+        let raw = VamanaIndexSnapshotRaw {
+            num_vectors: 3,
+            dimensions: 2,
+            max_degree: 3,
+            search_list_size: 4,
+            alpha: 1.2,
+            medoid: 0,
+            adjacency: vec![vec![1, 1], vec![0], vec![0]], // node 0 has duplicate neighbor 1
+            vectors: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        };
+        assert!(
+            VamanaIndexSnapshot::try_from(raw).is_err(),
+            "TryFrom must reject duplicate neighbors at serde boundary"
+        );
+    }
+
     // ---- Non-finite float boundary tests (VAMANA-AUD-001) ----
 
     #[test]

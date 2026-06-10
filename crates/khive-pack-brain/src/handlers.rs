@@ -20,6 +20,7 @@ use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 use khive_brain_core::{
     ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
+    DEFAULT_ESS_CAP,
 };
 
 // ── Handler table ─────────────────────────────────────────────────────────────
@@ -440,8 +441,8 @@ impl BrainPack {
                     "mean": posterior.mean(),
                     "variance": posterior.variance(),
                     "ess": posterior.effective_sample_size(),
-                    "alpha": posterior.alpha,
-                    "beta": posterior.beta,
+                    "alpha": posterior.alpha(),
+                    "beta": posterior.beta(),
                 }))
             }
             None => {
@@ -609,8 +610,8 @@ impl BrainPack {
                 sections_json.insert(
                     section.as_str().to_owned(),
                     json!({
-                        "alpha": posterior.alpha,
-                        "beta": posterior.beta,
+                        "alpha": posterior.alpha(),
+                        "beta": posterior.beta(),
                         "mean": posterior.mean(),
                         "variance": posterior.variance(),
                         "ess": posterior.effective_sample_size(),
@@ -1281,12 +1282,21 @@ impl BrainPack {
                             "missing or invalid beta for section {key:?}"
                         ))
                     })?;
-                    if alpha <= 0.0 || beta <= 0.0 {
+                    let posterior =
+                        khive_brain_core::BetaPosterior::try_new(alpha, beta).map_err(|e| {
+                            RuntimeError::InvalidInput(format!(
+                                "invalid seed_priors for section {key:?}: {e}"
+                            ))
+                        })?;
+                    let ess = posterior.effective_sample_size();
+                    if ess > DEFAULT_ESS_CAP {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "alpha and beta must be positive for section {key:?}; got alpha={alpha}, beta={beta}"
+                            "seed_priors for section {key:?}: alpha+beta ({ess}) exceeds \
+                             maximum allowed ESS ({DEFAULT_ESS_CAP}); use values where \
+                             alpha + beta <= {DEFAULT_ESS_CAP}"
                         )));
                     }
-                    priors.insert(st, khive_brain_core::BetaPosterior::new(alpha, beta));
+                    priors.insert(st, posterior);
                 }
                 SectionPosteriorState::from_priors(priors)
             } else {

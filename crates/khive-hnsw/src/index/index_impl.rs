@@ -387,7 +387,7 @@ impl HnswIndex {
             merged_vectors.insert(*id, v.clone());
         }
 
-        // Validate ALL vectors exist and have correct dimensions BEFORE clearing.
+        // Validate ALL vectors exist, have correct dimensions, and are finite BEFORE clearing.
         // This ensures the current index is not corrupted on error.
         let dims = self.config.dimensions;
         for id in &snapshot.indexed_ids {
@@ -399,6 +399,13 @@ impl HnswIndex {
                     expected: dims,
                     actual: vec.len(),
                 });
+            }
+            for (vi, &v) in vec.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(RetrievalError::hnsw(format!(
+                        "Non-finite value in vector for node {id:?} at index {vi}: {v}"
+                    )));
+                }
             }
         }
 
