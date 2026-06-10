@@ -180,11 +180,34 @@ pub async fn load_latest_snapshot(
     }
 }
 
-/// Result of a replay load: the valid events and the quarantine tally.
+/// A single row that was quarantined during replay, with enough metadata to
+/// diagnose and re-examine the bad entry without re-running a replay.
+pub struct QuarantinedRow {
+    /// Row primary key from `brain_event_log`.
+    pub id: i64,
+    /// Profile id recorded at write time (may be empty string if the column was null).
+    pub profile_id: String,
+    /// ISO-8601 / epoch-µs created_at value as recorded in the table.
+    pub created_at: i64,
+    /// Human-readable description of why the row was quarantined.
+    pub reason: String,
+    /// Leading ~200 chars of the raw payload for quick inspection (truncated with "…").
+    pub payload_snippet: String,
+}
+
+/// Result of a replay load: valid events and the full quarantine manifest.
 pub struct LoadEventsResult {
     pub events: Vec<khive_storage::event::Event>,
-    /// Number of rows skipped due to structural or semantic validation failure.
-    pub quarantine_count: usize,
+    /// Rows that were skipped due to structural or semantic validation failure.
+    /// The physical rows remain in `brain_event_log`; this vec makes them queryable.
+    pub quarantined: Vec<QuarantinedRow>,
+}
+
+impl LoadEventsResult {
+    /// Convenience accessor: number of quarantined rows.
+    pub fn quarantine_count(&self) -> usize {
+        self.quarantined.len()
+    }
 }
 
 pub async fn load_events_since(
@@ -195,7 +218,11 @@ pub async fn load_events_since(
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT payload FROM brain_event_log WHERE namespace = ?1 AND created_at > ?2 ORDER BY created_at ASC, id ASC".into(),
+            sql: "SELECT id, profile_id, event_kind, payload, created_at \
+                  FROM brain_event_log \
+                  WHERE namespace = ?1 AND created_at > ?2 \
+                  ORDER BY created_at ASC, id ASC"
+                .into(),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(since_us),
@@ -206,29 +233,51 @@ pub async fn load_events_since(
         .map_err(|e| sql_err("load events", e))?;
 
     let mut events = Vec::with_capacity(rows.len());
-    let mut quarantine_count: usize = 0;
+    let mut quarantined: Vec<QuarantinedRow> = Vec::new();
+
     for row in &rows {
+        let row_id = match row.get("id") {
+            Some(SqlValue::Integer(i)) => *i,
+            _ => 0,
+        };
+        let profile_id = match row.get("profile_id") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let created_at = match row.get("created_at") {
+            Some(SqlValue::Integer(i)) => *i,
+            _ => 0,
+        };
+
+        let mut push_quarantine = |reason: String, payload_raw: &str| {
+            let snippet = if payload_raw.len() > 200 {
+                format!("{}…", &payload_raw[..200])
+            } else {
+                payload_raw.to_string()
+            };
+            eprintln!(
+                "[brain] event-log replay: quarantined row id={row_id} profile={profile_id:?}: {reason}"
+            );
+            quarantined.push(QuarantinedRow {
+                id: row_id,
+                profile_id: profile_id.clone(),
+                created_at,
+                reason,
+                payload_snippet: snippet,
+            });
+        };
+
         let payload_str = match row.get("payload") {
             Some(SqlValue::Text(s)) => s,
             _ => {
-                quarantine_count += 1;
-                eprintln!(
-                    "[brain] event-log replay: row missing or non-text payload column \
-                     (quarantined row #{})",
-                    quarantine_count
-                );
+                push_quarantine("missing or non-text payload column".into(), "");
                 continue;
             }
         };
         let event = match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
             Ok(ev) => ev,
             Err(e) => {
-                quarantine_count += 1;
-                eprintln!(
-                    "[brain] event-log replay: malformed event JSON quarantined \
-                     (row #{}): {e}",
-                    quarantine_count
-                );
+                push_quarantine(format!("malformed event JSON: {e}"), payload_str);
                 continue;
             }
         };
@@ -238,11 +287,9 @@ pub async fn load_events_since(
         if event.verb == "brain.feedback" {
             if let Some(ss) = event.payload.get("section_signals") {
                 if let Err(e) = crate::validate_section_signals(ss) {
-                    quarantine_count += 1;
-                    eprintln!(
-                        "[brain] event-log replay: semantically invalid section_signals \
-                         quarantined (row #{}): {e}",
-                        quarantine_count
+                    push_quarantine(
+                        format!("semantically invalid section_signals: {e}"),
+                        payload_str,
                     );
                     continue;
                 }
@@ -250,17 +297,18 @@ pub async fn load_events_since(
         }
         events.push(event);
     }
-    if quarantine_count > 0 {
+    if !quarantined.is_empty() {
         eprintln!(
-            "[brain] event-log replay: {quarantine_count} row(s) quarantined \
-             out of {} total; replayed {} clean event(s)",
+            "[brain] event-log replay: {} row(s) quarantined out of {} total; \
+             replayed {} clean event(s)",
+            quarantined.len(),
             rows.len(),
             events.len()
         );
     }
     Ok(LoadEventsResult {
         events,
-        quarantine_count,
+        quarantined,
     })
 }
 
@@ -522,7 +570,7 @@ mod brain_007_replay_quarantine {
             1,
             "one valid event expected; malformed row must be quarantined, not panic"
         );
-        assert_eq!(result.quarantine_count, 1, "quarantine_count must be 1");
+        assert_eq!(result.quarantine_count(), 1, "quarantine_count must be 1");
     }
 
     #[tokio::test]
@@ -543,7 +591,7 @@ mod brain_007_replay_quarantine {
             result.events.is_empty(),
             "all malformed rows must be quarantined"
         );
-        assert_eq!(result.quarantine_count, 2, "quarantine_count must be 2");
+        assert_eq!(result.quarantine_count(), 2, "quarantine_count must be 2");
     }
 
     #[tokio::test]
@@ -562,7 +610,7 @@ mod brain_007_replay_quarantine {
             .expect("clean rows must replay without error");
 
         assert_eq!(result.events.len(), 3, "all 3 clean rows must be returned");
-        assert_eq!(result.quarantine_count, 0, "quarantine_count must be 0");
+        assert_eq!(result.quarantine_count(), 0, "quarantine_count must be 0");
     }
 
     // ── semantic quarantine (BRAIN-007 new coverage) ──────────────────────────
@@ -586,7 +634,7 @@ mod brain_007_replay_quarantine {
             result.events.is_empty(),
             "empty section_signals must be quarantined"
         );
-        assert_eq!(result.quarantine_count, 1);
+        assert_eq!(result.quarantine_count(), 1);
     }
 
     #[tokio::test]
@@ -611,7 +659,7 @@ mod brain_007_replay_quarantine {
             result.events.is_empty(),
             "unknown section must be quarantined"
         );
-        assert_eq!(result.quarantine_count, 1);
+        assert_eq!(result.quarantine_count(), 1);
     }
 
     #[tokio::test]
@@ -637,7 +685,7 @@ mod brain_007_replay_quarantine {
             result.events.is_empty(),
             "semantic signal in section_signals must be quarantined"
         );
-        assert_eq!(result.quarantine_count, 1);
+        assert_eq!(result.quarantine_count(), 1);
     }
 
     // ── state isolation: bad rows must not advance posterior state ────────────
@@ -673,11 +721,11 @@ mod brain_007_replay_quarantine {
             for (st, p) in &s.posteriors {
                 let bp = &b.posteriors[st];
                 assert!(
-                    (p.alpha - bp.alpha).abs() < 1e-12
-                        && (p.beta - bp.beta).abs() < 1e-12,
+                    (p.alpha() - bp.alpha()).abs() < 1e-12
+                        && (p.beta() - bp.beta()).abs() < 1e-12,
                     "section posterior for {:?} changed: got alpha={} beta={}, expected alpha={} beta={}; \
                      bad row must not mutate posteriors",
-                    st, p.alpha, p.beta, bp.alpha, bp.beta
+                    st, p.alpha(), p.beta(), bp.alpha(), bp.beta()
                 );
             }
         }
@@ -706,7 +754,8 @@ mod brain_007_replay_quarantine {
             .expect("load must not fail");
 
         assert_eq!(
-            result.quarantine_count, 1,
+            result.quarantine_count(),
+            1,
             "bad first row must be quarantined"
         );
         assert_eq!(result.events.len(), 1, "one clean event must pass through");
@@ -745,7 +794,8 @@ mod brain_007_replay_quarantine {
             .expect("load must not fail");
 
         assert_eq!(
-            result.quarantine_count, 1,
+            result.quarantine_count(),
+            1,
             "bad last row must be quarantined"
         );
         assert_eq!(result.events.len(), 1, "one clean event must pass through");
@@ -787,7 +837,11 @@ mod brain_007_replay_quarantine {
             .await
             .expect("load must not fail");
 
-        assert_eq!(result.quarantine_count, 2, "2 bad rows must be quarantined");
+        assert_eq!(
+            result.quarantine_count(),
+            2,
+            "2 bad rows must be quarantined"
+        );
         assert_eq!(result.events.len(), 3, "3 clean rows must pass through");
 
         // Apply only clean events; section posteriors must stay at baseline.
@@ -801,5 +855,60 @@ mod brain_007_replay_quarantine {
             }
         }
         assert_section_posteriors_at_baseline(&state, &baseline);
+    }
+
+    // ── quarantine metadata: id and reason must be returned, not just counted ──
+
+    #[tokio::test]
+    async fn quarantined_rows_return_id_and_reason() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // Two bad rows: one malformed JSON, one semantic poison.
+        insert_raw_payload(&rt, ns, "not json at all").await;
+        let poison = make_feedback_event_json(ns, Some(serde_json::json!({})));
+        insert_raw_payload(&rt, ns, &poison).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(
+            result.quarantine_count(),
+            2,
+            "both bad rows must be quarantined"
+        );
+        assert!(result.events.is_empty(), "no clean events expected");
+
+        // Each quarantined entry must carry a non-zero id and a non-empty reason.
+        for qr in &result.quarantined {
+            assert!(
+                qr.id > 0,
+                "quarantined row id must be a real autoincrement id; got {}",
+                qr.id
+            );
+            assert!(
+                !qr.reason.is_empty(),
+                "quarantined row must carry a non-empty reason string"
+            );
+        }
+
+        // First row: malformed JSON — reason must mention JSON or malformed.
+        assert!(
+            result.quarantined[0].reason.contains("malformed")
+                || result.quarantined[0].reason.contains("JSON")
+                || result.quarantined[0].reason.contains("json"),
+            "first quarantine reason must describe malformed JSON; got: {:?}",
+            result.quarantined[0].reason
+        );
+
+        // Second row: semantic poison (empty section_signals) — reason must mention section_signals.
+        assert!(
+            result.quarantined[1].reason.contains("section_signals"),
+            "second quarantine reason must mention section_signals; got: {:?}",
+            result.quarantined[1].reason
+        );
     }
 }

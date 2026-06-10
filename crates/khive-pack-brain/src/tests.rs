@@ -3211,6 +3211,10 @@ mod brain_005_section_signals {
                 msg.contains("section_signals"),
                 "error must mention section_signals; got: {msg}"
             );
+            assert!(
+                msg.contains("useful") || msg.contains("not_useful"),
+                "error for non-string signal must name valid values; got: {msg}"
+            );
         } else {
             panic!("expected InvalidInput, got {err:?}");
         }

@@ -48,7 +48,7 @@ pub(crate) fn validate_section_signals(
         }
         let sig = val.as_str().ok_or_else(|| {
             khive_runtime::RuntimeError::InvalidInput(format!(
-                "section_signals: signal for section {key:?} must be a string"
+                "section_signals: signal for section {key:?} must be one of: useful | not_useful | wrong"
             ))
         })?;
         if !valid_signals.contains(&sig) {
