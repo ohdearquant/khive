@@ -1370,21 +1370,28 @@ pub(crate) async fn resolve_auto_feedback_target(
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
-        // Brain observes pack events only — it must never process its own
-        // state-transition events. Skipping brain.* verbs here prevents
-        // double-counting: handle_feedback already calls apply_signal directly,
-        // so the hook firing afterward would increment total_events a second time.
         if view.event.verb.starts_with("brain.") {
             return;
         }
 
-        let signal = interpret(&view.event);
-        let mut state = self.state.lock().unwrap();
-        state.balanced_recall.apply_signal(&signal);
+        let _gate = self.dispatch_gate.lock().await;
 
-        // Sync profile record after every hook fire so that brain.profile
-        // reflects the live total_events and state_snapshot.
-        sync_balanced_recall_record(&mut state);
+        let signal = interpret(&view.event);
+
+        // Route the signal to the state bucket that owns view.event.namespace.
+        // No event is silently dropped: cold and saved namespaces are updated
+        // inside PersistenceTracker; only when the namespace is the active slot
+        // do we need to apply to the shared BrainState.
+        let target = {
+            let mut tracker = self.persistence.lock().unwrap();
+            tracker.route_signal(&view.event.namespace, &signal, ENTITY_CACHE_CAPACITY)
+        };
+
+        if matches!(target, crate::persist::ApplyTarget::ActiveSlot) {
+            let mut state = self.state.lock().unwrap();
+            state.balanced_recall.apply_signal(&signal);
+            sync_balanced_recall_record(&mut state);
+        }
     }
 }
 
@@ -1419,7 +1426,30 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        // Serialise the (ensure_loaded → handler) pair under the dispatch gate
+        // so no concurrent dispatch for a different namespace can swap the
+        // single shared BrainState slot between the two steps.
+        //
+        // Lock order: dispatch_gate (outermost) → persistence → state.
+        // Nothing inside ensure_loaded or any handler acquires dispatch_gate,
+        // so there is no lock-order cycle.
+        let _gate = self.dispatch_gate.lock().await;
+
         self.ensure_loaded(token).await?;
+
+        // In test builds, fire the interleaving hook (if any) between
+        // ensure_loaded returning and the handler acquiring self.state.
+        // This lets tests prove that without the gate a concurrent namespace
+        // swap would corrupt the handler's view.
+        #[cfg(test)]
+        {
+            let hook = crate::pack::DISPATCH_INTERLEAVE_HOOK.lock().unwrap().take();
+            if let Some(h) = hook {
+                let _ = h.reached_tx.send(());
+                let _ = h.proceed_rx.await;
+            }
+        }
+
         match verb {
             // Assertive
             "brain.state" => self.handle_state(params).await,

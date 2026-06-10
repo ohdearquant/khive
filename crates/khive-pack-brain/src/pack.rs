@@ -12,6 +12,29 @@ use crate::persist;
 
 pub const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
+// Test-only hook that fires inside dispatch(), after ensure_loaded returns and
+// before the handler acquires self.state.  Lets tests inject a concurrent
+// namespace swap to prove the dispatch gate prevents cross-namespace pollution.
+#[cfg(test)]
+pub(crate) struct DispatchHook {
+    pub reached_tx: tokio::sync::oneshot::Sender<()>,
+    pub proceed_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static DISPATCH_INTERLEAVE_HOOK: std::sync::Mutex<Option<DispatchHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_dispatch_interleave_hook(hook: DispatchHook) {
+    *DISPATCH_INTERLEAVE_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_dispatch_interleave_hook() {
+    *DISPATCH_INTERLEAVE_HOOK.lock().unwrap() = None;
+}
+
 /// Sync the `balanced-recall-v1` profile record to match the live `balanced_recall` state.
 pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     let total_ev = state.balanced_recall.total_events;
@@ -29,6 +52,14 @@ pub struct BrainPack {
     pub(crate) state: Mutex<BrainState>,
     /// Tracks which namespaces are loaded from DB and dirty event counts.
     pub(crate) persistence: Mutex<persist::PersistenceTracker>,
+    /// Serialises the (ensure_loaded → handler) pair so no namespace swap can
+    /// occur between the two steps.  Must be a tokio async mutex because the
+    /// guard is held across .await points inside dispatch().
+    ///
+    /// Lock order: dispatch_gate (outermost) → persistence → state.
+    /// Nothing inside ensure_loaded or any handler acquires dispatch_gate,
+    /// so there is no cycle and no deadlock risk.
+    pub(crate) dispatch_gate: tokio::sync::Mutex<()>,
 }
 
 impl Pack for BrainPack {
@@ -47,7 +78,16 @@ impl BrainPack {
             runtime,
             state: Mutex::new(state),
             persistence: Mutex::new(persist::PersistenceTracker::new()),
+            dispatch_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn activate_namespace_for_test(&self, namespace: &str) {
+        self.persistence
+            .lock()
+            .unwrap()
+            .mark_loaded(namespace.into());
     }
 
     pub(crate) async fn ensure_loaded(&self, token: &NamespaceToken) -> Result<(), RuntimeError> {
@@ -64,6 +104,16 @@ impl BrainPack {
     /// Public snapshot of the current `BrainState`.
     pub fn snapshot(&self) -> khive_brain_core::BrainStateSnapshot {
         self.state.lock().unwrap().to_snapshot()
+    }
+
+    /// Return the `total_events` counter for a namespace stored in the cold/saved
+    /// state buckets inside `PersistenceTracker`.  Returns `None` when no state
+    /// has been initialised for the given namespace.
+    ///
+    /// Intended for test verification only.  Production code should access state
+    /// via `ensure_loaded` + `snapshot()`.
+    pub fn cold_namespace_total_events(&self, namespace: &str) -> Option<u64> {
+        self.persistence.lock().unwrap().total_events_for(namespace)
     }
 }
 

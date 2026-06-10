@@ -3,13 +3,49 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// Test-only interleaving hook for ensure_loaded.
+//
+// When set, every cold ensure_loaded call (after the async DB load, before the
+// final tracker lock) will:
+//   1. Send () on `reached_tx` to signal the test controller "I am at the hook".
+//   2. Await `proceed_rx` before continuing.
+//
+// This lets a test precisely inject the following interleaving:
+//   - Loader B reaches hook  →  test controller receives reached signal
+//   - Test controller runs Loader A to completion and mutates state
+//   - Test controller sends on proceed_tx  →  Loader B continues
+//
+// With the old code (no re-check), Loader B then clobbered A's mutation.
+// With the fix (re-check under final guard), Loader B sees is_active=true
+// and returns early, preserving A's mutation.
+#[cfg(test)]
+pub(crate) struct LoadHook {
+    pub reached_tx: tokio::sync::oneshot::Sender<()>,
+    pub proceed_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static POST_LOAD_HOOK: std::sync::Mutex<Option<LoadHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_post_load_hook(hook: LoadHook) {
+    *POST_LOAD_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_post_load_hook() {
+    *POST_LOAD_HOOK.lock().unwrap() = None;
+}
+
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
 
-use khive_brain_core::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
+use khive_brain_core::{
+    validate_brain_state_snapshot, BrainSignal, BrainState, BrainStateSnapshot,
+};
 
 use crate::event::interpret;
 
@@ -27,6 +63,18 @@ pub struct PersistenceTracker {
     pub(crate) loaded_namespaces: HashMap<String, ()>,
     dirty_counts: HashMap<String, u64>,
     snapshot_batch_size: u64,
+    /// Pre-load accumulator for hook signals that arrive before `ensure_loaded` runs.
+    ///
+    /// When `on_dispatch` fires for a namespace that has never been loaded from the
+    /// DB, the signal is queued here rather than applied to a speculative
+    /// `BrainState`.  `ensure_loaded` drains this queue *after* the snapshot +
+    /// event-replay path completes, so the ordering guarantee is:
+    ///   persisted snapshot → replayed events → queued hook signals
+    ///
+    /// The namespace is deliberately NOT added to `loaded_namespaces` while
+    /// signals are pending; that prevents `ensure_loaded` from skipping the DB
+    /// round-trip for a namespace that may have existing persisted history.
+    pending_hook_signals: HashMap<String, Vec<BrainSignal>>,
 }
 
 impl Default for PersistenceTracker {
@@ -43,6 +91,7 @@ impl PersistenceTracker {
             loaded_namespaces: HashMap::new(),
             dirty_counts: HashMap::new(),
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
+            pending_hook_signals: HashMap::new(),
         }
     }
 
@@ -81,6 +130,84 @@ impl PersistenceTracker {
     pub fn reset_dirty(&mut self, namespace: &str) {
         self.dirty_counts.insert(namespace.to_string(), 0);
     }
+
+    /// Return the total_events counter for any namespace stored in `saved_states`
+    /// (saved-off namespaces) or `pending_hook_signals` (cold pre-load queue).
+    /// Returns `None` when no state has been initialised for the given namespace.
+    ///
+    /// Note: does NOT return the counter for the active namespace, which lives in
+    /// the shared `BrainState` slot, not in `saved_states`.
+    pub(crate) fn total_events_for(&self, namespace: &str) -> Option<u64> {
+        if let Some(s) = self.saved_states.get(namespace) {
+            return Some(s.balanced_recall.total_events);
+        }
+        self.pending_hook_signals
+            .get(namespace)
+            .map(|signals| signals.len() as u64)
+    }
+
+    /// Apply a signal to the state bucket that owns `namespace`.
+    ///
+    /// - Active namespace: returns `ApplyTarget::ActiveSlot` — caller must apply
+    ///   the signal to the shared `BrainState` lock while holding the dispatch gate.
+    /// - Saved (loaded) namespace: applies directly to `saved_states` and returns
+    ///   `ApplyTarget::Done`.
+    /// - Cold/unknown namespace: enqueues the signal in `pending_hook_signals` and
+    ///   returns `ApplyTarget::Done`.  The namespace is NOT marked loaded; the DB
+    ///   round-trip is preserved for the first `ensure_loaded` call.  The queue is
+    ///   drained by `ensure_loaded` *after* snapshot restore and event replay, so
+    ///   the ordering guarantee is: snapshot → replayed events → queued signals.
+    ///
+    /// No event is silently dropped regardless of which slot is currently active.
+    pub(crate) fn route_signal(
+        &mut self,
+        namespace: &str,
+        signal: &khive_brain_core::BrainSignal,
+        entity_capacity: usize,
+    ) -> ApplyTarget {
+        if self.is_active(namespace) {
+            return ApplyTarget::ActiveSlot;
+        }
+
+        if self.is_loaded(namespace) {
+            // Namespace has been loaded from the DB but is currently saved off.
+            // Apply directly to its saved BrainState.
+            if let Some(state) = self.saved_states.get_mut(namespace) {
+                state.balanced_recall.apply_signal(signal);
+                crate::sync_balanced_recall_record(state);
+            }
+            return ApplyTarget::Done;
+        }
+
+        // Cold/unknown namespace: queue the signal for deferred application.
+        // Do NOT mark the namespace loaded — ensure_loaded must still perform
+        // the DB snapshot + event-replay before draining this queue.
+        let _ = entity_capacity;
+        self.pending_hook_signals
+            .entry(namespace.to_string())
+            .or_default()
+            .push(signal.clone());
+        ApplyTarget::Done
+    }
+
+    /// Drain and return any pending hook signals for `namespace`.
+    ///
+    /// Called by `ensure_loaded` after the normal load path (snapshot + replay)
+    /// completes, so queued signals land on top of persisted history.
+    pub(crate) fn drain_pending_signals(&mut self, namespace: &str) -> Vec<BrainSignal> {
+        self.pending_hook_signals
+            .remove(namespace)
+            .unwrap_or_default()
+    }
+}
+
+/// Indicates where a dispatched signal should be applied by the caller.
+pub(crate) enum ApplyTarget {
+    /// The namespace is active — the caller must apply the signal to the shared
+    /// `BrainState` slot (which the caller already holds behind the dispatch gate).
+    ActiveSlot,
+    /// Signal was applied inside `PersistenceTracker`; caller has nothing left to do.
+    Done,
 }
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
@@ -368,63 +495,133 @@ pub async fn ensure_loaded(
         Some(bs)
     };
 
-    let new_state = {
-        let mut t = tracker.lock().unwrap();
-        let current_ns = t.active_namespace.clone();
-        let current_state = state.lock().unwrap();
-
-        if let Some(from_ns) = current_ns {
-            let saved_current = BrainState {
-                profiles: current_state.profiles.clone(),
-                balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
-                    current_state.balanced_recall.to_snapshot(),
-                    entity_capacity,
-                ),
-                profile_states: current_state
-                    .profile_states
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            khive_brain_core::BalancedRecallState::from_snapshot(
-                                v.to_snapshot(),
-                                entity_capacity,
-                            ),
-                        )
-                    })
-                    .collect(),
-                bindings: current_state.bindings.clone(),
-                section_states: current_state
-                    .section_states
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            khive_brain_core::SectionPosteriorState::from_snapshot(v.to_snapshot()),
-                        )
-                    })
-                    .collect(),
-            };
-            drop(current_state);
-
-            let restored = t.swap_namespace(&from_ns, saved_current, namespace.clone());
-            brain_state
-                .or(restored)
-                .unwrap_or_else(|| BrainState::new(entity_capacity))
-        } else {
-            drop(current_state);
-            t.active_namespace = Some(namespace.clone());
-            brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
+    // In test builds, honour the injected interleaving hook (if any).
+    // The hook fires only for cold loads (brain_state.is_some() at this
+    // point) so warm-path and already-loaded early-returns are unaffected.
+    #[cfg(test)]
+    if brain_state.is_some() {
+        let hook = POST_LOAD_HOOK.lock().unwrap().take();
+        if let Some(h) = hook {
+            // Signal the test controller: "I am at the hook."
+            let _ = h.reached_tx.send(());
+            // Wait for the controller to give the go-ahead.
+            let _ = h.proceed_rx.await;
         }
-    };
-
-    {
-        let mut s = state.lock().unwrap();
-        *s = new_state;
     }
 
+    // Lock order: tracker → state (always in this sequence).
+    // Reversing this order anywhere would risk deadlock; do not change.
+    //
+    // Publication is atomic: active_namespace, *state, and loaded_namespaces
+    // are all updated inside a single tracker-held critical section.
+    //
+    // Re-check under the final guard: a concurrent loader may have completed
+    // the same namespace while this task awaited the async DB load.  If so,
+    // discard the stale brain_state we loaded and defer to the live slot.
     {
         let mut t = tracker.lock().unwrap();
+
+        // Re-check 1: another loader already published this namespace as active.
+        // The shared state slot already contains the live state; return without
+        // clobbering it with our stale cold-loaded copy.
+        if t.is_active(&namespace) {
+            return Ok(());
+        }
+
+        // Re-check 2: another loader completed a cold load for this namespace
+        // (it is now in saved_states) while this task was awaiting the DB.
+        // Our brain_state was derived from a snapshot that is now stale relative
+        // to any mutations that occurred after that loader published.  Discard
+        // it so the save-restore path below uses the live saved state instead.
+        let fresh_brain_state = if t.is_loaded(&namespace) {
+            None
+        } else {
+            brain_state
+        };
+
+        let current_ns = t.active_namespace.clone();
+
+        // Clone the parts of the current shared state we need for save-restore,
+        // then immediately release the state lock so we can re-acquire it for
+        // the final write (Rust Mutexes are not reentrant).
+        let new_state = {
+            let current_state = state.lock().unwrap();
+
+            if let Some(ref from_ns) = current_ns {
+                let saved_current = BrainState {
+                    profiles: current_state.profiles.clone(),
+                    balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
+                        current_state.balanced_recall.to_snapshot(),
+                        entity_capacity,
+                    ),
+                    profile_states: current_state
+                        .profile_states
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                khive_brain_core::BalancedRecallState::from_snapshot(
+                                    v.to_snapshot(),
+                                    entity_capacity,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    bindings: current_state.bindings.clone(),
+                    section_states: current_state
+                        .section_states
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                khive_brain_core::SectionPosteriorState::from_snapshot(
+                                    v.to_snapshot(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                };
+                // Release the state guard before mutating the tracker (save-restore
+                // path) so the re-acquire below cannot deadlock.
+                drop(current_state);
+
+                let restored = t.swap_namespace(from_ns, saved_current, namespace.clone());
+                fresh_brain_state
+                    .or(restored)
+                    .unwrap_or_else(|| BrainState::new(entity_capacity))
+            } else {
+                drop(current_state);
+                // No active namespace yet — first load.  active_namespace is set
+                // below together with the state write and loaded_namespaces mark.
+                fresh_brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
+            }
+        };
+
+        // Drain any hook signals that arrived before this load completed.
+        // These are signals queued by `route_signal` while the namespace was
+        // still cold (no prior `ensure_loaded`).  Applying them here, after the
+        // snapshot + replay path, preserves ordering:
+        //   persisted snapshot → replayed events → queued hook signals
+        let pending = t.drain_pending_signals(&namespace);
+        let mut final_state = new_state;
+        for sig in &pending {
+            final_state.balanced_recall.apply_signal(sig);
+        }
+        if !pending.is_empty() {
+            crate::sync_balanced_recall_record(&mut final_state);
+        }
+
+        // Write the new state while the tracker lock is still held.
+        // After this line active_namespace, *state, and loaded_namespaces are
+        // all consistent; no concurrent dispatch can observe a partial view.
+        *state.lock().unwrap() = final_state;
+
+        // For the no-active-namespace (first-load) path swap_namespace was not
+        // called, so we set active_namespace here before marking loaded.
+        if current_ns.is_none() {
+            t.active_namespace = Some(namespace.clone());
+        }
+
         t.loaded_namespaces.insert(namespace, ());
     }
 
