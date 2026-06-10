@@ -149,26 +149,18 @@ impl ScoreAdjustment {
     }
 }
 
-/// Default score adjustments: episodic recency bonus, semantic age penalty, entity boost.
+/// Default score adjustments: semantic age penalty and entity boost.
+///
+/// H1 calibration (2026-06-10): the flat episodic recency bonus (+0.05) was removed because
+/// it stacked with the semantic age penalty (−0.05) to create a 0.10 score swing independent
+/// of content quality — the root cause of stratum-A failures where high-salience old semantics
+/// lost to low-salience fresh episodics. Salience weight increase (0.20→0.35) now carries the
+/// recency-vs-importance tradeoff without a content-blind flat bonus.
 pub fn default_adjustments() -> Vec<ScoreAdjustment> {
     vec![
-        // Episodic recency bonus: recent episodic memories get an additive boost.
-        ScoreAdjustment {
-            condition: AdjustmentCondition::All {
-                conditions: vec![
-                    AdjustmentCondition::MemoryType {
-                        kind: "episodic".into(),
-                    },
-                    AdjustmentCondition::AgeRange {
-                        min_days: None,
-                        max_days: Some(7.0),
-                    },
-                ],
-            },
-            operation: AdjustmentOp::Add { value: 0.05 },
-        },
-        // Semantic age penalty: old high-salience semantic memories get penalized
-        // to prevent reference docs from crowding out episodic content.
+        // Semantic age penalty: light nudge to prevent old reference docs from crowding out
+        // high-salience episodic content when the base score is near-equal. Reduced 0.05→0.02
+        // because w_salience now provides the main discriminator (H1 calibration).
         ScoreAdjustment {
             condition: AdjustmentCondition::All {
                 conditions: vec![
@@ -185,7 +177,7 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
                     },
                 ],
             },
-            operation: AdjustmentOp::Subtract { value: 0.05 },
+            operation: AdjustmentOp::Subtract { value: 0.02 },
         },
         // Entity match boost: memories mentioning queried entities get boosted.
         ScoreAdjustment {
@@ -201,20 +193,20 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringWeights {
-    /// Multiplicative boost from salience in `(1 + w_imp × salience)`. Default: 0.2.
+    /// Multiplicative boost from salience in `(1 + w_imp × salience)`. Default: 0.35 (H1).
     pub salience: f32,
-    /// Multiplicative boost from recency in `(1 + w_temp × recency)`. Default: 0.1.
+    /// Multiplicative boost from recency in `(1 + w_temp × recency)`. Default: 0.05 (H1).
     pub temporal: f32,
-    /// Base multiplier applied to relevance. Default: 0.7.
+    /// Base multiplier applied to relevance. Default: 0.65 (H1).
     pub relevance: f32,
 }
 
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
-            salience: 0.2,
-            temporal: 0.1,
-            relevance: 0.7,
+            salience: 0.35,
+            temporal: 0.05,
+            relevance: 0.65,
         }
     }
 }
@@ -729,5 +721,246 @@ mod tests {
         let s2 = output[&ids[2]];
         assert!(s0 > s1 && s1 > s2, "ordering must be preserved");
         assert!(s0 <= 1.0 && s2 >= 0.0, "scores must be in [0,1]");
+    }
+
+    // ── H1 calibration regression tests (2026-06-10) ──────────────────────────
+    // Root cause: flat ±0.05 adjustments stacked into a 0.10 swing that overrode
+    // salience signal. Q02/Q03 failure class from the stratified golden eval (n=20).
+
+    /// H1 property: old high-salience semantic (sal=0.85, age=65d) must outrank
+    /// fresh low-salience episodic (sal=0.40, age=0.5d) at equal relevance advantage.
+    /// This is the exact failure class (Q02/Q03) fixed by removing the episodic bonus.
+    #[test]
+    fn h1_old_semantic_high_salience_beats_fresh_low_salience_episodic() {
+        let config = ScoringConfig::default();
+        let now_ms = 0i64;
+        // Old semantic: 65 days old, sal=0.85, rel=0.70
+        let old_semantic = calculate_score(
+            &ScoreInput {
+                salience: 0.85,
+                memory_type_str: "semantic",
+                content: "lambda priority structure directive",
+                created_at_millis: -(65 * 24 * 60 * 60 * 1000),
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        // Fresh episodic: 0.5 days old, sal=0.40, rel=0.60
+        let fresh_episodic = calculate_score(
+            &ScoreInput {
+                salience: 0.40,
+                memory_type_str: "episodic",
+                content: "recent session checkpoint",
+                created_at_millis: -(43_200_000i64), // 0.5 days in ms
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.60,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            old_semantic > fresh_episodic,
+            "H1 failure: old semantic (sal=0.85, age=65d) score={old_semantic:.5} \
+             must beat fresh episodic (sal=0.40, age=0.5d) score={fresh_episodic:.5}"
+        );
+    }
+
+    /// H1 property: at equal salience and type, fresher memory still outranks older.
+    /// Recency is preserved — just no longer dominant via a flat bonus.
+    #[test]
+    fn h1_recency_preserved_at_equal_salience() {
+        let config = ScoringConfig::default();
+        let now_ms = 0i64;
+        let fresh = calculate_score(
+            &ScoreInput {
+                salience: 0.60,
+                memory_type_str: "episodic",
+                content: "content",
+                created_at_millis: -(24 * 60 * 60 * 1000), // 1 day
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        let stale = calculate_score(
+            &ScoreInput {
+                salience: 0.60,
+                memory_type_str: "episodic",
+                content: "content",
+                created_at_millis: -(90 * 24 * 60 * 60 * 1000), // 90 days
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            fresh > stale,
+            "H1: fresher memory (1d) score={fresh:.5} should outrank same-salience older (90d) score={stale:.5}"
+        );
+    }
+
+    /// H1 property: salience monotonicity at fixed age — higher salience always scores higher.
+    #[test]
+    fn h1_salience_monotonicity_at_fixed_age() {
+        let config = ScoringConfig::default();
+        let now_ms = 0i64;
+        let base_input = |sal: f32| ScoreInput {
+            salience: sal,
+            memory_type_str: "episodic",
+            content: "content",
+            created_at_millis: -(35 * 24 * 60 * 60 * 1000),
+            decay_factor: 0.01,
+            now_millis: now_ms,
+            relevance_score: 0.70,
+            entity_names: &[],
+        };
+        let s_low = calculate_score(&base_input(0.20), &config);
+        let s_mid = calculate_score(&base_input(0.50), &config);
+        let s_high = calculate_score(&base_input(0.90), &config);
+        assert!(
+            s_low < s_mid && s_mid < s_high,
+            "salience monotonicity violated: {s_low:.5} < {s_mid:.5} < {s_high:.5}"
+        );
+    }
+
+    /// H1 parity anchors: Rust f32 scores must match Python-computed values within f32
+    /// precision (1e-5). Python uses f64 arithmetic; Rust uses f32, so 1e-9 is not achievable
+    /// cross-precision — asserting to 1e-5 which is tight enough to detect formula divergence.
+    ///
+    /// Anchor values computed from eval_harness.py make_scorer() with config_h1.json constants.
+    #[test]
+    fn h1_parity_anchors_match_python_harness() {
+        let config = ScoringConfig::default();
+        let now_ms = 0i64;
+
+        // Anchor A: old semantic, sal=0.85, age=65d, rel=0.70, df=0.01
+        // Python: 0.5857723125 (semantic_age_penalty −0.02 applies: age=65≥30, sal=0.85≥0.85)
+        let anchor_a = calculate_score(
+            &ScoreInput {
+                salience: 0.85,
+                memory_type_str: "semantic",
+                content: "anchor",
+                created_at_millis: -(65 * 24 * 60 * 60 * 1000),
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            (anchor_a - 0.585_772_3f32).abs() < 1e-5,
+            "Anchor A mismatch: got {anchor_a:.8}, expected ~0.5857723"
+        );
+
+        // Anchor B: fresh episodic, sal=0.40, age=0.5d, rel=0.60, df=0.01
+        // Python: 0.4667191274 (no adjustment — episodic bonus removed)
+        let anchor_b = calculate_score(
+            &ScoreInput {
+                salience: 0.40,
+                memory_type_str: "episodic",
+                content: "anchor",
+                created_at_millis: -(43_200_000i64), // 0.5 days in ms
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.60,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            (anchor_b - 0.466_719_1f32).abs() < 1e-5,
+            "Anchor B mismatch: got {anchor_b:.8}, expected ~0.4667191"
+        );
+
+        // Anchor C: episodic 90d, sal=0.60, rel=0.70 — fresher 1d same params must beat it
+        // Python C_old=0.5617418463, C_new=0.5778035968
+        let anchor_c_old = calculate_score(
+            &ScoreInput {
+                salience: 0.60,
+                memory_type_str: "episodic",
+                content: "anchor",
+                created_at_millis: -(90 * 24 * 60 * 60 * 1000),
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        let anchor_c_new = calculate_score(
+            &ScoreInput {
+                salience: 0.60,
+                memory_type_str: "episodic",
+                content: "anchor",
+                created_at_millis: -(24 * 60 * 60 * 1000), // 1 day
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            (anchor_c_old - 0.561_741_8f32).abs() < 1e-5,
+            "Anchor C_old mismatch: got {anchor_c_old:.8}, expected ~0.5617418"
+        );
+        assert!(
+            (anchor_c_new - 0.577_803_6f32).abs() < 1e-5,
+            "Anchor C_new mismatch: got {anchor_c_new:.8}, expected ~0.5778036"
+        );
+        assert!(
+            anchor_c_new > anchor_c_old,
+            "recency ordering violated in anchor C"
+        );
+
+        // Anchor D: salience monotonicity at 35d semantic
+        // Python D_low=0.5534621935, D_high=0.5994066251 (penalty applies at sal=0.90 but not 0.50)
+        let anchor_d_low = calculate_score(
+            &ScoreInput {
+                salience: 0.50,
+                memory_type_str: "semantic",
+                content: "anchor",
+                created_at_millis: -(35 * 24 * 60 * 60 * 1000),
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        let anchor_d_high = calculate_score(
+            &ScoreInput {
+                salience: 0.90,
+                memory_type_str: "semantic",
+                content: "anchor",
+                created_at_millis: -(35 * 24 * 60 * 60 * 1000),
+                decay_factor: 0.01,
+                now_millis: now_ms,
+                relevance_score: 0.70,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert!(
+            (anchor_d_low - 0.553_462_2f32).abs() < 1e-5,
+            "Anchor D_low mismatch: got {anchor_d_low:.8}, expected ~0.5534622"
+        );
+        assert!(
+            (anchor_d_high - 0.599_406_6f32).abs() < 1e-5,
+            "Anchor D_high mismatch: got {anchor_d_high:.8}, expected ~0.5994066"
+        );
+        assert!(
+            anchor_d_high > anchor_d_low,
+            "salience monotonicity violated in anchor D"
+        );
     }
 }
