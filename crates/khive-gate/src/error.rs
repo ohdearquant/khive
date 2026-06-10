@@ -16,6 +16,8 @@ pub enum GateValidationError {
     EmptyVerb,
     #[error("deny reason must not be empty")]
     EmptyDenyReason,
+    #[error("audit tag must not be empty")]
+    EmptyAuditTag,
     #[error("rate limit window_secs must be > 0")]
     ZeroRateLimitWindow,
     #[error("rate limit max must be > 0")]
@@ -29,8 +31,6 @@ pub enum GateValidationError {
 pub enum GateError {
     #[error("policy error: {0}")]
     Policy(String),
-    #[error("evaluation error: {0}")]
-    Evaluation(String),
     #[error("internal gate error: {0}")]
     Internal(String),
     #[error("validation error: {0}")]

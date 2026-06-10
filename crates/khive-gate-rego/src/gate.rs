@@ -98,20 +98,24 @@ impl RegoGate {
     /// is installed — preventing a misconfigured entrypoint from causing
     /// fail-open dispatch errors at runtime.
     pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
-        self.entrypoint = entrypoint.into();
+        self.entrypoint = entrypoint.into().trim().to_string();
         self
     }
 
     /// Override the rule path with validation, returning `Err` for empty,
-    /// whitespace-only, or non-`data.`-prefixed entrypoints.
+    /// whitespace-only, non-`data.`-prefixed, or malformed-segment entrypoints,
+    /// and for entrypoints that do not name an existing rule in the loaded policy.
     ///
     /// Prefer this over [`Self::with_entrypoint`] for operator-supplied
     /// configuration. A misconfigured entrypoint discovered at construction
     /// time produces a deterministic `GateError::Policy` rather than a
-    /// dispatch-time `GateError::Evaluation` — the gate dispatcher treats
-    /// evaluation errors as infrastructure failures and proceeds (fail-open),
-    /// so catching misconfigurations at boot prevents unintended access.
-    pub fn try_with_entrypoint(self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
+    /// dispatch-time evaluation failure. `RegoGate::check` converts all
+    /// evaluation failures (missing rule, undefined result, serialization
+    /// error, poisoned engine) to `Ok(GateDecision::Deny)` (fail-closed);
+    /// construction-time validation is defense-in-depth. The runtime's
+    /// `Err(_)` branch is reserved for non-evaluation gate errors (e.g.
+    /// infrastructure faults from other `Gate` implementations).
+    pub fn try_with_entrypoint(mut self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
         let ep = entrypoint.into();
         let trimmed = ep.trim();
         if trimmed.is_empty() {
@@ -124,7 +128,33 @@ impl RegoGate {
                 "entrypoint must begin with 'data.' (got: {trimmed:?})"
             )));
         }
-        Ok(self.with_entrypoint(ep))
+        // Validate path segments after the "data." prefix: no empty components
+        // (which arise from consecutive dots, a leading dot after "data.", or a
+        // trailing dot).  "data.a..b" and "data.a." are rejected here.
+        let suffix = &trimmed["data.".len()..];
+        if suffix.is_empty() || suffix.split('.').any(|seg| seg.is_empty()) {
+            return Err(GateError::Policy(format!(
+                "entrypoint has empty path segment (got: {trimmed:?})"
+            )));
+        }
+        // Confirm the rule exists in the currently-loaded policy.  eval_rule
+        // returns Err("not a valid rule path") when the path is not a compiled
+        // rule — catching misconfigurations at boot rather than at first request.
+        {
+            let mut engine = self.engine.lock().map_err(|e| {
+                GateError::Internal(format!("engine mutex poisoned during validation: {e}"))
+            })?;
+            // A dummy empty-object input is sufficient; we only care whether the
+            // rule path exists, not the evaluated value.
+            engine.set_input(regorus::Value::new_object());
+            if let Err(e) = engine.eval_rule(trimmed.to_string()) {
+                return Err(GateError::Policy(format!(
+                    "entrypoint {trimmed:?} is not a valid rule in the loaded policy: {e}"
+                )));
+            }
+        }
+        self.entrypoint = trimmed.to_string();
+        Ok(self)
     }
 }
 
@@ -135,28 +165,138 @@ impl Gate for RegoGate {
         let input_value: regorus::Value = input.into();
 
         let result = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| GateError::Internal(format!("engine mutex poisoned: {e}")))?;
+            // A poisoned mutex means a prior eval_rule call panicked while
+            // holding the lock.  That is itself an evaluation failure: deny
+            // immediately rather than propagating Err into the runtime's
+            // fail-open branch.
+            let mut engine = match self.engine.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!(
+                        entrypoint = %self.entrypoint,
+                        "engine mutex poisoned — denying (fail-closed)"
+                    );
+                    return Ok(GateDecision::deny(format!(
+                        "engine mutex poisoned for {}",
+                        self.entrypoint
+                    )));
+                }
+            };
             engine.set_input(input_value);
-            engine
-                .eval_rule(self.entrypoint.clone())
-                .map_err(|e| GateError::Evaluation(format!("eval {}: {e}", self.entrypoint)))?
+            engine.eval_rule(self.entrypoint.clone())
         };
 
-        let decision_json = result
-            .to_json_str()
-            .map_err(|e| GateError::Evaluation(format!("decision to_json: {e}")))?;
+        // Fail closed: any evaluation failure (missing rule, undefined, engine
+        // error) becomes an explicit Deny rather than propagating an Err that the
+        // runtime's fail-open branch would treat as "allow".
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    error = %e,
+                    "rego eval failed — denying (fail-closed)"
+                );
+                return Ok(GateDecision::deny(format!(
+                    "policy evaluation failed for {}: {e}",
+                    self.entrypoint
+                )));
+            }
+        };
 
-        serde_json::from_str::<GateDecision>(&decision_json).map_err(|e| {
-            GateError::Evaluation(format!(
-                "policy returned shape that isn't a GateDecision: {e} (got: {decision_json})"
-            ))
-        })
+        // regorus returns Value::Undefined when the rule exists but no branch
+        // matched without a default.  Treat undefined as deny.
+        if value == regorus::Value::Undefined {
+            return Ok(GateDecision::deny(format!(
+                "policy rule {} is undefined for this input",
+                self.entrypoint
+            )));
+        }
+
+        // Serialization failure is treated as an evaluation failure: deny
+        // rather than propagating Err into the runtime's fail-open branch.
+        let decision_json = match value.to_json_str() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    error = %e,
+                    "decision value failed to serialize — denying (fail-closed)"
+                );
+                return Ok(GateDecision::deny(format!(
+                    "policy rule {} produced unserializable value: {e}",
+                    self.entrypoint
+                )));
+            }
+        };
+
+        // A result that parses to a non-GateDecision shape (e.g. a boolean,
+        // plain string, or wrong object) is also treated as deny rather than
+        // propagating an Err.
+        match serde_json::from_str::<GateDecision>(&decision_json) {
+            Ok(decision) => Ok(decision),
+            Err(e) => {
+                tracing::warn!(
+                    entrypoint = %self.entrypoint,
+                    got = %decision_json,
+                    error = %e,
+                    "policy returned non-GateDecision shape — denying (fail-closed)"
+                );
+                Ok(GateDecision::deny(format!(
+                    "policy rule {} returned unrecognized shape: {decision_json}",
+                    self.entrypoint
+                )))
+            }
+        }
     }
 
     fn impl_name(&self) -> &'static str {
         "RegoGate"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_gate::ActorRef;
+    use khive_types::Namespace;
+    use serde_json::json;
+
+    fn request(verb: &str) -> GateRequest {
+        GateRequest::new(ActorRef::anonymous(), Namespace::local(), verb, json!({}))
+    }
+
+    // ---- GATE-REGO-003: poisoned mutex → Deny, not Err ----
+
+    #[test]
+    fn poisoned_engine_mutex_returns_deny_not_err() {
+        use std::sync::Arc;
+
+        let policy = r#"
+            package khive.gate
+            import rego.v1
+            default decision := {"decision": "allow", "obligations": []}
+        "#;
+        let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+
+        // Poison the mutex by panicking inside a spawned thread while holding
+        // the lock.  After join() the mutex is permanently poisoned.
+        {
+            let gate_clone = Arc::clone(&gate);
+            let handle = std::thread::spawn(move || {
+                let _guard = gate_clone.engine.lock().unwrap();
+                panic!("intentional panic to poison the mutex");
+            });
+            // Join to ensure the panic has propagated and the mutex is poisoned.
+            let _ = handle.join();
+        }
+
+        // check() must return Ok(Deny), never Err.
+        let result = gate.check(&request("search"));
+        match result {
+            Ok(GateDecision::Deny { .. }) => {}
+            Ok(GateDecision::Allow { .. }) => panic!("expected Deny for poisoned mutex, got Allow"),
+            Err(e) => panic!("expected Ok(Deny) for poisoned mutex, got Err({e})"),
+        }
     }
 }

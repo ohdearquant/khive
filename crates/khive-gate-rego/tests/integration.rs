@@ -119,8 +119,11 @@ fn malformed_policy_returns_policy_error() {
 }
 
 #[test]
-fn missing_entrypoint_surfaces_evaluation_error() {
-    // Compiles fine but has no `decision` rule.
+fn missing_entrypoint_returns_deny_not_error() {
+    // Compiles fine but has no `decision` rule — the default entrypoint
+    // data.khive.gate.decision will be absent.  check() must return
+    // Ok(Deny) rather than Err so the runtime's fail-open Err branch is
+    // never reached.
     let policy = r#"
         package khive.gate
         import rego.v1
@@ -128,15 +131,143 @@ fn missing_entrypoint_surfaces_evaluation_error() {
     "#;
     let gate = RegoGate::from_policy_str(policy).expect("compiles");
     let result = gate.check(&request("search"));
-    // regorus returns null for a missing rule; that becomes "not a GateDecision"
-    // → evaluation error.
     match result {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(msg.contains("evaluation"), "wrong error variant: {msg}");
-        }
-        Ok(d) => panic!("expected evaluation error, got Ok({d:?})"),
+        Ok(GateDecision::Deny { .. }) => {}
+        Ok(GateDecision::Allow { .. }) => panic!("expected Deny, got Allow"),
+        Err(e) => panic!("expected Ok(Deny), got Err({e})"),
     }
+}
+
+#[test]
+fn try_with_entrypoint_rejects_rule_absent_from_policy() {
+    // Policy defines `verdict`, not `decision`.  Requesting `decision` as
+    // the entrypoint must fail at construction, not at first check().
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default verdict := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate
+        .try_with_entrypoint("data.khive.gate.decision")
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a valid rule") || msg.contains("policy"),
+        "expected policy-error for absent rule, got: {msg}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_accepts_present_rule() {
+    let policy = r#"
+        package khive.custom
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+        decision := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .try_with_entrypoint("data.khive.custom.decision")
+        .expect("rule exists — must be accepted");
+    assert!(gate.check(&request("search")).unwrap().is_allow());
+}
+
+#[test]
+fn try_with_entrypoint_rejects_malformed_data_dot_only() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("data.").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("empty path segment"),
+        "wrong error for 'data.': {msg}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_rejects_consecutive_dots() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate
+        .try_with_entrypoint("data.khive..gate.decision")
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("empty path segment"),
+        "wrong error for consecutive dots: {msg}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_rejects_trailing_dot() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate
+        .try_with_entrypoint("data.khive.gate.decision.")
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("empty path segment"),
+        "wrong error for trailing dot: {msg}"
+    );
+}
+
+#[test]
+fn undefined_rule_result_returns_deny() {
+    // A rule that exists but has no default and no matching branch returns
+    // Value::Undefined from eval_rule.  check() must return Ok(Deny).
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        decision := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .try_with_entrypoint("data.khive.gate.decision")
+        .expect("rule exists");
+    // verb != "search" → no branch matches → undefined
+    let result = gate.check(&request("delete")).unwrap();
+    assert!(
+        matches!(result, GateDecision::Deny { .. }),
+        "expected Deny for undefined result, got {result:?}"
+    );
+}
+
+#[test]
+fn wrong_shape_result_returns_deny() {
+    // A rule that returns a boolean instead of a GateDecision object.
+    // check() must return Ok(Deny) rather than Err.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := true
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .try_with_entrypoint("data.khive.gate.decision")
+        .expect("rule exists");
+    let result = gate.check(&request("search")).unwrap();
+    assert!(
+        matches!(result, GateDecision::Deny { .. }),
+        "expected Deny for wrong-shape result, got {result:?}"
+    );
 }
 
 #[test]
@@ -173,6 +304,112 @@ fn custom_entrypoint_is_respected() {
 #[test]
 fn default_entrypoint_constant_matches_doc() {
     assert_eq!(DEFAULT_ENTRYPOINT, "data.khive.gate.decision");
+}
+
+// ---- GATE-REGO-001: entrypoint trim/validation ----
+
+#[test]
+fn try_with_entrypoint_rejects_empty() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("").unwrap_err();
+    assert!(
+        format!("{err}").contains("empty or whitespace"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_rejects_whitespace_only() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("   ").unwrap_err();
+    assert!(
+        format!("{err}").contains("empty or whitespace"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
+fn try_with_entrypoint_trims_whitespace_and_works() {
+    // The entrypoint has surrounding whitespace. After trim it must resolve
+    // to a valid data. path and the gate must evaluate correctly.
+    let policy = r#"
+        package khive.custom
+        import rego.v1
+        default verdict := {"decision": "deny", "reason": "custom default"}
+        verdict := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .try_with_entrypoint("  data.khive.custom.verdict  ")
+        .expect("padded but valid entrypoint must be accepted");
+    // Debug output must show the trimmed form, not the padded original.
+    assert!(
+        format!("{gate:?}").contains("data.khive.custom.verdict"),
+        "Debug output did not contain trimmed entrypoint: {:?}",
+        gate
+    );
+    // And the gate must resolve correctly.
+    assert!(gate.check(&request("search")).unwrap().is_allow());
+    assert!(matches!(
+        gate.check(&request("delete")).unwrap(),
+        GateDecision::Deny { .. }
+    ));
+}
+
+#[test]
+fn try_with_entrypoint_rejects_missing_data_prefix() {
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+    "#;
+    let gate = RegoGate::from_policy_str(policy).unwrap();
+    let err = gate.try_with_entrypoint("khive.gate.decision").unwrap_err();
+    assert!(format!("{err}").contains("data."), "wrong error: {err}");
+}
+
+// ---- GATE-REGO-002: with_entrypoint trims whitespace ----
+
+#[test]
+fn with_entrypoint_trims_whitespace_and_allows() {
+    // with_entrypoint (infallible) must trim surrounding whitespace so that
+    // "  data.khive.gate  " behaves identically to "data.khive.gate.decision"
+    // when used with a matching policy.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        default decision := {"decision": "deny", "reason": "default"}
+        decision := {"decision": "allow", "obligations": []} if {
+            input.verb == "search"
+        }
+    "#;
+    let gate = RegoGate::from_policy_str(policy)
+        .unwrap()
+        .with_entrypoint("  data.khive.gate.decision  ");
+    // The stored entrypoint must be the trimmed form.
+    assert!(
+        format!("{gate:?}").contains("data.khive.gate.decision"),
+        "Debug output did not contain trimmed entrypoint: {:?}",
+        gate
+    );
+    // Evaluation must work correctly with the trimmed entrypoint.
+    assert!(gate.check(&request("search")).unwrap().is_allow());
+    assert!(matches!(
+        gate.check(&request("delete")).unwrap(),
+        GateDecision::Deny { .. }
+    ));
 }
 
 // ---------- helpers ----------

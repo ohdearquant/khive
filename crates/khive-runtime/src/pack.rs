@@ -1869,6 +1869,46 @@ mod tests {
         assert_eq!(ev.actor.kind, "anonymous");
     }
 
+    // ---- Rego gate: fail-closed end-to-end (issue #30) ----
+
+    /// A `RegoGate` whose policy lacks the named entrypoint rule must cause
+    /// `VerbRegistry::dispatch` to return `RuntimeError::PermissionDenied` —
+    /// never to proceed to the pack handler.
+    ///
+    /// This is the runtime-level assertion for the fix to security issue #30.
+    /// `RegoGate::check` converts all evaluation failures (missing rule,
+    /// undefined result, serialization error, poisoned engine) to
+    /// `Ok(GateDecision::Deny)`, so dispatch is blocked. The runtime's
+    /// fail-open `Err(_)` branch remains for non-evaluation gate errors
+    /// (e.g. infrastructure faults from other `Gate` implementations).
+    #[tokio::test]
+    async fn rego_gate_missing_entrypoint_returns_permission_denied() {
+        use khive_gate_rego::RegoGate;
+
+        // Policy defines `verdict` but NOT `data.khive.gate.decision` (the
+        // default entrypoint).  Construction succeeds — from_policy_str does
+        // not validate the default entrypoint.  check() must convert the
+        // missing-rule evaluation error to Ok(Deny) so the runtime denies
+        // the request rather than treating the Err as a fail-open signal.
+        let policy = r#"
+            package khive.gate
+            import rego.v1
+            verdict := "allow"
+        "#;
+        let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { ref verb, .. } if verb == "create"),
+            "expected PermissionDenied for missing rego entrypoint, got {err:?}"
+        );
+    }
+
     // ---- Audit tracing emission ----
     //
     // The AuditCapturingGate tests above prove that AuditEvent::from_check is
