@@ -147,9 +147,19 @@ corruption at scale).
 
 ### ANN warm-start
 
-The stdio MCP server calls `warm_all()` before accepting connections, loading
-persisted Vamana snapshots synchronously. This eliminates the cold-start
-0-result bug on the first suggest/search call after startup.
+ANN warm-start is owned by the **daemon** process (`khive-mcp --daemon`), not by
+the stdio server. After the daemon socket is bound, `warm_all()` runs in a
+background task, loading persisted Vamana snapshots into memory. The stdio MCP
+server forwards requests to the warm daemon via Unix socket (`forward_or_spawn`);
+it does not call `warm_all()` itself. This was changed in PR #20 (commit 9d9ec12):
+blocking stdio startup on `warm_all` delayed MCP connection without benefit.
+
+The net effect: steady-state traffic uses warmed Vamana indexes and benefits
+from full ANN recall. A first suggest/search call that races the background
+warm task may return results from lexical/atom signals only (BM25/FTS), without
+Vamana fusion, until `warm_all()` completes. The zero-result cold-start bug is
+resolved for steady-state traffic; there is no hard guarantee that the very
+first request will see ANN results.
 
 ### Cross-encoder rerank (deferred, optional)
 

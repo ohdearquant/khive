@@ -2,14 +2,15 @@
 
 ## ADR Compliance
 
-### ADR-002: SIMD Foundation Layer
+### ADR-011: SIMD Foundation Layer
 
 - Distance computation (`src/distance.rs`) delegates all vector math to `lattice-embed::simd`
-- Cosine, Dot, and L2 metrics use NEON/AVX2/AVX-512 dispatch from the lattice-embed crate
-- INT8 dot product (`int8_dot_product_raw`) also routes through `lattice_embed::simd::dot_product_i8_raw`
-- The HNSW crate itself contains no SIMD code; it is purely algorithmic
+  (ADR-011: Embedding and Inference — `lattice-embed` is the SIMD and quantization foundation).
+- Cosine, Dot, and L2 metrics use NEON/AVX2/AVX-512 dispatch from the lattice-embed crate.
+- INT8 dot product (`int8_dot_product_raw`) also routes through `lattice_embed::simd::dot_product_i8_raw`.
+- The HNSW crate itself contains no SIMD code; it is purely algorithmic.
 
-### ADR-003: HNSW Index Management Strategy
+### ADR-030: HNSW Index Management Strategy
 
 - Default parameters: M=20, ef_construction=200, ef_search=80, dimensions=384
   - M=20 is empirically optimal for k=10 recall at 384d

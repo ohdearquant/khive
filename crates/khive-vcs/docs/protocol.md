@@ -12,12 +12,12 @@ SQLite working database from those files.
 
 ## Modules
 
-| Module | File | Purpose |
-|--------|------|---------|
-| `types` | `src/types.rs` | `SnapshotId`, `SnapshotCoverage`, `VcsState` |
-| `hash` | `src/hash.rs` | Canonical JSON serialization and SHA-256 hashing |
-| `sync` | `src/sync.rs` | NDJSON parse, validate-first import, remote fetch |
-| `error` | `src/error.rs` | `VcsError` enum |
+| Module  | File           | Purpose                                           |
+| ------- | -------------- | ------------------------------------------------- |
+| `types` | `src/types.rs` | `SnapshotId`, `SnapshotCoverage`, `VcsState`      |
+| `hash`  | `src/hash.rs`  | Canonical JSON serialization and SHA-256 hashing  |
+| `sync`  | `src/sync.rs`  | NDJSON parse, validate-first import, remote fetch |
+| `error` | `src/error.rs` | `VcsError` enum                                   |
 
 ## Snapshot Format (ADR-010, ADR-042)
 
@@ -79,14 +79,14 @@ Notes are excluded until note packs define versioned export and merge semantics.
 
 ## Failure Modes
 
-| Scenario | Behaviour |
-|----------|-----------|
-| Invalid edge relation in NDJSON | Error before any DB/cache write; previous DB intact |
-| Hash mismatch on remote pin | `VcsError::HashMismatch`; no cache files written |
-| Git clone failure | Error with remote name only (URL redacted from message) |
-| Non-UTF-8 staging path | `Path` passed directly to `Command::arg`; no panic |
-| Non-finite edge weight | `VcsError::Internal` from `edge_to_canonical_value` |
-| WAL checkpoint failure | Error before rename; previous DB intact |
+| Scenario                        | Behaviour                                               |
+| ------------------------------- | ------------------------------------------------------- |
+| Invalid edge relation in NDJSON | Error before any DB/cache write; previous DB intact     |
+| Hash mismatch on remote pin     | `VcsError::HashMismatch`; no cache files written        |
+| Git clone failure               | Error with remote name only (URL redacted from message) |
+| Non-UTF-8 staging path          | `Path` passed directly to `Command::arg`; no panic      |
+| Non-finite edge weight          | `VcsError::Internal` from `edge_to_canonical_value`     |
+| WAL checkpoint failure          | Error before rename; previous DB intact                 |
 
 ## Test Coverage
 
@@ -98,6 +98,6 @@ Notes are excluded until note packs define versioned export and merge semantics.
 
 ## Baseline Performance
 
-| Scenario | Baseline | Date | Commit | Machine |
-|----------|----------|------|--------|---------|
-| (not yet measured) | — | — | — | — |
+| Scenario           | Baseline | Date | Commit | Machine |
+| ------------------ | -------- | ---- | ------ | ------- |
+| (not yet measured) | —        | —    | —      | —       |

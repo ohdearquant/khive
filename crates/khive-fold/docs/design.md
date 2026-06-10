@@ -8,16 +8,16 @@
 
 ## Modules
 
-| Module | Purpose |
-|--------|---------|
-| `fold` | Deterministic reduce: entries → derived state |
-| `anchor` | Causal graph traversal (provenance chains) |
-| `objective` | Score candidates and select best (precision-weighted scoring) |
-| `selector` | Budget-constrained pack: many → subset |
-| `ordering` | Deterministic IEEE-754 ordering primitives |
+| Module       | Purpose                                                              |
+| ------------ | -------------------------------------------------------------------- |
+| `fold`       | Deterministic reduce: entries → derived state                        |
+| `anchor`     | Causal graph traversal (provenance chains)                           |
+| `objective`  | Score candidates and select best (precision-weighted scoring)        |
+| `selector`   | Budget-constrained pack: many → subset                               |
+| `ordering`   | Deterministic IEEE-754 ordering primitives                           |
 | `checkpoint` | Generic snapshot envelope + in-memory store for fold-managed indexes |
-| `compose` | Composition combinators: filter, map, sequential, dual |
-| `pipeline` | ComposePipeline: objective scoring + selector budget packing |
+| `compose`    | Composition combinators: filter, map, sequential, dual               |
+| `pipeline`   | ComposePipeline: objective scoring + selector budget packing         |
 
 ## Key Invariants
 
@@ -48,18 +48,20 @@ The same rule applies to `Checkpoint::new` and `Checkpoint::with_hash`: `created
 set to the epoch on construction. Callers that need a real wall-clock timestamp should set
 `checkpoint.created_at = Utc::now()` after construction.
 
-### ADR-058: Selector Budget Packing
+### ADR-024 §"Bayesian extensions": Selector Budget Packing and Precision-Weighted Scoring
 
-`GreedySelector` implements priority-ordered budget packing with category-weight multipliers
+These behaviors are both specified in ADR-024 ("Fold Cognitive Primitives") under the
+§"Bayesian extensions" section. There are no separate ADR-058 or ADR-059 documents.
+
+**`GreedySelector`** implements priority-ordered budget packing with category-weight multipliers
 and deterministic tie-breaking (effective-score desc, size asc, id asc). The `diversity_bias`
 field controls how aggressively the selector prefers different categories at each pick step.
 At `diversity_bias = 0.0` the behavior reduces to a single-pass greedy sort (backward-compatible).
 
-### ADR-059: Epistemic (Precision-Weighted) Scoring
+**Precision-weighted scoring** — Both the `Objective` trait and the `Selector` implement
+precision-weighted scoring as specified in ADR-024:
 
-Both the `Objective` trait and the `Selector` implement precision-weighted scoring:
-
-**Objective**: The `precision()` hook returns an inverse-variance estimate in $(0, 1]$ for
+_Objective_: The `precision()` hook returns an inverse-variance estimate in $(0, 1]$ for
 each candidate's score. The default is 1.0 (fully trusted). The effective ranking score is
 
 $$\text{effective} = \text{score} \times \text{precision}$$
@@ -67,7 +69,7 @@ $$\text{effective} = \text{score} \times \text{precision}$$
 Non-finite precision falls back to 1.0. This allows objectives derived from uncertain models
 (e.g., embedding similarity) to discount their own scores.
 
-**Selector**: The `SelectorWeights.epistemic_weight` field adds an information-gain bonus to
+_Selector_: The `SelectorWeights.epistemic_weight` field adds an information-gain bonus to
 the pragmatic score. Effective selection score:
 
 $$\text{effective} = \text{pragmatic\_score} + \text{epistemic\_weight} \times \text{information\_gain}$$

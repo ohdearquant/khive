@@ -12,14 +12,15 @@ by the global IDF of each query term:
 
 $$
 \text{score} = \sum_{t \in \text{terms}} \mathrm{idf}(t) \cdot \Bigl(
-    w_{\text{exact\_name}} \cdot \mathrm{exact}(t, \text{name})
-  + w_{\text{name}} \cdot \mathrm{tf}(t, \text{name})
-  + w_{\text{desc}} \cdot \mathrm{tf}(t, \text{description})
-  + w_{\text{tags}} \cdot \mathrm{tf}(t, \text{tags})
-  + w_{\text{content}} \cdot \mathrm{tf}(t, \text{content})
-  + w_{\text{bigram}} \cdot \mathrm{bigram}(t, \text{name})
-\Bigr) \cdot \text{coverage}^{\alpha}
-$$
+w_{\text{exact\_name}} \cdot \mathrm{exact}(t, \text{name})
+
+- w_{\text{name}} \cdot \mathrm{tf}(t, \text{name})
+- w_{\text{desc}} \cdot \mathrm{tf}(t, \text{description})
+- w_{\text{tags}} \cdot \mathrm{tf}(t, \text{tags})
+- w_{\text{content}} \cdot \mathrm{tf}(t, \text{content})
+- w_{\text{bigram}} \cdot \mathrm{bigram}(t, \text{name})
+  \Bigr) \cdot \text{coverage}^{\alpha}
+  $$
 
 Default weights: `w_exact_name=5.0`, `w_name=3.0`, `w_description=1.5`, `w_tags=1.25`,
 `w_content=1.0`, `w_bigram=2.0`, `expand_discount=0.35`, `coverage_alpha=0.5`.
@@ -75,7 +76,7 @@ Section content...
 ```
 
 The parser (`parse_atlas_md`) reads the `# Title` line as the atom name, collects text before
-the first `## ` heading as the atom body, and maps each `## ` heading to a `SectionType` via
+the first `##` heading as the atom body, and maps each `##` heading to a `SectionType` via
 `SectionType::from_str_loose` (which accepts common heading aliases). Headings that don't match
 any canonical type are classified as `Other`.
 

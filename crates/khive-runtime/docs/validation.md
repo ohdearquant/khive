@@ -7,7 +7,7 @@ severity overrides work, and where rule configuration lives.
 
 ## ADR Links
 
-- [ADR-034](../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
+- [ADR-034](../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
 
 ## Rule Configuration File
 
@@ -56,8 +56,8 @@ write path is not yet implemented; `fix: Some(...)` is reserved for future use.
 
 ## Failure Modes
 
-| Condition | Behaviour |
-|-----------|-----------|
-| Duplicate rule ID | Not enforced at boot in v0.2; first registered wins |
+| Condition           | Behaviour                                                 |
+| ------------------- | --------------------------------------------------------- |
+| Duplicate rule ID   | Not enforced at boot in v0.2; first registered wins       |
 | Fix function panics | Propagates as runtime panic; fix functions must not panic |
-| Config key unknown | Ignored; rules use their default severity |
+| Config key unknown  | Ignored; rules use their default severity                 |

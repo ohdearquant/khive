@@ -141,17 +141,17 @@ bare verb names (16 verbs total):
 
 | Verb        | Speech act  | Description                                                                      |
 | ----------- | ----------- | -------------------------------------------------------------------------------- |
-| `create`    | assertive   | Create an entity or note                                                         |
+| `create`    | commissive  | Create an entity or note                                                         |
 | `get`       | assertive   | Fetch any record by UUID                                                         |
 | `list`      | assertive   | Structured browse with pagination                                                |
-| `update`    | assertive   | Patch entity or edge fields                                                      |
-| `delete`    | assertive   | Soft or hard delete a record                                                     |
+| `update`    | declaration | Patch entity or edge fields                                                      |
+| `delete`    | declaration | Soft or hard delete a record                                                     |
 | `search`    | assertive   | Hybrid FTS + vector search                                                       |
-| `link`      | assertive   | Create a typed directed edge                                                     |
+| `link`      | commissive  | Create a typed directed edge                                                     |
 | `neighbors` | assertive   | Immediate graph neighbors                                                        |
 | `traverse`  | assertive   | Multi-hop BFS traversal                                                          |
 | `query`     | assertive   | GQL/SPARQL pattern matching                                                      |
-| `merge`     | assertive   | Deduplicate two entities                                                         |
+| `merge`     | declaration | Deduplicate two entities                                                         |
 | `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                      |
 | `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`. |
 | `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.             |
@@ -214,8 +214,9 @@ context:
 ✗ memory.recall(mem_type="episodic")
 ✗ memory.recall(type="episodic")           # collides with entity_type / note_type
 
-✓ gtd.assign(task_status="next", task_priority="p1")
-✗ gtd.assign(status="next")                 # ambiguous in error/log frames
+✓ gtd.assign(status="next", priority="p1")
+✗ gtd.assign(task_status="next")           # rejected: deny_unknown_fields in handler
+✗ gtd.assign(task_priority="p1")           # rejected: deny_unknown_fields in handler
 
 ✓ brain.feedback(target_event_id="...", score=0.8)
 ✗ brain.feedback(event_id="...")           # which event?
@@ -224,6 +225,11 @@ context:
 The verb prefix (`memory.recall`) gives the _agent_ call context, but the field name
 travels into JSON payloads, audit logs, training data, and error frames where it loses
 that context. Full-word field names carry their own meaning.
+
+> **Implementation note**: `gtd.assign` uses `status` and `priority` directly.
+> The param struct is compiled with `#[serde(deny_unknown_fields)]`, so
+> `task_status` and `task_priority` are rejected at runtime rather than silently
+> ignored — they are not aliases.
 
 ### 6. Substrate verbs are kind-polymorphic — KindHook on every substrate verb
 

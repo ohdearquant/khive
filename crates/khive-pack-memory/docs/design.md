@@ -65,12 +65,13 @@
 - A property shortcut (`superseded_by` in `properties`) provides a secondary suppression path
   for archive-import compatibility when graph edges are not available.
 
-### ADR-062: Dotted Sub-Handler Naming
+### ADR-023: Dotted Sub-Handler Naming
 
 - Recall pipeline stages are exposed as sub-handlers using dotted names:
   `memory.recall_embed`, `memory.recall_candidates`, `memory.recall_fuse`,
   `memory.recall_rerank`, `memory.recall_score`.
-- These have `Visibility::Subhandler` and are not listed in public verb catalogs.
+- These have `Visibility::Subhandler` and are not listed in public verb catalogs,
+  per ADR-023 (Pack Verb Surface, Visibility, and Composition) §"Handlers vs. verbs".
 
 ## Consistency Notes
 

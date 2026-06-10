@@ -269,7 +269,7 @@ implementations. The pipeline is the bridge between the foundation layer and con
 | Item                                                       | Lives in                              | Why                                 |
 | ---------------------------------------------------------- | ------------------------------------- | ----------------------------------- |
 | `ObjectiveRegistry` (named registration + lookup)          | `khive-runtime`                       | Runtime infrastructure, not algebra |
-| `Checkpoint<S>` + stores (fold state persistence)          | `khive-runtime`                       | Storage/IO concern                  |
+| `Checkpoint<S>` + `InMemoryCheckpointStore`                | `khive-fold`                          | Pure in-memory; no IO or async deps |
 | `Scored<T>` + `ObjectiveConfig` (thin wrappers)            | Inline in consumers                   | Not fold-specific                   |
 | `FoldContext.actor/role/task/query` (domain fields)        | Consumers put in `extra`              | Couples fold to actor model         |
 | Domain folds (`MemoryFold`, `PolicyFold`)                  | Pack crates owning the domain         | Domain-specific                     |

@@ -20,13 +20,13 @@ Hierarchical Navigable Small World graphs", IEEE TPAMI (2018).
 
 ## Key Parameters (HnswConfig)
 
-| Parameter        | Default | Effect                                                              |
-| ---------------- | ------- | ------------------------------------------------------------------- |
-| `m`              | 20      | Max connections per node per layer. Higher → better recall, more memory. |
-| `m_max0`         | 40      | Max connections in layer 0 (base). Usually `2 × m`.                |
-| `ef_construction`| 200     | Search width during insert. Higher → better quality, slower build.  |
-| `ef_search`      | 80      | Search width at query time. Trade-off: recall vs speed.             |
-| `dimensions`     | 384     | Vector dimensionality (must match embedding model).                 |
+| Parameter         | Default | Effect                                                                   |
+| ----------------- | ------- | ------------------------------------------------------------------------ |
+| `m`               | 20      | Max connections per node per layer. Higher → better recall, more memory. |
+| `m_max0`          | 40      | Max connections in layer 0 (base). Usually `2 × m`.                      |
+| `ef_construction` | 200     | Search width during insert. Higher → better quality, slower build.       |
+| `ef_search`       | 80      | Search width at query time. Trade-off: recall vs speed.                  |
+| `dimensions`      | 384     | Vector dimensionality (must match embedding model).                      |
 
 Defaults are tuned for `m=20` which is optimal for k=10 recall at 384d (empirically measured).
 `ef_search=80` is sufficient for corpora under 100K vectors.

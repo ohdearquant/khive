@@ -71,6 +71,7 @@ selection (lowest_df / highest_idf) drops meaningful terms and loses recall, and
 
 #### `memory_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
 
+
 | Scenario                             | Low      | Median   | High     | Outliers   |
 | ------------------------------------ | -------- | -------- | -------- | ---------- |
 | remember/baseline                    | 6.932 ms | 7.545 ms | 8.248 ms | 1/20 (5%)  |

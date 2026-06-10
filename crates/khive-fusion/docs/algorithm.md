@@ -31,6 +31,7 @@ Does not cover storage, embedding, or retrieval engine internals.
 $$\text{score}(d) = \sum_{i} \frac{1}{k + \text{rank}_i(d)}$$
 
 where:
+
 - $k = 60$ (standard dampening constant — reduces dominance of rank-1 results)
 - $\text{rank}_i(d)$ = position of document $d$ in retriever $i$'s results (1-indexed)
 - If $d$ does not appear in retriever $i$, its contribution is 0
@@ -67,6 +68,7 @@ where $\hat{s}_i(d)$ is the min-max normalized score for document $d$ from sourc
 ### Weight normalization (RETRIEVAL-07)
 
 Weights are processed in this order before use:
+
 1. Non-finite values (`NaN`, `+Inf`, `-Inf`) are treated as `0.0`
 2. Negative values are treated as `0.0`
 3. If all effective weights are `<= 0`, equal distribution is applied
@@ -122,13 +124,13 @@ do not apply `top_k` truncation — they return the full fused list.
 
 ## Failure modes
 
-| Condition | Behavior |
-|-----------|----------|
-| Empty sources | Returns empty vec |
-| `top_k == 0` | Returns empty vec |
-| VectorOnly/KeywordOnly with multiple sources | Returns empty vec (wiring error) |
-| All-zero or all-negative weights | Falls back to equal weight distribution |
-| Non-finite weights in `weighted_fusion` | Treated as 0.0 (lossy); use `try_normalize_weights` to reject |
+| Condition                                    | Behavior                                                      |
+| -------------------------------------------- | ------------------------------------------------------------- |
+| Empty sources                                | Returns empty vec                                             |
+| `top_k == 0`                                 | Returns empty vec                                             |
+| VectorOnly/KeywordOnly with multiple sources | Returns empty vec (wiring error)                              |
+| All-zero or all-negative weights             | Falls back to equal weight distribution                       |
+| Non-finite weights in `weighted_fusion`      | Treated as 0.0 (lossy); use `try_normalize_weights` to reject |
 
 ---
 

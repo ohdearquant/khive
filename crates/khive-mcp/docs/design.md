@@ -3,6 +3,7 @@
 ## ADR Compliance
 
 ### ADR-016: Request DSL — Single `request` Tool
+
 - The MCP server exposes exactly one tool named `request`. All verbs are dispatched
   through it using the function-call DSL or JSON form.
 - The DSL supports three execution modes: Single, Parallel (batch), and Chain
@@ -18,6 +19,7 @@
   Per-verb validation failure returns a per-op `{ok: false, error: "..."}` entry.
 
 ### ADR-017: Pack Standard — Vocabulary, Visibility, and Schema Plans
+
 - Subhandler verbs are operator-only and are blocked at the MCP wire boundary.
   Exception: `help=true` is short-circuited in `VerbRegistry::dispatch` before
   reaching the pack, so introspection passes through.
@@ -28,6 +30,7 @@
   custom embedding providers are available before the first `remember`/`recall`.
 
 ### ADR-027: Dynamic Pack Loading
+
 - `builtin_pack_names()` is sourced from `PackRegistry::discovered_names()` so
   the list always reflects whichever pack crates are linked into the binary.
 - Pack registration fails fast on unknown names or unsatisfied dependencies —
@@ -35,14 +38,16 @@
 - `pack.rs` force-references one public symbol per pack crate so the linker
   includes their `inventory::submit!` constructors in the final binary.
 
-### ADR-031: Edge Endpoint Rules and Embedder Registration
+### ADR-031: Multi-Engine Retrieval — Edge Endpoint Rules and Embedder Registration
+
 - After the registry is built, `install_edge_rules` aggregates pack-declared
   edge endpoint rules into the runtime so `validate_edge_relation_endpoints`
   can consult the combined ruleset.
 - `call_register_embedders` is invoked after registry construction, before any
   verb dispatch, to wire custom embedding providers from each pack.
 
-### ADR-035: Authorization Gate and Audit Persistence
+### ADR-018: Authorization Gate and Audit Persistence
+
 - The authorization gate from `runtime.config().gate` is threaded into the
   registry. Gate decisions are hard-enforcing — a `Deny` result blocks pack
   dispatch and returns `PermissionDenied`.
@@ -50,6 +55,7 @@
   audit persistence of all dispatched operations.
 
 ### ADR-038: Write-Key Conflict Detection
+
 - Before parallel/single dispatch, operations targeting the same write key in
   the same batch are detected and receive per-op error entries.
 - Non-conflicting ops in the same batch execute normally.
@@ -57,6 +63,7 @@
   is never violated by conflict detection).
 
 ### ADR-045: Presentation Transforms
+
 - Presentation transforms are applied per-op AFTER dispatch, at the response
   envelope boundary. Chain `$prev` substitution uses canonical (verbose) handler
   output — the transform runs only on the final result, not on the intermediate
@@ -68,6 +75,7 @@
   `"verbose"` (full canonical shape), `"human"` (same as verbose at runtime).
 
 ### ADR-049: Daemon — Warm Pack Registry
+
 - The `daemon.rs` module provides the client side: `forward_or_spawn` connects
   to a warm daemon, auto-spawns it on first use, and maps responses to MCP
   error types. Any failure falls back to `None` so the caller dispatches locally.
@@ -79,11 +87,13 @@
   server can call back into the MCP server's local dispatch path.
 
 ### ADR-014: Fail-Fast Pack Validation
+
 - Pack registration is fail-fast: unknown names or unsatisfied dependencies
   abort construction and return the original runtime so callers can recover.
   The `PackRegError` type carries the runtime for this reason.
 
 ## Consistency Notes
+
 - The `schemars` description on `RequestParams.ops` references "ADR-016" inline;
   this is user-facing schema documentation and has been left as-is to avoid
   breaking schema consumers. The description text is surfaced in MCP client
