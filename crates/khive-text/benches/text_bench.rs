@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use khive_text::{
     analyzer::StandardAnalyzer,
     filter::{LowercaseFilter, MinLengthFilter, StopWordFilter},
@@ -146,43 +146,45 @@ fn bench_filter(c: &mut Criterion) {
     let stopword = StopWordFilter;
     let minlen = MinLengthFilter(2);
 
+    // Use iter_batched so the Vec<String> clone is in the setup phase,
+    // not on the measured path. Only the filter application is timed.
     g.bench_function("lowercase/medium_tokens", |b| {
-        b.iter(|| {
-            tokens
-                .iter()
-                .cloned()
-                .filter_map(|t| {
-                    use khive_text::TokenFilter;
-                    lowercase.apply(black_box(t))
-                })
-                .count()
-        })
+        b.iter_batched(
+            || tokens.clone(),
+            |ts| {
+                use khive_text::TokenFilter;
+                ts.into_iter()
+                    .filter_map(|t| lowercase.apply(black_box(t)))
+                    .count()
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     g.bench_function("stopword/medium_tokens", |b| {
-        b.iter(|| {
-            tokens
-                .iter()
-                .cloned()
-                .filter_map(|t| {
-                    use khive_text::TokenFilter;
-                    stopword.apply(black_box(t))
-                })
-                .count()
-        })
+        b.iter_batched(
+            || tokens.clone(),
+            |ts| {
+                use khive_text::TokenFilter;
+                ts.into_iter()
+                    .filter_map(|t| stopword.apply(black_box(t)))
+                    .count()
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     g.bench_function("min_length/medium_tokens", |b| {
-        b.iter(|| {
-            tokens
-                .iter()
-                .cloned()
-                .filter_map(|t| {
-                    use khive_text::TokenFilter;
-                    minlen.apply(black_box(t))
-                })
-                .count()
-        })
+        b.iter_batched(
+            || tokens.clone(),
+            |ts| {
+                use khive_text::TokenFilter;
+                ts.into_iter()
+                    .filter_map(|t| minlen.apply(black_box(t)))
+                    .count()
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Chain: full standard pipeline over a pre-tokenized vec.

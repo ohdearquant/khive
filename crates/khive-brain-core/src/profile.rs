@@ -202,7 +202,7 @@ impl BalancedRecallState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BalancedRecallSnapshot {
     pub relevance: BetaPosterior,
     pub salience: BetaPosterior,
@@ -210,4 +210,69 @@ pub struct BalancedRecallSnapshot {
     pub entity_posteriors: HashMap<Uuid, BetaPosterior>,
     pub total_events: u64,
     pub exploration_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-048 Phase-1 gate: profile save/load round-trip must produce identical
+    /// posteriors (snapshot == restored state).
+    #[test]
+    fn adr048_snapshot_roundtrip_equality() {
+        let mut state = BalancedRecallState::new(100);
+        let id = Uuid::new_v4();
+        for _ in 0..50 {
+            state.apply_signal(&crate::brain_signal::BrainSignal::RecallHit {
+                target_id: id,
+                latency_us: 10_000,
+            });
+        }
+        let snap = state.to_snapshot();
+        let restored = BalancedRecallState::from_snapshot(snap.clone(), 100);
+        let restored_snap = restored.to_snapshot();
+
+        // Full structural equality — covers every field including entity_posteriors.
+        // If any field (including a newly-added one) is not preserved by the
+        // round-trip, this assertion will catch it.
+        assert_eq!(
+            snap, restored_snap,
+            "ADR-048 Phase-1: snapshot != restored state"
+        );
+    }
+
+    /// ADR-048 Phase-1 gate: ESS cap convergence — after 200 positive events
+    /// followed by 200 opposing events, the salience posterior mean must shift
+    /// by at least 0.3.
+    #[test]
+    fn adr048_ess_cap_mean_shift_ge_0_3() {
+        let mut state = BalancedRecallState::new(200);
+        let id = Uuid::new_v4();
+
+        for _ in 0..200 {
+            state.apply_signal(&BrainSignal::Feedback {
+                target_id: id,
+                signal: FeedbackSignal::Useful,
+                served_by_profile_id: None,
+                section_signals: None,
+            });
+        }
+        let mean_after_positive = state.salience.mean();
+
+        for _ in 0..200 {
+            state.apply_signal(&BrainSignal::Feedback {
+                target_id: id,
+                signal: FeedbackSignal::NotUseful,
+                served_by_profile_id: None,
+                section_signals: None,
+            });
+        }
+        let mean_after_opposing = state.salience.mean();
+
+        let shift = (mean_after_positive - mean_after_opposing).abs();
+        assert!(
+            shift >= 0.3,
+            "ESS cap convergence: mean shift {shift:.4} < 0.3 (positive={mean_after_positive:.4}, opposing={mean_after_opposing:.4})"
+        );
+    }
 }

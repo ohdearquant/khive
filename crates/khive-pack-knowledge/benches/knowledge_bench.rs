@@ -45,8 +45,9 @@ fn seed_atoms(registry: &VerbRegistry, rt: &tokio::runtime::Runtime, n: usize) {
             json!({
                 "slug": format!("bench-atom-{i:04}"),
                 "name": format!("Bench Atom {i}"),
-                "description": format!("knowledge retrieval benchmark atom {i} semantic neural"),
-                "content": format!("dense sparse vector embedding search benchmark corpus atom {i}"),
+                "description": format!("knowledge retrieval benchmark atom {i} semantic neural transformer embedding"),
+                // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by the knowledge pack.
+                "content": format!("dense sparse vector embedding search benchmark corpus atom {i} gradient neural transformer retrieval semantic index query score rank precision recall"),
             })
         })
         .collect();
@@ -108,7 +109,8 @@ fn bench_upsert_atoms(c: &mut Criterion) {
                                 json!({
                                     "slug": format!("upsert-bench-{i}"),
                                     "name": format!("Upsert Bench Atom {i}"),
-                                    "content": format!("benchmark content atom {i} embedding search neural"),
+                                    // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20.
+                                    "content": format!("benchmark content atom {i} embedding search neural transformer retrieval corpus dense sparse vector index query score rank precision recall fusion"),
                                 })
                             })
                             .collect();
