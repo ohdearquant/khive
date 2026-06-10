@@ -85,6 +85,9 @@ rmcp = "1.7"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"
+proptest = "1"
+crossbeam-queue = "0.3"
+sqlite-vec = { version = "0.1.9" }
 
 [profile.release]
 opt-level = 3

@@ -23,10 +23,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
-crossbeam-queue = "0.3"
+crossbeam-queue = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
-sqlite-vec = { version = "0.1.9", optional = true }
+sqlite-vec = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

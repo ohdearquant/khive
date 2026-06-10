@@ -319,6 +319,9 @@ impl KhiveRuntime {
     // ---- Entity operations ----
 
     /// Create and persist a new entity.
+    // REASON: entity creation requires kind, type, name, description, properties, tags, and
+    // namespace token — refactoring into a builder would add indirection without reducing
+    // caller complexity; this signature mirrors the MCP verb surface directly.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_entity(
         &self,
@@ -1069,6 +1072,9 @@ impl KhiveRuntime {
     ///   `SubstrateKind::Note`.
     /// - For each UUID in `annotates`, creates an `EdgeRelation::Annotates` edge from
     ///   the note to that target.
+    // REASON: note creation requires kind, name, content, salience, properties, annotates,
+    // and namespace token — mirrors the MCP verb surface; a builder would not reduce
+    // caller complexity for pack handler callers.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note(
         &self,
@@ -1087,6 +1093,8 @@ impl KhiveRuntime {
     }
 
     /// Like [`create_note`] but also sets a non-zero decay factor on the note.
+    // REASON: extends create_note with an additional decay_factor parameter; same
+    // rationale — mirrors the MCP surface and reduces an extra builder layer.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note_with_decay(
         &self,
@@ -1114,6 +1122,9 @@ impl KhiveRuntime {
     }
 
     /// Like [`create_note_with_decay`] but targets a specific embedding model.
+    // REASON: adds an embedding_model parameter to the decay variant; the full parameter
+    // set is required for correct MCP verb routing and cannot be collapsed without
+    // introducing a separate config struct that would obscure call sites.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note_with_decay_for_embedding_model(
         &self,
@@ -1141,6 +1152,9 @@ impl KhiveRuntime {
         .await
     }
 
+    // REASON: private inner function unifies all create_note variants; it receives every
+    // optional parameter individually so that public variants can pass None without
+    // requiring callers to construct an intermediate struct.
     #[allow(clippy::too_many_arguments)]
     async fn create_note_inner(
         &self,
