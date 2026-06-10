@@ -1,11 +1,16 @@
 //! `kkernel exec` — run a verb DSL expression directly through the pack registry.
+//!
+//! When the warm daemon is reachable, exec forwards through it instead of
+//! building an in-process runtime (ADR-049). Config and namespace are matched
+//! against the daemon's own fingerprint; a mismatch falls back to local
+//! dispatch, keeping behaviour identical to the in-process path.
 
 use anyhow::Result;
 use clap::Parser;
 
-use khive_mcp::server::KhiveMcpServer;
+use khive_mcp::server::{compute_config_id, KhiveMcpServer};
 use khive_mcp::tools::request::RequestParams;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_runtime::{DaemonRequestFrame, KhiveRuntime, Namespace, RuntimeConfig};
 
 use crate::dbpath::resolve_db_override;
 
@@ -35,7 +40,19 @@ pub struct ExecArgs {
     pub presentation: Option<String>,
 }
 
-/// Execute the DSL expression in-process and print the JSON result to stdout.
+/// Execute the DSL expression, routing through the warm daemon when available.
+///
+/// Strategy:
+/// 1. Build `RuntimeConfig` from args (cheap — no I/O).
+/// 2. On Unix, attempt to forward through the daemon via the same
+///    length-prefixed socket protocol the MCP stdio server uses (ADR-049).
+///    Config and namespace fingerprints are verified by the daemon; a mismatch
+///    causes it to respond with a rejection and we fall through to step 3.
+/// 3. Fall back to building the full in-process runtime when the daemon is
+///    absent, unreachable, or returns a mismatch (KHIVE_NO_DAEMON=1 also skips).
+///
+/// Output byte-shape is identical in both paths — the daemon echoes the same
+/// JSON the local dispatch produces.
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let mut cfg = RuntimeConfig::default();
     if let Some(db_path) = resolve_db_override(args.db.as_deref()) {
@@ -44,6 +61,24 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     cfg.default_namespace =
         Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // ── daemon fast-path (Unix only) ─────────────────────────────────────────
+    #[cfg(unix)]
+    {
+        let frame = DaemonRequestFrame {
+            ops: args.ops.clone(),
+            presentation: args.presentation.clone(),
+            presentation_per_op: None,
+            namespace: cfg.default_namespace.as_str().to_string(),
+            config_id: compute_config_id(&cfg),
+        };
+        if let Some(res) = khive_mcp::daemon::forward_or_spawn(&frame).await {
+            let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            println!("{output}");
+            return Ok(());
+        }
+    }
+
+    // ── in-process fallback ───────────────────────────────────────────────────
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
 
