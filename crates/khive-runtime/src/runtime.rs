@@ -169,9 +169,11 @@ pub struct RuntimeConfig {
     /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
     /// recall-time score boosting (ADR-035 §Brain profile configuration).
     ///
-    /// Resolution order (highest to lowest):
-    /// 1. `--brain-profile` CLI flag / `KHIVE_BRAIN_PROFILE` env var / `runtime.brain_profile`
-    ///    in `khive.toml`
+    /// Resolution order (highest to lowest, ADR-035): CLI flag, then
+    /// `runtime.brain_profile` in project/global `khive.toml`, then the
+    /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
+    /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).
+    /// 1. `--brain-profile` CLI flag (explicit only)
     /// 2. Namespace-bound profile resolved via `brain.resolve` at feedback time
     /// 3. Pack-local global tuning prior (default fallback)
     pub brain_profile: Option<String>,
@@ -940,8 +942,8 @@ pub fn runtime_config_from_khive_config(
         _ => base.default_namespace.clone(),
     };
 
-    // Config-file `runtime.brain_profile` overrides the base only when explicitly set;
-    // the base already carries any CLI / env value, so we must not overwrite it.
+    // base.brain_profile must carry ONLY the explicit CLI tier — never an env
+    // value (env sits BELOW toml per ADR-035; the MCP resolver applies it after).
     let brain_profile = base.brain_profile.clone().or_else(|| {
         khive_cfg
             .runtime
