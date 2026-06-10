@@ -402,6 +402,24 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn get_note_including_deleted(&self, id: Uuid) -> Result<Option<Note>, StorageError> {
+        let id_str = id.to_string();
+
+        self.with_reader("get_note_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+                 properties, created_at, updated_at, deleted_at \
+                 FROM notes WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_note(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     async fn get_notes_batch(&self, ids: &[Uuid]) -> Result<Vec<Note>, StorageError> {
         if ids.is_empty() {
             return Ok(vec![]);

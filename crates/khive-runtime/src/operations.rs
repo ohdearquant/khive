@@ -419,6 +419,26 @@ impl KhiveRuntime {
         Ok(Some(entity))
     }
 
+    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace isolation.
+    ///
+    /// Returns `Ok(Some(note))` when the note exists in the caller's namespace regardless
+    /// of `deleted_at`. Returns `Ok(None)` when the UUID was never created or belongs to
+    /// a different namespace.
+    pub async fn get_note_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<khive_storage::note::Note>> {
+        let note = match self.notes(token)?.get_note_including_deleted(id).await? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        if note.namespace != token.namespace().as_str() {
+            return Ok(None);
+        }
+        Ok(Some(note))
+    }
+
     /// Fetch multiple entities by ID, returning only those that exist in the
     /// caller's namespace.  Missing or namespace-mismatched IDs are silently
     /// omitted so that batch lookups don't abort on a single stale reference.
@@ -1560,6 +1580,23 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(token, prefix, false).await
+    }
+
+    pub async fn resolve_prefix_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        prefix: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(token, prefix, true).await
+    }
+
+    async fn resolve_prefix_inner(
+        &self,
+        token: &NamespaceToken,
+        prefix: &str,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
         let ns = token.namespace().as_str().to_owned();
@@ -1576,7 +1613,7 @@ impl KhiveRuntime {
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
 
         for (table, has_deleted_at) in tables {
-            let deleted_filter = if has_deleted_at {
+            let deleted_filter = if has_deleted_at && !include_deleted {
                 " AND deleted_at IS NULL"
             } else {
                 ""
@@ -1669,6 +1706,42 @@ impl KhiveRuntime {
         Ok(None)
     }
 
+    /// Resolve a UUID to its substrate kind, including soft-deleted rows.
+    ///
+    /// Used exclusively by the hard-delete path to locate records that have
+    /// already been soft-deleted. Namespace isolation is still enforced.
+    pub async fn resolve_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        let ns = token.namespace().as_str();
+
+        if let Some(entity) = self
+            .entities(token)?
+            .get_entity_including_deleted(id)
+            .await?
+        {
+            if Self::ensure_namespace(&entity.namespace, ns).is_ok() {
+                return Ok(Some(Resolved::Entity(entity)));
+            }
+        }
+
+        if let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? {
+            if Self::ensure_namespace(&note.namespace, ns).is_ok() {
+                return Ok(Some(Resolved::Note(note)));
+            }
+        }
+
+        if let Some(event) = self.events(token)?.get_event(id).await? {
+            if Self::ensure_namespace(&event.namespace, ns).is_ok() {
+                return Ok(Some(Resolved::Event(event)));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Delete a note by ID, enforcing namespace isolation.
     ///
     /// On hard delete, cascades to remove all incident edges (both inbound and
@@ -1686,9 +1759,16 @@ impl KhiveRuntime {
     ) -> RuntimeResult<bool> {
         let ns = token.namespace().as_str();
         let note_store = self.notes(token)?;
-        let note = match note_store.get_note(id).await? {
-            Some(n) => n,
-            None => return Ok(false),
+        let note = if hard {
+            match note_store.get_note_including_deleted(id).await? {
+                Some(n) => n,
+                None => return Ok(false),
+            }
+        } else {
+            match note_store.get_note(id).await? {
+                Some(n) => n,
+                None => return Ok(false),
+            }
         };
         if Self::ensure_namespace(&note.namespace, ns).is_err() {
             return Ok(false);
@@ -1843,9 +1923,20 @@ impl KhiveRuntime {
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let entity = match self.entities(token)?.get_entity(id).await? {
-            Some(e) => e,
-            None => return Ok(false),
+        let entity = if hard {
+            match self
+                .entities(token)?
+                .get_entity_including_deleted(id)
+                .await?
+            {
+                Some(e) => e,
+                None => return Ok(false),
+            }
+        } else {
+            match self.entities(token)?.get_entity(id).await? {
+                Some(e) => e,
+                None => return Ok(false),
+            }
         };
         Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
         let mode = if hard {
