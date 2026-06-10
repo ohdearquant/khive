@@ -26,3 +26,8 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 khive-pack-kg = { version = "0.2.8", path = "../khive-pack-kg" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "brain_pack_bench"
+harness = false
