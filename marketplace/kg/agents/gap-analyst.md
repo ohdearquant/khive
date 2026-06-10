@@ -80,6 +80,10 @@ A single artifact: `gap_inventory.md`. Structure:
 ```markdown
 # Gap Inventory — <date>
 
+> **Snapshot notice**: this inventory reflects graph state at generation time. Any agent
+> queueing tasks from this file MUST re-verify each claim against the live graph at queue
+> time before acting — subsequent digest or polish waves may have resolved listed gaps.
+
 **Graph snapshot**: N concepts, M projects, K documents. Density: D edges/entity. **Polish health**:
 <last polish run date, residual orphan count, residual dupe count>
 
