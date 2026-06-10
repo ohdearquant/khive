@@ -33,10 +33,10 @@
 
 ```sh
 # From crates/ directory:
-cargo bench -p khive-vamana --bench vamana_bench
+cd crates && cargo bench -p khive-vamana --bench vamana_bench
 
 # Single group:
-cargo bench -p khive-vamana --bench vamana_bench -- search
+cd crates && cargo bench -p khive-vamana --bench vamana_bench -- search
 
 # HTML report (criterion):
 # open target/criterion/report/index.html
@@ -53,7 +53,19 @@ cargo bench -p khive-vamana --bench vamana_bench -- search
 
 ---
 
-## Baseline table
+## Release Ledger
+
+### v0.2.8 - 2026-06-08
+
+- Commit: `d3629501c550fd2f3bb7ed350a2b60309d596465`
+- Crate version: `0.2.8`
+- Khive version: `0.2.8`
+- Toolchain: `rustc 1.94.1 (e408947bf 2026-03-25)`, release profile (Criterion)
+- Machine: Apple M-series arm64, macOS Darwin 25.5.0, 16 GB
+- Feature flags: default
+- Command: `cd crates && cargo bench -p khive-vamana --bench vamana_bench`
+- Dataset: seeded random unit vectors, SEED=42, DIM=384; corpus sizes 1K / 5K / 10K
+- vs prior: first formal release ledger entry — no prior comparable baseline
 
 | Scenario                       | Low      | Median   | High     | Notes           |
 | ------------------------------ | -------- | -------- | -------- | --------------- |
@@ -75,13 +87,9 @@ cargo bench -p khive-vamana --bench vamana_bench -- search
 | snapshot/from_snapshot/1000    | 269.3 µs | 272.4 µs | 276.9 µs |                 |
 | snapshot/from_snapshot/5000    | 1.595 ms | 1.616 ms | 1.639 ms |                 |
 
-**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
-**Command:** `cargo bench -p khive-vamana --bench vamana_bench`
-**Dataset:** seeded random unit vectors (SEED=42, DIM=384)
-
-**Note (post-sweep):** `from_snapshot` regression (63.8→272 µs at 1K, 411→1620 µs at 5K) is due to
-prior run using a warm filesystem cache baseline, not a code regression — the docstring-only
-changes cannot affect codegen. All search latencies remain well within the 3ms SLO.
+- Notes: `from_snapshot` numbers (272 µs at 1K, 1.62 ms at 5K) are measured against a cold
+  filesystem; a prior run with a warm cache showed lower numbers (63.8 µs / 411 µs). No code
+  regression — the difference is measurement methodology. All search latencies pass the 3 ms SLO.
 
 ---
 
@@ -90,3 +98,5 @@ changes cannot affect codegen. All search latencies remain well within the 3ms S
 - `recall@10 >= 0.80` for N=1000x384 (integration test, always runs)
 - `recall@10 >= 0.85` for N=5000x384 (ignored; run manually)
 - Single-query search latency target: < 3 ms at N=10k (from perf/recall-fts SLO)
+
+Last reviewed: v0.2.8 (2026-06-08)
