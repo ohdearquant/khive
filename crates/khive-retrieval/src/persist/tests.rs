@@ -792,9 +792,9 @@ async fn test_missing_hnsw_snapshot_after_clear_returns_none() {
 
 // -- Test: HNSW snapshot with internally inconsistent state --
 //
-// Scenario: Snapshot deserializes successfully but has corrupted internal state
-//           (e.g., total_nodes doesn't match indexed_ids count). This simulates
-//           a partial write or in-memory corruption before serialization.
+// Scenario: Snapshot bytes are valid JSON but the encoded counts are inconsistent
+//           (total_nodes doesn't match indexed_ids count). HnswSnapshot::Deserialize
+//           runs verify() eagerly via TryFrom<RawHnswSnapshot>, so load returns Err.
 
 #[tokio::test]
 async fn test_inconsistent_hnsw_snapshot_detected_by_verify() {
@@ -829,20 +829,16 @@ async fn test_inconsistent_hnsw_snapshot_detected_by_verify() {
     let data = serde_json::to_vec(&bad_snapshot).expect("serialize");
     inject_raw_hnsw_snapshot(&persist, &data).await;
 
-    // Load succeeds (it's valid JSON with correct schema)
-    let loaded = persist
+    // HnswSnapshot::Deserialize runs verify() at load time, so loading an
+    // inconsistent snapshot returns Err rather than Ok(Some(invalid_snap)).
+    let load_err = persist
         .load_hnsw_snapshot()
         .await
-        .expect("load should succeed for valid JSON");
-    assert!(loaded.is_some(), "snapshot should load");
-
-    let snapshot = loaded.unwrap();
-
-    // But verify() detects the inconsistency
-    let verify_result = snapshot.verify();
+        .expect_err("load should fail verification at deserialization time");
+    let err_msg = load_err.to_string();
     assert!(
-        verify_result.is_err(),
-        "verify should catch total_nodes != indexed_ids.len()"
+        err_msg.contains("indexed_ids count mismatch") || err_msg.contains("inconsistent counts"),
+        "error should describe total_nodes != indexed_ids.len(), got: {err_msg}"
     );
 }
 
@@ -880,16 +876,16 @@ async fn test_tombstone_inconsistency_detected_by_verify() {
     let data = serde_json::to_vec(&bad_snapshot).expect("serialize");
     inject_raw_hnsw_snapshot(&persist, &data).await;
 
-    let loaded = persist
+    // HnswSnapshot::Deserialize runs verify() at load time; a tombstoned ID not
+    // present in indexed_ids causes load to return Err rather than Ok(invalid_snap).
+    let load_err = persist
         .load_hnsw_snapshot()
         .await
-        .expect("load")
-        .expect("snapshot exists");
-
-    let verify_result = loaded.verify();
+        .expect_err("load should fail verification at deserialization time");
+    let err_msg = load_err.to_string();
     assert!(
-        verify_result.is_err(),
-        "verify should catch tombstoned ID not in indexed_ids"
+        err_msg.contains("tombstoned id") || err_msg.contains("not found in indexed_ids"),
+        "error should describe tombstoned ID not in indexed_ids, got: {err_msg}"
     );
 }
 
@@ -1022,8 +1018,9 @@ async fn test_full_recovery_workflow_corrupt_then_rebuild() {
 
 // -- Test: Recovery from inconsistent snapshot via verify-then-rebuild --
 //
-// Scenario: Snapshot loads but fails verify(). Engine should detect this and
-//           trigger rebuild rather than using the corrupt topology.
+// Scenario: Snapshot bytes are valid JSON but counts are inconsistent.
+//           HnswSnapshot::Deserialize eagerly calls verify(); load returns Err.
+//           Engine clears the corrupt record and rebuilds a valid snapshot.
 
 #[tokio::test]
 async fn test_recovery_from_inconsistent_snapshot_via_verify() {
@@ -1058,16 +1055,14 @@ async fn test_recovery_from_inconsistent_snapshot_via_verify() {
     let data = serde_json::to_vec(&bad_snapshot).expect("serialize");
     inject_raw_hnsw_snapshot(&persist, &data).await;
 
-    // Load succeeds
-    let loaded = persist
+    // HnswSnapshot::Deserialize runs verify() at load time; the tombstone count
+    // mismatch (tombstone_count=2 vs tombstoned_ids.len()=1) causes load to
+    // return Err rather than Ok(invalid_snap).
+    let load_err = persist
         .load_hnsw_snapshot()
         .await
-        .expect("load")
-        .expect("snapshot exists");
-
-    // But verify catches the corruption
-    let verify_err = loaded.verify().unwrap_err();
-    let err_msg = verify_err.to_string();
+        .expect_err("load should fail verification at deserialization time");
+    let err_msg = load_err.to_string();
     assert!(
         err_msg.contains("tombstoned_ids count mismatch"),
         "should report tombstone count mismatch, got: {err_msg}"
