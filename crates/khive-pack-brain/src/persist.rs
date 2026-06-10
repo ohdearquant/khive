@@ -43,7 +43,9 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
 
-use khive_brain_core::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
+use khive_brain_core::{
+    validate_brain_state_snapshot, BrainSignal, BrainState, BrainStateSnapshot,
+};
 
 use crate::event::interpret;
 
@@ -61,6 +63,18 @@ pub struct PersistenceTracker {
     pub(crate) loaded_namespaces: HashMap<String, ()>,
     dirty_counts: HashMap<String, u64>,
     snapshot_batch_size: u64,
+    /// Pre-load accumulator for hook signals that arrive before `ensure_loaded` runs.
+    ///
+    /// When `on_dispatch` fires for a namespace that has never been loaded from the
+    /// DB, the signal is queued here rather than applied to a speculative
+    /// `BrainState`.  `ensure_loaded` drains this queue *after* the snapshot +
+    /// event-replay path completes, so the ordering guarantee is:
+    ///   persisted snapshot → replayed events → queued hook signals
+    ///
+    /// The namespace is deliberately NOT added to `loaded_namespaces` while
+    /// signals are pending; that prevents `ensure_loaded` from skipping the DB
+    /// round-trip for a namespace that may have existing persisted history.
+    pending_hook_signals: HashMap<String, Vec<BrainSignal>>,
 }
 
 impl Default for PersistenceTracker {
@@ -77,6 +91,7 @@ impl PersistenceTracker {
             loaded_namespaces: HashMap::new(),
             dirty_counts: HashMap::new(),
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
+            pending_hook_signals: HashMap::new(),
         }
     }
 
@@ -117,24 +132,31 @@ impl PersistenceTracker {
     }
 
     /// Return the total_events counter for any namespace stored in `saved_states`
-    /// (cold or saved-off namespaces).  Returns `None` when no state has been
-    /// initialised for the given namespace in the cold/saved bucket.
+    /// (saved-off namespaces) or `pending_hook_signals` (cold pre-load queue).
+    /// Returns `None` when no state has been initialised for the given namespace.
     ///
     /// Note: does NOT return the counter for the active namespace, which lives in
     /// the shared `BrainState` slot, not in `saved_states`.
     pub(crate) fn total_events_for(&self, namespace: &str) -> Option<u64> {
-        self.saved_states
+        if let Some(s) = self.saved_states.get(namespace) {
+            return Some(s.balanced_recall.total_events);
+        }
+        self.pending_hook_signals
             .get(namespace)
-            .map(|s| s.balanced_recall.total_events)
+            .map(|signals| signals.len() as u64)
     }
 
     /// Apply a signal to the state bucket that owns `namespace`.
     ///
     /// - Active namespace: returns `ApplyTarget::ActiveSlot` — caller must apply
     ///   the signal to the shared `BrainState` lock while holding the dispatch gate.
-    /// - Saved namespace: applies directly to `saved_states` and returns `ApplyTarget::Done`.
-    /// - Cold/unknown namespace: initialises a fresh `BrainState`, applies the
-    ///   signal to it, stores it in `saved_states`, and returns `ApplyTarget::Done`.
+    /// - Saved (loaded) namespace: applies directly to `saved_states` and returns
+    ///   `ApplyTarget::Done`.
+    /// - Cold/unknown namespace: enqueues the signal in `pending_hook_signals` and
+    ///   returns `ApplyTarget::Done`.  The namespace is NOT marked loaded; the DB
+    ///   round-trip is preserved for the first `ensure_loaded` call.  The queue is
+    ///   drained by `ensure_loaded` *after* snapshot restore and event replay, so
+    ///   the ordering guarantee is: snapshot → replayed events → queued signals.
     ///
     /// No event is silently dropped regardless of which slot is currently active.
     pub(crate) fn route_signal(
@@ -147,19 +169,35 @@ impl PersistenceTracker {
             return ApplyTarget::ActiveSlot;
         }
 
-        // Cold namespace: insert a fresh state and mark it loaded so future
-        // ensure_loaded calls skip the DB round-trip for this namespace.
-        if !self.saved_states.contains_key(namespace) {
-            self.loaded_namespaces.insert(namespace.to_string(), ());
-            self.saved_states
-                .insert(namespace.to_string(), BrainState::new(entity_capacity));
+        if self.is_loaded(namespace) {
+            // Namespace has been loaded from the DB but is currently saved off.
+            // Apply directly to its saved BrainState.
+            if let Some(state) = self.saved_states.get_mut(namespace) {
+                state.balanced_recall.apply_signal(signal);
+                crate::sync_balanced_recall_record(state);
+            }
+            return ApplyTarget::Done;
         }
-        // Unwrap is safe: we just ensured the key exists.
-        let state = self.saved_states.get_mut(namespace).unwrap();
 
-        state.balanced_recall.apply_signal(signal);
-        crate::sync_balanced_recall_record(state);
+        // Cold/unknown namespace: queue the signal for deferred application.
+        // Do NOT mark the namespace loaded — ensure_loaded must still perform
+        // the DB snapshot + event-replay before draining this queue.
+        let _ = entity_capacity;
+        self.pending_hook_signals
+            .entry(namespace.to_string())
+            .or_default()
+            .push(signal.clone());
         ApplyTarget::Done
+    }
+
+    /// Drain and return any pending hook signals for `namespace`.
+    ///
+    /// Called by `ensure_loaded` after the normal load path (snapshot + replay)
+    /// completes, so queued signals land on top of persisted history.
+    pub(crate) fn drain_pending_signals(&mut self, namespace: &str) -> Vec<BrainSignal> {
+        self.pending_hook_signals
+            .remove(namespace)
+            .unwrap_or_default()
     }
 }
 
@@ -458,10 +496,24 @@ pub async fn ensure_loaded(
             }
         };
 
+        // Drain any hook signals that arrived before this load completed.
+        // These are signals queued by `route_signal` while the namespace was
+        // still cold (no prior `ensure_loaded`).  Applying them here, after the
+        // snapshot + replay path, preserves ordering:
+        //   persisted snapshot → replayed events → queued hook signals
+        let pending = t.drain_pending_signals(&namespace);
+        let mut final_state = new_state;
+        for sig in &pending {
+            final_state.balanced_recall.apply_signal(sig);
+        }
+        if !pending.is_empty() {
+            crate::sync_balanced_recall_record(&mut final_state);
+        }
+
         // Write the new state while the tracker lock is still held.
         // After this line active_namespace, *state, and loaded_namespaces are
         // all consistent; no concurrent dispatch can observe a partial view.
-        *state.lock().unwrap() = new_state;
+        *state.lock().unwrap() = final_state;
 
         // For the no-active-namespace (first-load) path swap_namespace was not
         // called, so we set active_namespace here before marking loaded.

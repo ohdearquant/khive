@@ -90,6 +90,19 @@ impl BrainPack {
             .mark_loaded(namespace.into());
     }
 
+    /// Trigger the full `ensure_loaded` path for a given namespace string.
+    ///
+    /// Builds an anonymous `NamespaceToken` and runs the snapshot +
+    /// event-replay + pending-signals-drain path.  Intended for test
+    /// verification of cold-hook signal survival across the load boundary;
+    /// production callers should use the `dispatch` path instead.
+    pub async fn ensure_loaded_for_test(&self, namespace: &str) -> Result<(), RuntimeError> {
+        let ns = khive_types::Namespace::parse(namespace)
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        let token = self.runtime.authorize(ns)?;
+        self.ensure_loaded(&token).await
+    }
+
     pub(crate) async fn ensure_loaded(&self, token: &NamespaceToken) -> Result<(), RuntimeError> {
         persist::ensure_loaded(
             &self.runtime,

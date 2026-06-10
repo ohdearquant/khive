@@ -10,7 +10,7 @@ use crate::{FeedbackEventKind, FeedbackSignal, SectionType};
 ///
 /// Produced by `interpret(event)` in pack-brain. Consumed by
 /// `BalancedRecallState::apply_signal` and `SectionPosteriorState::apply_signal`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BrainSignal {
     RecallHit {
         target_id: Uuid,
