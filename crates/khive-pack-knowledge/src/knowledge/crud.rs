@@ -440,10 +440,16 @@ impl KnowledgeHandlers {
             }
             Some("atom") | None => {
                 let requested_statuses = status_values(p.status.as_ref());
+                let exclude_buf: Vec<&str> = p
+                    .exclude_status
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .into_iter()
+                    .collect();
                 let (data_status_clause, data_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 4);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 4);
                 let (count_status_clause, count_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 2);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 2);
 
                 let sql_str = format!(
                     "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",

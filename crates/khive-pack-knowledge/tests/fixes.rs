@@ -284,7 +284,8 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
                 "slug": "retrieval-domain",
                 "name": "Retrieval Domain",
                 "tags": ["type:domain", "retrieval"],
-                "content": "retrieval domain techniques xyzabc organization dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                "content": "retrieval domain techniques xyzabc organization dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+                "finalized": true
             }]
         }),
     )
@@ -1080,9 +1081,9 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rrf-a", "name": "RRF Alpha", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rrf-b", "name": "RRF Beta",  "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rrf-c", "name": "RRF Gamma", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-a", "name": "RRF Alpha", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                { "slug": "rrf-b", "name": "RRF Beta",  "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                { "slug": "rrf-c", "name": "RRF Gamma", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
             ]
         }),
     )
@@ -1135,6 +1136,12 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
     )
     .await
     .expect("upsert");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("rrf-single".into())],
+    )
+    .await;
 
     let resp = f
         .dispatch(
@@ -1449,9 +1456,15 @@ async fn search_scores_are_normalized_without_rank_inversion() {
     .expect("seed atoms");
 
     // Promote high to verified (1.2× multiplier after normalization, clamped to 1.0).
+    // Set mid and low to reviewed so they appear in default search (draft excluded by default).
     f.sql_exec(
         "UPDATE knowledge_atoms SET status='verified' WHERE slug=?1",
         vec![SqlValue::Text("norm-high".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug IN ('norm-mid', 'norm-low')",
+        vec![],
     )
     .await;
 
@@ -1504,8 +1517,8 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rerank-a", "name": "Cosine Alpha", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
-                { "slug": "rerank-b", "name": "Cosine Beta",  "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rerank-a", "name": "Cosine Alpha", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
             ]
         }),
     )
@@ -1564,6 +1577,224 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         .iter()
         .zip(norerank_scores.iter())
         .any(|(a, b)| (a - b).abs() > 1e-6);
+}
+
+// ── #78: draft exclusion + include_drafts opt-in ─────────────────────────────
+
+#[tokio::test]
+async fn issue78_search_excludes_drafts_by_default() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "reviewed-atom-78",
+                    "name": "Reviewed Atom 78",
+                    "content": "transformer attention mechanism self-attention multi-head unique zz78 covering concepts techniques algorithms implementations applications use cases and design patterns in detail for production systems"
+                },
+                {
+                    "slug": "draft-atom-78",
+                    "name": "Draft Atom 78",
+                    "content": "transformer attention mechanism self-attention multi-head unique zz78 covering concepts techniques algorithms implementations applications use cases and design patterns in detail for production systems"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("reviewed-atom-78".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("draft-atom-78".into())],
+    )
+    .await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "transformer attention zz78", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = resp["results"].as_array().expect("results");
+
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Reviewed Atom 78"),
+        "reviewed atom must appear by default: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Draft Atom 78"),
+        "draft atom must be excluded by default: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue78_include_drafts_true_returns_draft_atoms() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rev-atom-78b",
+                    "name": "Reviewed Atom 78b",
+                    "content": "sparse retrieval bm25 inverted index ranking corpus search unique zz78b covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+                {
+                    "slug": "dft-atom-78b",
+                    "name": "Draft Atom 78b",
+                    "content": "sparse retrieval bm25 inverted index ranking corpus search unique zz78b covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("rev-atom-78b".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("dft-atom-78b".into())],
+    )
+    .await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "sparse retrieval bm25 zz78b", "rerank": false, "include_drafts": true }),
+        )
+        .await
+        .expect("search ok");
+    let results = resp["results"].as_array().expect("results");
+
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Draft Atom 78b"),
+        "draft atom must appear when include_drafts=true: {names:?}"
+    );
+    assert!(
+        names.contains(&"Reviewed Atom 78b"),
+        "reviewed atom must also appear when include_drafts=true: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue78_include_drafts_does_not_surface_deprecated() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rev-atom-78c",
+                    "name": "Reviewed Atom 78c",
+                    "content": "vector quantization product quantization compression retrieval unique zz78c covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+                {
+                    "slug": "dep-atom-78c",
+                    "name": "Deprecated Atom 78c",
+                    "content": "vector quantization product quantization compression retrieval unique zz78c covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("rev-atom-78c".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='deprecated' WHERE slug=?1",
+        vec![SqlValue::Text("dep-atom-78c".into())],
+    )
+    .await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "vector quantization zz78c", "rerank": false, "include_drafts": true }),
+        )
+        .await
+        .expect("search ok");
+    let results = resp["results"].as_array().expect("results");
+
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Reviewed Atom 78c"),
+        "reviewed atom must appear: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Deprecated Atom 78c"),
+        "deprecated atom must not appear even with include_drafts=true: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue78_explicit_status_filter_overrides_include_drafts() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rev-atom-78d",
+                    "name": "Reviewed Atom 78d",
+                    "content": "graph neural network node embedding link prediction unique zz78d covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+                {
+                    "slug": "dft-atom-78d",
+                    "name": "Draft Atom 78d",
+                    "content": "graph neural network node embedding link prediction unique zz78d covering concepts techniques algorithms implementations applications use cases and design patterns for production systems"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("rev-atom-78d".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("dft-atom-78d".into())],
+    )
+    .await;
+
+    // Explicit status="draft" returns only draft atoms regardless of include_drafts.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "graph neural network zz78d", "rerank": false, "status": "draft" }),
+        )
+        .await
+        .expect("search ok");
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Draft Atom 78d"),
+        "explicit status=draft must return draft atoms: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Reviewed Atom 78d"),
+        "explicit status=draft must not return reviewed atoms: {names:?}"
+    );
 }
 
 #[tokio::test]

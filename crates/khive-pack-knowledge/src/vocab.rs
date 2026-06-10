@@ -159,7 +159,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured)",
+        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured). Draft atoms are excluded by default; pass include_drafts=true to opt in. Score bands observed in production: >=0.46 reliably on-target, 0.42-0.46 mixed quality, <0.42 mostly off-target.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -174,6 +174,12 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 param_type: "string",
                 required: false,
                 description: "Filter: \"atom\" | \"domain\" (default: both)",
+            },
+            ParamDef {
+                name: "include_drafts",
+                param_type: "boolean",
+                required: false,
+                description: "Include draft (unfinalized) atoms in results (default false). Has no effect when status= is set explicitly.",
             },
             ParamDef {
                 name: "role",
@@ -191,7 +197,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum TF-IDF score threshold (default 0.0)",
+                description: "Minimum score threshold (default 0.0). Score bands: >=0.46 reliable, 0.42-0.46 mixed, <0.42 mostly off-target.",
             },
             ParamDef {
                 name: "weights",

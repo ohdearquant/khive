@@ -131,7 +131,7 @@ async fn fetch_fts_candidates(
     raw_query: &str,
     type_filter: Option<&str>,
     statuses: &[String],
-    exclude_status: Option<&str>,
+    exclude_statuses: &[&str],
     fetch_limit: usize,
 ) -> Result<Vec<Atom>, RuntimeError> {
     let sql = runtime.sql();
@@ -156,7 +156,7 @@ async fn fetch_fts_candidates(
 
     if fts_rows.is_empty() {
         // FTS returned nothing — fall back to full scan (small corpora) capped at CANDIDATE_POOL.
-        let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, 3);
+        let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
         let sql_str = format!(
             "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL{} ORDER BY created_at DESC LIMIT ?2",
             status_clause
@@ -200,7 +200,8 @@ async fn fetch_fts_candidates(
         .collect::<Vec<_>>()
         .join(",");
 
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, ids.len() + 2);
+    let (status_clause, status_params) =
+        status_sql_clause(statuses, exclude_statuses, ids.len() + 2);
     let mut params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
     params.extend(ids.iter().map(|id| SqlValue::Text(id.clone())));
     params.extend(status_params);
@@ -230,7 +231,7 @@ struct SearchCtx<'a> {
     w: &'a Weights,
     fetch_limit: usize,
     statuses: &'a [String],
-    exclude_status: Option<&'a str>,
+    exclude_statuses: &'a [&'a str],
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
@@ -281,7 +282,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
         &raw_query,
         type_filter,
         ctx.statuses,
-        ctx.exclude_status,
+        ctx.exclude_statuses,
         CANDIDATE_POOL,
     )
     .await?;
@@ -369,7 +370,7 @@ async fn search_decomposed(
         w: ctx.w,
         fetch_limit: sub_limit,
         statuses: ctx.statuses,
-        exclude_status: ctx.exclude_status,
+        exclude_statuses: ctx.exclude_statuses,
     };
     let s1 = search_core(&sub_ctx1, &sub_q1).await?;
     let s2 = search_core(&sub_ctx1, &sub_q2).await?;
@@ -921,6 +922,23 @@ impl KnowledgeHandlers {
         let requested_statuses = status_values(p.status.as_ref());
         let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
+        // When no explicit status filter is given and include_drafts is not true,
+        // exclude both 'draft' and 'deprecated' from results by default.
+        // Callers that want draft atoms pass include_drafts=true.
+        // An explicit status= filter overrides this (the caller controls what they want).
+        let exclude_statuses_buf: Vec<&str> = if requested_statuses.is_empty() {
+            let include_drafts = p.include_drafts.unwrap_or(false);
+            if include_drafts {
+                vec!["deprecated"]
+            } else {
+                vec!["draft", "deprecated"]
+            }
+        } else if let Some(ref ex) = p.exclude_status {
+            vec![ex.as_str()]
+        } else {
+            vec![]
+        };
+
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -930,7 +948,7 @@ impl KnowledgeHandlers {
             w: &w,
             fetch_limit,
             statuses: &requested_statuses,
-            exclude_status: p.exclude_status.as_deref(),
+            exclude_statuses: &exclude_statuses_buf,
         };
 
         let mut hits = if do_decompose && non_stop_count >= decompose_threshold {
@@ -1011,7 +1029,7 @@ impl KnowledgeHandlers {
             w: &Weights::default(),
             fetch_limit: limit * 3,
             statuses: &[],
-            exclude_status: None,
+            exclude_statuses: &[],
         };
 
         let mut hits = search_core(&ctx, &raw_query).await?;
