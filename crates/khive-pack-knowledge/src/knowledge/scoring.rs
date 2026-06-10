@@ -1,4 +1,4 @@
-//! TF-IDF scoring, candidate tokenization, term expansion, and top-k selection.
+//! TF-IDF scoring, candidate tokenization, and term expansion.
 //!
 //! Pure computation extracted from the handler module to stay within the
 //! file-size gate (<700 LOC per file).

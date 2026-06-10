@@ -52,9 +52,9 @@ impl std::fmt::Display for BackendId {
 
 // ---- Sealed token ----
 
-pub(crate) mod private {
+mod private {
     #[derive(Clone, Debug)]
-    pub struct Sealed;
+    pub(crate) struct Sealed;
 }
 
 /// Authorization proof that a caller is permitted to access a specific namespace.
@@ -64,9 +64,9 @@ pub(crate) mod private {
 /// without going through the authorization path.
 #[derive(Clone, Debug)]
 pub struct NamespaceToken {
-    pub(crate) namespace: Namespace,
-    pub(crate) actor: ActorRef,
-    pub(crate) _sealed: private::Sealed,
+    namespace: Namespace,
+    actor: ActorRef,
+    _sealed: private::Sealed,
 }
 
 impl NamespaceToken {
@@ -265,7 +265,7 @@ pub(crate) fn build_embedder_registry(
     (registry, default_embedder_name)
 }
 
-pub(crate) fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
+fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
     let mut models = Vec::new();
     if let Some(model) = config.embedding_model {
         models.push(model);
@@ -382,7 +382,7 @@ pub fn runtime_config_from_khive_config(
 }
 
 /// Parse a comma- or whitespace-separated list of embedding model names.
-pub(crate) fn parse_embedding_model_list(s: &str) -> Vec<EmbeddingModel> {
+fn parse_embedding_model_list(s: &str) -> Vec<EmbeddingModel> {
     parse_pack_list(s)
         .into_iter()
         .filter_map(|raw| {
