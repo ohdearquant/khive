@@ -7,7 +7,9 @@ use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_storage::EdgeRelation;
 use uuid::Uuid;
 
-use khive_merge::types::{MergeConflict, MergeEngine, MergeError, MergeResult, MergeStrategy};
+use khive_merge::types::{
+    MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy,
+};
 use khive_merge::{merge::three_way_merge, ThreeWayMergeEngine};
 
 fn empty(ns: &str) -> KgArchive {
@@ -67,7 +69,7 @@ fn clean_merge_no_overlap() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id2, "B")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 2);
@@ -93,7 +95,7 @@ fn conflicts_on_name_mismatch() {
         a
     };
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
 }
 
@@ -116,7 +118,7 @@ fn ours_strategy_always_clean() {
         a
     };
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities[0].name, "NameA");
@@ -142,7 +144,7 @@ fn theirs_strategy_always_clean() {
         a
     };
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities[0].name, "NameB");
@@ -171,7 +173,7 @@ fn dangling_edge_in_auto_merge() {
         a
     };
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
 }
 
@@ -182,7 +184,7 @@ fn three_way_merge_engine_impl() {
     let ours = empty("test");
     let theirs = empty("test");
     let result = engine
-        .merge_branch(&base, &ours, &theirs, MergeStrategy::Auto)
+        .merge_branch(&base, &ours, &theirs, SnapshotMergeStrategy::Auto)
         .unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
 }
@@ -210,7 +212,7 @@ fn kind_conflict_detected() {
         a
     };
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
     if let MergeResult::Conflicts { conflicts } = result {
         assert!(
@@ -233,7 +235,7 @@ fn duplicate_uuid_same_content_auto_resolves() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id, "Same")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Clean { .. }));
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 1);
@@ -250,7 +252,7 @@ fn duplicate_uuid_different_content_is_conflict() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id, "NameB")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(
         matches!(result, MergeResult::Conflicts { .. }),
         "duplicate UUID with different content must be a conflict"
@@ -277,8 +279,8 @@ fn repeated_auto_merge_produces_equal_output() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id2, "B")];
 
-    let r1 = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
-    let r2 = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let r1 = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    let r2 = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
 
     if let (MergeResult::Clean { merged: m1 }, MergeResult::Clean { merged: m2 }) = (&r1, &r2) {
         assert_eq!(m1.exported_at, m2.exported_at, "timestamps must be equal");
@@ -301,7 +303,7 @@ fn entities_sorted_by_uuid() {
     }
     let theirs = empty("test");
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         ids.sort();
         let merged_ids: Vec<Uuid> = merged.entities.iter().map(|e| e.id).collect();
@@ -324,7 +326,7 @@ fn edges_sorted_by_source_target_relation() {
     ours.edges = vec![edge(c, a), edge(b, c), edge(a, b)];
     let theirs = empty("test");
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         for i in 1..merged.edges.len() {
             let prev = &merged.edges[i - 1];
@@ -355,7 +357,7 @@ fn ours_strategy_output_is_sorted() {
     }
     let theirs = empty("test");
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert!(merged.entities.len() >= 2);
         assert!(
@@ -380,7 +382,7 @@ fn theirs_strategy_output_is_sorted() {
         theirs.entities = vec![entity(id2, "B"), entity(id1, "A")];
     }
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert!(merged.entities.len() >= 2);
         assert!(
@@ -400,7 +402,7 @@ fn rejects_namespace_mismatch() {
     let ours = empty("ns2");
     let theirs = empty("ns1");
 
-    let err = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap_err();
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
     assert!(
         matches!(err, MergeError::NamespaceMismatch { .. }),
         "expected NamespaceMismatch, got: {err:?}"
@@ -416,7 +418,7 @@ fn rejects_non_finite_edge_weight_nan() {
     ours.edges = vec![edge_weighted(a, b, f64::NAN)];
     let theirs = empty("test");
 
-    let err = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap_err();
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
     assert!(matches!(err, MergeError::InvalidEdgeWeight(_)));
 }
 
@@ -429,7 +431,7 @@ fn rejects_non_finite_edge_weight_inf() {
     ours.edges = vec![edge_weighted(a, b, f64::INFINITY)];
     let theirs = empty("test");
 
-    let err = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap_err();
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
     assert!(matches!(err, MergeError::InvalidEdgeWeight(_)));
 }
 
@@ -441,7 +443,7 @@ fn rejects_duplicate_entity_ids_in_archive() {
     ours.entities = vec![entity(id, "First"), entity(id, "Second")];
     let theirs = empty("test");
 
-    let err = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap_err();
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
     assert!(
         matches!(err, MergeError::DuplicateEntityId { .. }),
         "expected DuplicateEntityId, got: {err:?}"
@@ -457,7 +459,7 @@ fn rejects_duplicate_edge_keys_in_archive() {
     ours.edges = vec![edge(a, b), edge(a, b)];
     let theirs = empty("test");
 
-    let err = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap_err();
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
     assert!(
         matches!(err, MergeError::DuplicateEdgeKey { .. }),
         "expected DuplicateEdgeKey, got: {err:?}"
@@ -473,7 +475,7 @@ fn unchanged_entity_passes_through() {
     let base = archive_with_entities(vec![e.clone()]);
     let ours = archive_with_entities(vec![e.clone()]);
     let theirs = archive_with_entities(vec![e]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 1);
         assert_eq!(merged.entities[0].name, "A");
@@ -488,7 +490,7 @@ fn added_in_ours_included() {
     let base = archive_with_entities(vec![]);
     let ours = archive_with_entities(vec![entity(id, "New")]);
     let theirs = archive_with_entities(vec![]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 1);
     } else {
@@ -502,7 +504,7 @@ fn deleted_in_both_excluded() {
     let base = archive_with_entities(vec![entity(id, "Old")]);
     let ours = archive_with_entities(vec![]);
     let theirs = archive_with_entities(vec![]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 0);
     } else {
@@ -519,7 +521,7 @@ fn modify_delete_conflict() {
     let ours = archive_with_entities(vec![modified]);
     let theirs = archive_with_entities(vec![]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
     if let MergeResult::Conflicts { conflicts } = result {
         assert_eq!(conflicts.len(), 1);
@@ -539,7 +541,7 @@ fn property_mismatch_conflict() {
     let ours = archive_with_entities(vec![e_ours]);
     let theirs = archive_with_entities(vec![e_theirs]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
     if let MergeResult::Conflicts { conflicts } = result {
         assert!(conflicts
@@ -560,7 +562,7 @@ fn name_conflict_reported() {
     let ours = archive_with_entities(vec![e_ours]);
     let theirs = archive_with_entities(vec![e_theirs]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
     if let MergeResult::Conflicts { conflicts } = result {
         assert!(conflicts
@@ -581,7 +583,7 @@ fn tags_are_unioned() {
     let ours = archive_with_entities(vec![e_ours]);
     let theirs = archive_with_entities(vec![e_theirs]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         let tags = &merged.entities[0].tags;
         assert!(tags.contains(&"a".to_string()));
@@ -604,7 +606,7 @@ fn theirs_only_property_keys_preserved() {
     let ours = archive_with_entities(vec![e_ours]);
     let theirs = archive_with_entities(vec![e_theirs]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         let props = merged.entities[0]
             .properties
@@ -631,7 +633,7 @@ fn edge_added_in_ours_included() {
     let base = archive_full(entities.clone(), vec![]);
     let ours = archive_full(entities.clone(), vec![edge(a, b)]);
     let theirs = archive_full(entities, vec![]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.edges.len(), 1);
     } else {
@@ -647,7 +649,7 @@ fn edge_deleted_in_both_excluded() {
     let base = archive_full(entities.clone(), vec![edge(a, b)]);
     let ours = archive_full(entities.clone(), vec![]);
     let theirs = archive_full(entities, vec![]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.edges.len(), 0);
     } else {
@@ -663,7 +665,7 @@ fn max_weight_on_both_added() {
     let base = archive_full(entities.clone(), vec![]);
     let ours = archive_full(entities.clone(), vec![edge_weighted(a, b, 0.6)]);
     let theirs = archive_full(entities, vec![edge_weighted(a, b, 0.9)]);
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.edges.len(), 1);
         assert!((merged.edges[0].weight - 0.9).abs() < f64::EPSILON);
@@ -695,7 +697,7 @@ fn edge_modify_delete_conflict() {
     let ours = archive_full(entities.clone(), vec![]);
     let theirs = archive_full(entities, vec![edge_weighted(a, b, 1.0)]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     assert!(matches!(result, MergeResult::Conflicts { .. }));
     if let MergeResult::Conflicts { conflicts } = result {
         assert!(
@@ -719,7 +721,7 @@ fn merge_preserves_added_edge_id() {
     let ours = archive_full(entities.clone(), vec![branch_edge]);
     let theirs = archive_full(entities, vec![]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.edges.len(), 1);
         assert_eq!(
@@ -757,7 +759,7 @@ fn merge_preserves_weight_modified_edge_id() {
     let ours = archive_full(entities.clone(), vec![ours_edge]);
     let theirs = archive_full(entities, vec![base_edge]);
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.edges.len(), 1);
         assert_eq!(merged.edges[0].weight, 0.9);
@@ -782,7 +784,7 @@ fn apply_ours_uses_ours_version() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id, "TheirsName")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 1);
         assert_eq!(merged.entities[0].name, "OursName");
@@ -801,7 +803,7 @@ fn apply_theirs_uses_theirs_version() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id, "TheirsName")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 1);
         assert_eq!(merged.entities[0].name, "TheirsName");
@@ -820,7 +822,7 @@ fn apply_ours_includes_theirs_only_additions() {
     let mut theirs = empty("test");
     theirs.entities = vec![entity(id_theirs, "B")];
 
-    let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
     if let MergeResult::Clean { merged } = result {
         assert_eq!(merged.entities.len(), 2);
     } else {

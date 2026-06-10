@@ -13,4 +13,6 @@ pub mod strategy;
 pub mod types;
 
 pub use merge::ThreeWayMergeEngine;
-pub use types::{BranchSide, MergeConflict, MergeEngine, MergeError, MergeResult, MergeStrategy};
+pub use types::{
+    BranchSide, MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy,
+};

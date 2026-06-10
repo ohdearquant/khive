@@ -11,7 +11,7 @@ use crate::diff_local::EdgeKey;
 use crate::edge::{merge_edges, validate_dangling_edges};
 use crate::entity::merge_entities;
 use crate::strategy::{apply_ours, apply_theirs};
-use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, MergeStrategy};
+use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy};
 
 /// Validate archive invariants before merge.
 ///
@@ -106,26 +106,26 @@ pub fn three_way_merge(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
-    strategy: MergeStrategy,
+    strategy: SnapshotMergeStrategy,
 ) -> Result<MergeResult, MergeError> {
     validate_inputs(base, ours, theirs)?;
 
     match strategy {
-        MergeStrategy::Ours => {
+        SnapshotMergeStrategy::Ours => {
             let mut merged = apply_ours(base, ours, theirs);
             sort_entities(&mut merged);
             sort_edges(&mut merged.edges);
             merged.exported_at = deterministic_timestamp(ours, theirs);
             Ok(MergeResult::Clean { merged })
         }
-        MergeStrategy::Theirs => {
+        SnapshotMergeStrategy::Theirs => {
             let mut merged = apply_theirs(base, ours, theirs);
             sort_entities(&mut merged);
             sort_edges(&mut merged.edges);
             merged.exported_at = deterministic_timestamp(ours, theirs);
             Ok(MergeResult::Clean { merged })
         }
-        MergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
+        SnapshotMergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
     }
 }
 
@@ -176,7 +176,7 @@ impl MergeEngine for ThreeWayMergeEngine {
         base: &KgArchive,
         ours: &KgArchive,
         theirs: &KgArchive,
-        strategy: MergeStrategy,
+        strategy: SnapshotMergeStrategy,
     ) -> Result<MergeResult, MergeError> {
         three_way_merge(base, ours, theirs, strategy)
     }

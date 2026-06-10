@@ -1,4 +1,4 @@
-.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local proof-check
+.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local proof-check check-fwd
 
 check:
 	cd crates && cargo check --workspace
@@ -31,6 +31,11 @@ clean:
 
 docs-check:
 	deno fmt --check docs/
+
+check-fwd:
+	RUSTFLAGS="-D warnings" cargo check --manifest-path crates/khive-merge/Cargo.toml --all-targets
+	cargo clippy --manifest-path crates/khive-merge/Cargo.toml --all-targets -- -D warnings
+	cargo test --manifest-path crates/khive-merge/Cargo.toml
 
 ci:
 	./scripts/ci.sh

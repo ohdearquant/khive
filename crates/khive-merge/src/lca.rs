@@ -22,6 +22,7 @@ pub trait SnapshotReader: Send + Sync {
 ///
 /// Returns `None` if the two histories are disjoint (no common ancestor).
 /// In that case the merge uses an empty `KgArchive` as the base.
+/// Cycle-safe: both the `ours` and `theirs` parent chains are guarded by visited sets.
 pub fn find_lca(reader: &dyn SnapshotReader, ours_id: &str, theirs_id: &str) -> Option<String> {
     if ours_id == theirs_id {
         return Some(ours_id.to_string());
@@ -29,12 +30,19 @@ pub fn find_lca(reader: &dyn SnapshotReader, ours_id: &str, theirs_id: &str) -> 
 
     let ours_ancestors = collect_ancestors(reader, ours_id);
 
+    // Guard against cycles in the theirs parent chain.
+    let mut visited_theirs: HashSet<String> = HashSet::new();
+    visited_theirs.insert(theirs_id.to_string());
     let mut current = Some(theirs_id.to_string());
     while let Some(id) = current {
         if ours_ancestors.contains(&id) {
             return Some(id);
         }
-        current = reader.parent_of(&id);
+        let next = reader.parent_of(&id);
+        current = match next {
+            Some(ref nid) if !visited_theirs.insert(nid.clone()) => None,
+            other => other,
+        };
     }
 
     None
@@ -104,5 +112,29 @@ mod tests {
         parents.insert("c".into(), "base".into());
         let reader = MockReader { parents };
         assert_eq!(find_lca(&reader, "d", "e"), Some("c".into()));
+    }
+
+    #[test]
+    fn lca_cycle_in_theirs_terminates() {
+        // Cycle in theirs chain: f -> g -> f (infinite without guard).
+        // ours is linear with no common node.
+        let mut parents = HashMap::new();
+        parents.insert("a".into(), "root_a".into());
+        parents.insert("f".into(), "g".into());
+        parents.insert("g".into(), "f".into()); // cycle
+        let reader = MockReader { parents };
+        assert_eq!(find_lca(&reader, "a", "f"), None);
+    }
+
+    #[test]
+    fn lca_cycle_in_ours_terminates() {
+        // Cycle in ours chain: h -> i -> h.
+        // collect_ancestors must not loop; theirs is linear with no shared node.
+        let mut parents = HashMap::new();
+        parents.insert("h".into(), "i".into());
+        parents.insert("i".into(), "h".into()); // cycle
+        parents.insert("b".into(), "root_b".into());
+        let reader = MockReader { parents };
+        assert_eq!(find_lca(&reader, "h", "b"), None);
     }
 }

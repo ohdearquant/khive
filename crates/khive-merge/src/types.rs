@@ -6,9 +6,12 @@ use khive_runtime::portability::KgArchive;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Merge strategy selector.
+/// Snapshot merge strategy selector (ADR-010).
+///
+/// Renamed from `MergeStrategy` to avoid collision with `ContentMergeStrategy` in
+/// the note-curation layer (ADR-014).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MergeStrategy {
+pub enum SnapshotMergeStrategy {
     /// Three-way merge with conflict detection.
     Auto,
     /// Last-write-wins: ours fields prevail on conflict.
@@ -79,7 +82,9 @@ pub enum MergeConflict {
 /// Identifies which side of the merge a change originates from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BranchSide {
+    /// The local branch being merged into the common base.
     Ours,
+    /// The remote branch being merged in.
     Theirs,
 }
 
@@ -88,12 +93,13 @@ pub enum BranchSide {
 /// Register an implementation of this trait in `khive-vcs` at startup to
 /// replace the default no-op merge engine.
 pub trait MergeEngine {
+    /// Run a three-way merge of `ours` and `theirs` against their common `base`.
     fn merge_branch(
         &self,
         base: &KgArchive,
         ours: &KgArchive,
         theirs: &KgArchive,
-        strategy: MergeStrategy,
+        strategy: SnapshotMergeStrategy,
     ) -> Result<MergeResult, MergeError>;
 }
 

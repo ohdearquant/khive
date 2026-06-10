@@ -4,6 +4,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../crates"
 
+echo "=== Forward-Deployed Crates Check ==="
+# Excluded workspace crates (forward-deployed infrastructure) must still compile,
+# pass clippy under -D warnings across all targets, and pass their test suite.
+RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets
+cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets -- -D warnings
+cargo test --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml"
+
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 

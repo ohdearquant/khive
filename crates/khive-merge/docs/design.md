@@ -23,7 +23,7 @@ integration layer is extended to expose snapshot ancestry for LCA walks.
 
 ### ADR-043: Three-Way Merge Conflict Taxonomy
 
-- The `MergeConflict` enum (in `merge_types.rs`) enumerates the six conflict kinds defined for
+- The `MergeConflict` enum (in `types.rs`) enumerates the six conflict kinds defined for
   the three-way merge: `NameConflict`, `KindConflict`, `ModifyDelete`, `PropertyMismatch`,
   `EdgeModifyDelete`, `DanglingEdge`.
 - Property merge rules (per-key, both-set-same → keep, both-set-different → conflict, one-side →
@@ -49,7 +49,7 @@ entity identity, field-level conflicts, edge weights, and dangling-edge semantic
 
 | Module | Role |
 |--------|------|
-| `merge_types` | Public types: `MergeStrategy`, `MergeConflict`, `MergeResult`, `MergeEngine` trait |
+| `types` | Public types: `SnapshotMergeStrategy`, `MergeConflict`, `MergeResult`, `MergeEngine` trait |
 | `merge` | Top-level `three_way_merge()` + `ThreeWayMergeEngine` impl |
 | `lca` | Lowest-common-ancestor walk over a `SnapshotReader` |
 | `diff_local` | Private: entity and edge diff between base and branch |
