@@ -1,9 +1,9 @@
-//! `kkernel reindex` — rebuild embedding vectors for entities and notes.
+//! `kkernel reindex` — rebuild embedding vectors and FTS documents for entities and notes.
 //!
 //! This is an infrastructure-level operation that walks all entities and notes
-//! in a database and (re-)embeds them using the specified model. It is NOT a
-//! pack verb — it operates on the raw runtime stores regardless of which packs
-//! are loaded.
+//! in a database and (re-)embeds them using the specified model and backfills the
+//! FTS index. It is NOT a pack verb — it operates on the raw runtime stores
+//! regardless of which packs are loaded.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,6 +18,8 @@ use uuid::Uuid;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_runtime::{KhiveRuntime, Namespace};
 use khive_storage::error::StorageError;
+use khive_storage::note::Note;
+use khive_storage::types::TextDocument;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
 
@@ -214,12 +216,15 @@ struct ReindexReport {
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
     errors_skipped: u64,
+    /// Note FTS upserts that failed during the backfill pass.
+    fts_notes_failed: u64,
 }
 
 impl ReindexReport {
     /// Did any part of the run fail? Drives the fail-closed exit decision.
     fn has_failures(&self) -> bool {
         self.errors_skipped > 0
+            || self.fts_notes_failed > 0
             || self.knowledge_atoms_failed > 0
             || self.knowledge_pass_errored
             || self.knowledge_ann_failed
@@ -309,6 +314,54 @@ async fn embed_and_store_batch(
     errors
 }
 
+/// Build the `TextDocument` for a note, mirroring the document-construction logic in
+/// `operations.rs` (`upsert_note` / FTS write path). Both callers — the create/update
+/// MCP path and this reindex path — must produce byte-identical documents for a given
+/// note; any divergence would cause a recall parity bug. Changes here require the
+/// same change in operations.rs and vice versa.
+fn note_fts_document(note: &Note) -> TextDocument {
+    let body = match &note.name {
+        Some(n) => format!("{n} {}", note.content),
+        None => note.content.clone(),
+    };
+    TextDocument {
+        subject_id: note.id,
+        kind: SubstrateKind::Note,
+        title: note.name.clone(),
+        body,
+        tags: vec![],
+        namespace: note.namespace.clone(),
+        metadata: note.properties.clone(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// Upsert FTS documents for a batch of notes into the namespace text index. Returns the
+/// number of per-note upsert failures. Idempotent: calling again for an already-indexed
+/// note replaces the existing row (FTS upsert semantics). Fails per-note, never panics.
+async fn fts_backfill_notes_batch(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    batch: &[Note],
+) -> u64 {
+    let fts = match rt.text_for_notes(token) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "FTS store unavailable; counting whole batch as failed");
+            return batch.len() as u64;
+        }
+    };
+    let mut errors: u64 = 0;
+    for note in batch {
+        let doc = note_fts_document(note);
+        if let Err(e) = fts.upsert_document(doc).await {
+            tracing::warn!(id = %note.id, error = %e, "FTS upsert failed for note");
+            errors += 1;
+        }
+    }
+    errors
+}
+
 /// Return the subset of `ids` that do NOT already have an embedding in `vectors`
 /// for the given `namespace`. When `batch_exists` is unsupported (e.g. a custom
 /// backend), conservatively returns all IDs so every record gets embedded.
@@ -391,6 +444,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                         models_used: vec![],
                         elapsed_ms: 0,
                         errors_skipped: 0,
+                        fts_notes_failed: 0,
                     };
                     print_report(&report, args.human);
                     eprintln!("warning: no embedding model configured");
@@ -409,6 +463,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_processed: u64 = 0;
     let mut notes_processed: u64 = 0;
     let mut errors_skipped: u64 = 0;
+    let mut fts_notes_failed: u64 = 0;
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     if do_graph {
@@ -499,6 +554,12 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 .await;
                 notes_processed += staged.len() as u64;
             }
+
+            // FTS backfill: index every note in this batch regardless of whether
+            // it had content to embed. Mirrors the upsert_document call in
+            // operations.rs — see note_fts_document for the parity contract.
+            fts_notes_failed += fts_backfill_notes_batch(&rt, &token, &batch).await;
+
             note_bar.update(notes_processed, note_total);
 
             if n < batch_size as usize {
@@ -596,6 +657,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
+        fts_notes_failed,
     };
 
     print_report(&report, args.human);
@@ -713,14 +775,21 @@ fn print_report(report: &ReindexReport, human: bool) {
             "Reindex complete"
         };
         println!(
-            "{status}: {} entities, {} notes{}{} ({} entity/note errors) in {}ms",
+            "{status}: {} entities, {} notes{}{} ({} vector errors, {} FTS errors) in {}ms",
             report.entities_processed,
             report.notes_processed,
             atoms,
             sections,
             report.errors_skipped,
+            report.fts_notes_failed,
             report.elapsed_ms
         );
+        if report.fts_notes_failed > 0 {
+            println!(
+                "FTS backfill: {} note upserts FAILED",
+                report.fts_notes_failed
+            );
+        }
         if report.knowledge_pass_errored {
             println!("Knowledge pass: FAILED (did not run to completion)");
         } else if report.knowledge_atoms_failed > 0 {
@@ -850,6 +919,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
+            fts_notes_failed: 0,
         }
     }
 
@@ -884,6 +954,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
+            fts_notes_failed: 0,
         };
         assert!(
             report.has_failures(),
@@ -913,6 +984,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
+            fts_notes_failed: 0,
         };
         assert!(
             report.has_failures(),
@@ -1064,5 +1136,168 @@ mod tests {
             args.namespace.is_none(),
             "omitted --namespace must be None (not a String default)"
         );
+    }
+
+    #[test]
+    fn has_failures_flags_fts_notes_failed() {
+        let report = ReindexReport {
+            entities_processed: 0,
+            notes_processed: 0,
+            knowledge_atoms_indexed: None,
+            knowledge_sections_indexed: None,
+            knowledge_atoms_failed: 0,
+            knowledge_pass_errored: false,
+            knowledge_ann_failed: false,
+            knowledge_sections_failed: 0,
+            models_used: vec![],
+            elapsed_ms: 0,
+            errors_skipped: 0,
+            fts_notes_failed: 1,
+        };
+        assert!(
+            report.has_failures(),
+            "fts_notes_failed > 0 alone must drive has_failures() = true"
+        );
+        assert!(
+            decide_result(report.has_failures(), false).is_err(),
+            "fts_notes_failed must fail closed (non-zero exit)"
+        );
+        assert!(
+            decide_result(report.has_failures(), true).is_ok(),
+            "best-effort downgrades fts_notes_failed to exit 0"
+        );
+    }
+
+    // Parity: note_fts_document must produce the same body/title as operations.rs.
+    #[test]
+    fn note_fts_document_parity_with_name() {
+        let mut note = Note::new("local", "memory", "the content body");
+        note.name = Some("my title".to_string());
+        let doc = note_fts_document(&note);
+        assert_eq!(doc.subject_id, note.id);
+        assert_eq!(doc.namespace, "local");
+        assert_eq!(doc.title.as_deref(), Some("my title"));
+        assert_eq!(doc.body, "my title the content body");
+        assert_eq!(doc.kind, SubstrateKind::Note);
+    }
+
+    #[test]
+    fn note_fts_document_parity_without_name() {
+        let note = Note::new("local", "memory", "body only content");
+        let doc = note_fts_document(&note);
+        assert!(doc.title.is_none());
+        assert_eq!(doc.body, "body only content");
+    }
+
+    // Regression: insert N notes via NoteStore (bypassing FTS), run
+    // fts_backfill_notes_batch, assert FTS count == N and a keyword hit works.
+    #[tokio::test]
+    async fn fts_backfill_populates_pre_existing_notes() {
+        use khive_storage::types::TextFilter;
+        use khive_types::SubstrateKind;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        let notes: Vec<Note> = (0..5)
+            .map(|i| {
+                Note::new(
+                    "local",
+                    "memory",
+                    format!("zxqsentinel{i} backfill content"),
+                )
+            })
+            .collect();
+
+        let note_store = rt.notes(&token).expect("note store");
+        for note in &notes {
+            note_store
+                .upsert_note(note.clone())
+                .await
+                .expect("upsert note");
+        }
+
+        // FTS should be empty before backfill (notes inserted via store, not runtime).
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        let before = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Note],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count before");
+        assert_eq!(before, 0, "FTS must be empty before backfill");
+
+        // Run the backfill.
+        let errors = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        assert_eq!(errors, 0, "backfill must produce zero errors");
+
+        // FTS must now contain one row per note.
+        let after = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Note],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count after");
+        assert_eq!(after, 5, "FTS must contain exactly N docs after backfill");
+
+        // A keyword from the first note must be retrievable.
+        let hits = fts
+            .search(khive_storage::types::TextSearchRequest {
+                query: "zxqsentinel0".to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .expect("FTS search");
+        assert!(
+            hits.iter().any(|h| h.subject_id == notes[0].id),
+            "pre-existing note must be findable by FTS after backfill"
+        );
+    }
+
+    // Idempotency: running backfill twice must not duplicate rows.
+    #[tokio::test]
+    async fn fts_backfill_is_idempotent() {
+        use khive_storage::types::TextFilter;
+        use khive_types::SubstrateKind;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        let notes: Vec<Note> = (0..3)
+            .map(|i| Note::new("local", "memory", format!("idemnote{i} content")))
+            .collect();
+
+        let note_store = rt.notes(&token).expect("note store");
+        for note in &notes {
+            note_store
+                .upsert_note(note.clone())
+                .await
+                .expect("upsert note");
+        }
+
+        let errors1 = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        let errors2 = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        assert_eq!(errors1, 0);
+        assert_eq!(errors2, 0);
+
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        let count = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Note],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count");
+        assert_eq!(count, 3, "second backfill pass must not duplicate rows");
     }
 }
