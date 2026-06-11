@@ -5277,3 +5277,300 @@ async fn link_concept_to_concept_extends_still_works() {
     let edge = result.unwrap();
     assert_eq!(edge["relation"], "extends");
 }
+
+// ---- #71 regression: hard delete must purge soft-deleted records ----
+
+/// Soft-delete an entity, then hard-delete it — must succeed and leave the row gone.
+#[tokio::test]
+async fn hard_delete_purges_soft_deleted_entity() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PurgeMeEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    f.dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let purge = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        purge.is_ok(),
+        "hard delete of a soft-deleted entity must succeed (issue #71); got: {purge:?}"
+    );
+    assert_eq!(
+        purge.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let second = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        second.is_err(),
+        "second hard delete must return not-found (row is physically gone); got: {second:?}"
+    );
+}
+
+/// Hard-delete a soft-deleted entity resolved via short prefix must succeed.
+#[tokio::test]
+async fn hard_delete_soft_deleted_entity_by_prefix() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PurgeMeByPrefix"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+    let prefix = &full_id[..8];
+
+    f.dispatch("delete", json!({"id": full_id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let purge = f
+        .dispatch("delete", json!({"id": prefix, "hard": true}))
+        .await;
+    assert!(
+        purge.is_ok(),
+        "hard delete by short prefix of a soft-deleted entity must succeed (issue #71); got: {purge:?}"
+    );
+    assert_eq!(
+        purge.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+/// Hard-delete a soft-deleted entity cascades its incident edges.
+#[tokio::test]
+async fn hard_delete_soft_deleted_entity_cascades_edges() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let source = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CascadeSource"}),
+        )
+        .await
+        .expect("create source must succeed");
+    let target = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CascadeTarget"}),
+        )
+        .await
+        .expect("create target must succeed");
+    let source_id = source["id"].as_str().unwrap().to_string();
+    let target_id = target["id"].as_str().unwrap().to_string();
+
+    f.dispatch(
+        "link",
+        json!({"source_id": source_id, "target_id": target_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    f.dispatch("delete", json!({"id": source_id}))
+        .await
+        .expect("soft delete must succeed");
+
+    f.dispatch("delete", json!({"id": source_id, "hard": true}))
+        .await
+        .expect("hard delete of soft-deleted entity must succeed (issue #71)");
+
+    let neighbors = f
+        .dispatch(
+            "neighbors",
+            json!({"node_id": target_id, "direction": "in"}),
+        )
+        .await
+        .expect("neighbors query must succeed");
+    let arr = neighbors.as_array().expect("neighbors must return array");
+    assert!(
+        arr.is_empty(),
+        "hard delete must cascade and remove incident edges; got: {arr:?}"
+    );
+}
+
+/// Hard-delete a soft-deleted entity from a different namespace must be denied.
+#[tokio::test]
+async fn hard_delete_soft_deleted_entity_cross_namespace_denied() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CrossNsConcept"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    f.dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let result = f
+        .dispatch(
+            "delete",
+            json!({"id": id, "hard": true, "namespace": "ns-attacker"}),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "cross-namespace hard delete of a soft-deleted entity must be denied; got: {result:?}"
+    );
+}
+
+/// Soft-delete a note, then hard-delete it — must succeed and leave the row gone.
+#[tokio::test]
+async fn hard_delete_purges_soft_deleted_note() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "purge me note content"}),
+        )
+        .await
+        .expect("create note must succeed");
+    let id = created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    f.dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let purge = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        purge.is_ok(),
+        "hard delete of a soft-deleted note must succeed (issue #71); got: {purge:?}"
+    );
+    assert_eq!(
+        purge.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let second = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        second.is_err(),
+        "second hard delete must return not-found (note row is physically gone); got: {second:?}"
+    );
+}
+
+/// Hard-delete a soft-deleted note from a different namespace must be denied.
+#[tokio::test]
+async fn hard_delete_soft_deleted_note_cross_namespace_denied() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "cross-ns note purge target"}),
+        )
+        .await
+        .expect("create note must succeed");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    f.dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let result = f
+        .dispatch(
+            "delete",
+            json!({"id": id, "hard": true, "namespace": "ns-attacker"}),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "cross-namespace hard delete of a soft-deleted note must be denied; got: {result:?}"
+    );
+}
+
+/// Soft-delete an edge, then hard-delete it WITHOUT supplying explicit kind — must
+/// succeed and leave the row physically gone (ADR-002: public delete auto-detects).
+#[tokio::test]
+async fn hard_delete_soft_deleted_edge_without_kind_purges_row() {
+    use khive_storage::{SqlStatement, SqlValue};
+    use uuid::Uuid;
+
+    let (f, rt) = pack_with_edge_rules();
+
+    let source = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EdgePurgeSource"}),
+        )
+        .await
+        .expect("create source must succeed");
+    let target = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EdgePurgeTarget"}),
+        )
+        .await
+        .expect("create target must succeed");
+    let source_id = source["id"].as_str().unwrap().to_string();
+    let target_id = target["id"].as_str().unwrap().to_string();
+
+    let linked = f
+        .dispatch(
+            "link",
+            json!({"source_id": source_id, "target_id": target_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = linked["id"]
+        .as_str()
+        .expect("link must return id")
+        .to_string();
+    let edge_uuid = Uuid::parse_str(&edge_id).expect("edge id must be valid UUID");
+
+    // Soft-delete the edge.
+    f.dispatch("delete", json!({"id": edge_id}))
+        .await
+        .expect("soft delete must succeed");
+
+    // Hard-delete WITHOUT explicit kind — exercises infer_kind_from_uuid_including_deleted.
+    let purge = f
+        .dispatch("delete", json!({"id": edge_id, "hard": true}))
+        .await;
+    assert!(
+        purge.is_ok(),
+        "hard delete of a soft-deleted edge without kind must succeed (ADR-002); got: {purge:?}"
+    );
+
+    // Verify the row is physically gone via raw SQL (no deleted_at filter).
+    let mut reader = rt.sql().reader().await.expect("sql reader must open");
+    let count = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE id = ?1".into(),
+            params: vec![SqlValue::Text(edge_uuid.to_string())],
+            label: Some("count_edge_row_by_id".into()),
+        })
+        .await
+        .expect("count query must succeed");
+    let row_count = match count {
+        Some(SqlValue::Integer(n)) => n as u64,
+        _ => 0,
+    };
+    assert_eq!(
+        row_count, 0,
+        "hard delete must physically remove the edge row from graph_edges"
+    );
+}

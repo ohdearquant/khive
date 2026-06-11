@@ -492,6 +492,25 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn get_edge_including_deleted(&self, id: LinkId) -> Result<Option<Edge>, StorageError> {
+        let namespace = self.namespace.clone();
+        let id_str = Uuid::from(id).to_string();
+
+        self.with_reader("get_edge_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_edge(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
         let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();
@@ -859,6 +878,20 @@ impl GraphStore for SqlGraphStore {
             }
 
             Ok(all_paths)
+        })
+        .await
+    }
+
+    async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
+        let namespace = self.namespace.clone();
+        let id_str = node_id.to_string();
+        self.with_writer("purge_incident_edges", move |conn| {
+            let affected = conn.execute(
+                "DELETE FROM graph_edges \
+                 WHERE namespace = ?1 AND (source_id = ?2 OR target_id = ?2)",
+                rusqlite::params![namespace, id_str],
+            )?;
+            Ok(affected as u64)
         })
         .await
     }

@@ -280,6 +280,11 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;
+    /// Fetch a note by UUID regardless of soft-deletion state.
+    ///
+    /// Returns the note row even when `deleted_at` is set. Callers use this
+    /// to distinguish "soft-deleted" from "never existed".
+    async fn get_note_including_deleted(&self, id: Uuid) -> StorageResult<Option<Note>>;
     /// Delete a note by UUID using the specified delete mode.
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.

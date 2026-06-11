@@ -89,7 +89,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the entity, note, or edge to fetch.",
+                description: "UUID of the entity, note, edge, event, or proposal to fetch.",
             },
             ParamDef {
                 name: "include_deleted",
