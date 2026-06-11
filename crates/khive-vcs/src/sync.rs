@@ -10,9 +10,9 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
-use khive_storage::types::{Edge, TextDocument};
-use khive_storage::{LinkId, SubstrateKind};
+use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
+use khive_storage::types::Edge;
+use khive_storage::LinkId;
 use khive_types::EdgeRelation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -656,11 +656,6 @@ async fn upsert_entities(
     for r in records {
         let created_at = parse_ts_micros(r.created_at.as_deref());
         let updated_at = parse_ts_micros(r.updated_at.as_deref());
-        // Build the FTS body from name + description (same as create_entity in operations.rs).
-        let body = match &r.description {
-            Some(d) if !d.is_empty() => format!("{} {}", r.name, d),
-            _ => r.name.clone(),
-        };
         let entity = khive_storage::entity::Entity {
             id: r.id,
             namespace: namespace.to_string(),
@@ -676,6 +671,9 @@ async fn upsert_entities(
             merge_event_id: None,
             merged_into: None,
         };
+        // Use the canonical FTS document constructor so sync, create, update,
+        // merge, and reindex all produce identical document shapes.
+        let fts_doc = entity_fts_document(&entity);
         store
             .upsert_entity(entity)
             .await
@@ -683,19 +681,9 @@ async fn upsert_entities(
         // Populate FTS5 index so text search works after sync.
         // Vectors are intentionally skipped: they are local-only derived state
         // and will be computed by `kkernel kg embed` when needed.
-        text.upsert_document(TextDocument {
-            subject_id: r.id,
-            kind: SubstrateKind::Entity,
-            title: Some(r.name.clone()),
-            body,
-            tags: r.tags.clone(),
-            namespace: namespace.to_string(),
-            metadata: r.properties.clone(),
-            updated_at: chrono::DateTime::from_timestamp_micros(updated_at)
-                .unwrap_or_else(chrono::Utc::now),
-        })
-        .await
-        .with_context(|| format!("fts index entity {}", r.id))?;
+        text.upsert_document(fts_doc)
+            .await
+            .with_context(|| format!("fts index entity {}", r.id))?;
         count += 1;
     }
     Ok(count)
@@ -1387,6 +1375,54 @@ mod tests {
         assert!(
             err_str.contains("scp-test") || err_chain.contains("scp-test"),
             "remote name must be present for diagnostics: {err_str} | {err_chain}"
+        );
+    }
+
+    /// Regression: VCS sync FTS document must be field-identical to
+    /// `entity_fts_document` output for the same entity.  Before this fix,
+    /// `upsert_entities` built a `TextDocument` inline with slightly different
+    /// field mapping than the canonical helper, which could produce divergent
+    /// FTS shapes when the helper is updated.
+    #[test]
+    fn sync_fts_document_matches_entity_fts_document() {
+        use khive_runtime::entity_fts_document;
+        use khive_storage::SubstrateKind;
+
+        let id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let props: Option<serde_json::Value> =
+            Some(serde_json::json!({"domain": "attention", "status": "researched"}));
+
+        let entity = khive_storage::entity::Entity {
+            id,
+            namespace: "test-ns".to_string(),
+            kind: "concept".to_string(),
+            entity_type: None,
+            name: "FlashAttention".to_string(),
+            description: Some("Fast attention algorithm".to_string()),
+            properties: props.clone(),
+            tags: vec!["attention".to_string(), "inference".to_string()],
+            created_at: 1_000_000,
+            updated_at: 2_000_000,
+            deleted_at: None,
+            merge_event_id: None,
+            merged_into: None,
+        };
+
+        let doc = entity_fts_document(&entity);
+
+        assert_eq!(doc.subject_id, id);
+        assert_eq!(doc.kind, SubstrateKind::Entity);
+        assert_eq!(doc.namespace, "test-ns");
+        assert_eq!(doc.title.as_deref(), Some("FlashAttention"));
+        assert_eq!(doc.body, "FlashAttention Fast attention algorithm");
+        assert_eq!(
+            doc.tags,
+            vec!["attention".to_string(), "inference".to_string()]
+        );
+        assert_eq!(doc.metadata, props);
+        assert_eq!(
+            doc.updated_at,
+            chrono::DateTime::from_timestamp_micros(2_000_000).unwrap()
         );
     }
 

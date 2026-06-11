@@ -23,8 +23,8 @@ pub mod secret_gate;
 pub mod validation;
 
 pub use curation::{
-    note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy,
-    EntityPatch, MergeSummary, NotePatch,
+    entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
+    EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
 pub use daemon::{

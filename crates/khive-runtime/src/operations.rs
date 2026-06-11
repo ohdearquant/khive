@@ -18,8 +18,8 @@ use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
-    PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter, TextQueryMode,
+    TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -27,7 +27,7 @@ use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
-use crate::curation::note_fts_document;
+use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -357,25 +357,12 @@ impl KhiveRuntime {
         }
         self.entities(token)?.upsert_entity(entity.clone()).await?;
 
-        let body = match &entity.description {
-            Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-            _ => entity.name.clone(),
-        };
-        self.text(token)?
-            .upsert_document(TextDocument {
-                subject_id: entity.id,
-                kind: SubstrateKind::Entity,
-                title: Some(entity.name.clone()),
-                body: body.clone(),
-                tags: entity.tags.clone(),
-                namespace: ns.to_string(),
-                metadata: entity.properties.clone(),
-                updated_at: chrono::Utc::now(),
-            })
-            .await?;
+        let doc = entity_fts_document(&entity);
+        let embed_body = doc.body.clone();
+        self.text(token)?.upsert_document(doc).await?;
 
         if self.config().embedding_model.is_some() {
-            let vector = self.embed_document(&body).await?;
+            let vector = self.embed_document(&embed_body).await?;
             self.vectors(token)?
                 .insert(
                     entity.id,
