@@ -862,6 +862,20 @@ impl GraphStore for SqlGraphStore {
         })
         .await
     }
+
+    async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
+        let namespace = self.namespace.clone();
+        let id_str = node_id.to_string();
+        self.with_writer("purge_incident_edges", move |conn| {
+            let affected = conn.execute(
+                "DELETE FROM graph_edges \
+                 WHERE namespace = ?1 AND (source_id = ?2 OR target_id = ?2)",
+                rusqlite::params![namespace, id_str],
+            )?;
+            Ok(affected as u64)
+        })
+        .await
+    }
 }
 
 // =============================================================================

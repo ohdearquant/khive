@@ -36,4 +36,8 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Vec<NeighborHit>>;
     /// Multi-hop BFS traversal from the given roots.
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
+    /// Hard-delete every incident edge (source or target) for `node_id`, regardless of soft-delete
+    /// state. Used during endpoint hard-delete to prevent dangling `graph_edges` rows (ADR-002
+    /// no-dangling-references contract).
+    async fn purge_incident_edges(&self, node_id: Uuid) -> StorageResult<u64>;
 }

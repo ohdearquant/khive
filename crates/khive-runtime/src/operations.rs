@@ -1779,27 +1779,12 @@ impl KhiveRuntime {
             DeleteMode::Soft
         };
 
-        // On hard delete, cascade-remove incident edges and clean up indexes.
+        // On hard delete, cascade-remove all incident edges (including soft-deleted) and clean up
+        // indexes. Uses purge_incident_edges so that already-soft-deleted edges are also removed,
+        // preventing dangling graph_edges rows (ADR-002 no-dangling-references).
         if hard {
             let graph = self.graph(token)?;
-            for direction in [Direction::Out, Direction::In] {
-                let hits = graph
-                    .neighbors(
-                        id,
-                        NeighborQuery {
-                            direction,
-                            relations: None,
-                            limit: None,
-                            min_weight: None,
-                        },
-                    )
-                    .await?;
-                for hit in hits {
-                    graph
-                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
-                        .await?;
-                }
-            }
+            graph.purge_incident_edges(id).await?;
             let ns_str = ns.to_string();
             self.text_for_notes(token)?
                 .delete_document(&ns_str, id)
@@ -1945,27 +1930,12 @@ impl KhiveRuntime {
             DeleteMode::Soft
         };
 
-        // On hard delete, cascade-remove incident edges to prevent dangling refs.
+        // On hard delete, cascade-remove all incident edges (including soft-deleted) to prevent
+        // dangling refs. Uses purge_incident_edges so that already-soft-deleted edges are also
+        // removed (ADR-002 no-dangling-references).
         if hard {
             let graph = self.graph(token)?;
-            for direction in [Direction::Out, Direction::In] {
-                let hits = graph
-                    .neighbors(
-                        id,
-                        NeighborQuery {
-                            direction,
-                            relations: None,
-                            limit: None,
-                            min_weight: None,
-                        },
-                    )
-                    .await?;
-                for hit in hits {
-                    graph
-                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
-                        .await?;
-                }
-            }
+            graph.purge_incident_edges(id).await?;
             self.remove_from_indexes(token, id).await?;
         }
 
@@ -5887,6 +5857,147 @@ mod tests {
         assert!(
             paths.is_empty(),
             "foreign traversal root must be filtered before expansion, got {paths:?}"
+        );
+    }
+
+    // ---- PR #82 regression: purge cascade must include already-soft-deleted edges ----
+    //
+    // ADR-002 requires hard delete to cascade ALL incident edges synchronously. The old
+    // implementation drove the cascade through `neighbors()`, which filters `deleted_at IS NULL`,
+    // so incident edges that were already soft-deleted survived endpoint purge as dangling rows.
+    // `purge_incident_edges` issues a single DELETE without a `deleted_at` guard.
+
+    /// Count ALL `graph_edges` rows for a given UUID (source OR target), including soft-deleted.
+    async fn count_all_incident_edges(rt: &KhiveRuntime, node_id: Uuid, ns: &str) -> u64 {
+        let mut reader = rt.sql().reader().await.expect("sql reader must open");
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM graph_edges \
+                      WHERE namespace = ?1 AND (source_id = ?2 OR target_id = ?2)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(node_id.to_string()),
+                ],
+                label: Some("count_all_incident_edges".into()),
+            })
+            .await
+            .expect("count query must succeed");
+        match row {
+            Some(SqlValue::Integer(n)) => n as u64,
+            _ => panic!("count must return an integer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_delete_entity_purges_already_soft_deleted_incident_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().to_string();
+
+        let a = rt
+            .create_entity(&tok, "concept", None, "SrcA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "TgtB", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Soft-delete the edge — it is now invisible to `neighbors` but still in storage.
+        let edge_hit = rt
+            .neighbors(&tok, a.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(edge_hit.len(), 1, "edge must exist before soft-delete");
+        let edge_uuid = edge_hit[0].edge_id;
+        rt.delete_edge(&tok, edge_uuid, false).await.unwrap();
+
+        // Confirm the edge is invisible to normal read paths but present in raw storage.
+        let visible = rt
+            .neighbors(&tok, a.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert!(visible.is_empty(), "soft-deleted edge must be invisible");
+        let raw_before = count_all_incident_edges(&rt, a.id, &ns).await;
+        assert_eq!(
+            raw_before, 1,
+            "soft-deleted edge must still be a physical row"
+        );
+
+        // Hard-delete (purge) the source entity — cascade must also remove the soft-deleted edge.
+        rt.delete_entity(&tok, a.id, true).await.unwrap();
+
+        let raw_after = count_all_incident_edges(&rt, a.id, &ns).await;
+        assert_eq!(
+            raw_after, 0,
+            "purge_incident_edges must physically remove soft-deleted edge rows (ADR-002)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_note_purges_already_soft_deleted_incident_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().to_string();
+
+        let target = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "purge-cascade target note",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let annotating = rt
+            .create_note(
+                &tok,
+                "insight",
+                None,
+                "annotator note",
+                Some(0.5),
+                None,
+                vec![target.id],
+            )
+            .await
+            .unwrap();
+
+        // Soft-delete the annotates edge.
+        let edge_hit = rt
+            .neighbors(
+                &tok,
+                annotating.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edge_hit.len(), 1, "annotates edge must exist");
+        let edge_uuid = edge_hit[0].edge_id;
+        rt.delete_edge(&tok, edge_uuid, false).await.unwrap();
+
+        let raw_before = count_all_incident_edges(&rt, target.id, &ns).await;
+        assert_eq!(
+            raw_before, 1,
+            "soft-deleted edge must still be a physical row before note purge"
+        );
+
+        // Hard-delete the target note — cascade must remove the soft-deleted edge row.
+        rt.delete_note(&tok, target.id, true).await.unwrap();
+
+        let raw_after = count_all_incident_edges(&rt, target.id, &ns).await;
+        assert_eq!(
+            raw_after, 0,
+            "purge_incident_edges must physically remove soft-deleted edge rows on note purge (ADR-002)"
         );
     }
 }
