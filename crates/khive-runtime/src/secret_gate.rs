@@ -411,10 +411,28 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
             || has_token_assignment(&low_window);
 
         // Pure hex tokens (git SHA, checksum digests) are allowlisted only when
-        // they are NOT near a credential trigger.  Hex API tokens are real
-        // secrets — a 32-char hex value next to "api key" must be flagged.
+        // they are NOT near a credential trigger.
         if !near_trigger && is_pure_hex(token) {
             continue;
+        }
+
+        // Hex API keys (AWS secret access key, Stripe test keys, random hex
+        // tokens) are pure hex yet are real credentials.  The entropy heuristic
+        // cannot catch them — hex alphabet maxes at log2(16) = 4.0 bits/char,
+        // which is always below ENTROPY_THRESHOLD (4.5).  When a credential-
+        // shaped hex token (32 / 40 / 64 / 128 chars) appears near a trigger
+        // word and the context does NOT contain explicit hash vocabulary (sha,
+        // md5, checksum, digest, hash, fingerprint), treat it as a secret
+        // independently of entropy.
+        const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
+        const HASH_CONTEXT_WORDS: &[&str] =
+            &["sha", "md5", "checksum", "digest", "hash", "fingerprint"];
+        if near_trigger
+            && is_pure_hex(token)
+            && HEX_CREDENTIAL_LENGTHS.contains(&token.len())
+            && !HASH_CONTEXT_WORDS.iter().any(|hw| low_window.contains(hw))
+        {
+            return Some(build_match("hex-credential-token", token));
         }
 
         let entropy = shannon_entropy(token.as_bytes());
@@ -1276,17 +1294,77 @@ mod tests {
     // purely hex tokens near triggers still correctly pass (entropy too low to flag).
 
     #[test]
-    fn hex_near_key_passes_entropy_gate_correctly() {
-        // A pure-hex 32-char token near "api key" has entropy ≤ 4.0 < 4.5 threshold,
-        // so it correctly passes.  This test confirms the gate does NOT over-block
-        // legitimate hex digests used as checksums even when near trigger words.
+    fn hex_near_key_blocked_in_credential_context() {
+        // A pure-hex 32-char token near "api key" is a credential-shaped hex
+        // token in trigger context.  Entropy alone cannot flag it (hex max =
+        // 4.0 < 4.5 threshold), but the explicit hex-credential-token path
+        // must catch it.
         let hex32 = "4f9c2e8a1d3b5c7e9f0a2b4d6e8c0a2b";
         assert_eq!(hex32.len(), 32);
         let line = format!("api key {hex32}");
         assert!(
-            scan(&line).is_none(),
-            "32-char pure hex near 'api key' must pass (entropy below threshold); fired: {:?}",
-            scan(&line)
+            scan(&line).is_some(),
+            "32-char pure hex near 'api key' must be blocked; got None"
+        );
+    }
+
+    #[test]
+    fn hex_credential_lengths_blocked_near_trigger() {
+        // Verify all four credential-shaped lengths are caught near a trigger.
+        let hex40 = "a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4";
+        let hex64 = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b";
+        let hex128 = format!("{hex64}{hex64}");
+        assert_eq!(hex40.len(), 40);
+        assert_eq!(hex64.len(), 64);
+        assert_eq!(hex128.len(), 128);
+
+        for (label, hex) in &[
+            ("hex40", hex40),
+            ("hex64", hex64),
+            ("hex128", hex128.as_str()),
+        ] {
+            let line = format!("secret key: {hex}");
+            assert!(
+                scan(&line).is_some(),
+                "{label} near 'secret key' must be blocked; got None"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_near_sha_context_word_allowed() {
+        // A 40-char hex with "sha" or "commit" in the window must be allowed —
+        // it's a git SHA or integrity hash, not a credential.
+        let hex40 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let sha_line = format!("sha1: {hex40}");
+        let commit_line = format!("commit sha {hex40}");
+        assert!(
+            scan(&sha_line).is_none(),
+            "hex40 near 'sha1' context must be allowed; fired: {:?}",
+            scan(&sha_line)
+        );
+        assert!(
+            scan(&commit_line).is_none(),
+            "hex40 near 'commit sha' context must be allowed; fired: {:?}",
+            scan(&commit_line)
+        );
+    }
+
+    #[test]
+    fn hex64_near_hash_context_allowed() {
+        // A 64-char hex with "sha256" or "hash" in the window must be allowed.
+        let hex64 = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b";
+        let sha_line = format!("sha256: {hex64}");
+        let hash_line = format!("hash value {hex64}");
+        assert!(
+            scan(&sha_line).is_none(),
+            "hex64 near 'sha256' must be allowed; fired: {:?}",
+            scan(&sha_line)
+        );
+        assert!(
+            scan(&hash_line).is_none(),
+            "hex64 near 'hash' must be allowed; fired: {:?}",
+            scan(&hash_line)
         );
     }
 
