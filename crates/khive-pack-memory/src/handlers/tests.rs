@@ -738,3 +738,43 @@ fn recall_text_terms_production_path_uses_constant() {
         recall_text_terms_with_limit(query, RECALL_FTS_TERM_FANOUT_LIMIT),
     );
 }
+
+// ── Type-differentiated salience + decay defaults (#84) ─────────────────────
+//
+// Production-path coverage (dispatches the real handler, asserts stored values)
+// lives in crates/khive-pack-memory/tests/integration.rs:
+//   - test_remember_episodic_defaults_stored
+//   - test_remember_omitted_memory_type_uses_episodic_defaults
+//   - test_remember_semantic_defaults_stored
+//   - test_remember_explicit_salience_overrides_episodic_default
+//   - test_remember_explicit_decay_overrides_episodic_default
+//
+// The named constants exercised by those tests are defined in handlers/common.rs:
+//   DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
+//   DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC.
+
+#[test]
+fn remember_type_defaults_constants_are_differentiated() {
+    use super::common::{
+        DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+        DEFAULT_SALIENCE_SEMANTIC,
+    };
+    const { assert!(DEFAULT_SALIENCE_EPISODIC < DEFAULT_SALIENCE_SEMANTIC) };
+    const { assert!(DEFAULT_DECAY_EPISODIC > DEFAULT_DECAY_SEMANTIC) };
+    assert!(
+        (DEFAULT_SALIENCE_EPISODIC - 0.3).abs() < 1e-12,
+        "episodic salience constant must be 0.3"
+    );
+    assert!(
+        (DEFAULT_SALIENCE_SEMANTIC - 0.5).abs() < 1e-12,
+        "semantic salience constant must be 0.5"
+    );
+    assert!(
+        (DEFAULT_DECAY_EPISODIC - 0.02).abs() < 1e-12,
+        "episodic decay constant must be 0.02"
+    );
+    assert!(
+        (DEFAULT_DECAY_SEMANTIC - 0.005).abs() < 1e-12,
+        "semantic decay constant must be 0.005"
+    );
+}

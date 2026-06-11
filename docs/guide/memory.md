@@ -26,13 +26,13 @@ request(ops="memory.remember(content=\"khive uses RRF fusion for hybrid search s
 
 ### Parameters
 
-| Parameter      | Type   | Default    | Description                                     |
-| -------------- | ------ | ---------- | ----------------------------------------------- |
-| `content`      | string | required   | The memory content                              |
-| `salience`     | float  | 0.5        | Importance weight for recall ranking (0.0-1.0)  |
-| `decay_factor` | float  | 0.01       | Higher = faster decay. 0.01 = ~69-day half-life |
-| `memory_type`  | string | "episodic" | `episodic` or `semantic`                        |
-| `source_id`    | uuid   | none       | Entity or note this memory annotates            |
+| Parameter      | Type   | Default                          | Description                                                               |
+| -------------- | ------ | -------------------------------- | ------------------------------------------------------------------------- |
+| `content`      | string | required                         | The memory content                                                        |
+| `salience`     | float  | episodic: 0.3 / semantic: 0.5    | Importance weight for recall ranking (0.0-1.0)                            |
+| `decay_factor` | float  | episodic: 0.02 / semantic: 0.005 | Higher = faster decay. 0.02 ≈ 35-day half-life; 0.005 ≈ 139-day half-life |
+| `memory_type`  | string | "episodic"                       | `episodic` or `semantic`                                                  |
+| `source_id`    | uuid   | none                             | Entity or note this memory annotates                                      |
 
 ### Salience calibration
 
@@ -116,18 +116,26 @@ $$w_{\text{decay}} = e^{-\lambda \cdot t}$$
 
 where $\lambda$ is `decay_factor` and $t$ is age in days.
 
-With the default `decay_factor=0.01`:
+With the episodic default `decay_factor=0.02`:
 
-- After 1 day: 99% of original salience
-- After 7 days: 93%
-- After 30 days: 74%
-- After 69 days: 50% (half-life)
-- After 180 days: 17%
+- After 1 day: 98% of original salience
+- After 7 days: 87%
+- After 35 days: 50% (half-life)
+- After 69 days: 25%
+- After 180 days: 3%
+
+With the semantic default `decay_factor=0.005`:
+
+- After 1 day: 99.5% of original salience
+- After 30 days: 86%
+- After 139 days: 50% (half-life)
+- After 365 days: 16%
 
 Higher `decay_factor` means faster decay:
 
 - `0.001`: very slow (693-day half-life) — for permanent reference memories
-- `0.01`: moderate (69-day half-life) — default, good for most content
+- `0.005`: slow (139-day half-life) — semantic default, good for durable facts
+- `0.02`: moderate (35-day half-life) — episodic default, good for session context
 - `0.05`: fast (14-day half-life) — for session-specific context
 - `0.1`: very fast (7-day half-life) — for truly ephemeral context
 

@@ -95,13 +95,13 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
                 name: "salience",
                 param_type: "number",
                 required: false,
-                description: "Salience weight 0.0–1.0 (default 0.5).",
+                description: "Salience weight 0.0–1.0. Default is type-differentiated: episodic=0.3, semantic=0.5.",
             },
             ParamDef {
                 name: "decay_factor",
                 param_type: "number",
                 required: false,
-                description: "Decay rate >= 0 (default 0.01). Higher = faster decay. At 0.01 the effective half-life is ~69 days.",
+                description: "Decay rate >= 0. Default is type-differentiated: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.",
             },
             ParamDef {
                 name: "memory_type",
@@ -153,7 +153,7 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

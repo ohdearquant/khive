@@ -12,7 +12,8 @@ use crate::MemoryPack;
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags,
     recall_candidate_count, search_source_label, to_json, validate_memory_type,
-    RecallCandidateParams, RecallParams, TextSnippetPolicy, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+    RecallCandidateParams, RecallParams, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
+    RECALL_DIAGNOSTIC_SNIPPET_CHARS,
 };
 
 impl MemoryPack {
@@ -299,7 +300,7 @@ impl MemoryPack {
                 let decay_factor = candidate
                     .get("decay_factor")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.01);
+                    .unwrap_or(DEFAULT_DECAY_EPISODIC);
                 let age_days = candidate
                     .get("age_days")
                     .and_then(|v| v.as_f64())
