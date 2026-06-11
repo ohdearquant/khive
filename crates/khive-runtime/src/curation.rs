@@ -379,27 +379,14 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         entity: &Entity,
     ) -> RuntimeResult<()> {
-        let body = match &entity.description {
-            Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-            _ => entity.name.clone(),
-        };
         // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
         let ns = entity.namespace.clone();
-        self.text(token)?
-            .upsert_document(TextDocument {
-                subject_id: entity.id,
-                kind: SubstrateKind::Entity,
-                title: Some(entity.name.clone()),
-                body: body.clone(),
-                tags: entity.tags.clone(),
-                namespace: ns.clone(),
-                metadata: entity.properties.clone(),
-                updated_at: chrono::Utc::now(),
-            })
-            .await?;
+        let doc = entity_fts_document(entity);
+        let embed_body = doc.body.clone();
+        self.text(token)?.upsert_document(doc).await?;
 
         if self.config().embedding_model.is_some() {
-            let vector = self.embed_document(&body).await?;
+            let vector = self.embed_document(&embed_body).await?;
             self.vectors(token)?
                 .insert(
                     entity.id,
@@ -620,6 +607,37 @@ impl KhiveRuntime {
 // ---------------------------------------------------------------------------
 // FTS document construction
 // ---------------------------------------------------------------------------
+
+/// Build the `TextDocument` for an entity. This is the single source of truth for
+/// entity FTS document shape; all write paths (create, update, merge, reindex, backfill)
+/// must go through this function so search parity is guaranteed.
+///
+/// Body rule: when the entity has a non-empty description, prepend the name
+/// (`"<name> <description>"`). Otherwise the body is just the name. This
+/// matches the FTS index contract: `title` and `body` are the ranked columns;
+/// `tags`, `metadata`, and `namespace` are UNINDEXED.
+///
+/// `updated_at` is taken from the entity's own timestamp so that backfill and
+/// reindex runs record the entity's actual mutation time rather than the
+/// reindex execution time.
+pub fn entity_fts_document(entity: &Entity) -> TextDocument {
+    let body = match &entity.description {
+        Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
+        _ => entity.name.clone(),
+    };
+    let updated_at =
+        chrono::DateTime::from_timestamp_micros(entity.updated_at).unwrap_or_else(chrono::Utc::now);
+    TextDocument {
+        subject_id: entity.id,
+        kind: SubstrateKind::Entity,
+        title: Some(entity.name.clone()),
+        body,
+        tags: entity.tags.clone(),
+        namespace: entity.namespace.clone(),
+        metadata: entity.properties.clone(),
+        updated_at,
+    }
+}
 
 /// Build the `TextDocument` for a note. This is the single source of truth for
 /// note FTS document shape; all write paths (create, update, reindex) must go
@@ -1012,6 +1030,9 @@ fn merge_entity_sql(
         )?;
 
         // --- Reindex into_id in FTS (delete existing, insert updated) ---
+        // Body formula mirrors entity_fts_document (the canonical constructor) —
+        // this path is sync/spawn_blocking so it cannot call entity_fts_document
+        // directly, but must stay field-identical.
         let fts_body = match &merged_description {
             Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
             _ => merged_name.clone(),
@@ -2880,5 +2901,182 @@ mod tests {
         assert!(rt.get_entity(&ns_a, into_a.id).await.is_ok());
         assert!(rt.get_entity(&ns_a, from_a.id).await.is_ok());
         assert!(rt.get_entity(&ns_b, foreign_b.id).await.is_ok());
+    }
+
+    // Parity: entity_fts_document must produce the same body/title as the
+    // create_entity and update_entity FTS write paths.
+    #[test]
+    fn entity_fts_document_with_description() {
+        let mut entity = Entity::new("local", "concept", "MyEntity");
+        entity = entity.with_description("some description text");
+        let doc = entity_fts_document(&entity);
+        assert_eq!(doc.subject_id, entity.id);
+        assert_eq!(doc.namespace, "local");
+        assert_eq!(doc.title.as_deref(), Some("MyEntity"));
+        assert_eq!(doc.body, "MyEntity some description text");
+        assert_eq!(doc.kind, khive_types::SubstrateKind::Entity);
+    }
+
+    #[test]
+    fn entity_fts_document_without_description() {
+        let entity = Entity::new("local", "concept", "NameOnly");
+        let doc = entity_fts_document(&entity);
+        assert_eq!(doc.title.as_deref(), Some("NameOnly"));
+        assert_eq!(doc.body, "NameOnly");
+    }
+
+    #[test]
+    fn entity_fts_document_empty_description_uses_name_only() {
+        let mut entity = Entity::new("local", "concept", "TitleOnly");
+        entity = entity.with_description("");
+        let doc = entity_fts_document(&entity);
+        assert_eq!(
+            doc.body, "TitleOnly",
+            "empty description must not be appended"
+        );
+    }
+
+    // Cross-path equality: an entity created through the runtime (operations.rs
+    // create_entity path) must produce a stored FTS document field-identical to
+    // entity_fts_document() called on the same Entity.
+    #[tokio::test]
+    async fn entity_fts_document_matches_runtime_create_path() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "CrossPathTitle",
+                Some("cross path description body"),
+                Some(serde_json::json!({"key": "val"})),
+                vec!["tag1".to_string()],
+            )
+            .await
+            .expect("create_entity");
+
+        let fts = rt.text(&tok).expect("FTS store");
+        let stored = fts
+            .get_document("local", entity.id)
+            .await
+            .expect("get_document")
+            .expect("document must exist after create_entity");
+
+        let expected = entity_fts_document(&entity);
+
+        assert_eq!(stored.subject_id, expected.subject_id, "subject_id");
+        assert_eq!(stored.kind, expected.kind, "kind");
+        assert_eq!(stored.title, expected.title, "title");
+        assert_eq!(stored.body, expected.body, "body");
+        assert_eq!(stored.namespace, expected.namespace, "namespace");
+    }
+
+    // Cross-path equality: update_entity must produce a stored FTS document
+    // field-identical to entity_fts_document() on the updated Entity.
+    #[tokio::test]
+    async fn entity_fts_document_matches_runtime_update_path() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "OldName",
+                Some("old desc"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_entity");
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    name: Some("NewName".to_string()),
+                    description: Some(Some("new desc".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update_entity");
+
+        let fts = rt.text(&tok).expect("FTS store");
+        let stored = fts
+            .get_document("local", updated.id)
+            .await
+            .expect("get_document")
+            .expect("document must exist after update_entity");
+
+        let expected = entity_fts_document(&updated);
+
+        assert_eq!(stored.title, expected.title, "title after update");
+        assert_eq!(stored.body, expected.body, "body after update");
+    }
+
+    // Cross-path equality: merge_entity must produce a stored FTS document for
+    // the kept entity that is field-identical to entity_fts_document().
+    #[tokio::test]
+    async fn entity_fts_document_matches_runtime_merge_path() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let into_e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "IntoEntity",
+                Some("into desc"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create into");
+        let from_e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FromEntity",
+                Some("from desc"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create from");
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into_e.id,
+                from_e.id,
+                EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await
+            .expect("merge_entity");
+
+        let kept = rt
+            .get_entity(&tok, summary.kept_id)
+            .await
+            .expect("get kept");
+
+        let fts = rt.text(&tok).expect("FTS store");
+        let stored = fts
+            .get_document("local", kept.id)
+            .await
+            .expect("get_document")
+            .expect("FTS document must exist for kept entity after merge");
+
+        let expected = entity_fts_document(&kept);
+
+        assert_eq!(stored.title, expected.title, "title after merge");
+        assert_eq!(stored.body, expected.body, "body after merge");
     }
 }

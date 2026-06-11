@@ -16,7 +16,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
-use khive_runtime::{note_fts_document, KhiveRuntime, Namespace};
+use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
+use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
 use khive_storage::VectorStore;
@@ -215,6 +216,8 @@ struct ReindexReport {
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
     errors_skipped: u64,
+    /// Entity FTS upserts that failed during the backfill pass.
+    entities_fts_failed: u64,
     /// Note FTS upserts that failed during the backfill pass.
     notes_fts_failed: u64,
 }
@@ -223,6 +226,7 @@ impl ReindexReport {
     /// Did any part of the run fail? Drives the fail-closed exit decision.
     fn has_failures(&self) -> bool {
         self.errors_skipped > 0
+            || self.entities_fts_failed > 0
             || self.notes_fts_failed > 0
             || self.knowledge_atoms_failed > 0
             || self.knowledge_pass_errored
@@ -339,6 +343,32 @@ async fn fts_backfill_notes_batch(
     errors
 }
 
+/// Upsert FTS documents for a batch of entities into the namespace text index. Returns the
+/// number of per-entity upsert failures. Idempotent: calling again for an already-indexed
+/// entity replaces the existing row (FTS upsert semantics). Fails per-entity, never panics.
+async fn fts_backfill_entities_batch(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    batch: &[Entity],
+) -> u64 {
+    let fts = match rt.text(token) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "FTS store unavailable; counting whole batch as failed");
+            return batch.len() as u64;
+        }
+    };
+    let mut errors: u64 = 0;
+    for entity in batch {
+        let doc = entity_fts_document(entity);
+        if let Err(e) = fts.upsert_document(doc).await {
+            tracing::warn!(id = %entity.id, error = %e, "FTS upsert failed for entity");
+            errors += 1;
+        }
+    }
+    errors
+}
+
 /// Return the subset of `ids` that do NOT already have an embedding in `vectors`
 /// for the given `namespace`. When `batch_exists` is unsupported (e.g. a custom
 /// backend), conservatively returns all IDs so every record gets embedded.
@@ -428,6 +458,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_processed: u64 = 0;
     let mut notes_processed: u64 = 0;
     let mut errors_skipped: u64 = 0;
+    let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
@@ -472,6 +503,12 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 .await;
                 entities_processed += staged.len() as u64;
             }
+
+            // FTS backfill: index every entity in this batch regardless of whether
+            // it had content to embed. Mirrors the upsert_document call in
+            // operations.rs — see entity_fts_document for the parity contract.
+            entities_fts_failed += fts_backfill_entities_batch(&rt, &token, &batch).await;
+
             entity_bar.update(entities_processed, entity_total);
 
             if n < batch_size as usize {
@@ -622,6 +659,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
+        entities_fts_failed,
         notes_fts_failed,
     };
 
@@ -739,6 +777,7 @@ fn print_report(report: &ReindexReport, human: bool) {
         } else {
             "Reindex complete"
         };
+        let fts_errors = report.entities_fts_failed + report.notes_fts_failed;
         println!(
             "{status}: {} entities, {} notes{}{} ({} vector errors, {} FTS errors) in {}ms",
             report.entities_processed,
@@ -746,9 +785,15 @@ fn print_report(report: &ReindexReport, human: bool) {
             atoms,
             sections,
             report.errors_skipped,
-            report.notes_fts_failed,
+            fts_errors,
             report.elapsed_ms
         );
+        if report.entities_fts_failed > 0 {
+            println!(
+                "FTS backfill: {} entity upserts FAILED",
+                report.entities_fts_failed
+            );
+        }
         if report.notes_fts_failed > 0 {
             println!(
                 "FTS backfill: {} note upserts FAILED",
@@ -884,6 +929,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
+            entities_fts_failed: 0,
             notes_fts_failed: 0,
         }
     }
@@ -919,6 +965,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
+            entities_fts_failed: 0,
             notes_fts_failed: 0,
         };
         assert!(
@@ -949,6 +996,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
+            entities_fts_failed: 0,
             notes_fts_failed: 0,
         };
         assert!(
@@ -1117,6 +1165,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
+            entities_fts_failed: 0,
             notes_fts_failed: 1,
         };
         assert!(
@@ -1456,5 +1505,258 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 3, "second backfill pass must not duplicate rows");
+    }
+
+    // Parity: entity_fts_document must produce the same body/title as
+    // operations.rs create_entity.
+    #[test]
+    fn entity_fts_document_parity_with_description() {
+        use khive_storage::entity::Entity;
+        let mut entity = Entity::new("local", "concept", "TestEntity");
+        entity = entity.with_description("detail text");
+        let doc = entity_fts_document(&entity);
+        assert_eq!(doc.subject_id, entity.id);
+        assert_eq!(doc.namespace, "local");
+        assert_eq!(doc.title.as_deref(), Some("TestEntity"));
+        assert_eq!(doc.body, "TestEntity detail text");
+        assert_eq!(doc.kind, SubstrateKind::Entity);
+    }
+
+    #[test]
+    fn entity_fts_document_parity_without_description() {
+        use khive_storage::entity::Entity;
+        let entity = Entity::new("local", "concept", "NameOnly");
+        let doc = entity_fts_document(&entity);
+        assert_eq!(doc.title.as_deref(), Some("NameOnly"));
+        assert_eq!(doc.body, "NameOnly");
+    }
+
+    // Regression: insert N entities via EntityStore (bypassing FTS), run
+    // fts_backfill_entities_batch, assert FTS count == N and a keyword hit works.
+    #[tokio::test]
+    async fn fts_backfill_populates_pre_existing_entities() {
+        use khive_storage::entity::Entity;
+        use khive_storage::types::TextFilter;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        let entities: Vec<Entity> = (0..5)
+            .map(|i| {
+                Entity::new("local", "concept", format!("zxqentitysentinel{i}"))
+                    .with_description(format!("backfill entity description {i}"))
+            })
+            .collect();
+
+        let entity_store = rt.entities(&token).expect("entity store");
+        for entity in &entities {
+            entity_store
+                .upsert_entity(entity.clone())
+                .await
+                .expect("upsert entity");
+        }
+
+        // FTS should be empty before backfill (entities inserted via store, not runtime).
+        let fts = rt.text(&token).expect("FTS store");
+        let before = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Entity],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count before");
+        assert_eq!(before, 0, "FTS must be empty before backfill");
+
+        // Run the backfill.
+        let errors = fts_backfill_entities_batch(&rt, &token, &entities).await;
+        assert_eq!(errors, 0, "backfill must produce zero errors");
+
+        // FTS must now contain one row per entity.
+        let after = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Entity],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count after");
+        assert_eq!(after, 5, "FTS must contain exactly N docs after backfill");
+
+        // A keyword from the first entity must be retrievable.
+        let hits = fts
+            .search(khive_storage::types::TextSearchRequest {
+                query: "zxqentitysentinel0".to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .expect("FTS search");
+        assert!(
+            hits.iter().any(|h| h.subject_id == entities[0].id),
+            "pre-existing entity must be findable by FTS after backfill"
+        );
+    }
+
+    // run_reindex with no embedding model must populate entity FTS for pre-existing
+    // entities. Guards the entity FTS path running independently of embedding.
+    #[tokio::test]
+    async fn run_reindex_populates_entity_fts_without_embedding_model() {
+        use khive_storage::entity::Entity;
+        use khive_storage::types::TextFilter;
+
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+
+        // Seed entities via EntityStore (bypassing runtime FTS write).
+        {
+            let cfg = resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(&db_path),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: true,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve config for seed");
+            let rt = KhiveRuntime::new(cfg).expect("seed runtime");
+            let token = rt
+                .authorize(Namespace::parse("local").expect("ns"))
+                .expect("authorize");
+            let entity_store = rt.entities(&token).expect("entity store");
+            for i in 0..3usize {
+                entity_store
+                    .upsert_entity(Entity::new(
+                        "local",
+                        "concept",
+                        format!("reindex-entity-sentinel{i}"),
+                    ))
+                    .await
+                    .expect("upsert seed entity");
+            }
+        }
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: None,
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: Some("local".to_string()),
+            knowledge_only: false,
+            no_knowledge: true,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        // Verify entity FTS was populated.
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_path),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for verify");
+        let rt = KhiveRuntime::new(cfg).expect("verify runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let fts = rt.text(&token).expect("entity FTS store");
+        let count = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Entity],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("fts count");
+        assert_eq!(
+            count, 3,
+            "run_reindex must populate entity FTS even when no embedding model is configured"
+        );
+    }
+
+    // Idempotency: running entity FTS backfill twice must not duplicate rows.
+    #[tokio::test]
+    async fn fts_backfill_entities_is_idempotent() {
+        use khive_storage::entity::Entity;
+        use khive_storage::types::TextFilter;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        let entities: Vec<Entity> = (0..3)
+            .map(|i| Entity::new("local", "concept", format!("idem-entity{i}")))
+            .collect();
+
+        let entity_store = rt.entities(&token).expect("entity store");
+        for entity in &entities {
+            entity_store
+                .upsert_entity(entity.clone())
+                .await
+                .expect("upsert entity");
+        }
+
+        let errors1 = fts_backfill_entities_batch(&rt, &token, &entities).await;
+        let errors2 = fts_backfill_entities_batch(&rt, &token, &entities).await;
+        assert_eq!(errors1, 0);
+        assert_eq!(errors2, 0);
+
+        let fts = rt.text(&token).expect("FTS store");
+        let count = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Entity],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            count, 3,
+            "second backfill pass must not duplicate entity rows"
+        );
+    }
+
+    // has_failures must flag entities_fts_failed alone.
+    #[test]
+    fn has_failures_flags_entities_fts_failed() {
+        let report = ReindexReport {
+            entities_processed: 0,
+            notes_processed: 0,
+            knowledge_atoms_indexed: None,
+            knowledge_sections_indexed: None,
+            knowledge_atoms_failed: 0,
+            knowledge_pass_errored: false,
+            knowledge_ann_failed: false,
+            knowledge_sections_failed: 0,
+            models_used: vec![],
+            elapsed_ms: 0,
+            errors_skipped: 0,
+            entities_fts_failed: 1,
+            notes_fts_failed: 0,
+        };
+        assert!(
+            report.has_failures(),
+            "entities_fts_failed > 0 alone must drive has_failures() = true"
+        );
+        assert!(
+            decide_result(report.has_failures(), false).is_err(),
+            "entities_fts_failed must fail closed (non-zero exit)"
+        );
+        assert!(
+            decide_result(report.has_failures(), true).is_ok(),
+            "best-effort downgrades entities_fts_failed to exit 0"
+        );
     }
 }
