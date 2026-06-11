@@ -153,7 +153,7 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

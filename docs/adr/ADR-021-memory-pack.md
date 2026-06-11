@@ -157,8 +157,15 @@ distinguish it from generic note search:
    episodic, plain RRF for semantic) are forward-compatible: the handler can branch on
    `properties.memory_type` without any schema change.
 
-`memory_type` (optional) post-filters to `episodic` or `semantic` only. Default returns
-both.
+`memory_type` (optional) filters to `episodic` or `semantic`. Notes with no stored
+`memory_type` property resolve to `episodic` (the default) for both filtering and scoring.
+Default (no filter) returns both types.
+
+Each recall hit carries **resolved (read-model) values**: `memory_type` is always a
+non-null string (`"episodic"` or `"semantic"`), and `salience`/`decay_factor` reflect the
+effective values used for ranking — the stored values when present, or the type-appropriate
+defaults (`episodic: 0.3/0.02`, `semantic: 0.5/0.005`) when the stored columns are NULL.
+This contrasts with `get`, which returns raw stored fields for curation purposes.
 
 `min_score` truncates low-scoring matches before returning.
 

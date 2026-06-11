@@ -2913,4 +2913,35 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
         "legacy note with no stored memory_type must appear in recall(memory_type=\"episodic\"); \
          returned ids: {returned_ids:?}"
     );
+
+    // Recall hits must carry resolved (read-model) values, not raw stored NULLs.
+    // Consumers such as ranking explanations and brain.auto_feedback rely on these fields.
+    let legacy_hit = hits
+        .iter()
+        .find(|h| h["note_id"].as_str().unwrap_or("") == legacy_id)
+        .expect("legacy hit present");
+
+    let hit_memory_type = legacy_hit["memory_type"]
+        .as_str()
+        .expect("memory_type field present in hit");
+    assert_eq!(
+        hit_memory_type, "episodic",
+        "recall hit memory_type must be resolved to \"episodic\" for legacy note; got {hit_memory_type:?}"
+    );
+
+    let hit_salience = legacy_hit["salience"]
+        .as_f64()
+        .expect("salience field present in hit");
+    assert!(
+        (hit_salience - 0.3).abs() < 1e-12,
+        "recall hit salience must be episodic default 0.3 for legacy note; got {hit_salience}"
+    );
+
+    let hit_decay = legacy_hit["decay_factor"]
+        .as_f64()
+        .expect("decay_factor field present in hit");
+    assert!(
+        (hit_decay - 0.02).abs() < 1e-12,
+        "recall hit decay_factor must be episodic default 0.02 for legacy note; got {hit_decay}"
+    );
 }
