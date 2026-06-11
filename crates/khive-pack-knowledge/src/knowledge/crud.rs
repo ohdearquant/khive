@@ -91,7 +91,7 @@ impl KnowledgeHandlers {
                 writer
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom.
-                        // Never demote an already reviewed/verified row, and leave status
+                        // Never demote an already reviewed row, and leave status
                         // untouched when not finalizing.
                         sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![

@@ -939,21 +939,23 @@ impl KnowledgeHandlers {
         let requested_statuses = status_values(p.status.as_ref());
         let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
-        // When no explicit status filter is given and include_drafts is not true,
-        // exclude both 'draft' and 'deprecated' from results by default.
-        // Callers that want draft atoms pass include_drafts=true.
-        // An explicit status= filter overrides this (the caller controls what they want).
-        let exclude_statuses_buf: Vec<&str> = if requested_statuses.is_empty() {
+        // Precedence (highest to lowest, matches ADR-047 §Status filtering):
+        //   1. explicit status=  → no exclusion; SQL handles the allowlist
+        //   2. no status=, explicit exclude_status= → use that exclusion
+        //   3. no status=, include_drafts=true → exclude only deprecated
+        //   4. default (no status params) → exclude draft and deprecated
+        let exclude_statuses_buf: Vec<&str> = if !requested_statuses.is_empty() {
+            // Caller specified exact status; no exclusion needed — SQL allowlist wins.
+            vec![]
+        } else if let Some(ref ex) = p.exclude_status {
+            vec![ex.as_str()]
+        } else {
             let include_drafts = p.include_drafts.unwrap_or(false);
             if include_drafts {
                 vec!["deprecated"]
             } else {
                 vec!["draft", "deprecated"]
             }
-        } else if let Some(ref ex) = p.exclude_status {
-            vec![ex.as_str()]
-        } else {
-            vec![]
         };
 
         let ctx = SearchCtx {
@@ -1196,6 +1198,17 @@ impl KnowledgeHandlers {
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
+        }
+
+        // Auto-compose inherits the same quality default as knowledge.search and
+        // knowledge.suggest: draft and deprecated atoms are excluded unless the caller
+        // explicitly provided atom_ids (which is an opt-in to whatever those IDs hold).
+        if is_auto {
+            const COMPOSE_EXCLUDE: &[&str] = &["draft", "deprecated"];
+            ordered_atoms.retain(|a| {
+                let status = a.status.as_deref().unwrap_or("");
+                !COMPOSE_EXCLUDE.contains(&status)
+            });
         }
 
         if ordered_atoms.is_empty() {

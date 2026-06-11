@@ -224,7 +224,7 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     pub exclude_status: Option<String>,
     /// When false (default), draft atoms are excluded from results.
-    /// Pass true to include draft atoms alongside reviewed/verified ones.
+    /// Pass true to include draft atoms alongside reviewed ones.
     /// Has no effect when an explicit `status` filter is provided.
     #[serde(default)]
     pub include_drafts: Option<bool>,

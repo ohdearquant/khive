@@ -1,8 +1,26 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b)
 **Date**: 2026-05-25
 **Authors**: Ocean, lambda:khive
+
+## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
+
+Follow-up to the 2026-06-10 amendment (PR #90, round 2 review findings):
+
+- **`exclude_status` precedence corrected**: the parameter now works as documented.
+  Precedence: explicit `status=` → no exclusion; else explicit `exclude_status=` → use it;
+  else `include_drafts=true` → exclude deprecated only; else default → exclude draft+deprecated.
+  The previous implementation silently ignored `exclude_status` when no `status=` was present.
+- **Auto-compose member atoms filtered**: when `knowledge.compose` runs in auto mode (no explicit
+  `domain_ids` or `atom_ids`), domain member atoms are now filtered by the same
+  `["draft", "deprecated"]` exclusion before building the briefing. Explicit `atom_ids` are not
+  filtered — the caller opts into whatever those IDs hold.
+- **Atom status taxonomy**: the closed atom-level status set is `draft | reviewed | deprecated`.
+  `verified` is a **section-level** status only (used by the dispute/resolution flow in
+  `knowledge.edit`). No public write path (`upsert_atoms`, migrations) sets atom `status` to
+  `verified`. The `verified` arm in `status_multiplier` has been removed; unknown atom statuses
+  fall through to the `reviewed`-equivalent 1.0 multiplier.
 
 ## Amendment (2026-06-10): knowledge.search draft exclusion default; status taxonomy; suggest/compose alignment
 
@@ -213,8 +231,9 @@ fields with configurable weights. Features:
 
 **Status filtering (amended 2026-06-10)**:
 
-The status taxonomy is a closed set: `draft` | `reviewed` | `deprecated`. Atoms have no status
-field by default and are treated as `reviewed` for scoring purposes.
+The atom status taxonomy is a closed set: `draft` | `reviewed` | `deprecated`. Atoms with no
+status are treated as `reviewed` for scoring purposes. `verified` is a **section-level** status
+only (set by the dispute-resolution flow); atom-level `verified` is not a valid public value.
 
 By default, `knowledge.search` and `knowledge.suggest` exclude both `draft` and `deprecated` atoms
 from results. This is the quality default — callers that index atoms before they are finalized

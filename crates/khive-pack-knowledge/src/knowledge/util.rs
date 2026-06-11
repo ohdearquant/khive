@@ -267,8 +267,10 @@ pub(super) fn explicitly_requested_status(statuses: &[String], status: &str) -> 
 }
 
 pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
+    // Atom status taxonomy: draft | reviewed | deprecated (closed set per ADR-047).
+    // 'verified' is a section-level status only; no public write path sets atom status
+    // to 'verified', so it falls through to the 1.0 default here.
     match status.unwrap_or("reviewed") {
-        "verified" => 1.2,
         "reviewed" => 1.0,
         "draft" => 0.8,
         "deprecated" => 0.0,

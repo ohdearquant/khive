@@ -2494,3 +2494,213 @@ mod ann_bypass_regression {
         );
     }
 }
+
+// ── exclude_status precedence regression (round-2 High-1) ─────────────────────
+
+// exclude_status= with NO status= must exclude matching atoms.
+// Previously the buffer logic silently ignored exclude_status when no status= was set.
+#[tokio::test]
+async fn exclude_status_without_status_param_excludes_target_status() {
+    let f = pack(rt());
+
+    // Seed a reviewed and a draft atom with shared distinctive content.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "prec-reviewed",
+                    "name": "Precedence Reviewed Atom",
+                    "content": "precedence exclude status regression reviewed dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique prec78a"
+                },
+                {
+                    "slug": "prec-draft",
+                    "name": "Precedence Draft Atom",
+                    "content": "precedence exclude status regression draft dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique prec78a"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    // Ensure statuses are set explicitly.
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("prec-reviewed".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("prec-draft".into())],
+    )
+    .await;
+
+    // exclude_status=reviewed, no status= → reviewed atoms must be excluded.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "precedence exclude status regression unique prec78a",
+                "rerank": false,
+                "exclude_status": "reviewed",
+                "include_drafts": true
+            }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"Precedence Reviewed Atom"),
+        "exclude_status=reviewed must remove reviewed atoms (no status= set): {names:?}"
+    );
+    assert!(
+        names.contains(&"Precedence Draft Atom"),
+        "draft atom must appear when include_drafts=true and exclude_status=reviewed: {names:?}"
+    );
+}
+
+// When status= is set, exclude_status= must have no effect (status= takes precedence).
+#[tokio::test]
+async fn exclude_status_is_ignored_when_status_param_is_set() {
+    let f = pack(rt());
+
+    // Seed reviewed and draft atoms.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "prec2-reviewed",
+                    "name": "Prec2 Reviewed Atom",
+                    "content": "precedence2 status override reviewed dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique prec78b"
+                },
+                {
+                    "slug": "prec2-draft",
+                    "name": "Prec2 Draft Atom",
+                    "content": "precedence2 status override draft dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique prec78b"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("prec2-reviewed".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("prec2-draft".into())],
+    )
+    .await;
+
+    // status=reviewed + exclude_status=reviewed: status= wins, reviewed atoms appear.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "precedence2 status override unique prec78b",
+                "rerank": false,
+                "status": "reviewed",
+                "exclude_status": "reviewed"
+            }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Prec2 Reviewed Atom"),
+        "status=reviewed overrides exclude_status=reviewed: reviewed atom must appear: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Prec2 Draft Atom"),
+        "status=reviewed must not return draft atoms: {names:?}"
+    );
+}
+
+// ── auto-compose draft member filter regression (round-2 High-2) ──────────────
+
+// When compose runs in explicit domain_ids mode (is_auto=false), draft member atoms
+// must NOT be filtered — the caller opted in by supplying the domain directly.
+#[tokio::test]
+async fn explicit_domain_ids_compose_includes_draft_member_atoms() {
+    let f = pack(rt());
+
+    // Seed a draft member atom.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": "compose-draft-member",
+                "name": "Compose Draft Member",
+                "content": "compose explicit domain draft member atom dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique cmp78d"
+            }]
+        }),
+    )
+    .await
+    .expect("seed draft atom");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("compose-draft-member".into())],
+    )
+    .await;
+
+    // Upsert a domain whose member list includes the draft atom.
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [{
+                "slug": "compose-explicit-domain",
+                "name": "Compose Explicit Domain",
+                "description": "compose explicit domain ids draft member test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique cmp78e",
+                "members": ["compose-draft-member"]
+            }]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    // Get the domain id.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "compose explicit domain ids draft member unique cmp78e", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search domain");
+    let domain_id = resp["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|r| r["slug"].as_str() == Some("compose-explicit-domain"))
+        .and_then(|r| r["id"].as_str())
+        .expect("domain id in results")
+        .to_string();
+
+    // Explicit domain_ids compose: draft member atom must appear (caller opted in).
+    let compose_resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "query": "compose explicit domain ids draft member unique cmp78e",
+                "domain_ids": [&domain_id]
+            }),
+        )
+        .await
+        .expect("compose ok");
+
+    let atoms = compose_resp["data"]["atoms"].as_array().expect("atoms");
+    let atom_names: Vec<&str> = atoms.iter().filter_map(|a| a["slug"].as_str()).collect();
+    assert!(
+        atom_names.contains(&"compose-draft-member"),
+        "explicit domain_ids compose must include draft member atoms (caller opted in): {atom_names:?}"
+    );
+}
