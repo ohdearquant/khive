@@ -1,8 +1,41 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b)
 **Date**: 2026-05-25
 **Authors**: Ocean, lambda:khive
+
+## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
+
+Follow-up to the 2026-06-10 amendment (PR #90, round 2 review findings):
+
+- **`exclude_status` precedence corrected**: the parameter now works as documented.
+  Precedence: explicit `status=` → no exclusion; else explicit `exclude_status=` → use it;
+  else `include_drafts=true` → exclude deprecated only; else default → exclude draft+deprecated.
+  The previous implementation silently ignored `exclude_status` when no `status=` was present.
+- **Auto-compose member atoms filtered**: when `knowledge.compose` runs in auto mode (no explicit
+  `domain_ids` or `atom_ids`), domain member atoms are now filtered by the same
+  `["draft", "deprecated"]` exclusion before building the briefing. Explicit `atom_ids` are not
+  filtered — the caller opts into whatever those IDs hold.
+- **Atom status taxonomy**: the closed atom-level status set is `draft | reviewed | deprecated`.
+  `verified` is a **section-level** status only (used by the dispute/resolution flow in
+  `knowledge.edit`). No public write path (`upsert_atoms`, migrations) sets atom `status` to
+  `verified`. The `verified` arm in `status_multiplier` has been removed; unknown atom statuses
+  fall through to the `reviewed`-equivalent 1.0 multiplier.
+
+## Amendment (2026-06-10): knowledge.search draft exclusion default; status taxonomy; suggest/compose alignment
+
+The search-quality work (issue #78, PR #90) adds the following contract changes. Where the body
+still reads otherwise, this amendment governs:
+
+- `knowledge.search` and `knowledge.suggest` now exclude `draft` and `deprecated` atoms by
+  default. Pass `include_drafts=true` to include drafts (`deprecated` always excluded by default).
+  Explicit `status=` overrides all defaults.
+- The new public parameters `include_drafts`, `status`, and `exclude_status` are documented in
+  the `knowledge.search` verb contract below.
+- `knowledge.suggest` and auto-`knowledge.compose` share the same default exclusion. There is
+  no `include_drafts` on `suggest`.
+- The default exclusion applies to **all result sources** including ANN-sourced candidates
+  (filtered post-hydration), not only the SQL/FTS path.
 
 ## Amendment (2026-06-07): content-only atoms; normalized response envelope
 
@@ -183,7 +216,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
@@ -195,6 +228,35 @@ fields with configurable weights. Features:
   similarity against the query embedding. `rerank_alpha` controls the blend (0.7 = TF-IDF dominant).
   Disable with `rerank=false`. No-op if no embedder is configured.
 - **Role weighting**: prepends the agent role to the query for contextual scoring.
+
+**Status filtering (amended 2026-06-10)**:
+
+The atom status taxonomy is a closed set: `draft` | `reviewed` | `deprecated`. Atoms with no
+status are treated as `reviewed` for scoring purposes. `verified` is a **section-level** status
+only (set by the dispute-resolution flow); atom-level `verified` is not a valid public value.
+
+By default, `knowledge.search` and `knowledge.suggest` exclude both `draft` and `deprecated` atoms
+from results. This is the quality default — callers that index atoms before they are finalized
+should not have those drafts polluting agent orientation or search results.
+
+Parameter precedence (highest to lowest):
+
+1. `status=<value>` — explicit filter: only atoms with this exact status are returned.
+   `include_drafts` has no effect when `status` is set.
+2. `exclude_status=<value>` — exclude this status; only effective when `status` is not set.
+3. `include_drafts=true` — include `draft` atoms; `deprecated` remain excluded regardless.
+4. Default (no status params) — excludes both `draft` and `deprecated`.
+
+The exclusion policy applies to **all result sources**: FTS/SQL candidates (via SQL predicate)
+and ANN-sourced candidates (filtered post-hydration before rerank). Every result regardless of
+retrieval path goes through the same status gate.
+
+`knowledge.suggest` and auto-`knowledge.compose` (which calls `suggest` internally) share the
+same default exclusion. There is no `include_drafts` override on `suggest` — domain atoms in
+draft state should not drive agent composition.
+
+**Score bands** (observed in production): `score >= 0.46` reliably on-target,
+`0.42 <= score < 0.46` mixed quality, `score < 0.42` mostly off-target.
 
 ### 3. `learn` — concept registration with domain promotion
 

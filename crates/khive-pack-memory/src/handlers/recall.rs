@@ -24,7 +24,8 @@ use crate::MemoryPack;
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
     recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, PROF_CID, RECALL_CALL_ID,
+    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
 };
 
 impl MemoryPack {
@@ -237,6 +238,9 @@ impl MemoryPack {
             raw_score: Option<f32>,
             breakdown: ScoreBreakdown,
             note: khive_storage::note::Note,
+            resolved_memory_type: String,
+            effective_salience: f64,
+            effective_decay_factor: f64,
         }
 
         let recall_pipeline = make_pipeline(&cfg);
@@ -259,13 +263,15 @@ impl MemoryPack {
                 Some(note) => note,
                 None => continue,
             };
+            let note_memory_type: String = note
+                .properties
+                .as_ref()
+                .and_then(|pr| pr.get("memory_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("episodic")
+                .to_owned();
             if let Some(mt) = &p.memory_type {
-                let stored = note
-                    .properties
-                    .as_ref()
-                    .and_then(|pr| pr.get("memory_type"))
-                    .and_then(|v| v.as_str());
-                if stored != Some(mt.as_str()) {
+                if note_memory_type != mt.as_str() {
                     continue;
                 }
             }
@@ -274,22 +280,26 @@ impl MemoryPack {
                     continue;
                 }
             }
-            let salience = note.salience.unwrap_or(0.5);
-            let decay_factor = note.decay_factor.unwrap_or(0.01);
+            let salience = note.salience.unwrap_or(if note_memory_type == "semantic" {
+                DEFAULT_SALIENCE_SEMANTIC
+            } else {
+                DEFAULT_SALIENCE_EPISODIC
+            });
+            let decay_factor = note
+                .decay_factor
+                .unwrap_or(if note_memory_type == "semantic" {
+                    DEFAULT_DECAY_SEMANTIC
+                } else {
+                    DEFAULT_DECAY_EPISODIC
+                });
             if salience < cfg.min_salience {
                 continue;
             }
 
-            let memory_type_str = note
-                .properties
-                .as_ref()
-                .and_then(|pr| pr.get("memory_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("episodic");
             let rank_score = calculate_score(
                 &ScoreInput {
                     salience: salience as f32,
-                    memory_type_str,
+                    memory_type_str: &note_memory_type,
                     content: &note.content,
                     created_at_millis: note.created_at / 1_000,
                     decay_factor: decay_factor as f32,
@@ -343,6 +353,9 @@ impl MemoryPack {
                 raw_score: raw_score_opt,
                 breakdown,
                 note,
+                resolved_memory_type: note_memory_type,
+                effective_salience: salience,
+                effective_decay_factor: decay_factor,
             });
         }
 
@@ -472,21 +485,15 @@ impl MemoryPack {
                     } else {
                         sn.note.content.clone()
                     };
-                let memory_type = sn
-                    .note
-                    .properties
-                    .as_ref()
-                    .and_then(|pr| pr.get("memory_type"))
-                    .and_then(|v| v.as_str());
                 let mut result = json!({
                     "note_id": sn.id.to_string(),
                     "score": sn.score,
                     "rank_score": sn.rank_score,
                     "raw_score": sn.raw_score,
                     "content": content_out,
-                    "salience": sn.note.salience,
-                    "decay_factor": sn.note.decay_factor,
-                    "memory_type": memory_type,
+                    "salience": sn.effective_salience,
+                    "decay_factor": sn.effective_decay_factor,
+                    "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
                 });
                 if is_verbose {

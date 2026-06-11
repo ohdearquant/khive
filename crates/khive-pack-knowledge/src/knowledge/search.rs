@@ -97,6 +97,23 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
     }
 }
 
+// ─── status filtering (post-hydration) ───────────────────────────────────────
+
+/// Remove hits whose `status` is in `exclude_statuses` after hydration.
+///
+/// This is the shared gate for both the SQL path (where exclusion is enforced
+/// in the query) and the ANN-only path (where hydration happens after fusion
+/// and the SQL predicate was never applied to the ANN-sourced IDs).
+fn filter_by_excluded_statuses(hits: &mut Vec<ScoredHit>, exclude_statuses: &[&str]) {
+    if exclude_statuses.is_empty() {
+        return;
+    }
+    hits.retain(|hit| {
+        let status = hit.status.as_deref().unwrap_or("");
+        !exclude_statuses.contains(&status)
+    });
+}
+
 // ─── status scoring ───────────────────────────────────────────────────────────
 
 fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprecated: bool) {
@@ -131,7 +148,7 @@ async fn fetch_fts_candidates(
     raw_query: &str,
     type_filter: Option<&str>,
     statuses: &[String],
-    exclude_status: Option<&str>,
+    exclude_statuses: &[&str],
     fetch_limit: usize,
 ) -> Result<Vec<Atom>, RuntimeError> {
     let sql = runtime.sql();
@@ -156,7 +173,7 @@ async fn fetch_fts_candidates(
 
     if fts_rows.is_empty() {
         // FTS returned nothing — fall back to full scan (small corpora) capped at CANDIDATE_POOL.
-        let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, 3);
+        let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
         let sql_str = format!(
             "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL{} ORDER BY created_at DESC LIMIT ?2",
             status_clause
@@ -200,7 +217,8 @@ async fn fetch_fts_candidates(
         .collect::<Vec<_>>()
         .join(",");
 
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, ids.len() + 2);
+    let (status_clause, status_params) =
+        status_sql_clause(statuses, exclude_statuses, ids.len() + 2);
     let mut params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
     params.extend(ids.iter().map(|id| SqlValue::Text(id.clone())));
     params.extend(status_params);
@@ -230,7 +248,7 @@ struct SearchCtx<'a> {
     w: &'a Weights,
     fetch_limit: usize,
     statuses: &'a [String],
-    exclude_status: Option<&'a str>,
+    exclude_statuses: &'a [&'a str],
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
@@ -281,7 +299,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
         &raw_query,
         type_filter,
         ctx.statuses,
-        ctx.exclude_status,
+        ctx.exclude_statuses,
         CANDIDATE_POOL,
     )
     .await?;
@@ -369,7 +387,7 @@ async fn search_decomposed(
         w: ctx.w,
         fetch_limit: sub_limit,
         statuses: ctx.statuses,
-        exclude_status: ctx.exclude_status,
+        exclude_statuses: ctx.exclude_statuses,
     };
     let s1 = search_core(&sub_ctx1, &sub_q1).await?;
     let s2 = search_core(&sub_ctx1, &sub_q2).await?;
@@ -921,6 +939,35 @@ impl KnowledgeHandlers {
         let requested_statuses = status_values(p.status.as_ref());
         let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
+        // Normalize exclude_status once: trim whitespace, treat blank as absent.
+        // This single normalized value feeds both the SQL predicate (via SearchCtx)
+        // and the ANN post-hydration filter, ensuring both result sources see the
+        // identical exclusion set regardless of how the caller formatted the value.
+        let exclude_status_normalized: Option<&str> = p
+            .exclude_status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Precedence (highest to lowest, matches ADR-047 §Status filtering):
+        //   1. explicit status=  → no exclusion; SQL handles the allowlist
+        //   2. no status=, explicit exclude_status= (non-blank) → use that exclusion
+        //   3. no status=, include_drafts=true → exclude only deprecated
+        //   4. default (no status params / blank exclude_status) → exclude draft and deprecated
+        let exclude_statuses_buf: Vec<&str> = if !requested_statuses.is_empty() {
+            // Caller specified exact status; no exclusion needed — SQL allowlist wins.
+            vec![]
+        } else if let Some(ex) = exclude_status_normalized {
+            vec![ex]
+        } else {
+            let include_drafts = p.include_drafts.unwrap_or(false);
+            if include_drafts {
+                vec!["deprecated"]
+            } else {
+                vec!["draft", "deprecated"]
+            }
+        };
+
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -930,7 +977,7 @@ impl KnowledgeHandlers {
             w: &w,
             fetch_limit,
             statuses: &requested_statuses,
-            exclude_status: p.exclude_status.as_deref(),
+            exclude_statuses: &exclude_statuses_buf,
         };
 
         let mut hits = if do_decompose && non_stop_count >= decompose_threshold {
@@ -949,6 +996,9 @@ impl KnowledgeHandlers {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, min_score);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
+                    // ANN-sourced hits bypass the SQL status predicate; apply the
+                    // same exclusion policy here so all result sources are consistent.
+                    filter_by_excluded_statuses(&mut hits, &exclude_statuses_buf);
                 }
             }
         }
@@ -1002,6 +1052,11 @@ impl KnowledgeHandlers {
         let limit = p.limit.unwrap_or(8).clamp(1, 100);
         let ns = token.namespace().as_str().to_owned();
 
+        // Exclude draft and deprecated domain atoms by default — same quality
+        // default as knowledge.search.  Draft domain atoms are incomplete and
+        // should not drive auto-compose or agent orientation.
+        const SUGGEST_EXCLUDE: &[&str] = &["draft", "deprecated"];
+
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -1011,7 +1066,7 @@ impl KnowledgeHandlers {
             w: &Weights::default(),
             fetch_limit: limit * 3,
             statuses: &[],
-            exclude_status: None,
+            exclude_statuses: SUGGEST_EXCLUDE,
         };
 
         let mut hits = search_core(&ctx, &raw_query).await?;
@@ -1024,6 +1079,8 @@ impl KnowledgeHandlers {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, 0.0);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
+                    // Apply the same status exclusion to ANN-sourced domain hits.
+                    filter_by_excluded_statuses(&mut hits, SUGGEST_EXCLUDE);
                 }
             }
         }
@@ -1151,6 +1208,17 @@ impl KnowledgeHandlers {
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
+        }
+
+        // Auto-compose inherits the same quality default as knowledge.search and
+        // knowledge.suggest: draft and deprecated atoms are excluded unless the caller
+        // explicitly provided atom_ids (which is an opt-in to whatever those IDs hold).
+        if is_auto {
+            const COMPOSE_EXCLUDE: &[&str] = &["draft", "deprecated"];
+            ordered_atoms.retain(|a| {
+                let status = a.status.as_deref().unwrap_or("");
+                !COMPOSE_EXCLUDE.contains(&status)
+            });
         }
 
         if ordered_atoms.is_empty() {
@@ -1358,6 +1426,73 @@ impl KnowledgeHandlers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── filter_by_excluded_statuses ───────────────────────────────────────────
+
+    fn make_hit(id: &str, status: Option<&str>, score: f32) -> ScoredHit {
+        ScoredHit {
+            id: id.to_string(),
+            slug: id.to_string(),
+            name: id.to_string(),
+            content: None,
+            tags: None,
+            finalized: false,
+            is_domain: false,
+            status: status.map(str::to_string),
+            score,
+        }
+    }
+
+    #[test]
+    fn filter_excluded_statuses_removes_draft_hits() {
+        let mut hits = vec![
+            make_hit("reviewed-1", Some("reviewed"), 0.8),
+            make_hit("draft-1", Some("draft"), 0.7),
+            make_hit("reviewed-2", Some("reviewed"), 0.6),
+            make_hit("draft-2", Some("draft"), 0.5),
+        ];
+        filter_by_excluded_statuses(&mut hits, &["draft", "deprecated"]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["reviewed-1", "reviewed-2"],
+            "draft hits must be removed"
+        );
+    }
+
+    #[test]
+    fn filter_excluded_statuses_removes_deprecated_hits() {
+        let mut hits = vec![
+            make_hit("reviewed-1", Some("reviewed"), 0.9),
+            make_hit("deprecated-1", Some("deprecated"), 0.8),
+        ];
+        filter_by_excluded_statuses(&mut hits, &["draft", "deprecated"]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["reviewed-1"]);
+    }
+
+    #[test]
+    fn filter_excluded_statuses_empty_list_is_noop() {
+        let mut hits = vec![
+            make_hit("draft-1", Some("draft"), 0.9),
+            make_hit("reviewed-1", Some("reviewed"), 0.8),
+        ];
+        filter_by_excluded_statuses(&mut hits, &[]);
+        assert_eq!(hits.len(), 2, "empty exclude list must be a no-op");
+    }
+
+    #[test]
+    fn filter_excluded_statuses_null_status_treated_as_not_excluded() {
+        // Hits with no status (ANN-sourced before hydration completes) must not
+        // be removed by the status exclusion — they are not drafts or deprecated.
+        let mut hits = vec![
+            make_hit("no-status", None, 0.9),
+            make_hit("draft-1", Some("draft"), 0.7),
+        ];
+        filter_by_excluded_statuses(&mut hits, &["draft", "deprecated"]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["no-status"], "null-status hit must survive exclusion");
+    }
 
     #[test]
     fn normalize_rrf_score_is_bounded_and_monotonic() {

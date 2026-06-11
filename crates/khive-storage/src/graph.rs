@@ -15,8 +15,11 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
-    /// Fetch an edge by link ID, returning `None` if absent.
+    /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.
     async fn get_edge(&self, id: LinkId) -> StorageResult<Option<Edge>>;
+    /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path
+    /// to locate and namespace-check an already-soft-deleted edge before purging it.
+    async fn get_edge_including_deleted(&self, id: LinkId) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
     /// Query edges with filter, sort, and pagination.
@@ -36,4 +39,8 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Vec<NeighborHit>>;
     /// Multi-hop BFS traversal from the given roots.
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
+    /// Hard-delete every incident edge (source or target) for `node_id`, regardless of soft-delete
+    /// state. Used during endpoint hard-delete to prevent dangling `graph_edges` rows (ADR-002
+    /// no-dangling-references contract).
+    async fn purge_incident_edges(&self, node_id: Uuid) -> StorageResult<u64>;
 }

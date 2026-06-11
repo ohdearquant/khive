@@ -30,11 +30,9 @@ fn parse_section_type(s: &str) -> Result<SectionType, RuntimeError> {
     })
 }
 
-// REASON: section_from_row and section_to_json are forward-deployed helpers for the
-// section-read verb surface (Phase 3); retained so the implementation
-// compiles without gaps when that verb lands.
-#[allow(dead_code)]
-fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
+/// Deserialise a `knowledge_sections` SQL row into a [`Section`].
+/// Returns `None` when the row carries an invalid UUID or unknown `section_type`.
+pub(super) fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
     let st_str = row_str(row, "section_type")?;
     let section_type = SectionType::from_str_loose(&st_str)?;
@@ -54,9 +52,10 @@ fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     })
 }
 
-// REASON: forward-deployed helper; see comment on section_from_row above.
-#[allow(dead_code)]
-fn section_to_json(s: &Section) -> Value {
+/// Serialise a [`Section`] to its wire JSON shape for `knowledge.get` responses.
+/// Fields: `id`, `atom_id`, `namespace`, `section_type`, `heading`, `content`,
+/// `content_hash`, `status`, `tokens`, `sort_order`, `created_at`, `updated_at`.
+pub(super) fn section_to_json(s: &Section) -> Value {
     json!({
         "id": s.id.to_string(),
         "atom_id": s.atom_id,
@@ -64,6 +63,8 @@ fn section_to_json(s: &Section) -> Value {
         "section_type": s.section_type.as_str(),
         "heading": s.heading,
         "content": s.content,
+        "content_hash": s.content_hash,
+        "status": s.status,
         "tokens": s.tokens,
         "sort_order": s.sort_order,
         "created_at": s.created_at,

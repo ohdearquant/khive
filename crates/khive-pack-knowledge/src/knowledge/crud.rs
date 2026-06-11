@@ -9,6 +9,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use super::schema::{
     DeleteAtomsParams, GetParams, ListParams, UpsertAtomsParams, UpsertDomainsParams,
 };
+use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
     domain_to_json, new_id, now_us, row_str, sql_err, status_sql_clause, status_values,
@@ -108,7 +109,7 @@ impl KnowledgeHandlers {
                 writer
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom.
-                        // Never demote an already reviewed/verified row, and leave status
+                        // Never demote an already reviewed row, and leave status
                         // untouched when not finalizing.
                         sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
@@ -351,6 +352,7 @@ impl KnowledgeHandlers {
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let id = p.id.trim().to_string();
+        let with_sections = p.include_sections.unwrap_or(false);
 
         let is_uuid = id.parse::<Uuid>().is_ok();
 
@@ -366,9 +368,14 @@ impl KnowledgeHandlers {
                 .await
                 .map_err(|e| sql_err("get atom by id", e))?;
             if let Some(r) = row {
-                return atom_from_row(&r)
-                    .map(|a| atom_to_json(&a))
-                    .ok_or_else(|| RuntimeError::Internal("atom row parse failed".into()));
+                let atom = atom_from_row(&r)
+                    .ok_or_else(|| RuntimeError::Internal("atom row parse failed".into()))?;
+                let atom_id = atom.id.to_string();
+                let mut out = atom_to_json(&atom);
+                if with_sections {
+                    out["sections"] = fetch_sections(runtime, &ns, &atom_id).await?;
+                }
+                return Ok(out);
             }
             let row = reader
                 .query_row(SqlStatement {
@@ -409,9 +416,14 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("get atom by slug", e))?;
         if let Some(r) = row {
-            return atom_from_row(&r)
-                .map(|a| atom_to_json(&a))
-                .ok_or_else(|| RuntimeError::Internal("atom row parse failed".into()));
+            let atom = atom_from_row(&r)
+                .ok_or_else(|| RuntimeError::Internal("atom row parse failed".into()))?;
+            let atom_id = atom.id.to_string();
+            let mut out = atom_to_json(&atom);
+            if with_sections {
+                out["sections"] = fetch_sections(runtime, &ns, &atom_id).await?;
+            }
+            return Ok(out);
         }
 
         Err(RuntimeError::NotFound(format!(
@@ -469,10 +481,16 @@ impl KnowledgeHandlers {
             }
             Some("atom") | None => {
                 let requested_statuses = status_values(p.status.as_ref());
+                let exclude_buf: Vec<&str> = p
+                    .exclude_status
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .into_iter()
+                    .collect();
                 let (data_status_clause, data_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 4);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 4);
                 let (count_status_clause, count_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 2);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 2);
 
                 let sql_str = format!(
                     "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
@@ -636,6 +654,52 @@ impl KnowledgeHandlers {
             "namespace": ns,
         }))
     }
+}
+
+/// Fetch all sections for `atom_id` scoped to `ns`, ordered by `sort_order`.
+/// Namespace isolation is preserved: `atom_id` was resolved under `ns` by the
+/// caller, and we additionally filter `knowledge_sections.namespace = ns`.
+async fn fetch_sections(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    atom_id: &str,
+) -> Result<Value, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("get sections reader", e))?;
+
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT * FROM knowledge_sections \
+                  WHERE atom_id = ?1 AND namespace = ?2 \
+                  ORDER BY sort_order ASC, created_at ASC, id ASC"
+                .into(),
+            params: vec![
+                SqlValue::Text(atom_id.to_owned()),
+                SqlValue::Text(ns.to_owned()),
+            ],
+            label: None,
+        })
+        .await
+        .map_err(|e| sql_err("get sections query", e))?;
+
+    let mut sections: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        match section_from_row(r) {
+            Some(s) => sections.push(section_to_json(&s)),
+            None => {
+                return Err(RuntimeError::Internal(
+                    "knowledge_sections row is malformed (invalid UUID or section_type); \
+                     data integrity check required"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    Ok(Value::Array(sections))
 }
 
 #[cfg(test)]

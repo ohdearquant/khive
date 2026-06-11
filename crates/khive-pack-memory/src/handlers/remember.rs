@@ -10,7 +10,10 @@ use khive_storage::EdgeRelation;
 use crate::ann;
 use crate::MemoryPack;
 
-use super::common::{deser, to_json, validate_memory_type, RememberParams};
+use super::common::{
+    deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
+    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
+};
 
 impl MemoryPack {
     pub(crate) async fn handle_remember(
@@ -35,7 +38,13 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            None => 0.5,
+            // episodic: lower default — session events decay quickly and should not
+            // crowd out timeless semantic memories in recall ranking.
+            // semantic: higher default — durable facts warrant stronger base weight.
+            None => match memory_type {
+                "semantic" => DEFAULT_SALIENCE_SEMANTIC,
+                _ => DEFAULT_SALIENCE_EPISODIC,
+            },
         };
         let decay_factor = match p.decay_factor {
             Some(v) if !v.is_finite() || v < 0.0 => {
@@ -44,7 +53,12 @@ impl MemoryPack {
                 )));
             }
             Some(v) => v,
-            None => 0.01,
+            // episodic: ~35-day half-life — short-lived session context ages out fast.
+            // semantic: ~139-day half-life — durable facts stay relevant much longer.
+            None => match memory_type {
+                "semantic" => DEFAULT_DECAY_SEMANTIC,
+                _ => DEFAULT_DECAY_EPISODIC,
+            },
         };
 
         let mut props = json!({ "memory_type": memory_type });

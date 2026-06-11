@@ -260,6 +260,28 @@ pub(crate) async fn resolve_uuid_async(
     resolve_name_async(s, runtime, token).await
 }
 
+pub(crate) async fn resolve_uuid_including_deleted(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = Uuid::from_str(s) {
+        return Ok(uuid);
+    }
+    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        match runtime.resolve_prefix_including_deleted(token, s).await {
+            Ok(Some(uuid)) => return Ok(uuid),
+            Ok(None) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "no record matches prefix: {s:?}"
+                )))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    resolve_name_async(s, runtime, token).await
+}
+
 // ---- Output formatting helpers ----
 
 pub(crate) fn format_edge_output(v: Value, _verbose: bool) -> Value {

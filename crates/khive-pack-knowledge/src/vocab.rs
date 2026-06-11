@@ -41,12 +41,20 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         description: "Fetch a single atom or domain by UUID or slug",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[ParamDef {
-            name: "id",
-            param_type: "string",
-            required: true,
-            description: "Atom/domain UUID or slug",
-        }],
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Atom/domain UUID or slug",
+            },
+            ParamDef {
+                name: "include_sections",
+                param_type: "boolean",
+                required: false,
+                description: "When true, include the atom's sections under a `sections` key. Each section object contains: id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at. Ordered by sort_order ASC, created_at ASC, id ASC. Ignored for domains. Default: false.",
+            },
+        ],
     },
     HandlerDef {
         name: "knowledge.list",
@@ -159,7 +167,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured)",
+        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured). Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Score bands: score>=0.46 reliably on-target, 0.42<=score<0.46 mixed quality, score<0.42 mostly off-target.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -174,6 +182,24 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 param_type: "string",
                 required: false,
                 description: "Filter: \"atom\" | \"domain\" (default: both)",
+            },
+            ParamDef {
+                name: "include_drafts",
+                param_type: "boolean",
+                required: false,
+                description: "Include draft (unfinalized) atoms in results (default false). Has no effect when status= is set explicitly.",
+            },
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Return only atoms with this exact status. Valid values: draft | reviewed | deprecated. Overrides include_drafts — when set, include_drafts has no effect.",
+            },
+            ParamDef {
+                name: "exclude_status",
+                param_type: "string",
+                required: false,
+                description: "Exclude atoms with this exact status. Only used when status= is not set. Valid values: draft | reviewed | deprecated.",
             },
             ParamDef {
                 name: "role",
@@ -191,7 +217,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum TF-IDF score threshold (default 0.0)",
+                description: "Minimum score threshold (default 0.0). Score bands: score>=0.46 reliable, 0.42<=score<0.46 mixed, score<0.42 mostly off-target.",
             },
             ParamDef {
                 name: "weights",
@@ -233,7 +259,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search).",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
