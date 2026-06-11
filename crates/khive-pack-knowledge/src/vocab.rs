@@ -159,7 +159,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured). Draft atoms are excluded by default; pass include_drafts=true to opt in. Score bands observed in production: >=0.46 reliably on-target, 0.42-0.46 mixed quality, <0.42 mostly off-target.",
+        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured). Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Score bands: score>=0.46 reliably on-target, 0.42<=score<0.46 mixed quality, score<0.42 mostly off-target.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -182,6 +182,18 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 description: "Include draft (unfinalized) atoms in results (default false). Has no effect when status= is set explicitly.",
             },
             ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Return only atoms with this exact status. Valid values: draft | reviewed | deprecated. Overrides include_drafts — when set, include_drafts has no effect.",
+            },
+            ParamDef {
+                name: "exclude_status",
+                param_type: "string",
+                required: false,
+                description: "Exclude atoms with this exact status. Only used when status= is not set. Valid values: draft | reviewed | deprecated.",
+            },
+            ParamDef {
                 name: "role",
                 param_type: "string",
                 required: false,
@@ -197,7 +209,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum score threshold (default 0.0). Score bands: >=0.46 reliable, 0.42-0.46 mixed, <0.42 mostly off-target.",
+                description: "Minimum score threshold (default 0.0). Score bands: score>=0.46 reliable, 0.42<=score<0.46 mixed, score<0.42 mostly off-target.",
             },
             ParamDef {
                 name: "weights",
@@ -239,7 +251,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search).",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

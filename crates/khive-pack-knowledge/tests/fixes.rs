@@ -1797,6 +1797,64 @@ async fn issue78_explicit_status_filter_overrides_include_drafts() {
     );
 }
 
+// ── issue78: suggest excludes draft domain atoms by default ──────────────────
+
+#[tokio::test]
+async fn issue78_suggest_excludes_draft_domain_atoms_by_default() {
+    let f = pack(rt());
+
+    // Seed a reviewed domain atom and a draft domain atom.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "suggest-domain-rev",
+                    "name": "Suggest Domain Reviewed",
+                    "content": "machine learning transformer architecture attention mechanism neural network deep learning optimization gradient descent backpropagation unique zz78s reviewed domain for suggest test",
+                    "tags": ["type:domain"]
+                },
+                {
+                    "slug": "suggest-domain-dft",
+                    "name": "Suggest Domain Draft",
+                    "content": "machine learning transformer architecture attention mechanism neural network deep learning optimization gradient descent backpropagation unique zz78s draft domain for suggest test",
+                    "tags": ["type:domain"]
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed domain atoms");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("suggest-domain-rev".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("suggest-domain-dft".into())],
+    )
+    .await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.suggest",
+            json!({
+                "query": "machine learning transformer architecture attention mechanism gradient"
+            }),
+        )
+        .await
+        .expect("suggest ok");
+
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"Suggest Domain Draft"),
+        "suggest must exclude draft domain atoms by default: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn search_rerank_false_is_explicit_opt_out() {
     let f = pack(rt_with_default_embedder());
@@ -2246,6 +2304,193 @@ mod embed_failure_tests {
             result["sections_indexed"].as_u64().unwrap_or(u64::MAX),
             0,
             "no sections indexed when every embed fails: {result:?}"
+        );
+    }
+}
+
+// ── ANN bypass regression (issue #78, PR #90) ────────────────────────────────
+//
+// Regression test: after `knowledge.index` with `rebuild_ann=true` the in-process
+// ANN index holds vectors for ALL atoms (regardless of status). A subsequent default
+// `knowledge.search` must not return draft atoms even when the ANN path finds them.
+//
+// Architecture: the fix adds `filter_by_excluded_statuses` immediately after
+// `hydrate_empty_hits` in the search handler so the ANN-sourced hits go through
+// the same status gate as the SQL/FTS candidates.
+
+mod ann_bypass_regression {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+    // Must match AllMiniLmL6V2.native_dimensions() so vector inserts succeed.
+    const DIM: usize = 384;
+
+    /// Returns N distinct unit vectors (one per text) so the index handler counts
+    /// each atom as successfully indexed. Vectors are differentiated by index so
+    /// ANN search can distinguish between atoms.
+    struct CorrectDimService;
+
+    #[async_trait]
+    impl EmbeddingService for CorrectDimService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    // Slightly different vectors per index position so ANN is non-trivial.
+                    let v = (i + 1) as f32;
+                    let norm = (DIM as f32 * v * v).sqrt();
+                    vec![v / norm; DIM]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "correct-dim"
+        }
+    }
+
+    struct CorrectDimProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for CorrectDimProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(CorrectDimService))
+        }
+    }
+
+    fn rt_with_correct_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+        })
+        .expect("runtime");
+        rt.register_embedder(CorrectDimProvider);
+        rt
+    }
+
+    /// Default search must exclude draft atoms even when the warm ANN index
+    /// contains vectors for them.
+    ///
+    /// Steps:
+    /// 1. Seed a reviewed and a draft atom.
+    /// 2. Index with rebuild_ann=true so the ANN holds both IDs.
+    /// 3. Run default knowledge.search — assert draft is absent.
+    /// 4. Run knowledge.search with include_drafts=true — assert draft appears.
+    #[tokio::test]
+    async fn ann_warm_draft_atom_excluded_by_default_search() {
+        let f = pack(rt_with_correct_embedder());
+
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    {
+                        "slug": "ann-rev-atom",
+                        "name": "ANN Reviewed Atom",
+                        "content": "neural network attention mechanism transformer dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique ann78rev"
+                    },
+                    {
+                        "slug": "ann-dft-atom",
+                        "name": "ANN Draft Atom",
+                        "content": "neural network attention mechanism transformer dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique ann78dft"
+                    },
+                ]
+            }),
+        )
+        .await
+        .expect("seed atoms");
+
+        f.sql_exec(
+            "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+            vec![SqlValue::Text("ann-rev-atom".into())],
+        )
+        .await;
+        f.sql_exec(
+            "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+            vec![SqlValue::Text("ann-dft-atom".into())],
+        )
+        .await;
+
+        // Index with rebuild_ann=true so the in-process ANN index is warmed for
+        // both atoms — including the draft atom. This is the precondition for the
+        // bypass bug to fire.
+        let idx = f
+            .dispatch("knowledge.index", json!({ "rebuild_ann": true }))
+            .await
+            .expect("index ok");
+        assert!(
+            idx["indexed"].as_u64().unwrap_or(0) >= 2,
+            "both atoms must be indexed for the ANN to hold them: {idx:?}"
+        );
+
+        // Default search must NOT return the draft atom even though it is in the ANN.
+        let resp = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "neural network attention mechanism transformer unique ann78",
+                    "rerank": false
+                }),
+            )
+            .await
+            .expect("default search ok");
+        let results = resp["results"].as_array().expect("results");
+        let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            !names.contains(&"ANN Draft Atom"),
+            "draft atom must be excluded by default even when warm ANN finds it: {names:?}"
+        );
+
+        // include_drafts=true must surface the draft atom.
+        let resp_incl = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "neural network attention mechanism transformer unique ann78",
+                    "rerank": false,
+                    "include_drafts": true
+                }),
+            )
+            .await
+            .expect("include_drafts search ok");
+        let results_incl = resp_incl["results"].as_array().expect("results");
+        let names_incl: Vec<&str> = results_incl
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(
+            names_incl.contains(&"ANN Draft Atom"),
+            "draft atom must appear when include_drafts=true: {names_incl:?}"
         );
     }
 }
