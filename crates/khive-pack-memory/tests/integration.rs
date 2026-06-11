@@ -2863,3 +2863,54 @@ async fn test_remember_explicit_decay_overrides_episodic_default() {
         "explicit decay_factor=0.01 must be stored as-is, not replaced by episodic default 0.02; got {decay}"
     );
 }
+
+/// Legacy note (created via KG create_note with no properties.memory_type, no salience,
+/// no decay_factor) must be returned by memory.recall(memory_type="episodic") because
+/// the resolved memory_type defaults to "episodic" when no stored value is present.
+#[tokio::test]
+async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create a bare memory note with no properties.memory_type, no salience, no decay —
+    // simulates a note written before the type-differentiated defaults PR.
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let legacy_note = rt
+        .create_note(
+            &tok,
+            "memory",
+            None,
+            "legacy note about transformer attention heads no memory type",
+            None,   // no salience
+            None,   // no properties (therefore no memory_type)
+            vec![], // no annotates edges
+        )
+        .await
+        .expect("create legacy note");
+    let legacy_id = legacy_note.id.to_string();
+
+    // recall with explicit memory_type="episodic" must include the legacy note because
+    // resolved memory_type defaults to "episodic" when properties.memory_type is absent.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "transformer attention heads no memory type",
+                "memory_type": "episodic",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall must succeed");
+
+    let hits = result.as_array().expect("recall returns array");
+    let returned_ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["note_id"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        returned_ids.contains(&legacy_id.as_str()),
+        "legacy note with no stored memory_type must appear in recall(memory_type=\"episodic\"); \
+         returned ids: {returned_ids:?}"
+    );
+}

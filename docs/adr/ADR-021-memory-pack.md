@@ -70,8 +70,9 @@ fields directly:
 There is no aliasing — the wire parameter and storage column are both `salience`.
 
 The substrate-wide `decay_factor` default is `0.0` (no decay). The memory pack handler
-overrides this default to `0.01` for memory notes, so memory participates in time decay
-by default while other note kinds remain unaffected.
+overrides this default using the resolved `memory_type`: episodic notes receive
+`0.02` (~35-day half-life) and semantic notes receive `0.005` (~139-day half-life), so
+memory participates in time decay by default while other note kinds remain unaffected.
 
 ### 3. `source` is an `annotates` edge, not a stored field
 

@@ -260,13 +260,14 @@ impl MemoryPack {
                 Some(note) => note,
                 None => continue,
             };
+            let note_memory_type = note
+                .properties
+                .as_ref()
+                .and_then(|pr| pr.get("memory_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("episodic");
             if let Some(mt) = &p.memory_type {
-                let stored = note
-                    .properties
-                    .as_ref()
-                    .and_then(|pr| pr.get("memory_type"))
-                    .and_then(|v| v.as_str());
-                if stored != Some(mt.as_str()) {
+                if note_memory_type != mt.as_str() {
                     continue;
                 }
             }
@@ -275,12 +276,6 @@ impl MemoryPack {
                     continue;
                 }
             }
-            let note_memory_type = note
-                .properties
-                .as_ref()
-                .and_then(|pr| pr.get("memory_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("episodic");
             let salience = note.salience.unwrap_or(if note_memory_type == "semantic" {
                 DEFAULT_SALIENCE_SEMANTIC
             } else {
