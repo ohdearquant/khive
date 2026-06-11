@@ -117,3 +117,24 @@ async fn bind_blocks_secret_in_actor() {
         "brain.bind with secret in actor must be rejected; got: {result:?}"
     );
 }
+
+/// brain.create_profile with a credential as a seed_priors JSON KEY must be rejected.
+#[tokio::test]
+async fn create_profile_blocks_secret_as_seed_priors_key() {
+    let ctx = BrainCtx::new();
+    let result = ctx
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "key-test-profile",
+                "seed_priors": {
+                    "AKIAFAKEKEY000000000": 0.9 // gitleaks:allow — credential as JSON key
+                },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "create_profile with secret as seed_priors key must be rejected; got: {result:?}"
+    );
+}

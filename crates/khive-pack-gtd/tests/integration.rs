@@ -2234,3 +2234,39 @@ async fn next_ordering_is_deterministic_on_equal_priority_and_timestamp() {
         "gtd.next must return identical ordering on repeated calls with the same task set"
     );
 }
+
+// ── Secret-gate regression tests ─────────────────────────────────────────────
+
+fn is_secret_detected(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::SecretDetected(_))
+}
+
+/// gtd.complete with a credential in the result field must be rejected before
+/// the task is loaded from storage.
+#[tokio::test]
+async fn complete_blocks_secret_in_result() {
+    let pack = pack(rt());
+
+    // Create and activate a task so we can attempt to complete it.
+    let task = assign(
+        &pack,
+        json!({"title": "secret-result-task", "status": "next"}),
+    )
+    .await;
+    let id = task["id"].as_str().expect("task id").to_owned();
+
+    // Attempting to complete with a credential in result must be rejected.
+    let result = pack
+        .dispatch(
+            "gtd.complete",
+            json!({
+                "id": id,
+                "result": "Completed with key AKIAFAKEKEY000000000", // gitleaks:allow
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "gtd.complete with secret in result must be rejected; got: {result:?}"
+    );
+}

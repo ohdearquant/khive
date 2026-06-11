@@ -1558,3 +1558,53 @@ async fn kpk002_domain_with_sufficient_description_is_accepted() {
     assert_eq!(resp["created"], json!(1u64));
     assert_eq!(resp["updated"], json!(0u64));
 }
+
+// ── Secret-gate regression tests ─────────────────────────────────────────────
+
+fn is_secret_detected(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::SecretDetected(_))
+}
+
+/// knowledge.upsert_domains with a credential-shaped slug must be rejected.
+#[tokio::test]
+async fn upsert_domains_blocks_secret_in_slug_insert() {
+    let f = pack(rt());
+    let result = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "ghp_FakeGitHubToken0000000000000000000", // gitleaks:allow
+                    "name": "Secret Slug Domain",
+                    "description": "This domain describes retrieval augmented generation patterns for building scalable AI knowledge systems with structured graph storage and semantic search capabilities.",
+                }]
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "upsert_domains with secret in slug must be rejected; got: {result:?}"
+    );
+}
+
+/// knowledge.upsert_domains with a clean slug must succeed.
+#[tokio::test]
+async fn upsert_domains_clean_slug_passes() {
+    let f = pack(rt());
+    let result = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "clean-domain-slug",
+                    "name": "Clean Domain",
+                    "description": "This domain covers retrieval augmented generation patterns for AI knowledge systems at scale with hybrid search and graph traversal features.",
+                }]
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "upsert_domains with clean slug must succeed; got: {result:?}"
+    );
+}

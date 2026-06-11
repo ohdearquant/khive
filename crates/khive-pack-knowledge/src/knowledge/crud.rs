@@ -196,6 +196,10 @@ impl KnowledgeHandlers {
                     "domain name must not be empty".into(),
                 ));
             }
+            // Secret gate: scan slug and name first (before content-length validation)
+            // so security violations short-circuit before business logic errors.
+            khive_runtime::secret_gate::check(&slug)?;
+            khive_runtime::secret_gate::check(&name)?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
@@ -203,8 +207,7 @@ impl KnowledgeHandlers {
             validate_atom_content(mirror_content).map_err(|e| {
                 RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
             })?;
-            // Secret gate: scan all caller-supplied text before any write.
-            khive_runtime::secret_gate::check(&name)?;
+            // Secret gate: scan remaining caller-supplied text.
             khive_runtime::secret_gate::check(mirror_content)?;
             if let Some(ref tags_vec) = domain_in.tags {
                 khive_runtime::secret_gate::check_tags(tags_vec)?;

@@ -5394,3 +5394,67 @@ async fn review_blocks_secret_in_comment() {
         "review with secret in comment must be rejected; got: {result:?}"
     );
 }
+
+/// withdraw.rationale containing a fake credential must be rejected.
+#[tokio::test]
+async fn withdraw_blocks_secret_in_rationale() {
+    let f = pack_with_events();
+
+    // Submit a clean proposal first so we have something to withdraw.
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Withdrawal test proposal",
+                "description": "Clean description.",
+                "changeset": { "kind": "add_entity", "entity": { "kind": "concept", "name": "WithdrawEntity" } },
+            }),
+        )
+        .await
+        .expect("clean propose must succeed");
+    let proposal_id = propose_result["proposal_id"]
+        .as_str()
+        .expect("proposal_id in response");
+
+    // Withdraw with a secret in the rationale must be rejected.
+    let result = f
+        .dispatch(
+            "withdraw",
+            json!({
+                "proposal_id": proposal_id,
+                "rationale": "Withdrawn: token AKIAFAKEKEY000000000", // gitleaks:allow
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "withdraw with secret in rationale must be rejected; got: {result:?}"
+    );
+}
+
+/// propose.changeset with a credential as an object KEY must be rejected.
+#[tokio::test]
+async fn propose_blocks_secret_as_changeset_key() {
+    let f = pack_with_events();
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Key-as-credential test",
+                "description": "No secrets in values.",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": {
+                        "kind": "concept",
+                        "name": "KeyTest",
+                        "properties": { "ghp_FakeGitHubToken0000000000000000000": "redacted" } // gitleaks:allow
+                    }
+                },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "propose with secret as changeset property key must be rejected; got: {result:?}"
+    );
+}

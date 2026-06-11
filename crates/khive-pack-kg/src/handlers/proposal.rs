@@ -389,6 +389,11 @@ impl KgPack {
             )));
         }
 
+        // Secret gate: scan rationale before constructing the event payload.
+        if let Some(ref rationale) = p.rationale {
+            khive_runtime::secret_gate::check(rationale)?;
+        }
+
         let payload = ProposalWithdrawnPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             by: actor.clone(),

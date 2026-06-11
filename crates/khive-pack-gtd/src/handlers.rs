@@ -756,6 +756,11 @@ impl GtdPack {
         // Accepts "done" (default) or "cancelled"; rejects anything else.
         let target = complete_target_status(p.status.as_deref())?;
 
+        // Secret gate: scan free-text result before any DB interaction.
+        if let Some(ref result) = p.result {
+            khive_runtime::secret_gate::check(result)?;
+        }
+
         let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 
         if is_terminal(&current) {
