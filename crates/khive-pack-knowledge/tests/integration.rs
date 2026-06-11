@@ -861,6 +861,86 @@ async fn get_include_sections_namespace_isolation() {
     assert_eq!(sections_b.len(), 0, "ns-b atom must not see ns-a sections");
 }
 
+// Regression: two sections sharing the same sort_order must come back in a
+// stable, deterministic order (id ASC as final tie-breaker).
+#[tokio::test]
+async fn get_include_sections_ordering_tie_break_is_stable() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "tie-atom", "name": "TieAtom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    // Insert two sections with the same sort_order (both default to their
+    // SectionType ordinal; explicitly override to the same value to guarantee
+    // the tie). Each has distinct content so both rows are inserted.
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "tie-atom",
+            "sections": [
+                {
+                    "section_type": "overview",
+                    "content": "First section content for the tie-break test covering overview of the main topic in sufficient detail for the minimum content length requirement to be satisfied.",
+                    "sort_order": 5
+                },
+                {
+                    "section_type": "formalism",
+                    "content": "Second section content for the tie-break test covering formal definitions and mathematical notation in sufficient detail for the minimum content length requirement.",
+                    "sort_order": 5
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("edit");
+
+    // Fetch twice; both calls must return the same order.
+    let first = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "tie-atom", "include_sections": true }),
+        )
+        .await
+        .expect("get first");
+    let second = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "tie-atom", "include_sections": true }),
+        )
+        .await
+        .expect("get second");
+
+    let s1 = first["sections"].as_array().expect("sections first");
+    let s2 = second["sections"].as_array().expect("sections second");
+
+    assert_eq!(s1.len(), 2, "expected 2 sections on first fetch");
+    assert_eq!(s2.len(), 2, "expected 2 sections on second fetch");
+
+    // Both rows share sort_order=5; the id-ASC tie-breaker must produce the
+    // same sequence across repeated queries.
+    let ids_first: Vec<&str> = s1.iter().filter_map(|s| s["id"].as_str()).collect();
+    let ids_second: Vec<&str> = s2.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert_eq!(
+        ids_first, ids_second,
+        "section order must be deterministic across repeated fetches (id ASC tie-breaker)"
+    );
+
+    // Both calls must agree on which section type comes first (also validates
+    // that the order is NOT random).
+    let types_first: Vec<&str> = s1
+        .iter()
+        .filter_map(|s| s["section_type"].as_str())
+        .collect();
+    let types_second: Vec<&str> = s2
+        .iter()
+        .filter_map(|s| s["section_type"].as_str())
+        .collect();
+    assert_eq!(types_first, types_second, "section_type order must match");
+}
+
 // ── knowledge.list ────────────────────────────────────────────────────────────
 
 #[tokio::test]

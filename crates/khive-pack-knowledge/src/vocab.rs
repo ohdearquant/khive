@@ -52,7 +52,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "include_sections",
                 param_type: "boolean",
                 required: false,
-                description: "When true, include the atom's sections under a `sections` key, ordered by sort_order. Ignored for domains. Default: false.",
+                description: "When true, include the atom's sections under a `sections` key. Each section object contains: id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at. Ordered by sort_order ASC, created_at ASC, id ASC. Ignored for domains. Default: false.",
             },
         ],
     },

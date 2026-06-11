@@ -639,7 +639,7 @@ async fn fetch_sections(
         .query_all(SqlStatement {
             sql: "SELECT * FROM knowledge_sections \
                   WHERE atom_id = ?1 AND namespace = ?2 \
-                  ORDER BY sort_order ASC, created_at ASC"
+                  ORDER BY sort_order ASC, created_at ASC, id ASC"
                 .into(),
             params: vec![
                 SqlValue::Text(atom_id.to_owned()),
@@ -650,10 +650,19 @@ async fn fetch_sections(
         .await
         .map_err(|e| sql_err("get sections query", e))?;
 
-    let sections: Vec<Value> = rows
-        .iter()
-        .filter_map(|r| section_from_row(r).map(|s| section_to_json(&s)))
-        .collect();
+    let mut sections: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        match section_from_row(r) {
+            Some(s) => sections.push(section_to_json(&s)),
+            None => {
+                return Err(RuntimeError::Internal(
+                    "knowledge_sections row is malformed (invalid UUID or section_type); \
+                     data integrity check required"
+                        .into(),
+                ));
+            }
+        }
+    }
 
     Ok(Value::Array(sections))
 }

@@ -30,6 +30,8 @@ fn parse_section_type(s: &str) -> Result<SectionType, RuntimeError> {
     })
 }
 
+/// Deserialise a `knowledge_sections` SQL row into a [`Section`].
+/// Returns `None` when the row carries an invalid UUID or unknown `section_type`.
 pub(super) fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
     let st_str = row_str(row, "section_type")?;
@@ -50,6 +52,9 @@ pub(super) fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Sec
     })
 }
 
+/// Serialise a [`Section`] to its wire JSON shape for `knowledge.get` responses.
+/// Fields: `id`, `atom_id`, `namespace`, `section_type`, `heading`, `content`,
+/// `content_hash`, `status`, `tokens`, `sort_order`, `created_at`, `updated_at`.
 pub(super) fn section_to_json(s: &Section) -> Value {
     json!({
         "id": s.id.to_string(),
