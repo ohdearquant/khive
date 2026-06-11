@@ -94,6 +94,13 @@ impl KhiveRuntime {
     /// Use this for all index/store/backfill paths so that instruction-tuned
     /// models produce passage-side vectors.
     ///
+    /// **Reindex caveat**: switching from an unprefixed model (or a model with no
+    /// `document_instruction`) to an instruction-tuned model changes the vector
+    /// representation. Vectors stored under the old scheme are not comparable to
+    /// newly prefixed vectors. Operators must trigger a full reindex
+    /// (`knowledge.index(rebuild_ann=true)` / `kkernel reindex`) after changing
+    /// the embedding model config.
+    ///
     /// Returns `UnknownModel` if `model_name` is not registered.
     pub async fn embed_document_with_model(
         &self,
@@ -207,6 +214,9 @@ impl KhiveRuntime {
     ///
     /// Applies `EmbeddingService::embed_passage`. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
+    ///
+    /// **Reindex caveat**: see [`embed_document_with_model`] — the same
+    /// incomparability applies to batch-indexed vectors when switching models.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
     pub async fn embed_document_batch_with_model(

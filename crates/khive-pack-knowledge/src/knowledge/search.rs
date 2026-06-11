@@ -989,7 +989,7 @@ impl KnowledgeHandlers {
         // Trigger background warm — never block search on the ANN rebuild.
         vamana::ensure_ann_background(runtime, token, ann);
 
-        if let Ok(query_emb) = runtime.embed(&raw_query).await {
+        if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             let ann_k = fetch_limit.max(20);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
             if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
@@ -1072,7 +1072,7 @@ impl KnowledgeHandlers {
         let mut hits = search_core(&ctx, &raw_query).await?;
 
         vamana::ensure_ann_background(runtime, token, ann);
-        if let Ok(query_emb) = runtime.embed(&raw_query).await {
+        if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             let ann_k = (limit * 3).max(20);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
             if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
@@ -1416,6 +1416,43 @@ impl KnowledgeHandlers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── embed-intent regression ───────────────────────────────────────────────
+    // Guard that the ANN query paths in `search` and `suggest` use the
+    // query-intent embedding call, not the generic `runtime.embed(...)`.
+    // Uses include_str! so the assertion runs on the actual source bytes,
+    // but splits the needle to avoid matching the needle itself in test source.
+    #[test]
+    fn knowledge_ann_query_paths_use_query_intent_embed() {
+        let src = include_str!("search.rs");
+        // Build needle at runtime to avoid self-match in include_str.
+        let generic_needle: String = [".embed(", "&raw_query)"].concat();
+        let generic_count = src
+            .lines()
+            // Skip lines that are part of this test body (contain "concat" or "needle").
+            .filter(|l| !l.contains("concat") && !l.contains("needle"))
+            .filter(|l| l.contains(&generic_needle))
+            .count();
+        assert_eq!(
+            generic_count, 0,
+            "ANN query paths must not call generic {generic_needle}; \
+             found {generic_count} occurrence(s) — use embed_query instead"
+        );
+        // Confirm the query-intent call is present for both search and suggest.
+        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
+        let query_intent_count = src
+            .lines()
+            .filter(|l| !l.contains("concat"))
+            .filter(|l| l.contains(&query_intent_needle))
+            .count();
+        // 3 sites: knowledge.search ANN path, knowledge.suggest ANN path,
+        // and the section-scoring query embed (search.rs:~1291).
+        assert_eq!(
+            query_intent_count, 3,
+            "expected exactly 3 {query_intent_needle} calls \
+             (search ANN + suggest ANN + section query), found {query_intent_count}"
+        );
+    }
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
 
