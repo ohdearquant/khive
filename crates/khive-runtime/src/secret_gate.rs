@@ -419,19 +419,15 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
         // Hex API keys (AWS secret access key, Stripe test keys, random hex
         // tokens) are pure hex yet are real credentials.  The entropy heuristic
         // cannot catch them — hex alphabet maxes at log2(16) = 4.0 bits/char,
-        // which is always below ENTROPY_THRESHOLD (4.5).  When a credential-
-        // shaped hex token (32 / 40 / 64 / 128 chars) appears near a trigger
-        // word and the context does NOT contain explicit hash vocabulary (sha,
-        // md5, checksum, digest, hash, fingerprint), treat it as a secret
-        // independently of entropy.
+        // which is always below ENTROPY_THRESHOLD (4.5).  A credential-shaped
+        // hex token (32 / 40 / 64 / 128 chars) near a trigger word is always
+        // flagged.  Credential triggers dominate: adding "sha" or "hash" to
+        // the window does not rescue the token — a caller controlling the prose
+        // could trivially bypass the gate with one extra word.  Safe git SHAs
+        // and content-hash digests do not appear near credential trigger words
+        // and are already allowed via the `!near_trigger && is_pure_hex` path.
         const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
-        const HASH_CONTEXT_WORDS: &[&str] =
-            &["sha", "md5", "checksum", "digest", "hash", "fingerprint"];
-        if near_trigger
-            && is_pure_hex(token)
-            && HEX_CREDENTIAL_LENGTHS.contains(&token.len())
-            && !HASH_CONTEXT_WORDS.iter().any(|hw| low_window.contains(hw))
-        {
+        if near_trigger && is_pure_hex(token) && HEX_CREDENTIAL_LENGTHS.contains(&token.len()) {
             return Some(build_match("hex-credential-token", token));
         }
 
@@ -1332,9 +1328,28 @@ mod tests {
     }
 
     #[test]
+    fn hex_blocked_when_trigger_and_hash_word_coexist() {
+        // Credential trigger dominates: adding "hash" or "sha" to the window does
+        // not rescue a pure-hex token when a credential trigger is also present.
+        // An attacker controlling the prose could otherwise bypass the gate with
+        // one extra word, so the hash-word exception must NOT apply in trigger context.
+        let hex32 = "4f9c2e8a1d3b5c7e9f0a2b4d6e8c0a2b";
+        let key_hash_line = format!("api key hash {hex32}");
+        let secret_sha_line = format!("secret sha {hex32}");
+        assert!(
+            scan(&key_hash_line).is_some(),
+            "'api key hash <hex32>' must be blocked; got None"
+        );
+        assert!(
+            scan(&secret_sha_line).is_some(),
+            "'secret sha <hex32>' must be blocked; got None"
+        );
+    }
+
+    #[test]
     fn hex_near_sha_context_word_allowed() {
-        // A 40-char hex with "sha" or "commit" in the window must be allowed —
-        // it's a git SHA or integrity hash, not a credential.
+        // A 40-char hex with "sha" or "commit" in the window — but no credential
+        // trigger — must be allowed (git SHA or content hash in normal prose).
         let hex40 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
         let sha_line = format!("sha1: {hex40}");
         let commit_line = format!("commit sha {hex40}");
@@ -1352,7 +1367,8 @@ mod tests {
 
     #[test]
     fn hex64_near_hash_context_allowed() {
-        // A 64-char hex with "sha256" or "hash" in the window must be allowed.
+        // A 64-char hex near "sha256" or "hash" — with no credential trigger —
+        // must be allowed (content digest in normal prose).
         let hex64 = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b";
         let sha_line = format!("sha256: {hex64}");
         let hash_line = format!("hash value {hex64}");
