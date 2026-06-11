@@ -5278,6 +5278,187 @@ async fn link_concept_to_concept_extends_still_works() {
     assert_eq!(edge["relation"], "extends");
 }
 
+// ── Secret-gate: proposal path regression tests ───────────────────────────────
+
+fn is_secret_detected(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::SecretDetected(_))
+}
+
+/// propose.description containing a fake AWS key must be rejected.
+#[tokio::test]
+async fn propose_blocks_secret_in_description() {
+    let f = pack_with_events();
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Test proposal",
+                "description": "Access key: AKIAFAKEKEY000000000", // gitleaks:allow
+                "changeset": { "kind": "add_entity", "entity": { "kind": "concept", "name": "Test" } },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "propose with secret in description must be rejected; got: {result:?}"
+    );
+}
+
+/// propose.changeset containing a fake AWS key in proposed entity properties must be rejected.
+#[tokio::test]
+async fn propose_blocks_secret_in_changeset_entity_properties() {
+    let f = pack_with_events();
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Credential slip",
+                "description": "A description without secrets.",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": {
+                        "kind": "concept",
+                        "name": "SomeEntity",
+                        "properties": { "api_key": "AKIAFAKEKEY000000000" } // gitleaks:allow
+                    }
+                },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "propose with secret in changeset entity properties must be rejected; got: {result:?}"
+    );
+}
+
+/// propose changeset with a secret in proposed note content must be rejected.
+#[tokio::test]
+async fn propose_blocks_secret_in_changeset_note_content() {
+    let f = pack_with_events();
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Note proposal",
+                "description": "A description without secrets.",
+                "changeset": {
+                    "kind": "add_note",
+                    "note": {
+                        "kind": "observation",
+                        "content": "My token: ghp_FakeGitHubToken0000000000000000000" // gitleaks:allow
+                    }
+                },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "propose with secret in changeset note content must be rejected; got: {result:?}"
+    );
+}
+
+/// review.comment containing a fake credential must be rejected.
+#[tokio::test]
+async fn review_blocks_secret_in_comment() {
+    let f = pack_with_events();
+
+    // First submit a clean proposal to review.
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Clean proposal",
+                "description": "No secrets here.",
+                "changeset": { "kind": "add_entity", "entity": { "kind": "concept", "name": "SafeEntity" } },
+            }),
+        )
+        .await
+        .expect("clean propose must succeed");
+    let proposal_id = propose_result["proposal_id"]
+        .as_str()
+        .expect("proposal_id in response");
+
+    // Review with a secret in the comment must be rejected.
+    let result = f
+        .dispatch(
+            "review",
+            json!({
+                "proposal_id": proposal_id,
+                "decision": "comment",
+                "comment": "Here is my secret: AKIAFAKEKEY000000000", // gitleaks:allow
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "review with secret in comment must be rejected; got: {result:?}"
+    );
+}
+
+/// withdraw.rationale containing a fake credential must be rejected.
+#[tokio::test]
+async fn withdraw_blocks_secret_in_rationale() {
+    let f = pack_with_events();
+
+    // Submit a clean proposal first so we have something to withdraw.
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Withdrawal test proposal",
+                "description": "Clean description.",
+                "changeset": { "kind": "add_entity", "entity": { "kind": "concept", "name": "WithdrawEntity" } },
+            }),
+        )
+        .await
+        .expect("clean propose must succeed");
+    let proposal_id = propose_result["proposal_id"]
+        .as_str()
+        .expect("proposal_id in response");
+
+    // Withdraw with a secret in the rationale must be rejected.
+    let result = f
+        .dispatch(
+            "withdraw",
+            json!({
+                "proposal_id": proposal_id,
+                "rationale": "Withdrawn: token AKIAFAKEKEY000000000", // gitleaks:allow
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "withdraw with secret in rationale must be rejected; got: {result:?}"
+    );
+}
+
+/// propose.changeset with a credential as an object KEY must be rejected.
+#[tokio::test]
+async fn propose_blocks_secret_as_changeset_key() {
+    let f = pack_with_events();
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Key-as-credential test",
+                "description": "No secrets in values.",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": {
+                        "kind": "concept",
+                        "name": "KeyTest",
+                        "properties": { "ghp_FakeGitHubToken0000000000000000000": "redacted" } // gitleaks:allow
+                    }
+                },
+            }),
+        )
+        .await;
+    assert!(
+        result.as_ref().err().is_some_and(is_secret_detected),
+        "propose with secret as changeset property key must be rejected; got: {result:?}"
+    );
+}
+
 // ---- #71 regression: hard delete must purge soft-deleted records ----
 
 /// Soft-delete an entity, then hard-delete it — must succeed and leave the row gone.

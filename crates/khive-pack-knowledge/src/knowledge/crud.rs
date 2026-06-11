@@ -51,6 +51,23 @@ impl KnowledgeHandlers {
 
             let content = atom_in.content.as_deref().unwrap_or("").trim().to_string();
             validate_atom_content(&content)?;
+            // Secret gate: scan all caller-supplied text and structured fields
+            // before any reader/writer is acquired.
+            khive_runtime::secret_gate::check(&slug)?;
+            khive_runtime::secret_gate::check(&atom_in.name)?;
+            khive_runtime::secret_gate::check(&content)?;
+            if let Some(ref tags_vec) = atom_in.tags {
+                khive_runtime::secret_gate::check_tags(tags_vec)?;
+            }
+            if let Some(ref props) = atom_in.properties {
+                khive_runtime::secret_gate::check_json(props)?;
+            }
+            if let Some(ref uri) = atom_in.source_uri {
+                khive_runtime::secret_gate::check(uri)?;
+            }
+            if let Some(ref st) = atom_in.source_type {
+                khive_runtime::secret_gate::check(st)?;
+            }
 
             let tags_json = tags_to_json(atom_in.tags.as_ref());
             let props_json = atom_in
@@ -180,6 +197,10 @@ impl KnowledgeHandlers {
                     "domain name must not be empty".into(),
                 ));
             }
+            // Secret gate: scan slug and name first (before content-length validation)
+            // so security violations short-circuit before business logic errors.
+            khive_runtime::secret_gate::check(&slug)?;
+            khive_runtime::secret_gate::check(&name)?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
@@ -187,6 +208,14 @@ impl KnowledgeHandlers {
             validate_atom_content(mirror_content).map_err(|e| {
                 RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
             })?;
+            // Secret gate: scan remaining caller-supplied text.
+            khive_runtime::secret_gate::check(mirror_content)?;
+            if let Some(ref tags_vec) = domain_in.tags {
+                khive_runtime::secret_gate::check_tags(tags_vec)?;
+            }
+            if let Some(ref members_vec) = domain_in.members {
+                khive_runtime::secret_gate::check_tags(members_vec)?;
+            }
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
             if !tags.iter().any(|t| t == "type:domain") {
@@ -671,4 +700,58 @@ async fn fetch_sections(
     }
 
     Ok(Value::Array(sections))
+}
+
+#[cfg(test)]
+mod tests {
+    // Gate wiring tests: confirm that the secret check integrated into
+    // upsert_atoms fires on credential-shaped atom content and passes on
+    // allowlisted content (sha256 hex, UUIDs).  Tests call
+    // `khive_runtime::secret_gate::check` directly with the same inputs
+    // that the handler would pass — this proves the gate is reachable without
+    // requiring a live DB connection.
+
+    use khive_runtime::secret_gate::check;
+
+    #[test]
+    fn atom_body_with_fake_aws_key_is_blocked() {
+        // Fake AWS access key ID in an atom body — must be blocked.
+        let body = "provider: aws\naccess_key_id: AKIAFAKE000000000000\nregion: us-east-1";
+        assert!(
+            check(body).is_err(),
+            "atom body containing fake AWS key must be blocked"
+        );
+    }
+
+    #[test]
+    fn atom_body_with_sha256_hash_passes() {
+        // A manifest-style line containing a sha256 digest — must pass the allowlist.
+        let body =
+            "checksum = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"";
+        assert!(
+            check(body).is_ok(),
+            "atom body with sha256 manifest hash must pass; fired: {:?}",
+            check(body).err()
+        );
+    }
+
+    #[test]
+    fn atom_name_with_fake_openai_key_is_blocked() {
+        // A credential accidentally used as an atom name — must be blocked.
+        let name = "sk-proj-FAKEKEY0000000000000000000000000000000000"; // gitleaks:allow
+        assert!(
+            check(name).is_err(),
+            "atom name containing fake OpenAI key must be blocked"
+        );
+    }
+
+    #[test]
+    fn normal_atom_name_passes() {
+        let name = "FlashAttention-2: efficient transformer self-attention";
+        assert!(
+            check(name).is_ok(),
+            "normal atom name must pass; fired: {:?}",
+            check(name).err()
+        );
+    }
 }

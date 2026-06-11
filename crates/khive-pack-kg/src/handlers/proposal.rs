@@ -92,6 +92,12 @@ impl KgPack {
             ));
         }
 
+        // Secret gate: scan all caller-supplied text before constructing/appending events.
+        khive_runtime::secret_gate::check(&p.title)?;
+        khive_runtime::secret_gate::check(&p.description)?;
+        khive_runtime::secret_gate::check_tags(&p.reviewers)?;
+        khive_runtime::secret_gate::check_json(&p.changeset)?;
+
         let _changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
 
@@ -259,6 +265,11 @@ impl KgPack {
             )));
         }
 
+        // Secret gate: scan caller-supplied comment before constructing/appending events.
+        if let Some(ref c) = p.comment {
+            khive_runtime::secret_gate::check(c)?;
+        }
+
         let payload = ProposalReviewedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             reviewer: actor.clone(),
@@ -376,6 +387,11 @@ impl KgPack {
                 "proposal {} is already {current_status} and cannot be withdrawn",
                 p.proposal_id
             )));
+        }
+
+        // Secret gate: scan rationale before constructing the event payload.
+        if let Some(ref rationale) = p.rationale {
+            khive_runtime::secret_gate::check(rationale)?;
         }
 
         let payload = ProposalWithdrawnPayload {

@@ -1086,6 +1086,18 @@ impl BrainPack {
             }
         }
 
+        // Secret gate: scan arbitrary text fields before writing.
+        // Wildcard sentinel `*` is safe; real values are scanned.
+        if actor != "*" {
+            khive_runtime::secret_gate::check(&actor)?;
+        }
+        if namespace != "*" {
+            khive_runtime::secret_gate::check(&namespace)?;
+        }
+        if consumer_kind != "*" {
+            khive_runtime::secret_gate::check(&consumer_kind)?;
+        }
+
         // Remove any existing binding for the same (actor, namespace, consumer_kind)
         state.bindings.retain(|b| {
             !(b.actor == actor && b.namespace == namespace && b.consumer_kind == consumer_kind)
@@ -1244,6 +1256,14 @@ impl BrainPack {
         let description = p
             .description
             .unwrap_or_else(|| format!("User-created profile: {}", p_name));
+
+        // Secret gate: scan caller-supplied text before any write.
+        // `p_name` is already constrained to [a-zA-Z0-9-]+ and cannot carry a secret.
+        khive_runtime::secret_gate::check(&description)?;
+        khive_runtime::secret_gate::check(&consumer_kind)?;
+        if let Some(ref seed) = p.seed_priors {
+            khive_runtime::secret_gate::check_json(seed)?;
+        }
 
         let mut state = self.state.lock().unwrap();
 

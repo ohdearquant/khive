@@ -19,6 +19,7 @@ pub mod presentation;
 pub mod registry;
 pub mod retrieval;
 pub mod runtime;
+pub mod secret_gate;
 pub mod validation;
 
 pub use curation::{
@@ -60,6 +61,7 @@ pub use runtime::{
     parse_pack_list, runtime_config_from_khive_config, BackendId, KhiveRuntime, NamespaceToken,
     RuntimeConfig,
 };
+pub use secret_gate::SecretMatch;
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

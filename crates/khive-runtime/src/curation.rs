@@ -180,6 +180,19 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<Entity> {
+        // Secret gate: scan incoming text fields, properties, and tags.
+        if let Some(ref name) = patch.name {
+            crate::secret_gate::check(name)?;
+        }
+        if let Some(Some(ref desc)) = patch.description {
+            crate::secret_gate::check(desc)?;
+        }
+        if let Some(ref props) = patch.properties {
+            crate::secret_gate::check_json(props)?;
+        }
+        if let Some(ref tags) = patch.tags {
+            crate::secret_gate::check_tags(tags)?;
+        }
         let store = self.entities(token)?;
         let mut entity = store
             .get_entity(id)
@@ -448,6 +461,16 @@ impl KhiveRuntime {
         id: Uuid,
         patch: NotePatch,
     ) -> RuntimeResult<khive_storage::note::Note> {
+        // Secret gate: scan incoming text fields and structured properties.
+        if let Some(ref content) = patch.content {
+            crate::secret_gate::check(content)?;
+        }
+        if let Some(Some(ref name)) = patch.name {
+            crate::secret_gate::check(name)?;
+        }
+        if let Some(ref props) = patch.properties {
+            crate::secret_gate::check_json(props)?;
+        }
         let store = self.notes(token)?;
         let mut note = store
             .get_note(id)
