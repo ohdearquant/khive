@@ -492,6 +492,25 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn get_edge_including_deleted(&self, id: LinkId) -> Result<Option<Edge>, StorageError> {
+        let namespace = self.namespace.clone();
+        let id_str = Uuid::from(id).to_string();
+
+        self.with_reader("get_edge_including_deleted", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_edge(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
         let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();

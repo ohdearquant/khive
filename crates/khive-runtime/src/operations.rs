@@ -2014,6 +2014,36 @@ impl KhiveRuntime {
         Ok(self.graph(token)?.get_edge(LinkId::from(edge_id)).await?)
     }
 
+    /// Fetch an edge by UUID including soft-deleted rows, returning `None` if absent or if the
+    /// record belongs to a different namespace. Used by the hard-delete path so that a
+    /// soft-deleted primary edge can still be purged via its edge ID.
+    pub async fn get_edge_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        edge_id: Uuid,
+    ) -> RuntimeResult<Option<Edge>> {
+        let mut reader = self.sql().reader().await?;
+        let record_ns = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT namespace FROM graph_edges WHERE id = ?1 LIMIT 1".into(),
+                params: vec![SqlValue::Text(edge_id.to_string())],
+                label: Some("get_edge_including_deleted_namespace".into()),
+            })
+            .await?;
+
+        let Some(SqlValue::Text(record_ns)) = record_ns else {
+            return Ok(None);
+        };
+        if Self::ensure_namespace(&record_ns, token.namespace().as_str()).is_err() {
+            return Ok(None);
+        }
+
+        Ok(self
+            .graph(token)?
+            .get_edge_including_deleted(LinkId::from(edge_id))
+            .await?)
+    }
+
     /// List edges matching `filter`. `limit` is capped at 1000; defaults to 100.
     pub async fn list_edges(
         &self,
@@ -2259,30 +2289,28 @@ impl KhiveRuntime {
             DeleteMode::Soft
         };
 
-        // Guard: verify `edge_id` is actually an edge before touching anything.
-        // Without this check, passing an entity/note UUID would delete all inbound
-        // annotates edges targeting that record and then return false — a destructive
-        // side effect on an invalid call.
-        if graph.get_edge(LinkId::from(edge_id)).await?.is_none() {
+        // Guard: verify `edge_id` is actually an edge (not an entity/note UUID) before touching
+        // anything. For soft delete, the live-only check is correct — there is nothing to do if
+        // the row is already soft-deleted. For hard delete, also check soft-deleted rows so that
+        // a soft-deleted edge can still be purged via its edge ID (namespace check is preserved:
+        // get_edge_including_deleted returns None for foreign-namespace IDs).
+        let edge_exists = if hard {
+            self.get_edge_including_deleted(token, edge_id)
+                .await?
+                .is_some()
+        } else {
+            graph.get_edge(LinkId::from(edge_id)).await?.is_some()
+        };
+        if !edge_exists {
             return Ok(false);
         }
 
-        // Cascade: remove annotate edges that target this edge (inbound from note sources).
-        let inbound = graph
-            .neighbors(
-                edge_id,
-                NeighborQuery {
-                    direction: Direction::In,
-                    relations: None,
-                    limit: None,
-                    min_weight: None,
-                },
-            )
-            .await?;
-        for hit in inbound {
-            graph
-                .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
-                .await?;
+        // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
+        // already-soft-deleted ones — to prevent dangling graph_edges rows (ADR-002).
+        // On soft delete the cascade is skipped (data-vs-view principle: soft-deleting the base
+        // edge does not cascade to annotation edges; only a hard purge cleans up incident rows).
+        if hard {
+            graph.purge_incident_edges(edge_id).await?;
         }
 
         let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
@@ -5998,6 +6026,158 @@ mod tests {
         assert_eq!(
             raw_after, 0,
             "purge_incident_edges must physically remove soft-deleted edge rows on note purge (ADR-002)"
+        );
+    }
+
+    // ---- PR #82 round-2 regression: edge-ID hard-delete path ----
+    //
+    // Bug class (codex R2): delete_edge drove the primary-edge guard through get_edge()
+    // (live-only) and the cascade through neighbors() (live-only). Two reachable holes:
+    // (a) soft-deleted primary edge cannot be hard-purged via its own ID;
+    // (b) an already-soft-deleted annotates edge targeting a base edge survives that
+    //     edge's hard delete as a dangling row with target_id = physically-gone edge id.
+
+    /// Count graph_edges rows matching the given edge ID, including soft-deleted rows.
+    async fn count_edge_rows_by_id(rt: &KhiveRuntime, edge_id: Uuid, ns: &str) -> u64 {
+        let mut reader = rt.sql().reader().await.expect("sql reader must open");
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM graph_edges WHERE namespace = ?1 AND id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(edge_id.to_string()),
+                ],
+                label: Some("count_edge_rows_by_id".into()),
+            })
+            .await
+            .expect("count query must succeed");
+        match row {
+            Some(SqlValue::Integer(n)) => n as u64,
+            _ => panic!("count must return an integer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_delete_edge_purges_already_soft_deleted_primary_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().to_string();
+
+        let a = rt
+            .create_entity(&tok, "concept", None, "EA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "EB", None, None, vec![])
+            .await
+            .unwrap();
+
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        // Soft-delete the edge first.
+        let soft = rt.delete_edge(&tok, edge_uuid, false).await.unwrap();
+        assert!(soft, "soft delete must succeed");
+
+        // Edge is now invisible to normal reads but still a physical row.
+        assert!(
+            rt.get_edge(&tok, edge_uuid).await.unwrap().is_none(),
+            "soft-deleted edge must be invisible to get_edge"
+        );
+        assert_eq!(
+            count_edge_rows_by_id(&rt, edge_uuid, &ns).await,
+            1,
+            "soft-deleted edge must still be a physical row"
+        );
+
+        // Hard-delete (purge) via the edge ID — must succeed and remove the row.
+        let purged = rt.delete_edge(&tok, edge_uuid, true).await.unwrap();
+        assert!(
+            purged,
+            "hard delete of a soft-deleted edge must return true"
+        );
+
+        assert_eq!(
+            count_edge_rows_by_id(&rt, edge_uuid, &ns).await,
+            0,
+            "hard-delete must physically remove the soft-deleted edge row (ADR-002)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_base_edge_purges_already_soft_deleted_annotates_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().to_string();
+
+        let a = rt
+            .create_entity(&tok, "concept", None, "CA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "CB", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Create the base edge to be annotated.
+        let base_edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        let base_edge_uuid: Uuid = base_edge.id.into();
+
+        // Create a note that annotates the base edge.
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "note about base edge",
+                Some(0.5),
+                None,
+                vec![base_edge_uuid],
+            )
+            .await
+            .unwrap();
+
+        // Find the annotates edge.
+        let ann_hits = rt
+            .neighbors(
+                &tok,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ann_hits.len(), 1, "annotates edge must exist");
+        let ann_edge_uuid = ann_hits[0].edge_id;
+
+        // Soft-delete the annotates edge — now invisible but still a physical row.
+        rt.delete_edge(&tok, ann_edge_uuid, false).await.unwrap();
+        assert_eq!(
+            count_edge_rows_by_id(&rt, ann_edge_uuid, &ns).await,
+            1,
+            "soft-deleted annotates edge must still be a physical row"
+        );
+
+        // Hard-delete the base edge — cascade must also remove the soft-deleted annotates row.
+        let purged = rt.delete_edge(&tok, base_edge_uuid, true).await.unwrap();
+        assert!(purged, "hard delete of base edge must return true");
+
+        assert_eq!(
+            count_edge_rows_by_id(&rt, ann_edge_uuid, &ns).await,
+            0,
+            "hard-delete of base edge must purge already-soft-deleted annotates edge row (ADR-002)"
+        );
+        assert_eq!(
+            count_edge_rows_by_id(&rt, base_edge_uuid, &ns).await,
+            0,
+            "hard-delete must physically remove the base edge row"
         );
     }
 }

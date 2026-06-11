@@ -15,8 +15,11 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
-    /// Fetch an edge by link ID, returning `None` if absent.
+    /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.
     async fn get_edge(&self, id: LinkId) -> StorageResult<Option<Edge>>;
+    /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path
+    /// to locate and namespace-check an already-soft-deleted edge before purging it.
+    async fn get_edge_including_deleted(&self, id: LinkId) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
     /// Query edges with filter, sort, and pagination.
