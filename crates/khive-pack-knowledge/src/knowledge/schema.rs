@@ -9,9 +9,6 @@ pub use khive_brain_core::SectionType;
 // ── Section record (what the SQL stores) ─────────────────────────────────────
 
 #[derive(Debug, Clone)]
-// REASON: section_from_row and section_to_json are forward-deployed helpers retained
-// for the section-read surface (Phase 3); not yet wired to a verb.
-#[allow(dead_code)]
 pub(crate) struct Section {
     pub id: uuid::Uuid,
     pub atom_id: String,
@@ -139,6 +136,10 @@ pub(crate) struct UpsertDomainsParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct GetParams {
     pub id: String,
+    /// When `true`, include the atom's sections in the response under a `sections` key.
+    /// Defaults to `false`; domains ignore this flag (they have no sections).
+    #[serde(default)]
+    pub include_sections: Option<bool>,
 }
 
 // ── list ─────────────────────────────────────────────────────────────────────
