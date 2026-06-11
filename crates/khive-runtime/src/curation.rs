@@ -629,6 +629,42 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
     }
 }
 
+/// SQL-bind–ready scalars derived from [`note_fts_document`].
+///
+/// Used by `merge_note_sql` to guarantee that the raw SQL FTS INSERT stores
+/// exactly what [`Fts5TextSearch::upsert_document`] would write, preventing
+/// null/empty-string divergence on the `title` column for nameless notes.
+pub(crate) struct NoteFtsScalars {
+    /// Empty string when `note.name` is `None` — matches the `unwrap_or("")` in
+    /// `Fts5TextSearch::upsert_document`.
+    pub title: String,
+    pub body: String,
+    /// Always the JSON array `"[]"`.
+    pub tags: String,
+    /// Serialised `note.properties`, or `None` when properties are absent.
+    pub metadata: Option<String>,
+    /// `note.updated_at` converted to `DateTime<Utc>` timestamp_micros.
+    pub updated_at_micros: i64,
+}
+
+/// Derive [`NoteFtsScalars`] from a [`Note`].
+///
+/// All values match the encoding that [`Fts5TextSearch::upsert_document`]
+/// applies when given the output of [`note_fts_document`].
+pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
+    let doc = note_fts_document(note);
+    NoteFtsScalars {
+        title: doc.title.unwrap_or_default(),
+        body: doc.body,
+        tags: "[]".to_string(),
+        metadata: doc
+            .metadata
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default()),
+        updated_at_micros: doc.updated_at.timestamp_micros(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transactional merge SQL helpers
 // ---------------------------------------------------------------------------
@@ -1412,10 +1448,18 @@ fn merge_note_sql(
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
-        // Body parity with note_fts_document: prepend name when present.
-        let merged_fts_body = match &merged_name {
-            Some(n) => format!("{n} {merged_content}"),
-            None => merged_content.clone(),
+        // Derive FTS scalars through the shared constructor so this raw SQL
+        // path is field-identical to TextSearch::upsert_document.  Critically,
+        // `title` is an empty string (not SQL NULL) for nameless notes —
+        // matching the unwrap_or("") in Fts5TextSearch::upsert_document and
+        // allowing get_document to round-trip None ↔ "" correctly.
+        let fts_merged = {
+            let mut merged_note = Note::new(&namespace, &*into_note.kind, &*merged_content);
+            merged_note.id = into_id;
+            merged_note.name = merged_name.clone();
+            merged_note.properties = merged_props.clone();
+            merged_note.updated_at = now;
+            note_fts_scalars(&merged_note)
         };
         conn.execute(
             &format!(
@@ -1427,12 +1471,12 @@ fn merge_note_sql(
             rusqlite::params![
                 &into_str,
                 SubstrateKind::Note.to_string(),
-                &merged_name,
-                &merged_fts_body,
-                "[]",
+                &fts_merged.title,
+                &fts_merged.body,
+                &fts_merged.tags,
                 &namespace,
-                &props_str,
-                now,
+                &fts_merged.metadata,
+                fts_merged.updated_at_micros,
             ],
         )?;
 
@@ -2346,6 +2390,110 @@ mod tests {
         assert_eq!(
             from_after.content, "From content",
             "dry_run must not mutate from-note"
+        );
+    }
+
+    // Regression: merge two NAMELESS notes with no embedding model configured.
+    // Before this fix, the raw SQL FTS INSERT bound &merged_name directly — for a
+    // nameless note that is SQL NULL, while Fts5TextSearch::upsert_document stores
+    // an empty string.  The mismatch caused get_document to diverge (or fail) for
+    // nameless merged notes.  After the fix, note_fts_scalars drives every scalar
+    // and the round-trip is field-identical.
+    #[tokio::test]
+    async fn merge_nameless_notes_fts_document_is_parity_correct() {
+        use khive_storage::types::TextSearchRequest;
+
+        let rt = rt(); // in-memory runtime — no embedding model configured
+        let tok = NamespaceToken::local();
+
+        let into = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "intosentinelzxq body",
+                None,
+                Some(serde_json::json!({"src": "into"})),
+                vec![],
+            )
+            .await
+            .expect("create into-note");
+        let from = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "fromsentinelzxq body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create from-note");
+
+        let into_id = into.id;
+        let from_id = from.id;
+
+        rt.merge_note(
+            &tok,
+            into_id,
+            from_id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .expect("merge_note must succeed");
+
+        // Fetch the merged note from the note store to get its current state.
+        let note_store = rt.notes(&tok).expect("note store");
+        let merged_note = note_store
+            .get_note(into_id)
+            .await
+            .expect("get_note")
+            .expect("merged note must exist");
+
+        // Compute the expected FTS document via the shared constructor.
+        let expected = note_fts_document(&merged_note);
+
+        // Fetch the stored FTS document and verify field parity.
+        let fts = rt.text_for_notes(&tok).expect("FTS store");
+        let stored = fts
+            .get_document("local", into_id)
+            .await
+            .expect("get_document must not error")
+            .expect("FTS document must exist after merge");
+
+        // Core parity: subject_id, title (must be None, not Some("")), body.
+        assert_eq!(stored.subject_id, expected.subject_id, "subject_id");
+        assert_eq!(
+            stored.title, expected.title,
+            "title (None for nameless note)"
+        );
+        assert_eq!(stored.body, expected.body, "body");
+        assert_eq!(stored.namespace, expected.namespace, "namespace");
+        assert_eq!(stored.kind, expected.kind, "kind");
+
+        // The merged note is nameless — title must be None, matching the shared path.
+        assert!(
+            stored.title.is_none(),
+            "nameless merged note must have title=None in FTS (was NULL before fix)"
+        );
+
+        // The merged note must be searchable by a unique token from the into-note body.
+        let hits = fts
+            .search(TextSearchRequest {
+                query: "intosentinelzxq".to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .expect("search");
+        assert!(
+            hits.iter().any(|h| h.subject_id == into_id),
+            "merged note must be searchable by into-note content"
         );
     }
 
