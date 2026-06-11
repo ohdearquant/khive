@@ -1231,13 +1231,16 @@ mod tests {
     // must produce a stored FTS document that is field-identical to calling
     // note_fts_document() on the same Note. Catches drift between the shared
     // constructor and any caller that previously built documents inline.
+    // Properties are included so that metadata and updated_at are also under test.
     #[tokio::test]
     async fn note_fts_document_matches_runtime_create_path() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("ns");
         let token = rt.authorize(ns).expect("authorize");
 
-        // Create with a name so the title+body composition is exercised.
+        // Create with a name AND properties so metadata, title+body composition,
+        // and updated_at derivation are all exercised.
+        let props = serde_json::json!({"key": "value", "score": 42});
         let note = rt
             .create_note(
                 &token,
@@ -1245,7 +1248,7 @@ mod tests {
                 Some("cross path title"),
                 "cross path content body",
                 None,
-                None,
+                Some(props),
                 vec![],
             )
             .await
@@ -1267,6 +1270,103 @@ mod tests {
         assert_eq!(stored.title, expected.title, "title");
         assert_eq!(stored.body, expected.body, "body");
         assert_eq!(stored.namespace, expected.namespace, "namespace");
+        assert_eq!(stored.tags, expected.tags, "tags");
+        assert_eq!(stored.metadata, expected.metadata, "metadata");
+        // Compare at microsecond resolution — DateTime<Utc> round-trips through i64.
+        assert_eq!(
+            stored.updated_at.timestamp_micros(),
+            note.updated_at,
+            "updated_at must be derived from the note, not Utc::now()"
+        );
+    }
+
+    // Regression: run_reindex with no embedding model must still populate FTS for
+    // pre-existing notes. Guards against reintroduction of the early-return that
+    // skipped the FTS pass when model_names was empty (round-1 fix).
+    #[tokio::test]
+    async fn run_reindex_populates_fts_without_embedding_model() {
+        use khive_storage::types::TextFilter;
+        use khive_types::SubstrateKind;
+
+        // Use a temp-file db so run_reindex (which builds its own runtime) and our
+        // verification pass share the same on-disk state.
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+
+        // Seed notes via a runtime opened on the same file BEFORE calling run_reindex.
+        {
+            let cfg = resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(&db_path),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: true,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve config for seed");
+            let rt = KhiveRuntime::new(cfg).expect("seed runtime");
+            let token = rt
+                .authorize(Namespace::parse("local").expect("ns"))
+                .expect("authorize");
+            let note_store = rt.notes(&token).expect("note store");
+            for i in 0..3usize {
+                note_store
+                    .upsert_note(Note::new(
+                        "local",
+                        "observation",
+                        format!("run-reindex-sentinel{i} body"),
+                    ))
+                    .await
+                    .expect("upsert seed note");
+            }
+        }
+
+        // run_reindex with no embedding model and --no-knowledge.
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: None,
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: Some("local".to_string()),
+            knowledge_only: false,
+            no_knowledge: true,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        // Verify FTS was populated by re-opening the db.
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_path),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for verify");
+        let rt = KhiveRuntime::new(cfg).expect("verify runtime");
+        let token = rt
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        let count = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Note],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("fts count");
+        assert_eq!(
+            count, 3,
+            "run_reindex must populate FTS even when no embedding model is configured"
+        );
     }
 
     // No-embedding-model FTS: when no embedding model is registered, the note

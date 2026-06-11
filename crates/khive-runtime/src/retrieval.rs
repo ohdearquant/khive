@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
+use crate::curation::note_fts_document;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
@@ -340,7 +341,7 @@ impl KhiveRuntime {
     ///
     /// Returns the total number of records backfilled across all models.
     pub async fn backfill_missing_embeddings(&self, token: &NamespaceToken) -> RuntimeResult<u64> {
-        use khive_storage::types::{SqlRow, SqlStatement, SqlValue, TextDocument};
+        use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
         let model_names = self.registered_embedding_model_names();
         if model_names.is_empty() {
@@ -462,11 +463,15 @@ impl KhiveRuntime {
 
             // --- Notes: embed content where no vector entry exists ---
             let text_store = self.text_for_notes(token).ok();
+            let note_store = self.notes(token).ok();
             let mut note_total = 0usize;
             loop {
+                // Select only the id here; the full Note is fetched below so that
+                // note_fts_document receives all fields (name, properties, updated_at)
+                // and produces a parity-correct document rather than a stripped one.
                 let note_sql = SqlStatement {
                     sql: format!(
-                        "SELECT id, content FROM notes \
+                        "SELECT id FROM notes \
                          WHERE namespace = ?1 AND deleted_at IS NULL \
                          AND id NOT IN (\
                              SELECT subject_id FROM {vec_table} \
@@ -499,42 +504,38 @@ impl KhiveRuntime {
                             None
                         }
                     });
-                    let content = row.columns.get(1).and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
 
-                    let (Some(id_str), Some(content)) = (id_str, content) else {
+                    let Some(id_str) = id_str else {
                         continue;
                     };
                     let Ok(id) = id_str.parse::<Uuid>() else {
                         continue;
                     };
-                    if content.trim().is_empty() {
+
+                    // Fetch the full Note so that note_fts_document has all fields
+                    // (name, properties, updated_at) — prevents overwriting a correct
+                    // FTS row with a stripped content-only document.
+                    let note = match &note_store {
+                        Some(store) => match store.get_note(id).await {
+                            Ok(Some(n)) => n,
+                            _ => continue,
+                        },
+                        None => continue,
+                    };
+
+                    if note.content.trim().is_empty() {
                         continue;
                     }
 
-                    // Repopulate FTS entry if missing (best-effort, first model only to avoid N duplicates).
+                    // Repopulate FTS entry using the shared constructor (first model only
+                    // to avoid N identical overwrites per note).
                     if model_names.first().map(|n| n.as_str()) == Some(model_name.as_str()) {
                         if let Some(ref ts) = text_store {
-                            let _ = ts
-                                .upsert_document(TextDocument {
-                                    subject_id: id,
-                                    namespace: ns.clone(),
-                                    kind: SubstrateKind::Note,
-                                    title: None,
-                                    body: content.clone(),
-                                    tags: vec![],
-                                    metadata: None,
-                                    updated_at: chrono::Utc::now(),
-                                })
-                                .await;
+                            let _ = ts.upsert_document(note_fts_document(&note)).await;
                         }
                     }
 
+                    let content = note.content.clone();
                     match self.embed_with_model(model_name, &content).await {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
