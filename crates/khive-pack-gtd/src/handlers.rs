@@ -936,6 +936,10 @@ impl GtdPack {
                 status = p.status
             )));
         }
+        // Secret gate: scan the caller-supplied transition note before any write.
+        if let Some(ref n) = p.note {
+            khive_runtime::secret_gate::check(n)?;
+        }
 
         let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 

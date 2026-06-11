@@ -4,24 +4,36 @@
 //! causes a hard `RuntimeError::SecretDetected` that names the detector and
 //! carries a masked excerpt — it never echoes the full candidate back.
 //!
+//! Scope: **credentials only** — API keys, tokens, private keys, passwords,
+//! and connection strings with embedded credentials.  General PII such as
+//! email addresses, phone numbers, and company names is intentionally NOT
+//! blocked; those are normal knowledge-graph content.
+//!
 //! Detection is layered, cheap-first:
 //!
 //! 1. **Known-prefix / known-shape patterns** — AWS AKIA/ASIA, GitHub tokens,
-//!    OpenAI `sk-`, Anthropic `sk-ant-`, Stripe live keys, Fly.io tokens,
+//!    OpenAI `sk-proj-`, Anthropic `sk-ant-`, Stripe live keys, Fly.io tokens,
 //!    Vercel secrets, Slack `xox*`, JWT triples, PEM private-key headers,
 //!    Age secret keys, URL userinfo (`scheme://user:pass@`).
-//! 2. **High-entropy token heuristic** — base64/hex runs ≥ 24 chars near
-//!    a trigger word (key, token, secret, password, credential, bearer).
+//!    Bare `sk-` is also checked but only when NOT followed by a known safe
+//!    word boundary (e.g. `sk-learn`, `sk-image`).
+//! 2. **High-entropy token heuristic** — base64/hex/base64url runs ≥ 24 chars
+//!    near a trigger word (key, secret, password, credential, bearer, auth,
+//!    apikey, api_key, access_key, private_key).  The word `token` alone is NOT
+//!    a trigger to avoid blocking `tokenizer_*`, `token_count`, etc.
 //!
 //! Allowlist (false-positive suppression):
-//! - Pure hex strings (sha256, git SHA, UUID-hex) — passed unconditionally.
+//! - Pure hex strings (sha256, git SHA) — passed unconditionally.
 //! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed.
+//! - Base64/base64url content-hash shapes (standard-alphabet, URL-safe-alphabet,
+//!   length 24–88, no `=` padding or trailing `=` padding only) — passed when
+//!   not preceded by a known-vendor prefix.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
-// ─── Error variant ───────────────────────────────────────────────────────────
+// ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Returned when a write would store credential-looking content.
 ///
@@ -54,6 +66,44 @@ pub fn check(content: &str) -> RuntimeResult<()> {
         return Err(RuntimeError::SecretDetected(m));
     }
     Ok(())
+}
+
+/// Recursively scan a JSON value for credential-shaped strings.
+///
+/// Walks every string leaf (object values, array elements, nested objects).
+/// Returns `Err(RuntimeError::SecretDetected)` on the first match found.
+/// `None` / null / numeric / boolean JSON values are skipped.
+pub fn check_json(value: &serde_json::Value) -> RuntimeResult<()> {
+    scan_json_value(value)
+}
+
+/// Scan a string-tagged slice (entity/note tags).
+///
+/// Each tag string is scanned individually.
+pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
+    for tag in tags {
+        check(tag)?;
+    }
+    Ok(())
+}
+
+fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
+    match value {
+        serde_json::Value::String(s) => check(s),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                scan_json_value(v)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                scan_json_value(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
@@ -105,11 +155,13 @@ const PREFIX_DETECTORS: &[(&str, &str, usize)] = &[
     ("slack-token", "xoxp-", 40),
     ("slack-token", "xoxr-", 40),
     ("slack-token", "xoxs-", 40),
-    // OpenAI bare (after more-specific)
-    ("openai-api-key", "sk-", 30),
     // Age secret key
     ("age-secret-key", "AGE-SECRET-KEY-", 60),
 ];
+
+/// Known safe compound words that start with `sk-` but are not credentials.
+/// E.g. scikit-learn slugs such as `sk-learn`, `sk-image`, `sk-lego`.
+const SK_SAFE_PREFIXES: &[&str] = &["sk-learn", "sk-image", "sk-lego", "sk-base", "sk-misc"];
 
 /// Shape-based patterns checked with custom logic.
 fn check_known_patterns(text: &str) -> Option<SecretMatch> {
@@ -117,6 +169,14 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
     for &(name, needle, min_len) in PREFIX_DETECTORS {
         if let Some(m) = find_prefix_token(text, needle, min_len) {
             return Some(build_match(name, m));
+        }
+    }
+
+    // --- Bare `sk-` (after all more-specific sk- detectors above) ---
+    // Require length ≥ 30 AND exclude known safe scikit/library compound words.
+    if let Some(token) = find_prefix_token(text, "sk-", 30) {
+        if !SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe)) {
+            return Some(build_match("openai-api-key", token));
         }
     }
 
@@ -144,9 +204,20 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
     // --- PEM private key block ---
     // "-----BEGIN <TYPE> PRIVATE KEY-----"
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
-        // Find the start of the header to build a masked excerpt.
         if let Some(pos) = text.find("-----BEGIN") {
-            let excerpt = &text[pos..];
+            // Measure only the key block itself (up to END marker or end-of-string),
+            // not the rest of the surrounding text, so build_match reports the
+            // block length rather than the remaining string length.
+            let block_end = text[pos..]
+                .find("-----END")
+                .map(|rel| {
+                    text[pos + rel..]
+                        .find('\n')
+                        .map(|l| pos + rel + l + 1)
+                        .unwrap_or(text.len())
+                })
+                .unwrap_or(text.len());
+            let excerpt = &text[pos..block_end];
             return Some(build_match("pem-private-key", excerpt));
         }
     }
@@ -270,9 +341,13 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 // ─── Layer 2: entropy heuristic ─────────────────────────────────────────────
 
 /// Trigger words near which high-entropy tokens are suspicious.
+///
+/// The bare word `token` is intentionally excluded: it appears in benign
+/// technical context (`tokenizer`, `token_count`, `next_token`) and is too
+/// broad.  Compound forms `apikey`, `api_key`, `access_key`, `private_key`
+/// are retained because they are narrower.
 const TRIGGER_WORDS: &[&str] = &[
     "key",
-    "token",
     "secret",
     "password",
     "passwd",
@@ -313,7 +388,7 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
             continue;
         }
         // Allowlist: skip pure hex (sha256, git SHA), UUID canonical form, and
-        // things that look like base64 content hashes (all hex or UUID-shaped).
+        // base64/base64url content-hash shapes (SRI hashes, lockfile digests).
         if is_allowlisted(token) {
             continue;
         }
@@ -339,23 +414,101 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
 /// Returns `true` for tokens that should NOT trigger the entropy heuristic.
 ///
 /// Allowlisted forms:
-/// - Pure lowercase hex of any length ≥ 8 (git SHA, sha256 digest, uuid-hex).
 /// - UUID canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
-/// - Strings shorter than MIN_ENTROPY_LEN after delimiter stripping.
+/// - Pure hex (case-insensitive, 8–128 chars, optional `0x`/`0X` prefix) —
+///   git SHA, sha256 digest, uuid-hex.
+/// - Base64 / base64url content-hash shapes: standard alphabet
+///   (`[A-Za-z0-9+/]`) or URL-safe alphabet (`[A-Za-z0-9_-]`), length 24–88,
+///   optional trailing `=`/`==` padding.  These appear in SRI hashes, npm
+///   lockfile checksums, and tokenizer/model metadata and are almost never
+///   credentials.
 fn is_allowlisted(token: &str) -> bool {
     // UUID canonical form.
     if is_uuid_canonical(token) {
         return true;
     }
-    // Pure hex (lowercase or uppercase, possibly with 0x prefix).
+    // Pure hex (case-insensitive, optional 0x prefix).
     let hex_part = token
         .strip_prefix("0x")
         .or(token.strip_prefix("0X"))
         .unwrap_or(token);
-    if hex_part.len() >= 8 && hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hex_part.len() >= 8
+        && hex_part.len() <= 128
+        && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return true;
+    }
+    // Base64 / base64url content-hash shape.
+    if is_base64_content_hash(token) {
         return true;
     }
     false
+}
+
+/// Returns `true` for tokens that look like base64/base64url content hashes
+/// (SRI hash body, npm integrity).
+///
+/// Criteria (deliberately narrow to avoid FPs on real tokens):
+/// - Matches SHA-family content-hash lengths after stripping padding:
+///   - sha256 body: 43 chars (base64 of 32 bytes)
+///   - sha384 body: 64 chars (base64 of 48 bytes)
+///   - sha512 body: 86–88 chars (base64 of 64 bytes)
+/// - Every byte is a standard-base64 or URL-safe-base64 character.
+/// - Does NOT start with a known vendor-token prefix (those are credentials
+///   regardless of alphabet).
+fn is_base64_content_hash(token: &str) -> bool {
+    // Known vendor prefixes — never allowlist even if they look like base64.
+    // Includes bare `sk-` to prevent OpenAI-shaped tokens from being allowlisted.
+    const VENDOR_PREFIXES: &[&str] = &[
+        "sk-",
+        "rk_live_",
+        "fm2_",
+        "vercel_",
+        "xoxb-",
+        "xoxa-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "AKIA",
+        "ASIA",
+        "AGE-SECRET-KEY-",
+        "FlyV1",
+    ];
+    if VENDOR_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        return false;
+    }
+    // Strip SRI `sha[0-9]+-` prefix (e.g. `sha256-`, `sha384-`, `sha512-`)
+    // before measuring the hash body length.
+    let body = if let Some(rest) = token.strip_prefix("sha") {
+        // rest starts with digits followed by '-'
+        let dash = rest.find('-').unwrap_or(rest.len());
+        let digits = &rest[..dash];
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && dash < rest.len() {
+            &rest[dash + 1..] // everything after "sha<digits>-"
+        } else {
+            token
+        }
+    } else {
+        token
+    };
+    // Strip optional padding (at most 2 `=`).
+    let stripped = body.trim_end_matches('=');
+    let pad_removed = body.len() - stripped.len();
+    if pad_removed > 2 {
+        return false;
+    }
+    // Accept only SHA-family content-hash lengths (43, 64, 86–88 chars unpadded).
+    let n = stripped.len();
+    if n != 43 && n != 64 && !(86..=88).contains(&n) {
+        return false;
+    }
+    // Accept both standard-base64 and URL-safe-base64 alphabets.
+    stripped
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_')
 }
 
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
@@ -570,12 +723,12 @@ mod tests {
     }
 
     #[test]
-    fn blocks_high_entropy_near_token_word() {
-        // 32 random-looking base64 chars adjacent to the word "token".
+    fn blocks_high_entropy_near_bearer_word() {
+        // 32 random-looking base64 chars adjacent to the word "bearer".
         let fake = "Bearer token: Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"; // gitleaks:allow
         assert!(
             scan(fake).is_some(),
-            "high-entropy token near 'token' must be caught"
+            "high-entropy value near 'bearer' must be caught"
         );
         assert_eq!(scan(fake).unwrap().detector, "high-entropy-token");
     }
@@ -758,5 +911,183 @@ mod tests {
     fn allowlist_does_not_pass_mixed_token() {
         // A token that starts with letters but mixes in non-hex chars.
         assert!(!is_allowlisted("sk-aaaaaabbbbbbccccccddddddeeeeeeffffgg"));
+    }
+
+    // ── Structured-field gate helpers ────────────────────────────────────────
+
+    #[test]
+    fn check_json_blocks_secret_in_object_value() {
+        let props = serde_json::json!({ "api_key": "AKIAFAKEKEY1234567890" });
+        assert!(
+            check_json(&props).is_err(),
+            "secret in properties object value must be blocked"
+        );
+    }
+
+    #[test]
+    fn check_json_blocks_secret_in_nested_object() {
+        let props = serde_json::json!({ "credentials": { "token": "sk-proj-FAKEKEY00000000000000000000000000000000" } }); // gitleaks:allow
+        assert!(
+            check_json(&props).is_err(),
+            "secret in nested properties object must be blocked"
+        );
+    }
+
+    #[test]
+    fn check_json_blocks_secret_in_array() {
+        let props = serde_json::json!(["normal", "AKIAFAKEKEY1234567890"]);
+        assert!(
+            check_json(&props).is_err(),
+            "secret in JSON array must be blocked"
+        );
+    }
+
+    #[test]
+    fn check_json_passes_safe_properties() {
+        let props = serde_json::json!({
+            "domain": "attention",
+            "status": "researched",
+            "year": 2024
+        });
+        assert!(
+            check_json(&props).is_ok(),
+            "normal properties must pass; fired: {:?}",
+            check_json(&props).err()
+        );
+    }
+
+    #[test]
+    fn check_tags_blocks_credential_tag() {
+        let tags = vec![
+            "type:concept".to_string(),
+            "AKIAFAKEKEY1234567890".to_string(),
+        ];
+        assert!(
+            check_tags(&tags).is_err(),
+            "credential-shaped tag must be blocked"
+        );
+    }
+
+    #[test]
+    fn check_tags_passes_normal_tags() {
+        let tags = vec!["type:concept".to_string(), "domain:attention".to_string()];
+        assert!(
+            check_tags(&tags).is_ok(),
+            "normal tags must pass; fired: {:?}",
+            check_tags(&tags).err()
+        );
+    }
+
+    // ── False-positive: sk-learn and scikit-learn slugs ──────────────────────
+
+    #[test]
+    fn allows_sk_learn_prose() {
+        // scikit-learn slug used as an entity name or knowledge atom.
+        let texts = &[
+            "sk-learn is a Python machine learning library",
+            "sk-learn-compatible transformer pipeline reference",
+            "sk-learn scikit-learn estimator interface",
+        ];
+        for t in texts {
+            assert!(
+                scan(t).is_none(),
+                "sk-learn prose must pass; fired: {:?} on {:?}",
+                scan(t),
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_openai_sk_proj_not_confused_with_sk_learn() {
+        // Real OpenAI key shape must still be caught.
+        let fake = "sk-proj-FAKEKEY00000000000000000000000000000000"; // gitleaks:allow
+        assert!(
+            scan(fake).is_some(),
+            "sk-proj- key must still be caught after sk-learn exemption"
+        );
+    }
+
+    // ── False-positive: SRI / tokenizer hash metadata ────────────────────────
+
+    #[test]
+    fn allows_sri_hash() {
+        // SRI hash as used in HTML integrity attributes (sha384, base64-encoded).
+        // Placed near the word "key" to test the entropy heuristic allowlist.
+        let line = "integrity key: sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC";
+        assert!(
+            scan(line).is_none(),
+            "SRI hash must pass; fired: {:?}",
+            scan(line)
+        );
+    }
+
+    #[test]
+    fn allows_base64_tokenizer_hash_metadata() {
+        // Tokenizer metadata containing a base64 hash near technical keywords.
+        let line = "tokenizer_vocab_hash: Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"; // gitleaks:allow
+        assert!(
+            scan(line).is_none(),
+            "tokenizer hash metadata must pass; fired: {:?}",
+            scan(line)
+        );
+    }
+
+    #[test]
+    fn allows_npm_lockfile_integrity() {
+        // npm lockfile integrity line with sha512 base64url hash (86 base64 chars + ==).
+        // sha512 digest = 64 bytes → base64 = 88 chars (86 unpadded + ==).
+        let body_86 = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1234567890abcdefghijklmnopqrstuvwxABCDEFGHIJKLMNOPQRST";
+        assert_eq!(body_86.len(), 86, "test body must be exactly 86 chars");
+        let line = format!(
+            "resolved: https://registry.npmjs.org/foo/-/foo-1.0.0.tgz\nintegrity: sha512-{body_86}=="
+        );
+        assert!(
+            scan(&line).is_none(),
+            "npm lockfile integrity must pass; fired: {:?}",
+            scan(&line)
+        );
+    }
+
+    // ── False-positive: tokenizer vs token trigger word ─────────────────────
+
+    #[test]
+    fn allows_tokenizer_vocab_hash_no_block() {
+        // The word "tokenizer" must not trigger as the `token` trigger word.
+        let line = "tokenizer_vocab_hash = Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"; // gitleaks:allow
+        assert!(
+            scan(line).is_none(),
+            "tokenizer_vocab_hash must pass since 'token' is no longer a trigger; fired: {:?}",
+            scan(line)
+        );
+    }
+
+    // ── PEM masking format ───────────────────────────────────────────────────
+
+    #[test]
+    fn pem_masked_excerpt_reflects_block_length_not_rest_of_string() {
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let fake = format!(
+            "{}\nMIIEo\u{2026}\n-----END RSA PRIVATE KEY-----\nsome trailing text that is very long",
+            header
+        );
+        let m = scan(&fake).unwrap();
+        assert_eq!(m.detector, "pem-private-key");
+        // The masked length should reflect only the key block, not the whole string.
+        // "some trailing text that is very long" is ~37 chars; total string is much longer.
+        // The block ends after "-----END RSA PRIVATE KEY-----\n".
+        // We just verify it is shorter than the full string length.
+        let full_len = fake.chars().count();
+        let reported_len: usize = m
+            .masked
+            .trim_end_matches("chars")
+            .rsplit("...")
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(full_len + 1);
+        assert!(
+            reported_len < full_len,
+            "masked length ({reported_len}) should be less than full string length ({full_len})"
+        );
     }
 }

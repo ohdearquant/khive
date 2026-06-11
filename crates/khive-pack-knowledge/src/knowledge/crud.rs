@@ -189,6 +189,15 @@ impl KnowledgeHandlers {
             validate_atom_content(mirror_content).map_err(|e| {
                 RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
             })?;
+            // Secret gate: scan all caller-supplied text before any write.
+            khive_runtime::secret_gate::check(&name)?;
+            khive_runtime::secret_gate::check(mirror_content)?;
+            if let Some(ref tags_vec) = domain_in.tags {
+                khive_runtime::secret_gate::check_tags(tags_vec)?;
+            }
+            if let Some(ref members_vec) = domain_in.members {
+                khive_runtime::secret_gate::check_tags(members_vec)?;
+            }
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
             if !tags.iter().any(|t| t == "type:domain") {

@@ -334,11 +334,15 @@ impl KhiveRuntime {
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
         self.validate_entity_kind(kind)?;
-        // Secret gate: scan name and description before any write.
+        // Secret gate: scan name, description, structured properties, and tags.
         crate::secret_gate::check(name)?;
         if let Some(d) = description {
             crate::secret_gate::check(d)?;
         }
+        if let Some(ref p) = properties {
+            crate::secret_gate::check_json(p)?;
+        }
+        crate::secret_gate::check_tags(&tags)?;
         let ns = token.namespace().as_str();
         let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
@@ -1174,10 +1178,13 @@ impl KhiveRuntime {
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
         self.validate_note_kind(kind)?;
-        // Secret gate: scan content and optional name before any write.
+        // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
             crate::secret_gate::check(n)?;
+        }
+        if let Some(ref p) = properties {
+            crate::secret_gate::check_json(p)?;
         }
         let ns = token.namespace().as_str();
 
