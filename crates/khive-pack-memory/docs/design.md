@@ -11,7 +11,7 @@
   $$\text{effective\_salience} = \text{salience} \times e^{-\text{decay\_factor} \times \text{age\_days}}$$
   The note's own `decay_factor` field controls the rate; `temporal_half_life_days` is used only
   by the independent temporal recency score, not by salience decay.
-- Defaults are type-differentiated: `episodic` → `salience=0.3`, `decay_factor=0.02` (~23-day
+- Defaults are type-differentiated: `episodic` → `salience=0.3`, `decay_factor=0.02` (~35-day
   half-life); `semantic` → `salience=0.5`, `decay_factor=0.005` (~139-day half-life).
   Explicit caller-supplied values always override the defaults.
 - `memory_type` property is always written (default `"episodic"`); only `"episodic"` and

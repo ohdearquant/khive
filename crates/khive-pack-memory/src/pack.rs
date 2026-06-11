@@ -101,7 +101,7 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
                 name: "decay_factor",
                 param_type: "number",
                 required: false,
-                description: "Decay rate >= 0. Default is type-differentiated: episodic=0.02 (~23d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.",
+                description: "Decay rate >= 0. Default is type-differentiated: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.",
             },
             ParamDef {
                 name: "memory_type",

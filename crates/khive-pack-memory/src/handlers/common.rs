@@ -196,6 +196,15 @@ pub(super) fn normalize_relevance(raw: f64, strategy: &FusionStrategy) -> f64 {
 /// Salience amplifier exponent applied to `effective_salience` in `compute_score`.
 pub(super) const SALIENCE_AMPLIFIER_ALPHA: f64 = 1.5;
 
+/// Default salience for episodic memories (session events; decay quickly).
+pub(super) const DEFAULT_SALIENCE_EPISODIC: f64 = 0.3;
+/// Default salience for semantic memories (durable facts; stronger base weight).
+pub(super) const DEFAULT_SALIENCE_SEMANTIC: f64 = 0.5;
+/// Default decay_factor for episodic memories (~35-day half-life).
+pub(super) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
+/// Default decay_factor for semantic memories (~139-day half-life).
+pub(super) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
+
 pub(super) fn compute_score(
     cfg: &RecallConfig,
     pipeline: &MemoryRecallPipeline,

@@ -464,7 +464,8 @@ impl RecallConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DecayModel {
-    /// `salience * exp(-decay_factor * age_days)` — default ~69-day half-life at decay_factor=0.01.
+    /// `salience * exp(-decay_factor * age_days)` — half-life = ln(2)/decay_factor.
+    /// Pack defaults: episodic decay_factor=0.02 (~35d), semantic decay_factor=0.005 (~139d).
     #[default]
     Exponential,
     /// `salience / (1 + decay_factor * age_days)`

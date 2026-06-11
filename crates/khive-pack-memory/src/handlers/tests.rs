@@ -739,94 +739,42 @@ fn recall_text_terms_production_path_uses_constant() {
     );
 }
 
-// ── Type-differentiated salience + decay defaults (#70) ─────────────────────
-
-fn default_salience_for(memory_type: &str) -> f64 {
-    match memory_type {
-        "semantic" => 0.5,
-        _ => 0.3,
-    }
-}
-
-fn default_decay_for(memory_type: &str) -> f64 {
-    match memory_type {
-        "semantic" => 0.005,
-        _ => 0.02,
-    }
-}
+// ── Type-differentiated salience + decay defaults (#84) ─────────────────────
+//
+// Production-path coverage (dispatches the real handler, asserts stored values)
+// lives in crates/khive-pack-memory/tests/integration.rs:
+//   - test_remember_episodic_defaults_stored
+//   - test_remember_omitted_memory_type_uses_episodic_defaults
+//   - test_remember_semantic_defaults_stored
+//   - test_remember_explicit_salience_overrides_episodic_default
+//   - test_remember_explicit_decay_overrides_episodic_default
+//
+// The named constants exercised by those tests are defined in handlers/common.rs:
+//   DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
+//   DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC.
 
 #[test]
-fn remember_default_salience_episodic_is_0_3() {
-    assert!(
-        (default_salience_for("episodic") - 0.3).abs() < 1e-12,
-        "episodic default salience must be 0.3"
-    );
-}
-
-#[test]
-fn remember_default_salience_semantic_is_0_5() {
-    assert!(
-        (default_salience_for("semantic") - 0.5).abs() < 1e-12,
-        "semantic default salience must be 0.5"
-    );
-}
-
-#[test]
-fn remember_default_decay_episodic_is_0_02() {
-    assert!(
-        (default_decay_for("episodic") - 0.02).abs() < 1e-12,
-        "episodic default decay_factor must be 0.02"
-    );
-}
-
-#[test]
-fn remember_default_decay_semantic_is_0_005() {
-    assert!(
-        (default_decay_for("semantic") - 0.005).abs() < 1e-12,
-        "semantic default decay_factor must be 0.005"
-    );
-}
-
-#[test]
-fn remember_defaults_are_type_differentiated() {
-    assert!(
-        default_salience_for("episodic") < default_salience_for("semantic"),
-        "episodic default salience ({}) must be lower than semantic ({})",
-        default_salience_for("episodic"),
-        default_salience_for("semantic"),
-    );
-    assert!(
-        default_decay_for("episodic") > default_decay_for("semantic"),
-        "episodic default decay ({}) must be faster than semantic ({})",
-        default_decay_for("episodic"),
-        default_decay_for("semantic"),
-    );
-}
-
-#[test]
-fn remember_explicit_salience_overrides_type_default() {
-    let explicit: f64 = 0.9;
-    let salience = if !(0.0..=1.0).contains(&explicit) {
-        panic!("out of range")
-    } else {
-        explicit
+fn remember_type_defaults_constants_are_differentiated() {
+    use super::common::{
+        DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+        DEFAULT_SALIENCE_SEMANTIC,
     };
+    const { assert!(DEFAULT_SALIENCE_EPISODIC < DEFAULT_SALIENCE_SEMANTIC) };
+    const { assert!(DEFAULT_DECAY_EPISODIC > DEFAULT_DECAY_SEMANTIC) };
     assert!(
-        (salience - 0.9).abs() < 1e-12,
-        "explicit salience must override type default"
+        (DEFAULT_SALIENCE_EPISODIC - 0.3).abs() < 1e-12,
+        "episodic salience constant must be 0.3"
     );
-}
-
-#[test]
-fn remember_explicit_decay_overrides_type_default() {
-    let explicit: f64 = 0.001;
-    let decay = if !explicit.is_finite() || explicit < 0.0 {
-        panic!("invalid decay")
-    } else {
-        explicit
-    };
     assert!(
-        (decay - 0.001).abs() < 1e-12,
-        "explicit decay_factor must override type default"
+        (DEFAULT_SALIENCE_SEMANTIC - 0.5).abs() < 1e-12,
+        "semantic salience constant must be 0.5"
+    );
+    assert!(
+        (DEFAULT_DECAY_EPISODIC - 0.02).abs() < 1e-12,
+        "episodic decay constant must be 0.02"
+    );
+    assert!(
+        (DEFAULT_DECAY_SEMANTIC - 0.005).abs() < 1e-12,
+        "semantic decay constant must be 0.005"
     );
 }

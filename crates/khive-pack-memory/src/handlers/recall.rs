@@ -24,7 +24,8 @@ use crate::MemoryPack;
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
     recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, PROF_CID, RECALL_CALL_ID,
+    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
 };
 
 impl MemoryPack {
@@ -274,22 +275,32 @@ impl MemoryPack {
                     continue;
                 }
             }
-            let salience = note.salience.unwrap_or(0.5);
-            let decay_factor = note.decay_factor.unwrap_or(0.01);
-            if salience < cfg.min_salience {
-                continue;
-            }
-
-            let memory_type_str = note
+            let note_memory_type = note
                 .properties
                 .as_ref()
                 .and_then(|pr| pr.get("memory_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("episodic");
+            let salience = note.salience.unwrap_or(if note_memory_type == "semantic" {
+                DEFAULT_SALIENCE_SEMANTIC
+            } else {
+                DEFAULT_SALIENCE_EPISODIC
+            });
+            let decay_factor = note
+                .decay_factor
+                .unwrap_or(if note_memory_type == "semantic" {
+                    DEFAULT_DECAY_SEMANTIC
+                } else {
+                    DEFAULT_DECAY_EPISODIC
+                });
+            if salience < cfg.min_salience {
+                continue;
+            }
+
             let rank_score = calculate_score(
                 &ScoreInput {
                     salience: salience as f32,
-                    memory_type_str,
+                    memory_type_str: note_memory_type,
                     content: &note.content,
                     created_at_millis: note.created_at / 1_000,
                     decay_factor: decay_factor as f32,

@@ -62,10 +62,10 @@ The notes substrate carries `salience` (the primary signal used by retrieval rer
 decay rate). The memory pack does NOT introduce new columns; it uses these substrate
 fields directly:
 
-| Wire parameter | Storage column | Default                                |
-| -------------- | -------------- | -------------------------------------- |
-| `salience`     | `salience`     | `0.5`                                  |
-| `decay_factor` | `decay_factor` | `0.01` (mild decay; ~69-day half-life) |
+| Wire parameter | Storage column | Default (episodic)         | Default (semantic)           |
+| -------------- | -------------- | -------------------------- | ---------------------------- |
+| `salience`     | `salience`     | `0.3`                      | `0.5`                        |
+| `decay_factor` | `decay_factor` | `0.02` (~35-day half-life) | `0.005` (~139-day half-life) |
 
 There is no aliasing — the wire parameter and storage column are both `salience`.
 
@@ -106,8 +106,8 @@ Semantically equivalent to:
 1. note_id = create(
      kind = "memory",
      content = content,
-     salience = <salience | 0.5>,
-     decay_factor = <decay_factor | 0.01>,
+     salience = <salience | (episodic: 0.3, semantic: 0.5)>,
+     decay_factor = <decay_factor | (episodic: 0.02, semantic: 0.005)>,
      properties = { memory_type: <memory_type | "episodic"> },
      tags = <tags | []>,
      namespace = namespace,
@@ -291,13 +291,18 @@ The cost: callers querying through generic `search(kind="note", note_kind="memor
 get both types mixed; filtering on `memory_type` requires a `properties.memory_type`
 post-filter or use of the `recall` verb's `memory_type` argument. Acceptable.
 
-### Why decay defaults to `0.01` (not `0.0`)
+### Why decay defaults are type-differentiated (not a flat `0.01`)
 
 The substrate-wide default of `0.0` (no decay) is correct for note kinds where age is
 not a relevance signal (e.g., decisions, references). For memory, age IS a relevance
 signal — a memory from yesterday is more salient than one from a year ago, all else
-equal. Defaulting to `0.01` (mild decay, ~69-day half-life) gives sensible behaviour
-out of the box.
+equal.
+
+Episodic memories (session events) are inherently transient. A flat `0.01` default
+was revised to a type-differentiated scheme: episodic uses `0.02` (~35-day half-life)
+so session context ages out faster, while semantic memories use `0.005` (~139-day
+half-life) because durable facts should remain retrievable much longer. Salience
+defaults follow the same logic: episodic `0.3` vs. semantic `0.5`.
 
 Agents that want different decay characteristics override per-memory:
 `memory.remember(content="...", decay_factor=0.05)` for fast-fading episodic content,
@@ -430,15 +435,18 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 
 ### Tests
 
-| Scenario                                               | Assert                                                                      |
-| ------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `memory.remember(content="x")` defaults                | `memory_type="episodic"`, `salience=0.5`, `decay_factor=0.01`               |
-| `memory.remember(... source_id=P)`                     | `annotates` edge from memory_id to P exists                                 |
-| `memory.recall(query="x")` excludes non-memory notes   | Mixed namespace with observations + tasks; no leak                          |
-| `recall` with mixed namespace > `limit * 4` non-memory | Candidate scoping pushes filter into retrieval; correct limit hits returned |
-| Decay-weighted ranking                                 | High-decay old memory ranks below low-decay equivalent                      |
-| `memory_type` post-filter                              | Returns only specified type                                                 |
-| `delete(memory_id)` works without forget verb          | Subsequent recall excludes the deleted memory                               |
+| Scenario                                                        | Assert                                                                      |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `memory.remember(content="x")` defaults                         | `memory_type="episodic"`, `salience=0.3`, `decay_factor=0.02`               |
+| `memory.remember(content="x", memory_type="semantic")` defaults | `salience=0.5`, `decay_factor=0.005`                                        |
+| Explicit `salience=0.5` with episodic type                      | Stored value is `0.5`, not overridden by type default                       |
+| Explicit `decay_factor=0.01` with episodic type                 | Stored value is `0.01`, not overridden by type default                      |
+| `memory.remember(... source_id=P)`                              | `annotates` edge from memory_id to P exists                                 |
+| `memory.recall(query="x")` excludes non-memory notes            | Mixed namespace with observations + tasks; no leak                          |
+| `recall` with mixed namespace > `limit * 4` non-memory          | Candidate scoping pushes filter into retrieval; correct limit hits returned |
+| Decay-weighted ranking                                          | High-decay old memory ranks below low-decay equivalent                      |
+| `memory_type` post-filter                                       | Returns only specified type                                                 |
+| `delete(memory_id)` works without forget verb                   | Subsequent recall excludes the deleted memory                               |
 
 ## References
 
