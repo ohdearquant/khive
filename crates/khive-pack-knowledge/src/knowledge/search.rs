@@ -1288,17 +1288,7 @@ impl KnowledgeHandlers {
                 .map(|(st, w)| (st.as_str().to_string(), w as f32))
                 .collect();
 
-            let q_emb = runtime
-                .embed_batch(std::slice::from_ref(&raw_query))
-                .await
-                .ok()
-                .and_then(|mut v| {
-                    if v.len() == 1 {
-                        Some(v.remove(0))
-                    } else {
-                        None
-                    }
-                });
+            let q_emb = runtime.embed_query(&raw_query).await.ok();
 
             if let Some(qe) = q_emb {
                 super::compose::score_sections(

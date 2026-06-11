@@ -69,6 +69,10 @@ impl KhiveRuntime {
     /// because custom services are expected to ignore the enum argument (they
     /// own a single model implicitly).
     ///
+    /// Applies no instruction prefix (generic role). Use
+    /// [`embed_document_with_model`] / [`embed_query_with_model`] for
+    /// instruction-tuned models where the asymmetric prefix matters.
+    ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
     pub async fn embed_with_model(&self, model_name: &str, text: &str) -> RuntimeResult<Vec<f32>> {
         // Try to resolve as a lattice alias. If that succeeds, use the enum to
@@ -78,6 +82,89 @@ impl KhiveRuntime {
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
         Ok(service.embed_one(text, emb_model).await?)
+    }
+
+    /// Embed a document/passage for indexing using the named model.
+    ///
+    /// Applies `EmbeddingService::embed_passage`, which prepends the model's
+    /// `document_instruction()` prefix when defined (e.g. `"passage: "` for
+    /// multilingual-e5). For models with no document prefix (MiniLM, BGE) this
+    /// is identical to [`embed_with_model`].
+    ///
+    /// Use this for all index/store/backfill paths so that instruction-tuned
+    /// models produce passage-side vectors.
+    ///
+    /// Returns `UnknownModel` if `model_name` is not registered.
+    pub async fn embed_document_with_model(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
+        let model = parse_embedding_model_alias(model_name);
+        let service = self.embedder(model_name).await?;
+        let emb_model = model.unwrap_or_default();
+        service
+            .embed_passage(&[text.to_string()], emb_model)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))
+    }
+
+    /// Embed a query string for retrieval using the named model.
+    ///
+    /// Applies `EmbeddingService::embed_query`, which prepends the model's
+    /// `query_instruction()` prefix when defined (e.g. `"query: "` for
+    /// multilingual-e5). For models with no query prefix (MiniLM, BGE) this
+    /// is identical to [`embed_with_model`].
+    ///
+    /// Use this for all search/recall/suggest query embedding paths so that
+    /// instruction-tuned models land in the correct side of their retrieval
+    /// space.
+    ///
+    /// Returns `UnknownModel` if `model_name` is not registered.
+    pub async fn embed_query_with_model(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<Vec<f32>> {
+        let model = parse_embedding_model_alias(model_name);
+        let service = self.embedder(model_name).await?;
+        let emb_model = model.unwrap_or_default();
+        service
+            .embed_query(&[text.to_string()], emb_model)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))
+    }
+
+    /// Embed a document for indexing using the configured default model.
+    ///
+    /// Delegates to [`embed_document_with_model`]. Use for entity/note
+    /// create and reindex paths.
+    ///
+    /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_document_with_model(model_name, text).await
+    }
+
+    /// Embed a query for retrieval using the configured default model.
+    ///
+    /// Delegates to [`embed_query_with_model`]. Use for vector search and
+    /// hybrid search query paths.
+    ///
+    /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    pub async fn embed_query(&self, text: &str) -> RuntimeResult<Vec<f32>> {
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_query_with_model(model_name, text).await
     }
 
     /// Generate embeddings for multiple texts in one call using the configured default model.
@@ -116,6 +203,64 @@ impl KhiveRuntime {
         Ok(service.embed(texts, emb_model).await?)
     }
 
+    /// Embed a batch of documents for indexing using the named model.
+    ///
+    /// Applies `EmbeddingService::embed_passage`. Use for all bulk
+    /// index/backfill/reindex operations to apply the passage-side prefix.
+    ///
+    /// Returns `UnknownModel` if `model_name` is not registered.
+    pub async fn embed_document_batch_with_model(
+        &self,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let model = parse_embedding_model_alias(model_name);
+        let service = self.embedder(model_name).await?;
+        let emb_model = model.unwrap_or_default();
+        Ok(service.embed_passage(texts, emb_model).await?)
+    }
+
+    /// Embed a batch of documents for indexing using the configured default model.
+    ///
+    /// Convenience delegate to [`embed_document_batch_with_model`]. Use for
+    /// bulk knowledge-atom and section indexing paths.
+    ///
+    /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    pub async fn embed_document_batch(&self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_document_batch_with_model(model_name, texts)
+            .await
+    }
+
+    /// Embed a batch of queries for retrieval using the named model.
+    ///
+    /// Applies `EmbeddingService::embed_query`. Use for bulk query-side
+    /// operations where multiple queries need instruction-tuned prefixing.
+    ///
+    /// Returns `UnknownModel` if `model_name` is not registered.
+    pub async fn embed_query_batch_with_model(
+        &self,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let model = parse_embedding_model_alias(model_name);
+        let service = self.embedder(model_name).await?;
+        let emb_model = model.unwrap_or_default();
+        Ok(service.embed_query(texts, emb_model).await?)
+    }
+
     /// Search vectors using either a caller-provided embedding or query text.
     ///
     /// Existing callers pass `query_embedding: Some(vec)` to avoid re-embedding.
@@ -142,7 +287,7 @@ impl KhiveRuntime {
                         "query_text must not be empty".into(),
                     ));
                 }
-                self.embed(text).await?
+                self.embed_query(text).await?
             }
         };
 
@@ -420,7 +565,7 @@ impl KhiveRuntime {
                         continue;
                     }
 
-                    match self.embed_with_model(model_name, &desc).await {
+                    match self.embed_document_with_model(model_name, &desc).await {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
@@ -536,7 +681,7 @@ impl KhiveRuntime {
                     }
 
                     let content = note.content.clone();
-                    match self.embed_with_model(model_name, &content).await {
+                    match self.embed_document_with_model(model_name, &content).await {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
@@ -1033,6 +1178,78 @@ mod tests {
         assert!(
             hit.title.as_deref().unwrap().contains("FlashAttention"),
             "title must contain entity name"
+        );
+    }
+
+    // ---- embed intent tests (issue #93) ----
+
+    #[test]
+    #[ignore = "loads ~80 MB model; run with --include-ignored"]
+    fn minilm_document_and_query_embed_are_identical_no_prefix_model() {
+        // MiniLM has no instruction prefixes; document and query paths must
+        // produce byte-identical vectors so that existing stored vectors remain
+        // comparable after this change.
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let text = "attention is all you need".to_string();
+        let rt_ref = &rt;
+        let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let d = rt_ref
+                .embed_document_with_model(&model.to_string(), &text)
+                .await
+                .unwrap();
+            let q = rt_ref
+                .embed_query_with_model(&model.to_string(), &text)
+                .await
+                .unwrap();
+            (d, q)
+        });
+        assert_eq!(
+            doc_emb, query_emb,
+            "MiniLM has no instruction prefix: document and query embeds must be identical"
+        );
+    }
+
+    #[test]
+    #[ignore = "loads multilingual-e5-small (~90 MB); run with --include-ignored"]
+    fn e5_document_and_query_embed_differ_instruction_tuned_model() {
+        // multilingual-e5 prepends "passage: " for documents and "query: " for
+        // queries. The same raw text must produce different embeddings when the
+        // correct prefixes are applied, confirming the asymmetric-retrieval
+        // capability is now exercised.
+        let model = EmbeddingModel::MultilingualE5Small;
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let text = "attention is all you need".to_string();
+        let rt_ref = &rt;
+        let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let d = rt_ref
+                .embed_document_with_model(&model.to_string(), &text)
+                .await
+                .unwrap();
+            let q = rt_ref
+                .embed_query_with_model(&model.to_string(), &text)
+                .await
+                .unwrap();
+            (d, q)
+        });
+        assert_ne!(
+            doc_emb, query_emb,
+            "multilingual-e5-small uses asymmetric prefixes: document ('passage: ') \
+             and query ('query: ') embeds of the same text must differ"
         );
     }
 }

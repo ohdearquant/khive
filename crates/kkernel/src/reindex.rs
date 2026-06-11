@@ -285,7 +285,7 @@ async fn embed_and_store_batch(
         }
 
         let texts: Vec<String> = subset.iter().map(|(_, t)| truncate_text(t)).collect();
-        match rt.embed_batch_with_model(model_name, &texts).await {
+        match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
                 for ((id, _), emb) in subset.iter().zip(embeddings.iter()) {
                     if drop_existing {

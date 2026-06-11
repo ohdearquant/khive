@@ -40,7 +40,11 @@ impl MemoryPack {
         let primary_model = self.runtime.default_embedder_name().to_owned();
 
         for model_name in &model_names {
-            match self.runtime.embed_with_model(model_name, &p.query).await {
+            match self
+                .runtime
+                .embed_query_with_model(model_name, &p.query)
+                .await
+            {
                 Ok(vec) => {
                     let dims = vec.len();
                     if primary_embedding.is_none() || model_name == &primary_model {
