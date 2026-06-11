@@ -375,7 +375,7 @@ impl KhiveRuntime {
             .await?;
 
         if self.config().embedding_model.is_some() {
-            let vector = self.embed(&body).await?;
+            let vector = self.embed_document(&body).await?;
             self.vectors(token)?
                 .insert(
                     entity.id,
@@ -1286,7 +1286,9 @@ impl KhiveRuntime {
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vector = self.embed_with_model(model_name, &note.content).await?;
+            let vector = self
+                .embed_document_with_model(model_name, &note.content)
+                .await?;
             self.vectors_for_model(token, model_name)?
                 .insert(
                     note.id,
@@ -1307,7 +1309,7 @@ impl KhiveRuntime {
                 let text = content_owned.clone();
                 let name = model_name.clone();
                 handles.push(tokio::spawn(async move {
-                    rt.embed_with_model(&name, &text).await
+                    rt.embed_document_with_model(&name, &text).await
                 }));
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());

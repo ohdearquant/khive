@@ -54,6 +54,10 @@ pub(super) fn plog_n(call_id: u64, stage: &str, us: u128, n: usize) {
 }
 
 /// Embed one query string for one model, checking the pack-local LRU cache first.
+///
+/// Uses query-side instruction prefix so instruction-tuned models (e.g.
+/// multilingual-e5) land in the correct retrieval space. For models with no
+/// query instruction this is identical to the generic embed path.
 pub(super) async fn embed_query_model(
     runtime: khive_runtime::KhiveRuntime,
     cache: QueryEmbeddingCache,
@@ -67,7 +71,7 @@ pub(super) async fn embed_query_model(
     let model_name_blk = model_name.clone();
     let query_blk = query.clone();
     let v = tokio::task::spawn_blocking(move || {
-        handle.block_on(runtime.embed_with_model(&model_name_blk, &query_blk))
+        handle.block_on(runtime.embed_query_with_model(&model_name_blk, &query_blk))
     })
     .await
     .map_err(|e| RuntimeError::Internal(format!("recall embed task panicked: {e}")))??;

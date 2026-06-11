@@ -124,7 +124,7 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let embeddings = match runtime.embed_batch(&texts).await {
+            let embeddings = match runtime.embed_document_batch(&texts).await {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::warn!(

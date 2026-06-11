@@ -399,7 +399,7 @@ impl KhiveRuntime {
             .await?;
 
         if self.config().embedding_model.is_some() {
-            let vector = self.embed(&body).await?;
+            let vector = self.embed_document(&body).await?;
             self.vectors(token)?
                 .insert(
                     entity.id,
@@ -440,7 +440,7 @@ impl KhiveRuntime {
 
         if self.config().embedding_model.is_some() {
             let ns = note.namespace.clone();
-            let vector = self.embed(&note.content).await?;
+            let vector = self.embed_document(&note.content).await?;
             self.vectors(token)?
                 .insert(
                     note.id,

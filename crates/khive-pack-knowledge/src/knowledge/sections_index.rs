@@ -157,7 +157,7 @@ pub(crate) async fn embed_sections(
 
         for chunk in staged.chunks(EMBED_BATCH) {
             let texts: Vec<String> = chunk.iter().map(|(_, t)| truncate_bytes(t)).collect();
-            let embeddings = match runtime.embed_batch(&texts).await {
+            let embeddings = match runtime.embed_document_batch(&texts).await {
                 Ok(e) if e.len() == chunk.len() => e,
                 Ok(_) => {
                     tracing::warn!(
