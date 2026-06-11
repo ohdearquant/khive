@@ -25,9 +25,9 @@
 //! Allowlist (false-positive suppression):
 //! - Pure hex strings (sha256, git SHA) — passed unconditionally.
 //! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed.
-//! - Base64/base64url content-hash shapes (standard-alphabet, URL-safe-alphabet,
-//!   length 24–88, no `=` padding or trailing `=` padding only) — passed when
-//!   not preceded by a known-vendor prefix.
+//! - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI
+//!   hashes, npm lockfile integrity) — passed when not preceded by a known-vendor
+//!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
 
@@ -342,10 +342,11 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 
 /// Trigger words near which high-entropy tokens are suspicious.
 ///
-/// The bare word `token` is intentionally excluded: it appears in benign
-/// technical context (`tokenizer`, `token_count`, `next_token`) and is too
-/// broad.  Compound forms `apikey`, `api_key`, `access_key`, `private_key`
-/// are retained because they are narrower.
+/// The bare substring `token` is NOT in this list because it fires on benign
+/// terms like `tokenizer`, `token_count`, and `next_token`.  Instead we match
+/// the assignment forms `token=` and `token:` (which are always credential
+/// assignment syntax), and a standalone word-boundary check for `token` is
+/// performed separately in `check_entropy_heuristic`.
 const TRIGGER_WORDS: &[&str] = &[
     "key",
     "secret",
@@ -358,6 +359,8 @@ const TRIGGER_WORDS: &[&str] = &[
     "api_key",
     "access_key",
     "private_key",
+    "token=",
+    "token:",
 ];
 
 /// Minimum token length to apply the entropy check.
@@ -405,8 +408,41 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
         if TRIGGER_WORDS.iter().any(|tw| low_window.contains(tw)) {
             return Some(build_match("high-entropy-token", token));
         }
+        // Standalone word-boundary match for `token` — fires when the window
+        // contains `token` as a whole word but NOT as part of `tokenizer`,
+        // `token_count`, `next_token`, etc.
+        if has_standalone_token(&low_window) {
+            return Some(build_match("high-entropy-token", token));
+        }
     }
     None
+}
+
+/// Returns `true` when `low_window` contains the word `token` as a standalone
+/// word — i.e. surrounded by non-alphanumeric boundaries — but NOT as part of
+/// compound identifiers such as `tokenizer`, `token_count`, or `next_token`.
+fn has_standalone_token(low_window: &str) -> bool {
+    let needle = "token";
+    let mut start = 0;
+    while let Some(rel) = low_window[start..].find(needle) {
+        let abs = start + rel;
+        let before_ok = abs == 0
+            || low_window[..abs]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let after_end = abs + needle.len();
+        let after_ok = after_end >= low_window.len()
+            || low_window[after_end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + needle.len().max(1);
+    }
+    false
 }
 
 // ─── Allowlist helpers ───────────────────────────────────────────────────────
@@ -417,11 +453,10 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
 /// - UUID canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
 /// - Pure hex (case-insensitive, 8–128 chars, optional `0x`/`0X` prefix) —
 ///   git SHA, sha256 digest, uuid-hex.
-/// - Base64 / base64url content-hash shapes: standard alphabet
-///   (`[A-Za-z0-9+/]`) or URL-safe alphabet (`[A-Za-z0-9_-]`), length 24–88,
-///   optional trailing `=`/`==` padding.  These appear in SRI hashes, npm
-///   lockfile checksums, and tokenizer/model metadata and are almost never
-///   credentials.
+/// - Base64/base64url content hashes with an explicit `sha<N>-` prefix —
+///   SRI hashes (`sha384-...`) and npm lockfile integrity values.  Bare
+///   base64 tokens without the prefix are NOT allowlisted regardless of length,
+///   because they are indistinguishable from real API tokens.
 fn is_allowlisted(token: &str) -> bool {
     // UUID canonical form.
     if is_uuid_canonical(token) {
@@ -445,17 +480,21 @@ fn is_allowlisted(token: &str) -> bool {
     false
 }
 
-/// Returns `true` for tokens that look like base64/base64url content hashes
-/// (SRI hash body, npm integrity).
+/// Returns `true` for tokens that are unambiguous base64/base64url content
+/// hashes with an explicit `sha<N>-` prefix (SRI hash, npm lockfile integrity).
 ///
-/// Criteria (deliberately narrow to avoid FPs on real tokens):
-/// - Matches SHA-family content-hash lengths after stripping padding:
-///   - sha256 body: 43 chars (base64 of 32 bytes)
-///   - sha384 body: 64 chars (base64 of 48 bytes)
-///   - sha512 body: 86–88 chars (base64 of 64 bytes)
-/// - Every byte is a standard-base64 or URL-safe-base64 character.
+/// Criteria:
+/// - Token starts with `sha<digits>-` (e.g. `sha256-`, `sha384-`, `sha512-`).
+/// - The body after the prefix matches a SHA-family length (43, 64, or 86–88
+///   unpadded chars).
+/// - Every byte in the body is a standard-base64 or URL-safe-base64 character.
 /// - Does NOT start with a known vendor-token prefix (those are credentials
 ///   regardless of alphabet).
+///
+/// Bare base64 tokens of those lengths WITHOUT the `sha<N>-` prefix are NOT
+/// allowlisted here — a 43-char base64url API token near the word "key" is
+/// indistinguishable from a sha256 hash body without the prefix, so we require
+/// the explicit prefix to avoid false-negative credential escapes.
 fn is_base64_content_hash(token: &str) -> bool {
     // Known vendor prefixes — never allowlist even if they look like base64.
     // Includes bare `sk-` to prevent OpenAI-shaped tokens from being allowlisted.
@@ -480,8 +519,8 @@ fn is_base64_content_hash(token: &str) -> bool {
     if VENDOR_PREFIXES.iter().any(|p| token.starts_with(p)) {
         return false;
     }
-    // Strip SRI `sha[0-9]+-` prefix (e.g. `sha256-`, `sha384-`, `sha512-`)
-    // before measuring the hash body length.
+    // Require an explicit SRI `sha[0-9]+-` prefix.  Bare base64 at sha-length
+    // is NOT allowlisted — it is indistinguishable from a real API token.
     let body = if let Some(rest) = token.strip_prefix("sha") {
         // rest starts with digits followed by '-'
         let dash = rest.find('-').unwrap_or(rest.len());
@@ -489,10 +528,10 @@ fn is_base64_content_hash(token: &str) -> bool {
         if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && dash < rest.len() {
             &rest[dash + 1..] // everything after "sha<digits>-"
         } else {
-            token
+            return false; // no valid sha<N>- prefix → not a known content hash
         }
     } else {
-        token
+        return false; // no sha prefix → not allowlisted
     };
     // Strip optional padding (at most 2 `=`).
     let stripped = body.trim_end_matches('=');
@@ -1053,11 +1092,112 @@ mod tests {
 
     #[test]
     fn allows_tokenizer_vocab_hash_no_block() {
-        // The word "tokenizer" must not trigger as the `token` trigger word.
+        // `tokenizer_vocab_hash` contains the substring "token" but NOT as a
+        // standalone word (followed by 'i' which is alphanumeric), so the
+        // standalone-token boundary check must not fire here.
         let line = "tokenizer_vocab_hash = Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"; // gitleaks:allow
         assert!(
             scan(line).is_none(),
-            "tokenizer_vocab_hash must pass since 'token' is no longer a trigger; fired: {:?}",
+            "tokenizer_vocab_hash must pass; 'token' is only standalone-word matched; fired: {:?}",
+            scan(line)
+        );
+    }
+
+    // ── True-positives: bare base64 at sha-lengths near trigger words ────────
+
+    #[test]
+    fn blocks_bare_base64url_43chars_near_key() {
+        // A 43-char base64url token (= sha256 body length) near the word "key".
+        // Without a sha<N>- prefix this MUST be caught, not allowlisted.
+        let token_43 = "wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123"; // gitleaks:allow
+        assert_eq!(token_43.len(), 43, "test token must be exactly 43 chars");
+        let line = format!("api key {token_43}");
+        assert!(
+            scan(&line).is_some(),
+            "43-char base64url token near 'key' must be caught (no sha-prefix = not a hash); fired: {:?}",
+            scan(&line)
+        );
+    }
+
+    #[test]
+    fn blocks_bare_base64url_64chars_near_secret() {
+        // A 64-char base64url token (= sha384 body length) near "secret".
+        // Must be caught without sha<N>- prefix.
+        let token_64 = "wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123wJalrXUtnFEMI-K7MDENa"; // gitleaks:allow
+        assert_eq!(token_64.len(), 64, "test token must be exactly 64 chars");
+        let line = format!("secret: {token_64}");
+        assert!(
+            scan(&line).is_some(),
+            "64-char base64url token near 'secret' must be caught; got: {:?}",
+            scan(&line)
+        );
+    }
+
+    #[test]
+    fn blocks_bare_base64url_86chars_near_auth() {
+        // An 86-char base64url token (= sha512 body length) near "auth".
+        // Must be caught without sha<N>- prefix.
+        let token_86 = "wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123wJalrXUtnFEMI-K7MDENwJalrXUtnFEMI-K7MDENabc"; // gitleaks:allow
+        assert_eq!(token_86.len(), 86, "test token must be exactly 86 chars");
+        let line = format!("auth header {token_86}");
+        assert!(
+            scan(&line).is_some(),
+            "86-char base64url token near 'auth' must be caught; got: {:?}",
+            scan(&line)
+        );
+    }
+
+    // ── True-positives: standalone `token` trigger ───────────────────────────
+
+    #[test]
+    fn blocks_service_token_opaque_value() {
+        // "service token <opaque-high-entropy>" — `token` as a standalone word
+        // with a high-entropy value must be caught.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        assert!(
+            opaque.len() >= 24,
+            "opaque must be long enough for entropy check"
+        );
+        let line = format!("service token {opaque}");
+        assert!(
+            scan(&line).is_some(),
+            "service token <opaque> must be caught by standalone 'token' check; got: {:?}",
+            scan(&line)
+        );
+    }
+
+    #[test]
+    fn blocks_token_equals_credential() {
+        // `token=<high-entropy>` (assignment form) must be caught via `token=` trigger.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let line = format!("token={opaque}");
+        assert!(
+            scan(&line).is_some(),
+            "token=<value> must be caught via token= trigger; got: {:?}",
+            scan(&line)
+        );
+    }
+
+    #[test]
+    fn blocks_token_colon_credential() {
+        // `token: <high-entropy>` (key-value form) must be caught via `token:` trigger.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let line = format!("token: {opaque}");
+        assert!(
+            scan(&line).is_some(),
+            "token: <value> must be caught via token: trigger; got: {:?}",
+            scan(&line)
+        );
+    }
+
+    #[test]
+    fn allows_next_token_technical_context() {
+        // `next_token` is a technical term; the high-entropy value here has low
+        // entropy anyway, so it must pass.
+        let line = "next_token: cursor-page-2-abcdef12345678";
+        assert!(
+            scan(line).is_none(),
+            "next_token technical context must not be blocked; fired: {:?}",
             scan(line)
         );
     }

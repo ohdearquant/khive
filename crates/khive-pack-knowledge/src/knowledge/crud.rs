@@ -50,9 +50,23 @@ impl KnowledgeHandlers {
 
             let content = atom_in.content.as_deref().unwrap_or("").trim().to_string();
             validate_atom_content(&content)?;
-            // Secret gate: scan atom name and body before any write.
+            // Secret gate: scan all caller-supplied text and structured fields
+            // before any reader/writer is acquired.
+            khive_runtime::secret_gate::check(&slug)?;
             khive_runtime::secret_gate::check(&atom_in.name)?;
             khive_runtime::secret_gate::check(&content)?;
+            if let Some(ref tags_vec) = atom_in.tags {
+                khive_runtime::secret_gate::check_tags(tags_vec)?;
+            }
+            if let Some(ref props) = atom_in.properties {
+                khive_runtime::secret_gate::check_json(props)?;
+            }
+            if let Some(ref uri) = atom_in.source_uri {
+                khive_runtime::secret_gate::check(uri)?;
+            }
+            if let Some(ref st) = atom_in.source_type {
+                khive_runtime::secret_gate::check(st)?;
+            }
 
             let tags_json = tags_to_json(atom_in.tags.as_ref());
             let props_json = atom_in

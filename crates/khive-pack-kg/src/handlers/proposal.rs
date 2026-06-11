@@ -92,6 +92,12 @@ impl KgPack {
             ));
         }
 
+        // Secret gate: scan all caller-supplied text before constructing/appending events.
+        khive_runtime::secret_gate::check(&p.title)?;
+        khive_runtime::secret_gate::check(&p.description)?;
+        khive_runtime::secret_gate::check_tags(&p.reviewers)?;
+        khive_runtime::secret_gate::check_json(&p.changeset)?;
+
         let _changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
 
@@ -257,6 +263,11 @@ impl KgPack {
             return Err(RuntimeError::InvalidInput(format!(
                 "self-approval is forbidden: proposer {actor:?} cannot approve their own proposal"
             )));
+        }
+
+        // Secret gate: scan caller-supplied comment before constructing/appending events.
+        if let Some(ref c) = p.comment {
+            khive_runtime::secret_gate::check(c)?;
         }
 
         let payload = ProposalReviewedPayload {
