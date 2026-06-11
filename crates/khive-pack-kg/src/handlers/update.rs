@@ -46,7 +46,12 @@ impl KgPack {
             Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
-                if self.runtime.get_edge(token, id).await?.is_some() {
+                if self
+                    .runtime
+                    .get_edge_including_deleted(token, id)
+                    .await?
+                    .is_some()
+                {
                     Ok(KindSpec::Edge)
                 } else {
                     Err(RuntimeError::NotFound(format!("not found: {id_str}")))

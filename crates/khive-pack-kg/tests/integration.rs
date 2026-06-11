@@ -5501,3 +5501,76 @@ async fn hard_delete_soft_deleted_note_cross_namespace_denied() {
         "cross-namespace hard delete of a soft-deleted note must be denied; got: {result:?}"
     );
 }
+
+/// Soft-delete an edge, then hard-delete it WITHOUT supplying explicit kind — must
+/// succeed and leave the row physically gone (ADR-002: public delete auto-detects).
+#[tokio::test]
+async fn hard_delete_soft_deleted_edge_without_kind_purges_row() {
+    use khive_storage::{SqlStatement, SqlValue};
+    use uuid::Uuid;
+
+    let (f, rt) = pack_with_edge_rules();
+
+    let source = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EdgePurgeSource"}),
+        )
+        .await
+        .expect("create source must succeed");
+    let target = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EdgePurgeTarget"}),
+        )
+        .await
+        .expect("create target must succeed");
+    let source_id = source["id"].as_str().unwrap().to_string();
+    let target_id = target["id"].as_str().unwrap().to_string();
+
+    let linked = f
+        .dispatch(
+            "link",
+            json!({"source_id": source_id, "target_id": target_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = linked["id"]
+        .as_str()
+        .expect("link must return id")
+        .to_string();
+    let edge_uuid = Uuid::parse_str(&edge_id).expect("edge id must be valid UUID");
+
+    // Soft-delete the edge.
+    f.dispatch("delete", json!({"id": edge_id}))
+        .await
+        .expect("soft delete must succeed");
+
+    // Hard-delete WITHOUT explicit kind — exercises infer_kind_from_uuid_including_deleted.
+    let purge = f
+        .dispatch("delete", json!({"id": edge_id, "hard": true}))
+        .await;
+    assert!(
+        purge.is_ok(),
+        "hard delete of a soft-deleted edge without kind must succeed (ADR-002); got: {purge:?}"
+    );
+
+    // Verify the row is physically gone via raw SQL (no deleted_at filter).
+    let mut reader = rt.sql().reader().await.expect("sql reader must open");
+    let count = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE id = ?1".into(),
+            params: vec![SqlValue::Text(edge_uuid.to_string())],
+            label: Some("count_edge_row_by_id".into()),
+        })
+        .await
+        .expect("count query must succeed");
+    let row_count = match count {
+        Some(SqlValue::Integer(n)) => n as u64,
+        _ => 0,
+    };
+    assert_eq!(
+        row_count, 0,
+        "hard delete must physically remove the edge row from graph_edges"
+    );
+}
