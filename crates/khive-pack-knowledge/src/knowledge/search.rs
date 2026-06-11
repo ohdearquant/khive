@@ -939,16 +939,26 @@ impl KnowledgeHandlers {
         let requested_statuses = status_values(p.status.as_ref());
         let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
+        // Normalize exclude_status once: trim whitespace, treat blank as absent.
+        // This single normalized value feeds both the SQL predicate (via SearchCtx)
+        // and the ANN post-hydration filter, ensuring both result sources see the
+        // identical exclusion set regardless of how the caller formatted the value.
+        let exclude_status_normalized: Option<&str> = p
+            .exclude_status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
         // Precedence (highest to lowest, matches ADR-047 §Status filtering):
         //   1. explicit status=  → no exclusion; SQL handles the allowlist
-        //   2. no status=, explicit exclude_status= → use that exclusion
+        //   2. no status=, explicit exclude_status= (non-blank) → use that exclusion
         //   3. no status=, include_drafts=true → exclude only deprecated
-        //   4. default (no status params) → exclude draft and deprecated
+        //   4. default (no status params / blank exclude_status) → exclude draft and deprecated
         let exclude_statuses_buf: Vec<&str> = if !requested_statuses.is_empty() {
             // Caller specified exact status; no exclusion needed — SQL allowlist wins.
             vec![]
-        } else if let Some(ref ex) = p.exclude_status {
-            vec![ex.as_str()]
+        } else if let Some(ex) = exclude_status_normalized {
+            vec![ex]
         } else {
             let include_drafts = p.include_drafts.unwrap_or(false);
             if include_drafts {

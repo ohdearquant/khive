@@ -173,16 +173,19 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
     );
 }
 
+// Atom status taxonomy is the closed set: draft | reviewed | deprecated.
+// 'verified' is a section-level status only (ADR-047).
+// reviewed (1.0×) must outrank draft (0.8×) — both present only when include_drafts=true.
 #[tokio::test]
-async fn w5_status_multiplier_verified_beats_draft() {
+async fn w5_status_multiplier_reviewed_beats_draft() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
                 {
-                    "slug": "veri-atom",
-                    "name": "Verified Atom",
+                    "slug": "reviewed-atom",
+                    "name": "Reviewed Atom",
                     "content": "neural network gradient descent unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
@@ -197,8 +200,8 @@ async fn w5_status_multiplier_verified_beats_draft() {
     .expect("upsert");
 
     f.sql_exec(
-        "UPDATE knowledge_atoms SET status='verified' WHERE slug=?1",
-        vec![SqlValue::Text("veri-atom".into())],
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("reviewed-atom".into())],
     )
     .await;
     f.sql_exec(
@@ -207,32 +210,78 @@ async fn w5_status_multiplier_verified_beats_draft() {
     )
     .await;
 
+    // include_drafts=true to keep both atoms in results.
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "neural network gradient learning zzzxxx", "rerank": false }),
+            json!({ "query": "neural network gradient learning zzzxxx", "rerank": false, "include_drafts": true }),
         )
         .await
         .expect("search ok");
     let results = resp["results"].as_array().expect("results");
 
-    let verified_score = results
+    let reviewed_score = results
         .iter()
-        .find(|r| r["name"].as_str() == Some("Verified Atom"))
+        .find(|r| r["name"].as_str() == Some("Reviewed Atom"))
         .and_then(|r| r["score"].as_f64());
     let draft_score = results
         .iter()
         .find(|r| r["name"].as_str() == Some("Draft Atom"))
         .and_then(|r| r["score"].as_f64());
 
-    match (verified_score, draft_score) {
-        (Some(v), Some(d)) => assert!(
-            v > d,
-            "verified score {v:.4} must exceed draft score {d:.4} (1.2× vs 0.8× multiplier)"
+    match (reviewed_score, draft_score) {
+        (Some(r), Some(d)) => assert!(
+            r > d,
+            "reviewed score {r:.4} must exceed draft score {d:.4} (1.0× vs 0.8× multiplier)"
         ),
-        (Some(_), None) => {} // draft filtered — multiplier=0.8 below threshold, acceptable
-        (None, _) => panic!("verified atom missing from results: {results:?}"),
+        (Some(_), None) => {} // draft filtered below min_score — acceptable
+        (None, _) => panic!("reviewed atom missing from results: {results:?}"),
     }
+}
+
+// Unknown atom statuses fall through to the 1.0 (reviewed-equivalent) multiplier.
+// The closed public taxonomy is draft | reviewed | deprecated; anything else is neutral.
+#[tokio::test]
+async fn w5_status_multiplier_unknown_status_is_neutral() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": "unknown-status-atom",
+                "name": "Unknown Status Atom",
+                "content": "unknown status neutral multiplier dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique unk78x"
+            }]
+        }),
+    )
+    .await
+    .expect("upsert");
+
+    // Set an unknown atom status directly — should not crash and should score as 1.0.
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='custom' WHERE slug=?1",
+        vec![SqlValue::Text("unknown-status-atom".into())],
+    )
+    .await;
+
+    // include_drafts=true to allow any status through the exclusion filter.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "unknown status neutral unique unk78x", "rerank": false, "include_drafts": true }),
+        )
+        .await
+        .expect("search ok");
+    let results = resp["results"].as_array().expect("results");
+    assert!(
+        !results.is_empty(),
+        "atom with unknown status must still appear in results: {results:?}"
+    );
+    let score = results[0]["score"].as_f64().expect("score");
+    assert!(
+        (0.0..=1.0).contains(&score),
+        "score {score} for unknown-status atom must be in [0,1]"
+    );
 }
 
 #[tokio::test]
@@ -1215,39 +1264,47 @@ async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
     );
 }
 
+// The upsert CASE expression only promotes draft → reviewed when finalizing.
+// Any non-draft status (reviewed, deprecated, or any future value) must be left
+// untouched — re-finalizing must not overwrite an already-reviewed or deprecated atom.
 #[tokio::test]
-async fn upsert_finalizing_does_not_demote_verified() {
+async fn upsert_finalizing_does_not_demote_non_draft_status() {
     let f = pack(rt());
+
+    // Insert a finalized atom (starts as reviewed).
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V", "content": "b dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "non-draft-atom", "name": "V", "content": "b dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("insert");
-    // Manually promote to the higher 'verified' state.
+
+    // Manually set to deprecated — a valid non-draft status in the closed taxonomy.
     f.sql_exec(
-        "UPDATE knowledge_atoms SET status='verified' WHERE slug=?1",
-        vec![SqlValue::Text("verified-atom".into())],
+        "UPDATE knowledge_atoms SET status='deprecated' WHERE slug=?1",
+        vec![SqlValue::Text("non-draft-atom".into())],
     )
     .await;
-    // Re-upsert with finalized=true again: must NOT demote verified -> reviewed.
+
+    // Re-upsert with finalized=true: CASE only fires on draft; deprecated must remain.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V2", "content": "b2 dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "non-draft-atom", "name": "V2", "content": "b2 dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("re-upsert");
+
     let row = f
         .sql_query_one(
             "SELECT status FROM knowledge_atoms WHERE slug=?1",
-            vec![SqlValue::Text("verified-atom".into())],
+            vec![SqlValue::Text("non-draft-atom".into())],
         )
         .await
         .expect("row");
     assert_eq!(
         row_text(&row, "status").as_deref(),
-        Some("verified"),
-        "re-finalizing must not demote an already-verified atom"
+        Some("deprecated"),
+        "re-finalizing must not overwrite a non-draft status (deprecated in this case)"
     );
 }
 
@@ -1455,15 +1512,9 @@ async fn search_scores_are_normalized_without_rank_inversion() {
     .await
     .expect("seed atoms");
 
-    // Promote high to verified (1.2× multiplier after normalization, clamped to 1.0).
-    // Set mid and low to reviewed so they appear in default search (draft excluded by default).
+    // Set all atoms to reviewed so they appear in default search (draft excluded by default).
     f.sql_exec(
-        "UPDATE knowledge_atoms SET status='verified' WHERE slug=?1",
-        vec![SqlValue::Text("norm-high".into())],
-    )
-    .await;
-    f.sql_exec(
-        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug IN ('norm-mid', 'norm-low')",
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug IN ('norm-high', 'norm-mid', 'norm-low')",
         vec![],
     )
     .await;
@@ -1491,7 +1542,7 @@ async fn search_scores_are_normalized_without_rank_inversion() {
         );
     }
 
-    // Verified (high) must outrank non-verified — ordering preserved after normalization + clamp.
+    // High-relevance atom must outrank mid-relevance — ordering preserved after normalization + clamp.
     let high = results
         .iter()
         .find(|r| r["slug"].as_str() == Some("norm-high"));
@@ -1503,7 +1554,7 @@ async fn search_scores_are_normalized_without_rank_inversion() {
         let ms = m["score"].as_f64().unwrap();
         assert!(
             hs >= ms,
-            "verified atom score {hs:.4} must not be less than draft score {ms:.4}"
+            "high-relevance atom score {hs:.4} must not be less than mid-relevance score {ms:.4}"
         );
     }
 }
@@ -2622,6 +2673,132 @@ async fn exclude_status_is_ignored_when_status_param_is_set() {
     assert!(
         !names.contains(&"Prec2 Draft Atom"),
         "status=reviewed must not return draft atoms: {names:?}"
+    );
+}
+
+// blank exclude_status= must behave identically to absent — draft+deprecated excluded by default.
+#[tokio::test]
+async fn blank_exclude_status_falls_through_to_default_draft_exclusion() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "blank-ex-reviewed",
+                    "name": "Blank Ex Reviewed",
+                    "content": "blank exclude status normalization reviewed dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique blnk78a"
+                },
+                {
+                    "slug": "blank-ex-draft",
+                    "name": "Blank Ex Draft",
+                    "content": "blank exclude status normalization draft dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique blnk78a"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("blank-ex-reviewed".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("blank-ex-draft".into())],
+    )
+    .await;
+
+    // exclude_status="" — blank must be treated as absent, so draft is still excluded by default.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "blank exclude status normalization unique blnk78a",
+                "rerank": false,
+                "exclude_status": ""
+            }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"Blank Ex Draft"),
+        "blank exclude_status must not bypass draft exclusion: {names:?}"
+    );
+    assert!(
+        names.contains(&"Blank Ex Reviewed"),
+        "reviewed atom must appear with blank exclude_status: {names:?}"
+    );
+}
+
+// whitespace-padded exclude_status=" draft " must normalize to "draft" and behave
+// the same as exclude_status="draft" — NOT apply as a raw " draft " exclusion that
+// the ANN post-filter would miss (since the filter uses exact contains comparison).
+#[tokio::test]
+async fn whitespace_padded_exclude_status_normalizes_to_draft() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "ws-ex-reviewed",
+                    "name": "Ws Ex Reviewed",
+                    "content": "whitespace padded exclude status reviewed dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique wspad78"
+                },
+                {
+                    "slug": "ws-ex-draft",
+                    "name": "Ws Ex Draft",
+                    "content": "whitespace padded exclude status draft dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity unique wspad78"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='reviewed' WHERE slug=?1",
+        vec![SqlValue::Text("ws-ex-reviewed".into())],
+    )
+    .await;
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='draft' WHERE slug=?1",
+        vec![SqlValue::Text("ws-ex-draft".into())],
+    )
+    .await;
+
+    // exclude_status=" draft " with leading/trailing spaces must normalize to "draft"
+    // and exclude draft atoms consistently (SQL and ANN use the same normalized value).
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "whitespace padded exclude status unique wspad78",
+                "rerank": false,
+                "exclude_status": " draft ",
+                "include_drafts": true
+            }),
+        )
+        .await
+        .expect("search ok");
+
+    let results = resp["results"].as_array().expect("results");
+    let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"Ws Ex Draft"),
+        "whitespace-padded \" draft \" must normalize to \"draft\" and exclude draft atoms: {names:?}"
+    );
+    assert!(
+        names.contains(&"Ws Ex Reviewed"),
+        "reviewed atom must appear when exclude_status=\" draft \": {names:?}"
     );
 }
 
