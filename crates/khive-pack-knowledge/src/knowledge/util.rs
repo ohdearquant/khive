@@ -216,7 +216,7 @@ pub(super) fn status_values(value: Option<&Value>) -> Vec<String> {
 
 pub(super) fn status_sql_clause(
     statuses: &[String],
-    exclude_status: Option<&str>,
+    exclude_statuses: &[&str],
     first_param: usize,
 ) -> (String, Vec<SqlValue>) {
     if !statuses.is_empty() {
@@ -235,11 +235,25 @@ pub(super) fn status_sql_clause(
         return (clause, params);
     }
 
-    if let Some(status) = exclude_status.map(str::trim).filter(|s| !s.is_empty()) {
-        return (
-            format!(" AND (status IS NULL OR status != ?{first_param})"),
-            vec![SqlValue::Text(status.to_string())],
-        );
+    let non_empty: Vec<&str> = exclude_statuses
+        .iter()
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if !non_empty.is_empty() {
+        let conditions: Vec<String> = non_empty
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("status != ?{}", first_param + i))
+            .collect();
+        let clause = format!(" AND (status IS NULL OR ({}))", conditions.join(" AND "));
+        let params: Vec<SqlValue> = non_empty
+            .iter()
+            .map(|s| SqlValue::Text(s.to_string()))
+            .collect();
+        return (clause, params);
     }
 
     (
@@ -253,8 +267,10 @@ pub(super) fn explicitly_requested_status(statuses: &[String], status: &str) -> 
 }
 
 pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
+    // Atom status taxonomy: draft | reviewed | deprecated (closed set per ADR-047).
+    // 'verified' is a section-level status only; no public write path sets atom status
+    // to 'verified', so it falls through to the 1.0 default here.
     match status.unwrap_or("reviewed") {
-        "verified" => 1.2,
         "reviewed" => 1.0,
         "draft" => 0.8,
         "deprecated" => 0.0,

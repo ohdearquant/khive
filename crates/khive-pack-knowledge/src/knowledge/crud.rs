@@ -92,7 +92,7 @@ impl KnowledgeHandlers {
                 writer
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom.
-                        // Never demote an already reviewed/verified row, and leave status
+                        // Never demote an already reviewed row, and leave status
                         // untouched when not finalizing.
                         sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
@@ -452,10 +452,16 @@ impl KnowledgeHandlers {
             }
             Some("atom") | None => {
                 let requested_statuses = status_values(p.status.as_ref());
+                let exclude_buf: Vec<&str> = p
+                    .exclude_status
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .into_iter()
+                    .collect();
                 let (data_status_clause, data_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 4);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 4);
                 let (count_status_clause, count_status_params) =
-                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 2);
+                    status_sql_clause(&requested_statuses, &exclude_buf, 2);
 
                 let sql_str = format!(
                     "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
