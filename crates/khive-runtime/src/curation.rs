@@ -15,6 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_db::SqliteError;
+use khive_storage::note::Note;
 use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 use khive_types::EventKind;
@@ -420,21 +421,12 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         note: &khive_storage::note::Note,
     ) -> RuntimeResult<()> {
-        let ns = note.namespace.clone();
         self.text_for_notes(token)?
-            .upsert_document(TextDocument {
-                subject_id: note.id,
-                kind: SubstrateKind::Note,
-                title: note.name.clone(),
-                body: note.content.clone(),
-                tags: Vec::new(),
-                namespace: ns.clone(),
-                metadata: note.properties.clone(),
-                updated_at: chrono::Utc::now(),
-            })
+            .upsert_document(note_fts_document(note))
             .await?;
 
         if self.config().embedding_model.is_some() {
+            let ns = note.namespace.clone();
             let vector = self.embed(&note.content).await?;
             self.vectors(token)?
                 .insert(
@@ -599,6 +591,41 @@ impl KhiveRuntime {
             self.reindex_note(token, &updated_note).await?;
         }
         Ok(summary)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FTS document construction
+// ---------------------------------------------------------------------------
+
+/// Build the `TextDocument` for a note. This is the single source of truth for
+/// note FTS document shape; all write paths (create, update, reindex) must go
+/// through this function so recall parity is guaranteed. Changes here apply to
+/// every caller automatically.
+///
+/// Body rule: when the note has a `name`, prepend it to the content
+/// (`"<name> <content>"`). This matches the FTS index contract: title and body
+/// both contribute to ranking, and the name is the most salient signal.
+///
+/// `updated_at` is taken from the note's own timestamp (not `Utc::now()`) so
+/// that backfill and reindex runs record the note's actual mutation time rather
+/// than the reindex execution time.
+pub fn note_fts_document(note: &Note) -> TextDocument {
+    let body = match &note.name {
+        Some(n) => format!("{n} {}", note.content),
+        None => note.content.clone(),
+    };
+    let updated_at =
+        chrono::DateTime::from_timestamp_micros(note.updated_at).unwrap_or_else(chrono::Utc::now);
+    TextDocument {
+        subject_id: note.id,
+        kind: SubstrateKind::Note,
+        title: note.name.clone(),
+        body,
+        tags: vec![],
+        namespace: note.namespace.clone(),
+        metadata: note.properties.clone(),
+        updated_at,
     }
 }
 
@@ -1385,6 +1412,11 @@ fn merge_note_sql(
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
+        // Body parity with note_fts_document: prepend name when present.
+        let merged_fts_body = match &merged_name {
+            Some(n) => format!("{n} {merged_content}"),
+            None => merged_content.clone(),
+        };
         conn.execute(
             &format!(
                 "INSERT INTO {} \
@@ -1396,7 +1428,7 @@ fn merge_note_sql(
                 &into_str,
                 SubstrateKind::Note.to_string(),
                 &merged_name,
-                &merged_content,
+                &merged_fts_body,
                 "[]",
                 &namespace,
                 &props_str,

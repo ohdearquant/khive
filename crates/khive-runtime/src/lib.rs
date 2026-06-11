@@ -22,8 +22,8 @@ pub mod runtime;
 pub mod validation;
 
 pub use curation::{
-    ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
-    MergeSummary, NotePatch,
+    note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy,
+    EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
 pub use daemon::{

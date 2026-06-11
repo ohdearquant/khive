@@ -16,10 +16,9 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
-use khive_runtime::{KhiveRuntime, Namespace};
+use khive_runtime::{note_fts_document, KhiveRuntime, Namespace};
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
-use khive_storage::types::TextDocument;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
 
@@ -217,14 +216,14 @@ struct ReindexReport {
     /// Entity/note vector inserts that failed across all engines.
     errors_skipped: u64,
     /// Note FTS upserts that failed during the backfill pass.
-    fts_notes_failed: u64,
+    notes_fts_failed: u64,
 }
 
 impl ReindexReport {
     /// Did any part of the run fail? Drives the fail-closed exit decision.
     fn has_failures(&self) -> bool {
         self.errors_skipped > 0
-            || self.fts_notes_failed > 0
+            || self.notes_fts_failed > 0
             || self.knowledge_atoms_failed > 0
             || self.knowledge_pass_errored
             || self.knowledge_ann_failed
@@ -312,28 +311,6 @@ async fn embed_and_store_batch(
         }
     }
     errors
-}
-
-/// Build the `TextDocument` for a note, mirroring the document-construction logic in
-/// `operations.rs` (`upsert_note` / FTS write path). Both callers — the create/update
-/// MCP path and this reindex path — must produce byte-identical documents for a given
-/// note; any divergence would cause a recall parity bug. Changes here require the
-/// same change in operations.rs and vice versa.
-fn note_fts_document(note: &Note) -> TextDocument {
-    let body = match &note.name {
-        Some(n) => format!("{n} {}", note.content),
-        None => note.content.clone(),
-    };
-    TextDocument {
-        subject_id: note.id,
-        kind: SubstrateKind::Note,
-        title: note.name.clone(),
-        body,
-        tags: vec![],
-        namespace: note.namespace.clone(),
-        metadata: note.properties.clone(),
-        updated_at: chrono::Utc::now(),
-    }
 }
 
 /// Upsert FTS documents for a batch of notes into the namespace text index. Returns the
@@ -424,6 +401,10 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // registered engines, matching the runtime's multi-model write path so a
     // reindex reproduces exactly what create/update would have embedded.
     // Only needed for the entity/note pass (knowledge uses the default embedder).
+    //
+    // When no embedding model is configured, model_names is empty: the embedding
+    // loop is a no-op but the note loop still runs for FTS backfill, which needs
+    // no embedder and must never be skipped due to a missing embedding config.
     let model_names: Vec<String> = if !do_graph {
         vec![]
     } else {
@@ -432,23 +413,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             None => {
                 let names = rt.registered_embedding_model_names();
                 if names.is_empty() {
-                    let report = ReindexReport {
-                        entities_processed: 0,
-                        notes_processed: 0,
-                        knowledge_atoms_indexed: None,
-                        knowledge_sections_indexed: None,
-                        knowledge_atoms_failed: 0,
-                        knowledge_pass_errored: false,
-                        knowledge_ann_failed: false,
-                        knowledge_sections_failed: 0,
-                        models_used: vec![],
-                        elapsed_ms: 0,
-                        errors_skipped: 0,
-                        fts_notes_failed: 0,
-                    };
-                    print_report(&report, args.human);
-                    eprintln!("warning: no embedding model configured");
-                    return Ok(());
+                    eprintln!("warning: no embedding model configured — skipping vector embedding; FTS backfill will still run");
                 }
                 names
             }
@@ -463,7 +428,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_processed: u64 = 0;
     let mut notes_processed: u64 = 0;
     let mut errors_skipped: u64 = 0;
-    let mut fts_notes_failed: u64 = 0;
+    let mut notes_fts_failed: u64 = 0;
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     if do_graph {
@@ -558,7 +523,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             // FTS backfill: index every note in this batch regardless of whether
             // it had content to embed. Mirrors the upsert_document call in
             // operations.rs — see note_fts_document for the parity contract.
-            fts_notes_failed += fts_backfill_notes_batch(&rt, &token, &batch).await;
+            notes_fts_failed += fts_backfill_notes_batch(&rt, &token, &batch).await;
 
             note_bar.update(notes_processed, note_total);
 
@@ -657,7 +622,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         models_used: model_names,
         elapsed_ms,
         errors_skipped,
-        fts_notes_failed,
+        notes_fts_failed,
     };
 
     print_report(&report, args.human);
@@ -781,13 +746,13 @@ fn print_report(report: &ReindexReport, human: bool) {
             atoms,
             sections,
             report.errors_skipped,
-            report.fts_notes_failed,
+            report.notes_fts_failed,
             report.elapsed_ms
         );
-        if report.fts_notes_failed > 0 {
+        if report.notes_fts_failed > 0 {
             println!(
                 "FTS backfill: {} note upserts FAILED",
-                report.fts_notes_failed
+                report.notes_fts_failed
             );
         }
         if report.knowledge_pass_errored {
@@ -919,7 +884,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: errors,
-            fts_notes_failed: 0,
+            notes_fts_failed: 0,
         }
     }
 
@@ -954,7 +919,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
-            fts_notes_failed: 0,
+            notes_fts_failed: 0,
         };
         assert!(
             report.has_failures(),
@@ -984,7 +949,7 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
-            fts_notes_failed: 0,
+            notes_fts_failed: 0,
         };
         assert!(
             report.has_failures(),
@@ -1139,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn has_failures_flags_fts_notes_failed() {
+    fn has_failures_flags_notes_fts_failed() {
         let report = ReindexReport {
             entities_processed: 0,
             notes_processed: 0,
@@ -1152,19 +1117,19 @@ mod tests {
             models_used: vec![],
             elapsed_ms: 0,
             errors_skipped: 0,
-            fts_notes_failed: 1,
+            notes_fts_failed: 1,
         };
         assert!(
             report.has_failures(),
-            "fts_notes_failed > 0 alone must drive has_failures() = true"
+            "notes_fts_failed > 0 alone must drive has_failures() = true"
         );
         assert!(
             decide_result(report.has_failures(), false).is_err(),
-            "fts_notes_failed must fail closed (non-zero exit)"
+            "notes_fts_failed must fail closed (non-zero exit)"
         );
         assert!(
             decide_result(report.has_failures(), true).is_ok(),
-            "best-effort downgrades fts_notes_failed to exit 0"
+            "best-effort downgrades notes_fts_failed to exit 0"
         );
     }
 
@@ -1259,6 +1224,98 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.subject_id == notes[0].id),
             "pre-existing note must be findable by FTS after backfill"
+        );
+    }
+
+    // Cross-path equality: a note created through the runtime (operations.rs path)
+    // must produce a stored FTS document that is field-identical to calling
+    // note_fts_document() on the same Note. Catches drift between the shared
+    // constructor and any caller that previously built documents inline.
+    #[tokio::test]
+    async fn note_fts_document_matches_runtime_create_path() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Create with a name so the title+body composition is exercised.
+        let note = rt
+            .create_note(
+                &token,
+                "observation",
+                Some("cross path title"),
+                "cross path content body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note");
+
+        // Retrieve the stored FTS document written by the create path.
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        let stored = fts
+            .get_document("local", note.id)
+            .await
+            .expect("get_document")
+            .expect("document must exist after create");
+
+        // Build the expected document using the shared constructor on the same note.
+        let expected = note_fts_document(&note);
+
+        assert_eq!(stored.subject_id, expected.subject_id, "subject_id");
+        assert_eq!(stored.kind, expected.kind, "kind");
+        assert_eq!(stored.title, expected.title, "title");
+        assert_eq!(stored.body, expected.body, "body");
+        assert_eq!(stored.namespace, expected.namespace, "namespace");
+    }
+
+    // No-embedding-model FTS: when no embedding model is registered, the note
+    // loop and FTS backfill must still execute — FTS needs no embedder.
+    #[tokio::test]
+    async fn fts_backfill_runs_without_embedding_model() {
+        use khive_storage::types::TextFilter;
+        use khive_types::SubstrateKind;
+
+        // KhiveRuntime::memory() has no embedding model configured.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        let notes: Vec<Note> = (0..3)
+            .map(|i| {
+                Note::new(
+                    "local",
+                    "observation",
+                    format!("nomodel-sentinel{i} content"),
+                )
+            })
+            .collect();
+
+        let note_store = rt.notes(&token).expect("note store");
+        for note in &notes {
+            note_store.upsert_note(note.clone()).await.expect("upsert");
+        }
+
+        // With no embedding model, embed_and_store_batch is a no-op but
+        // fts_backfill_notes_batch must still populate the FTS index.
+        let errors = fts_backfill_notes_batch(&rt, &token, &notes).await;
+        assert_eq!(
+            errors, 0,
+            "FTS backfill must succeed with no embedding model"
+        );
+
+        let fts = rt.text_for_notes(&token).expect("FTS store");
+        let count = fts
+            .count(TextFilter {
+                kinds: vec![SubstrateKind::Note],
+                namespaces: vec!["local".to_string()],
+                ids: vec![],
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            count, 3,
+            "FTS must be populated even when no embedding model is configured"
         );
     }
 

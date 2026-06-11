@@ -27,6 +27,7 @@ use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
+use crate::curation::note_fts_document;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -1220,22 +1221,8 @@ impl KhiveRuntime {
         }
         self.notes(token)?.upsert_note(note.clone()).await?;
 
-        let body = match &note.name {
-            Some(n) => format!("{n} {}", note.content),
-            None => note.content.clone(),
-        };
-
         self.text_for_notes(token)?
-            .upsert_document(TextDocument {
-                subject_id: note.id,
-                kind: SubstrateKind::Note,
-                title: note.name.clone(),
-                body,
-                tags: vec![],
-                namespace: ns.to_string(),
-                metadata: note.properties.clone(),
-                updated_at: chrono::Utc::now(),
-            })
+            .upsert_document(note_fts_document(&note))
             .await?;
 
         // Multi-model vector embedding:
