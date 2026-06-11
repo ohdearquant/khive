@@ -928,6 +928,26 @@ async fn get_include_sections_ordering_tie_break_is_stable() {
         "section order must be deterministic across repeated fetches (id ASC tie-breaker)"
     );
 
+    // Pin the full ordering contract (sort_order ASC, created_at ASC, id ASC):
+    // repeated-read agreement alone can pass on SQLite insertion-order luck
+    // even if the id tie-breaker is removed.
+    let actual: Vec<(i64, i64, &str)> = s1
+        .iter()
+        .map(|s| {
+            (
+                s["sort_order"].as_i64().expect("sort_order"),
+                s["created_at"].as_i64().expect("created_at"),
+                s["id"].as_str().expect("id"),
+            )
+        })
+        .collect();
+    let mut expected = actual.clone();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "sections must be sorted by (sort_order, created_at, id)"
+    );
+
     // Both calls must agree on which section type comes first (also validates
     // that the order is NOT random).
     let types_first: Vec<&str> = s1
