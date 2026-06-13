@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "KG versioning — git-native core types, canonical hash, and NDJSON-to-SQLite sync (ADR-010/ADR-020)"
 
 [dependencies]
-khive-runtime = { version = "0.2.8", path = "../khive-runtime" }
-khive-storage = { version = "0.2.8", path = "../khive-storage" }
-khive-types = { version = "0.2.8", path = "../khive-types" }
+khive-runtime = { version = "0.2.10", path = "../khive-runtime" }
+khive-storage = { version = "0.2.10", path = "../khive-storage" }
+khive-types = { version = "0.2.10", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -25,4 +25,4 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
-khive-vcs-adapters = { version = "0.2.8", path = "../khive-vcs-adapters" }
+khive-vcs-adapters = { version = "0.2.10", path = "../khive-vcs-adapters" }

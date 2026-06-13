@@ -63,6 +63,7 @@ CRATES=(
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-kg
     khive-pack-gtd
+    khive-brain-core
     khive-pack-brain
     khive-pack-memory
     khive-pack-comm

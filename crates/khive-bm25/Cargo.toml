@@ -11,7 +11,7 @@ categories.workspace = true
 description = "BM25 (Okapi BM25) keyword index with deterministic scoring"
 
 [dependencies]
-khive-score = { version = "0.2.8", path = "../khive-score" }
+khive-score = { version = "0.2.10", path = "../khive-score" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

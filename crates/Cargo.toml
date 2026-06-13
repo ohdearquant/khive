@@ -40,7 +40,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
