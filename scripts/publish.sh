@@ -74,7 +74,7 @@ CRATES=(
     kkernel
 )
 
-DELAY=5  # seconds to wait for crates.io index between publishes
+DELAY=10  # seconds to wait for crates.io index between publishes
 
 for crate in "${CRATES[@]}"; do
     echo ""
