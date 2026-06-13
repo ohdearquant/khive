@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-06-13
+
+Full crates.io publish (all 29 workspace crates).
+
+### Fixed
+
+- `khive-brain-core` added to publish dependency order — unblocks
+  `khive-pack-brain` on crates.io
+- All inter-crate version references bumped consistently
+
 ## [0.2.9] - 2026-06-11
 
 GitHub release only — crates.io remains at 0.2.8.
