@@ -11,15 +11,15 @@ categories.workspace = true
 description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-encoder) with deterministic scoring"
 
 [dependencies]
-khive-hnsw    = { version = "0.2.10", path = "../khive-hnsw" }
-khive-bm25    = { version = "0.2.10", path = "../khive-bm25" }
-khive-fusion  = { version = "0.2.10", path = "../khive-fusion" }
-khive-score   = { version = "0.2.10", path = "../khive-score" }
-khive-types   = { version = "0.2.10", path = "../khive-types" }
-khive-fold    = { version = "0.2.10", path = "../khive-fold", optional = true }
-khive-storage = { version = "0.2.10", path = "../khive-storage", optional = true }
-khive-db      = { version = "0.2.10", path = "../khive-db" }
-khive-gate    = { version = "0.2.10", path = "../khive-gate", optional = true }
+khive-hnsw    = { version = "0.2.11", path = "../khive-hnsw" }
+khive-bm25    = { version = "0.2.11", path = "../khive-bm25" }
+khive-fusion  = { version = "0.2.11", path = "../khive-fusion" }
+khive-score   = { version = "0.2.11", path = "../khive-score" }
+khive-types   = { version = "0.2.11", path = "../khive-types" }
+khive-fold    = { version = "0.2.11", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.2.11", path = "../khive-storage", optional = true }
+khive-db      = { version = "0.2.11", path = "../khive-db" }
+khive-gate    = { version = "0.2.11", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
 
 serde = { workspace = true }
@@ -60,8 +60,8 @@ graph-legacy = []
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-score = { version = "0.2.10", path = "../khive-score" }
-khive-fusion = { version = "0.2.10", path = "../khive-fusion" }
+khive-score = { version = "0.2.11", path = "../khive-score" }
+khive-fusion = { version = "0.2.11", path = "../khive-fusion" }
 
 [[bench]]
 name = "fusion_bench"

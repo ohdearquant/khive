@@ -12,11 +12,11 @@ description = "Rego (Open Policy Agent) backend for khive-gate, powered by regor
 readme = "README.md"
 
 [dependencies]
-khive-gate = { version = "0.2.10", path = "../khive-gate" }
+khive-gate = { version = "0.2.11", path = "../khive-gate" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
 regorus = { workspace = true }
 
 [dev-dependencies]
-khive-types = { version = "0.2.10", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }

@@ -8,9 +8,13 @@
 use anyhow::Result;
 use clap::Parser;
 
-use khive_mcp::server::{compute_config_id, KhiveMcpServer};
+#[cfg(unix)]
+use khive_mcp::server::compute_config_id;
+use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
-use khive_runtime::{DaemonRequestFrame, KhiveRuntime, Namespace, RuntimeConfig};
+#[cfg(unix)]
+use khive_runtime::DaemonRequestFrame;
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 
 use crate::dbpath::resolve_db_override;
 

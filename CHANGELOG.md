@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-06-13
+
+### Fixed
+
+- Cross-platform compile: `DaemonRequestFrame` and `compute_config_id` imports
+  in `kkernel/src/exec.rs` gated with `#[cfg(unix)]` to match their declaration
+  in `khive-runtime`
+
 ## [0.2.10] - 2026-06-13
 
 Full crates.io publish (all 29 workspace crates).
