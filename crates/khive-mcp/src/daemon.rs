@@ -11,8 +11,8 @@ use std::process::Stdio;
 
 use async_trait::async_trait;
 use khive_runtime::daemon::{
-    self, env_truthy, pid_path, read_frame, socket_path, write_frame, DaemonRequestFrame,
-    DaemonResponseFrame, PROTOCOL_VERSION,
+    self, env_truthy, lock_path, pid_path, read_frame, socket_path, write_frame,
+    DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
 };
 use rmcp::ErrorData as McpError;
 use tokio::net::UnixStream;
@@ -63,6 +63,14 @@ enum ForwardOutcome {
     /// Connected but the response could not be decoded — most likely a stale
     /// daemon speaking a different wire format.
     ParseFailure,
+    /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
+    /// does not match [`PROTOCOL_VERSION`] even though `version_mismatch` is false.
+    /// This is the new-client + old-daemon (pre-versioning) scenario: the old daemon
+    /// ignores the unknown request field and returns a decodable response whose
+    /// protocol fields default to `false`/`0`. The client must treat this exactly
+    /// like `ParseFailure`: kill the stale daemon, respawn once, and return a clear
+    /// error if the replacement still has the wrong version.
+    ProtocolMismatch,
 }
 
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
@@ -83,7 +91,24 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
         Err(_) => return ForwardOutcome::NoSocket,
     };
     match serde_json::from_slice::<DaemonResponseFrame>(&resp) {
-        Ok(frame) => ForwardOutcome::Response(frame),
+        Ok(frame) => {
+            // A pre-versioning daemon (old-daemon scenario) returns a decodable
+            // response whose `daemon_protocol_version` defaults to 0. The field
+            // `version_mismatch` is also false because the old daemon never set
+            // it — making `map_response` accept the stale response when
+            // `served_config_id` happens to match. Detect this here so the
+            // caller can route it through the same kill/respawn path.
+            if frame.daemon_protocol_version != PROTOCOL_VERSION && !frame.version_mismatch {
+                tracing::warn!(
+                    daemon_version = frame.daemon_protocol_version,
+                    expected = PROTOCOL_VERSION,
+                    "daemon protocol version mismatch (old daemon, no version_mismatch flag) \
+                     — treating as stale",
+                );
+                return ForwardOutcome::ProtocolMismatch;
+            }
+            ForwardOutcome::Response(frame)
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -155,19 +180,93 @@ fn spawn_daemon() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Return `true` if the process with the given PID is identifiable as a khive
+/// daemon (kkernel binary). Uses `ps -p <pid> -o args=` (portable across macOS
+/// and Linux) and checks that the executable name contains "kkernel".
+///
+/// If the process is gone or is a foreign process, returns `false` — the caller
+/// must then clean up the stale PID file without sending SIGTERM.
+fn pid_is_khive_daemon(pid: u32) -> bool {
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid_i32 <= 0 {
+        return false;
+    }
+    // Quick liveness check before shelling out.
+    // SAFETY: signal 0 is an existence/permission probe with no side effects.
+    if unsafe { libc::kill(pid_i32, 0) } != 0 {
+        return false;
+    }
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let args = String::from_utf8_lossy(&out.stdout);
+            args.contains("kkernel")
+        }
+        _ => false,
+    }
+}
+
+/// Acquire an exclusive advisory flock on the recovery lock file. The returned
+/// `File` holds the lock for its lifetime; dropping it releases the lock.
+fn acquire_recovery_lock() -> Option<std::fs::File> {
+    let path = lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "cannot open recovery lock file");
+            return None;
+        }
+    };
+    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+    let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("flock LOCK_EX failed on recovery lock");
+        return None;
+    }
+    Some(file)
+}
+
 /// Kill the daemon recorded in the PID file (best-effort, no error on failure).
+///
+/// Before sending SIGTERM, the PID is validated: `ps` must confirm the process
+/// is a kkernel binary. If the PID is gone or belongs to a foreign process,
+/// SIGTERM is skipped and only the stale files are cleaned up. An advisory flock
+/// on the recovery lock file serializes concurrent clients.
 fn kill_stale_daemon() {
+    // Hold the lock for the duration of kill + file cleanup so concurrent
+    // clients do not race through the same PID/socket.
+    let _lock = acquire_recovery_lock();
+
     let pid_file = pid_path();
     if let Ok(contents) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = contents.trim().parse::<u32>() {
-            if let Ok(signed) = i32::try_from(pid) {
-                if signed > 0 {
-                    // SAFETY: SIGTERM is a standard termination signal with no
-                    // side effects beyond asking the process to exit.
-                    unsafe {
-                        libc::kill(signed, libc::SIGTERM);
+            if pid_is_khive_daemon(pid) {
+                if let Ok(signed) = i32::try_from(pid) {
+                    if signed > 0 {
+                        // SAFETY: SIGTERM is a standard termination signal with no
+                        // side effects beyond asking the process to exit.
+                        unsafe {
+                            libc::kill(signed, libc::SIGTERM);
+                        }
                     }
                 }
+            } else {
+                tracing::warn!(
+                    pid,
+                    "PID in daemon file does not belong to a khive daemon — skipping SIGTERM"
+                );
             }
         }
     }
@@ -180,10 +279,12 @@ fn kill_stale_daemon() {
 /// Returns `None` on any failure → caller falls back to local dispatch.
 ///
 /// If the daemon socket is reachable but its response cannot be decoded
-/// (stale binary speaking a different wire format), the stale daemon is
-/// killed and a fresh one is spawned once. If the fresh spawn also fails
-/// to respond with a decodable frame, `None` is returned so the caller can
-/// fall back to local dispatch rather than looping or hanging forever.
+/// (stale binary speaking a different wire format), or the decoded response
+/// carries a `daemon_protocol_version` that does not match [`PROTOCOL_VERSION`]
+/// (new-client + old-daemon scenario), the stale daemon is killed and a fresh
+/// one is spawned exactly once. If the fresh daemon still reports the wrong
+/// protocol version, a hard protocol-mismatch error is returned rather than
+/// silently falling back to local dispatch (which would hide the version skew).
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
@@ -199,6 +300,67 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             kill_stale_daemon();
             // Give the kernel a moment to release the socket path.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        ForwardOutcome::ProtocolMismatch => {
+            // The response was decodable but `daemon_protocol_version` does not
+            // match PROTOCOL_VERSION (old daemon silently omits the field → 0).
+            // Kill it, respawn, and if the replacement STILL mismatches, return
+            // a hard error — never silently accept a stale daemon's results.
+            tracing::info!(
+                "killing stale daemon (protocol version mismatch, old daemon) and respawning"
+            );
+            kill_stale_daemon();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            if spawn_daemon().is_err() {
+                return Some(Err(McpError::internal_error(
+                    format!(
+                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                         respawn failed — run `make local` to rebuild the daemon binary"
+                    ),
+                    None,
+                )));
+            }
+
+            let sock = socket_path();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                if UnixStream::connect(&sock).await.is_ok() {
+                    return match try_forward_inner(frame).await {
+                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
+                            Some(Err(McpError::internal_error(
+                                format!(
+                                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                                     respawned daemon still reports wrong version — \
+                                     run `make local` to rebuild the daemon binary"
+                                ),
+                                None,
+                            )))
+                        }
+                        ForwardOutcome::NoSocket => Some(Err(McpError::internal_error(
+                            format!(
+                                "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                                 respawned daemon did not accept connections — \
+                                 run `make local` to rebuild the daemon binary"
+                            ),
+                            None,
+                        ))),
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            return Some(Err(McpError::internal_error(
+                format!(
+                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                     respawned daemon did not become ready within 5s — \
+                     run `make local` to rebuild the daemon binary"
+                ),
+                None,
+            )));
         }
     }
 
@@ -219,6 +381,13 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     );
                     None
                 }
+                ForwardOutcome::ProtocolMismatch => Some(Err(McpError::internal_error(
+                    format!(
+                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                         run `make local` to rebuild the daemon binary"
+                    ),
+                    None,
+                ))),
                 ForwardOutcome::NoSocket => None,
             };
         }
@@ -254,6 +423,7 @@ mod tests {
         std::env::remove_var("KHIVE_SOCKET");
         std::env::remove_var("KHIVE_PID");
         std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::remove_var("KHIVE_LOCK");
     }
 
     async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
@@ -637,5 +807,128 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         clear_daemon_env();
+    }
+
+    // ── new-client + old-daemon regression (fix for #98 BLOCKER) ─────────────
+    //
+    // Simulates a pre-versioning daemon that:
+    //   • Ignores the unknown `protocol_version` request field (it deserializes
+    //     as missing and is silently dropped).
+    //   • Returns a decodable response with a matching `served_config_id` but
+    //     WITHOUT `daemon_protocol_version` or `version_mismatch` (they default
+    //     to `0` / `false` on the client).
+    //
+    // Before the fix, `map_response` accepted this response because `version_mismatch`
+    // was false and `served_config_id` matched — the stale daemon was trusted.
+    //
+    // After the fix, `try_forward_inner` detects `daemon_protocol_version == 0 != 1`
+    // and returns `ForwardOutcome::ProtocolMismatch`, which `forward_or_spawn` routes
+    // through kill/respawn/error rather than accepting.
+    //
+    // The test verifies at the `forward_or_spawn` level (not just `map_response`)
+    // that:
+    //   1. The stale response is NOT accepted.
+    //   2. At most one recovery attempt is made (the fake socket closes after one
+    //      exchange; a second attempt sees NoSocket rather than looping).
+    //   3. A clear "protocol mismatch" error is returned.
+
+    /// Minimal "old daemon" frame: has `served_config_id` but omits the
+    /// protocol version fields (they default to `false`/`0` on the client side).
+    fn old_daemon_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: true,
+            result: Some("stale-result".to_string()),
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            // Pre-versioning daemon would never set these:
+            version_mismatch: false,
+            daemon_protocol_version: 0,
+        }
+    }
+
+    /// Serve exactly one connection with `response`, then stop accepting.
+    async fn serve_one_response(listener: tokio::net::UnixListener, response: DaemonResponseFrame) {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Read the inbound request frame (and discard it — old daemon ignores
+            // unknown fields, which is the scenario we're simulating).
+            if read_frame(&mut stream).await.is_ok() {
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let _ = write_frame(&mut stream, &payload).await;
+                }
+            }
+        }
+        // Listener drops here; subsequent connection attempts see "connection refused".
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_rejects_old_daemon_and_returns_protocol_mismatch_error() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        // Bind the fake old-daemon socket BEFORE starting the client.
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake old-daemon socket");
+        // Write a placeholder PID file so kill_stale_daemon finds a PID to look at.
+        // We use the current process's PID, which pid_is_khive_daemon() will reject
+        // because the current exe is the test binary (not "kkernel"), so no SIGTERM
+        // will be sent — this is the safe path we want to exercise.
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        let old_resp = old_daemon_response(config_id);
+        // Serve exactly one exchange, then let the listener drop (no second connection
+        // will be served — this enforces the "at most one recovery attempt" constraint:
+        // if forward_or_spawn tried the old socket a second time it would get NoSocket).
+        let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+
+        // The fake socket served exactly one old-protocol response.  The fake handle
+        // should have completed by now; join it to catch any panics.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        // Must NOT accept the stale daemon result.
+        match result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("protocol mismatch"),
+                    "error must name 'protocol mismatch'; got: {message}"
+                );
+                assert!(
+                    message.contains("make local") || message.contains("rebuild"),
+                    "error must tell the operator what to do; got: {message}"
+                );
+            }
+            Some(Ok(v)) => {
+                panic!("forward_or_spawn must NOT accept old-daemon response; got Ok({v:?})")
+            }
+            None => panic!(
+                "forward_or_spawn must return Some(Err(..)) for protocol mismatch, \
+                 not None (which would cause silent fallback to local dispatch)"
+            ),
+        }
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
     }
 }

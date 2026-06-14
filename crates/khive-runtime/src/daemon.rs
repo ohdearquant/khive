@@ -68,6 +68,19 @@ pub fn pid_path() -> PathBuf {
     khive_dir().join("khived.pid")
 }
 
+/// Advisory lock file used to serialize stale-daemon recovery across concurrent
+/// clients (flock on the file; released when the lock file handle is dropped).
+///
+/// Overridable via the `KHIVE_LOCK` env var (for tests).
+pub fn lock_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KHIVE_LOCK") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    khive_dir().join("khived.recovery.lock")
+}
+
 // ── wire types ────────────────────────────────────────────────────────────────
 
 /// Request frame sent from a client to the daemon.
