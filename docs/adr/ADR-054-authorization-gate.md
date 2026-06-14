@@ -70,9 +70,10 @@ ADR adds the missing upstream stage that resolves a real `ActorRef` before that 
 
 /// Resolves an opaque token (API key, JWT, mTLS subject, etc.) to an ActorRef.
 ///
-/// The embedded default returns a fixed local-user caller so that OSS single-user
-/// deployments need no configuration. Cloud deployments replace this with a
-/// tenant-aware implementation that validates the token against the auth store.
+/// The embedded default returns the anonymous sentinel (`ActorRef::anonymous()`)
+/// so that OSS single-user deployments need no configuration. Cloud deployments
+/// replace this with a tenant-aware implementation that validates the token
+/// against the auth store.
 pub trait ActorStore: Send + Sync {
     fn resolve(&self, token: &str) -> Result<ActorRef, AuthError>;
 }
