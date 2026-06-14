@@ -942,8 +942,10 @@ def test_epistemic_edge_endpoints(proc: subprocess.Popen) -> None:
     )
 
     # ---- ILLEGAL: document -[supports]-> document (target not concept) ----
-    # Error from operations.rs:695-699: target kind "document" is not in the
-    # allowlist for supports; only "concept" is a valid entity-form target.
+    # Rejected because target kind "document" is not a valid entity-form target
+    # for supports; only "concept" is. The surfaced message is the pack-enriched
+    # form (handlers/common.rs enrich_allowlist_error: "Valid relations: ...")
+    # with the appended epistemic hint naming the concept-target requirement.
     err_doc_doc = _expect_rpc_error(proc, "link", {
         "source_id": doc_evidence["id"],
         "target_id": doc_other["id"],
