@@ -88,7 +88,7 @@ below the runtime trust boundary.
 - `RetrievalError::QueryTimeout`: search future exceeded the configured duration.
 - `RetrievalError::QueryCancelled`: cancellation token was triggered before search completed.
 - `PersistError::Sqlite`: SQLite operation failed during index persistence/load.
-- `RetrievalError::GraphTraversal`: BFS/DFS exceeded `MAX_TRAVERSAL_DEPTH` or `MAX_TRAVERSAL_RESULTS`.
+- `RetrievalError::GraphTraversal`: graph algorithm error.
 
 ## Quick start
 
