@@ -11,9 +11,12 @@ by the knowledge pack and hybrid retrieval stack ([ADR-012](ADR-012-retrieval-co
 hybrid FTS+vector+graph fusion pipeline.
 
 The driving engineering goal is **sublinear query latency with extreme performance** on khive's
-actual production workload. This ADR records the scaling contract: which axes are genuinely
-sublinear, which are not, what the evidence base is, and where the honest limits lie. Future
-contributors must not re-litigate these decisions without new measurements.
+production workload. If accepted, this ADR would establish the scaling contract: which axes are
+genuinely sublinear, which are not, what the evidence base is, and where the honest limits lie.
+The evidence cited here was gathered on a representative proxy corpus (BeIR/quora); production-
+corpus measurement on khive's own knowledge-graph data is required before the query-sublinearity
+claim is accepted as binding. Future contributors should not re-litigate these decisions without
+new measurements once the ADR is accepted.
 
 ### Governing mechanism: intrinsic dimension
 
@@ -42,40 +45,44 @@ a ≥5× range in N unless otherwise noted.
 
 ### Scaling contract
 
-The following table records the honest asymptotic floor for each axis. This is the normative
-contract; claims beyond these bounds require new measurements and an ADR amendment.
+The following table records the proposed asymptotic floor for each axis. If this ADR is
+accepted, claims beyond these bounds would require new measurements and an ADR amendment.
 
-| Axis                   | Asymptotic floor                                                                           | Sublinear in N?                             |
-| ---------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------- |
-| Query latency          | empirical O(log N) in the low-intrinsic-dim regime; Indyk-Xu O((4α)^δ · log Δ) upper bound | Yes, workload-scoped                        |
-| Update (insert/delete) | O(log N) insert; O(degree² · d) Wolverine delete, N-independent per op                     | Yes, conditional on amortized consolidation |
-| Build work             | Ω(N)                                                                                       | No                                          |
-| Build wall-clock       | Ω(N)/P on P cores                                                                          | No                                          |
-| Memory                 | O(N)                                                                                       | No                                          |
+| Axis                   | Asymptotic floor                                                                           | Sublinear in N?                          |
+| ---------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| Query latency          | empirical O(log N) in the low-intrinsic-dim regime; Indyk-Xu O((4α)^δ · log Δ) upper bound | Yes, proxy-measured (production pending) |
+| Update (insert/delete) | O(log N) insert; O(degree² · d) Wolverine delete, N-independent per op                     | Not yet established                      |
+| Build work             | Ω(N)                                                                                       | No                                       |
+| Build wall-clock       | Ω(N)/P on P cores                                                                          | No                                       |
+| Memory                 | O(N)                                                                                       | No                                       |
 
-The "Yes, conditional" for update carries a **tracked design obligation**: the amortized cost of
-periodic consolidation must be measured and confirmed sublinear at production scale before the
-update axis is claimed fully sublinear. This obligation is not yet discharged; see ADR-052 for
-the consolidation design.
+The update axis carries a **tracked design obligation** that is not yet discharged: the amortized
+cost of periodic consolidation must be measured and confirmed sublinear at production scale before
+any "Yes" appears in the sublinear column for insert/delete. See ADR-052 for the consolidation
+design. The query-latency "Yes" is scoped to the proxy-corpus measurement described below;
+it becomes binding only after production-corpus confirmation.
 
 The build and memory axes deliver only **extreme constant-factor** improvement. No future
 contributor should claim asymptotic build or memory sublinearity. The constant-factor levers are
 the perf stack described in the Consequences section.
 
-### khive's production workload is in the sublinear regime
+### Representative proxy workload is in the sublinear regime (production measurement pending)
 
 khive's production primary embedding model is `all-minilm-l6-v2` (384-d), verified in
 `crates/khive-runtime/src/engine_config.rs` as the configured primary model. Its intrinsic
-dimension, measured on a 30K sample from a 522K-passage representative sentence corpus
-(BeIR/quora) using TwoNN and MLE estimators (`khive-real-intrinsic-dim.json`), is:
+dimension was measured on a 30K sample from a 522K-passage sentence corpus (BeIR/quora) used
+as a representative proxy for khive's note and entity text. This is not khive's own
+knowledge-graph corpus; it is a proxy appropriate in kind (short sentence-length passages).
+Estimators used: TwoNN and MLE
+(`evidence/adr-054/khive-real-intrinsic-dim.json`):
 
 - TwoNN: 12.3
 - MLE: 15.6
 - Consensus: ~14 (ESS excluded; it overestimates on clustered high-dimensional distributions)
 
-The `intrinsic_dim_approx: "~20"` field stamped in `probe-results-khive-real-3pt.json` is a stale
-value carried over from the GloVe probe template. The measured value for this workload is ~14,
-recorded in `khive-real-intrinsic-dim.json`.
+The `intrinsic_dim_approx: "~20"` field stamped in `evidence/adr-054/probe-results-khive-real-3pt.json`
+is a stale value carried over from the GloVe probe template. The measured value for this proxy
+workload is ~14, recorded in `evidence/adr-054/khive-real-intrinsic-dim.json`.
 
 This places khive's workload in the intermediate-low intrinsic-dim regime, substantially closer
 to SIFT-1M (~10) than to GloVe-100-angular (~20). Sentence embeddings cluster by semantic topic,
@@ -84,7 +91,8 @@ actively helps greedy graph traversal.
 
 ### Evidence
 
-**khive's real production workload (headline result)** (`probe-results-khive-real-3pt.json`,
+**Proxy workload headline result (BeIR/quora, representative for khive's sentence corpus)**
+(`evidence/adr-054/probe-results-khive-real-3pt.json`,
 α=1.0, R=64/L=128, 384-d L2-normalized, 3-point fit at N = 100K/200K/500K):
 
 | N    | iso-recall beam | recall@10 | warm p50 | brute p50 | speedup |
@@ -99,7 +107,7 @@ than the point estimate), brute-force exponent 1.003 (R²=1.0, confirms the harn
 measuring N-linear work). The beam is pinned at the floor across the full 5× N range. Recall
 holds ≥0.987 at 500K. The speedup widens with N because brute force is linear and query is flat.
 
-**SIFT-1M corroboration (gold-standard benchmark)** (`probe-results-sift-3pt.json`, R=64/L=128,
+**SIFT-1M corroboration (gold-standard benchmark)** (`evidence/adr-054/probe-results-sift-3pt.json`, R=64/L=128,
 128-d raw L2, 3-point fit at N = 100K/300K/1M):
 
 | N    | iso-recall beam | recall@10 | warm p50 | brute p50 | speedup |
@@ -111,7 +119,7 @@ holds ≥0.987 at 500K. The speedup widens with N because brute force is linear 
 3-point fits: beam-growth exponent 0.000 (R²=1.0), query exponent 0.303 (R²=0.988), brute-force
 exponent 1.017 (R²=1.0), build wall-clock exponent 1.449 (R²=1.0, Ω(N) as expected).
 
-**Regime boundary: GloVe-100-angular** (`probe-results-glove.json`, 2-point fit at N = 100K/300K):
+**Regime boundary: GloVe-100-angular** (`evidence/adr-054/probe-results-glove.json`, 2-point fit at N = 100K/300K):
 
 | N    | iso-recall beam | recall@10 | warm p50 | brute p50 | speedup |
 | ---- | --------------- | --------- | -------- | --------- | ------- |
@@ -123,7 +131,7 @@ flat-beam regime does not hold: the beam must grow as ~N^0.57 to maintain recall
 query to near-linear and collapses the speedup to ~1.1×. GloVe-100 uses word vectors; khive
 indexes sentence vectors, and sentence embeddings sit at lower intrinsic dimension.
 
-**α-sweep on GloVe** (`probe-results-glove-alpha.json`, R=64/L=128, N=100K and 300K): at α=1.0
+**α-sweep on GloVe** (`evidence/adr-054/probe-results-glove-alpha.json`, R=64/L=128, N=100K and 300K): at α=1.0
 the iso-recall beam is 132 at 100K versus 203 at α=1.2, and the 2-point beam-growth exponent
 drops from 0.566 to 0.341. The direction matters: khive-vamana uses the standard DiskANN
 RobustPrune α-squared condition (`graph.rs`), in which α=1.0 is the most aggressive pruning
@@ -136,13 +144,14 @@ config, so α tuning is off khive's critical path.
 
 ## Consequences
 
-### What khive claims
+### What this ADR proposes to claim (pending acceptance and production-corpus confirmation)
 
-1. **Query sublinearity is real and measured on khive's actual production workload.** The claim
-   is workload-scoped: khive's configured primary embedding model, at its measured intrinsic
-   dimension of ~14 on a representative sentence corpus, produces flat-beam behavior across 5×
-   (100K to 500K) with recall ≥0.987. The speedup widens with N (57× at 500K vs brute force).
-   The same regime is corroborated at larger scale on SIFT-1M (34× at 1M).
+1. **Query sublinearity is measured on a representative proxy corpus.** The proxy (BeIR/quora,
+   intrinsic dim ~14) uses the same model (`all-minilm-l6-v2`, 384-d) as khive's production
+   configuration and produces flat-beam behavior across 5× (100K to 500K) with recall
+   ≥0.987. The speedup widens with N (57× at 500K vs brute force). The same regime is
+   corroborated at larger scale on SIFT-1M (34× at 1M). Production-corpus measurement on
+   khive's own knowledge-graph data is required before this claim becomes binding.
 
 2. **The claim is not a blanket statement.** It holds for sentence-embedding workloads at
    intrinsic dim ≤ ~16. It does not hold for word-vector or other high-intrinsic-dim data.
@@ -162,21 +171,25 @@ config, so α tuning is off khive's critical path.
      not corpus size, so the hot-path delete cost is N-independent. Periodic consolidation
      handles compaction off the critical path.
 
-4. **Corpus scope caveat.** The intrinsic-dimension measurement and the real-workload probe use
+4. **Corpus scope caveat.** The intrinsic-dimension measurement and the scaling probe use
    BeIR/quora as a representative proxy for khive's note and entity text, not khive's own
-   knowledge graph corpus. The proxy is appropriate in kind (short sentence-length text passages)
-   but not identical. The flat-beam behavior at N ≤ 500K is the empirical falsification test:
-   if the real corpus had higher intrinsic dim, the beam would have grown. It did not.
+   knowledge-graph corpus. The proxy is appropriate in kind (short sentence-length text passages)
+   but it is not khive's actual data. The flat-beam result at N ≤ 500K on the proxy supports
+   the hypothesis that khive's real corpus is also in the sublinear regime, but it does not
+   prove it: a proxy corpus with intrinsic dim ~14 cannot serve as falsification evidence for
+   khive's own corpus. A production measurement on khive's own entity and note vectors is
+   required to discharge this obligation.
 
 5. **Query-exponent interpretation.** The measured query exponent (0.043 on khive's real corpus,
    0.303 on SIFT-1M) is directional. At near-flat latency the 3-point fit is noise-dominated
    (R²=0.20 for the real-corpus fit). Report query latency as **flat** at the production scale
    range, with the exponent as directional confirmation of sublinearity, not a precise estimate.
 
-6. **Consolidation obligation.** The update-axis sublinearity claim (O(log N) amortized) rests
-   on amortized consolidation staying sublinear at scale. This has not been measured in production.
-   It is a tracked design obligation: measure consolidation throughput as a function of N before
-   advertising update sublinearity as a production property.
+6. **Consolidation obligation (update axis not yet established).** The update-axis sublinearity
+   target (O(log N) amortized) rests on amortized consolidation staying sublinear at scale.
+   This has not been measured. The update row in the scaling table above is marked "Not yet
+   established" precisely because of this gap. The tracked obligation: measure consolidation
+   throughput as a function of N before any "Yes" is entered for the update axis.
 
 7. **α tuning is an open question, not guidance.** A preliminary 2-point GloVe probe showed α=1.0
    reaching the recall target with a smaller beam than α=1.2 on that out-of-regime word-vector

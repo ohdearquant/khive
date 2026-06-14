@@ -1,0 +1,97 @@
+{
+  "caveats": [
+    "2-point fit: directional only; λ adds the top point to make 3-point; λ adds the top point for a complete fit",
+    "vectors are L2-normalized (angular/cosine benchmark — normalization required for correct L2 ordering)",
+    "GT recomputed by brute-force L2 on each subset (1000 queries)",
+    "latency measured warm-cache",
+    "GloVe intrinsic dim ~20 vs SIFT ~10 — harder manifold; beam may need to grow"
+  ],
+  "config": {
+    "build_batch": 1024,
+    "k": 10,
+    "max_degree": 64,
+    "max_iso_beam": 1024,
+    "search_list_size": 128,
+    "target_recall": 0.95
+  },
+  "dataset": {
+    "base_file": "/Users/lion/projects/khive/khive-sublinear/data/glove/glove_base.fvecs",
+    "base_n": 1183514,
+    "dim": 100,
+    "intrinsic_dim_approx": "~20 (harder than SIFT ~10; literature estimate)",
+    "name": "GloVe-100-angular",
+    "normalization": "L2-normalized to unit sphere (angular/cosine → L2 ordering equivalent)",
+    "query_file": "/Users/lion/projects/khive/khive-sublinear/data/glove/glove_query.fvecs",
+    "query_n": 10000
+  },
+  "decisive_question": {
+    "criteria": {
+      "a_beam_exp": 0.5658850014607956,
+      "a_beam_flat": false,
+      "b_query_exp": 1.0305672104902046,
+      "b_query_sublinear": false,
+      "c_recall_holds": true,
+      "d_beats_brute_force": true,
+      "d_max_n": 300000,
+      "d_speedup_at_max_n": 1.1379154450903306,
+      "per_n_recall": [
+        {
+          "n": 100000,
+          "recall": 0.9501999999999974,
+          "saturated": false
+        },
+        {
+          "n": 300000,
+          "recall": 0.9501999999999979,
+          "saturated": false
+        }
+      ]
+    },
+    "verdict": "PARTIAL — recall ≥0.95 and ANN beats brute-force; 2-pt fit insufficient to confirm scaling exponent"
+  },
+  "fits": {
+    "beam_growth_exponent": 0.5658850014607956,
+    "beam_growth_r2": 1.0,
+    "bruteforce_exponent": 1.01414953079136,
+    "bruteforce_r2": 1.0,
+    "build_wallclock_exponent": 1.1301689094684753,
+    "build_wallclock_r2": 1.0,
+    "iso_recall_query_exponent_warm": 1.0305672104902046,
+    "iso_recall_query_r2_warm": 1.0,
+    "note": "2-point fit: directional only; λ adds the top point to make 3-point"
+  },
+  "gt_policy": {
+    "n_gt_queries": 1000,
+    "n_latency_queries": 1000,
+    "note": "provided 'neighbors' dataset indexes into full 1.18M train — invalid for subsets",
+    "source": "brute-force recomputed on subset (L2 on unit sphere == cosine ordering)"
+  },
+  "rows": [
+    {
+      "bruteforce_us_median": 1040.8329999999999,
+      "build_ms": 24488.714500000002,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 203,
+      "n": 100000,
+      "per_query_resident_exceeds_llc": false,
+      "query_warm_us_median": 898.334,
+      "query_warm_us_p95": 1287.667,
+      "recall_at_10": 0.9501999999999974,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 1.1586258563073422
+    },
+    {
+      "bruteforce_us_median": 3171.4170000000004,
+      "build_ms": 84760.516833,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 378,
+      "n": 300000,
+      "per_query_resident_exceeds_llc": false,
+      "query_warm_us_median": 2787.041,
+      "query_warm_us_p95": 3455.792,
+      "recall_at_10": 0.9501999999999979,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 1.1379154450903306
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "caveats": [
+    "3-point fit complete (N=100K/300K/1M); λ ran the 1M point",
+    "GT recomputed by brute force on first 1000 queries against each subset (not provided GT)",
+    "latency measured warm-cache",
+    "SIFT vectors are raw unnormalized L2 descriptors"
+  ],
+  "config": {
+    "build_batch": 1024,
+    "k": 10,
+    "max_degree": 64,
+    "max_iso_beam": 1024,
+    "search_list_size": 128,
+    "target_recall": 0.95
+  },
+  "dataset": {
+    "base_n": 1000000,
+    "descriptor": "raw unnormalized L2 SIFT descriptors (128-dim)",
+    "dim": 128,
+    "gt_top": 100,
+    "intrinsic_dim_approx": "~10-12 (literature estimate)",
+    "name": "TEXMEX SIFT-1M",
+    "query_n": 10000,
+    "source": "https://huggingface.co/datasets/qbo-odp/sift1m"
+  },
+  "decisive_question": {
+    "criteria": {
+      "a_beam_exp": 0.0,
+      "a_beam_flat": true,
+      "b_query_exp": 0.30252027438652707,
+      "b_query_sublinear": true,
+      "c_recall_holds": true,
+      "d_beats_brute_force": true,
+      "d_max_n": 1000000,
+      "d_speedup_at_max_n": 34.4435849248577
+    },
+    "verdict": "YES — all criteria met: beam flat, query sublinear, recall ≥0.95, ANN beats brute force"
+  },
+  "fits": {
+    "beam_growth_exponent": 0.0,
+    "beam_growth_r2": 1.0,
+    "bruteforce_exponent": 1.0174638018979343,
+    "bruteforce_r2": 0.9999703840487655,
+    "build_wallclock_exponent": 1.4485217529666226,
+    "build_wallclock_r2": 0.9995479260391824,
+    "iso_recall_query_exponent_warm": 0.30252027438652707,
+    "iso_recall_query_r2_warm": 0.9875538898374127,
+    "note": "3-point fit"
+  },
+  "gt_policy": {
+    "n_gt_queries": 1000,
+    "n_latency_queries": 1000,
+    "note": "provided sift_groundtruth.ivecs indexes into full 1M base — invalid for subsets; always recomputed",
+    "source": "brute-force recomputed on subset"
+  },
+  "rows": [
+    {
+      "bruteforce_us_median": 1105.25,
+      "build_ms": 13843.618917,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 64,
+      "n": 100000,
+      "per_query_resident_exceeds_llc": false,
+      "query_warm_us_median": 166.167,
+      "query_warm_us_p95": 217.0,
+      "recall_at_10": 0.9986999999999998,
+      "speedup_vs_brute_force": 6.6514410201784955
+    },
+    {
+      "bruteforce_us_median": 3418.083,
+      "build_ms": 63868.234916,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 64,
+      "n": 300000,
+      "per_query_resident_exceeds_llc": false,
+      "query_warm_us_median": 248.16699999999997,
+      "query_warm_us_p95": 327.917,
+      "recall_at_10": 0.9932999999999992,
+      "speedup_vs_brute_force": 13.773317967336514
+    },
+    {
+      "bruteforce_us_median": 11509.875,
+      "build_ms": 388112.442875,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 64,
+      "n": 1000000,
+      "per_query_resident_exceeds_llc": false,
+      "query_warm_us_median": 334.166,
+      "query_warm_us_p95": 408.041,
+      "recall_at_10": 0.9855999999999986,
+      "speedup_vs_brute_force": 34.4435849248577
+    }
+  ]
+}

@@ -5,27 +5,38 @@
 
 ## Context
 
-khive ships two ANN index crates behind the `VectorStore` trait
-([ADR-005](ADR-005-storage-capability-traits.md)):
+khive ships two ANN index crates. **khive-hnsw** is the mature index: hierarchical navigable
+small-world graph, search-time INT8 quantization (`QuantizedArena`), snapshot persistence
+(currently behind an optional checkpoint feature gate), incremental ops, ~69 tests.
+**khive-vamana** is the DiskANN-style index consumed directly by the knowledge pack as an ANN
+bridge ([ADR-030](ADR-030-retrieval-stack-port.md)). It provides single-shot batch build
+(`build()`), greedy search (`search()`), and an L2² SIMD distance kernel, with ~16 tests.
+It has **no delete, no incremental insert, no consolidation, and no acquisition-time
+quantization**.
 
-- **khive-hnsw**: the mature index: hierarchical navigable small-world graph, search-time INT8
-  quantization (`QuantizedArena`), snapshot persistence (currently behind an optional checkpoint
-  feature gate), incremental ops, ~69 tests.
-- **khive-vamana**: the DiskANN-style index used by knowledge search: single-shot batch build
-  (`build()`), greedy search (`search()`), L2² SIMD distance kernel, ~16 tests. It has **no
-  delete, no incremental insert, no consolidation, no acquisition-time quantization**. Every
-  process restart rebuilds the graph from scratch.
+Note on trait boundaries: `VectorStore` ([ADR-005](ADR-005-storage-capability-traits.md)) is
+currently implemented only by `SqliteVecStore` in `khive-db`. khive-vamana is not behind the
+`VectorStore` trait; it is consumed directly by the knowledge pack as a separate ANN bridge
+alongside the sqlite-vec path. `VectorStore::insert` and `VectorStore::delete` already exist in
+the trait definition ([ADR-005](ADR-005-storage-capability-traits.md) lines 82-85).
 
-For a knowledge corpus that grows and churns across sessions, khive-vamana is an index demo, not
-a database component. Three gaps:
+For a knowledge corpus that grows and churns across sessions, khive-vamana is an index, not yet
+a fully production-capable database component. Three gaps this ADR proposes to close:
 
-1. **No delete.** The only way to remove a vector is a full rebuild. A long-lived corpus with
-   superseded records accumulates dead vectors, and recall drifts as deleted content keeps
-   matching.
-2. **O(rebuild) restart.** Batch construction runs many greedy searches; on a cold start of a
-   100K-vector corpus it costs seconds-to-tens-of-seconds. Doing that on every daemon restart
-   ([ADR-049](ADR-049-persistent-daemon.md) keeps the daemon warm precisely to avoid this) is
-   the dominant cold-path cost.
+1. **No delete.** The only way to remove a vector from the ANN graph is a full rebuild. A
+   long-lived corpus with hard-deleted or orphaned vector rows accumulates dead vectors in the
+   ANN graph, and recall drifts as orphaned content keeps matching. (Superseded records are a
+   view-layer concern: they remain in storage and are filtered post-hydration per khive's
+   data-vs-view principle. ANN deletion applies to hard-deleted/orphaned vector rows and stale
+   snapshots only.)
+2. **Cold-start cost on snapshot miss.** The knowledge pack's `ensure_ann_for_model` already
+   performs snapshot warm-load first (matching fingerprint), falling back to rebuild only when
+   the snapshot is absent, stale, or corrupt ([ADR-049](ADR-049-khived-daemon.md),
+   [ADR-051](ADR-051-section-embeddings-hybrid-compose.md)). On a snapshot hit, restart cost
+   is O(deserialize), not O(rebuild). However, the current snapshot format is a JSON/BLOB
+   written to `retrieval_snapshots`, which is slow to deserialize at scale (~50-120 s at
+   466K vectors). This ADR proposes replacing the JSON/BLOB restore with an mmap/segment
+   restore that targets O(load) at the same scale.
 3. **No acquisition-time quantization.** Build and search are bottlenecked on f32 distance
    computations. The dominant cost during RobustPrune and greedy search is distance evaluation;
    an integer kernel would cut it substantially.
@@ -181,9 +192,12 @@ the claim is made load-bearing.
   (`types -> score -> quant -> hnsw/vamana`). It depends only on `khive-types`.
 - khive-hnsw keeps its existing snapshot path; the SQ8 build/search functions are additive and
   opt-in. The checkpoint feature gate is orthogonal to this ADR.
-- khive-vamana's lifecycle additions are gated behind the `VectorStore` trait; no consumer API
-  change is required for build/search. Delete and insert become newly available capabilities on
-  the trait surface.
+- khive-vamana's lifecycle additions (tombstone, insert, consolidate, v2 persistence) are
+  internal to the index crate. The knowledge pack's ANN bridge (`ensure_ann_for_model`,
+  `load_or_build`) gains tombstone/insert/consolidate calls as the index-internal interface
+  grows. No change to the `VectorStore` trait is proposed here: insert and delete already exist
+  on that trait ([ADR-005](ADR-005-storage-capability-traits.md)), and khive-vamana is not
+  behind it.
 - `khive-fold` is unaffected -- persistence here is self-contained in the index crate's v2
   format, not routed through fold.
 
@@ -201,8 +215,9 @@ the claim is made load-bearing.
 
 ## Consequences
 
-- khive-vamana survives restart via mmap instead of rebuild -- the daemon's cold path drops from
-  O(rebuild) to O(load).
+- khive-vamana snapshot restore changes from JSON/BLOB deserialization to mmap segment load --
+  the daemon's snapshot-hit cold path drops from slow deserialization to O(load). Full rebuild
+  still occurs on snapshot miss (absent, stale, or corrupt snapshot), as today.
 - Delete becomes a real operation (tombstone + eager repair + periodic consolidation) with
   bounded recall drift, instead of "rebuild the whole index."
 - Distance-bound build/search speeds up via the integer kernel (~16.8x on the kernel,

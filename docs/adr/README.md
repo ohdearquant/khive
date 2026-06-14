@@ -70,18 +70,23 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 
 ## New v1 Surfaces
 
-| #                                                        | Title                                                                                         |
-| -------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [ADR-040](ADR-040-communication-and-schedule-packs.md)   | Communication and Schedule Packs                                                              |
-| [ADR-041](ADR-041-event-provenance-projection.md)        | Event Provenance Projection — Hybrid Log + Graph Edges                                        |
-| [ADR-042](ADR-042-local-rerank-via-lattice-inference.md) | Composable Rerank Pipeline (local cross-encoder + salience + graph-proximity)                 |
-| [ADR-043](ADR-043-embedding-model-migration.md)          | Embedding Model Migration                                                                     |
-| [ADR-044](ADR-044-vector-store-extensions.md)            | Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep |
-| [ADR-045](ADR-045-verb-response-presentation.md)         | Verb Response Presentation Modes                                                              |
-| [ADR-046](ADR-046-event-sourced-proposals.md)            | Event-Sourced Agent KG Proposals                                                              |
-| [ADR-047](ADR-047-knowledge-pack.md)                     | Knowledge Pack — Concept Registration, Citation, and Topic Search                             |
-| [ADR-048](ADR-048-knowledge-section-profiles.md)         | Knowledge Section Profiles                                                                    |
-| [ADR-049](ADR-049-khived-daemon.md)                      | khived Daemon — Persistent Warm Runtime over a Unix Socket                                    |
+| #                                                        | Title                                                                                                           |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| [ADR-040](ADR-040-communication-and-schedule-packs.md)   | Communication and Schedule Packs                                                                                |
+| [ADR-041](ADR-041-event-provenance-projection.md)        | Event Provenance Projection — Hybrid Log + Graph Edges                                                          |
+| [ADR-042](ADR-042-local-rerank-via-lattice-inference.md) | Composable Rerank Pipeline (local cross-encoder + salience + graph-proximity)                                   |
+| [ADR-043](ADR-043-embedding-model-migration.md)          | Embedding Model Migration                                                                                       |
+| [ADR-044](ADR-044-vector-store-extensions.md)            | Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep                   |
+| [ADR-045](ADR-045-verb-response-presentation.md)         | Verb Response Presentation Modes                                                                                |
+| [ADR-046](ADR-046-event-sourced-proposals.md)            | Event-Sourced Agent KG Proposals                                                                                |
+| [ADR-047](ADR-047-knowledge-pack.md)                     | Knowledge Pack — Concept Registration, Citation, and Topic Search                                               |
+| [ADR-048](ADR-048-knowledge-section-profiles.md)         | Knowledge Section Profiles                                                                                      |
+| [ADR-049](ADR-049-khived-daemon.md)                      | khived Daemon — Persistent Warm Runtime over a Unix Socket                                                      |
+| [ADR-050](ADR-050-kg-token-namespace-contract.md)        | KG Token Namespace Contract (Proposed)                                                                          |
+| [ADR-051](ADR-051-section-embeddings-hybrid-compose.md)  | Section-Level Embeddings and Hybrid Compose Scoring (Accepted)                                                  |
+| [ADR-052](ADR-052-ann-production-lifecycle.md)           | ANN Production Lifecycle — SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence (Proposed) |
+| [ADR-053](ADR-053-authorization-gate.md)                 | Authorization Gate — ActorStore, SessionStore, and Cloud-Tier Caller Propagation (Proposed)                     |
+| [ADR-054](ADR-054-ann-build-strategy-scaling-limits.md)  | ANN Build Strategy and Scaling Limits (Proposed)                                                                |
 
 ## Closed Taxonomies — Quick Reference
 
