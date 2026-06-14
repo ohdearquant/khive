@@ -11,7 +11,7 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
@@ -2879,5 +2879,68 @@ async fn explicit_domain_ids_compose_includes_draft_member_atoms() {
     assert!(
         atom_names.contains(&"compose-draft-member"),
         "explicit domain_ids compose must include draft member atoms (caller opted in): {atom_names:?}"
+    );
+}
+
+// ── #80: stats.total_events must count real knowledge events ─────────────────
+
+fn pack_with_events(rt: KhiveRuntime) -> Fixture {
+    let rt_clone = rt.clone();
+    let tok = rt.authorize(Namespace::local()).expect("local token");
+    let event_store = rt.events(&tok).expect("event store");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_event_store(event_store);
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(KnowledgePack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    Fixture {
+        registry,
+        rt: rt_clone,
+    }
+}
+
+#[tokio::test]
+async fn stats_total_events_counts_knowledge_verbs() {
+    let f = pack_with_events(rt());
+
+    let long_content = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu \
+                        nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+
+    // Dispatch two knowledge verbs so their audit events land in the events table.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "evt-atom-a", "name": "Event Atom A", "content": long_content }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "evt-atom-b", "name": "Event Atom B", "content": long_content }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms second");
+
+    let stats = f
+        .dispatch("knowledge.stats", json!({}))
+        .await
+        .expect("stats ok");
+
+    let total_events = stats["total_events"]
+        .as_i64()
+        .expect("total_events must be an integer");
+
+    assert!(
+        total_events >= 2,
+        "total_events must count at least the 2 knowledge.upsert_atoms dispatches; got {total_events}"
     );
 }

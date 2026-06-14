@@ -623,6 +623,16 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("stats finalized", e))?;
 
+        let event_count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'"
+                    .into(),
+                params: vec![SqlValue::Text(ns.clone())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("stats events", e))?;
+
         let total_atoms = match atom_count {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,
@@ -632,6 +642,10 @@ impl KnowledgeHandlers {
             _ => 0,
         };
         let finalized = match finalized_count {
+            Some(SqlValue::Integer(n)) => n,
+            _ => 0,
+        };
+        let total_events = match event_count {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,
         };
@@ -648,7 +662,7 @@ impl KnowledgeHandlers {
         Ok(json!({
             "total_atoms": total_atoms,
             "total_domains": total_domains,
-            "total_events": 0,
+            "total_events": total_events,
             "eval_coverage": eval_coverage,
             "embedding_coverage": embedding_coverage,
             "namespace": ns,
