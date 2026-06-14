@@ -288,7 +288,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "relation",
                 param_type: "string",
                 required: false,
-                description: "New edge relation (edges only; any of the 15 canonical relations).",
+                description: "New edge relation (edges only; any of the 17 canonical relations).",
             },
             ParamDef {
                 name: "weight",
@@ -450,7 +450,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "relation",
                 param_type: "string",
                 required: true,
-                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates).",
+                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes).",
             },
             ParamDef {
                 name: "weight",

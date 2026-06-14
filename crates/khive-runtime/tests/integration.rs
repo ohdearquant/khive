@@ -1289,3 +1289,589 @@ mod embedder_registry_tests {
         );
     }
 }
+
+// =============================================================================
+// Epistemic endpoint tests (ADR-055 Phase 2+3)
+// =============================================================================
+
+// --- Entity→Entity ACCEPT cases ---
+
+/// Concept→Concept supports: base allowlist row.
+#[tokio::test]
+async fn link_concept_concept_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let a = rt
+        .create_entity(&tok, "concept", None, "Finding A", None, None, vec![])
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&tok, "concept", None, "Claim B", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, a.id, b.id, EdgeRelation::Supports, 0.8, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+    assert_eq!(edge.source_id, a.id);
+    assert_eq!(edge.target_id, b.id);
+}
+
+/// Document→Concept supports: base allowlist row.
+#[tokio::test]
+async fn link_document_concept_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let doc = rt
+        .create_entity(&tok, "document", None, "Paper X", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis Y", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, doc.id, claim.id, EdgeRelation::Supports, 0.9, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+}
+
+/// Concept→Concept refutes: base allowlist row.
+#[tokio::test]
+async fn link_concept_concept_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let a = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "Counter-evidence",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&tok, "concept", None, "Claim B", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, a.id, b.id, EdgeRelation::Refutes, 0.7, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+}
+
+/// Document→Concept refutes: base allowlist row.
+#[tokio::test]
+async fn link_document_concept_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let doc = rt
+        .create_entity(&tok, "document", None, "Negative study", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Claim C", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, doc.id, claim.id, EdgeRelation::Refutes, 0.85, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+}
+
+// --- Note→Note ACCEPT cases ---
+
+/// Note→Note supports: same substrate, any note kind allowed.
+#[tokio::test]
+async fn link_note_note_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let finding = rt
+        .create_note(
+            &tok,
+            "observation",
+            Some("Finding note"),
+            "experiment shows positive result",
+            Some(0.8),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let claim = rt
+        .create_note(
+            &tok,
+            "question",
+            Some("Claim note"),
+            "does intervention work?",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let edge = rt
+        .link(
+            &tok,
+            finding.id,
+            claim.id,
+            EdgeRelation::Supports,
+            0.9,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+    assert_eq!(edge.source_id, finding.id);
+    assert_eq!(edge.target_id, claim.id);
+}
+
+/// Note→Note refutes: same substrate allowed.
+#[tokio::test]
+async fn link_note_note_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let counter = rt
+        .create_note(
+            &tok,
+            "observation",
+            Some("Counter finding"),
+            "null result from replication",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let hypothesis = rt
+        .create_note(
+            &tok,
+            "insight",
+            Some("Hypothesis"),
+            "the intervention increases outcome",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let edge = rt
+        .link(
+            &tok,
+            counter.id,
+            hypothesis.id,
+            EdgeRelation::Refutes,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+}
+
+// --- Cross-substrate REJECT cases ---
+
+/// Note→Entity supports: cross-substrate, must error.
+#[tokio::test]
+async fn link_note_entity_supports_rejected() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let note = rt
+        .create_note(
+            &tok,
+            "observation",
+            None,
+            "finding note",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Some concept", None, None, vec![])
+        .await
+        .unwrap();
+    let result = rt
+        .link(&tok, note.id, entity.id, EdgeRelation::Supports, 0.8, None)
+        .await;
+    assert!(
+        matches!(result, Err(khive_runtime::RuntimeError::InvalidInput(_))),
+        "note→entity supports must be rejected (cross-substrate); got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("supports"),
+        "error message must name the relation 'supports'; got: {msg}"
+    );
+}
+
+/// Entity→Note refutes: cross-substrate, must error.
+#[tokio::test]
+async fn link_entity_note_refutes_rejected() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "A concept", None, None, vec![])
+        .await
+        .unwrap();
+    let note = rt
+        .create_note(
+            &tok,
+            "observation",
+            None,
+            "some note",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let result = rt
+        .link(&tok, entity.id, note.id, EdgeRelation::Refutes, 0.5, None)
+        .await;
+    assert!(
+        matches!(result, Err(khive_runtime::RuntimeError::InvalidInput(_))),
+        "entity→note refutes must be rejected (cross-substrate); got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("refutes"),
+        "error message must name the relation 'refutes'; got: {msg}"
+    );
+}
+
+// --- Disallowed entity pair REJECT case ---
+
+/// Person→Concept supports: not in base allowlist, must error naming the relation.
+#[tokio::test]
+async fn link_person_concept_supports_rejected_with_relation_name() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let person = rt
+        .create_entity(&tok, "person", None, "Researcher A", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis Z", None, None, vec![])
+        .await
+        .unwrap();
+    let result = rt
+        .link(&tok, person.id, claim.id, EdgeRelation::Supports, 0.5, None)
+        .await;
+    assert!(
+        matches!(result, Err(khive_runtime::RuntimeError::InvalidInput(_))),
+        "person→concept supports is not in base allowlist; got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("supports"),
+        "error message must name the relation 'supports'; got: {msg}"
+    );
+}
+
+// --- Remaining allowlist source kinds ---
+
+/// Dataset→Concept supports: base allowlist row (previously untested source kind).
+#[tokio::test]
+async fn link_dataset_concept_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ds = rt
+        .create_entity(&tok, "dataset", None, "Bench-X", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis Q", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, ds.id, claim.id, EdgeRelation::Supports, 0.8, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+}
+
+/// Artifact→Concept refutes: base allowlist row (previously untested source kind).
+#[tokio::test]
+async fn link_artifact_concept_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let art = rt
+        .create_entity(&tok, "artifact", None, "Checkpoint-v1", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Claim R", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, art.id, claim.id, EdgeRelation::Refutes, 0.7, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+}
+
+/// Artifact→Concept supports: base allowlist row (previously untested combination).
+#[tokio::test]
+async fn link_artifact_concept_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let art = rt
+        .create_entity(&tok, "artifact", None, "Checkpoint-v2", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Claim T", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, art.id, claim.id, EdgeRelation::Supports, 0.8, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+    assert_eq!(edge.source_id, art.id);
+    assert_eq!(edge.target_id, claim.id);
+}
+
+/// Dataset→Concept refutes: base allowlist row (previously untested combination).
+#[tokio::test]
+async fn link_dataset_concept_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ds = rt
+        .create_entity(&tok, "dataset", None, "Bench-Y", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis W", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, ds.id, claim.id, EdgeRelation::Refutes, 0.75, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+    assert_eq!(edge.source_id, ds.id);
+    assert_eq!(edge.target_id, claim.id);
+}
+
+// --- update_edge parity tests ---
+
+/// (a) update_edge legal entity edge → Supports on allowlist pair: accepted.
+/// Uses concept→concept: start with Extends, update to Supports.
+#[tokio::test]
+async fn update_edge_to_supports_on_legal_entity_pair_accepted() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let evidence = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "Evidence concept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis H", None, None, vec![])
+        .await
+        .unwrap();
+    // Start with Extends (legal for concept→concept).
+    let edge = rt
+        .link(
+            &tok,
+            evidence.id,
+            claim.id,
+            EdgeRelation::Extends,
+            0.9,
+            None,
+        )
+        .await
+        .unwrap();
+    // Update the relation to Supports — concept→concept is in the Supports allowlist.
+    let updated = rt
+        .update_edge(
+            &tok,
+            edge.id.into(),
+            EdgePatch {
+                relation: Some(EdgeRelation::Supports),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update_edge to supports on concept→concept must be accepted");
+    assert_eq!(updated.relation, EdgeRelation::Supports);
+}
+
+/// (b) update_edge entity edge → Supports on off-allowlist pair: rejected.
+#[tokio::test]
+async fn update_edge_to_supports_on_disallowed_entity_pair_rejected() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let person = rt
+        .create_entity(&tok, "person", None, "Researcher B", None, None, vec![])
+        .await
+        .unwrap();
+    let concept = rt
+        .create_entity(&tok, "concept", None, "Claim S", None, None, vec![])
+        .await
+        .unwrap();
+    // Person→Concept with a relation that IS legal to start (introduced_by is
+    // illegal for person→concept too — use enables which IS legal for person
+    // is also illegal, use instance_of which allows *→concept).
+    // Simplest: use instance_of (valid for *→concept) to create the edge first.
+    let edge = rt
+        .link(
+            &tok,
+            person.id,
+            concept.id,
+            EdgeRelation::InstanceOf,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+    // Now update to Supports — person is not in the allowlist for supports.
+    let result = rt
+        .update_edge(
+            &tok,
+            edge.id.into(),
+            EdgePatch {
+                relation: Some(EdgeRelation::Supports),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(khive_runtime::RuntimeError::InvalidInput(_))),
+        "update_edge to supports on person→concept must be rejected; got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("supports"),
+        "error message must name the relation 'supports'; got: {msg}"
+    );
+}
+
+/// (c) update_edge note→entity annotates edge → Supports: rejected (cross-substrate).
+#[tokio::test]
+async fn update_edge_annotates_to_supports_rejected_cross_substrate() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Target concept", None, None, vec![])
+        .await
+        .unwrap();
+    let note = rt
+        .create_note(
+            &tok,
+            "observation",
+            None,
+            "some observation",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    // Create note→entity annotates edge (the only legal cross-substrate relation).
+    let edge = rt
+        .link(&tok, note.id, entity.id, EdgeRelation::Annotates, 1.0, None)
+        .await
+        .unwrap();
+    // Update to Supports → must fail (note→entity is cross-substrate for supports).
+    let result = rt
+        .update_edge(
+            &tok,
+            edge.id.into(),
+            EdgePatch {
+                relation: Some(EdgeRelation::Supports),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(khive_runtime::RuntimeError::InvalidInput(_))),
+        "update_edge note→entity annotates → supports must be rejected; got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("supports"),
+        "error message must name the relation 'supports'; got: {msg}"
+    );
+}
+
+/// (d) update_edge note→note edge → Refutes: accepted (same substrate).
+#[tokio::test]
+async fn update_edge_note_note_to_refutes_accepted() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let note_a = rt
+        .create_note(
+            &tok,
+            "observation",
+            None,
+            "prior finding",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let note_b = rt
+        .create_note(
+            &tok,
+            "insight",
+            None,
+            "derived claim",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    // Create a note→note edge with Supports first.
+    let edge = rt
+        .link(
+            &tok,
+            note_a.id,
+            note_b.id,
+            EdgeRelation::Supports,
+            0.8,
+            None,
+        )
+        .await
+        .unwrap();
+    // Update to Refutes — note→note same-substrate, must be accepted.
+    let updated = rt
+        .update_edge(
+            &tok,
+            edge.id.into(),
+            EdgePatch {
+                relation: Some(EdgeRelation::Refutes),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update_edge note→note supports → refutes must be accepted");
+    assert_eq!(updated.relation, EdgeRelation::Refutes);
+}
