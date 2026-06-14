@@ -208,6 +208,15 @@ fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &st
         ("artifact", EdgeRelation::Supersedes, "artifact"),
         ("service", EdgeRelation::Supersedes, "service"),
         ("dataset", EdgeRelation::Supersedes, "dataset"),
+        // Epistemic (Supports/Refutes — evidence sources → Concept claim only)
+        ("concept", EdgeRelation::Supports, "concept"),
+        ("document", EdgeRelation::Supports, "concept"),
+        ("dataset", EdgeRelation::Supports, "concept"),
+        ("artifact", EdgeRelation::Supports, "concept"),
+        ("concept", EdgeRelation::Refutes, "concept"),
+        ("document", EdgeRelation::Refutes, "concept"),
+        ("dataset", EdgeRelation::Refutes, "concept"),
+        ("artifact", EdgeRelation::Refutes, "concept"),
     ];
     RULES.iter().any(|(src, rel, tgt)| {
         *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
@@ -596,8 +605,8 @@ impl KhiveRuntime {
     /// `link()` and `update_edge()` share identical enforcement:
     ///
     /// - `annotates`: source MUST be a note; target may be any substrate.
-    /// - `supersedes`: same-substrate only (note→note or entity→entity).
-    /// - All other 11 relations: both endpoints MUST be entities.
+    /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
+    /// - All other 13 relations: both endpoints MUST be entities.
     ///
     /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
     /// the same messages as the previous inline block (byte-identical behaviour).
@@ -640,15 +649,19 @@ impl KhiveRuntime {
                     "link target {target_id} not found in namespace"
                 )));
             }
-        } else if relation == EdgeRelation::Supersedes {
-            // supersedes: same-substrate only (note→note or entity→entity).
+        } else if matches!(
+            relation,
+            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
+        ) {
+            // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
+            let rel_name = relation.as_str();
             let src = match self.resolve(token, source_id).await? {
                 Some(r) => r,
                 None => {
                     if self.get_edge(token, source_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "supersedes source {source_id} must be a note or entity (got edge)"
+                            "{rel_name} source {source_id} must be a note or entity (got edge)"
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
@@ -661,7 +674,7 @@ impl KhiveRuntime {
                 None => {
                     if self.get_edge(token, target_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "supersedes target {target_id} must be a note or entity (got edge)"
+                            "{rel_name} target {target_id} must be a note or entity (got edge)"
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
@@ -671,11 +684,10 @@ impl KhiveRuntime {
             };
             match (&src, &tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
-                    if !base_entity_rule_allows(&src_e.kind, EdgeRelation::Supersedes, &tgt_e.kind)
-                    {
+                    if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "({}) -[supersedes]-> ({}) is not in the base endpoint \
-                             allowlist; supersedes requires same-kind entity endpoints",
+                            "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
+                             allowlist; {rel_name} requires same-kind entity endpoints",
                             src_e.kind, tgt_e.kind
                         )));
                     }
@@ -683,29 +695,29 @@ impl KhiveRuntime {
                 (Resolved::Note(_), Resolved::Note(_)) => {}
                 (Resolved::Event(_), _) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "supersedes does not apply to events; source {source_id} is an event"
+                        "{rel_name} does not apply to events; source {source_id} is an event"
                     )));
                 }
                 (_, Resolved::Event(_)) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "supersedes does not apply to events; target {target_id} is an event"
+                        "{rel_name} does not apply to events; target {target_id} is an event"
                     )));
                 }
                 (Resolved::Entity(_), Resolved::Note(_)) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "supersedes endpoints must be the same substrate (note→note or entity→entity); \
+                        "{rel_name} endpoints must be the same substrate (note→note or entity→entity); \
                          got source={source_id} (entity) target={target_id} (note)"
                     )));
                 }
                 (Resolved::Note(_), Resolved::Entity(_)) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "supersedes endpoints must be the same substrate (note→note or entity→entity); \
+                        "{rel_name} endpoints must be the same substrate (note→note or entity→entity); \
                          got source={source_id} (note) target={target_id} (entity)"
                     )));
                 }
             }
         } else {
-            // All 13 base relations require entity→entity with kind-level
+            // All remaining base relations require entity→entity with kind-level
             // restrictions (see base allowlist). Packs may extend the allowlist
             // additively via EDGE_RULES.
             //
