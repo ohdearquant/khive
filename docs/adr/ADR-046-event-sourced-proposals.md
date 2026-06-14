@@ -451,8 +451,8 @@ verbs and the apply worker each have policy hooks:
 | Surface                                                        | Action                                                    | How                                    |
 | -------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------- |
 | MCP `propose(...)`                                             | Create a proposal                                         | Verb                                   |
-| MCP `review(proposal_id, decision, comment?)`                  | Cast a review                                             | Verb                                   |
-| MCP `withdraw(proposal_id, rationale?)`                        | Withdraw a proposal (proposer-only)                       | Verb                                   |
+| MCP `review(id, decision, comment?)`                           | Cast a review                                             | Verb                                   |
+| MCP `withdraw(id, rationale?)`                                 | Withdraw a proposal (proposer-only)                       | Verb                                   |
 | MCP `list(kind=proposal, status="open")`                       | Browse open proposals                                     | Lists from `proposals_open` projection |
 | MCP `get(id=<proposal_id>)`                                    | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
 | CLI `kkernel call kg proposal_cleanup --older-than <duration>` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
@@ -729,3 +729,22 @@ Lookup wire shape:
   reuses
 - Ocean directive 2026-05-23: option (c) selected — "event sourced proposal
   sounds fine"
+
+## Amendment (2026-06-14): proposal_id → id wire-key rename
+
+**Scope**: wire-result keys and input params only. Internal struct fields,
+DB columns, and event payload fields are unchanged.
+
+- `propose` result key: `proposal_id` → `id`
+- `review` result key: `proposal_id` → `id`; input param `proposal_id` → `id`
+- `withdraw` result key: `proposal_id` → `id`; input param `proposal_id` → `id`
+- `list(kind=proposal)` row key: `proposal_id` → `id`
+- `get(id=<proposal_uuid>)` result key: `proposal_id` → `id`
+
+**Clean break**: `ReviewParams` and `WithdrawParams` use `#[serde(deny_unknown_fields)]`,
+so callers still passing `proposal_id=` receive an immediate deserialization error.
+No dual-emit. Matches PR #109 (`note_id → id`) discipline.
+
+**Unchanged permanently**: `ProposalCreatedPayload.proposal_id` struct field,
+`proposals_open.proposal_id` DB column, `EventFilter.payload_proposal_id` filter field,
+and all internal worker references.

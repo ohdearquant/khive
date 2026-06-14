@@ -209,6 +209,9 @@ impl KgPack {
         })?;
 
         if let serde_json::Value::Object(ref mut map) = result {
+            if let Some(v) = map.remove("proposal_id") {
+                map.insert("id".to_string(), v);
+            }
             map.insert(
                 "kind".to_string(),
                 serde_json::Value::String("proposal".to_string()),

@@ -128,7 +128,7 @@ fn review_params_decisions() {
     use super::ReviewParams;
     for decision in ["approve", "reject", "comment", "request_changes"] {
         let p: ReviewParams = serde_json::from_value(json!({
-            "proposal_id": "00000000-0000-0000-0000-000000000001",
+            "id": "00000000-0000-0000-0000-000000000001",
             "decision": decision,
         }))
         .expect("ReviewParams must deserialize");
@@ -145,11 +145,11 @@ fn review_params_no_actor_field() {
     use super::ReviewParams;
     // Baseline: ReviewParams works without actor.
     let p: ReviewParams = serde_json::from_value(json!({
-        "proposal_id": "00000000-0000-0000-0000-000000000001",
+        "id": "00000000-0000-0000-0000-000000000001",
         "decision": "approve",
     }))
     .expect("ReviewParams must deserialize without actor");
-    assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000001");
+    assert_eq!(p.id, "00000000-0000-0000-0000-000000000001");
     assert_eq!(p.decision, "approve");
 }
 
@@ -158,10 +158,10 @@ fn review_params_no_actor_field() {
 fn withdraw_params_no_actor_field() {
     use super::WithdrawParams;
     let p: WithdrawParams = serde_json::from_value(json!({
-        "proposal_id": "00000000-0000-0000-0000-000000000002",
+        "id": "00000000-0000-0000-0000-000000000002",
     }))
     .expect("WithdrawParams must deserialize without actor");
-    assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000002");
+    assert_eq!(p.id, "00000000-0000-0000-0000-000000000002");
     assert!(p.rationale.is_none());
 }
 

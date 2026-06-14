@@ -2157,11 +2157,11 @@ async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()
         parent_first["ok"], true,
         "parent propose must succeed; got: {parent_first}"
     );
-    let parent_id = parent_first["result"]["proposal_id"]
+    let parent_id = parent_first["result"]["id"]
         .as_str()
-        .expect("parent proposal_id")
+        .expect("parent id")
         .to_string();
-    assert_eq!(parent_id.len(), 36, "parent proposal_id must be full UUID");
+    assert_eq!(parent_id.len(), 36, "parent id must be full UUID");
 
     // Propose with all optional fields populated: description, reviewers, parent_id,
     // and a changeset that carries a named entity.
@@ -2191,15 +2191,11 @@ async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], true, "propose must succeed; got: {first}");
-    let proposal_id = first["result"]["proposal_id"]
+    let proposal_id = first["result"]["id"]
         .as_str()
-        .expect("propose must return proposal_id")
+        .expect("propose must return id")
         .to_string();
-    assert_eq!(
-        proposal_id.len(),
-        36,
-        "proposal_id from propose must be full UUID"
-    );
+    assert_eq!(proposal_id.len(), 36, "id from propose must be full UUID");
 
     // Now get(id=<proposal_id>) — must return the ProposalCreated event payload.
     let get_result = ok_one(&client, &format!(r#"get(id="{proposal_id}")"#)).await?;
@@ -2295,7 +2291,7 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
         body["results"][1]["ok"], true,
         "second propose must succeed"
     );
-    let pid_a = body["results"][0]["result"]["proposal_id"]
+    let pid_a = body["results"][0]["result"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2304,7 +2300,7 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
     let ops_withdraw = serde_json::to_string(&json!([{
         "tool": "withdraw",
         "args": {
-            "proposal_id": pid_a,
+            "id": pid_a,
             "rationale": "test withdrawal for audit list"
         }
     }]))

@@ -602,7 +602,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
         category: VerbCategory::Declaration,
         params: &[
             ParamDef {
-                name: "proposal_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Full UUID or 8-char short ID of the proposal to review.",
@@ -629,7 +629,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
-                name: "proposal_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Full UUID or 8-char short ID of the open proposal to withdraw.",
@@ -763,14 +763,12 @@ mod tests {
     }
 
     #[test]
-    fn review_params_has_required_proposal_id_and_decision() {
+    fn review_params_has_required_id_and_decision() {
         let h = find_handler("review");
         assert!(!h.params.is_empty(), "review must have params");
         assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "proposal_id" && p.required),
-            "review must have required proposal_id param"
+            h.params.iter().any(|p| p.name == "id" && p.required),
+            "review must have required id param"
         );
         assert!(
             h.params.iter().any(|p| p.name == "decision" && p.required),
@@ -783,14 +781,12 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_params_has_required_proposal_id_and_optional_rationale() {
+    fn withdraw_params_has_required_id_and_optional_rationale() {
         let h = find_handler("withdraw");
         assert!(!h.params.is_empty(), "withdraw must have params");
         assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "proposal_id" && p.required),
-            "withdraw must have required proposal_id param"
+            h.params.iter().any(|p| p.name == "id" && p.required),
+            "withdraw must have required id param"
         );
         assert!(
             h.params

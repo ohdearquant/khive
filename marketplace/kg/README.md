@@ -64,15 +64,15 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `traverse`  | `roots` (req, array), `max_depth?` (default 3), `relations?`, `direction?`                                                                                                                                    | Multi-hop BFS                                    |
 | `query`     | `query` (req, GQL string), `limit?` (default 500, cap 10000)                                                                                                                                                  | GQL/SPARQL pattern matching                      |
 | `propose`   | `title` (req), `description` (req), `changeset` (req), `reviewers?`, `expiry?`, `parent_id?`                                                                                                                  | Create an event-sourced change proposal          |
-| `review`    | `proposal_id` (req), `decision` (req), `comment?`                                                                                                                                                             | Review a proposal                                |
-| `withdraw`  | `proposal_id` (req), `rationale?`                                                                                                                                                                             | Withdraw an open proposal                        |
+| `review`    | `id` (req), `decision` (req), `comment?`                                                                                                                                                                      | Review a proposal                                |
+| `withdraw`  | `id` (req), `rationale?`                                                                                                                                                                                      | Withdraw an open proposal                        |
 | `stats`     | (none)                                                                                                                                                                                                        | Aggregate entity, edge, and note counts          |
 | `verbs`     | `category?`, `pack?`                                                                                                                                                                                          | List all registered MCP-callable verbs           |
 
 **Proposal lifecycle**: `open → approved → applying → applied` (happy path). Terminal states:
 `rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while the
-apply worker holds it. `propose` returns `proposal_id` — pass this to `review` and `withdraw`, not
-an `id` field. `review` is rejected if the proposal is not in `open` or `changes_requested` state.
+apply worker holds it. `propose` returns `id` — pass this to `review` and `withdraw` as the `id`
+param. `review` is rejected if the proposal is not in `open` or `changes_requested` state.
 
 ### 9 Skills (workflow-shaped, not verb docs)
 

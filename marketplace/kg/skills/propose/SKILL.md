@@ -45,12 +45,12 @@ request(ops="propose(title=\"Merge duplicate FlashAttention entities\", descript
 
 ### 3. Check proposal status
 
-`propose` returns a `proposal_id` field. Use it in subsequent calls — not `id`:
+`propose` returns `id`. Use `$prev.id` to chain:
 
 ```text
-# propose returns: {"proposal_id": "<uuid>", "status": "open", "proposer": "...", "title": "..."}
-request(ops="get(id=\"<proposal_id-from-response>\")")
-request(ops="review(proposal_id=\"<proposal_id-from-response>\", decision=\"approve\")")
+# propose returns: {"id": "<uuid>", "status": "open", "proposer": "...", "title": "..."}
+request(ops="get(id=\"<id-from-response>\")")
+request(ops="review(id=\"<id-from-response>\", decision=\"approve\")")
 ```
 
 Or list open proposals:
