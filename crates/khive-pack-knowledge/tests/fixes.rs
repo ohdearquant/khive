@@ -2930,6 +2930,15 @@ async fn stats_total_events_counts_knowledge_verbs() {
     .await
     .expect("upsert atoms second");
 
+    // Non-knowledge verbs in the SAME namespace must NOT be counted: this proves the
+    // `verb LIKE 'knowledge.%'` predicate actually filters, not merely that events
+    // exist. Two of them push a broken (unfiltered) count to >= 4, outside [2, 3].
+    for name in ["evt-entity-a", "evt-entity-b"] {
+        f.dispatch("create", json!({ "kind": "concept", "name": name }))
+            .await
+            .expect("create concept");
+    }
+
     let stats = f
         .dispatch("knowledge.stats", json!({}))
         .await
@@ -2939,8 +2948,12 @@ async fn stats_total_events_counts_knowledge_verbs() {
         .as_i64()
         .expect("total_events must be an integer");
 
+    // 2 = the knowledge.upsert_atoms dispatches; +1 if the knowledge.stats audit event
+    // is recorded before the handler's COUNT runs. The 2 non-knowledge `create` events
+    // must be excluded, so an unfiltered predicate would yield >= 4.
     assert!(
-        total_events >= 2,
-        "total_events must count at least the 2 knowledge.upsert_atoms dispatches; got {total_events}"
+        (2..=3).contains(&total_events),
+        "total_events must count the knowledge.* dispatches but EXCLUDE the 2 \
+         non-knowledge `create` events; expected 2 or 3, got {total_events}"
     );
 }
