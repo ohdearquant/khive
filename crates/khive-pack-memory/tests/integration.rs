@@ -2945,3 +2945,233 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
         "recall hit decay_factor must be episodic default 0.02 for legacy note; got {hit_decay}"
     );
 }
+
+// ── Regression tests for issue #94: token-budget truncation signal + rank order ──
+
+/// #94 regression (signal): when the token budget caps the returned count below
+/// the requested `limit`, the response must surface `budget_capped: true` and
+/// `truncated_for_budget: N` (N > 0).
+///
+/// Without the fix the response was a plain array with no capping signal.
+#[tokio::test]
+async fn test_recall_budget_capped_surfaces_signal() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create 5 notes whose content is long enough that the tiny budget below
+    // cannot accommodate all of them.  Each note content is ~60 chars.
+    let shared_query = "budget signal regression unique phrase alpha";
+    for i in 0..5_u8 {
+        let content =
+            format!("budget signal regression unique phrase alpha memory content item number {i}");
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({ "content": content, "salience": 0.8 }),
+            )
+            .await
+            .expect("remember");
+    }
+
+    // Set a token budget that can hold at most 1 note (~60 chars / 4 = ~15 tokens).
+    // default_token_budget=20 tokens × chars_per_token=4 = 80 chars budget.
+    // First note uses ~60 chars; second note would push total to ~120 > 80 → capped.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": shared_query,
+                "limit": 5,
+                "config": {
+                    "scoring": {
+                        "default_token_budget": 20,
+                        "chars_per_token": 4,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with tiny budget succeeds");
+
+    // The response MUST be an object (not a bare array) when budget_capped.
+    assert!(
+        result.is_object(),
+        "#94: budget-capped recall must return an object with budget_capped field; \
+         got bare array (signal not surfaced): {result}"
+    );
+    assert_eq!(
+        result["budget_capped"].as_bool(),
+        Some(true),
+        "#94: budget_capped must be true when results were truncated by the token budget; \
+         got: {}",
+        result["budget_capped"]
+    );
+    let truncated = result["truncated_for_budget"]
+        .as_u64()
+        .expect("#94: truncated_for_budget must be a non-negative integer");
+    assert!(
+        truncated > 0,
+        "#94: truncated_for_budget must be > 0 when budget_capped is true; got {truncated}"
+    );
+    let returned = result["results"]
+        .as_array()
+        .expect("#94: results array must be present in capped response");
+    assert!(
+        !returned.is_empty(),
+        "#94: results must be non-empty even under budget capping"
+    );
+    assert!(
+        returned.len() < 5,
+        "#94: returned count ({}) must be < requested limit (5) when budget_capped",
+        returned.len()
+    );
+}
+
+/// #94 regression (no false positive): when all results fit within the token budget,
+/// the response is a plain array (no wrapping, no budget_capped field).
+#[tokio::test]
+async fn test_recall_no_budget_cap_returns_plain_array() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "plain array uncapped recall test phrase", "salience": 0.7 }),
+        )
+        .await
+        .expect("remember");
+
+    // Large budget: 4000 tokens × 4 chars = 16 000 chars — one short note trivially fits.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "plain array uncapped recall test", "limit": 3 }),
+        )
+        .await
+        .expect("recall with generous budget succeeds");
+
+    assert!(
+        result.is_array(),
+        "#94 no-cap path: recall must return a plain array when budget is not exhausted; \
+         got: {result}"
+    );
+}
+
+/// #94 regression (rank order): when the token budget forces truncation, the
+/// returned items must be the top-ranked ones in rank order — no higher-ranked
+/// item may be skipped to accommodate a shorter lower-ranked item.
+///
+/// The old greedy `retain` would skip rank N if it was long and keep rank N+1
+/// if it was short. The fix replaces `retain` with a clean prefix cut: stop at
+/// the first item that exceeds the remaining budget.
+#[tokio::test]
+async fn test_recall_budget_truncation_preserves_rank_order() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create 3 notes, all matching the same query.  We can't control BM25 rank
+    // precisely, so we store the same content for all 3 and only vary salience
+    // (with mmr_penalty=0 so identical content doesn't trigger diversity suppression).
+    // After scoring, the highest-salience note ranks first.
+    let shared_content = "rank order budget truncation regression phrase unique zeta theta delta";
+
+    // Salience ladder so we can predict the rank ordering.
+    let saliences = [0.9_f64, 0.6, 0.3];
+    let mut note_ids = Vec::new();
+    for sal in &saliences {
+        let res = registry
+            .dispatch(
+                "memory.remember",
+                json!({ "content": shared_content, "salience": sal }),
+            )
+            .await
+            .expect("remember");
+        note_ids.push(res["note_id"].as_str().unwrap().to_owned());
+    }
+
+    // Budget: allow exactly 1 note (shared_content is ~70 chars, budget = 80 chars).
+    // With the fix (prefix cut) only rank #1 is returned.
+    // With the old bug (greedy retain) rank #1 could be skipped if it happens to
+    // be "long" while a later item is "short" — but since all contents are identical
+    // here, the regression is proved by verifying the TOP-ranked (highest-salience)
+    // note is included in the single returned result.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "rank order budget truncation regression phrase",
+                "limit": 3,
+                "config": {
+                    "scoring": {
+                        "default_token_budget": 20,
+                        "chars_per_token": 4,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with rank-order budget test");
+
+    // Response must be a budget-capped object (budget = 80 chars, all notes ~70 chars each,
+    // so only the first fits).
+    assert!(
+        result.is_object(),
+        "#94 rank-order: budget-capped response must be an object; got: {result}"
+    );
+    assert_eq!(
+        result["budget_capped"].as_bool(),
+        Some(true),
+        "#94 rank-order: budget_capped must be true"
+    );
+
+    let returned = result["results"].as_array().expect("results array present");
+    assert_eq!(
+        returned.len(),
+        1,
+        "#94 rank-order: budget of 80 chars must admit exactly 1 note of ~70 chars; got {}",
+        returned.len()
+    );
+
+    // The single returned note must be the top-ranked one (highest salience = note_ids[0]).
+    // Full recall sorts by rank_score descending before the prefix cut, so the top-ranked
+    // note is always the one retained.
+    let returned_id = returned[0]["note_id"].as_str().expect("note_id present");
+    let rank_score = returned[0]["rank_score"]
+        .as_f64()
+        .expect("rank_score present");
+
+    // Verify no item with a higher rank_score was skipped.
+    // We do this by re-running recall with a generous budget and checking that the
+    // note returned under budget constraint has the highest rank_score in the full set.
+    let full_result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "rank order budget truncation regression phrase",
+                "limit": 3,
+                "config": {
+                    "scoring": {
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with full budget");
+
+    let full_hits = full_result.as_array().expect("full results array");
+    assert!(
+        !full_hits.is_empty(),
+        "#94 rank-order: full-budget recall must return results"
+    );
+    let top_id_full = full_hits[0]["note_id"].as_str().expect("note_id");
+    assert_eq!(
+        returned_id, top_id_full,
+        "#94 rank-order: budget-capped result must be the top-ranked note from the full set. \
+         Budget returned {returned_id} (rank_score={rank_score:.4}) but full ranking has \
+         {top_id_full} at rank #1. A higher-ranked note was skipped — rank-order bug NOT fixed."
+    );
+}

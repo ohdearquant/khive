@@ -461,15 +461,21 @@ impl MemoryPack {
         ranked.truncate(limit);
 
         let token_budget_chars = scoring_cfg.default_token_budget * scoring_cfg.chars_per_token;
+        let pre_budget_count = ranked.len();
         let mut total_chars = 0usize;
-        ranked.retain(|sn| {
+        let mut budget_cutoff: Option<usize> = None;
+        for (i, sn) in ranked.iter().enumerate() {
             let entry_chars = sn.note.content.len();
             if total_chars + entry_chars > token_budget_chars {
-                return false;
+                budget_cutoff = Some(i);
+                break;
             }
             total_chars += entry_chars;
-            true
-        });
+        }
+        if let Some(cut) = budget_cutoff {
+            ranked.truncate(cut);
+        }
+        let budget_capped = ranked.len() < pre_budget_count;
 
         let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
         let full_content = p.full_content.unwrap_or(true);
@@ -541,11 +547,18 @@ impl MemoryPack {
                     json!({ "model": model, "hits": hits_json })
                 })
                 .collect();
+            let truncated_for_budget = if budget_capped {
+                pre_budget_count - results.len()
+            } else {
+                0
+            };
             return to_json(&json!({
                 "results": results,
                 "candidates": {
                     "vector_candidates_per_model": per_model,
                 },
+                "budget_capped": budget_capped,
+                "truncated_for_budget": truncated_for_budget,
             }));
         }
 
@@ -556,6 +569,15 @@ impl MemoryPack {
             if let Some(ref t) = t_total {
                 plog(call_id, "total", t.elapsed().as_micros());
             }
+        }
+
+        if budget_capped {
+            let truncated_for_budget = pre_budget_count - results.len();
+            return to_json(&json!({
+                "results": results,
+                "budget_capped": true,
+                "truncated_for_budget": truncated_for_budget,
+            }));
         }
 
         to_json(&results)
