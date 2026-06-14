@@ -87,11 +87,12 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-052](ADR-052-ann-production-lifecycle.md)           | ANN Production Lifecycle — SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence (Proposed) |
 | [ADR-053](ADR-053-authorization-gate.md)                 | Authorization Gate — ActorStore, SessionStore, and Cloud-Tier Caller Propagation (Proposed)                     |
 | [ADR-054](ADR-054-ann-build-strategy-scaling-limits.md)  | ANN Build Strategy and Scaling Limits (Proposed)                                                                |
+| [ADR-055](ADR-055-epistemic-edge-relations.md)           | Epistemic Edge Relations — `supports` and `refutes` (Accepted)                                                  |
 
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (15 in 8 categories)** (ADR-002):
+- **Edge relations (17 in 9 categories)** (ADR-002, extended by ADR-055):
   - Structure: `contains`, `part_of`, `instance_of`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
@@ -100,6 +101,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
   - Implementation: `implements`
   - Lateral: `competes_with`, `composed_with`
   - Annotation: `annotates`
+  - Epistemic: `supports`, `refutes`
 - **Note kinds (5 base)**: `observation`, `insight`, `question`, `decision`, `reference` (ADR-013). Packs may add (e.g., GTD adds `task`; memory pack adds `memory`).
 
 ## Cross-Cutting Principles
