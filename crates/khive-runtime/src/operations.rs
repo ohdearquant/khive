@@ -685,9 +685,16 @@ impl KhiveRuntime {
             match (&src, &tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
+                        let rule_hint = match relation {
+                            EdgeRelation::Supports | EdgeRelation::Refutes => {
+                                "requires concept|document|dataset|artifact -> concept \
+                                 (or same-substrate note -> note)"
+                            }
+                            _ => "requires same-kind entity endpoints",
+                        };
                         return Err(RuntimeError::InvalidInput(format!(
                             "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
-                             allowlist; {rel_name} requires same-kind entity endpoints",
+                             allowlist; {rel_name} {rule_hint}",
                             src_e.kind, tgt_e.kind
                         )));
                     }
