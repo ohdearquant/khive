@@ -8,7 +8,7 @@ use core::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// The 8 structural categories that group the 15 canonical edge relations.
+/// The 9 structural categories that group the 17 canonical edge relations.
 ///
 /// Exposed via [`EdgeRelation::category`] for query planners and UI rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,9 +31,11 @@ pub enum EdgeCategory {
     Lateral,
     /// Cross-substrate annotation: `annotates`
     Annotation,
+    /// Evidence for/against a claim: `supports`, `refutes`
+    Epistemic,
 }
 
-/// Closed set of 15 canonical edge relations.
+/// Closed set of 17 canonical edge relations.
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -64,11 +66,14 @@ pub enum EdgeRelation {
     ComposedWith,
     // Annotation
     Annotates,
+    // Epistemic
+    Supports,
+    Refutes,
 }
 
 impl EdgeRelation {
-    /// All 15 canonical relations in ontology-table order.
-    pub const ALL: [Self; 15] = [
+    /// All 17 canonical relations in ontology-table order.
+    pub const ALL: [Self; 17] = [
         Self::Contains,
         Self::PartOf,
         Self::InstanceOf,
@@ -84,9 +89,11 @@ impl EdgeRelation {
         Self::CompetesWith,
         Self::ComposedWith,
         Self::Annotates,
+        Self::Supports,
+        Self::Refutes,
     ];
 
-    /// Valid snake_case names for all 15 canonical relations.
+    /// Valid snake_case names for all 17 canonical relations.
     pub const VALID_NAMES: &'static [&'static str] = &[
         "contains",
         "part_of",
@@ -103,6 +110,8 @@ impl EdgeRelation {
         "competes_with",
         "composed_with",
         "annotates",
+        "supports",
+        "refutes",
     ];
 
     /// `true` for symmetric relations: edge direction has no semantic meaning.
@@ -123,6 +132,7 @@ impl EdgeRelation {
             Self::Implements => EdgeCategory::Implementation,
             Self::CompetesWith | Self::ComposedWith => EdgeCategory::Lateral,
             Self::Annotates => EdgeCategory::Annotation,
+            Self::Supports | Self::Refutes => EdgeCategory::Epistemic,
         }
     }
 
@@ -144,6 +154,8 @@ impl EdgeRelation {
             Self::CompetesWith => "competes_with",
             Self::ComposedWith => "composed_with",
             Self::Annotates => "annotates",
+            Self::Supports => "supports",
+            Self::Refutes => "refutes",
         }
     }
 }
@@ -159,7 +171,7 @@ impl FromStr for EdgeRelation {
 
     /// Parse a string into an `EdgeRelation`.
     ///
-    /// Accepts the 15 canonical relation names (case-insensitive, with hyphens
+    /// Accepts the 17 canonical relation names (case-insensitive, with hyphens
     /// normalised to underscores) and also squashed forms that omit the separator
     /// (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist for ergonomic
     /// DSL entry; they are **not** stored on the wire, which always uses the
@@ -193,6 +205,8 @@ impl FromStr for EdgeRelation {
             "competes_with" | "competeswith" => Ok(Self::CompetesWith),
             "composed_with" | "composedwith" => Ok(Self::ComposedWith),
             "annotates" => Ok(Self::Annotates),
+            "supports" => Ok(Self::Supports),
+            "refutes" => Ok(Self::Refutes),
             _ => Err(crate::error::UnknownVariant::new(
                 "edge_relation",
                 s,
@@ -208,12 +222,12 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn all_has_fifteen_variants() {
-        assert_eq!(EdgeRelation::ALL.len(), 15);
+    fn all_has_seventeen_variants() {
+        assert_eq!(EdgeRelation::ALL.len(), 17);
     }
 
     #[test]
-    fn all_eight_categories_covered() {
+    fn all_nine_categories_covered() {
         let mut cats = alloc::vec::Vec::new();
         for r in EdgeRelation::ALL {
             let c = r.category();
@@ -221,7 +235,7 @@ mod tests {
                 cats.push(c);
             }
         }
-        assert_eq!(cats.len(), 8, "all 8 categories must be represented");
+        assert_eq!(cats.len(), 9, "all 9 categories must be represented");
     }
 
     #[test]
@@ -291,7 +305,7 @@ mod tests {
             "error should list derived_from"
         );
         assert!(msg.contains("precedes"), "error should list precedes");
-        assert!(msg.contains("annotates"), "error should list all 15");
+        assert!(msg.contains("annotates"), "error should list all 17");
     }
 
     #[test]
@@ -361,6 +375,30 @@ mod tests {
         assert!(!EdgeRelation::Extends.is_symmetric());
     }
 
+    #[test]
+    fn from_str_epistemic_relations() {
+        assert_eq!(
+            "supports".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Supports
+        );
+        assert_eq!(
+            "refutes".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Refutes
+        );
+        assert_eq!(
+            "Supports".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Supports
+        );
+        assert_eq!(
+            "REFUTES".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Refutes
+        );
+        assert_eq!(EdgeRelation::Supports.category(), EdgeCategory::Epistemic);
+        assert_eq!(EdgeRelation::Refutes.category(), EdgeCategory::Epistemic);
+        assert!(!EdgeRelation::Supports.is_symmetric());
+        assert!(!EdgeRelation::Refutes.is_symmetric());
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn serde_snake_case_roundtrip() {
@@ -379,5 +417,19 @@ mod tests {
             let parsed: EdgeRelation = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, rel);
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_epistemic_relations_roundtrip() {
+        let sup_json = serde_json::to_string(&EdgeRelation::Supports).unwrap();
+        assert_eq!(sup_json, "\"supports\"");
+        let sup_parsed: EdgeRelation = serde_json::from_str(&sup_json).unwrap();
+        assert_eq!(sup_parsed, EdgeRelation::Supports);
+
+        let ref_json = serde_json::to_string(&EdgeRelation::Refutes).unwrap();
+        assert_eq!(ref_json, "\"refutes\"");
+        let ref_parsed: EdgeRelation = serde_json::from_str(&ref_json).unwrap();
+        assert_eq!(ref_parsed, EdgeRelation::Refutes);
     }
 }
