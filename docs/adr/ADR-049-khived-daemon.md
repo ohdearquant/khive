@@ -147,3 +147,44 @@ Warm becomes **non-blocking**, benefiting both modes:
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — `PackRuntime::warm()` / `register_embedders` hooks
 - [ADR-047](ADR-047-knowledge-pack.md), ADR-033 family — knowledge search + Vamana ANN
 - Pre-OSS reference: `khive-internal/apps/cli/src/server/` (daemon loop), `src/daemon.rs` (client)
+
+## Amendment (2026-06-14): single-binary kkernel topology
+
+The convergence path described in ADR-003 is now complete. The shipped binary is `kkernel`,
+not `khive-mcp`. The following topology corrections apply to this ADR.
+
+**Binary name**: The ADR's Context section (line 9) refers to "the MCP surface ships as a
+single binary, `khive-mcp`" and describes `.mcp.json → command: khive-mcp`. The shipped
+configuration is `command: kkernel` with subcommand `mcp`. The `kkernel` binary is declared
+in `crates/kkernel/Cargo.toml` (`[[bin]] name = "kkernel"`, path = `src/main.rs`).
+
+**`khive-mcp` is a library**: `khive-mcp` ships no binary of its own. Its `Cargo.toml`
+carries no `[[bin]]` section and its description reads "khive MCP server library — served
+via the kkernel binary." Its `lib.rs` (line 4) documents: "The binary frontend is
+`kkernel mcp`; this crate ships no binary of its own."
+
+**Daemon spawn**: The Decision section (line 39) describes the daemon flag as
+`khive-mcp --daemon`. In the shipped code the daemon is spawned by `spawn_daemon()` in
+`crates/khive-mcp/src/daemon.rs` (lines 87-104). The function calls
+`std::env::current_exe()` to obtain the running binary path (which resolves to `kkernel`),
+then appends the subcommand arguments `["mcp", "--daemon"]`. The MCP entry point
+`crates/khive-mcp/src/serve.rs` (line 17) is driven by `kkernel mcp` as confirmed by the
+`run(args, registry)` function and the comment on line 3: "This is the bootstrap that the
+`kkernel mcp` subcommand drives."
+
+**Section 1 corrected description**: "One binary, two modes" remains accurate in intent,
+but the binary is `kkernel`, not `khive-mcp`. The two modes are `kkernel mcp` (stdio) and
+`kkernel mcp --daemon` (Unix socket server).
+
+**Diagram correction**: The ASCII diagram in Section 2 should read:
+
+```
+kkernel mcp (stdio, thin)              kkernel mcp --daemon (long-lived)
+  request(ops=...)  --frame-->  warm VerbRegistry.dispatch --> result
+                    <--frame---
+```
+
+Rationale: the kkernel unification (ADR-003 convergence path, now complete) absorbed
+`khive-mcp` as a library, making `kkernel` the sole shipped Rust binary. All MCP
+configurations, daemon-spawn logic, and user-facing documentation should reference
+`kkernel mcp` and `kkernel mcp --daemon` instead of `khive-mcp` and `khive-mcp --daemon`.

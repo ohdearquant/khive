@@ -290,3 +290,34 @@ users install once and run constantly, install size is a real friction point.
 - `cargo-zigbuild` — https://github.com/rust-cross/cargo-zigbuild
 - Apple notarization — `xcrun notarytool`
 - Windows Authenticode signing
+
+## Amendment (2026-06-14): single-binary kkernel topology
+
+The ADR-003 convergence path is now complete. The following corrections apply to the
+packaging description above.
+
+**Subpackage binary count**: The Decision section (line 62) states "Each subpackage ships
+exactly two binaries: `kkernel` and `khive-mcp` for the matching platform." This is no
+longer accurate. `khive-mcp` is now a library crate with no shipped binary. Its
+`Cargo.toml` declares no `[[bin]]` section; its description reads "khive MCP server
+library — served via the kkernel binary." Each platform subpackage ships one binary:
+`kkernel`.
+
+**Build pipeline step correction**: The "Build / release pipeline" table (line 115) lists
+step 1 as `cargo build --release --target <triple> -p kkernel -p khive-mcp`. The correct
+command builds only `-p kkernel`; building `-p khive-mcp` produces no binary artifact
+because the crate is library-only.
+
+**`khive-mcp` shim**: The sentence "After ADR-003's convergence to single-binary, each
+subpackage will ship one binary (`kkernel`) and the `khive-mcp` shim" (line 63) describes
+the now-complete state. The `khive-mcp` shim is not a separate file distributed in the
+subpackage; `khive-mcp` functionality is reached via the `kkernel mcp` subcommand. Any
+backward-compatibility shim (if shipped) is a thin wrapper that delegates to `kkernel mcp`.
+
+**Negative consequences correction**: The Negative section (line 253) states "Six native
+binaries built per release, two per binary set (`kkernel` + `khive-mcp`) pre-convergence."
+Convergence is complete: each release builds one binary per platform (`kkernel`), not two.
+
+Rationale: the kkernel unification absorbed `khive-mcp` as a library crate, reducing the
+shipped artifact to a single binary per platform. Build pipelines and subpackage manifests
+should reference `kkernel` only.

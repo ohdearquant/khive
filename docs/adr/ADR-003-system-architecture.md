@@ -480,3 +480,55 @@ boundary tight and avoids adding a public surface for internal plumbing.
   When they differ, ADR-003 wins and CLAUDE.md should be corrected.
 - MCP wire protocol is unchanged. Agents see the same `request` tool.
 - The `request` DSL syntax is unchanged.
+
+## Amendment (2026-06-14): single-binary kkernel topology
+
+The convergence path described in this ADR (Binary architecture section, "Convergence
+path") is now complete. The following topology statements are updated to reflect shipped
+reality.
+
+**`khive-mcp` is now a library**: The ADR's crate responsibility table (line 205) lists
+`khive-mcp` as "the agent binary" owning "MCP stdio transport, gate enforcement,
+request/response adaptation." In the shipped codebase `khive-mcp` is a library crate with
+no binary of its own. Its `Cargo.toml` carries no `[[bin]]` section and its description
+reads "khive MCP server library — served via the kkernel binary." Its `lib.rs` (line 4)
+documents: "The binary frontend is `kkernel mcp`; this crate ships no binary of its own."
+
+**Crate dependency diagram correction**: The "Binary architecture" dependency diagram
+(lines 88-98) shows `khive-mcp` as a peer binary with its own `main`. In the shipped
+layout `khive-mcp` is a library dependency of `kkernel`. The `kkernel` crate's
+`Cargo.toml` lists `khive-mcp = { path = "../khive-mcp" }` as a dependency, and
+`kkernel/src/main.rs` (line 211) delegates `Command::Mcp(a)` directly to
+`khive_mcp::serve::run(a, &khive_mcp::transport::TransportRegistry::with_builtins())`.
+
+**Single shipped binary**: The "End state" bullet in the Binary architecture section
+(line 63) describes the end state as "`kkernel` is the single Rust binary." That end
+state is now current. The binary is declared in `crates/kkernel/Cargo.toml`
+(`[[bin]] name = "kkernel"`, `path = "src/main.rs"`). The subcommand surface matches
+the end-state description: `kkernel mcp` (MCP stdio server), `kkernel sync`, `kkernel
+pack list`, `kkernel db migrate`, plus `kkernel exec` (verb DSL from CLI) and
+`kkernel reindex` (embedding rebuild).
+
+**Dispatch model diagram correction**: The Dispatch model diagram (line 113) lists
+"Binary (kkernel mcp / khive-mcp)" as the top-level dispatch entry. The current shipped
+entry point is `kkernel mcp` only; `khive-mcp` no longer acts as a standalone binary
+entry point.
+
+**Trust boundary table correction**: The Validation Boundary table (line 237) assigns
+"Gate enforcement" to "`khive-mcp` (agent binary)". Gate enforcement is still the
+responsibility of the MCP-serving mode; the correct owner is `kkernel mcp` (the `mcp`
+subcommand of `kkernel`), implemented in the `khive-mcp` library crate consumed by
+`kkernel`.
+
+**Negative consequence correction**: The Negative consequences note (line 467) states
+"Two binaries (three during convergence)." Convergence is complete: there is one shipped
+binary (`kkernel`). The remaining note that "convergence path reduces to one binary with
+multiple modes" describes the current state.
+
+**Future layer table correction**: The Future Layer Contract table (line 325) lists
+`khive-mcp` as "current (deprecating)." The deprecation is complete. `khive-mcp` is now
+a library; only `kkernel mcp` appears in user-facing documentation and MCP configurations.
+
+Rationale: the kkernel unification merged the agent-facing MCP transport into `kkernel`
+as a library-backed subcommand, completing the three-step convergence sequence described
+in this ADR and eliminating `khive-mcp` as a standalone binary.
