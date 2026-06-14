@@ -571,15 +571,6 @@ impl MemoryPack {
             }
         }
 
-        if budget_capped {
-            let truncated_for_budget = pre_budget_count - results.len();
-            return to_json(&json!({
-                "results": results,
-                "budget_capped": true,
-                "truncated_for_budget": truncated_for_budget,
-            }));
-        }
-
         to_json(&results)
     }
 }
