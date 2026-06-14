@@ -4,14 +4,11 @@
 
 ### ADR-004: Graph Traversal Algorithms
 
-- This crate's `graph` module (feature `graph-legacy`) implements BFS, DFS, and bidirectional
-  BFS shortest-path over the `LinkStore` trait from `khive-db`.
-- The traversal algorithms operate on `LinkStore` / `EntityRef` / `StorageContext` types,
-  enabling relationship-aware retrieval pipelines.
-- Safety limits `MAX_TRAVERSAL_DEPTH = 20` and `MAX_TRAVERSAL_RESULTS = 10_000` prevent
-  runaway traversals.
-- The `graph` module is gated behind `feature = "graph-legacy"` because the `LinkStore` API
-  predates the current `GraphStore` trait in `khive-storage`. It is not yet ported.
+- The legacy `graph` module (the `graph-legacy` feature) was removed (#58). It predated the
+  `GraphStore` trait and duplicated traversal that now lives canonically in `khive-runtime`
+  (`graph_traversal`) over `khive-storage`'s `GraphStore` and unified `TraversalOptions`.
+- Relationship-aware retrieval composes with that runtime traversal rather than a
+  retrieval-local `LinkStore` implementation.
 
 ### ADR-006: Deterministic Scoring
 
@@ -48,9 +45,8 @@
 - **Feature default deviation (ADR-030)**: ADR-030 marks `checkpoint`, `persist`, `embed`,
   and `storage-adapters` as default-on, but `Cargo.toml` has `default = []`. An ADR-030
   amendment is needed to reflect the actual shipping defaults.
-- **Graph module not ported**: The `graph-legacy` feature exposes the old `LinkStore`-based
-  traversal API. This should be ported to the `GraphStore` trait from `khive-storage` and
-  the feature flag removed. Tracked as a known gap.
+- **Graph module removed**: The legacy `graph-legacy` `LinkStore`-based traversal module was
+  deleted (#58). Traversal lives in `khive-runtime` over `khive-storage`'s `GraphStore`.
 - **EmbeddedEngine stub**: `engine_replay.rs` defines `type EmbeddedEngine = ()` as a
   placeholder for when `khive-inference` lands. This is an intentional forward stub, not
   dead code; the `#[allow(dead_code)]` comment explains why.

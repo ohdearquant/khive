@@ -9,21 +9,20 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 
 ## Module layout
 
-| Module | Purpose |
-| --- | --- |
-| `src/adapters/` | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
-| `src/error.rs` | `RetrievalError` enum and `Result` alias |
-| `src/eval/` | Precision/recall/nDCG/Jaccard retrieval evaluation metrics |
-| `src/graph/` | BFS/DFS/shortest-path graph traversal (feature `graph-legacy`) |
-| `src/hybrid/` | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query` |
-| `src/metrics/` | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink` |
-| `src/persist/` | SQLite persistence for HNSW/BM25 indexes (feature `persist`) |
-| `src/policy/` | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy` |
-| `src/query_ir.rs` | `QueryNode` IR tree; composable, serialisable query plans |
-| `src/replay/` | Temporal replay and drift metrics (feature `persist`) |
-| `src/search_config.rs` | Per-call `SearchConfig` for recall/compose search phase |
-| `src/timeout.rs` | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline` |
-| `src/weights/` | Per-atom weight loading for replay (feature `persist`) |
+| Module                 | Purpose                                                                       |
+| ---------------------- | ----------------------------------------------------------------------------- |
+| `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
+| `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
+| `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
+| `src/hybrid/`          | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
+| `src/metrics/`         | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
+| `src/persist/`         | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
+| `src/policy/`          | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
+| `src/query_ir.rs`      | `QueryNode` IR tree; composable, serialisable query plans                     |
+| `src/replay/`          | Temporal replay and drift metrics (feature `persist`)                         |
+| `src/search_config.rs` | Per-call `SearchConfig` for recall/compose search phase                       |
+| `src/timeout.rs`       | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
+| `src/weights/`         | Per-atom weight loading for replay (feature `persist`)                        |
 
 ## Tests and benchmarks
 
@@ -56,14 +55,13 @@ is the crate that materialises that composition. The `VectorSearch`, `KeywordSea
 
 ### Feature flag policy (ADR-030)
 
-| Feature | Default | Notes |
-| --- | --- | --- |
-| `checkpoint` | off | HNSW snapshot save/restore; requires `khive-fold` |
-| `persist` | off | SQLite persistence for indexes; requires `rusqlite` |
-| `embed` | off | Native `lattice-embed` model implementations |
-| `storage-adapters` | off | Bridge `khive-storage` backends to retrieval traits |
-| `policy` | off | Gate integration (`khive-gate`); opt-in |
-| `graph-legacy` | off | Legacy traversal (not yet ported to `GraphStore` trait) |
+| Feature            | Default | Notes                                               |
+| ------------------ | ------- | --------------------------------------------------- |
+| `checkpoint`       | off     | HNSW snapshot save/restore; requires `khive-fold`   |
+| `persist`          | off     | SQLite persistence for indexes; requires `rusqlite` |
+| `embed`            | off     | Native `lattice-embed` model implementations        |
+| `storage-adapters` | off     | Bridge `khive-storage` backends to retrieval traits |
+| `policy`           | off     | Gate integration (`khive-gate`); opt-in             |
 
 The current `default = []` deviates from the ADR-030 table which marks `checkpoint`,
 `persist`, `embed`, and `storage-adapters` as default-on. This deviation is tracked as a
