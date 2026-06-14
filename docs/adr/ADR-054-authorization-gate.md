@@ -133,9 +133,70 @@ transport (MCP stdio / HTTP)
   -> dispatch  pack handler                               (record-level namespace check still applies)
 ```
 
-The `GateRequest` handed to `VerbRegistry::dispatch` carries the resolved `ActorRef` instead of
-`ActorRef::anonymous()`. The gate logic in ADR-018 is unchanged; the only difference is the
-`actor` field now carries a real identity when the transport has resolved one.
+The gate logic in ADR-018 is unchanged. The difference this ADR introduces is that the resolved
+`ActorRef` reaches the dispatch site as a per-request input, so the `actor` field carries a real
+identity instead of the anonymous sentinel.
+
+### 3a. Threading the actor into dispatch
+
+The current entry point is `pub async fn dispatch(&self, verb: &str, params: Value)`
+(`pack.rs:657`). It takes no caller identity, so it builds the `GateRequest` with
+`ActorRef::anonymous()` (`pack.rs:671`) and mints the `NamespaceToken` with
+`ActorRef::anonymous()` (`pack.rs:750-754`). Resolving an actor upstream does not change either
+of those two construction sites by itself, so without a dispatch-surface change every pack still
+runs under an anonymous token. Closing the gap requires passing the resolved actor through
+dispatch and using it at both sites.
+
+This ADR adds a per-request dispatch context and an actor-aware entry point:
+
+```rust
+// crates/khive-runtime/src/pack.rs
+
+/// Per-request inputs for a single dispatch, including the resolved caller.
+pub struct DispatchRequest {
+    pub verb:   String,
+    pub params: serde_json::Value,
+    pub actor:  ActorRef,
+}
+
+impl VerbRegistry {
+    /// Actor-aware dispatch. The supplied `actor` is the single source of identity
+    /// for both the gate check and the namespace token within this dispatch.
+    pub async fn dispatch_request(
+        &self,
+        req: DispatchRequest,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        // ... namespace resolution unchanged ...
+        // pack.rs:671 site, now actor-bearing:
+        let gate_req = GateRequest::new(req.actor.clone(), ns, &req.verb, req.params.clone());
+        // ... gate check unchanged ...
+        // pack.rs:750-754 site, now actor-bearing:
+        let token = NamespaceToken::mint_authorized(ns_for_token, req.actor.clone());
+        // ... pack handler dispatch unchanged ...
+    }
+}
+```
+
+The existing `dispatch(&self, verb, params)` becomes a thin wrapper that calls
+`dispatch_request` with `actor: ActorRef::anonymous()`, preserving today's behavior for callers
+that have no resolved identity (including the embedded single-user path). The two construction
+sites (`pack.rs:671` and `pack.rs:750-754`) are changed to read the actor from `DispatchRequest`
+rather than calling `ActorRef::anonymous()` directly, so the gate decision and the namespace
+token are always derived from the same resolved identity within a request.
+
+The end-to-end path is therefore concrete:
+
+1. The transport or session layer resolves the caller via `ActorStore::resolve` (and, for
+   connection-oriented transports, `SessionStore::resolve`) to an `ActorRef`.
+2. The transport constructs a `DispatchRequest { verb, params, actor }` and calls
+   `dispatch_request`.
+3. `dispatch_request` uses that one `ActorRef` for both the `GateRequest` and the
+   `NamespaceToken`.
+
+Adding `actor_store` to the registry builder (see Migration path) is configuration-time state: it
+determines how a token is resolved, but it does not by itself carry a per-request actor into
+dispatch. The per-request `DispatchRequest` path above is the part that actually threads the
+resolved identity through. Both pieces are required.
 
 ### 4. Cloud-tier TenantGate
 
@@ -166,25 +227,38 @@ other way around.
 
 1. Add `AuthError`, `SessionError`, `ActorStore` (with `NoopActorStore`), and `SessionStore`
    (with `EphemeralSessionStore`) to `crates/khive-gate/`.
-2. Add an `actor_store: Arc<dyn ActorStore>` field to `VerbRegistryBuilder` (defaulting to
-   `NoopActorStore`). The builder resolves the actor before constructing the `GateRequest`, so
-   the gate consistently sees a resolved `ActorRef`.
-3. MCP server startup wires `NoopActorStore` by default; embedded behavior is unchanged.
-4. (Cloud tier, separate repo/crate) implement a `TenantActorStore` that validates API keys
+2. Add the `DispatchRequest` type and the `dispatch_request` entry point to `VerbRegistry`
+   (section 3a). Change the `GateRequest` construction (`pack.rs:671`) and the `NamespaceToken`
+   minting (`pack.rs:750-754`) to read the actor from `DispatchRequest` instead of calling
+   `ActorRef::anonymous()`. Keep the existing `dispatch(verb, params)` as a wrapper that supplies
+   `ActorRef::anonymous()`, so callers without a resolved identity behave exactly as today.
+3. Add an `actor_store: Arc<dyn ActorStore>` field to `VerbRegistryBuilder` (defaulting to
+   `NoopActorStore`). This is configuration-time state for resolving tokens. It is necessary but
+   not sufficient on its own: the per-request `DispatchRequest` path from step 2 is what carries
+   the resolved actor into dispatch.
+4. Update the transport (`crates/khive-mcp/src/server.rs`) to resolve the caller through the
+   configured `ActorStore` (and `SessionStore` for connection-oriented transports), build a
+   `DispatchRequest { verb, params, actor }`, and call `dispatch_request`.
+5. MCP server startup wires `NoopActorStore` by default; embedded behavior is unchanged because
+   the default resolves to `ActorRef::anonymous()`.
+6. (Cloud tier, separate repo/crate) implement a `TenantActorStore` that validates API keys
    against the tenant store and returns a namespace-scoped `ActorRef`.
 
 ## Consequences
 
-- The gate reliably sees a resolved caller identity on every dispatch, not always
-  `ActorRef::anonymous()`.
-- Cloud-tier authentication plugs in at one place (the `ActorStore`) without modifying packs
-  or handlers.
+- The gate and the namespace token are both derived from the same resolved caller identity on
+  every dispatch that goes through `dispatch_request`, not always `ActorRef::anonymous()`. The
+  legacy `dispatch(verb, params)` wrapper keeps the anonymous behavior for callers that supply no
+  identity.
+- Cloud-tier authentication plugs in at the `ActorStore` (token resolution) and reaches the gate
+  through the `dispatch_request` actor parameter, without modifying packs or handlers.
 - The session lifecycle contract is defined before the HTTP gateway ships, avoiding
   post-hoc retrofitting.
 - Embedded OSS deployments are unchanged: `NoopActorStore` returns `ActorRef::anonymous()` as
   before.
-- Approximately 150 LOC of new types and defaults in `khive-gate`, plus builder wiring in the
-  runtime.
+- Approximately 150 LOC of new types and defaults in `khive-gate`, plus the `DispatchRequest`
+  type, the `dispatch_request` entry point, the two construction-site edits (`pack.rs:671` and
+  `pack.rs:750-754`), and builder wiring in the runtime.
 
 ## Related ADRs
 
