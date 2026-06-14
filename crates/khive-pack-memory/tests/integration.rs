@@ -2945,3 +2945,204 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
         "recall hit decay_factor must be episodic default 0.02 for legacy note; got {hit_decay}"
     );
 }
+
+// ── Regression tests for issue #94: token-budget truncation signal + rank order ──
+
+/// #94 regression (budget cap): when the token budget caps the returned count below
+/// the requested `limit`, fewer results than `limit` are returned.
+///
+/// The non-verbose path always returns a bare array; the budget-capped status is
+/// observable as a count < limit.  Budget signal fields (`budget_capped`,
+/// `truncated_for_budget`) are available on the verbose/breakdown path when the
+/// runtime loads two or more embedding models (multi-model production setup).
+#[tokio::test]
+async fn test_recall_budget_capped_surfaces_signal() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create 5 notes whose content is long enough that the tiny budget below
+    // cannot accommodate all of them.  Each note content is ~75 chars.
+    let shared_query = "budget signal regression unique phrase alpha";
+    for i in 0..5_u8 {
+        let content =
+            format!("budget signal regression unique phrase alpha memory content item number {i}");
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({ "content": content, "salience": 0.8 }),
+            )
+            .await
+            .expect("remember");
+    }
+
+    // default_token_budget=20 tokens × chars_per_token=4 = 80 chars budget.
+    // Each note is ~75 chars; only 1 fits; the remaining 4 are dropped by the prefix cut.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": shared_query,
+                "limit": 5,
+                "config": {
+                    "scoring": {
+                        "default_token_budget": 20,
+                        "chars_per_token": 4,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with tiny budget succeeds");
+
+    // Non-verbose path always returns a bare array regardless of budget state.
+    let returned = result
+        .as_array()
+        .expect("#94: recall must return a bare array on the non-verbose path");
+    assert!(
+        !returned.is_empty(),
+        "#94: at least one result must fit within the budget"
+    );
+    assert!(
+        returned.len() < 5,
+        "#94: returned count ({}) must be < requested limit (5) when budget is exhausted; \
+         prefix-cut is not working if all 5 fit in an 80-char budget",
+        returned.len()
+    );
+}
+
+/// #94 regression (no false positive): when all results fit within the token budget,
+/// the response is a plain array with count equal to available results.
+#[tokio::test]
+async fn test_recall_no_budget_cap_returns_plain_array() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "plain array uncapped recall test phrase", "salience": 0.7 }),
+        )
+        .await
+        .expect("remember");
+
+    // Large budget: 4000 tokens × 4 chars = 16 000 chars — one short note trivially fits.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "plain array uncapped recall test", "limit": 3 }),
+        )
+        .await
+        .expect("recall with generous budget succeeds");
+
+    assert!(
+        result.is_array(),
+        "#94 no-cap path: recall must return a plain array; got: {result}"
+    );
+}
+
+/// #94 regression (rank order): when the token budget forces truncation, the
+/// returned items must be the top-ranked contiguous prefix — no higher-ranked
+/// item may be skipped to accommodate a shorter lower-ranked item.
+///
+/// Setup uses THREE notes with DIFFERENT content lengths so the old greedy
+/// `retain` bug actually fires:
+///   rank #1 — short content (~55 chars) — fits within the 80-char budget
+///   rank #2 — long content (~110 chars) — overflows the remaining budget after #1
+///   rank #3 — short content (~55 chars) — would fit if reached by old retain
+///
+/// With the fix (prefix cut): result = [#1] — #2 overflows → cut, #3 never reached.
+/// With the old retain bug:    result = [#1, #3] — #2 skipped, #3 kept (rank violation).
+///
+/// Assert: exactly 1 result returned AND it is rank #1 AND rank #3 is absent.
+#[tokio::test]
+async fn test_recall_budget_truncation_preserves_rank_order() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Shared keyword prefix so all 3 notes score on the same query.
+    // Unique distinguishing suffix per note controls both length and identity.
+    let query = "rankorder prefix budget truncation";
+
+    // rank #1: short — fits in 80-char budget (~55 chars with prefix).
+    let content_rank1 = format!("{query} item short alpha unique");
+    // rank #2: long — overflows the remaining budget after rank #1.
+    // budget = 80 chars; rank #1 uses ~55 chars; remaining = ~25 chars.
+    // rank #2 must exceed 25 chars — pad to ~110 chars total.
+    let content_rank2 = format!("{query} item long beta {}", "x".repeat(50));
+    // rank #3: short — would fit if the old retain reached it.
+    let content_rank3 = format!("{query} item short gamma unique");
+
+    // Salience drives rank: 0.9 → rank #1, 0.6 → rank #2, 0.3 → rank #3.
+    // mmr_penalty=0 prevents diversity suppression from reordering.
+    let notes = [
+        (&content_rank1, 0.9_f64),
+        (&content_rank2, 0.6_f64),
+        (&content_rank3, 0.3_f64),
+    ];
+    let mut stored_ids = Vec::new();
+    for (content, sal) in &notes {
+        let res = registry
+            .dispatch(
+                "memory.remember",
+                json!({ "content": content, "salience": sal }),
+            )
+            .await
+            .expect("remember");
+        stored_ids.push(res["note_id"].as_str().unwrap().to_owned());
+    }
+    let id_rank1 = &stored_ids[0];
+    let id_rank3 = &stored_ids[2];
+
+    // budget = 20 tokens × 4 chars = 80 chars.
+    // rank #1 (~55 chars) admitted. rank #2 (~110 chars) pushes total to ~165 > 80 → cut.
+    // rank #3 is never considered (prefix cut stops at rank #2 overflow).
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 3,
+                "config": {
+                    "scoring": {
+                        "default_token_budget": 20,
+                        "chars_per_token": 4,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall with rank-order budget test");
+
+    // Non-verbose path returns a bare array.
+    let returned = result
+        .as_array()
+        .expect("#94 rank-order: recall must return a bare array");
+
+    // Exactly 1 result (rank #1 fits, prefix cut stops at rank #2 overflow).
+    // Old retain would return 2 results: [rank#1, rank#3].
+    assert_eq!(
+        returned.len(),
+        1,
+        "#94 rank-order: exactly 1 result expected (rank #1 fits, rank #2 overflows, \
+         rank #3 must not be reached); got {} — old retain bug returns [#1,#3]",
+        returned.len()
+    );
+
+    let returned_id = returned[0]["note_id"].as_str().expect("note_id present");
+    assert_eq!(
+        returned_id, id_rank1,
+        "#94 rank-order: the single returned note must be rank #1 ({id_rank1}), got {returned_id}"
+    );
+
+    // rank #3 must not appear — its presence is the rank-skip signature.
+    let has_rank3 = returned
+        .iter()
+        .any(|r| r["note_id"].as_str() == Some(id_rank3));
+    assert!(
+        !has_rank3,
+        "#94 rank-order: rank #3 ({id_rank3}) must NOT be in results — \
+         its presence proves the old greedy retain was used instead of the prefix cut"
+    );
+}
