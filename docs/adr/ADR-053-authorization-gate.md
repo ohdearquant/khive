@@ -1,4 +1,4 @@
-# ADR-054: Authorization Gate -- ActorStore, SessionStore, and Cloud-Tier Caller Propagation
+# ADR-053: Authorization Gate -- ActorStore, SessionStore, and Cloud-Tier Caller Propagation
 
 **Status**: Proposed
 **Date**: 2026-06-13

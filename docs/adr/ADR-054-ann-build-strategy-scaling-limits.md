@@ -1,4 +1,4 @@
-# ADR-056: ANN Build Strategy and Scaling Limits
+# ADR-054: ANN Build Strategy and Scaling Limits
 
 **Status**: Proposed
 **Date**: 2026-06-14
@@ -55,7 +55,7 @@ contract; claims beyond these bounds require new measurements and an ADR amendme
 
 The "Yes, conditional" for update carries a **tracked design obligation**: the amortized cost of
 periodic consolidation must be measured and confirmed sublinear at production scale before the
-update axis is claimed fully sublinear. This obligation is not yet discharged; see ADR-053 for
+update axis is claimed fully sublinear. This obligation is not yet discharged; see ADR-052 for
 the consolidation design.
 
 The build and memory axes deliver only **extreme constant-factor** improvement. No future
@@ -152,13 +152,13 @@ config, so α tuning is off khive's critical path.
 3. **Build and memory are Ω(N) and O(N).** The "extreme performance" delivery on those axes is
    the constant-factor harvest stack, not asymptotic improvement:
    - SQ8 scalar quantization: ~4× memory reduction (GsSq8Codec for the Vamana acquisition tier,
-     specified in ADR-053). The kernel speedup is 16.8× on the distance computation alone
-     (ADR-053), but the end-to-end build improvement is only 1.3-1.4× (ADR-053): build is
+     specified in ADR-052). The kernel speedup is 16.8× on the distance computation alone
+     (ADR-052), but the end-to-end build improvement is only 1.3-1.4× (ADR-052): build is
      distance-bound, so random DRAM fetches for neighbor IDs cap the gain. Lifting that ceiling
      would require an access-aware memory layout that stores neighbor IDs contiguously with the
      quantized codewords (the approach taken by the Flash index). That is an identified future
      optimization, not yet specified in any khive ADR.
-   - Wolverine 2-hop eager-delete repair (ADR-053): per-delete repair cost is bounded by degree,
+   - Wolverine 2-hop eager-delete repair (ADR-052): per-delete repair cost is bounded by degree,
      not corpus size, so the hot-path delete cost is N-independent. Periodic consolidation
      handles compaction off the critical path.
 
@@ -191,6 +191,6 @@ config, so α tuning is off khive's critical path.
 - [ADR-012](ADR-012-retrieval-composition.md): Retrieval composition and hybrid search pipeline.
 - [ADR-031](ADR-031-multi-engine-retrieval.md): Multi-engine retrieval and fusion.
 - [ADR-044](ADR-044-vector-store-extensions.md): VectorStore trait extensions.
-- [ADR-053](ADR-053-ann-production-lifecycle.md): SQ8 quantization, tombstone delete,
+- [ADR-052](ADR-052-ann-production-lifecycle.md): SQ8 quantization, tombstone delete,
   consolidation, and crash-safe persistence: the lifecycle operations and constant-factor perf
   stack referenced in this ADR's Consequences section.

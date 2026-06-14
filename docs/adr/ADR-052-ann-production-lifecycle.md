@@ -1,4 +1,4 @@
-# ADR-053: ANN Production Lifecycle -- SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence
+# ADR-052: ANN Production Lifecycle -- SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence
 
 **Status**: Proposed
 **Date**: 2026-06-13
