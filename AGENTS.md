@@ -160,15 +160,65 @@ request(ops="[{\"tool\":\"create\",\"args\":{\"kind\":\"entity\",\"entity_kind\"
 ```
 
 Ops in a batch run in parallel and have no ordering guarantee. If op B depends on op A's output
-(e.g. create-then-link), use two `request` calls.
+(e.g. create-then-link), chain them with `|` instead (see _Efficient batching and round-trip reduction_ below).
 
 **Deferred (not yet available):**
 
 - `create(supersedes=<old-id>)` parameter shortcut — this convenience form (which would atomically
   create a new record and add a `supersedes` edge to the old one) is not yet in the wire surface.
-  Use the two-step approach: `create(...)` then `link(..., relation="supersedes")`.
+  Use two ops, which you can run as one chained call: `create(...) | link(..., relation="supersedes")`.
 - Note merge — only entity merge is implemented (`merge(into_id=..., from_id=...)`).
   Deduplicating two notes is not yet supported; add a `supersedes` edge manually.
+
+### Efficient batching and round-trip reduction
+
+Every `request` call is one round trip, and the server keeps a warm daemon between calls (see
+_Daemon and warm startup_). Folding work into fewer calls cuts both the per-call round trip and
+repeated access to that warm state. Two forms do this: a parallel batch for independent ops, and a
+sequential chain for dependent ops.
+
+Batch independent ops with `[ … ]`. They run in parallel, each returns its own `ok`/`error` so one
+failure does not abort the rest, and the limit is 100 ops per batch. Orient at session start in one
+call instead of three:
+
+```text
+request(ops="[gtd.next(limit=10), gtd.tasks(status=\"active\"), comm.inbox(limit=10)]")
+```
+
+The response carries each op's result alongside a `summary` with `total`, `succeeded`, and `failed`.
+
+Chain dependent ops with `|` and `$prev`. When one op needs the previous op's output, separate them
+with `|` and reference the prior result with `$prev`. A chain runs sequentially and skips the
+remaining ops if a step fails. This collapses create-then-link into a single call:
+
+```text
+request(ops="create(kind=\"concept\", name=\"LoRA\") | link(source_id=$prev.id, target_id=\"<uuid>\", relation=\"extends\")")
+```
+
+`$prev` reads fields by dotted path and arrays by index, such as `$prev.id` or `$prev[0].id`.
+Reference the field the previous verb actually returns; create, remember, and the other write verbs
+return the new record's `id`. Recording a corrected memory and marking the old one superseded is then
+one call:
+
+```text
+request(ops="memory.remember(content=\"corrected fact\", salience=0.8) | link(source_id=$prev.id, target_id=\"<old-uuid>\", relation=\"supersedes\")")
+```
+
+`$prev` refers to the immediately preceding op only. In a three-op chain `A | B | C`, the `$prev` in
+`C` is `B`'s result, not `A`'s; there is no multi-step back-reference. If `C` needs a value from `A`,
+split the work into two `request` calls.
+
+The two forms cannot be combined in one `request`, and the JSON op form does not support `$prev`:
+
+| Situation                       | Use                        | Note                                         |
+| ------------------------------- | -------------------------- | -------------------------------------------- |
+| Ops are independent             | batch `[a(), b()]`         | parallel, up to 100 ops                      |
+| Op B needs op A's result        | chain `a() \| b(…=$prev…)` | sequential, aborts on failure                |
+| Two writes to the same record   | chain, not batch           | a parallel batch rejects same-record writes  |
+| Discovering a verb's parameters | `verb(help=true)`          | returns the parameter schema without running |
+
+Mixing `,` and `|` at the top level of one `request` is rejected, as is `$prev` inside the JSON op
+form. Use the function-call form shown above for chaining.
 
 ### Notes vs entities
 
