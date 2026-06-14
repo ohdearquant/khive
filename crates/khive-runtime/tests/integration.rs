@@ -1619,6 +1619,50 @@ async fn link_artifact_concept_refutes_accepted() {
     assert_eq!(edge.relation, EdgeRelation::Refutes);
 }
 
+/// Artifact→Concept supports: base allowlist row (previously untested combination).
+#[tokio::test]
+async fn link_artifact_concept_supports_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let art = rt
+        .create_entity(&tok, "artifact", None, "Checkpoint-v2", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Claim T", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, art.id, claim.id, EdgeRelation::Supports, 0.8, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Supports);
+    assert_eq!(edge.source_id, art.id);
+    assert_eq!(edge.target_id, claim.id);
+}
+
+/// Dataset→Concept refutes: base allowlist row (previously untested combination).
+#[tokio::test]
+async fn link_dataset_concept_refutes_accepted() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ds = rt
+        .create_entity(&tok, "dataset", None, "Bench-Y", None, None, vec![])
+        .await
+        .unwrap();
+    let claim = rt
+        .create_entity(&tok, "concept", None, "Hypothesis W", None, None, vec![])
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok, ds.id, claim.id, EdgeRelation::Refutes, 0.75, None)
+        .await
+        .unwrap();
+    assert_eq!(edge.relation, EdgeRelation::Refutes);
+    assert_eq!(edge.source_id, ds.id);
+    assert_eq!(edge.target_id, claim.id);
+}
+
 // --- update_edge parity tests ---
 
 /// (a) update_edge legal entity edge → Supports on allowlist pair: accepted.
