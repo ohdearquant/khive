@@ -609,7 +609,7 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     err_rel = _expect_rpc_error(proc, "link", {
         "source_id": src["id"],
         "target_id": tgt["id"],
-        "relation": "invented_by",  # not in the 13-relation closed set
+        "relation": "invented_by",  # not in the 17-relation closed set
     })
     assert err_rel, "Expected non-empty error for invalid edge relation"
     assert "invented_by" in err_rel, (
