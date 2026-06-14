@@ -319,7 +319,7 @@ impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
 
 /// BFS traversal configuration controlling depth, direction, and edge filters.
 /// Deserialization rejects non-finite min_weight.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "TraversalOptionsRaw")]
 pub struct TraversalOptions {
     pub max_depth: usize,
@@ -327,6 +327,18 @@ pub struct TraversalOptions {
     pub relations: Option<Vec<EdgeRelation>>,
     pub min_weight: Option<f64>,
     pub limit: Option<u32>,
+}
+
+impl Default for TraversalOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            direction: Direction::Out,
+            relations: None,
+            min_weight: None,
+            limit: None,
+        }
+    }
 }
 
 impl TraversalOptions {
@@ -396,4 +408,14 @@ pub struct GraphPath {
     pub root_id: Uuid,
     pub nodes: Vec<PathNode>,
     pub total_weight: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traversal_options_default_max_depth_is_three() {
+        assert_eq!(TraversalOptions::default().max_depth, 3);
+    }
 }

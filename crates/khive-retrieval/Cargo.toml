@@ -55,8 +55,6 @@ storage-adapters = ["khive-storage", "khive-db/vectors"]
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
 embed = []
-# Legacy graph traversal module (depends on old EntityRef/LinkStore API; not yet ported)
-graph-legacy = []
 
 [dev-dependencies]
 criterion = { workspace = true }

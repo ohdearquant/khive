@@ -19,10 +19,6 @@
 pub mod adapters;
 pub mod error;
 pub mod eval;
-// graph module depends on EntityRef/LinkStore/StorageContext from old monolith khive-db API;
-// gated until ported to current khive-storage GraphStore trait.
-#[cfg(feature = "graph-legacy")]
-pub mod graph;
 pub mod hybrid;
 pub mod metrics;
 #[cfg(feature = "persist")]
@@ -43,12 +39,6 @@ pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 // Re-export core types
 pub use error::{ErrorKind, Result, RetrievalError};
 
-// Re-export types from sibling crates (now separate crates)
-#[cfg(feature = "graph-legacy")]
-pub use graph::{
-    bfs_traverse, dfs_traverse, find_shortest_path, Direction, PathNode, TraversalOptions,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS,
-};
 pub use khive_bm25::{Bm25Config, Bm25Index, Bm25Stats, DocumentId, SearchContext};
 pub use khive_fusion::{
     fuse, normalize_weights, reciprocal_rank_fusion, weighted_fusion, weights_are_normalized,

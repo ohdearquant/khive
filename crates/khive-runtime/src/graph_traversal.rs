@@ -16,8 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use uuid::Uuid;
 
-use khive_storage::types::{Direction, Edge, LinkId, NeighborQuery};
-use khive_storage::EdgeRelation;
+use khive_storage::types::{Direction, Edge, LinkId, NeighborQuery, TraversalOptions};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -31,30 +30,6 @@ pub struct PathNode {
     pub depth: usize,
     /// Edge that led to this node (`None` for the start node).
     pub via_edge: Option<Edge>,
-}
-
-/// Options for BFS traversal and shortest-path search.
-#[derive(Debug, Clone)]
-pub struct TraversalOptions {
-    /// Maximum hops to follow.
-    pub max_depth: usize,
-    /// Which edge directions to follow.
-    pub direction: Direction,
-    /// Restrict traversal to these relation types (`None` = all).
-    pub relations: Option<Vec<EdgeRelation>>,
-    /// Stop after collecting this many nodes (start node counts as one).
-    pub max_results: Option<usize>,
-}
-
-impl Default for TraversalOptions {
-    fn default() -> Self {
-        Self {
-            max_depth: 3,
-            direction: Direction::Out,
-            relations: None,
-            max_results: None,
-        }
-    }
 }
 
 impl KhiveRuntime {
@@ -73,7 +48,7 @@ impl KhiveRuntime {
         }
 
         let graph = self.graph(token)?;
-        let limit = options.max_results.unwrap_or(usize::MAX);
+        let limit = options.limit.map(|n| n as usize).unwrap_or(usize::MAX);
 
         let mut visited: HashSet<Uuid> = HashSet::new();
         let mut results: Vec<PathNode> = Vec::new();
