@@ -180,9 +180,41 @@ fn spawn_daemon() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Return `true` if `args` (the full `ps -o args=` output for a process)
+/// identifies a khive daemon.
+///
+/// Both conditions must hold:
+/// (a) the first whitespace-delimited token's file-name basename is exactly
+///     `kkernel` (an absolute path like `/Users/x/.cargo/bin/kkernel` is
+///     accepted; a basename of `not-kkernel` or a wrapper whose argv[0] merely
+///     mentions kkernel elsewhere is rejected), AND
+/// (b) the remaining tokens contain both `mcp` and `--daemon` as distinct
+///     whitespace-separated tokens (matching the daemon spawn shape
+///     `kkernel mcp --daemon`; a bare `kkernel exec '...'` has no `--daemon`
+///     token and is correctly rejected).
+fn argv_is_khive_daemon(args: &str) -> bool {
+    let mut tokens = args.split_whitespace();
+    let Some(exe_token) = tokens.next() else {
+        return false;
+    };
+    // Compare by file-name basename so absolute paths are handled correctly.
+    let basename = std::path::Path::new(exe_token)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if basename != "kkernel" {
+        return false;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    rest.contains(&"mcp") && rest.contains(&"--daemon")
+}
+
 /// Return `true` if the process with the given PID is identifiable as a khive
-/// daemon (kkernel binary). Uses `ps -p <pid> -o args=` (portable across macOS
-/// and Linux) and checks that the executable name contains "kkernel".
+/// daemon. Uses `ps -p <pid> -o args=` (portable across macOS and Linux) and
+/// verifies that (a) the executable basename is exactly `kkernel`, AND (b) the
+/// remaining argv tokens include both `mcp` and `--daemon` (the daemon spawn
+/// shape). A process that merely mentions "kkernel" in some other argument
+/// position is rejected.
 ///
 /// If the process is gone or is a foreign process, returns `false` — the caller
 /// must then clean up the stale PID file without sending SIGTERM.
@@ -204,7 +236,7 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     {
         Ok(out) if out.status.success() => {
             let args = String::from_utf8_lossy(&out.stdout);
-            args.contains("kkernel")
+            argv_is_khive_daemon(args.trim())
         }
         _ => false,
     }
@@ -240,10 +272,12 @@ fn acquire_recovery_lock() -> Option<std::fs::File> {
 
 /// Kill the daemon recorded in the PID file (best-effort, no error on failure).
 ///
-/// Before sending SIGTERM, the PID is validated: `ps` must confirm the process
-/// is a kkernel binary. If the PID is gone or belongs to a foreign process,
-/// SIGTERM is skipped and only the stale files are cleaned up. An advisory flock
-/// on the recovery lock file serializes concurrent clients.
+/// Before sending SIGTERM, the PID is validated: `ps` must confirm that the
+/// process has basename `kkernel` AND carries both `mcp` and `--daemon` as
+/// distinct argv tokens (the daemon spawn shape). If the PID is gone or belongs
+/// to a foreign process that does not match that shape, SIGTERM is skipped and
+/// only the stale files are cleaned up. An advisory flock on the recovery lock
+/// file serializes concurrent clients.
 fn kill_stale_daemon() {
     // Hold the lock for the duration of kill + file cleanup so concurrent
     // clients do not race through the same PID/socket.
@@ -930,5 +964,53 @@ mod tests {
 
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── argv_is_khive_daemon unit tests ───────────────────────────────────────
+
+    #[test]
+    fn argv_daemon_true_bare() {
+        // Exact daemon argv as spawned by spawn_daemon().
+        assert!(argv_is_khive_daemon("kkernel mcp --daemon"));
+    }
+
+    #[test]
+    fn argv_daemon_true_absolute_path() {
+        // Absolute path to kkernel binary — basename must match.
+        assert!(argv_is_khive_daemon(
+            "/Users/x/.cargo/bin/kkernel mcp --daemon"
+        ));
+    }
+
+    #[test]
+    fn argv_daemon_false_editor_with_kkernel_in_filename() {
+        // Editor opened on a file whose name contains kkernel — not a daemon.
+        assert!(!argv_is_khive_daemon("vim kkernel-notes.md"));
+    }
+
+    #[test]
+    fn argv_daemon_false_less_with_kkernel_path() {
+        // less paging a kkernel source file — argv[0] is "less", not "kkernel".
+        assert!(!argv_is_khive_daemon(
+            "less /Users/x/projects/kkernel/daemon.rs"
+        ));
+    }
+
+    #[test]
+    fn argv_daemon_false_kkernel_no_daemon_flag() {
+        // kkernel exec subcommand — has kkernel basename but no --daemon token.
+        assert!(!argv_is_khive_daemon("kkernel exec 'something'"));
+    }
+
+    #[test]
+    fn argv_daemon_false_wrapper_argv0_not_kkernel() {
+        // A wrapper script passes kkernel mcp --daemon as args but its own
+        // argv[0] is "some-wrapper" — basename check must reject it.
+        assert!(!argv_is_khive_daemon("some-wrapper kkernel mcp --daemon"));
+    }
+
+    #[test]
+    fn argv_daemon_false_empty_string() {
+        assert!(!argv_is_khive_daemon(""));
     }
 }
