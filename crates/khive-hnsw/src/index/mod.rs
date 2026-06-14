@@ -1,6 +1,5 @@
 //! HNSW index implementation — insert, delete, search, and rebuild.
 
-mod build_batch;
 mod index_impl;
 mod insert;
 mod memory;

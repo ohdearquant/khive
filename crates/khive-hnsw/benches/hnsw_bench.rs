@@ -60,31 +60,6 @@ fn bench_build(c: &mut Criterion) {
         });
     }
 
-    // Batch build: items pre-generated outside the timed loop so only
-    // `build_batch` time is measured.
-    for &n in &[1_000usize, 5_000] {
-        let config = HnswConfig {
-            seed: Some(SEED),
-            ..HnswConfig::with_dimensions(DIMS)
-        };
-        let items: Vec<(NodeId, Vec<f32>)> = {
-            let mut rng = StdRng::seed_from_u64(SEED);
-            (0..n)
-                .map(|i| (make_node_id(i), random_unit_vector(&mut rng)))
-                .collect()
-        };
-        group.bench_function(format!("batch_{n}"), |b| {
-            b.iter_batched(
-                || (HnswIndex::with_config(config.clone()), items.clone()),
-                |(mut index, batch)| {
-                    index.build_batch(black_box(batch)).unwrap();
-                    black_box(index.len())
-                },
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
     group.finish();
 }
 
