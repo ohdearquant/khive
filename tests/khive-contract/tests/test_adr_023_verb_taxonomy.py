@@ -174,7 +174,7 @@ def test_pack_product_verbs_are_reachable_when_loaded(
         "namespace": ns,
     })
     assert mem is not None, "memory.remember must return a result"
-    mem_id = mem.get("id") or mem.get("note_id")
+    mem_id = mem["id"]
     assert mem_id, f"memory.remember must return an id: {mem}"
 
     # memory.recall

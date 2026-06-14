@@ -792,14 +792,14 @@ impl VerbRegistry {
                     .with_outcome(EventOutcome::Success)
                     .with_duration_us(dispatch_us);
 
-                    // For recall verbs: extract the first result's note_id as
+                    // For recall verbs: extract the first result's id as
                     // target_id so the brain temporal posterior can observe
                     // real hit/miss and latency (fix for codex P12 Major).
                     if verb == "memory.recall" {
                         let first_note_id = ok_val
                             .as_array()
                             .and_then(|arr| arr.first())
-                            .and_then(|v| v.get("note_id"))
+                            .and_then(|v| v.get("id"))
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<uuid::Uuid>().ok());
                         if let Some(note_id) = first_note_id {

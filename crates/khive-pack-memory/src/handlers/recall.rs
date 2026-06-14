@@ -492,7 +492,7 @@ impl MemoryPack {
                         sn.note.content.clone()
                     };
                 let mut result = json!({
-                    "note_id": sn.id.to_string(),
+                    "id": sn.id.to_string(),
                     "score": sn.score,
                     "rank_score": sn.rank_score,
                     "raw_score": sn.raw_score,
@@ -516,7 +516,7 @@ impl MemoryPack {
         {
             let latency_us = recall_start.elapsed().as_micros() as i64;
             let top_id = results.first().and_then(|r| {
-                r.get("note_id")
+                r.get("id")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<Uuid>().ok())
             });
@@ -538,7 +538,7 @@ impl MemoryPack {
                         .iter()
                         .map(|h| {
                             json!({
-                                "note_id": h.subject_id.to_string(),
+                                "id": h.subject_id.to_string(),
                                 "score": h.score.to_f64(),
                                 "rank": h.rank,
                             })

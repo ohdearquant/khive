@@ -98,14 +98,14 @@ The recall pipeline decomposes into shipped subhandlers. `memory.recall` is the 
 The debug/calibration handlers are registered as `Visibility::Subhandler`; MCP blocks normal
 calls to subhandlers and exposes help only.
 
-| Handler                    | Visibility | Input                                  | Output                                                                   |
-| -------------------------- | ---------- | -------------------------------------- | ------------------------------------------------------------------------ |
-| `memory.recall_embed`      | Subhandler | `{query: str}`                         | `{embeddings: [{engine_id, model_id, vector: [f32]}]}`                   |
-| `memory.recall_candidates` | Subhandler | `{query, namespace, limit}`            | `{text_hits, vector_hits_by_engine}`                                     |
-| `memory.recall_fuse`       | Subhandler | `{text_hits, vector_hits, strategy}`   | `{fused_hits}`                                                           |
-| `memory.recall_rerank`     | Subhandler | `{candidates, config?}`                | `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}` |
-| `memory.recall_score`      | Subhandler | `{fused_hits, reranked?, config}`      | `{scored: [{id, score, breakdown}]}`                                     |
-| `memory.recall`            | **Verb**   | `{query, namespace?, limit?, config?}` | `{results}`                                                              |
+| Handler                    | Visibility | Input                                  | Output                                                              |
+| -------------------------- | ---------- | -------------------------------------- | ------------------------------------------------------------------- |
+| `memory.recall_embed`      | Subhandler | `{query: str}`                         | `{embeddings: [{engine_id, model_id, vector: [f32]}]}`              |
+| `memory.recall_candidates` | Subhandler | `{query, namespace, limit}`            | `{text_hits, vector_hits_by_engine}`                                |
+| `memory.recall_fuse`       | Subhandler | `{text_hits, vector_hits, strategy}`   | `{fused_hits}`                                                      |
+| `memory.recall_rerank`     | Subhandler | `{candidates, config?}`                | `{reranked: [{id, rerank_scores, rerank_score}], active_rerankers}` |
+| `memory.recall_score`      | Subhandler | `{fused_hits, reranked?, config}`      | `{scored: [{id, score, breakdown}]}`                                |
+| `memory.recall`            | **Verb**   | `{query, namespace?, limit?, config?}` | `{results}`                                                         |
 
 `memory.recall_embed` generates one embedding **per active engine** — the multi-engine
 fan-out from ADR-031. The output is a list of `{engine_id, model_id, vector}` triples,
@@ -119,7 +119,7 @@ The `memory.recall_score` handler returns a score breakdown per result:
 
 ```json
 {
-  "note_id": "abc...",
+  "id": "abc...",
   "score": 0.42,
   "breakdown": {
     "relevance": 0.35,
@@ -302,7 +302,11 @@ _model class_ (e.g., cross-encoder, graph-proximate) would require a new ADR.
 
 **`recall.rerank` subhandler:** Accepts fused candidates (with optional `fused_score`,
 `salience`, `age_days`, `decay_factor`, `temporal`, `source` fields) plus a `config`
-override. Returns `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}`.
+override. Returns `{reranked: [{id, rerank_scores, rerank_score}], active_rerankers}`.
+
+Amendment (2026-06-14): the recall/rerank hit identity field was renamed `note_id` → `id` for
+cross-verb coherence — `create`, `remember`, and `recall` all return `id` for the record. No
+field collision (annotation-edge ids remain `edge_id`). Clean break, no dual-emit.
 When weights are empty, returns candidates with empty `rerank_scores` (pass-through).
 
 ### 6.3 Multi-model vector fusion (v024/multi-vector-fusion)
@@ -336,7 +340,7 @@ When `recall` is called without an explicit `embedding_model` parameter:
    strategy behavior (RRF and Weighted do not apply their full algorithm to a single-source
    input — `fuse_search_results` returns raw scores when `sources.len() == 1`).
 
-**Wire shape is unchanged:** `recall` always returns `[{note_id, score, ...}]`. The
+**Wire shape:** `recall` always returns `[{id, score, ...}]`. The
 per-model vector breakdown is only exposed via the `recall.candidates` sub-handler's
 `vector_candidates_per_model` field, which appears only when two or more models are active.
 

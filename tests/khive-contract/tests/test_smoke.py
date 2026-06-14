@@ -382,7 +382,7 @@ def test_memory_smoke(
         "namespace": ns,
     })
     assert mem is not None, "memory.remember must return a result"
-    mem_id = mem.get("id") or mem.get("note_id")
+    mem_id = mem["id"]
     assert mem_id, f"memory.remember must return an id: {mem}"
 
     # remember second memory

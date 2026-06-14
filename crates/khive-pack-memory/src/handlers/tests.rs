@@ -588,7 +588,7 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
                 .iter()
                 .map(|h| {
                     serde_json::json!({
-                        "note_id": h.subject_id.to_string(),
+                        "id": h.subject_id.to_string(),
                         "score": h.score.to_f64(),
                         "rank": h.rank,
                     })
@@ -600,9 +600,9 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
 
     assert_eq!(per_model.len(), 2, "should have one entry per model");
     assert_eq!(per_model[0]["model"], "model-a");
-    assert_eq!(per_model[0]["hits"][0]["note_id"], id1.to_string());
+    assert_eq!(per_model[0]["hits"][0]["id"], id1.to_string());
     assert_eq!(per_model[1]["model"], "model-b");
-    assert_eq!(per_model[1]["hits"][0]["note_id"], id2.to_string());
+    assert_eq!(per_model[1]["hits"][0]["id"], id2.to_string());
 }
 
 #[test]

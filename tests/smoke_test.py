@@ -503,7 +503,7 @@ def memory_smoke():
             "memory_type": "semantic",
         })
         assert mem is not None, "memory.remember must return a result"
-        mem_id = mem.get("id") or mem.get("note_id")
+        mem_id = mem["id"]
         assert mem_id, f"memory.remember must return an id: {mem}"
         print(f"  [memory] memory.remember — id {str(mem_id)[:8]}...")
 

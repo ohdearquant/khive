@@ -49,7 +49,7 @@ All three score fields are bounded to `[0.0, 1.0]`. Pass `include_breakdown=true
 per-component `breakdown` field (relevance, salience contributions, temporal).
 
 Treat higher-ranked hits as more relevant, not automatically true. When a hit matters, carry forward
-its `note_id` in your notes or response so it can be inspected later.
+its `id` in your notes or response so it can be inspected later.
 
 ### 4. Adjust thresholds only after the first pass
 

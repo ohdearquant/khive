@@ -104,7 +104,7 @@ memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, tag
 Semantically equivalent to:
 
 ```
-1. note_id = create(
+1. id = create(
      kind = "memory",
      content = content,
      salience = <salience | (episodic: 0.3, semantic: 0.5)>,
@@ -115,7 +115,7 @@ Semantically equivalent to:
    )
 
 2. if source_id is provided:
-     link(source_id = note_id, target_id = source_id, relation = "annotates")
+     link(source_id = id, target_id = source_id, relation = "annotates")
 ```
 
 The handler validates: (a) `content` non-empty, (b) `memory_type ∈ {episodic, semantic}`
