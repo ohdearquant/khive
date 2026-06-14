@@ -88,6 +88,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-053](ADR-053-authorization-gate.md)                 | Authorization Gate — ActorStore, SessionStore, and Cloud-Tier Caller Propagation (Proposed)                     |
 | [ADR-054](ADR-054-ann-build-strategy-scaling-limits.md)  | ANN Build Strategy and Scaling Limits (Proposed)                                                                |
 | [ADR-055](ADR-055-epistemic-edge-relations.md)           | Epistemic Edge Relations — `supports` and `refutes` (Accepted)                                                  |
+| [ADR-056](ADR-056-channel-transport-layer.md)            | Channel Transport Layer — `khive-channel` and External Messaging Adapters (Proposed)                            |
 
 ## Closed Taxonomies — Quick Reference
 
