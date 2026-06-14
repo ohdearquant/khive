@@ -17,7 +17,6 @@ HTML reports are written to `target/criterion/`.
 | Group                           | Scenario                      | What Is Measured                                  |
 | ------------------------------- | ----------------------------- | ------------------------------------------------- |
 | `build/sequential`              | Sequential insert (1K, 5K)    | Index construction time only (vectors pre-built)  |
-| `build/batch`                   | `build_batch` (1K, 5K)        | Parallel batch index build time only              |
 | `search/n5k_kN`                 | Single-query search (k=10,50) | Per-query latency on a 5K-vector index            |
 | `search/n5k_kN_with_ctx`        | Context-reuse search          | Per-query latency with reused `HnswSearchContext` |
 | `search_quantized/n5k_k10_int8` | INT8 two-phase                | Per-query latency with INT8 pre-filter enabled    |
