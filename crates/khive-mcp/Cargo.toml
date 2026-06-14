@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

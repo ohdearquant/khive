@@ -23,6 +23,18 @@ use tokio::net::{UnixListener, UnixStream};
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Wire protocol version for the daemon IPC framing.
+///
+/// Increment this constant whenever the request or response frame shape
+/// changes in a backward-incompatible way. The client sends its version
+/// in every request; the daemon rejects mismatches with an explicit error
+/// that names both sides so the operator knows exactly what to do
+/// (`make local` rebuilds the client binary).
+///
+/// Version history:
+///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`)
+pub const PROTOCOL_VERSION: u32 = 1;
+
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
@@ -71,6 +83,11 @@ pub struct DaemonRequestFrame {
     /// dispatches through the broader default daemon. See ADR-027 / ADR-049.
     #[serde(default)]
     pub config_id: String,
+    /// IPC protocol version sent by the client. Pre-versioning clients omit
+    /// this field (deserializes to 0). The daemon compares against
+    /// [`PROTOCOL_VERSION`] and rejects mismatches with an explicit error.
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -93,6 +110,17 @@ pub struct DaemonResponseFrame {
     /// trust a still-warm legacy daemon's broader registry.
     #[serde(default)]
     pub served_config_id: Option<String>,
+    /// Set when the client's `protocol_version` does not match the daemon's
+    /// [`PROTOCOL_VERSION`]. The client must treat this as a hard error and
+    /// surface the human-readable `error` field rather than falling back to
+    /// local dispatch (which would hide the version skew).
+    #[serde(default)]
+    pub version_mismatch: bool,
+    /// The daemon's [`PROTOCOL_VERSION`], echoed in error responses so the
+    /// client can include both sides in the diagnostic message. Pre-versioning
+    /// daemons omit this field (deserializes to 0).
+    #[serde(default)]
+    pub daemon_protocol_version: u32,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -179,7 +207,28 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
     };
 
     let served_config_id = Some(dispatcher.config_id().to_string());
-    let resp = if frame.namespace != dispatcher.namespace() {
+    let resp = if frame.protocol_version != PROTOCOL_VERSION {
+        let msg = format!(
+            "daemon protocol mismatch: client={} daemon={} — \
+             rebuild/update the client binary (make local)",
+            frame.protocol_version, PROTOCOL_VERSION,
+        );
+        tracing::warn!(
+            client_version = frame.protocol_version,
+            daemon_version = PROTOCOL_VERSION,
+            "daemon protocol version mismatch"
+        );
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(msg),
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id,
+            version_mismatch: true,
+            daemon_protocol_version: PROTOCOL_VERSION,
+        }
+    } else if frame.namespace != dispatcher.namespace() {
         DaemonResponseFrame {
             ok: false,
             result: None,
@@ -187,6 +236,8 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             namespace_mismatch: true,
             config_mismatch: false,
             served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
         }
     } else if frame.config_id != dispatcher.config_id() {
         DaemonResponseFrame {
@@ -196,6 +247,8 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
         }
     } else {
         match dispatcher
@@ -209,6 +262,8 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
             },
             Err(e) => DaemonResponseFrame {
                 ok: false,
@@ -217,6 +272,8 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
             },
         }
     };
