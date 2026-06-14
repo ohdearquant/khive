@@ -450,11 +450,11 @@ async fn handle_recall(args):
 ```text
 async fn handle_remember(args):
     registry = self.runtime.embedders()
-    note_id  = self.runtime.create_note(args.content, ...)
+    id = self.runtime.create_note(args.content, ...)
 
     embeddings = registry.embed_document_all(args.content)  # document_prefix applied per D1
     for (cfg, vector) in embeddings:
-        self.runtime.upsert_vector(args.namespace, cfg.name, note_id, vector)
+        self.runtime.upsert_vector(args.namespace, cfg.name, id, vector)
 ```
 
 **Per-engine normalization** (`noise_floor`, `max_similarity`, `threshold` from `EngineConfig`):
