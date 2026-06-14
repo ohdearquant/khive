@@ -1013,4 +1013,11 @@ mod tests {
     fn argv_daemon_false_empty_string() {
         assert!(!argv_is_khive_daemon(""));
     }
+
+    #[test]
+    fn argv_daemon_true_with_surrounding_and_inner_whitespace() {
+        assert!(argv_is_khive_daemon(
+            "  /Users/x/.cargo/bin/kkernel   mcp    --daemon  "
+        ));
+    }
 }
