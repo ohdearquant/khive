@@ -530,6 +530,192 @@ def memory_smoke():
         proc.wait(timeout=5)
 
 
+def epistemic_smoke():
+    """E2E smoke test for supports/refutes epistemic edge relations (ADR-055).
+
+    Endpoint contract (ADR-055 §"Secondary rail: Entity→Entity" and ADR-002
+    §"Epistemic relations"):
+
+    Entity-form legal pairs (source → target):
+      concept  → concept   (operations.rs:212,216)
+      document → concept   (operations.rs:213,217)
+      dataset  → concept   (operations.rs:214,218)
+      artifact → concept   (operations.rs:215,219)
+
+    Note-form: any note kind → any note kind (substrate-level, operations.rs:702).
+
+    Illegal: document → document is rejected because target is not concept
+    (operations.rs:695-699).
+
+    Direction: source = evidence, target = claim. NOT symmetric.
+    (ADR-055 §"Direction and symmetry")
+    """
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    proc = subprocess.Popen(
+        [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "epistemic-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # --- entity-form: document → concept (supports) ---
+        # ADR-055 §"Secondary rail": document is a legal evidence source; concept is
+        # the only legal entity-form claim target.
+        claim = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "name": "EpistemicClaim",
+            "description": "Hypothesis: epistemic edges work",
+        })
+        claim_id = claim["id"]
+
+        paper = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "document",
+            "name": "EpistemicEvidencePaper",
+            "properties": {"authors": "Test et al.", "year": 2024},
+        })
+        paper_id = paper["id"]
+
+        sup_edge = call_verb(proc, "link", {
+            "source_id": paper_id,
+            "target_id": claim_id,
+            "relation": "supports",
+            "weight": 0.9,
+        })
+        assert sup_edge["relation"] == "supports", f"expected supports, got: {sup_edge}"
+        sup_edge_id = sup_edge["id"]
+        print(f"  [epistemic] link document -[supports]-> concept — ok")
+
+        # Verify via neighbors(direction=in) on the claim: the paper must appear as
+        # an inbound supports neighbor.  Direction=in means "edges INTO the node"
+        # i.e. source→node; the evidence paper is the source. (ADR-055: query the
+        # inverse with direction=in, exactly as for every other directional relation.)
+        nbrs_in = call_verb(proc, "neighbors", {
+            "node_id": claim_id,
+            "direction": "in",
+            "relations": ["supports"],
+        })
+        nbr_ids = [n.get("id", "") for n in nbrs_in]
+        assert any(nid == paper_id or nid.startswith(paper_id) for nid in nbr_ids), (
+            f"paper must appear as inbound supports neighbor of claim; got: {nbr_ids}"
+        )
+        print(f"  [epistemic] neighbors(direction=in, supports) sees evidence paper — ok")
+
+        # Confirm via get that the edge fields are correct
+        fetched_edge = call_verb(proc, "get", {"id": sup_edge_id})
+        assert fetched_edge["kind"] == "edge", f"expected kind=edge: {fetched_edge}"
+        assert fetched_edge["relation"] == "supports", f"expected supports relation: {fetched_edge}"
+        print(f"  [epistemic] get supports edge — ok")
+
+        # --- entity-form: document → concept (refutes) ---
+        counter = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "document",
+            "name": "EpistemicCounterEvidencePaper",
+        })
+        counter_id = counter["id"]
+
+        ref_edge = call_verb(proc, "link", {
+            "source_id": counter_id,
+            "target_id": claim_id,
+            "relation": "refutes",
+            "weight": 0.7,
+        })
+        assert ref_edge["relation"] == "refutes", f"expected refutes, got: {ref_edge}"
+        print(f"  [epistemic] link document -[refutes]-> concept — ok")
+
+        # Verify both edges are visible together as inbound neighbors
+        nbrs_both = call_verb(proc, "neighbors", {
+            "node_id": claim_id,
+            "direction": "in",
+        })
+        all_neighbor_ids = [n.get("id", "") for n in nbrs_both]
+        assert any(nid == paper_id or nid.startswith(paper_id) for nid in all_neighbor_ids), (
+            f"supports paper must appear in combined inbound neighbors: {all_neighbor_ids}"
+        )
+        assert any(nid == counter_id or nid.startswith(counter_id) for nid in all_neighbor_ids), (
+            f"refutes paper must appear in combined inbound neighbors: {all_neighbor_ids}"
+        )
+        print(f"  [epistemic] neighbors(direction=in) sees both supports + refutes evidence — ok")
+
+        # --- note-form: observation -[supports]-> question (Note→Note rail) ---
+        # ADR-055 §"Primary rail: Note→Note": any note kind → any note kind,
+        # enforced at substrate level (operations.rs:702).
+        finding_note = call_verb(proc, "create", {
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "Experiment result confirms the hypothesis with p<0.001",
+        })
+        finding_id = finding_note["id"]
+
+        hypothesis_note = call_verb(proc, "create", {
+            "kind": "note",
+            "note_kind": "question",
+            "content": "Does epistemic edge feature work correctly?",
+        })
+        hypothesis_id = hypothesis_note["id"]
+
+        note_sup_edge = call_verb(proc, "link", {
+            "source_id": finding_id,
+            "target_id": hypothesis_id,
+            "relation": "supports",
+            "weight": 0.85,
+        })
+        assert note_sup_edge["relation"] == "supports", (
+            f"Note→Note supports edge must succeed: {note_sup_edge}"
+        )
+        print(f"  [epistemic] link observation -[supports]-> question (Note→Note rail) — ok")
+
+        # --- NEGATIVE case: document -[supports]-> document must be REJECTED ---
+        # ADR-055 §"Secondary rail": target must be concept for entity-form.
+        # document → document is rejected because document is not concept.
+        # Error from operations.rs:695-699: "(document) -[supports]-> (document) is not
+        # in the base endpoint allowlist; supports requires concept|document|dataset|artifact
+        # -> concept (or same-substrate note -> note)"
+        other_doc = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "document",
+            "name": "EpistemicDocTarget",
+        })
+        other_doc_id = other_doc["id"]
+
+        ops_neg = json.dumps([{"tool": "link", "args": {
+            "source_id": paper_id,
+            "target_id": other_doc_id,
+            "relation": "supports",
+        }}])
+        body_neg = _call_request_raw(proc, ops_neg)
+        results_neg = body_neg.get("results") or []
+        assert results_neg, f"expected at least one result entry in batch response: {body_neg}"
+        neg_result = results_neg[0]
+        assert not neg_result.get("ok", True), (
+            f"document -[supports]-> document must be rejected (target must be concept); "
+            f"got ok=True: {neg_result}"
+        )
+        err_msg = neg_result.get("error", "")
+        assert "allowlist" in err_msg or "concept" in err_msg, (
+            f"rejection error must mention 'allowlist' or 'concept'; got: {err_msg!r}"
+        )
+        print(f"  [epistemic] document -[supports]-> document rejected (target not concept) — ok")
+
+        print(f"\n  EPISTEMIC SMOKE TESTS PASSED (ADR-055)")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
 if __name__ == "__main__":
     code = main()
     if code == 0 and os.environ.get("KHIVE_SMOKE_GTD", "1") != "0":
@@ -544,4 +730,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [memory FAIL] {e}")
             code = 3
+    if code == 0 and os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
+        try:
+            epistemic_smoke()
+        except Exception as e:
+            print(f"  [epistemic FAIL] {e}")
+            code = 4
     sys.exit(code)

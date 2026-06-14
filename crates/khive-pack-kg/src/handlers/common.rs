@@ -471,7 +471,7 @@ pub(crate) async fn enrich_allowlist_error(
         Err(_) => return original.to_string(),
     };
     let valid = valid_relations_for_entity_pair(&src_kind, &tgt_kind);
-    if valid.is_empty() {
+    let mut msg = if valid.is_empty() {
         format!(
             "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
              No valid relations exist for {src_kind}\u{2192}{tgt_kind} in the current edge rules.",
@@ -484,7 +484,18 @@ pub(crate) async fn enrich_allowlist_error(
             relation.as_str(),
             valid.join(", ")
         )
+    };
+    // supports/refutes accept a kind-restricted entity target (ADR-055); the
+    // generic valid-relations list alone reads as "wrong relation" when the
+    // actual fix is a concept target, so name the requirement explicitly.
+    if matches!(relation, EdgeRelation::Supports | EdgeRelation::Refutes) {
+        msg.push_str(&format!(
+            " (note: {} on entities requires a concept target: \
+             concept|document|dataset|artifact\u{2192}concept)",
+            relation.as_str()
+        ));
     }
+    msg
 }
 
 pub(crate) const IMMUTABLE_EVENT_MSG: &str =
