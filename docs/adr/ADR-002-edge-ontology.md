@@ -24,7 +24,10 @@ classification ambiguity.
 
 ## Decision
 
-**15 canonical relations, grouped into 8 categories. No others.**
+**17 canonical relations, grouped into 9 categories. No others.**
+
+> **Amended 2026-06-14 ([ADR-055](ADR-055-epistemic-edge-relations.md))**: added Category 9
+> (Epistemic / Evidential) with `supports` and `refutes`, expanding the closed set from 15 → 17.
 
 ### Category 1: Structure (composition and classification)
 
@@ -80,6 +83,17 @@ classification ambiguity.
 | Relation    | Direction       | When                                                     |
 | ----------- | --------------- | -------------------------------------------------------- |
 | `annotates` | note → anything | A note comments on an entity, edge, event, or other note |
+
+### Category 9: Epistemic / Evidential (evidence for/against a claim)
+
+Added by [ADR-055](ADR-055-epistemic-edge-relations.md). The relation carries the **polarity**
+(for vs. against); the edge **weight** carries the **strength** of the evidential link on the
+standard scale. Directional (evidence → claim), **not** symmetric.
+
+| Relation   | Direction        | When                                                            |
+| ---------- | ---------------- | --------------------------------------------------------------- |
+| `supports` | evidence → claim | Evidence **for** the claim (corroborates, confirms, replicates) |
+| `refutes`  | evidence → claim | Evidence **against** the claim (contradicts, falsifies)         |
 
 ### `supersedes` vs `precedes`
 
@@ -152,7 +166,7 @@ allowlist but cannot remove base rules.
 1. Resolve source and target substrate (Entity | Note | Edge | Event)
 2. Apply substrate-level contract:
    - annotates: source must be Note, target may be any substrate UUID
-   - supersedes: same substrate (Note→Note or Entity→Entity)
+   - supersedes, supports, refutes: same substrate (Note→Note or Entity→Entity)
    - all other base relations: Entity→Entity unless explicitly stated
 3. If both endpoints are entities, resolve EntityKind for both
 4. Check base allowlist
@@ -256,6 +270,30 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 `annotates` is the only relation that crosses substrate kinds. Source is always a note.
 Target may be any existing UUID (entity, note, event, edge) in the caller's namespace.
 
+#### Epistemic relations (added by ADR-055)
+
+`supports` and `refutes` are **same-substrate** (Note→Note or Entity→Entity), like
+`supersedes`. They do **not** cross substrates — `annotates` remains the only relation that does.
+
+Entity form (kind-restricted). The claim is a `concept`; evidence may be a concept, document,
+dataset, or artifact:
+
+| Source     | Relation   | Target    |
+| ---------- | ---------- | --------- |
+| `Concept`  | `supports` | `Concept` |
+| `Document` | `supports` | `Concept` |
+| `Dataset`  | `supports` | `Concept` |
+| `Artifact` | `supports` | `Concept` |
+| `Concept`  | `refutes`  | `Concept` |
+| `Document` | `refutes`  | `Concept` |
+| `Dataset`  | `refutes`  | `Concept` |
+| `Artifact` | `refutes`  | `Concept` |
+
+Note form (substrate-level, any note kind → any note kind): a finding-note `supports`/`refutes`
+a hypothesis-note. Enforced at the substrate level like `supersedes`, not in the kind allowlist.
+
+Event and edge endpoints are invalid for `supports`/`refutes`.
+
 #### KG pack extensions (added v0.2.4)
 
 The KG pack extends the base endpoint contract via `EDGE_RULES` to cover
@@ -350,13 +388,14 @@ No dangling references.
 
 For provenance/lineage-sensitive relations, hard-delete cascade emits a warning event:
 
-| Relation       | Cascade behavior                                    |
-| -------------- | --------------------------------------------------- |
-| `derived_from` | cascade edge; emit provenance-loss warning          |
-| `supersedes`   | cascade edge; emit replacement-lineage-loss warning |
-| `precedes`     | cascade edge; emit temporal-sequence-loss warning   |
-| `annotates`    | cascade as documented                               |
-| others         | cascade normally                                    |
+| Relation               | Cascade behavior                                    |
+| ---------------------- | --------------------------------------------------- |
+| `derived_from`         | cascade edge; emit provenance-loss warning          |
+| `supersedes`           | cascade edge; emit replacement-lineage-loss warning |
+| `precedes`             | cascade edge; emit temporal-sequence-loss warning   |
+| `supports` / `refutes` | cascade edge; emit evidential-link-loss warning     |
+| `annotates`            | cascade as documented                               |
+| others                 | cascade normally                                    |
 
 No hard blocks on delete. If stronger provenance guarantees are needed later, add tombstones
 or immutable lineage records in a separate ADR.
@@ -369,20 +408,28 @@ Open ontologies fail in practice. Real-world KGs accumulate hundreds of near-syn
 relations, making queries impossible. The cost of "rejection at write time" is far lower
 than "untangling synonyms at query time."
 
-### Why 15 specifically?
+### Why 17 specifically?
 
-The original 13 covered 6 query classes. The expansion adds two:
+The original 13 covered 6 query classes. The first expansion (→ 15) added two:
 
 - **Provenance queries** ("what was this artifact generated from") need `derived_from`.
   Previously approximated by `depends_on` or `extends`, both semantically wrong.
 - **Temporal queries** ("what came before this, without implying replacement") need
   `precedes`. Previously approximated by `supersedes`, which carries a replacement judgment.
 
-### Why 8 categories?
+The second expansion (→ 17, [ADR-055](ADR-055-epistemic-edge-relations.md)) adds the
+**Epistemic** category:
 
-Each category serves a distinct query class. Single-relation categories (Implementation,
-Annotation, Provenance, Temporal) are justified because the relation within each answers a
-question no other category covers. Category count is driven by query semantics, not by
+- **Evidential queries** ("what is the evidence for and against claim X, and how strong") need
+  `supports` and `refutes`. Previously approximated by `annotates`, which is polarity-blind and
+  does not connect two entities. The relation choice carries polarity; the weight carries
+  strength. This is the signal a confidence model consumes.
+
+### Why 9 categories?
+
+Each category serves a distinct query class. Single- or two-relation categories (Implementation,
+Annotation, Provenance, Temporal, Epistemic) are justified because the relation(s) within each
+answer a question no other category covers. Category count is driven by query semantics, not by
 balancing relation counts.
 
 ### Why no auto-inverse?
@@ -410,6 +457,7 @@ pub enum EdgeCategory {
     Implementation,
     Lateral,
     Annotation,
+    Epistemic,
 }
 
 pub enum EdgeRelation {
@@ -429,6 +477,8 @@ pub enum EdgeRelation {
     CompetesWith, ComposedWith,
     // Annotation
     Annotates,
+    // Epistemic
+    Supports, Refutes,
 }
 ```
 

@@ -258,6 +258,11 @@ When you `link` nodes, use ONLY these relations:
 
 - `annotates` — a note observes/comments on an entity (or another note)
 
+### Epistemic
+
+- `supports` — evidence for a claim (evidence → claim; weight = strength); same-substrate
+- `refutes` — evidence against a claim (evidence → claim; weight = strength); same-substrate
+
 **Why closed**: a sparse ontology stays queryable. Ad-hoc relations (`uses`, `related_to`,
 `loaded_by`) fragment the graph and make traversal useless. If your relationship doesn't fit, it's
 probably a property on the entity, not an edge.
