@@ -548,7 +548,7 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
         "query": "unique_token_abc",
         "limit": 20,
     })
-    hit_note_ids = [h.get("id", h.get("note_id", "")) for h in hits]
+    hit_note_ids = [h.get("id", "") for h in hits]
 
     assert old_id not in hit_note_ids, (
         f"Superseded note (old_id={old_id}) should be excluded from search, "

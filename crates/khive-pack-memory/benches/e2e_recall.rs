@@ -160,7 +160,7 @@ async fn run_recall_inner(
     };
     let ids: Vec<String> = arr
         .iter()
-        .filter_map(|m| m["note_id"].as_str().map(|s| s.to_string()))
+        .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
         .collect();
     Ok((elapsed, ids))
 }

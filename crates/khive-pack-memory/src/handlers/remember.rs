@@ -143,7 +143,7 @@ impl MemoryPack {
         };
 
         let mut response = json!({
-            "note_id": note.id.to_string(),
+            "id": note.id.to_string(),
             "kind": note.kind,
             "salience": note.salience,
             "decay_factor": note.decay_factor,

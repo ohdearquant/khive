@@ -155,7 +155,7 @@ def test_note_supersession_search_excludes_old_but_get_keeps_both(
         "limit": 20,
         "namespace": temp_namespace,
     })
-    hit_ids = [h.get("id", h.get("note_id", "")) for h in hits]
+    hit_ids = [h.get("id", "") for h in hits]
 
     assert old_id not in hit_ids, (
         f"Superseded note (old_id={old_id}) should be excluded from search, "

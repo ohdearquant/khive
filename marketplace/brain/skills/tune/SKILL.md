@@ -12,19 +12,19 @@ drifted and you want to return to the prior.
 
 ### 1. Emit explicit feedback on a recalled memory
 
-After a `recall` call returns a memory, note its `note_id` from the result. Emit feedback with one
+After a `recall` call returns a memory, note its `id` from the result. Emit feedback with one
 of eight signals:
 
-| Signal | Meaning |
-| --- | --- |
-| `useful` | Memory was relevant and helpful |
-| `not_useful` | Memory was returned but unhelpful |
-| `wrong` | Memory content was incorrect (strongest negative) |
-| `explicit_positive` | Strong positive signal (equivalent to `useful`) |
+| Signal              | Meaning                                             |
+| ------------------- | --------------------------------------------------- |
+| `useful`            | Memory was relevant and helpful                     |
+| `not_useful`        | Memory was returned but unhelpful                   |
+| `wrong`             | Memory content was incorrect (strongest negative)   |
+| `explicit_positive` | Strong positive signal (equivalent to `useful`)     |
 | `explicit_negative` | Strong negative signal (equivalent to `not_useful`) |
-| `implicit_positive` | Weak positive signal inferred from agent behavior |
-| `implicit_negative` | Weak negative signal inferred from agent behavior |
-| `correction` | Memory was returned with errors that were corrected |
+| `implicit_positive` | Weak positive signal inferred from agent behavior   |
+| `implicit_negative` | Weak negative signal inferred from agent behavior   |
+| `correction`        | Memory was returned with errors that were corrected |
 
 `target_id` must be the **full UUID** of the memory note — short prefix IDs are not accepted.
 
@@ -112,7 +112,7 @@ prior (~0.7 for relevance, ~0.2 for salience, ~0.1 for temporal with the default
 ## Anti-patterns
 
 - **Using a short UUID prefix for `target_id`.** `brain.feedback` requires the full UUID — short
-  prefix IDs are rejected. Use the complete `note_id` from the recall response.
+  prefix IDs are rejected. Use the complete `id` from the recall response.
 - **Resetting during an active session.** Reset discards posteriors accumulated during the current
   session. Use it between sessions or after deliberate behavioral experiments.
 - **Over-emitting wrong signal.** A single `wrong` event is sufficient; duplicate signals on the

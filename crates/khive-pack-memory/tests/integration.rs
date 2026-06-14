@@ -46,7 +46,7 @@ async fn test_remember_recall_smoke() {
         .await
         .expect("memory.remember succeeds");
 
-    let note_id = result["note_id"].as_str().expect("has note_id");
+    let note_id = result["id"].as_str().expect("has note_id");
     assert!(!note_id.is_empty());
 
     let recall_result = registry
@@ -59,7 +59,7 @@ async fn test_remember_recall_smoke() {
 
     let hits = recall_result.as_array().expect("array of hits");
     assert!(!hits.is_empty(), "recall returned at least one result");
-    let first_id = hits[0]["note_id"].as_str().unwrap();
+    let first_id = hits[0]["id"].as_str().unwrap();
     assert_eq!(first_id, note_id, "recalled the memory we just created");
 }
 
@@ -84,7 +84,7 @@ async fn test_recall_decay_ranking() {
         )
         .await
         .expect("fresh remember");
-    let fresh_id = fresh["note_id"].as_str().unwrap().to_string();
+    let fresh_id = fresh["id"].as_str().unwrap().to_string();
 
     // Create old memory (simulate 90 days ago) with high decay
     let old = registry
@@ -98,7 +98,7 @@ async fn test_recall_decay_ranking() {
         )
         .await
         .expect("old remember");
-    let old_id = old["note_id"].as_str().unwrap().to_string();
+    let old_id = old["id"].as_str().unwrap().to_string();
 
     // Manually backdate the old note to simulate age
     let old_uuid: uuid::Uuid = old_id.parse().unwrap();
@@ -132,7 +132,7 @@ async fn test_recall_decay_ranking() {
         .iter()
         .map(|h| {
             (
-                h["note_id"].as_str().unwrap(),
+                h["id"].as_str().unwrap(),
                 h["rank_score"].as_f64().unwrap_or(0.0),
             )
         })
@@ -173,7 +173,7 @@ async fn test_recall_salience_ranking() {
         )
         .await
         .expect("high salience remember");
-    let high_id = high["note_id"].as_str().unwrap().to_string();
+    let high_id = high["id"].as_str().unwrap().to_string();
 
     let low = registry
         .dispatch(
@@ -186,7 +186,7 @@ async fn test_recall_salience_ranking() {
         )
         .await
         .expect("low salience remember");
-    let low_id = low["note_id"].as_str().unwrap().to_string();
+    let low_id = low["id"].as_str().unwrap().to_string();
 
     let recall_result = registry
         .dispatch(
@@ -201,7 +201,7 @@ async fn test_recall_salience_ranking() {
         .iter()
         .map(|h| {
             (
-                h["note_id"].as_str().unwrap(),
+                h["id"].as_str().unwrap(),
                 h["rank_score"].as_f64().unwrap_or(0.0),
             )
         })
@@ -250,7 +250,7 @@ async fn test_recall_memory_type_filter() {
         )
         .await
         .expect("semantic remember");
-    let semantic_id = semantic["note_id"].as_str().unwrap().to_string();
+    let semantic_id = semantic["id"].as_str().unwrap().to_string();
 
     let filtered = registry
         .dispatch(
@@ -266,10 +266,7 @@ async fn test_recall_memory_type_filter() {
         let mt = hit["memory_type"].as_str().unwrap_or("");
         assert_eq!(mt, "semantic", "only semantic results returned");
     }
-    let ids: Vec<&str> = hits
-        .iter()
-        .map(|h| h["note_id"].as_str().unwrap())
-        .collect();
+    let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
     assert!(
         ids.contains(&semantic_id.as_str()),
         "semantic note is in results"
@@ -315,11 +312,7 @@ async fn test_remember_source_id_not_in_properties() {
         .await
         .expect("remember with source_id");
 
-    let note_id: Uuid = result["note_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .expect("valid uuid");
+    let note_id: Uuid = result["id"].as_str().unwrap().parse().expect("valid uuid");
 
     let note_store = rt
         .notes(&rt.authorize(Namespace::local()).unwrap())
@@ -358,11 +351,7 @@ async fn test_remember_decay_factor_no_upper_cap() {
         .await
         .expect("remember with decay_factor > 1.0 should succeed");
 
-    let note_id: Uuid = result["note_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .expect("valid uuid");
+    let note_id: Uuid = result["id"].as_str().unwrap().parse().expect("valid uuid");
 
     let note_store = rt
         .notes(&rt.authorize(Namespace::local()).unwrap())
@@ -415,11 +404,7 @@ async fn test_remember_default_memory_type_written_to_properties() {
         .await
         .expect("remember without memory_type");
 
-    let note_id: Uuid = result["note_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .expect("valid uuid");
+    let note_id: Uuid = result["id"].as_str().unwrap().parse().expect("valid uuid");
 
     // The response must carry memory_type
     assert_eq!(
@@ -503,8 +488,8 @@ async fn test_recall_rerank_passthrough_with_no_active_rerankers() {
     let registry = make_registry(rt);
 
     let candidates = json!([
-        { "note_id": "00000000-0000-0000-0000-000000000001", "fused_score": 0.8 },
-        { "note_id": "00000000-0000-0000-0000-000000000002", "fused_score": 0.6 },
+        { "id": "00000000-0000-0000-0000-000000000001", "fused_score": 0.8 },
+        { "id": "00000000-0000-0000-0000-000000000002", "fused_score": 0.6 },
     ]);
 
     let result = registry
@@ -566,7 +551,7 @@ async fn test_recall_candidates_returns_arrays() {
 
     let text = result["text_candidates"].as_array().expect("text array");
     assert!(!text.is_empty());
-    assert!(text[0]["note_id"].as_str().is_some());
+    assert!(text[0]["id"].as_str().is_some());
     assert!(text[0]["score"].as_f64().is_some());
     assert!(text[0]["rank"].as_u64().is_some());
     assert!(result["candidate_limit"].as_u64().is_some());
@@ -808,10 +793,7 @@ async fn test_recall_fuse_shape_preserved_after_retrieval_wiring() {
     assert!(!fused.is_empty(), "fused_candidates must be non-empty");
 
     let c = &fused[0];
-    assert!(
-        c["note_id"].as_str().is_some(),
-        "note_id must be a string UUID"
-    );
+    assert!(c["id"].as_str().is_some(), "note_id must be a string UUID");
     assert!(
         c["fused_score"].as_f64().is_some(),
         "fused_score must be a float"
@@ -928,8 +910,8 @@ async fn test_recall_excludes_non_memory_notes() {
         )
         .await
         .expect("remember 2");
-    let mem1_id = mem1["note_id"].as_str().unwrap().to_string();
-    let mem2_id = mem2["note_id"].as_str().unwrap().to_string();
+    let mem1_id = mem1["id"].as_str().unwrap().to_string();
+    let mem2_id = mem2["id"].as_str().unwrap().to_string();
 
     let result = registry
         .dispatch(
@@ -944,10 +926,7 @@ async fn test_recall_excludes_non_memory_notes() {
         !hits.is_empty(),
         "recall should return memory notes even when non-memory notes dominate the index"
     );
-    let ids: Vec<&str> = hits
-        .iter()
-        .map(|h| h["note_id"].as_str().unwrap())
-        .collect();
+    let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
     assert!(
         ids.contains(&mem1_id.as_str()) || ids.contains(&mem2_id.as_str()),
         "at least one memory note must appear in recall results"
@@ -955,7 +934,7 @@ async fn test_recall_excludes_non_memory_notes() {
     for hit in hits {
         // recall must never surface observation or other non-memory kinds
         assert!(
-            hit.get("note_id").is_some(),
+            hit.get("id").is_some(),
             "hit has note_id field (memory pack shape)"
         );
         assert!(
@@ -1138,8 +1117,8 @@ async fn test_recall_default_identity() {
     // shifts the ranking or rescaling.
     for (i, (b, k)) in base_hits.iter().zip(knobless_hits.iter()).enumerate() {
         assert_eq!(
-            b["note_id"].as_str(),
-            k["note_id"].as_str(),
+            b["id"].as_str(),
+            k["id"].as_str(),
             "null knobs altered note_id at position {i}"
         );
         // Scores must round-trip; allow tiny float jitter
@@ -1360,7 +1339,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
         .as_array()
         .expect("array")
         .iter()
-        .map(|h| h["note_id"].as_str().unwrap().to_string())
+        .map(|h| h["id"].as_str().unwrap().to_string())
         .collect();
 
     let with_empty_reranker = registry
@@ -1377,7 +1356,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
         .as_array()
         .expect("array")
         .iter()
-        .map(|h| h["note_id"].as_str().unwrap().to_string())
+        .map(|h| h["id"].as_str().unwrap().to_string())
         .collect();
 
     assert_eq!(
@@ -1431,7 +1410,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
         )
         .await
         .expect("high salience remember");
-    let high_id = high_salience["note_id"].as_str().unwrap().to_string();
+    let high_id = high_salience["id"].as_str().unwrap().to_string();
 
     // Step 1: baseline recall — pure relevance scoring (salience_weight=0) so
     // BM25-heavy low-salience notes rank first.
@@ -1457,7 +1436,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     );
     let baseline_ids: Vec<String> = baseline_hits
         .iter()
-        .map(|h| h["note_id"].as_str().unwrap().to_string())
+        .map(|h| h["id"].as_str().unwrap().to_string())
         .collect();
     let baseline_top = &baseline_ids[0];
 
@@ -1486,7 +1465,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     assert!(!reranked_hits.is_empty(), "must get results");
     let reranked_ids: Vec<String> = reranked_hits
         .iter()
-        .map(|h| h["note_id"].as_str().unwrap().to_string())
+        .map(|h| h["id"].as_str().unwrap().to_string())
         .collect();
     let top_id = &reranked_ids[0];
 
@@ -1516,12 +1495,12 @@ async fn test_rerank_subhandler_uses_request_weights() {
     // when relevance weight = 1.0.
     let candidates = json!([
         {
-            "note_id": "00000000-0000-0000-0000-000000000001",
+            "id": "00000000-0000-0000-0000-000000000001",
             "fused_score": 0.9,
             "source": "both"
         },
         {
-            "note_id": "00000000-0000-0000-0000-000000000002",
+            "id": "00000000-0000-0000-0000-000000000002",
             "fused_score": 0.3,
             "source": "text"
         }
@@ -1547,7 +1526,7 @@ async fn test_rerank_subhandler_uses_request_weights() {
     let score_for = |id: &str| -> f64 {
         reranked
             .iter()
-            .find(|c| c["note_id"].as_str() == Some(id))
+            .find(|c| c["id"].as_str() == Some(id))
             .and_then(|c| c["rerank_score"].as_f64())
             .unwrap_or(f64::NAN)
     };
@@ -1616,7 +1595,7 @@ async fn test_remember_source_id_accepts_short_id() {
         .await
         .expect("remember with 8-char short source_id must succeed");
 
-    let note_id_str = result["note_id"].as_str().expect("has note_id");
+    let note_id_str = result["id"].as_str().expect("has note_id");
 
     // Verify the annotates edge was created: neighbors(note, direction=out) returns
     // an array of NeighborHit; each hit carries "id" (the neighbor's UUID) and "relation".
@@ -1986,7 +1965,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
         .await
         .expect("remember with custom-only embedder must succeed");
 
-    let note_id = result["note_id"].as_str().expect("note_id present");
+    let note_id = result["id"].as_str().expect("note_id present");
     assert!(!note_id.is_empty());
 
     // recall — custom embedder must have participated: at least the text path
@@ -2000,10 +1979,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
         .expect("recall after custom-embedder remember");
 
     let hits = recall_result.as_array().expect("array");
-    let ids: Vec<&str> = hits
-        .iter()
-        .map(|h| h["note_id"].as_str().unwrap())
-        .collect();
+    let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
     assert!(
         ids.contains(&note_id),
         "recall must find the note created via custom embedder; got: {ids:?}"
@@ -2055,7 +2031,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
         .await
         .expect("remember with two custom embedders");
 
-    let note_id = result["note_id"].as_str().expect("note_id");
+    let note_id = result["id"].as_str().expect("note_id");
 
     // Recall with explicit Weighted strategy — text must not be zeroed.
     let recall = registry
@@ -2071,10 +2047,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
         .expect("recall with weighted fusion and 2 vector models");
 
     let hits = recall.as_array().expect("array");
-    let ids: Vec<&str> = hits
-        .iter()
-        .map(|h| h["note_id"].as_str().unwrap())
-        .collect();
+    let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
     assert!(
         ids.contains(&note_id),
         "weighted fusion with N>1 vector models must not zero-weight text — \
@@ -2287,7 +2260,7 @@ async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
 
     // All returned text candidates must be memory-kind notes.
     for tc in text_candidates {
-        let note_id = tc["note_id"].as_str().expect("note_id present");
+        let note_id = tc["id"].as_str().expect("note_id present");
         assert!(
             !note_id.is_empty(),
             "text_candidate note_id must be non-empty"
@@ -2427,7 +2400,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         )
         .await
         .expect("remember impl khive");
-    let impl_khive_id = impl_khive["note_id"].as_str().unwrap().to_owned();
+    let impl_khive_id = impl_khive["id"].as_str().unwrap().to_owned();
 
     let critic_khive = registry
         .dispatch(
@@ -2440,7 +2413,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         )
         .await
         .expect("remember critic khive");
-    let critic_khive_id = critic_khive["note_id"].as_str().unwrap().to_owned();
+    let critic_khive_id = critic_khive["id"].as_str().unwrap().to_owned();
 
     let impl_rust = registry
         .dispatch(
@@ -2453,7 +2426,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         )
         .await
         .expect("remember impl rust");
-    let impl_rust_id = impl_rust["note_id"].as_str().unwrap().to_owned();
+    let impl_rust_id = impl_rust["id"].as_str().unwrap().to_owned();
 
     // no-filter: all three should appear.
     let no_filter = registry
@@ -2467,7 +2440,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|h| h["note_id"].as_str())
+        .filter_map(|h| h["id"].as_str())
         .collect();
     assert!(
         no_filter_ids.contains(&impl_khive_id.as_str()),
@@ -2499,7 +2472,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|h| h["note_id"].as_str())
+        .filter_map(|h| h["id"].as_str())
         .collect();
     assert!(
         any_ids.contains(&critic_khive_id.as_str()),
@@ -2531,7 +2504,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|h| h["note_id"].as_str())
+        .filter_map(|h| h["id"].as_str())
         .collect();
     assert!(
         all_ids.contains(&impl_khive_id.as_str()),
@@ -2906,7 +2879,7 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
     let hits = result.as_array().expect("recall returns array");
     let returned_ids: Vec<&str> = hits
         .iter()
-        .map(|h| h["note_id"].as_str().unwrap_or(""))
+        .map(|h| h["id"].as_str().unwrap_or(""))
         .collect();
     assert!(
         returned_ids.contains(&legacy_id.as_str()),
@@ -2918,7 +2891,7 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
     // Consumers such as ranking explanations and brain.auto_feedback rely on these fields.
     let legacy_hit = hits
         .iter()
-        .find(|h| h["note_id"].as_str().unwrap_or("") == legacy_id)
+        .find(|h| h["id"].as_str().unwrap_or("") == legacy_id)
         .expect("legacy hit present");
 
     let hit_memory_type = legacy_hit["memory_type"]
@@ -3089,7 +3062,7 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
             )
             .await
             .expect("remember");
-        stored_ids.push(res["note_id"].as_str().unwrap().to_owned());
+        stored_ids.push(res["id"].as_str().unwrap().to_owned());
     }
     let id_rank1 = &stored_ids[0];
     let id_rank3 = &stored_ids[2];
@@ -3130,16 +3103,14 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
         returned.len()
     );
 
-    let returned_id = returned[0]["note_id"].as_str().expect("note_id present");
+    let returned_id = returned[0]["id"].as_str().expect("note_id present");
     assert_eq!(
         returned_id, id_rank1,
         "#94 rank-order: the single returned note must be rank #1 ({id_rank1}), got {returned_id}"
     );
 
     // rank #3 must not appear — its presence is the rank-skip signature.
-    let has_rank3 = returned
-        .iter()
-        .any(|r| r["note_id"].as_str() == Some(id_rank3));
+    let has_rank3 = returned.iter().any(|r| r["id"].as_str() == Some(id_rank3));
     assert!(
         !has_rank3,
         "#94 rank-order: rank #3 ({id_rank3}) must NOT be in results — \

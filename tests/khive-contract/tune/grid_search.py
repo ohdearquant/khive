@@ -120,9 +120,9 @@ def setup_session(
             args["tags"] = mem["tags"]
 
         result = session.verb("remember", args)
-        note_id = result.get("note_id") or result.get("id") if result else None
+        note_id = result["id"] if result else None
         if not note_id:
-            raise RuntimeError(f"remember() returned no note_id for memory {i}: {result!r}")
+            raise RuntimeError(f"remember() returned no id for memory {i}: {result!r}")
 
         if version == "v2":
             corpus_key = mem.get("id", str(i))
@@ -223,7 +223,7 @@ def evaluate_config(
         retrieved_ids: list[str] = []
         if isinstance(hits, list):
             for h in hits:
-                nid = h.get("note_id") or h.get("id") if isinstance(h, dict) else None
+                nid = h.get("id") if isinstance(h, dict) else None
                 if nid:
                     retrieved_ids.append(str(nid))
 

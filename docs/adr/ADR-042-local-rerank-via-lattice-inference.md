@@ -82,9 +82,9 @@ the final `rank_score` directly. It is not further blended with RRF/salience/tem
 
 The shipped memory-pack subhandler is:
 
-| Handler                | Visibility | Input                   | Output                                                                   |
-| ---------------------- | ---------- | ----------------------- | ------------------------------------------------------------------------ |
-| `memory.recall_rerank` | Subhandler | `{candidates, config?}` | `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}` |
+| Handler                | Visibility | Input                   | Output                                                              |
+| ---------------------- | ---------- | ----------------------- | ------------------------------------------------------------------- |
+| `memory.recall_rerank` | Subhandler | `{candidates, config?}` | `{reranked: [{id, rerank_scores, rerank_score}], active_rerankers}` |
 
 It is an internal feature-weight subhandler. It does not accept `hook`, `profile_id`, or
 `model_id`, and it does not return `hook_applied`.

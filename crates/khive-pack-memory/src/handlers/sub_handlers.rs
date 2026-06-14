@@ -129,7 +129,7 @@ impl MemoryPack {
             .filter(|hit| memory_ids.contains(&hit.subject_id))
             .map(|hit| {
                 json!({
-                    "note_id": hit.subject_id.to_string(),
+                    "id": hit.subject_id.to_string(),
                     "score": hit.score.to_f64(),
                     "rank": hit.rank,
                     "title": hit.title.as_deref(),
@@ -143,7 +143,7 @@ impl MemoryPack {
             .iter()
             .map(|hit| {
                 json!({
-                    "note_id": hit.subject_id.to_string(),
+                    "id": hit.subject_id.to_string(),
                     "score": hit.score.to_f64(),
                     "rank": hit.rank,
                 })
@@ -166,7 +166,7 @@ impl MemoryPack {
                         .iter()
                         .map(|h| {
                             json!({
-                                "note_id": h.subject_id.to_string(),
+                                "id": h.subject_id.to_string(),
                                 "score": h.score.to_f64(),
                                 "rank": h.rank,
                             })
@@ -244,7 +244,7 @@ impl MemoryPack {
                     }
                 }
                 Some(json!({
-                    "note_id": hit.entity_id.to_string(),
+                    "id": hit.entity_id.to_string(),
                     "fused_score": hit.score.to_f64(),
                     "source": search_source_label(hit.source),
                     "title": hit.title,
@@ -281,13 +281,13 @@ impl MemoryPack {
             .iter()
             .map(|candidate| {
                 let id = candidate
-                    .get("note_id")
+                    .get("id")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
                 if cfg.reranker_weights.is_empty() {
                     return json!({
-                        "note_id": id,
+                        "id": id,
                         "rerank_scores": {},
                         "rerank_score": 0.0_f64,
                     });
@@ -355,7 +355,7 @@ impl MemoryPack {
                 }
 
                 json!({
-                    "note_id": id,
+                    "id": id,
                     "rerank_scores": rerank_scores,
                     "rerank_score": rerank_score,
                 })
