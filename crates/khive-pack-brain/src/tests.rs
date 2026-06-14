@@ -2413,7 +2413,7 @@ async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
             "brain.auto_feedback",
             json!({
                 "query": "recall calibration target",
-                "results": [{ "note_id": target }]
+                "results": [{ "id": target }]
             }),
             &registry,
             &token,
@@ -2481,7 +2481,7 @@ async fn brain_auto_feedback_accepts_short_note_id_prefix() {
             "brain.auto_feedback",
             json!({
                 "query": "prefix resolution test",
-                "results": [{ "note_id": prefix }]
+                "results": [{ "id": prefix }]
             }),
             &registry,
             &token,

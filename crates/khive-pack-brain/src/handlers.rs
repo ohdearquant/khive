@@ -209,7 +209,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects; the first object's note_id is credited.",
+                description: "Recall result objects; the first object's id is credited.",
             },
             khive_types::ParamDef {
                 name: "signal",
@@ -988,7 +988,7 @@ impl BrainPack {
 
         #[derive(Deserialize)]
         struct AutoFeedbackResult {
-            note_id: String,
+            id: String,
         }
 
         let p: AutoFeedbackParams = serde_json::from_value(params)
@@ -1007,7 +1007,7 @@ impl BrainPack {
             }));
         };
 
-        let target = resolve_auto_feedback_target(&self.runtime, token, &first.note_id).await?;
+        let target = resolve_auto_feedback_target(&self.runtime, token, &first.id).await?;
 
         let mut feedback_params = json!({
             "target_id": target.to_string(),
@@ -1352,7 +1352,7 @@ impl BrainPack {
 
 // ── brain.auto_feedback helpers ───────────────────────────────────────────────
 
-/// Resolve a `note_id` from `memory.recall` output to a full UUID.
+/// Resolve an `id` from `memory.recall` output to a full UUID.
 ///
 /// Accepts a 36-char UUID directly, or an 8-char hex prefix (Agent-mode short
 /// form). Returns `InvalidInput` if neither form matches or the prefix is
@@ -1372,12 +1372,12 @@ pub(crate) async fn resolve_auto_feedback_target(
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
-                    "auto_feedback: no record matches note_id prefix: {raw:?}"
+                    "auto_feedback: no record matches id prefix: {raw:?}"
                 ))
             });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "auto_feedback: invalid note_id {raw:?}; expected full UUID or 8-char hex prefix"
+        "auto_feedback: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
     )))
 }
 

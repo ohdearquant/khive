@@ -86,6 +86,10 @@ The shipped memory-pack subhandler is:
 | ---------------------- | ---------- | ----------------------- | ------------------------------------------------------------------- |
 | `memory.recall_rerank` | Subhandler | `{candidates, config?}` | `{reranked: [{id, rerank_scores, rerank_score}], active_rerankers}` |
 
+Amendment (2026-06-14): the recall/rerank hit identity field was renamed `note_id` → `id` for
+cross-verb coherence — `create`, `remember`, and `recall` all return `id` for the record. Clean
+break, no dual-emit. No collision — annotation-edge ids remain `edge_id`.
+
 It is an internal feature-weight subhandler. It does not accept `hook`, `profile_id`, or
 `model_id`, and it does not return `hook_applied`.
 

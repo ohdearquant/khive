@@ -210,12 +210,12 @@ split the work into two `request` calls.
 
 The two forms cannot be combined in one `request`, and the JSON op form does not support `$prev`:
 
-| Situation                       | Use                        | Note                                         |
-| ------------------------------- | -------------------------- | -------------------------------------------- |
-| Ops are independent             | batch `[a(), b()]`         | parallel, up to 100 ops                      |
-| Op B needs op A's result        | chain `a() \| b(…=$prev…)` | sequential, aborts on failure                |
-| Two writes to the same record   | chain, not batch           | a parallel batch rejects same-record writes  |
-| Discovering a verb's parameters | `verb(help=true)`          | returns the parameter schema without running |
+| Situation                       | Use                        | Note                                                                                  |
+| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------- |
+| Ops are independent             | batch `[a(), b()]`         | parallel, up to 100 ops                                                               |
+| Op B needs op A's result        | chain `a() \| b(…=$prev…)` | sequential, aborts on failure                                                         |
+| Two writes to the same record   | chain, not batch           | conflicting same-record writes get per-op errors and are skipped; other ops still run |
+| Discovering a verb's parameters | `verb(help=true)`          | returns the parameter schema without running                                          |
 
 Mixing `,` and `|` at the top level of one `request` is rejected, as is `$prev` inside the JSON op
 form. Use the function-call form shown above for chaining.
