@@ -18,7 +18,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
 
-SQL_FILES=$(find "$ROOT/crates" -name '*.sql' -type f | sort)
+SQL_FILES=$(find "$ROOT/crates" \
+    \( -name 'target' -o -name 'target-wt' \) -type d -prune \
+    -o -name '*.sql' -type f -print \
+    | sort)
 
 if [ -z "$SQL_FILES" ]; then
     echo "no SQL files found"
