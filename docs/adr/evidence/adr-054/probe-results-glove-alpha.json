@@ -1,0 +1,85 @@
+{
+  "answer": {
+    "beam_cut_at_100k": true,
+    "beam_exp": 0.341060675641692,
+    "beam_exp_improved": true,
+    "improvement_pct": 34.97536945812808
+  },
+  "best_alpha": {
+    "alpha": 1.0,
+    "baseline_beam_growth_exp": 0.5659,
+    "baseline_iso_beam_100k": 203,
+    "beam_growth_exponent_2pt": 0.341060675641692,
+    "beam_reduction_pct": 34.97536945812808,
+    "iso_beam_at_100k": 132
+  },
+  "caveats": [
+    "2-pt exponent for best-alpha: λ adds top N for 3-pt fit",
+    "GT recomputed by brute-force L2 on each subset",
+    "latency warm-cache only",
+    "GloVe vectors L2-normalized before indexing"
+  ],
+  "config_fixed": {
+    "build_batch": 1024,
+    "k": 10,
+    "max_degree": 64,
+    "max_iso_beam": 1024,
+    "search_list_size": 128,
+    "target_recall": 0.95
+  },
+  "dataset": "GloVe-100-angular (L2-normalized, dim=100, intrinsic_dim~20)",
+  "experiment": "alpha-sweep on GloVe-100-angular",
+  "rows": [
+    {
+      "alpha": 1.0,
+      "build_ms": 13555.662458,
+      "iso_recall_beam": 132,
+      "n": 100000,
+      "query_warm_us_p50": 498.5,
+      "recall_at_10": 0.9507999999999966,
+      "recall_saturated": false
+    },
+    {
+      "alpha": 1.2,
+      "build_ms": 19071.257666,
+      "iso_recall_beam": 203,
+      "n": 100000,
+      "query_warm_us_p50": 864.708,
+      "recall_at_10": 0.9501999999999974,
+      "recall_saturated": false
+    },
+    {
+      "alpha": 1.5,
+      "build_ms": 19156.914875,
+      "iso_recall_beam": 245,
+      "n": 100000,
+      "query_warm_us_p50": 1159.167,
+      "recall_at_10": 0.9500999999999973,
+      "recall_saturated": false
+    },
+    {
+      "alpha": 2.0,
+      "build_ms": 21026.552833,
+      "iso_recall_beam": 266,
+      "n": 100000,
+      "query_warm_us_p50": 1376.875,
+      "recall_at_10": 0.9502999999999975,
+      "recall_saturated": false
+    },
+    {
+      "alpha": 1.0,
+      "build_ms": 61532.984417,
+      "iso_recall_beam": 192,
+      "n": 300000,
+      "query_warm_us_p50": 1107.75,
+      "recall_at_10": 0.9501999999999979,
+      "recall_saturated": false
+    }
+  ],
+  "sweep_alphas": [
+    1.0,
+    1.2,
+    1.5,
+    2.0
+  ]
+}
