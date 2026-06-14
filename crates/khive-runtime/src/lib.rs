@@ -29,6 +29,7 @@ pub use curation::{
 #[cfg(unix)]
 pub use daemon::{
     pid_path, run_daemon, socket_path, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
+    PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};
