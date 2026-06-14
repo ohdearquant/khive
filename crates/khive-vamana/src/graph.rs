@@ -92,14 +92,23 @@ impl VisitedSet {
 }
 
 /// The Vamana proximity graph over `u32` node IDs.
+///
+/// `reverse_adj[v]` holds every node `u` such that `adjacency[u]` contains `v`.
+/// It is kept consistent with `adjacency` throughout build and any future mutation.
+/// Required by the Wolverine 2-hop delete-repair algorithm (ADR-052 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VamanaGraph {
     adjacency: Vec<Vec<u32>>,
+    /// In-neighbor index: `reverse_adj[v]` = `{ u | v ∈ adjacency[u] }`.
+    reverse_adj: Vec<Vec<u32>>,
     medoid: u32,
 }
 
 impl VamanaGraph {
     /// Create an empty graph. Errors if `num_nodes == 0` or `medoid >= num_nodes`.
+    ///
+    /// `reverse_adj` is initialized with empty lists; callers must populate it after
+    /// filling `adjacency` (via `rebuild_reverse_adj_from_adjacency` or incrementally).
     pub fn new(num_nodes: usize, medoid: u32) -> Result<Self> {
         if num_nodes == 0 {
             return Err(VamanaError::EmptyInput);
@@ -112,8 +121,25 @@ impl VamanaGraph {
         }
         Ok(Self {
             adjacency: vec![Vec::new(); num_nodes],
+            reverse_adj: vec![Vec::new(); num_nodes],
             medoid,
         })
+    }
+
+    /// Rebuild `reverse_adj` from scratch by scanning the current `adjacency`.
+    ///
+    /// O(N × R) where N is node count and R is average out-degree. Called after
+    /// `build()` completes, and after `load` / `from_snapshot` restores adjacency
+    /// from disk (v1 format does not persist `reverse_adj`).
+    pub(crate) fn rebuild_reverse_adj_from_adjacency(&mut self) {
+        let n = self.adjacency.len();
+        let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (u, neighbors) in self.adjacency.iter().enumerate() {
+            for &v in neighbors {
+                rev[v as usize].push(u as u32);
+            }
+        }
+        self.reverse_adj = rev;
     }
 
     /// Build a Vamana graph from `vectors` using the given `config`.
@@ -219,16 +245,25 @@ impl VamanaGraph {
             list.truncate(config.max_degree);
         }
 
-        Ok(Self { adjacency, medoid })
+        let reverse_adj = build_reverse_adj(&adjacency);
+        Ok(Self {
+            adjacency,
+            reverse_adj,
+            medoid,
+        })
     }
 
     /// Append a new node with no neighbors and return its `u32` ID.
+    ///
+    /// Both `adjacency` and `reverse_adj` are extended atomically so the index
+    /// remains consistent after every call.
     pub fn add_node(&mut self) -> Result<u32> {
         let new_id = self.adjacency.len();
         if new_id >= u32::MAX as usize {
             return Err(VamanaError::TooManyVectors { count: new_id + 1 });
         }
         self.adjacency.push(Vec::new());
+        self.reverse_adj.push(Vec::new());
         Ok(new_id as u32)
     }
 
@@ -260,6 +295,25 @@ impl VamanaGraph {
             )));
         }
         Ok(&self.adjacency[idx])
+    }
+
+    /// Return the in-neighbors of `node`: every `u` such that `adjacency[u]` contains `node`.
+    ///
+    /// Required by the Wolverine 2-hop delete-repair algorithm (ADR-052 §2 step 2).
+    /// Returns an error if `node` is out of range.
+    pub fn in_neighbors(&self, node: u32) -> Result<&[u32]> {
+        let idx = node as usize;
+        if idx >= self.reverse_adj.len() {
+            return Err(VamanaError::invalid_format(format!(
+                "node {node} out of range for reverse_adj"
+            )));
+        }
+        Ok(&self.reverse_adj[idx])
+    }
+
+    /// Return all in-neighbor lists, one per node.
+    pub fn reverse_adjacency(&self) -> &[Vec<u32>] {
+        &self.reverse_adj
     }
 
     /// Run greedy beam search from the medoid and return the `k` nearest candidates.
@@ -618,6 +672,23 @@ fn sort_dedup_u32(values: &mut Vec<u32>) {
     values.dedup();
 }
 
+/// Build a complete reverse-adjacency index from a forward adjacency list.
+///
+/// For each edge `u -> v` in `adjacency`, records `u` in `result[v]`.
+/// O(N × R) where R is the average out-degree. Used at `build()` completion
+/// and when reconstructing the index after a v1-format load (which does not
+/// persist `reverse_adj`).
+fn build_reverse_adj(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let n = adjacency.len();
+    let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (u, neighbors) in adjacency.iter().enumerate() {
+        for &v in neighbors {
+            rev[v as usize].push(u as u32);
+        }
+    }
+    rev
+}
+
 // INLINE TEST JUSTIFICATION: Tests here require direct access to `adjacency` (private field)
 // and internal helpers (`initial_random_adjacency`, `validate_graph_vectors`) that are not
 // exposed in the public API. Moving them to `tests/` would require pub(crate) re-exports
@@ -871,6 +942,143 @@ mod tests {
             }
         }
         (vectors, g)
+    }
+
+    // ---- PR1: reverse_adj consistency tests ----
+
+    /// After `build`, every forward edge u→v must be reflected in `reverse_adj[v]` as `u`.
+    /// Equivalently: for every node v, `reverse_adj[v]` must contain exactly the set of nodes
+    /// that have `v` in their forward adjacency list.
+    #[test]
+    fn build_reverse_adj_consistent_with_forward_adjacency() {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(0x00AD_C052);
+        let n = 60usize;
+        let dim = 4usize;
+        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+
+        let g = VamanaGraph::build(&raw, &cfg).unwrap();
+
+        // For each node v, build the expected in-neighbor set by scanning forward adjacency.
+        let expected_rev: Vec<std::collections::HashSet<u32>> = (0..n)
+            .map(|v| {
+                (0..n)
+                    .filter(|&u| u != v && g.adjacency()[u].contains(&(v as u32)))
+                    .map(|u| u as u32)
+                    .collect()
+            })
+            .collect();
+
+        for (v, expected) in expected_rev.iter().enumerate() {
+            let actual: std::collections::HashSet<u32> =
+                g.reverse_adjacency()[v].iter().copied().collect();
+            assert_eq!(
+                &actual, expected,
+                "reverse_adj[{v}] inconsistent with forward adjacency after build: \
+                 got {actual:?}, expected {expected:?}",
+            );
+        }
+    }
+
+    /// After `VamanaGraph::new` + manual adjacency edits (simulating a load path),
+    /// calling `rebuild_reverse_adj_from_adjacency` must restore full consistency.
+    #[test]
+    fn rebuild_reverse_adj_restores_consistency_after_manual_adjacency_load() {
+        // Build a small chain graph manually (as `load` paths do).
+        let n = 5usize;
+        let mut g = VamanaGraph::new(n, 0).unwrap();
+        // Chain: 0→1, 1→0,2, 2→1,3, 3→2,4, 4→3
+        g.adjacency[0] = vec![1];
+        g.adjacency[1] = vec![0, 2];
+        g.adjacency[2] = vec![1, 3];
+        g.adjacency[3] = vec![2, 4];
+        g.adjacency[4] = vec![3];
+
+        // Before rebuild, reverse_adj is all-empty (from `new`).
+        for v in 0..n {
+            assert!(
+                g.reverse_adj[v].is_empty(),
+                "reverse_adj[{v}] should be empty before rebuild"
+            );
+        }
+
+        g.rebuild_reverse_adj_from_adjacency();
+
+        // Now verify consistency: every forward edge u→v must appear as v's in-neighbor.
+        for u in 0..n {
+            for &v in &g.adjacency[u] {
+                assert!(
+                    g.reverse_adj[v as usize].contains(&(u as u32)),
+                    "after rebuild: forward edge {u}→{v} not reflected in reverse_adj[{v}]"
+                );
+            }
+        }
+        // And the reverse: every entry in reverse_adj[v] must be a forward neighbor pointing at v.
+        for v in 0..n {
+            for &u in &g.reverse_adj[v] {
+                assert!(
+                    g.adjacency[u as usize].contains(&(v as u32)),
+                    "after rebuild: reverse_adj[{v}] contains {u} \
+                     but adjacency[{u}] does not contain {v}"
+                );
+            }
+        }
+    }
+
+    /// `in_neighbors` returns the correct set for a known graph.
+    #[test]
+    fn in_neighbors_matches_expected_for_small_graph() {
+        // Graph: 0→1, 0→2, 1→2
+        let n = 3usize;
+        let mut g = VamanaGraph::new(n, 0).unwrap();
+        g.adjacency[0] = vec![1, 2];
+        g.adjacency[1] = vec![2];
+        g.adjacency[2] = vec![];
+        g.rebuild_reverse_adj_from_adjacency();
+
+        // Node 0: no one points at 0
+        let in0: std::collections::HashSet<u32> =
+            g.in_neighbors(0).unwrap().iter().copied().collect();
+        assert_eq!(in0, std::collections::HashSet::new());
+
+        // Node 1: only 0 points at 1
+        let in1: std::collections::HashSet<u32> =
+            g.in_neighbors(1).unwrap().iter().copied().collect();
+        assert_eq!(in1, std::collections::HashSet::from([0u32]));
+
+        // Node 2: both 0 and 1 point at 2
+        let in2: std::collections::HashSet<u32> =
+            g.in_neighbors(2).unwrap().iter().copied().collect();
+        assert_eq!(in2, std::collections::HashSet::from([0u32, 1u32]));
+    }
+
+    /// `in_neighbors` returns an error for out-of-range node IDs.
+    #[test]
+    fn in_neighbors_rejects_out_of_range_node() {
+        let g = VamanaGraph::new(3, 0).unwrap();
+        assert!(
+            matches!(g.in_neighbors(99), Err(VamanaError::InvalidFormat { .. })),
+            "in_neighbors must return InvalidFormat for out-of-range node"
+        );
+    }
+
+    /// After `add_node`, reverse_adj grows in sync with adjacency so the
+    /// graph remains consistent for any subsequent rebuild.
+    #[test]
+    fn add_node_extends_reverse_adj_in_sync() {
+        let mut g = VamanaGraph::new(2, 0).unwrap();
+        assert_eq!(g.adjacency.len(), g.reverse_adj.len());
+        g.add_node().unwrap();
+        assert_eq!(
+            g.adjacency.len(),
+            g.reverse_adj.len(),
+            "reverse_adj must grow with adjacency after add_node"
+        );
+        assert_eq!(g.node_count(), 3);
     }
 
     // ---- Regression tests for P0/P1 fixes ----

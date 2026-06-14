@@ -382,7 +382,7 @@ impl VamanaIndex {
         };
         config.validate()?;
 
-        let graph = read_graph(&path.join("graph.bin"), meta.max_degree, meta.num_vectors)?;
+        let mut graph = read_graph(&path.join("graph.bin"), meta.max_degree, meta.num_vectors)?;
 
         if graph.node_count() != meta.num_vectors {
             return Err(VamanaError::invalid_format(format!(
@@ -404,6 +404,10 @@ impl VamanaIndex {
             .checked_mul(meta.dimensions)
             .ok_or_else(|| VamanaError::invalid_format("metadata overflow".into()))?;
         let storage = mmap_vectors(&path.join("vectors.bin"), expected_len_f32)?;
+
+        // v1 format does not persist reverse_adj; reconstruct O(N*R) from adjacency.
+        // This must run before any tombstone call — lazy init would silently skip repair.
+        graph.rebuild_reverse_adj_from_adjacency();
 
         Ok(Self {
             vectors: storage,
@@ -582,6 +586,10 @@ impl VamanaIndex {
             }
             graph.adjacency_mut_for_load()[node] = neighbors.clone();
         }
+
+        // v1 snapshot format does not persist reverse_adj; reconstruct O(N*R) from adjacency.
+        // This must run before any tombstone call — lazy init would silently skip repair.
+        graph.rebuild_reverse_adj_from_adjacency();
 
         Ok(Self {
             vectors: VectorStorage::Owned(ix.vectors.clone()),
@@ -1190,6 +1198,115 @@ mod tests {
             "snapshot fingerprint must equal the build-time fingerprint"
         );
     }
+    // ---- PR1: reverse_adj consistency via VamanaIndex ----
+
+    /// `VamanaIndex::build` must produce a graph where every forward edge u→v is reflected
+    /// in `reverse_adj[v]` and vice versa.
+    #[test]
+    fn index_build_reverse_adj_consistent_with_forward() {
+        let vectors = rand_unit_vectors(40, 8, 0x00AD_C052);
+        let cfg = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let g = idx.graph();
+        let adj = g.adjacency();
+        let rev = g.reverse_adjacency();
+
+        // Every forward edge u→v must appear in rev[v].
+        for (u, neighbors) in adj.iter().enumerate() {
+            for &v in neighbors {
+                assert!(
+                    rev[v as usize].contains(&(u as u32)),
+                    "index build: forward edge {u}→{v} not in reverse_adj[{v}]"
+                );
+            }
+        }
+        // Every entry in rev[v] must be backed by a forward edge.
+        for (v, in_neighbors) in rev.iter().enumerate() {
+            for &u in in_neighbors {
+                assert!(
+                    adj[u as usize].contains(&(v as u32)),
+                    "index build: reverse_adj[{v}] contains {u} \
+                     but adjacency[{u}] does not contain {v}"
+                );
+            }
+        }
+    }
+
+    /// After `VamanaIndex::load`, reverse_adj must be consistent with forward adjacency
+    /// (v1 format does not persist reverse_adj; it is rebuilt at load time).
+    #[test]
+    fn index_load_reverse_adj_consistent_with_forward() {
+        let vectors = rand_unit_vectors(20, 4, 0x0010_AD52);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let original = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        original.save(dir.path()).unwrap();
+        let loaded = VamanaIndex::load(dir.path()).unwrap();
+
+        let g = loaded.graph();
+        let adj = g.adjacency();
+        let rev = g.reverse_adjacency();
+
+        for (u, neighbors) in adj.iter().enumerate() {
+            for &v in neighbors {
+                assert!(
+                    rev[v as usize].contains(&(u as u32)),
+                    "load: forward edge {u}→{v} not in reverse_adj[{v}]"
+                );
+            }
+        }
+        for (v, in_neighbors) in rev.iter().enumerate() {
+            for &u in in_neighbors {
+                assert!(
+                    adj[u as usize].contains(&(v as u32)),
+                    "load: reverse_adj[{v}] contains {u} but adjacency[{u}] lacks {v}"
+                );
+            }
+        }
+    }
+
+    /// After `VamanaIndex::from_snapshot`, reverse_adj must be consistent with forward adjacency.
+    #[test]
+    fn index_from_snapshot_reverse_adj_consistent_with_forward() {
+        let vectors = rand_unit_vectors(16, 4, 0x0050_A152);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let fp = CorpusFingerprint {
+            vector_count: 16,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..16).map(|i| format!("id-{i}")).collect();
+        let snapshot = idx.to_snapshot("ns", "model", fp, ext_ids).unwrap();
+        let restored = VamanaIndex::from_snapshot(&snapshot).unwrap();
+
+        let g = restored.graph();
+        let adj = g.adjacency();
+        let rev = g.reverse_adjacency();
+
+        for (u, neighbors) in adj.iter().enumerate() {
+            for &v in neighbors {
+                assert!(
+                    rev[v as usize].contains(&(u as u32)),
+                    "from_snapshot: forward edge {u}→{v} not in reverse_adj[{v}]"
+                );
+            }
+        }
+        for (v, in_neighbors) in rev.iter().enumerate() {
+            for &u in in_neighbors {
+                assert!(
+                    adj[u as usize].contains(&(v as u32)),
+                    "from_snapshot: reverse_adj[{v}] contains {u} but adjacency[{u}] lacks {v}"
+                );
+            }
+        }
+    }
+
     // ---- Regression tests for P0/P1 fixes ----
 
     /// P1: recall_at_k must reject k=0 to avoid 0/0 = NaN.
