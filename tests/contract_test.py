@@ -25,6 +25,9 @@ Concretely, these tests cover:
   8. annotates source-must-be-note — entity-as-source is rejected with a
      clear error; note-as-source succeeds; hard-deleting the target cascades
      the edge (ADR-002 §annotates endpoint validation).
+  9. Epistemic edge endpoint enforcement — supports/refutes legal pairs are
+     accepted; illegal pairs (wrong target kind, cross-substrate) are rejected
+     with clear error messages (ADR-055 + ADR-002 §"Epistemic relations").
 
 How to run
 ----------
@@ -612,10 +615,11 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     assert "invented_by" in err_rel, (
         f"Error should name the offending relation 'invented_by': {err_rel!r}"
     )
-    # All 13 canonical relations must be listed.
+    # All 17 canonical relations must be listed (ADR-002 amended by ADR-055: 15→17).
     for rel in ("contains", "part_of", "instance_of", "extends", "variant_of",
-                "introduced_by", "supersedes", "depends_on", "enables",
-                "implements", "competes_with", "composed_with", "annotates"):
+                "introduced_by", "supersedes", "derived_from", "precedes",
+                "depends_on", "enables", "implements", "competes_with",
+                "composed_with", "annotates", "supports", "refutes"):
         assert rel in err_rel, (
             f"Valid edge relation '{rel}' missing from error message: {err_rel!r}"
         )
@@ -843,6 +847,139 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract 9 — Epistemic edge endpoint enforcement (ADR-055 + ADR-002)
+# ---------------------------------------------------------------------------
+
+def test_epistemic_edge_endpoints(proc: subprocess.Popen) -> None:
+    """supports/refutes legal endpoint pairs are accepted; illegal ones are rejected.
+
+    ADR-055 §"Secondary rail: Entity→Entity" (kind-restricted):
+      Legal   : concept|document|dataset|artifact → concept
+      Illegal : document → document  (target is not concept)
+      Illegal : entity  → note       (cross-substrate, same-substrate rule)
+      Illegal : note    → entity     (cross-substrate, same-substrate rule)
+
+    ADR-055 §"Primary rail: Note→Note":
+      Legal   : any note kind → any note kind (substrate-level enforcement,
+                operations.rs:702)
+
+    Source citations:
+      Entity allowlist  — operations.rs:211-219, pack-kg/handlers/common.rs:431-438
+      Same-substrate    — operations.rs:652-654, 702, 713-724
+      Error hint text   — operations.rs:689-693
+    """
+    # ---- Create fixtures ----
+    claim = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "ContractClaim",
+        "description": "A hypothesis under test",
+    })
+    doc_evidence = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "document",
+        "name": "ContractEvidencePaper",
+    })
+    doc_other = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "document",
+        "name": "ContractDocTarget",
+    })
+    finding_note = _tool(proc, "create", {
+        "kind": "note",
+        "note_kind": "observation",
+        "content": "Experiment confirms the claim with high confidence",
+    })
+    hypothesis_note = _tool(proc, "create", {
+        "kind": "note",
+        "note_kind": "insight",
+        "content": "Claim might be true",
+    })
+
+    # ---- LEGAL: document -[supports]-> concept (ADR-055 entity-form) ----
+    sup_edge = _tool(proc, "link", {
+        "source_id": doc_evidence["id"],
+        "target_id": claim["id"],
+        "relation": "supports",
+        "weight": 0.85,
+    })
+    assert sup_edge["relation"] == "supports", (
+        f"document -[supports]-> concept must succeed; got: {sup_edge}"
+    )
+
+    # Verify via neighbors(direction=in, relations=[supports]) on the claim
+    nbrs = _tool(proc, "neighbors", {
+        "node_id": claim["id"],
+        "direction": "in",
+        "relations": ["supports"],
+    })
+    nbr_ids = [n.get("id", "") for n in nbrs]
+    assert doc_evidence["id"] in nbr_ids, (
+        f"doc_evidence must appear as inbound supports neighbor of claim; "
+        f"nbr_ids={nbr_ids}"
+    )
+
+    # ---- LEGAL: document -[refutes]-> concept (ADR-055 entity-form) ----
+    ref_edge = _tool(proc, "link", {
+        "source_id": doc_other["id"],
+        "target_id": claim["id"],
+        "relation": "refutes",
+        "weight": 0.6,
+    })
+    assert ref_edge["relation"] == "refutes", (
+        f"document -[refutes]-> concept must succeed; got: {ref_edge}"
+    )
+
+    # ---- LEGAL: observation -[supports]-> insight (Note→Note rail, ADR-055 primary) ----
+    note_edge = _tool(proc, "link", {
+        "source_id": finding_note["id"],
+        "target_id": hypothesis_note["id"],
+        "relation": "supports",
+        "weight": 0.9,
+    })
+    assert note_edge["relation"] == "supports", (
+        f"observation -[supports]-> insight (Note→Note) must succeed; got: {note_edge}"
+    )
+
+    # ---- ILLEGAL: document -[supports]-> document (target not concept) ----
+    # Error from operations.rs:695-699: target kind "document" is not in the
+    # allowlist for supports; only "concept" is a valid entity-form target.
+    err_doc_doc = _expect_rpc_error(proc, "link", {
+        "source_id": doc_evidence["id"],
+        "target_id": doc_other["id"],
+        "relation": "supports",
+    })
+    assert err_doc_doc, "document -[supports]-> document must be rejected"
+    assert "allowlist" in err_doc_doc or "concept" in err_doc_doc, (
+        f"rejection error must mention 'allowlist' or 'concept'; got: {err_doc_doc!r}"
+    )
+
+    # ---- ILLEGAL: entity -[supports]-> note (cross-substrate, ADR-055 same-substrate rule) ----
+    # operations.rs:713-716: entity→note cross-substrate is explicitly rejected.
+    err_cross_en = _expect_rpc_error(proc, "link", {
+        "source_id": doc_evidence["id"],
+        "target_id": finding_note["id"],
+        "relation": "supports",
+    })
+    assert err_cross_en, "entity -[supports]-> note (cross-substrate) must be rejected"
+    assert "substrate" in err_cross_en or "note" in err_cross_en or "entity" in err_cross_en, (
+        f"rejection error must mention substrate mismatch; got: {err_cross_en!r}"
+    )
+
+    # ---- ILLEGAL: note -[refutes]-> entity (cross-substrate, ADR-055 same-substrate rule) ----
+    # operations.rs:719-723: note→entity cross-substrate is explicitly rejected.
+    err_cross_ne = _expect_rpc_error(proc, "link", {
+        "source_id": finding_note["id"],
+        "target_id": claim["id"],
+        "relation": "refutes",
+    })
+    assert err_cross_ne, "note -[refutes]-> entity (cross-substrate) must be rejected"
+    assert "substrate" in err_cross_ne or "note" in err_cross_ne or "entity" in err_cross_ne, (
+        f"rejection error must mention substrate mismatch; got: {err_cross_ne!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -863,6 +1000,7 @@ def main() -> int:
         ("closed_taxonomy_errors", test_closed_taxonomy_errors),
         ("merge_semantics", test_merge_semantics),
         ("annotates_source_must_be_note", test_annotates_source_must_be_note),
+        ("epistemic_edge_endpoints", test_epistemic_edge_endpoints),
     ]
 
     for name, fn in tests:
