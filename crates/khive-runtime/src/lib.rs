@@ -35,11 +35,12 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
-pub use graph_traversal::{PathNode, TraversalOptions};
+pub use graph_traversal::PathNode;
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
 };
+pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use objectives::{
