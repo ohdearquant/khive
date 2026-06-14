@@ -180,9 +180,9 @@ config, so α tuning is off khive's critical path.
    khive's own corpus. A production measurement on khive's own entity and note vectors is
    required to discharge this obligation.
 
-5. **Query-exponent interpretation.** The measured query exponent (0.043 on khive's real corpus,
+5. **Query-exponent interpretation.** The measured query exponent (0.043 on the BeIR/quora proxy,
    0.303 on SIFT-1M) is directional. At near-flat latency the 3-point fit is noise-dominated
-   (R²=0.20 for the real-corpus fit). Report query latency as **flat** at the production scale
+   (R²=0.20 for the proxy fit). Report query latency as **flat** at the production scale
    range, with the exponent as directional confirmation of sublinearity, not a precise estimate.
 
 6. **Consolidation obligation (update axis not yet established).** The update-axis sublinearity
