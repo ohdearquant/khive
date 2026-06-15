@@ -20,7 +20,12 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 [[bench]]
 name = "vamana_bench"
 harness = false
+
+[[example]]
+name = "vec_bench"
