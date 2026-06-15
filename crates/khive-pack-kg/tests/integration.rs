@@ -5819,22 +5819,36 @@ async fn get_proposal_wire_key_is_id_not_proposal_id() {
     );
 }
 
-/// review(proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+/// review(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
 ///
-/// ReviewParams declares `id`, not `proposal_id`, with deny_unknown_fields.
-/// Passing the old key must produce an InvalidInput error, not silently succeed.
+/// ReviewParams declares `id` (required) with deny_unknown_fields — `proposal_id` is
+/// unknown. Supplying both keys proves the rejection is triggered by the unknown field,
+/// not by a missing required field: if deny_unknown_fields were removed the call would
+/// succeed (id is present, proposal_id silently ignored), so a passing test here is a
+/// genuine regression guard.
 #[tokio::test]
 async fn review_with_old_proposal_id_param_is_rejected() {
     let f = pack_with_events();
 
-    // Propose so there is a valid target UUID — we pass a fake one intentionally
-    // because the deny_unknown_fields rejection fires at deserialization, before
-    // any UUID lookup.
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "deny_unknown review guard",
+                "description": "guard test",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id");
+
     let err = f
         .dispatch(
             "review",
             json!({
-                "proposal_id": "00000000-0000-0000-0000-000000000001",
+                "id": pid,
+                "proposal_id": pid,
                 "decision": "reject"
             }),
         )
@@ -5842,38 +5856,74 @@ async fn review_with_old_proposal_id_param_is_rejected() {
 
     assert!(
         err.is_err(),
-        "review(proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+        "review(id=..., proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    let e = err.unwrap_err();
+    assert!(
+        is_invalid_input(&e),
+        "review(id=..., proposal_id=...) must produce InvalidInput; got {e:?}"
+    );
+    let msg = invalid_input_message(&e);
+    assert!(
+        msg.contains("unknown field"),
+        "error must mention 'unknown field'; got: {msg}"
     );
     assert!(
-        is_invalid_input(err.as_ref().unwrap_err()),
-        "review(proposal_id=...) must produce InvalidInput; got {:?}",
-        err.unwrap_err()
+        msg.contains("proposal_id"),
+        "error must mention 'proposal_id'; got: {msg}"
     );
 }
 
-/// withdraw(proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+/// withdraw(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
 ///
-/// WithdrawParams declares `id`, not `proposal_id`, with deny_unknown_fields.
+/// WithdrawParams declares `id` (required) with deny_unknown_fields — `proposal_id` is
+/// unknown. Supplying both keys proves the rejection is triggered by the unknown field,
+/// not by a missing required field: if deny_unknown_fields were removed the call would
+/// succeed (id is present, proposal_id silently ignored), so a passing test here is a
+/// genuine regression guard.
 #[tokio::test]
 async fn withdraw_with_old_proposal_id_param_is_rejected() {
     let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "deny_unknown withdraw guard",
+                "description": "guard test",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id");
 
     let err = f
         .dispatch(
             "withdraw",
             json!({
-                "proposal_id": "00000000-0000-0000-0000-000000000001"
+                "id": pid,
+                "proposal_id": pid
             }),
         )
         .await;
 
     assert!(
         err.is_err(),
-        "withdraw(proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+        "withdraw(id=..., proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    let e = err.unwrap_err();
+    assert!(
+        is_invalid_input(&e),
+        "withdraw(id=..., proposal_id=...) must produce InvalidInput; got {e:?}"
+    );
+    let msg = invalid_input_message(&e);
+    assert!(
+        msg.contains("unknown field"),
+        "error must mention 'unknown field'; got: {msg}"
     );
     assert!(
-        is_invalid_input(err.as_ref().unwrap_err()),
-        "withdraw(proposal_id=...) must produce InvalidInput; got {:?}",
-        err.unwrap_err()
+        msg.contains("proposal_id"),
+        "error must mention 'proposal_id'; got: {msg}"
     );
 }
