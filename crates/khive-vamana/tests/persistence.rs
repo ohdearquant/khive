@@ -364,6 +364,73 @@ fn v2_fingerprint_mismatch_triggers_rebuild() {
     assert!(!rebuilt.search(&query, 3).unwrap().is_empty());
 }
 
+/// FIX 1: A hub graph whose reverse-adj degree exceeds max_degree*4 must load successfully.
+/// Before the fix, parse_lifecycle would reject valid hub reverse-adjacency lists with degree
+/// > max_degree*4 even though inbound degree can legitimately reach num_vectors-1.
+#[test]
+fn v2_hub_graph_high_inbound_degree_loads_successfully() {
+    // Use a large max_degree relative to n to avoid the constraint firing for normal nodes,
+    // but keep n large enough that a hub node can have inbound degree >> max_degree*4.
+    // With max_degree=2 and n=20, a hub can have up to 19 inbound edges (>> 2*4=8).
+    let dim = 4usize;
+    let n = 20usize;
+    let vectors = rand_unit_vectors(n, dim, 0xB1_01);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(2)
+        .with_search_list_size(4);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    let corpus = idx.vectors().unwrap().to_vec();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // Reload must succeed even if the medoid's reverse-adj degree exceeds max_degree*4.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(2)
+        .with_search_list_size(4);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &corpus, fallback).unwrap();
+
+    // Forward and reverse adjacency must be mutually consistent.
+    assert_rev_adj_consistent(loaded.graph());
+
+    // Search must still work.
+    let query = rand_unit_vectors(1, dim, 0xB1_02);
+    assert!(!loaded.search(&query, 3).unwrap().is_empty());
+}
+
+/// FIX 3: metadata.bin with >=8 bytes of unknown/garbage magic causes load_or_build to
+/// rebuild rather than return InvalidFormat. (VamanaIndex::load remains strict.)
+#[test]
+fn v2_garbage_magic_causes_load_or_build_to_rebuild() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(12, dim, 0xB3_01);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // Overwrite metadata.bin with >=8 bytes of garbage (unknown magic).
+    let garbage = b"UNKNOWNX__padding__more_bytes_here".to_vec();
+    fs::write(dir.path().join("metadata.bin"), &garbage).unwrap();
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    // Must NOT return Err — must rebuild and return a usable index.
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), idx.num_vectors());
+
+    // metadata.bin must now have the KHVVAMG2 magic (rebuilt + saved).
+    let meta = fs::read(dir.path().join("metadata.bin")).unwrap();
+    assert_eq!(&meta[..8], b"KHVVAMG2", "rebuilt index must be saved as v2");
+
+    // Search must work.
+    let query = rand_unit_vectors(1, dim, 0xB3_02);
+    assert!(!rebuilt.search(&query, 3).unwrap().is_empty());
+}
+
 /// V1 compat: v1-format save → load_or_build upgrades to v2.
 #[test]
 fn v2_upgrades_v1_format_to_v2() {

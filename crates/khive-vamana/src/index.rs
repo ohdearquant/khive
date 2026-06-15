@@ -546,6 +546,16 @@ impl VamanaIndex {
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
+        // Barrier: make metadata.bin durable before promoting canonical segments.
+        // Commit gate is metadata.bin: after this fsync any post-crash state is either
+        // (old metadata + old segments) or (new KHVVAMG2 metadata + maybe-stale segments).
+        // The new-metadata path is checksum-guarded, so stale/partial segments safe-degrade
+        // to rebuild — never a torn no-checksum read.
+        {
+            let dir_file = File::open(path)?;
+            dir_file.sync_all()?;
+        }
+
         // 8. Promote staged segments to their final names.
         fs::rename(&vectors_new, &vectors_path)?;
         fs::rename(&graph_new, &graph_path)?;
@@ -727,9 +737,12 @@ impl VamanaIndex {
             index.save_atomic(path)?;
             Ok(index)
         } else {
-            Err(VamanaError::invalid_format(
-                "metadata.bin has unrecognised magic".into(),
-            ))
+            // Unknown or garbage magic: treat as corrupt snapshot and rebuild.
+            // VamanaIndex::load (direct v1 callers) remains strict; load_or_build always
+            // recovers because the caller supplies a corpus and fallback config.
+            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+            index.save_atomic(path)?;
+            Ok(index)
         }
     }
 
@@ -2017,7 +2030,7 @@ fn write_lifecycle(
 }
 
 /// Parse lifecycle.bin bytes into `ParsedLifecycle`.
-fn parse_lifecycle(data: &[u8], num_vectors: usize, max_degree: usize) -> Result<ParsedLifecycle> {
+fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Result<ParsedLifecycle> {
     if data.len() < 8 {
         return Err(VamanaError::invalid_format(
             "lifecycle.bin too short".into(),
@@ -2111,10 +2124,12 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, max_degree: usize) -> Result
         let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if degree > max_degree * 4 {
-            // Allow up to 4× max_degree for the medoid overflow; anything larger is corrupt.
+        // Reverse-adjacency degree is bounded by num_vectors-1 (every other node pointing
+        // here), not by max_degree (which caps forward out-degree only). A hub node in a
+        // legitimate graph can have up to num_vectors-1 inbound edges.
+        if degree > num_vectors.saturating_sub(1) {
             return Err(VamanaError::invalid_format(format!(
-                "lifecycle.bin node {node} rev degree {degree} implausible"
+                "lifecycle.bin node {node} rev degree {degree} > num_vectors-1"
             )));
         }
         if offset + degree * 4 > data.len() {
@@ -2123,15 +2138,26 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, max_degree: usize) -> Result
             ));
         }
         let mut neighbors = Vec::with_capacity(degree);
+        let mut seen = std::collections::HashSet::with_capacity(degree);
         for _ in 0..degree {
             let nb = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
             if nb as usize >= num_vectors {
                 return Err(VamanaError::invalid_format(format!(
                     "lifecycle.bin rev neighbor {nb} >= num_vectors {num_vectors}"
                 )));
             }
+            if nb as usize == node {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin node {node} has self-reference in reverse adjacency"
+                )));
+            }
+            if !seen.insert(nb) {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin node {node} has duplicate rev neighbor {nb}"
+                )));
+            }
             neighbors.push(nb);
-            offset += 4;
         }
         reverse_adj.push(neighbors);
     }
