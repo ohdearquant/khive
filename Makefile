@@ -1,4 +1,4 @@
-.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local proof-check check-fwd
+.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local proof-check check-fwd bench-1m bench-1m-ci
 
 check:
 	cd crates && cargo check --workspace
@@ -45,6 +45,16 @@ publish-dry:
 
 publish:
 	./scripts/publish.sh --live
+
+bench-1m:
+	@echo "==> Running Vamana 1M scale-proof bench (3-point: 100K/316K/1M, ~7 min)..."
+	@echo "    Set SIFT_DIR to the sift_base.fvecs / sift_query.fvecs directory."
+	bash scripts/bench_1m.sh
+
+bench-1m-ci:
+	@echo "==> Running Vamana CI smoke bench (2-point: 10K/50K, <60 s)..."
+	@echo "    Set SIFT_DIR to the sift_base.fvecs / sift_query.fvecs directory."
+	bash scripts/bench_1m.sh --ci
 
 local:
 	@echo "==> Building kkernel (release)..."

@@ -1,1 +1,4 @@
-date,sha,pr,target,p50_us,p95_us,p99_us,max_us,pass,runner_os,loadavg1,notes
+date,sha,target,n,beam,recall_at_10,p50_us,p95_us,p99_us,build_ms,speedup,pass,loadavg,notes
+2026-06-15T20:04:45Z,eb6696c,khive-vamana/1m-scale-proof/sift-1m,100000,30,0.9504,71.0,92.917,102.333,11123.379,88.8,PASS,5.54,SIFT-1M-honest-3pt macos-arm64
+2026-06-15T20:04:45Z,eb6696c,khive-vamana/1m-scale-proof/sift-1m,316228,43,0.9523,129.792,176.584,200.25,54589.638,152.6,PASS,5.54,SIFT-1M-honest-3pt macos-arm64
+2026-06-15T20:04:45Z,eb6696c,khive-vamana/1m-scale-proof/sift-1m,1000000,49,0.9521,170.792,216.083,234.167,320776.873,341.4,PASS,5.54,SIFT-1M-honest-3pt macos-arm64
