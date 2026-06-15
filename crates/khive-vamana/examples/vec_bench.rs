@@ -179,10 +179,15 @@ fn load_fvecs(path: &Path) -> (Vec<f32>, usize) {
     let mut out = Vec::with_capacity(n * dim);
     let mut record_buf = vec![0u8; record_size];
 
-    for _ in 0..n {
+    for rec_idx in 0..n {
         reader
             .read_exact(&mut record_buf)
             .expect("fvecs read error");
+        let rec_dim = i32::from_le_bytes(record_buf[0..4].try_into().unwrap()) as usize;
+        assert!(
+            rec_dim == dim,
+            "fvecs: record {rec_idx} has dim={rec_dim}, expected {dim}"
+        );
         for i in 0..dim {
             let offset = 4 + i * 4;
             let v = f32::from_le_bytes(record_buf[offset..offset + 4].try_into().unwrap());
@@ -306,7 +311,9 @@ fn find_iso_recall_beam(
     queries: &[f32],
     gt: &[Vec<u32>],
 ) -> (usize, f64, bool) {
-    let min_beam = K.max(MAX_DEGREE);
+    // Search from K upward — the graph clamps the effective list to ≥k internally,
+    // so beams below MAX_DEGREE are valid search parameters.
+    let min_beam = K;
     let max_beam = MAX_ISO_BEAM;
 
     let recall_at_max = mean_recall_gt(graph, corpus, dim, queries, gt, max_beam);
@@ -394,7 +401,7 @@ fn measure_bruteforce_latency_us(
 
 // ─── log-log OLS ─────────────────────────────────────────────────────────────
 
-fn log_log_slope(xs: &[f64], ys: &[f64]) -> (f64, f64) {
+fn log_log_slope(xs: &[f64], ys: &[f64]) -> (f64, Option<f64>) {
     let pairs: Vec<(f64, f64)> = xs
         .iter()
         .zip(ys.iter())
@@ -404,7 +411,18 @@ fn log_log_slope(xs: &[f64], ys: &[f64]) -> (f64, f64) {
 
     let n = pairs.len() as f64;
     if n < 2.0 {
-        return (f64::NAN, f64::NAN);
+        return (f64::NAN, None);
+    }
+    // Two-point fit: slope is exact-by-construction, not model evidence.
+    if n < 3.0 {
+        let (x0, y0) = pairs[0];
+        let (x1, y1) = pairs[1];
+        let slope = if (x1 - x0).abs() < 1e-15 {
+            f64::NAN
+        } else {
+            (y1 - y0) / (x1 - x0)
+        };
+        return (slope, None);
     }
 
     let mean_x = pairs.iter().map(|(x, _)| x).sum::<f64>() / n;
@@ -413,7 +431,7 @@ fn log_log_slope(xs: &[f64], ys: &[f64]) -> (f64, f64) {
     let ss_xx: f64 = pairs.iter().map(|(x, _)| (x - mean_x) * (x - mean_x)).sum();
 
     if ss_xx.abs() < 1e-15 {
-        return (f64::NAN, f64::NAN);
+        return (f64::NAN, None);
     }
 
     let slope = ss_xy / ss_xx;
@@ -428,10 +446,11 @@ fn log_log_slope(xs: &[f64], ys: &[f64]) -> (f64, f64) {
         .sum();
     let ss_tot: f64 = pairs.iter().map(|(_, y)| (y - mean_y) * (y - mean_y)).sum();
 
+    // Constant-y series: R² is undefined (no variance to explain).
     let r2 = if ss_tot < 1e-15 {
-        1.0
+        None
     } else {
-        1.0 - ss_res / ss_tot
+        Some(1.0 - ss_res / ss_tot)
     };
 
     (slope, r2)
@@ -674,13 +693,13 @@ fn get_row_metric(metric: &str, row: &RowResult) -> f64 {
 fn get_fits_metric(metric: &str, fits: &FitsResult) -> f64 {
     match metric {
         "beam_growth_exponent" => fits.beam_growth_exponent,
-        "beam_growth_r2" => fits.beam_growth_r2,
+        "beam_growth_r2" => fits.beam_growth_r2.unwrap_or(f64::NAN),
         "build_wallclock_exponent" => fits.build_wallclock_exponent,
-        "build_wallclock_r2" => fits.build_wallclock_r2,
+        "build_wallclock_r2" => fits.build_wallclock_r2.unwrap_or(f64::NAN),
         "iso_recall_query_exponent_warm" => fits.iso_recall_query_exponent_warm,
-        "iso_recall_query_r2_warm" => fits.iso_recall_query_r2_warm,
+        "iso_recall_query_r2_warm" => fits.iso_recall_query_r2_warm.unwrap_or(f64::NAN),
         "bruteforce_exponent" => fits.bruteforce_exponent,
-        "bruteforce_r2" => fits.bruteforce_r2,
+        "bruteforce_r2" => fits.bruteforce_r2.unwrap_or(f64::NAN),
         _ => f64::NAN,
     }
 }
@@ -720,15 +739,15 @@ struct RowResult {
 struct FitsResult {
     note: String,
     beam_growth_exponent: f64,
-    beam_growth_r2: f64,
+    beam_growth_r2: Option<f64>,
     build_wallclock_exponent: f64,
-    build_wallclock_r2: f64,
+    build_wallclock_r2: Option<f64>,
     build_work_exponent: Option<f64>,
     build_work_r2: Option<f64>,
     iso_recall_query_exponent_warm: f64,
-    iso_recall_query_r2_warm: f64,
+    iso_recall_query_r2_warm: Option<f64>,
     bruteforce_exponent: f64,
-    bruteforce_r2: f64,
+    bruteforce_r2: Option<f64>,
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
@@ -946,11 +965,24 @@ fn main() {
         );
     }
     println!();
+    let fmt_r2 = |r: Option<f64>| r.map_or_else(|| "null".to_string(), |v| format!("{v:.4}"));
     println!("=== Fitted Exponents ({fit_note}) ===");
-    println!("  beam_growth_exponent:      {beam_exp:.4} (R²={beam_r2:.4})");
-    println!("  build_wallclock_exponent:  {build_exp:.4} (R²={build_r2:.4})");
-    println!("  iso_recall_query_exponent: {query_exp:.4} (R²={query_r2:.4})");
-    println!("  brute_force_exponent:      {bf_exp:.4} (R²={bf_r2:.4})");
+    println!(
+        "  beam_growth_exponent:      {beam_exp:.4} (R²={})",
+        fmt_r2(beam_r2)
+    );
+    println!(
+        "  build_wallclock_exponent:  {build_exp:.4} (R²={})",
+        fmt_r2(build_r2)
+    );
+    println!(
+        "  iso_recall_query_exponent: {query_exp:.4} (R²={})",
+        fmt_r2(query_r2)
+    );
+    println!(
+        "  brute_force_exponent:      {bf_exp:.4} (R²={})",
+        fmt_r2(bf_r2)
+    );
     println!();
 
     // ─── decisive question ─────────────────────────────────────────────────
