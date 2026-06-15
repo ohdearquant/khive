@@ -287,6 +287,12 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
+    /// Directly restore `reverse_adj` from a previously serialized in-neighbor list.
+    /// Used by the v2 fast-load path to avoid an O(N*R) rebuild from adjacency.
+    pub(crate) fn restore_reverse_adj(&mut self, reverse_adj: Vec<Vec<u32>>) {
+        self.reverse_adj = reverse_adj;
+    }
+
     /// Mutable access to both adjacency and reverse_adj for Wolverine repair.
     pub(crate) fn adjacency_and_reverse_mut(&mut self) -> (&mut Vec<Vec<u32>>, &mut Vec<Vec<u32>>) {
         (&mut self.adjacency, &mut self.reverse_adj)

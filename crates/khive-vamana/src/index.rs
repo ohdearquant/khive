@@ -2,6 +2,7 @@
 
 use std::{
     fs::{self, File},
+    io::Write,
     path::Path,
 };
 
@@ -19,6 +20,12 @@ use crate::{
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
+
+// v2 commit-record magic written into metadata.bin by save_atomic.
+const V2_COMMIT_MAGIC: &[u8; 8] = b"KHVVAMG2";
+
+// lifecycle.bin magic for v2 persistence.
+const LIFECYCLE_MAGIC: &[u8; 8] = b"KHVVLIF1";
 
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
@@ -448,6 +455,253 @@ impl VamanaIndex {
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
         })
+    }
+
+    /// Crash-safe v2 save. Writes vectors.bin and graph.bin (same formats as v1),
+    /// then lifecycle.bin (tombstones, free_slots, reverse_adj, ops_since_consolidation),
+    /// then atomically renames metadata.bin.tmp → metadata.bin as the commit record.
+    ///
+    /// If a crash interrupts before the rename the previous metadata.bin (v1 or v2) is
+    /// still valid. load_or_build never observes a torn v2 commit.
+    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+
+        let vectors_path = path.join("vectors.bin");
+        let graph_path = path.join("graph.bin");
+        let lifecycle_path = path.join("lifecycle.bin");
+        let metadata_path = path.join("metadata.bin");
+        let metadata_tmp = path.join("metadata.bin.tmp");
+
+        // 1. Write vectors.bin (identical format to v1).
+        write_vectors(&vectors_path, self.vectors()?)?;
+
+        // 2. Write graph.bin (identical format to v1, medoid-overflow capped).
+        write_graph(&graph_path, &self.graph, self.config.max_degree)?;
+
+        // 3. Write lifecycle.bin (new in v2).
+        write_lifecycle(
+            &lifecycle_path,
+            &self.tombstones,
+            &self.free_slots,
+            &self.graph,
+            self.ops_since_consolidation,
+        )?;
+
+        // 4. Compute blake3 checksums of the three segments.
+        let vectors_data = fs::read(&vectors_path)?;
+        let graph_data = fs::read(&graph_path)?;
+        let lifecycle_data = fs::read(&lifecycle_path)?;
+
+        let vectors_hash = blake3::hash(&vectors_data);
+        let graph_hash = blake3::hash(&graph_data);
+        let lifecycle_hash = blake3::hash(&lifecycle_data);
+
+        // 5. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
+        let content_hash = *vectors_hash.as_bytes();
+        let fp = V2CorpusFingerprint {
+            vector_count: self.num_vectors as u64,
+            dimensions: self.dimensions as u64,
+            content_hash,
+        };
+
+        // 6. Write metadata.bin.tmp then rename atomically.
+        write_v2_commit_full(
+            &metadata_tmp,
+            vectors_hash.as_bytes(),
+            graph_hash.as_bytes(),
+            lifecycle_hash.as_bytes(),
+            &fp,
+            self.num_vectors,
+            self.dimensions,
+            self.config.max_degree,
+            self.config.search_list_size,
+            self.config.alpha,
+        )?;
+        fs::rename(&metadata_tmp, &metadata_path)?;
+
+        Ok(())
+    }
+
+    /// Fingerprint-gated restore. On a corpus fingerprint match, loads all segments including
+    /// lifecycle state in O(N) without rebuilding reverse_adj. On mismatch or missing v2
+    /// commit, falls back to rebuild.
+    ///
+    /// `corpus_vectors` is the raw flat f32 slice from the caller's database layer.
+    ///
+    /// Decision tree:
+    /// - metadata.bin with KHVVAMG2 magic AND checksums valid AND fingerprint matches → fast path
+    /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild + save_atomic
+    /// - metadata.bin with KHVVAMM1 (v1) → v1 load + save_atomic upgrade
+    /// - metadata.bin missing → rebuild + save_atomic
+    pub fn load_or_build(path: &Path, corpus_vectors: &[f32]) -> Result<Self> {
+        let metadata_path = path.join("metadata.bin");
+
+        let metadata_bytes = match fs::read(&metadata_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if metadata_bytes.len() < 8 {
+            return Err(VamanaError::invalid_format(
+                "metadata.bin too short to detect magic".into(),
+            ));
+        }
+
+        if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
+            let commit = match parse_v2_commit(&metadata_bytes) {
+                Ok(c) => c,
+                Err(_) => {
+                    let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+            };
+
+            // Verify checksums of all three segments.
+            let vectors_data = fs::read(path.join("vectors.bin"))?;
+            let graph_data = fs::read(path.join("graph.bin"))?;
+            let lifecycle_data = fs::read(path.join("lifecycle.bin"))?;
+
+            let vhash = *blake3::hash(&vectors_data).as_bytes();
+            let ghash = *blake3::hash(&graph_data).as_bytes();
+            let lhash = *blake3::hash(&lifecycle_data).as_bytes();
+
+            if vhash != commit.vectors_hash
+                || ghash != commit.graph_hash
+                || lhash != commit.lifecycle_hash
+            {
+                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+
+            // Verify corpus fingerprint: dimensions, count, and content hash.
+            let dim = commit.index_meta.dimensions;
+            if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
+                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+            let live_count = corpus_vectors.len() / dim;
+            let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
+
+            let fp_matches = commit.fingerprint.vector_count == live_count as u64
+                && commit.fingerprint.dimensions == dim as u64
+                && commit.fingerprint.content_hash == live_content_hash;
+
+            if !fp_matches {
+                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+
+            // Fast path: load all segments, restore lifecycle state.
+            Self::load_v2_fast(path, &lifecycle_data)
+        } else if &metadata_bytes[..8] == METADATA_MAGIC {
+            // V1 format: upgrade to v2.
+            let mut index = Self::load(path)?;
+            // Release the mmap before save_atomic overwrites the same files.
+            index.ensure_owned()?;
+            index.save_atomic(path)?;
+            Ok(index)
+        } else {
+            Err(VamanaError::invalid_format(
+                "metadata.bin has unrecognised magic".into(),
+            ))
+        }
+    }
+
+    /// Load all v2 segments from `path` and restore lifecycle state from `lifecycle_data`.
+    fn load_v2_fast(path: &Path, lifecycle_data: &[u8]) -> Result<Self> {
+        let meta_bytes = fs::read(path.join("metadata.bin"))?;
+        let commit = parse_v2_commit(&meta_bytes)?;
+
+        let config = VamanaConfig {
+            dimensions: commit.index_meta.dimensions,
+            max_degree: commit.index_meta.max_degree,
+            search_list_size: commit.index_meta.search_list_size,
+            alpha: commit.index_meta.alpha,
+        };
+        config.validate()?;
+
+        let num_vectors = commit.index_meta.num_vectors;
+
+        let dimensions = config.dimensions;
+        let max_degree = config.max_degree;
+        let mut graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
+
+        if graph.node_count() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "graph node count {} != commit num_vectors {}",
+                graph.node_count(),
+                num_vectors
+            )));
+        }
+
+        let expected_len_f32 = num_vectors
+            .checked_mul(dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
+        let storage = mmap_vectors(&path.join("vectors.bin"), expected_len_f32)?;
+
+        // Parse lifecycle.bin and restore state directly (no O(N*R) rebuild).
+        let lifecycle = parse_lifecycle(lifecycle_data, num_vectors, max_degree)?;
+        graph.restore_reverse_adj(lifecycle.reverse_adj);
+
+        let tombstone_count = lifecycle
+            .tombstones
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum();
+
+        Ok(Self {
+            vectors: storage,
+            graph,
+            config,
+            num_vectors,
+            dimensions,
+            tombstones: lifecycle.tombstones,
+            tombstone_count,
+            ops_since_consolidation: lifecycle.ops_since_consolidation,
+            free_slots: lifecycle.free_slots,
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+        })
+    }
+
+    /// Build a fresh VamanaIndex from `corpus_vectors`, recovering config from saved metadata.
+    /// Used when fingerprint mismatches or metadata is corrupt/missing.
+    fn rebuild_from_corpus(corpus_vectors: &[f32], path: &Path) -> Result<Self> {
+        if corpus_vectors.is_empty() {
+            return Err(VamanaError::EmptyInput);
+        }
+        let metadata_path = path.join("metadata.bin");
+        if !metadata_path.exists() {
+            return Err(VamanaError::invalid_format(
+                "cannot rebuild: no saved config (metadata.bin missing)".into(),
+            ));
+        }
+        let meta_bytes = fs::read(&metadata_path)?;
+        let meta = if meta_bytes.len() >= 8 && &meta_bytes[..8] == V2_COMMIT_MAGIC {
+            let commit = parse_v2_commit(&meta_bytes)?;
+            commit.index_meta
+        } else if meta_bytes.len() >= 8 && &meta_bytes[..8] == METADATA_MAGIC {
+            read_metadata_bytes(&meta_bytes)?
+        } else {
+            return Err(VamanaError::invalid_format("unknown metadata magic".into()));
+        };
+
+        let config = VamanaConfig {
+            dimensions: meta.dimensions,
+            max_degree: meta.max_degree,
+            search_list_size: meta.search_list_size,
+            alpha: meta.alpha,
+        };
+        config.validate()?;
+        VamanaIndex::build(corpus_vectors, config)
     }
 
     /// Mean recall@k across `queries` vs. exact brute-force. Errors on empty, bad dim, or non-finite.
@@ -1455,6 +1709,382 @@ fn exact_search(
         a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
     });
     dists
+}
+
+// ---- V2 persistence helpers ----
+
+/// Corpus identity check used by `save_atomic` / `load_or_build`.
+/// Separate from `CorpusFingerprint` (which is part of the snapshot API).
+struct V2CorpusFingerprint {
+    vector_count: u64,
+    dimensions: u64,
+    content_hash: [u8; 32],
+}
+
+/// Parsed content of a KHVVAMG2 commit record (metadata.bin written by save_atomic).
+struct V2Commit {
+    vectors_hash: [u8; 32],
+    graph_hash: [u8; 32],
+    lifecycle_hash: [u8; 32],
+    fingerprint: V2CorpusFingerprint,
+    index_meta: IndexMetadata,
+}
+
+/// Parsed lifecycle.bin content.
+struct ParsedLifecycle {
+    tombstones: Vec<u64>,
+    free_slots: Vec<u32>,
+    reverse_adj: Vec<Vec<u32>>,
+    ops_since_consolidation: usize,
+}
+
+/// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
+#[allow(clippy::too_many_arguments)]
+fn write_v2_commit_full(
+    path: &Path,
+    vectors_hash: &[u8; 32],
+    graph_hash: &[u8; 32],
+    lifecycle_hash: &[u8; 32],
+    fp: &V2CorpusFingerprint,
+    num_vectors: usize,
+    dimensions: usize,
+    max_degree: usize,
+    search_list_size: usize,
+    alpha: f64,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(V2_COMMIT_MAGIC)?;
+    w.write_all(vectors_hash)?;
+    w.write_all(graph_hash)?;
+    w.write_all(lifecycle_hash)?;
+    w.write_all(&fp.vector_count.to_le_bytes())?;
+    w.write_all(&fp.dimensions.to_le_bytes())?;
+    w.write_all(&fp.content_hash)?;
+    // Embedded v1-style index metadata.
+    w.write_all(&(num_vectors as u64).to_le_bytes())?;
+    w.write_all(&(dimensions as u64).to_le_bytes())?;
+    w.write_all(&(max_degree as u64).to_le_bytes())?;
+    w.write_all(&(search_list_size as u64).to_le_bytes())?;
+    w.write_all(&alpha.to_le_bytes())?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Parse a KHVVAMG2 commit record from bytes.
+fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
+    // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
+    // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
+    let expected_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
+    if data.len() < expected_len {
+        return Err(VamanaError::invalid_format(format!(
+            "v2 commit record too short: {} < {expected_len}",
+            data.len()
+        )));
+    }
+    if &data[..8] != V2_COMMIT_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "v2 commit record magic mismatch".into(),
+        ));
+    }
+
+    let mut offset = 8usize;
+
+    let mut vectors_hash = [0u8; 32];
+    vectors_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut graph_hash = [0u8; 32];
+    graph_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut lifecycle_hash = [0u8; 32];
+    lifecycle_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let vector_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let fp_dimensions = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let num_vectors = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit num_vectors overflow".into()))?;
+    offset += 8;
+    let dimensions = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit dimensions overflow".into()))?;
+    offset += 8;
+    let max_degree = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit max_degree overflow".into()))?;
+    offset += 8;
+    let search_list_size = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit search_list_size overflow".into()))?;
+    offset += 8;
+    let alpha = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+
+    if num_vectors == 0 {
+        return Err(VamanaError::invalid_format(
+            "v2 commit num_vectors is 0".into(),
+        ));
+    }
+    if dimensions == 0 {
+        return Err(VamanaError::invalid_format(
+            "v2 commit dimensions is 0".into(),
+        ));
+    }
+
+    Ok(V2Commit {
+        vectors_hash,
+        graph_hash,
+        lifecycle_hash,
+        fingerprint: V2CorpusFingerprint {
+            vector_count,
+            dimensions: fp_dimensions,
+            content_hash,
+        },
+        index_meta: IndexMetadata {
+            num_vectors,
+            dimensions,
+            max_degree,
+            search_list_size,
+            alpha,
+        },
+    })
+}
+
+/// Write lifecycle.bin.
+///
+/// Layout (all little-endian):
+///   magic            8 B   "KHVVLIF1"
+///   tombstone_words  8 B   (u64 count of u64 words)
+///   tombstone data   N × 8 B
+///   free_slots_count 8 B   (u64)
+///   free_slots data  M × 4 B (u32)
+///   ops              8 B   (u64)
+///   // reverse_adj: same format as graph.bin adjacency (per-node degree + neighbors)
+///   // num_nodes derived from tombstone_words (context: caller knows num_vectors)
+///   rev_num_nodes    8 B   (u64)
+///   for each node:
+///     degree         4 B   (u32)
+///     neighbors      degree × 4 B (u32 each)
+fn write_lifecycle(
+    path: &Path,
+    tombstones: &[u64],
+    free_slots: &[u32],
+    graph: &VamanaGraph,
+    ops_since_consolidation: usize,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(LIFECYCLE_MAGIC)?;
+
+    // Tombstones.
+    let ts_words = tombstones.len() as u64;
+    w.write_all(&ts_words.to_le_bytes())?;
+    for &word in tombstones {
+        w.write_all(&word.to_le_bytes())?;
+    }
+
+    // Free slots.
+    let fs_count = free_slots.len() as u64;
+    w.write_all(&fs_count.to_le_bytes())?;
+    for &slot in free_slots {
+        w.write_all(&slot.to_le_bytes())?;
+    }
+
+    // ops_since_consolidation.
+    w.write_all(&(ops_since_consolidation as u64).to_le_bytes())?;
+
+    // Reverse adjacency.
+    let rev = graph.reverse_adjacency();
+    let rev_nodes = rev.len() as u64;
+    w.write_all(&rev_nodes.to_le_bytes())?;
+    for neighbors in rev {
+        let degree = neighbors.len() as u32;
+        w.write_all(&degree.to_le_bytes())?;
+        for &nb in neighbors {
+            w.write_all(&nb.to_le_bytes())?;
+        }
+    }
+
+    w.flush()?;
+    Ok(())
+}
+
+/// Parse lifecycle.bin bytes into `ParsedLifecycle`.
+fn parse_lifecycle(data: &[u8], num_vectors: usize, max_degree: usize) -> Result<ParsedLifecycle> {
+    if data.len() < 8 {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin too short".into(),
+        ));
+    }
+    if &data[..8] != LIFECYCLE_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin magic mismatch".into(),
+        ));
+    }
+
+    let mut offset = 8usize;
+
+    // Tombstones.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at tombstone_words".into(),
+        ));
+    }
+    let ts_words = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    if offset + ts_words * 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at tombstone data".into(),
+        ));
+    }
+    let mut tombstones = Vec::with_capacity(ts_words);
+    for _ in 0..ts_words {
+        let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        tombstones.push(word);
+        offset += 8;
+    }
+    // Ensure tombstone bitvec covers all nodes.
+    let needed_words = num_vectors.div_ceil(64);
+    if tombstones.len() < needed_words {
+        tombstones.resize(needed_words, 0);
+    }
+
+    // Free slots.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at free_slots_count".into(),
+        ));
+    }
+    let fs_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    if offset + fs_count * 4 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at free_slots data".into(),
+        ));
+    }
+    let mut free_slots = Vec::with_capacity(fs_count);
+    for _ in 0..fs_count {
+        let slot = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        free_slots.push(slot);
+        offset += 4;
+    }
+
+    // ops_since_consolidation.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at ops".into(),
+        ));
+    }
+    let ops_since_consolidation =
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+
+    // Reverse adjacency.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at rev_num_nodes".into(),
+        ));
+    }
+    let rev_num_nodes = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+
+    if rev_num_nodes != num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin rev_num_nodes {rev_num_nodes} != num_vectors {num_vectors}"
+        )));
+    }
+
+    let mut reverse_adj: Vec<Vec<u32>> = Vec::with_capacity(rev_num_nodes);
+    for node in 0..rev_num_nodes {
+        if offset + 4 > data.len() {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin truncated at rev degree".into(),
+            ));
+        }
+        let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if degree > max_degree * 4 {
+            // Allow up to 4× max_degree for the medoid overflow; anything larger is corrupt.
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin node {node} rev degree {degree} implausible"
+            )));
+        }
+        if offset + degree * 4 > data.len() {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin truncated at rev neighbors".into(),
+            ));
+        }
+        let mut neighbors = Vec::with_capacity(degree);
+        for _ in 0..degree {
+            let nb = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            if nb as usize >= num_vectors {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin rev neighbor {nb} >= num_vectors {num_vectors}"
+                )));
+            }
+            neighbors.push(nb);
+            offset += 4;
+        }
+        reverse_adj.push(neighbors);
+    }
+
+    Ok(ParsedLifecycle {
+        tombstones,
+        free_slots,
+        reverse_adj,
+        ops_since_consolidation,
+    })
+}
+
+/// Parse metadata fields from a KHVVAMM1 (v1) metadata.bin byte slice.
+fn read_metadata_bytes(data: &[u8]) -> Result<IndexMetadata> {
+    let expected_len = 8 + 5 * 8;
+    if data.len() < expected_len {
+        return Err(VamanaError::invalid_format("metadata.bin truncated".into()));
+    }
+    if &data[..8] != METADATA_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "metadata.bin magic mismatch".into(),
+        ));
+    }
+    let num_vectors = usize::try_from(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("num_vectors overflows usize".into()))?;
+    let dimensions = usize::try_from(u64::from_le_bytes(data[16..24].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("dimensions overflows usize".into()))?;
+    let max_degree = usize::try_from(u64::from_le_bytes(data[24..32].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("max_degree overflows usize".into()))?;
+    let search_list_size = usize::try_from(u64::from_le_bytes(data[32..40].try_into().unwrap()))
+        .map_err(|_| VamanaError::invalid_format("search_list_size overflows usize".into()))?;
+    let alpha = f64::from_le_bytes(data[40..48].try_into().unwrap());
+    if num_vectors == 0 {
+        return Err(VamanaError::invalid_format("num_vectors is 0".into()));
+    }
+    if dimensions == 0 {
+        return Err(VamanaError::invalid_format("dimensions is 0".into()));
+    }
+    Ok(IndexMetadata {
+        num_vectors,
+        dimensions,
+        max_degree,
+        search_list_size,
+        alpha,
+    })
 }
 
 fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
