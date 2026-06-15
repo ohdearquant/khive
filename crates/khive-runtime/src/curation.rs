@@ -315,7 +315,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.graph(token)?;
         let _ = self.text(token)?;
-        if self.config().embedding_model.is_some() {
+        if !self.registered_embedding_model_names().is_empty() {
             let _ = self.vectors(token)?;
         }
 
@@ -334,7 +334,12 @@ impl KhiveRuntime {
 
         // If vectors are configured, reindex into_entity (requires async embedding).
         // FTS and vec-delete were already committed inside the transaction above.
-        if !dry_run && self.config().embedding_model.is_some() {
+        // TODO(#NN): merge_entity's SQLite transaction deletes only the from-entity's
+        // default-model vector (vec_table above). Non-default-model vectors from the
+        // from-entity are NOT deleted inside the transaction and become orphaned after
+        // merge. Fixing this requires the spawn_blocking closure to fan out across all
+        // registered model vec_table names, which is a non-trivial schema-level change.
+        if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_entity(token, &updated_entity).await?;
         }
 
@@ -369,11 +374,18 @@ impl KhiveRuntime {
 
     // ---- Internal helpers ----
 
-    /// Re-upsert FTS5 document (and vector if model configured) for the entity.
+    /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
     /// than the caller-supplied `namespace` parameter. This prevents a cross-namespace
     /// reindex from writing the search document into the wrong namespace's FTS index.
+    ///
+    /// Best-effort for vectors: if embedding or inserting for a particular model fails,
+    /// logs a warning and continues to the next model. The FTS step is fail-closed
+    /// (propagates error). Callers (update_entity, merge_entity) have already committed
+    /// the entity row, so a partial embed miss leaves a stale vector rather than
+    /// rolling back the update — acceptable because SqliteVecStore::insert is an upsert
+    /// (the prior vector stays intact on failure, keeping the record searchable).
     pub(crate) async fn reindex_entity(
         &self,
         token: &NamespaceToken,
@@ -385,23 +397,53 @@ impl KhiveRuntime {
         let embed_body = doc.body.clone();
         self.text(token)?.upsert_document(doc).await?;
 
-        if self.config().embedding_model.is_some() {
-            let vector = self.embed_document(&embed_body).await?;
-            self.vectors(token)?
-                .insert(
-                    entity.id,
-                    SubstrateKind::Entity,
-                    &ns,
-                    "entity.body",
-                    vec![vector],
-                )
-                .await?;
+        let embed_model_names = self.registered_embedding_model_names();
+        for model_name in &embed_model_names {
+            match self
+                .embed_document_with_model(model_name, &embed_body)
+                .await
+            {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => {
+                        if let Err(e) = vs
+                            .insert(
+                                entity.id,
+                                SubstrateKind::Entity,
+                                &ns,
+                                "entity.body",
+                                vec![vector],
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                model = model_name,
+                                id = %entity.id,
+                                "reindex_entity: vector insert failed, skipping model: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = model_name,
+                            id = %entity.id,
+                            "reindex_entity: could not access vector store for model, skipping: {e}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        model = model_name,
+                        id = %entity.id,
+                        "reindex_entity: embed failed for model, skipping: {e}"
+                    );
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Remove an entity from FTS5 and (if configured) vector indexes.
+    /// Remove an entity from FTS5 and vector indexes across all registered models.
     pub(crate) async fn remove_from_indexes(
         &self,
         token: &NamespaceToken,
@@ -409,13 +451,17 @@ impl KhiveRuntime {
     ) -> RuntimeResult<()> {
         let ns = token.namespace().as_str().to_owned();
         self.text(token)?.delete_document(&ns, id).await?;
-        if self.config().embedding_model.is_some() {
-            self.vectors(token)?.delete(id).await?;
+        for model_name in self.registered_embedding_model_names() {
+            self.vectors_for_model(token, &model_name)?
+                .delete(id)
+                .await?;
         }
         Ok(())
     }
 
-    /// Re-upsert FTS5 document (and vector if model configured) for the note.
+    /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
+    ///
+    /// Best-effort for vectors: mirrors reindex_entity's warn-and-continue policy.
     pub(crate) async fn reindex_note(
         &self,
         token: &NamespaceToken,
@@ -425,18 +471,48 @@ impl KhiveRuntime {
             .upsert_document(note_fts_document(note))
             .await?;
 
-        if self.config().embedding_model.is_some() {
-            let ns = note.namespace.clone();
-            let vector = self.embed_document(&note.content).await?;
-            self.vectors(token)?
-                .insert(
-                    note.id,
-                    SubstrateKind::Note,
-                    &ns,
-                    "note.content",
-                    vec![vector],
-                )
-                .await?;
+        let ns = note.namespace.clone();
+        let embed_model_names = self.registered_embedding_model_names();
+        for model_name in &embed_model_names {
+            match self
+                .embed_document_with_model(model_name, &note.content)
+                .await
+            {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => {
+                        if let Err(e) = vs
+                            .insert(
+                                note.id,
+                                SubstrateKind::Note,
+                                &ns,
+                                "note.content",
+                                vec![vector],
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                model = model_name,
+                                id = %note.id,
+                                "reindex_note: vector insert failed, skipping model: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = model_name,
+                            id = %note.id,
+                            "reindex_note: could not access vector store for model, skipping: {e}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        model = model_name,
+                        id = %note.id,
+                        "reindex_note: embed failed for model, skipping: {e}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -573,7 +649,7 @@ impl KhiveRuntime {
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
-        if self.config().embedding_model.is_some() {
+        if !self.registered_embedding_model_names().is_empty() {
             let _ = self.vectors(token)?;
         }
 
@@ -597,7 +673,7 @@ impl KhiveRuntime {
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))??;
 
-        if !dry_run && self.config().embedding_model.is_some() {
+        if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_note(token, &updated_note).await?;
         }
         Ok(summary)
