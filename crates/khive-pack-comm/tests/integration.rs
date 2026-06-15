@@ -2637,46 +2637,209 @@ async fn t4_inbound_note_namespace_is_recipient() {
     );
 }
 
-// T5 — ADR-057: recipient inbox sees 0 messages (inbound is in sender ns, not recipient ns).
-// Both copies land in lambda:leo; lambda:khive cannot see them.
+// T5 — ADR-057 §(c): shared-namespace delivery (single-actor fallback).
+//
+// In the production deployment all lambdas run as namespace "local". A send from
+// "local" to any actor label writes both copies into "local". comm.inbox called with
+// namespace "local" skips the to_actor filter (single-actor fallback) and sees all
+// inbound messages. This is the path that makes lambda→lambda messaging functional
+// today, without requiring per-actor namespace isolation (issue #75).
+//
+// ADR-057 §(c) steps 13-15: send from "local" to "lambda:leo", assert send succeeds,
+// assert the inbound message appears in the "local" inbox.
 #[tokio::test]
 async fn t5_recipient_inbox_sees_message() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
-    let (registry_khive, _rt_khive) =
-        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+    // Both sender and recipient share namespace "local" — the real deployment topology.
+    let (registry_sender, rt_local) = build_crossns_registry(Arc::clone(&backend), "local", vec![]);
+    // A second registry also in "local" simulates the recipient reading their inbox.
+    let (registry_recipient, _rt_local2) =
+        build_crossns_registry(Arc::clone(&backend), "local", vec![]);
 
-    registry_leo
+    // Send from "local" to actor label "lambda:leo".
+    let send_result = registry_sender
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "inbox check" }),
+            serde_json::json!({ "to": "lambda:leo", "content": "inbox check" }),
         )
-        .await
-        .expect("T5: send must succeed");
+        .await;
+    assert!(
+        send_result.is_ok(),
+        "T5: send from 'local' to 'lambda:leo' must succeed; got {send_result:?}"
+    );
 
-    // ADR-057: recipient (lambda:khive) inbox is empty — inbound is in sender ns.
-    let inbox = registry_khive
+    // The inbound note has to_actor="lambda:leo" and lives in namespace "local".
+    let local_tok = rt_local
+        .authorize(Namespace::parse("local").unwrap())
+        .unwrap();
+    let all_notes = rt_local
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound = all_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .filter(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "T5: expect 1 inbound note in 'local' namespace; got {}",
+        inbound.len()
+    );
+    assert_eq!(
+        inbound[0].namespace.as_str(),
+        "local",
+        "T5: inbound note namespace must be 'local'"
+    );
+    let inbound_to_actor = inbound[0]
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("to_actor"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        inbound_to_actor,
+        Some("lambda:leo"),
+        "T5: inbound note must have to_actor='lambda:leo'"
+    );
+
+    // The recipient inbox (also "local") sees the inbound message via the single-actor
+    // fallback: caller_actor == "local" skips the to_actor filter, returning all inbound.
+    let inbox = registry_recipient
         .dispatch("comm.inbox", serde_json::json!({}))
         .await
         .expect("T5: inbox dispatch must succeed");
     let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-    assert_eq!(
-        count, 0,
-        "T5: recipient inbox must be empty under ADR-057 (inbound lives in sender ns); got {count}"
+    assert!(
+        count >= 1,
+        "T5: 'local' inbox must see the inbound message (single-actor fallback); got count={count}"
     );
 
-    // Both outbound + inbound copies are in the sender namespace (lambda:leo).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // Namespace isolation: no notes in any namespace other than "local".
+    // Both outbound + inbound copies are in "local".
+    let local_alive = all_notes.iter().filter(|n| n.deleted_at.is_none()).count();
+    assert_eq!(
+        local_alive, 2,
+        "T5: 'local' namespace must hold both outbound + inbound copies; got {local_alive}"
+    );
+}
+
+// T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, codex Critical #2).
+//
+// Reply on a shared-namespace setup proves the fail-closed reply path: after the fix,
+// handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
+// and always sets from_actor/to_actor. No path through handle_reply can cause
+// dual_write_message to mint a token in a foreign namespace.
+//
+// This test exercises the "original had no actor labels" branch (legacy message forged
+// via a plain send to "local", so from_actor/to_actor on the original are set by
+// handle_send, not absent). We also verify the reply lands in "local" and the thread
+// links correctly.
+#[tokio::test]
+async fn t5b_reply_always_writes_same_namespace() {
+    let backend = shared_backend();
+    let (registry_local, rt_local) = build_crossns_registry(Arc::clone(&backend), "local", vec![]);
+
+    // Send from "local" to "lambda:khive" — both copies in "local".
+    let send_val = registry_local
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "hello for reply" }),
+        )
+        .await
+        .expect("T5b: initial send must succeed");
+    let outbound_id = send_val
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T5b: send must return full_id");
+
+    // Find the inbound note in "local".
+    let local_tok = rt_local
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let all_notes = rt_local
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let leo_alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
+    let inbound_id = all_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .find(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("T5b: must find inbound note in 'local'");
+
+    // Reply from the same "local" registry.
+    let reply_result = registry_local
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": inbound_id, "content": "got it, replying" }),
+        )
+        .await;
+    assert!(
+        reply_result.is_ok(),
+        "T5b: reply must succeed; got {reply_result:?}"
+    );
+    let reply_val = reply_result.unwrap();
+
+    // Reply carries the same thread_id as the original send.
+    let reply_thread_id = reply_val
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T5b: reply must carry thread_id");
     assert_eq!(
-        leo_alive, 2,
-        "T5: sender ns must hold both outbound + inbound copies; got {leo_alive}"
+        reply_thread_id, outbound_id,
+        "T5b: reply thread_id must equal original outbound UUID"
+    );
+
+    // All four notes (outbound1, inbound1, outbound2, inbound2) are in "local".
+    // No note exists in any other namespace.
+    let notes_after = rt_local
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let alive = notes_after
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        alive, 4,
+        "T5b: expect 4 notes after send + reply (2 outbound + 2 inbound); got {alive}"
+    );
+    for note in notes_after.iter().filter(|n| n.deleted_at.is_none()) {
+        assert_eq!(
+            note.namespace.as_str(),
+            "local",
+            "T5b: every note must be in 'local' namespace; found {}",
+            note.namespace.as_str()
+        );
+    }
+
+    // The "local" inbox sees the reply inbound (single-actor fallback, no to_actor filter).
+    let inbox_after = registry_local
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("T5b: inbox after reply must succeed");
+    let inbox_count = inbox_after
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        inbox_count >= 1,
+        "T5b: 'local' inbox must see at least one inbound message; got {inbox_count}"
     );
 }
 

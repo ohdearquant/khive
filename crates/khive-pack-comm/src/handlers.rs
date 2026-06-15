@@ -342,17 +342,14 @@ pub(crate) async fn handle_reply(
         original_from.clone()
     };
 
-    // ADR-057: set from_actor/to_actor on the reply when the original had them.
-    let reply_from_actor = if original_from_actor.is_some() || original_to_actor.is_some() {
-        Some(from.clone())
-    } else {
-        None
-    };
-    let reply_to_actor = if original_from_actor.is_some() || original_to_actor.is_some() {
-        Some(reply_to.clone())
-    } else {
-        None
-    };
+    // ADR-057: always set from_actor/to_actor on replies (fail-closed on cross-namespace
+    // write). Both copies land in the caller's namespace regardless of whether the
+    // original message carried actor labels. The reply_to label is derived from the
+    // original's actor fields when present, else from the legacy from/to strings treated
+    // as labels. No legacy code path can cause dual_write_message to mint a token in a
+    // foreign namespace.
+    let reply_from_actor = from.clone();
+    let reply_to_actor = reply_to.clone();
 
     let reply_subject_opt = if reply_subject.is_empty() {
         None
@@ -360,28 +357,20 @@ pub(crate) async fn handle_reply(
         Some(reply_subject.as_str())
     };
 
-    // When actor labels are present (actor-addressed reply, ADR-057), pass caller_ns
-    // as both `from` and `to` so `from == recipient_ns_str` in dual_write_message,
-    // naturally bypassing the cross-namespace allowlist gate. Actor labels are stored
-    // via from_actor/to_actor arguments. For legacy cross-namespace replies (no actor
-    // labels), pass the original from/to namespace strings unchanged.
-    let dual_write_to = if reply_from_actor.is_some() {
-        from.clone()
-    } else {
-        reply_to.clone()
-    };
-
+    // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
+    // dual_write_message, naturally bypassing the cross-namespace allowlist gate
+    // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
     let reply_note = dual_write_message(
         runtime,
         token,
         &from,
-        &dual_write_to,
+        &from,
         reply_subject_opt,
         &p.content,
         Some(&thread_id),
         &sent_at,
-        reply_from_actor.as_deref(),
-        reply_to_actor.as_deref(),
+        Some(&reply_from_actor),
+        Some(&reply_to_actor),
     )
     .await?;
 

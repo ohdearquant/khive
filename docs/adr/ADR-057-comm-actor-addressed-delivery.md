@@ -76,6 +76,24 @@ Option B is deferred. Issue #13 remains open and will be addressed in a future c
 (likely a companion to ADR-053). This ADR does not conflict with Option B; both can coexist
 because the actor-addressed path fires only when sender and recipient share a namespace.
 
+### Scope of this implementation
+
+This PR delivers **Failure 1 (delivery denied)** for the shared-`"local"` deployment:
+`comm.send` and `comm.reply` no longer return `PermissionDenied` for actor-addressed sends.
+Both copies of a message stay in the caller's namespace; delivery works via the single-actor
+fallback in `comm.inbox` (no `to_actor` filter when `caller_actor == "local"`).
+
+**Failure 2 (per-actor inbox filtering)** requires distinguishing actors within a shared
+namespace, which in turn requires actor identity to be carried separately from the namespace
+string. That work is tracked in issue #75. The `to_actor` field, the
+`idx_comm_message_to_actor` index, and the `EqOrMissing` filter in `handle_inbox` are
+forward-deployed and dormant: they activate automatically once tokens carry distinct actor
+labels within the same namespace.
+
+`comm.reply` is fail-closed: it always writes both copies into the caller's namespace and
+always sets `from_actor`/`to_actor`. No code path through `handle_reply` can cause
+`dual_write_message` to mint a token in a foreign namespace.
+
 ### Interaction with issue #75
 
 Issue #75 (actor identity on every request) is not a hard prerequisite for this ADR. The
@@ -257,38 +275,39 @@ JSON properties; index creation is idempotent via `CREATE INDEX IF NOT EXISTS` a
 
 ## Test Plan
 
-Tests must assert both:
+Tests assert the following:
 
-**(a) Same-namespace actor-addressed delivery works and inbox filters correctly**
+**(a) Per-actor inbox filtering -- deferred to issue #75**
 
-1. Construct two `NamespaceToken`s both with namespace `"local"` but simulating actor labels
-   `"lambda:khive"` and `"lambda:leo"` (by setting `default_namespace` in test config via
-   `khive_cfg_with_actor`).
-2. As `lambda:khive`, call `comm.send(to="lambda:leo", content="hello")`.
-3. Assert: send returns `ok`, no `PermissionDenied` error.
-4. Assert: the outbound note in namespace `"local"` has `direction=outbound`,
-   `from_actor="lambda:khive"`, `to_actor="lambda:leo"`.
-5. Assert: the inbound note in namespace `"local"` has `direction=inbound`,
-   `to_actor="lambda:leo"`.
-6. `comm.inbox` as `lambda:leo`: the message appears.
-7. `comm.inbox` as `lambda:khive`: the message does not appear.
-8. `comm.inbox` as `lambda:other`: no messages.
-9. `comm.reply` as `lambda:leo`: the reply is routed to `lambda:khive` and appears in A's
-   inbox.
+Steps 6-8 of the original plan (inbox as `lambda:leo` sees the message; inbox as `lambda:khive`
+does not) require carrying actor identity separately from the namespace string. With the current
+mechanism, `token.namespace().as_str()` IS the actor label, so two actors in the same namespace
+`"local"` would both have actor label `"local"` and both see all messages via the single-actor
+fallback. Per-actor filtering within a shared namespace is therefore not achievable with this
+implementation and is deferred to issue #75. The `to_actor` field, the
+`idx_comm_message_to_actor` index, and the `EqOrMissing` inbox filter are forward-deployed
+machinery that activate once tokens carry distinct non-`"local"` actor labels.
 
 **(b) Namespace isolation is preserved**
 
-10. Assert all notes written in steps 2-5 have `namespace = "local"`.
-11. Assert no note exists in any namespace other than `"local"` after the delivery sequence.
-12. Assert `NamespaceToken::with_namespace` is not called during the actor-addressed send path
-    (confirm by inspection or by asserting the test runtime has no cross-namespace writes).
+1. As `lambda:leo` (namespace `"lambda:leo"`), call `comm.send(to="lambda:khive", content=...)`.
+2. Assert: send returns `ok`, no `PermissionDenied` error.
+3. Assert: both the outbound and inbound notes have `namespace = "lambda:leo"`.
+4. Assert: the inbound note has `from_actor="lambda:leo"`, `to_actor="lambda:khive"`.
+5. Assert: no note exists in namespace `"lambda:khive"` after the sequence.
+6. Assert `NamespaceToken::with_namespace` is not called during the actor-addressed send path
+   (verify by inspection: `dual_write_message` takes the `from_actor.is_some()` branch, which
+   uses `caller_token` directly for the inbound write).
 
-**(c) Single-actor fallback is unchanged**
+**(c) Single-actor fallback delivers messages (Failure 1 fix)**
 
-13. Call `comm.send(to="lambda:leo")` with actor label `"local"` (no `--actor` configured).
-14. Assert send succeeds.
-15. `comm.inbox` with actor label `"local"`: the inbound message appears (no `to_actor` filter
-    applied in the single-actor path).
+7. Call `comm.send(to="lambda:leo")` with actor label `"local"` (no `--actor` configured).
+8. Assert send succeeds, no `PermissionDenied`.
+9. Assert the inbound note is in namespace `"local"` with `to_actor="lambda:leo"`.
+10. `comm.inbox` with actor label `"local"`: the inbound message appears (the `caller_actor ==
+    "local"` branch skips the `to_actor` filter, returning all inbound messages).
+11. Assert `comm.reply` from `"local"` on the inbound note succeeds and all four notes
+    (outbound1, inbound1, outbound2, inbound2) remain in namespace `"local"`.
 
 ## Alternatives Considered
 
