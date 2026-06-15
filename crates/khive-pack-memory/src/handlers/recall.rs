@@ -16,7 +16,7 @@ use khive_storage::EdgeRelation;
 use crate::config::ScoreBreakdown;
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, contains_cjk, normalize_min_score, normalize_rank_fusion_scores,
+    calculate_score, needs_multilingual, normalize_min_score, normalize_rank_fusion_scores,
     normalize_rrf_scores, ScoreInput,
 };
 use crate::MemoryPack;
@@ -110,7 +110,7 @@ impl MemoryPack {
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
 
-        let is_cjk = scoring_cfg.enable_cjk_routing && contains_cjk(query_trimmed);
+        let is_cjk = scoring_cfg.enable_cjk_routing && needs_multilingual(query_trimmed);
 
         let candidate_limit =
             recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);
