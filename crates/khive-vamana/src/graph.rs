@@ -480,6 +480,18 @@ pub(crate) fn greedy_search_inner(
     let effective_l = search_list_size.max(k);
     visited.clear();
 
+    // Defense-in-depth: if the medoid seed is tombstoned (possible in the window between
+    // a crash-truncated medoid tombstone and PR4's crash-safe medoid update), skip seeding
+    // it and return an empty result rather than surfacing a deleted node in results.
+    if let Some(ts) = tombstones {
+        if is_tombstoned_bit(ts, start as usize) {
+            return GreedySearchResult {
+                results: Vec::new(),
+                expanded: Vec::new(),
+            };
+        }
+    }
+
     let start_dist = l2_squared(query, row(vectors, dimensions, start));
     visited.mark_if_new(start as usize);
 
@@ -543,8 +555,15 @@ pub(crate) fn greedy_search_inner(
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    // Filter tombstoned nodes from the result set (defense-in-depth for the no-repair
+    // control path and crash-truncated repair windows pre-PR4).
     let results = frontier
         .iter()
+        .filter(|c| {
+            tombstones
+                .map(|ts| !is_tombstoned_bit(ts, c.id as usize))
+                .unwrap_or(true)
+        })
         .take(k)
         .map(|c| (c.id, c.distance))
         .collect();

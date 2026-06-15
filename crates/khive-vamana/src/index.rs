@@ -694,6 +694,8 @@ impl VamanaIndex {
     /// `reverse_adj` is updated in lockstep on every rewire.
     ///
     /// If `node_id` was the medoid, a new medoid is elected (centroid-nearest live node).
+    ///
+    /// Returns an error without mutating any state if the op would leave zero live nodes.
     pub fn tombstone(&mut self, node_id: u32) -> Result<()> {
         let idx = node_id as usize;
         if idx >= self.num_vectors {
@@ -705,6 +707,13 @@ impl VamanaIndex {
         if is_tombstoned_bit(&self.tombstones, idx) {
             return Err(VamanaError::invalid_format(format!(
                 "tombstone: node_id {node_id} is already tombstoned"
+            )));
+        }
+        // Preflight: reject if this would leave zero live nodes (elect_medoid would fail
+        // with EmptyInput; guard here so no state is mutated on the error path).
+        if self.tombstone_count + 1 >= self.num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "tombstone: deleting node {node_id} would leave zero live nodes"
             )));
         }
 
@@ -748,16 +757,16 @@ impl VamanaIndex {
     /// Performs all structural rewires (Wolverine 2-hop repair, reverse_adj updates) for
     /// every node in `ordinals` first. Re-elects the medoid exactly once at the end, only
     /// if the current medoid is in the batch. Single-delete callers should use `tombstone()`.
+    ///
+    /// Returns an error without mutating any state if the batch would leave zero live nodes.
     pub fn tombstone_batch(&mut self, ordinals: &[u32]) -> Result<()> {
         if ordinals.is_empty() {
             return Ok(());
         }
 
-        let vecs = self.vectors.as_slice()?;
-        let vecs: Vec<f32> = vecs.to_vec(); // clone to avoid borrow conflict with &mut self
-
-        let mut medoid_affected = false;
-
+        // Preflight: validate all ordinals and check the all-tombstoned case before any
+        // mutation. This keeps the error path clean — no partial state on Err.
+        let mut unique_live: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &node_id in ordinals {
             let idx = node_id as usize;
             if idx >= self.num_vectors {
@@ -771,6 +780,22 @@ impl VamanaIndex {
                     "tombstone_batch: node_id {node_id} is already tombstoned"
                 )));
             }
+            unique_live.insert(node_id);
+        }
+        let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
+        if new_live == 0 {
+            return Err(VamanaError::invalid_format(
+                "tombstone_batch: batch would leave zero live nodes".into(),
+            ));
+        }
+
+        let vecs = self.vectors.as_slice()?;
+        let vecs: Vec<f32> = vecs.to_vec(); // clone to avoid borrow conflict with &mut self
+
+        let mut medoid_affected = false;
+
+        for &node_id in ordinals {
+            let idx = node_id as usize;
 
             // Track whether the current medoid is in this batch.
             if self.graph.medoid() == node_id {
@@ -796,6 +821,77 @@ impl VamanaIndex {
 
         // Single medoid re-election after all rewires — O(N*dims) once, not K times.
         if medoid_affected {
+            let new_medoid =
+                elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+            self.graph.set_medoid(new_medoid);
+        }
+
+        Ok(())
+    }
+
+    /// Tombstone a batch without Wolverine in-neighbor rewiring. Test support only.
+    ///
+    /// Sets tombstone bits and clears each deleted node's own forward adjacency (updating
+    /// `reverse_adj` in lockstep), but does NOT reselect in-neighbor lists via RobustPrune.
+    /// The medoid is re-elected once at the end if it falls in the batch.
+    ///
+    /// Used by the OQ1 empirical drift test to build a genuine no-repair control: search
+    /// still skips tombstoned nodes via the `Option<&[u64]>` guard in `greedy_search_inner`,
+    /// but in-neighbors that previously pointed to deleted nodes are NOT rewired, so the
+    /// graph retains dead-end paths that Wolverine would have bypassed.
+    #[doc(hidden)]
+    pub fn tombstone_batch_no_repair(&mut self, ordinals: &[u32]) -> Result<()> {
+        if ordinals.is_empty() {
+            return Ok(());
+        }
+
+        // Same preflight as tombstone_batch.
+        let mut unique_live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+            if idx >= self.num_vectors {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: node_id {node_id} out of range ({} nodes)",
+                    self.num_vectors
+                )));
+            }
+            if is_tombstoned_bit(&self.tombstones, idx) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: node_id {node_id} is already tombstoned"
+                )));
+            }
+            unique_live.insert(node_id);
+        }
+        let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
+        if new_live == 0 {
+            return Err(VamanaError::invalid_format(
+                "tombstone_batch_no_repair: batch would leave zero live nodes".into(),
+            ));
+        }
+
+        let mut medoid_affected = false;
+
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+
+            if self.graph.medoid() == node_id {
+                medoid_affected = true;
+            }
+
+            set_tombstone_bit(&mut self.tombstones, idx);
+            self.tombstone_count += 1;
+            self.ops_since_consolidation += 1;
+
+            // No Wolverine rewire. Just clear the deleted node's own forward adjacency so
+            // there are no outgoing edges from a dead node (reverse_adj updated in lockstep).
+            self.graph
+                .replace_adjacency_and_update_reverse(node_id, Vec::new());
+
+            self.free_slots.push(node_id);
+        }
+
+        if medoid_affected {
+            let vecs = self.vectors.as_slice()?.to_vec();
             let new_medoid =
                 elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
             self.graph.set_medoid(new_medoid);

@@ -224,6 +224,97 @@ fn tombstone_rejects_already_tombstoned() {
     assert!(idx.tombstone(target).is_err(), "double-tombstone must fail");
 }
 
+/// tombstone() on the last live node is rejected atomically — no state mutation on Err.
+///
+/// Index has n=2. Tombstone node 0, then try to tombstone node 1. The second call
+/// would leave zero live nodes. It must return Err AND leave the index intact:
+/// - tombstone_count stays at 1 (not 2)
+/// - node 1 is not marked tombstoned
+/// - search still returns results from node 1
+#[test]
+fn tombstone_rejects_all_tombstoned_single() {
+    let n = 2usize;
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(n, dim, 0xDEAD_0010);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    // Tombstone the non-medoid node first.
+    let medoid = idx.graph().medoid();
+    let first = if medoid == 0 { 1u32 } else { 0u32 };
+    idx.tombstone(first).unwrap();
+    assert_eq!(idx.tombstone_count(), 1);
+
+    // Now try to tombstone the medoid — would leave zero live nodes.
+    let result = idx.tombstone(medoid);
+    assert!(
+        result.is_err(),
+        "tombstone on last live node must return Err"
+    );
+
+    // State must be unchanged: count still 1, medoid not tombstoned, search works.
+    assert_eq!(
+        idx.tombstone_count(),
+        1,
+        "tombstone_count mutated on Err path"
+    );
+    assert!(
+        !idx.is_tombstoned(medoid),
+        "medoid incorrectly marked tombstoned after rejected op"
+    );
+    let q = &vectors[medoid as usize * dim..(medoid as usize + 1) * dim];
+    let results = idx.search(q, 1).unwrap();
+    assert!(
+        !results.is_empty(),
+        "search must still return results after rejected tombstone"
+    );
+}
+
+/// tombstone_batch() covering all nodes is rejected atomically — no state mutation on Err.
+///
+/// Index has n=3. Build all-ordinals batch. Call must return Err AND leave the index
+/// completely untouched: tombstone_count stays 0, no node is marked tombstoned.
+#[test]
+fn tombstone_batch_rejects_all_tombstoned() {
+    let n = 3usize;
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(n, dim, 0xDEAD_0011);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    let all: Vec<u32> = (0..n as u32).collect();
+    let result = idx.tombstone_batch(&all);
+    assert!(
+        result.is_err(),
+        "tombstone_batch covering all nodes must return Err"
+    );
+
+    // Atomicity: no state mutation.
+    assert_eq!(
+        idx.tombstone_count(),
+        0,
+        "tombstone_count mutated on Err path"
+    );
+    for i in 0..n as u32 {
+        assert!(
+            !idx.is_tombstoned(i),
+            "node {i} incorrectly marked tombstoned after rejected batch"
+        );
+    }
+
+    // Search still works.
+    let q = &vectors[0..dim];
+    let results = idx.search(q, 1).unwrap();
+    assert!(
+        !results.is_empty(),
+        "search must still work after rejected tombstone_batch"
+    );
+}
+
 /// tombstone_count() and is_tombstoned() are accurate.
 #[test]
 fn tombstone_count_and_is_tombstoned_accurate() {
@@ -265,7 +356,13 @@ fn needs_consolidation_false_below_tau() {
 }
 
 /// OQ1 empirical drift test: at 20% deletion on N=1000, Wolverine repair must beat
-/// no-repair control AND stay >= 0.95 * pre-deletion baseline.
+/// a genuine no-repair control AND stay >= 0.95 * pre-deletion baseline.
+///
+/// Control construction: `tombstone_batch_no_repair` uses the same graph topology and
+/// search config as the repaired index. The ONLY difference is that in-neighbor lists
+/// are NOT rewired by RobustPrune — dead-end paths remain in the graph. The search-time
+/// tombstone skip (`Option<&[u64]>` in `greedy_search_inner`) applies to BOTH indexes,
+/// so any recall delta is attributable solely to Wolverine repair vs. no repair.
 ///
 /// # Literature grounds
 /// - FreshDiskANN (SIGMOD 2022): consolidates at 20% deletion, maintains >95% recall.
@@ -277,6 +374,7 @@ fn oq1_wolverine_repair_beats_no_repair_and_meets_literature_floor() {
     let k = 10usize;
 
     let corpus = rand_unit_vectors(n, dim, 0xBEEF_C052);
+    // All three indexes use IDENTICAL cfg so any recall delta comes solely from repair.
     let cfg = VamanaConfig::with_dimensions(dim)
         .with_max_degree(16)
         .with_search_list_size(32);
@@ -295,26 +393,19 @@ fn oq1_wolverine_repair_beats_no_repair_and_meets_literature_floor() {
         .collect();
     assert_eq!(tombstone_set.len(), n / 5, "must delete exactly 20%");
 
-    // Build repaired index (Wolverine repair enabled — normal tombstone_batch).
+    // Build repaired index (Wolverine 2-hop repair via normal tombstone_batch).
     let mut repaired_idx = VamanaIndex::build(&corpus, cfg.clone()).unwrap();
     repaired_idx
         .tombstone_batch(&tombstone_set)
         .expect("repaired tombstone_batch");
 
-    // Build control index: tombstone with reverse_adj update but NO RobustPrune rewire.
-    // Implemented as a second index where we use tombstone_batch but then verify the
-    // tombstoned nodes actually don't appear (hard invariant), while using a config with
-    // a small search_list that degrades recall without repair.
-    // Cleaner: use a tiny search_list_size on the control so recall degrades meaningfully.
-    let ctrl_cfg = VamanaConfig::with_dimensions(dim)
-        .with_max_degree(16)
-        .with_search_list_size(16); // narrower beam = lower recall without repair
-    let mut control_idx = VamanaIndex::build(&corpus, ctrl_cfg).unwrap();
-    // Tombstone without the repair benefit by using a minimal-degree config so the graph
-    // is less connected; tombstone_batch still runs but the pre-existing graph is weaker.
+    // Build genuine no-repair control: same cfg, same tombstone set, but in-neighbors are
+    // NOT rewired by RobustPrune. Dead-end paths to deleted nodes remain; search skips
+    // tombstoned nodes at query time. This isolates Wolverine repair as the only variable.
+    let mut control_idx = VamanaIndex::build(&corpus, cfg.clone()).unwrap();
     control_idx
-        .tombstone_batch(&tombstone_set)
-        .expect("control tombstone_batch");
+        .tombstone_batch_no_repair(&tombstone_set)
+        .expect("control tombstone_batch_no_repair");
 
     let repaired = repaired_idx
         .recall_at_k(&queries, k)
@@ -325,7 +416,7 @@ fn oq1_wolverine_repair_beats_no_repair_and_meets_literature_floor() {
 
     println!("baseline={baseline:.4} control={control:.4} repaired={repaired:.4}");
 
-    // PRIMARY assertion: repair must beat no-repair control.
+    // PRIMARY assertion: Wolverine repair must beat no-repair control.
     assert!(
         repaired > control,
         "repair recall {repaired:.4} did not beat no-repair control {control:.4}"
@@ -340,7 +431,7 @@ fn oq1_wolverine_repair_beats_no_repair_and_meets_literature_floor() {
         0.95 * baseline
     );
 
-    // HARD INVARIANT: no tombstoned ordinal in any result set (zero tolerance).
+    // HARD INVARIANT: no tombstoned ordinal in any result set from the repaired index.
     let tombstone_set_hs: HashSet<u32> = tombstone_set.into_iter().collect();
     for qi in 0..50 {
         let q = &queries[qi * dim..(qi + 1) * dim];
