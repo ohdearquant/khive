@@ -142,8 +142,12 @@ default, so all cross-namespace sends are denied unless the sender opts in.
 When a recipient namespace appears in the sender's allowlist, `dual_write_message` mints a
 narrowed `NamespaceToken` (via `NamespaceToken::with_namespace`) scoped to the recipient
 namespace and uses it to write the inbound note, keeping the write operation namespace-isolated.
-The sender token's read visibility is not propagated — the minted token is write-only for the
-recipient namespace. The denial error is `RuntimeError::PermissionDenied { verb: "comm.send" }`.
+The minted token has `namespace = recipient` and `visible = [recipient]`; it is an ordinary
+`NamespaceToken` that the comm handler uses in an append-only manner (one `create_note` call,
+never returned to the sender). The enforced boundary is the sender-side allowlist check plus
+the handler's single-create usage — not the token type. A future cloud-path authorization ADR
+(not yet written) will replace this with a type-enforced, append-only capability primitive.
+The denial error is `RuntimeError::PermissionDenied { verb: "comm.send" }`.
 
 Within-namespace messaging (sender and recipient in the same namespace) proceeds without any
 allowlist check.
@@ -151,8 +155,8 @@ allowlist check.
 The `RuntimeError::CrossNamespaceWrite` variant is retained for the VCS/remote semantics; it
 is no longer returned by `comm.send`.
 
-The recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in, ADR-057 cloud path)
-is reserved for a future cloud release and is not part of this OSS implementation.
+The recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for a
+future cloud release and is not part of this OSS implementation.
 
 #### Message-to-entity attachment
 

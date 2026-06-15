@@ -11,9 +11,11 @@ Key design decisions from ADR-040:
 - **Dual-write delivery**: every `comm.send` writes an outbound copy (caller namespace) and an
   inbound copy (recipient namespace). If the inbound write fails, the outbound note is rolled back
   before returning the error.
-- **Cross-namespace delivery is DENIED**: pending ACL policy specification (ADR-018). The recipient
-  namespace must equal the caller namespace. This prevents unauthorized writes into arbitrary
-  recipient namespaces (issue #481 fix).
+- **Cross-namespace delivery**: controlled by the sender-side `actor.allowed_outbound_namespaces`
+  allowlist. An empty allowlist (the default) reproduces the prior deny-all behavior. Namespaces
+  listed in the allowlist may receive inbound notes via `dual_write_message`. Unlisted namespaces
+  receive `RuntimeError::PermissionDenied { verb: "comm.send" }` (issue #481 fix, updated by the
+  cross-namespace ACL PR).
 - **Canonical thread_id**: when a root message is sent (`thread_id` is `None`), both the outbound
   and inbound copies share the same canonical `thread_id` — the sender's outbound UUID. This
   ensures `comm.thread(id=outbound_id)` can find replies across namespaces.

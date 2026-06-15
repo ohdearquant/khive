@@ -38,9 +38,37 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 // link failure")` instead of calling the real implementation.  The counter is
 // reset to 0 after each call regardless of whether it triggered, so tests are
 // isolated from one another.
+//
+// `FTS_FAIL_FLAG` / `VECTOR_FAIL_FLAG`: global atomics, armed via `arm_fts_fail` /
+// `arm_vector_fail`.  Atomics (not cfg(test) thread-locals) so that external
+// integration test crates can arm them via the exported functions — the
+// thread-local approach only works within the same crate's test binary.
+// Overhead is negligible: a single `load(Relaxed)` on the hot path, only in
+// configurations that call `create_note`.
 #[cfg(test)]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+static FTS_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VECTOR_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the FTS failure injection for `create_note_inner`.
+///
+/// After this is called, the next `create_note` call returns an injected error
+/// at the FTS upsert step (after the note row is committed), then disarms.
+/// Callable from external integration test crates.
+pub fn arm_fts_fail() {
+    FTS_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the vector insertion failure injection for `create_note_inner`.
+///
+/// After this is called, the next `create_note` call returns an injected error
+/// at the first vector insert step, then disarms.
+/// Callable from external integration test crates.
+pub fn arm_vector_fail() {
+    VECTOR_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A note search result with UUID, salience-weighted RRF score, and display text.
@@ -1343,14 +1371,18 @@ impl KhiveRuntime {
         }
         self.notes(token)?.upsert_note(note.clone()).await?;
 
-        self.text_for_notes(token)?
-            .upsert_document(note_fts_document(&note))
-            .await?;
+        // From here on, any error must compensate by removing the note row, its
+        // FTS document, and any vector entries already inserted — the same
+        // cleanup used by the annotates-edge block below.  A local closure
+        // captures those operations so both this block and the edge block share
+        // the same cleanup path without duplication.
+        //
+        // Note: the closure borrows `self`, `token`, `ns`, `note`, and
+        // `embed_model_names` (populated after the FTS step); because the
+        // vector-model list is only known after embedding is decided, we collect
+        // it once before the FTS step and thread it through.
 
-        // Multi-model vector embedding:
-        //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
-        //   - None + no models configured → skip (text-only)
+        // Decide which embedding models to use (before touching FTS/vectors).
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -1368,21 +1400,86 @@ impl KhiveRuntime {
             }
         };
 
+        // FTS step — compensate note row on failure.
+        {
+            // Injection: check the FTS_FAIL_FLAG (armed by `arm_fts_fail()`).
+            let fts_inject = FTS_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let fts_result: RuntimeResult<()> = if fts_inject {
+                Err(RuntimeError::Internal("injected FTS failure".to_string()))
+            } else {
+                self.text_for_notes(token)?
+                    .upsert_document(note_fts_document(&note))
+                    .await
+                    .map_err(RuntimeError::from)
+            };
+
+            if let Err(e) = fts_result {
+                // Best-effort compensation — ignore cleanup errors.
+                if let Ok(store) = self.notes(token) {
+                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                }
+                return Err(e);
+            }
+        }
+
+        // Vector embedding + insert step — compensate note row + FTS doc on failure.
+        // Multi-model vector embedding:
+        //   - explicit embedding_model → single model (existing behaviour)
+        //   - None + any models registered → ALL registered models in parallel
+        //   - None + no models configured → skip (text-only)
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vector = self
+            let vec_result = self
                 .embed_document_with_model(model_name, &note.content)
-                .await?;
-            self.vectors_for_model(token, model_name)?
-                .insert(
-                    note.id,
-                    SubstrateKind::Note,
-                    ns,
-                    "note.content",
-                    vec![vector],
-                )
-                .await?;
+                .await;
+
+            // Injection: check VECTOR_FAIL_FLAG (armed by `arm_vector_fail()`).
+            // Swap-false atomically so the flag resets after one trigger.
+            let vec_inject = VECTOR_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
+                Err(RuntimeError::Internal(
+                    "injected vector failure".to_string(),
+                ))
+            } else {
+                vec_result
+            };
+
+            match vec_result {
+                Ok(vector) => {
+                    let insert_result = self
+                        .vectors_for_model(token, model_name)?
+                        .insert(
+                            note.id,
+                            SubstrateKind::Note,
+                            ns,
+                            "note.content",
+                            vec![vector],
+                        )
+                        .await
+                        .map_err(RuntimeError::from);
+                    if let Err(e) = insert_result {
+                        // Compensate note row + FTS.
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    // Compensate note row + FTS.
+                    if let Ok(store) = self.notes(token) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                    }
+                    if let Ok(fts) = self.text_for_notes(token) {
+                        let _ = fts.delete_document(ns, note.id).await;
+                    }
+                    return Err(e);
+                }
+            }
         } else if !embed_model_names.is_empty() {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
@@ -1399,14 +1496,28 @@ impl KhiveRuntime {
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
             for handle in handles {
-                let vec = handle
+                match handle
                     .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")))??;
-                vectors.push(vec);
+                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")))?
+                {
+                    Ok(vec) => vectors.push(vec),
+                    Err(e) => {
+                        // Compensate note row + FTS.
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(e);
+                    }
+                }
             }
             // TODO(P2): parallelize vector inserts (codex review #444)
+            let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
-                self.vectors_for_model(token, model_name)?
+                let insert_result = self
+                    .vectors_for_model(token, model_name)?
                     .insert(
                         note.id,
                         SubstrateKind::Note,
@@ -1414,7 +1525,24 @@ impl KhiveRuntime {
                         "note.content",
                         vec![vector],
                     )
-                    .await?;
+                    .await
+                    .map_err(RuntimeError::from);
+                if let Err(e) = insert_result {
+                    // Compensate note row + FTS + already-inserted vectors.
+                    if let Ok(store) = self.notes(token) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                    }
+                    if let Ok(fts) = self.text_for_notes(token) {
+                        let _ = fts.delete_document(ns, note.id).await;
+                    }
+                    for m in &inserted_models {
+                        if let Ok(vs) = self.vectors_for_model(token, m) {
+                            let _ = vs.delete(note.id).await;
+                        }
+                    }
+                    return Err(e);
+                }
+                inserted_models.push(model_name.clone());
             }
         }
 
@@ -5452,6 +5580,46 @@ mod tests {
         assert!(
             edges_from_t2.is_empty(),
             "no second annotates edge must exist; got {edges_from_t2:?}"
+        );
+    }
+
+    // Inject an FTS failure after the note row is committed and assert the note
+    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // the call and it resets automatically after one trigger.
+    #[tokio::test]
+    async fn create_note_fts_failure_rolls_back_note_row() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        arm_fts_fail();
+
+        let result = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "fts-fail rollback target",
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note must propagate the injected FTS failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected FTS failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove the note row after FTS failure; got {notes:?}"
         );
     }
 

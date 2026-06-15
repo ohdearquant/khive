@@ -161,18 +161,25 @@ impl NamespaceToken {
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// The visible set is replaced with `[ns]` — the new token cannot read from
-    /// the original token's namespaces. This is a capability-transfer primitive,
-    /// not a policy gate: the caller is responsible for enforcing any ACL check
-    /// before calling this method.
+    /// The visible set is replaced with `[ns]` — the minted token has
+    /// `namespace = ns` and `visible = [ns]`. This is a full read+write token
+    /// for `ns`: public runtime APIs (`list_notes`, `update_note`, `delete_note`,
+    /// etc.) accept it and will operate on `ns`. It is NOT a type-enforced
+    /// write-only or append-only capability. This is a capability-transfer
+    /// primitive, not a policy gate: the caller is responsible for enforcing any
+    /// ACL check before calling this method and for using the minted token only
+    /// in the intended narrow scope (e.g. a single `create_note` call).
     ///
     /// Callers today:
     /// - `khive-pack-memory` FTS fanout: iterates token's own visible set; no escalation.
-    /// - `khive-pack-comm` inbound delivery: mints a write token for the recipient ns,
-    ///   gated by `actor.allowed_outbound_namespaces` allowlist check immediately before.
+    /// - `khive-pack-comm` inbound delivery: mints a token for the recipient ns,
+    ///   gated by `actor.allowed_outbound_namespaces` allowlist check immediately
+    ///   before, and uses it for exactly one `create_note` call (append-only by
+    ///   convention, not by type enforcement).
     ///
     /// Under a security model (cloud, mutual auth), replace this call pattern with a
-    /// `comm.ingest` Subhandler dispatch (ADR-056/ADR-053) that goes through the Gate.
+    /// type-enforced append-only capability or a `comm.ingest` Subhandler dispatch
+    /// (see ADR-056/ADR-053) that goes through the Gate.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }
@@ -244,10 +251,11 @@ pub struct RuntimeConfig {
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
     /// in `khive.toml`. Empty by default — cross-namespace delivery denied
-    /// unless explicitly declared. Grants write-only inbound-append access
-    /// to the listed namespaces; does NOT grant read access. The recipient-side
+    /// unless explicitly declared. The comm handler uses an ordinary
+    /// `NamespaceToken` (minted via `with_namespace`) in an append-only manner;
+    /// the token itself is NOT type-enforced write-only. The recipient-side
     /// `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for
-    /// the ADR-057 cloud path.
+    /// a future cloud-path authorization ADR (not yet written).
     pub allowed_outbound_namespaces: Vec<Namespace>,
 }
 

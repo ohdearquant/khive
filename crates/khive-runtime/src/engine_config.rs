@@ -123,10 +123,11 @@ pub struct ActorConfig {
 
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Empty by default — cross-namespace delivery
-    /// denied unless explicitly declared. Grants write-only inbound-append
-    /// access to the listed namespaces; does NOT grant read access. The
-    /// recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in)
-    /// is reserved for the ADR-057 cloud path.
+    /// denied unless explicitly declared. The comm handler uses an ordinary
+    /// `NamespaceToken` (minted via `with_namespace`) in an append-only manner;
+    /// the token itself is NOT type-enforced write-only. The recipient-side
+    /// `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for
+    /// a future cloud-path authorization ADR (not yet written).
     ///
     /// Each entry must be a valid `Namespace` string; validated at
     /// config-load time. An empty list preserves the prior deny-all behavior

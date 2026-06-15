@@ -3876,6 +3876,100 @@ fn compute_config_id_is_stable_under_visible_namespace_reorder() {
 }
 
 // =============================================================================
+// Fix 1: compute_config_id must include allowed_outbound_namespaces so a
+// daemon started with a permissive outbound allowlist cannot be reused for a
+// client whose config has an empty allowlist.
+// =============================================================================
+
+/// Two RuntimeConfigs that are identical except for their
+/// `allowed_outbound_namespaces` must produce different `compute_config_id`
+/// fingerprints.
+///
+/// Without this, a daemon started with `allowed_outbound_namespaces =
+/// ["lambda:khive"]` could be reused for a client whose local config has an
+/// empty allowlist — granting cross-namespace writes that the client should
+/// fail closed on.
+#[test]
+fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::{Namespace, RuntimeConfig};
+
+    let base = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("out-a").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        allowed_outbound_namespaces: vec![],
+        ..RuntimeConfig::default()
+    };
+    let with_outbound = RuntimeConfig {
+        allowed_outbound_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
+        ..base.clone()
+    };
+
+    let id_empty = compute_config_id(&base);
+    let id_with_outbound = compute_config_id(&with_outbound);
+
+    assert_ne!(
+        id_empty, id_with_outbound,
+        "compute_config_id must differ when allowed_outbound_namespaces differs; \
+         same id would allow wrong-allowlist daemon reuse"
+    );
+    assert!(
+        id_with_outbound.contains("lambda:khive"),
+        "allowed outbound namespace 'lambda:khive' must appear in config_id string; got: {id_with_outbound}"
+    );
+}
+
+/// Order of entries in allowed_outbound_namespaces must not change the
+/// fingerprint (the fingerprint sorts + deduplicates before hashing).
+#[test]
+fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::{Namespace, RuntimeConfig};
+
+    let cfg_ab = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("out-a").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        allowed_outbound_namespaces: vec![
+            Namespace::parse("lambda:khive").unwrap(),
+            Namespace::parse("lambda:leo").unwrap(),
+        ],
+        ..RuntimeConfig::default()
+    };
+    let cfg_ba = RuntimeConfig {
+        allowed_outbound_namespaces: vec![
+            Namespace::parse("lambda:leo").unwrap(),
+            Namespace::parse("lambda:khive").unwrap(),
+        ],
+        ..cfg_ab.clone()
+    };
+    let cfg_dup = RuntimeConfig {
+        allowed_outbound_namespaces: vec![
+            Namespace::parse("lambda:khive").unwrap(),
+            Namespace::parse("lambda:leo").unwrap(),
+            Namespace::parse("lambda:khive").unwrap(), // duplicate
+        ],
+        ..cfg_ab.clone()
+    };
+
+    assert_eq!(
+        compute_config_id(&cfg_ab),
+        compute_config_id(&cfg_ba),
+        "compute_config_id must be stable under reordering of allowed_outbound_namespaces"
+    );
+    assert_eq!(
+        compute_config_id(&cfg_ab),
+        compute_config_id(&cfg_dup),
+        "compute_config_id must be stable under duplication of allowed_outbound_namespaces"
+    );
+}
+
+// =============================================================================
 // Finding 6: actor.visible_namespaces from config wires cross-namespace reads
 // but mutations on visible-only records must return NotFound.
 // =============================================================================
