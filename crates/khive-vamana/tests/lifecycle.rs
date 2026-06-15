@@ -1074,3 +1074,108 @@ fn oq2_consolidate_beats_no_consolidate_on_memory() {
         0.95 * pre_recall
     );
 }
+
+// ---- Regression tests (codex round-2 required) ----
+
+/// T-R1: insert a distinctive vector, self-query k=1, assert the assigned ordinal is found.
+/// The previous suite only queried ORIGINAL vectors (lifecycle.rs:538). This closes that gap.
+#[test]
+fn insert_then_self_query() {
+    let dim = 16usize;
+    let n = 40usize;
+    let vecs = rand_unit_vectors(n, dim, 0xB001);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(20);
+    let mut idx = VamanaIndex::build(&vecs, cfg).unwrap();
+
+    // Insert a unit vector along the first axis — distinctive from the random corpus.
+    let mut distinctive = vec![0.0f32; dim];
+    distinctive[0] = 1.0;
+    let assigned = idx.insert(&distinctive).unwrap();
+
+    // Self-query: search for the exact vector just inserted.
+    let results = idx.search(&distinctive, 1).unwrap();
+    assert_eq!(results.len(), 1, "search must return 1 result");
+    assert_eq!(
+        results[0].0, assigned,
+        "self-query must return the just-inserted ordinal"
+    );
+}
+
+/// T-R2: codex Critical repro — max_degree=1, insert a far vector; assert inbound edges
+/// non-empty AND self-query finds the new node.
+#[test]
+fn insert_saturated_low_degree_reachable() {
+    let dim = 1usize;
+    // Build with two vectors: 0.0 and 1.0.
+    let vecs = vec![0.0f32, 1.0f32];
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(1)
+        .with_search_list_size(1);
+    let mut idx = VamanaIndex::build(&vecs, cfg).unwrap();
+
+    // Insert a far vector — codex repro: ordinal 2.
+    let far = vec![100.0f32];
+    let assigned = idx.insert(&far).unwrap();
+
+    // Inbound edges must be non-empty (orphan postcondition).
+    assert!(
+        !idx.graph().reverse_adjacency()[assigned as usize].is_empty(),
+        "inserted node must have >=1 inbound edge (orphan postcondition)"
+    );
+
+    // Self-query must find the inserted node.
+    let results = idx.search(&far, 1).unwrap();
+    assert_eq!(
+        results[0].0, assigned,
+        "self-query must find the inserted far node"
+    );
+}
+
+/// T-R3: delete a node (creates free_slot), insert a new vector (recycles the slot),
+/// self-query, assert the recycled ordinal is found and reachable.
+#[test]
+fn insert_recycled_slot_self_query() {
+    let dim = 8usize;
+    let n = 20usize;
+    let vecs = rand_unit_vectors(n, dim, 0xB003);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(6)
+        .with_search_list_size(16);
+    let mut idx = VamanaIndex::build(&vecs, cfg).unwrap();
+
+    // Tombstone a non-medoid node to create a free_slot.
+    let medoid = idx.graph().medoid();
+    let target = if medoid == 5 { 6u32 } else { 5u32 };
+    idx.tombstone_batch(&[target]).unwrap();
+    let tc_before = idx.tombstone_count();
+    assert_eq!(tc_before, 1);
+
+    // Insert a new distinctive vector — must recycle `target`.
+    let mut new_vec = vec![0.0f32; dim];
+    new_vec[1] = 1.0;
+    let assigned = idx.insert(&new_vec).unwrap();
+    assert_eq!(
+        assigned, target,
+        "insert must recycle the free slot after tombstone"
+    );
+    assert_eq!(
+        idx.tombstone_count(),
+        0,
+        "tombstone_count must be 0 after recycle"
+    );
+
+    // Inbound edges must be non-empty.
+    assert!(
+        !idx.graph().reverse_adjacency()[assigned as usize].is_empty(),
+        "recycled-slot insert must have >=1 inbound edge"
+    );
+
+    // Self-query must find the recycled ordinal.
+    let results = idx.search(&new_vec, 1).unwrap();
+    assert_eq!(
+        results[0].0, assigned,
+        "self-query must find the recycled-slot node"
+    );
+}

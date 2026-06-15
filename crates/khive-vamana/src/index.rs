@@ -14,7 +14,7 @@ use crate::{
     config::VamanaConfig,
     distance::l2_squared,
     error::{Result, VamanaError},
-    graph::{is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, VamanaGraph, VisitedSet},
+    graph::{is_tombstoned_bit, robust_prune_inner, row, sort_dedup_u32, VamanaGraph, VisitedSet},
 };
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
@@ -728,10 +728,7 @@ impl VamanaIndex {
     /// Returns `Err` without mutating state if the vector is non-finite, wrong dimension,
     /// or would push `num_vectors` past `u32::MAX`.
     pub fn insert(&mut self, vector: &[f32]) -> Result<u32> {
-        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
-        self.ensure_owned()?;
-
-        // Preflight — validate before any state change.
+        // Preflight — validate before ANY state change (including Mmap promotion).
         if vector.len() != self.dimensions {
             return Err(VamanaError::DimensionMismatch {
                 expected: self.dimensions,
@@ -744,6 +741,10 @@ impl VamanaIndex {
                 count: self.num_vectors,
             });
         }
+
+        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
+        // Only reached when preflight passed — a rejected insert never touches Mmap.
+        self.ensure_owned()?;
 
         // Slot assignment: recycle or append.
         let ordinal: u32;
@@ -873,6 +874,73 @@ impl VamanaIndex {
                         .replace_adjacency_and_update_reverse(v, v_candidates);
                 }
             }
+
+            // Orphan postcondition: the inserted node MUST have at least one inbound edge.
+            //
+            // The back-edge loop can evict `ordinal` from a neighbor's adjacency when
+            // robust_prune_inner trims to max_degree without keeping it. This leaves
+            // `ordinal` with forward edges but zero inbound edges — unreachable via
+            // forward-edge search descending from the medoid.
+            //
+            // Fix: if orphaned, pin `ordinal` into its CLOSEST out-neighbor. Pinning
+            // into the closest neighbor is safe because all out-neighbors were found via
+            // greedy search from the medoid, so they are in the reachable component.
+            // If the pin target is at max_degree, EVICT its farthest neighbor (the one
+            // most distant from it by L2²) to make room — never exceed max_degree.
+            //
+            // new_neighbors is non-empty whenever live_before > 0 (the else branch), so
+            // there is always a valid pin target.
+            debug_assert!(
+                !new_neighbors.is_empty(),
+                "insert: new_neighbors empty in live_before>0 branch — impossible"
+            );
+            if self.graph.reverse_adjacency()[ordinal as usize].is_empty() {
+                let vecs = self.vectors.as_slice()?;
+                let inserted_vec = row(vecs, self.dimensions, ordinal);
+
+                // Pick the closest out-neighbor by L2² from the inserted node.
+                let pin_target = new_neighbors
+                    .iter()
+                    .copied()
+                    .min_by(|&a, &b| {
+                        let da = l2_squared(inserted_vec, row(vecs, self.dimensions, a));
+                        let db = l2_squared(inserted_vec, row(vecs, self.dimensions, b));
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .expect("insert: new_neighbors non-empty in else branch");
+
+                let mut pin_adj: Vec<u32> = self.graph.adjacency()[pin_target as usize]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(ordinal))
+                    .filter(|&x| x != pin_target)
+                    .collect();
+                sort_dedup_u32(&mut pin_adj);
+
+                if pin_adj.len() > self.config.max_degree {
+                    // Evict the farthest neighbor from pin_target's perspective,
+                    // BUT never evict `ordinal` itself — that is the node we are pinning.
+                    let pin_vec = row(vecs, self.dimensions, pin_target);
+                    let (evict_pos, _) = pin_adj
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &nb)| nb != ordinal) // never evict the just-inserted node
+                        .map(|(i, &nb)| (i, l2_squared(pin_vec, row(vecs, self.dimensions, nb))))
+                        .max_by(|(_, da), (_, db)| {
+                            da.partial_cmp(db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .expect("pin_adj has a non-ordinal entry to evict");
+                    pin_adj.swap_remove(evict_pos);
+                    sort_dedup_u32(&mut pin_adj);
+                }
+
+                debug_assert!(
+                    pin_adj.contains(&ordinal),
+                    "insert: pin failed — ordinal not in pin_adj after eviction"
+                );
+                self.graph
+                    .replace_adjacency_and_update_reverse(pin_target, pin_adj);
+            }
         }
 
         self.ops_since_consolidation += 1;
@@ -895,14 +963,16 @@ impl VamanaIndex {
     /// After return: `tombstone_count == 0`, `free_slots` is empty,
     /// `ops_since_consolidation == 0`, `num_vectors == prior live_count`.
     pub fn consolidate(&mut self) -> Result<Vec<u32>> {
-        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
-        self.ensure_owned()?;
-
-        // No-op fast path: no tombstones.
+        // No-op fast path: no tombstones — skip Mmap promotion entirely.
+        // A clean index on a Mmap-backed store stays Mmap after a no-op consolidate.
         if self.tombstone_count == 0 {
             self.ops_since_consolidation = 0;
             return Ok(Vec::new());
         }
+
+        // GAP-1 resolution: promote Mmap to Owned before the compaction rebuild.
+        // Only reached when there are tombstones to compact.
+        self.ensure_owned()?;
 
         let m = self.num_vectors - self.tombstone_count;
 
@@ -2556,6 +2626,53 @@ mod tests {
                 Err(VamanaError::NonFiniteFloat { .. })
             ),
             "from_snapshot must reject NaN in vectors"
+        );
+    }
+
+    /// Regression test for MEDIUM: rejected insert and no-op consolidate must NOT
+    /// promote a Mmap-backed index to Owned. Verified via the private `VectorStorage`
+    /// variant (only accessible inside `mod tests` due to `use super::*`).
+    #[test]
+    fn mmap_atomicity_rejected_insert_and_noop_consolidate_stay_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let dim = 4usize;
+        let vectors = rand_unit_vectors(8, dim, 0xABC1);
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        idx.save(path).unwrap();
+
+        // Load: vectors are Mmap-backed.
+        let mut loaded = VamanaIndex::load(path).unwrap();
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "loaded index must use Mmap-backed storage"
+        );
+
+        // Rejected insert (wrong dimension) must not promote to Owned.
+        let bad = vec![0.5f32; dim + 1];
+        assert!(
+            loaded.insert(&bad).is_err(),
+            "wrong-dim insert must return Err"
+        );
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "Mmap must stay Mmap after rejected insert"
+        );
+
+        // No-op consolidate (tombstone_count == 0) must not promote to Owned.
+        assert_eq!(loaded.tombstone_count(), 0);
+        let remap = loaded.consolidate().unwrap();
+        assert!(
+            remap.is_empty(),
+            "no-op consolidate must return empty remap"
+        );
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "Mmap must stay Mmap after no-op consolidate"
         );
     }
 }
