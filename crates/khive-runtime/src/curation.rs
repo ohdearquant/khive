@@ -334,7 +334,7 @@ impl KhiveRuntime {
 
         // If vectors are configured, reindex into_entity (requires async embedding).
         // FTS and vec-delete were already committed inside the transaction above.
-        // TODO(#NN): merge_entity's SQLite transaction deletes only the from-entity's
+        // TODO(#135): merge_entity's SQLite transaction deletes only the from-entity's
         // default-model vector (vec_table above). Non-default-model vectors from the
         // from-entity are NOT deleted inside the transaction and become orphaned after
         // merge. Fixing this requires the spawn_blocking closure to fan out across all
