@@ -449,7 +449,13 @@ impl KhiveRuntime {
             };
             if let Err(e) = fts_result {
                 if let Ok(store) = self.entities(token) {
-                    let _ = store.delete_entity(entity.id, DeleteMode::Hard).await;
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back entity row after FTS failure"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -510,10 +516,22 @@ impl KhiveRuntime {
             };
             if let Err(e) = single_result {
                 if let Ok(store) = self.entities(token) {
-                    let _ = store.delete_entity(entity.id, DeleteMode::Hard).await;
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back entity row after vector failure"
+                        );
+                    }
                 }
                 if let Ok(fts) = self.text(token) {
-                    let _ = fts.delete_document(ns, entity.id).await;
+                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back FTS document after vector failure"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -539,19 +557,45 @@ impl KhiveRuntime {
                 match join_result {
                     Err(e) => {
                         if let Ok(store) = self.entities(token) {
-                            let _ = store.delete_entity(entity.id, DeleteMode::Hard).await;
+                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
+                            {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back entity row after embed task panic"
+                                );
+                            }
                         }
                         if let Ok(fts) = self.text(token) {
-                            let _ = fts.delete_document(ns, entity.id).await;
+                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back FTS document after embed task panic"
+                                );
+                            }
                         }
                         return Err(e);
                     }
                     Ok(Err(e)) => {
                         if let Ok(store) = self.entities(token) {
-                            let _ = store.delete_entity(entity.id, DeleteMode::Hard).await;
+                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
+                            {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back entity row after embed failure"
+                                );
+                            }
                         }
                         if let Ok(fts) = self.text(token) {
-                            let _ = fts.delete_document(ns, entity.id).await;
+                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back FTS document after embed failure"
+                                );
+                            }
                         }
                         return Err(e);
                     }
@@ -599,14 +643,33 @@ impl KhiveRuntime {
                 if let Err(e) = insert_result {
                     // Compensate entity row + FTS + already-inserted vectors.
                     if let Ok(store) = self.entities(token) {
-                        let _ = store.delete_entity(entity.id, DeleteMode::Hard).await;
+                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back entity row after vector insert failure"
+                            );
+                        }
                     }
                     if let Ok(fts) = self.text(token) {
-                        let _ = fts.delete_document(ns, entity.id).await;
+                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back FTS document after vector insert failure"
+                            );
+                        }
                     }
                     for m in &inserted_models {
                         if let Ok(vs) = self.vectors_for_model(token, m) {
-                            let _ = vs.delete(entity.id).await;
+                            if let Err(ce) = vs.delete(entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    model = m,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back vector for model after insert failure"
+                                );
+                            }
                         }
                     }
                     return Err(e);

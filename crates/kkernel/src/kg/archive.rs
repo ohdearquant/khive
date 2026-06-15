@@ -395,6 +395,7 @@ mod tests {
             db_path: Some(db_path.clone()),
             default_namespace: ns.clone(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             ..Default::default()
         };
         let runtime = KhiveRuntime::new(config).unwrap();
@@ -431,6 +432,7 @@ mod tests {
             db_path: Some(db_path.clone()),
             default_namespace: ns.clone(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             ..Default::default()
         };
         let runtime = KhiveRuntime::new(config).unwrap();
@@ -470,6 +472,7 @@ mod tests {
             db_path: Some(db_path.clone()),
             default_namespace: ns.clone(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             ..Default::default()
         };
         let runtime = KhiveRuntime::new(config).unwrap();
