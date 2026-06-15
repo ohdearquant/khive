@@ -3210,10 +3210,30 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            pre_a.len(),
-            2,
-            "both entities must be in model-a before merge"
+        assert!(
+            pre_a.iter().any(|h| h.subject_id == into_e.id)
+                && pre_a.iter().any(|h| h.subject_id == from_e.id),
+            "both entities must be in model-a before merge; got {pre_a:?}"
+        );
+
+        // model-b must ALSO hold both entities pre-merge, else the post-merge
+        // model-b emptiness check below is vacuous (nothing to delete).
+        let pre_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("merge-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_b.iter().any(|h| h.subject_id == into_e.id)
+                && pre_b.iter().any(|h| h.subject_id == from_e.id),
+            "both entities must be in model-b before merge; got {pre_b:?}"
         );
 
         rt.merge_entity(
@@ -3328,7 +3348,31 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(pre_a.len(), 2, "both notes must be in model-a before merge");
+        assert!(
+            pre_a.iter().any(|h| h.subject_id == into_n.id)
+                && pre_a.iter().any(|h| h.subject_id == from_n.id),
+            "both notes must be in model-a before merge; got {pre_a:?}"
+        );
+
+        // model-b must ALSO hold both notes pre-merge, else the post-merge
+        // model-b emptiness check below is vacuous (nothing to delete).
+        let pre_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("merge-note-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_b.iter().any(|h| h.subject_id == into_n.id)
+                && pre_b.iter().any(|h| h.subject_id == from_n.id),
+            "both notes must be in model-b before merge; got {pre_b:?}"
+        );
 
         rt.merge_note(
             &tok,
