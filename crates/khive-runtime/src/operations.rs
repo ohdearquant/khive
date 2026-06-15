@@ -5632,9 +5632,15 @@ mod tests {
     #[tokio::test]
     async fn create_note_fts_failure_rolls_back_note_row() {
         let rt = rt();
-        let tok = NamespaceToken::local();
+        // Unique namespace: the process-global FTS_FAIL_NS one-shot flag armed
+        // below must be consumable only by THIS test's create_note. Sharing the
+        // "local" namespace let a concurrent "local" create_note consume the
+        // armed flag, flaking this test and its victim under parallel
+        // `cargo test` (latent since #129; surfaced by #131 CI timing).
+        let ns = Namespace::parse("fault-fts-rollback").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_fts_fail("local");
+        arm_fts_fail(ns.as_str());
 
         let result = rt
             .create_note(
@@ -5668,10 +5674,11 @@ mod tests {
 
     // Inject a vector insertion failure after note row + FTS commit and assert
     // both the note row and the FTS document are removed (no stranded rows).
-    // arm_vector_fail("local") targets the "local" namespace; since the single
-    // registered provider fires embed_document before the injection check, the
-    // injection converts the successful embedding into an error just before the
-    // VectorStore insert, then disarms.
+    // Uses a unique namespace (see create_note_fts_failure_rolls_back_note_row)
+    // so the process-global VECTOR_FAIL_NS flag is consumed only by this test.
+    // Since the single registered provider fires embed_document before the
+    // injection check, the injection converts the successful embedding into an
+    // error just before the VectorStore insert, then disarms.
     #[tokio::test]
     async fn create_note_vector_failure_rolls_back_note_row_and_fts() {
         const MODEL: &str = "test-vec-inject";
@@ -5681,9 +5688,10 @@ mod tests {
         let (provider, _counter) = ConstVecProvider::new(MODEL, DIMS);
         rt.register_embedder(provider);
 
-        let tok = NamespaceToken::local();
+        let ns = Namespace::parse("fault-vec-rollback").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
 
-        arm_vector_fail("local");
+        arm_vector_fail(ns.as_str());
 
         let result = rt
             .create_note(
