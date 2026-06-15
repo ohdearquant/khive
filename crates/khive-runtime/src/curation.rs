@@ -301,22 +301,22 @@ impl KhiveRuntime {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let fts_table = format!("fts_entities_{}", sanitized_ns);
-        let vec_table = self.config().embedding_model.map(|model| {
-            let key: String = model
-                .to_string()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            format!("vec_{}", key)
-        });
+        let vec_tables: Vec<String> = self
+            .registered_embedding_model_names()
+            .iter()
+            .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
+            .collect();
 
         // Ensure all required tables exist before entering the transaction.
         // Each accessor applies its DDL idempotently via `CREATE TABLE IF NOT EXISTS`.
         let _ = self.entities(token)?;
         let _ = self.graph(token)?;
         let _ = self.text(token)?;
-        if self.config().embedding_model.is_some() {
-            let _ = self.vectors(token)?;
+        // Prime DDL for every registered model's vec table.  Use vectors_for_model
+        // (not the default-model-only self.vectors()) so that custom-only runtimes
+        // (embedding_model: None but custom providers registered) work correctly.
+        for model_name in &self.registered_embedding_model_names() {
+            let _ = self.vectors_for_model(token, model_name)?;
         }
 
         let pool = self.backend().pool_arc();
@@ -325,7 +325,7 @@ impl KhiveRuntime {
             let guard = pool.writer()?;
             guard.transaction(|conn| {
                 merge_entity_sql(
-                    conn, ns, fts_table, vec_table, into_id, from_id, strategy, dry_run,
+                    conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
                 )
             })
         })
@@ -333,8 +333,9 @@ impl KhiveRuntime {
         .map_err(|e| RuntimeError::Internal(e.to_string()))??;
 
         // If vectors are configured, reindex into_entity (requires async embedding).
-        // FTS and vec-delete were already committed inside the transaction above.
-        if !dry_run && self.config().embedding_model.is_some() {
+        // FTS and vec-deletes for all registered models were already committed inside
+        // the transaction above.
+        if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_entity(token, &updated_entity).await?;
         }
 
@@ -369,11 +370,18 @@ impl KhiveRuntime {
 
     // ---- Internal helpers ----
 
-    /// Re-upsert FTS5 document (and vector if model configured) for the entity.
+    /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
     /// than the caller-supplied `namespace` parameter. This prevents a cross-namespace
     /// reindex from writing the search document into the wrong namespace's FTS index.
+    ///
+    /// Best-effort for vectors: if embedding or inserting for a particular model fails,
+    /// logs a warning and continues to the next model. The FTS step is fail-closed
+    /// (propagates error). Callers (update_entity, merge_entity) have already committed
+    /// the entity row, so a partial embed miss leaves a stale vector rather than
+    /// rolling back the update — acceptable because SqliteVecStore::insert is an upsert
+    /// (the prior vector stays intact on failure, keeping the record searchable).
     pub(crate) async fn reindex_entity(
         &self,
         token: &NamespaceToken,
@@ -385,23 +393,53 @@ impl KhiveRuntime {
         let embed_body = doc.body.clone();
         self.text(token)?.upsert_document(doc).await?;
 
-        if self.config().embedding_model.is_some() {
-            let vector = self.embed_document(&embed_body).await?;
-            self.vectors(token)?
-                .insert(
-                    entity.id,
-                    SubstrateKind::Entity,
-                    &ns,
-                    "entity.body",
-                    vec![vector],
-                )
-                .await?;
+        let embed_model_names = self.registered_embedding_model_names();
+        for model_name in &embed_model_names {
+            match self
+                .embed_document_with_model(model_name, &embed_body)
+                .await
+            {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => {
+                        if let Err(e) = vs
+                            .insert(
+                                entity.id,
+                                SubstrateKind::Entity,
+                                &ns,
+                                "entity.body",
+                                vec![vector],
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                model = model_name,
+                                id = %entity.id,
+                                "reindex_entity: vector insert failed, skipping model: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = model_name,
+                            id = %entity.id,
+                            "reindex_entity: could not access vector store for model, skipping: {e}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        model = model_name,
+                        id = %entity.id,
+                        "reindex_entity: embed failed for model, skipping: {e}"
+                    );
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Remove an entity from FTS5 and (if configured) vector indexes.
+    /// Remove an entity from FTS5 and vector indexes across all registered models.
     pub(crate) async fn remove_from_indexes(
         &self,
         token: &NamespaceToken,
@@ -409,13 +447,17 @@ impl KhiveRuntime {
     ) -> RuntimeResult<()> {
         let ns = token.namespace().as_str().to_owned();
         self.text(token)?.delete_document(&ns, id).await?;
-        if self.config().embedding_model.is_some() {
-            self.vectors(token)?.delete(id).await?;
+        for model_name in self.registered_embedding_model_names() {
+            self.vectors_for_model(token, &model_name)?
+                .delete(id)
+                .await?;
         }
         Ok(())
     }
 
-    /// Re-upsert FTS5 document (and vector if model configured) for the note.
+    /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
+    ///
+    /// Best-effort for vectors: mirrors reindex_entity's warn-and-continue policy.
     pub(crate) async fn reindex_note(
         &self,
         token: &NamespaceToken,
@@ -425,18 +467,48 @@ impl KhiveRuntime {
             .upsert_document(note_fts_document(note))
             .await?;
 
-        if self.config().embedding_model.is_some() {
-            let ns = note.namespace.clone();
-            let vector = self.embed_document(&note.content).await?;
-            self.vectors(token)?
-                .insert(
-                    note.id,
-                    SubstrateKind::Note,
-                    &ns,
-                    "note.content",
-                    vec![vector],
-                )
-                .await?;
+        let ns = note.namespace.clone();
+        let embed_model_names = self.registered_embedding_model_names();
+        for model_name in &embed_model_names {
+            match self
+                .embed_document_with_model(model_name, &note.content)
+                .await
+            {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => {
+                        if let Err(e) = vs
+                            .insert(
+                                note.id,
+                                SubstrateKind::Note,
+                                &ns,
+                                "note.content",
+                                vec![vector],
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                model = model_name,
+                                id = %note.id,
+                                "reindex_note: vector insert failed, skipping model: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = model_name,
+                            id = %note.id,
+                            "reindex_note: could not access vector store for model, skipping: {e}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        model = model_name,
+                        id = %note.id,
+                        "reindex_note: embed failed for model, skipping: {e}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -549,14 +621,11 @@ impl KhiveRuntime {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let fts_table = format!("fts_notes_{}", sanitized_ns);
-        let vec_table = self.config().embedding_model.map(|model| {
-            let key: String = model
-                .to_string()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            format!("vec_{}", key)
-        });
+        let vec_tables: Vec<String> = self
+            .registered_embedding_model_names()
+            .iter()
+            .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
+            .collect();
 
         let note_store = self.notes(token)?;
         let into_note = note_store
@@ -573,8 +642,9 @@ impl KhiveRuntime {
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
-        if self.config().embedding_model.is_some() {
-            let _ = self.vectors(token)?;
+        // Prime DDL for every registered model's vec table (mirrors merge_entity fix).
+        for model_name in &self.registered_embedding_model_names() {
+            let _ = self.vectors_for_model(token, model_name)?;
         }
 
         let pool = self.backend().pool_arc();
@@ -585,7 +655,7 @@ impl KhiveRuntime {
                     conn,
                     ns,
                     fts_table,
-                    vec_table,
+                    vec_tables,
                     into_id,
                     from_id,
                     strategy,
@@ -597,7 +667,7 @@ impl KhiveRuntime {
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))??;
 
-        if !dry_run && self.config().embedding_model.is_some() {
+        if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_note(token, &updated_note).await?;
         }
         Ok(summary)
@@ -798,7 +868,7 @@ fn merge_entity_sql(
     conn: &rusqlite::Connection,
     namespace: String,
     fts_table: String,
-    vec_table: Option<String>,
+    vec_tables: Vec<String>,
     into_id: Uuid,
     from_id: Uuid,
     strategy: EntityDedupMergePolicy,
@@ -1074,8 +1144,8 @@ fn merge_entity_sql(
             rusqlite::params![&namespace, &from_str],
         )?;
 
-        // --- Delete from_id from vector index if configured ---
-        if let Some(ref vec_tbl) = vec_table {
+        // --- Delete from_id from all registered model vector tables ---
+        for vec_tbl in &vec_tables {
             conn.execute(
                 &format!(
                     "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
@@ -1238,7 +1308,7 @@ fn merge_note_sql(
     conn: &rusqlite::Connection,
     namespace: String,
     fts_table: String,
-    vec_table: Option<String>,
+    vec_tables: Vec<String>,
     into_id: Uuid,
     from_id: Uuid,
     strategy: EntityDedupMergePolicy,
@@ -1533,8 +1603,8 @@ fn merge_note_sql(
             rusqlite::params![&namespace, &from_str],
         )?;
 
-        // Delete from-note from vector index if configured.
-        if let Some(ref vec_tbl) = vec_table {
+        // Delete from-note from all registered model vector tables.
+        for vec_tbl in &vec_tables {
             conn.execute(
                 &format!(
                     "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
@@ -3017,6 +3087,346 @@ mod tests {
 
         assert_eq!(stored.title, expected.title, "title after update");
         assert_eq!(stored.body, expected.body, "body after update");
+    }
+
+    // ── Fix #135 regression tests ────────────────────────────────────────────
+    //
+    // Verify that merge_entity / merge_note delete from_id vectors from ALL
+    // registered model vec tables, not just the default-model table.
+    //
+    // Uses the same ConstVecProvider/ConstVecService pattern as operations.rs
+    // so no real model files are required.
+
+    struct MergeTestVecService {
+        dims: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for MergeTestVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "merge-test-const-vec"
+        }
+    }
+
+    struct MergeTestVecProvider {
+        provider_name: String,
+        dims: usize,
+    }
+
+    impl MergeTestVecProvider {
+        fn new(name: &str, dims: usize) -> Self {
+            Self {
+                provider_name: name.to_owned(),
+                dims,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedder_registry::EmbedderProvider for MergeTestVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(
+            &self,
+        ) -> crate::error::RuntimeResult<std::sync::Arc<dyn lattice_embed::EmbeddingService>>
+        {
+            Ok(std::sync::Arc::new(MergeTestVecService { dims: self.dims }))
+        }
+    }
+
+    /// merge_entity must delete from_id vectors from ALL registered model tables.
+    ///
+    /// Two custom embedders ("merge-vec-a", "merge-vec-b") are registered.  Both
+    /// entities are embedded so each has a row in both model tables.  After merge,
+    /// from_id must have zero surviving rows in either table.
+    #[tokio::test]
+    async fn merge_entity_clears_vectors_from_all_registered_models() {
+        const DIMS: usize = 4;
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(MergeTestVecProvider::new("merge-vec-a", DIMS));
+        rt.register_embedder(MergeTestVecProvider::new("merge-vec-b", DIMS));
+
+        let ns_str = "merge-entity-vec-cleanup";
+        let ns = crate::Namespace::parse(ns_str).unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+
+        let into_e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "IntoVecEntity",
+                Some("desc a"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create into");
+        let from_e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FromVecEntity",
+                Some("desc b"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create from");
+
+        // Confirm both entities have vectors in both model tables before merge.
+        let vs_a = rt.vectors_for_model(&tok, "merge-vec-a").unwrap();
+        let vs_b = rt.vectors_for_model(&tok, "merge-vec-b").unwrap();
+        use khive_storage::types::VectorSearchRequest;
+        let query = vec![1.0_f32; DIMS];
+        let pre_a = vs_a
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("merge-vec-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_a.iter().any(|h| h.subject_id == into_e.id)
+                && pre_a.iter().any(|h| h.subject_id == from_e.id),
+            "both entities must be in model-a before merge; got {pre_a:?}"
+        );
+
+        // model-b must ALSO hold both entities pre-merge, else the post-merge
+        // model-b emptiness check below is vacuous (nothing to delete).
+        let pre_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("merge-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_b.iter().any(|h| h.subject_id == into_e.id)
+                && pre_b.iter().any(|h| h.subject_id == from_e.id),
+            "both entities must be in model-b before merge; got {pre_b:?}"
+        );
+
+        rt.merge_entity(
+            &tok,
+            into_e.id,
+            from_e.id,
+            EntityDedupMergePolicy::PreferInto,
+            false,
+        )
+        .await
+        .expect("merge_entity");
+
+        // from_id must have ZERO rows in EITHER model table after merge.
+        let post_a = vs_a
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("merge-vec-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        let from_ids_a: Vec<_> = post_a
+            .iter()
+            .filter(|h| h.subject_id == from_e.id)
+            .collect();
+        assert!(
+            from_ids_a.is_empty(),
+            "from_id must have no vectors in model-a after merge; got {from_ids_a:?}"
+        );
+
+        let post_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("merge-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        let from_ids_b: Vec<_> = post_b
+            .iter()
+            .filter(|h| h.subject_id == from_e.id)
+            .collect();
+        assert!(
+            from_ids_b.is_empty(),
+            "from_id must have no vectors in model-b after merge; got {from_ids_b:?}"
+        );
+    }
+
+    /// merge_note must delete from_id vectors from ALL registered model tables.
+    ///
+    /// Two custom embedders ("merge-note-vec-a", "merge-note-vec-b") are registered.
+    /// Both notes are embedded so each has a row in both model tables.  After merge,
+    /// from_id must have zero surviving rows in either table.
+    #[tokio::test]
+    async fn merge_note_clears_vectors_from_all_registered_models() {
+        const DIMS: usize = 4;
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(MergeTestVecProvider::new("merge-note-vec-a", DIMS));
+        rt.register_embedder(MergeTestVecProvider::new("merge-note-vec-b", DIMS));
+
+        let ns_str = "merge-note-vec-cleanup";
+        let ns = crate::Namespace::parse(ns_str).unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+
+        let into_n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "IntoVecNote content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create into note");
+        let from_n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "FromVecNote content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create from note");
+
+        let vs_a = rt.vectors_for_model(&tok, "merge-note-vec-a").unwrap();
+        let vs_b = rt.vectors_for_model(&tok, "merge-note-vec-b").unwrap();
+        use khive_storage::types::VectorSearchRequest;
+        let query = vec![1.0_f32; DIMS];
+
+        let pre_a = vs_a
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("merge-note-vec-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_a.iter().any(|h| h.subject_id == into_n.id)
+                && pre_a.iter().any(|h| h.subject_id == from_n.id),
+            "both notes must be in model-a before merge; got {pre_a:?}"
+        );
+
+        // model-b must ALSO hold both notes pre-merge, else the post-merge
+        // model-b emptiness check below is vacuous (nothing to delete).
+        let pre_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("merge-note-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            pre_b.iter().any(|h| h.subject_id == into_n.id)
+                && pre_b.iter().any(|h| h.subject_id == from_n.id),
+            "both notes must be in model-b before merge; got {pre_b:?}"
+        );
+
+        rt.merge_note(
+            &tok,
+            into_n.id,
+            from_n.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::PreferInto,
+            false,
+        )
+        .await
+        .expect("merge_note");
+
+        // from_id must have ZERO rows in EITHER model table after merge.
+        let post_a = vs_a
+            .search(VectorSearchRequest {
+                query_vectors: vec![query.clone()],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("merge-note-vec-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        let from_ids_a: Vec<_> = post_a
+            .iter()
+            .filter(|h| h.subject_id == from_n.id)
+            .collect();
+        assert!(
+            from_ids_a.is_empty(),
+            "from_id must have no vectors in model-a after merge; got {from_ids_a:?}"
+        );
+
+        let post_b = vs_b
+            .search(VectorSearchRequest {
+                query_vectors: vec![query],
+                top_k: 100,
+                namespace: Some(ns_str.to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("merge-note-vec-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        let from_ids_b: Vec<_> = post_b
+            .iter()
+            .filter(|h| h.subject_id == from_n.id)
+            .collect();
+        assert!(
+            from_ids_b.is_empty(),
+            "from_id must have no vectors in model-b after merge; got {from_ids_b:?}"
+        );
     }
 
     // Cross-path equality: merge_entity must produce a stored FTS document for

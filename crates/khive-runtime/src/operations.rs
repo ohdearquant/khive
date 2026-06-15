@@ -53,6 +53,25 @@ std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Count-targetable vector-INSERT fault injection: when set to N (N > 0), the next N
+// vector insert calls succeed and the (N+1)-th returns an injected error.  After
+// triggering the counter resets to 0.  `thread_local!` provides per-thread isolation;
+// `#[tokio::test]` uses a current-thread runtime so there is no thread migration
+// mid-test.  This lets T-E3 let model-a's insert succeed and fail on model-b's.
+#[cfg(any(test, feature = "fault-injection"))]
+std::thread_local! {
+    static VECTOR_FAIL_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
+/// the next one.  Set `n = 0` to fail immediately on the first insert.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_vector_fail_after(n: usize) {
+    VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
+}
+
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(any(test, feature = "fault-injection"))]
@@ -405,19 +424,258 @@ impl KhiveRuntime {
 
         let doc = entity_fts_document(&entity);
         let embed_body = doc.body.clone();
-        self.text(token)?.upsert_document(doc).await?;
 
-        if self.config().embedding_model.is_some() {
-            let vector = self.embed_document(&embed_body).await?;
-            self.vectors(token)?
-                .insert(
-                    entity.id,
-                    SubstrateKind::Entity,
-                    ns,
-                    "entity.body",
-                    vec![vector],
-                )
-                .await?;
+        // FTS step — compensate entity row on failure (mirrors create_note_inner).
+        {
+            #[cfg(any(test, feature = "fault-injection"))]
+            let fts_inject = {
+                let mut g = FTS_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let fts_inject = false;
+            let fts_result: RuntimeResult<()> = if fts_inject {
+                Err(RuntimeError::Internal("injected FTS failure".to_string()))
+            } else {
+                match self.text(token) {
+                    Ok(fts) => fts.upsert_document(doc).await.map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                }
+            };
+            if let Err(e) = fts_result {
+                if let Ok(store) = self.entities(token) {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back entity row after FTS failure"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
+
+        // Vector embedding + insert step — compensate entity row + FTS doc on failure.
+        // Fan out to ALL registered models (mirrors create_note_inner multi-model path).
+        let embed_model_names = {
+            let names = self.registered_embedding_model_names();
+            if names.is_empty() {
+                vec![]
+            } else {
+                names
+            }
+        };
+
+        if embed_model_names.len() == 1 {
+            let model_name = &embed_model_names[0];
+            let vec_result = self
+                .embed_document_with_model(model_name, &embed_body)
+                .await;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            let vec_inject = {
+                let mut g = VECTOR_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let vec_inject = false;
+            let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
+                Err(RuntimeError::Internal(
+                    "injected vector failure".to_string(),
+                ))
+            } else {
+                vec_result
+            };
+
+            let single_result: RuntimeResult<()> = match vec_result {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => vs
+                        .insert(
+                            entity.id,
+                            SubstrateKind::Entity,
+                            ns,
+                            "entity.body",
+                            vec![vector],
+                        )
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(e) = single_result {
+                if let Ok(store) = self.entities(token) {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back entity row after vector failure"
+                        );
+                    }
+                }
+                if let Ok(fts) = self.text(token) {
+                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_entity: failed to roll back FTS document after vector failure"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        } else if !embed_model_names.is_empty() {
+            // Multi-model path: embed with each model in parallel, then insert sequentially
+            // with inserted_models tracking for rollback on partial failure.
+            let rt_clone = self.clone();
+            let body_owned = embed_body.clone();
+            let mut handles = Vec::with_capacity(embed_model_names.len());
+            for model_name in &embed_model_names {
+                let rt = rt_clone.clone();
+                let text = body_owned.clone();
+                let name = model_name.clone();
+                handles.push(tokio::spawn(async move {
+                    rt.embed_document_with_model(&name, &text).await
+                }));
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for handle in handles {
+                let join_result = handle
+                    .await
+                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                match join_result {
+                    Err(e) => {
+                        if let Ok(store) = self.entities(token) {
+                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
+                            {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back entity row after embed task panic"
+                                );
+                            }
+                        }
+                        if let Ok(fts) = self.text(token) {
+                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back FTS document after embed task panic"
+                                );
+                            }
+                        }
+                        return Err(e);
+                    }
+                    Ok(Err(e)) => {
+                        if let Ok(store) = self.entities(token) {
+                            if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await
+                            {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back entity row after embed failure"
+                                );
+                            }
+                        }
+                        if let Ok(fts) = self.text(token) {
+                            if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back FTS document after embed failure"
+                                );
+                            }
+                        }
+                        return Err(e);
+                    }
+                    Ok(Ok(vec)) => vectors.push(vec),
+                }
+            }
+            // TODO(P2): parallelize vector inserts
+            let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
+            for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
+                // Count-targetable fault injection for multi-model insert path (T-E3).
+                #[cfg(any(test, feature = "fault-injection"))]
+                let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
+                    Some(0) => {
+                        cell.set(None);
+                        true
+                    }
+                    Some(n) => {
+                        cell.set(Some(n - 1));
+                        false
+                    }
+                    None => false,
+                });
+                #[cfg(not(any(test, feature = "fault-injection")))]
+                let count_inject = false;
+
+                let insert_result = if count_inject {
+                    Err(RuntimeError::Internal(
+                        "injected vector insert failure".to_string(),
+                    ))
+                } else {
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => vs
+                            .insert(
+                                entity.id,
+                                SubstrateKind::Entity,
+                                ns,
+                                "entity.body",
+                                vec![vector],
+                            )
+                            .await
+                            .map_err(RuntimeError::from),
+                        Err(e) => Err(e),
+                    }
+                };
+                if let Err(e) = insert_result {
+                    // Compensate entity row + FTS + already-inserted vectors.
+                    if let Ok(store) = self.entities(token) {
+                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back entity row after vector insert failure"
+                            );
+                        }
+                    }
+                    if let Ok(fts) = self.text(token) {
+                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                            tracing::error!(
+                                error = %ce,
+                                id = %entity.id,
+                                "create_entity: failed to roll back FTS document after vector insert failure"
+                            );
+                        }
+                    }
+                    for m in &inserted_models {
+                        if let Ok(vs) = self.vectors_for_model(token, m) {
+                            if let Err(ce) = vs.delete(entity.id).await {
+                                tracing::error!(
+                                    error = %ce,
+                                    model = m,
+                                    id = %entity.id,
+                                    "create_entity: failed to roll back vector for model after insert failure"
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+                inserted_models.push(model_name.clone());
+            }
         }
 
         Ok(entity)
@@ -6699,6 +6957,366 @@ mod tests {
             count_edge_rows_by_id(&rt, base_edge_uuid, &ns).await,
             0,
             "hard-delete must physically remove the base edge row"
+        );
+    }
+
+    // ---- Issue #10: entity create/update multi-model embed fan-out tests ----
+
+    // T-E1: FTS failure after entity row commit rolls back the entity row.
+    // Mirrors create_note_fts_failure_rolls_back_note_row but for entities.
+    // Uses a unique namespace so the process-global FTS_FAIL_NS one-shot is
+    // consumed only by this test's create_entity call.
+    #[tokio::test]
+    async fn create_entity_fts_failure_rolls_back_entity_row() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("fault-entity-fts").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        arm_fts_fail(ns.as_str());
+
+        let result = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "fts-fail rollback target",
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_entity must propagate the injected FTS failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected FTS failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 1000, 0).await.unwrap();
+        assert!(
+            entities.is_empty(),
+            "compensation must remove the entity row after FTS failure; got {entities:?}"
+        );
+    }
+
+    // T-E2: Vector insert failure after entity row + FTS commit rolls back both.
+    // Uses a unique namespace to avoid consuming the VECTOR_FAIL_NS flag from
+    // a concurrent test's create_entity or create_note.
+    #[tokio::test]
+    async fn create_entity_vector_failure_rolls_back_entity_row_and_fts() {
+        const MODEL: &str = "test-entity-vec-inject";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL, DIMS);
+        rt.register_embedder(provider);
+
+        let ns = Namespace::parse("fault-entity-vec").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        arm_vector_fail(ns.as_str());
+
+        let result = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "vec-fail rollback target",
+                Some("description so embed body is non-empty"),
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_entity must propagate the injected vector failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected vector failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 1000, 0).await.unwrap();
+        assert!(
+            entities.is_empty(),
+            "compensation must remove entity row after vector failure; got {entities:?}"
+        );
+
+        // FTS document must also be removed.
+        use khive_storage::types::{TextFilter, TextQueryMode, TextSearchRequest};
+        let fts_hits = rt
+            .text(&tok)
+            .unwrap()
+            .search(TextSearchRequest {
+                query: "vec-fail rollback target".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.as_str().to_string()],
+                    ..Default::default()
+                }),
+                top_k: 10,
+                snippet_chars: 100,
+            })
+            .await
+            .unwrap();
+        assert!(
+            fts_hits.is_empty(),
+            "compensation must remove FTS document after vector failure; got {fts_hits:?}"
+        );
+    }
+
+    // T-E3: Multi-model create_entity — second model's vector INSERT fails after the
+    // first model's insert succeeds, triggering inserted_models rollback.
+    // Uses arm_vector_fail_after(1) so the first insert passes and the second fails,
+    // exercising the inserted_models compensation path in create_entity.
+    // Thread-local VECTOR_FAIL_AFTER is per-thread isolated (current-thread tokio runtime),
+    // so this test does not race with namespace-targeted VECTOR_FAIL_NS tests.
+    #[tokio::test]
+    async fn create_entity_multi_model_second_vector_failure_rolls_back_all() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("model-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("model-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("fault-entity-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        // Let the first vector insert succeed, fail on the second.
+        arm_vector_fail_after(1);
+
+        let result = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "multi-model rollback target",
+                Some("description for embedding"),
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_entity must propagate the injected multi-model vector failure"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 1000, 0).await.unwrap();
+        assert!(
+            entities.is_empty(),
+            "compensation must remove entity row; got {entities:?}"
+        );
+
+        // Both model-a and model-b vector stores must be empty for the entity id.
+        // (The entity was never returned so we can't get its id from the result;
+        // list_entities returning empty is the primary assertion. Additionally confirm
+        // both stores have zero rows via a broad vector search.)
+        use khive_storage::types::VectorSearchRequest;
+        let query_vec = vec![1.0_f32; DIMS];
+        let hits_a = rt
+            .vectors_for_model(&tok, "model-a")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec.clone()],
+                top_k: 100,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("model-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_a.is_empty(),
+            "model-a vector store must be empty after rollback; got {hits_a:?}"
+        );
+        let hits_b = rt
+            .vectors_for_model(&tok, "model-b")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec],
+                top_k: 100,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("model-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_b.is_empty(),
+            "model-b vector store must be empty after rollback; got {hits_b:?}"
+        );
+    }
+
+    // T-U1: update_entity fans out to ALL registered models.
+    // After create + update with a changed description, both model-a and model-b
+    // vector stores hold a row for the entity id.
+    #[tokio::test]
+    async fn update_entity_fans_out_to_all_registered_models() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("embed-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("embed-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("update-entity-fanout").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FanOutEntity",
+                Some("initial description"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_entity must succeed");
+
+        use crate::curation::EntityPatch;
+        let patch = EntityPatch {
+            description: Some(Some("updated description after fan-out fix".to_string())),
+            ..Default::default()
+        };
+        rt.update_entity(&tok, entity.id, patch)
+            .await
+            .expect("update_entity must succeed");
+
+        use khive_storage::types::VectorSearchRequest;
+        let query_vec = vec![1.0_f32; DIMS];
+
+        let hits_a = rt
+            .vectors_for_model(&tok, "embed-a")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec.clone()],
+                top_k: 10,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("embed-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_a.iter().any(|h| h.subject_id == entity.id),
+            "embed-a must hold a vector for the entity after update; got {hits_a:?}"
+        );
+
+        let hits_b = rt
+            .vectors_for_model(&tok, "embed-b")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec],
+                top_k: 10,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Entity),
+                embedding_model: Some("embed-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_b.iter().any(|h| h.subject_id == entity.id),
+            "embed-b must hold a vector for the entity after update; got {hits_b:?}"
+        );
+    }
+
+    // T-U2: update_note fans out to ALL registered models.
+    // After create + update with changed content, both embed-a and embed-b
+    // vector stores hold a row for the note id.
+    #[tokio::test]
+    async fn update_note_fans_out_to_all_registered_models() {
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("embed-a", DIMS);
+        let (provider_b, _cb) = ConstVecProvider::new("embed-b", DIMS);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("update-note-fanout").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "initial note content for fan-out test",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note must succeed");
+
+        use crate::curation::NotePatch;
+        let patch = NotePatch {
+            content: Some("updated content after fan-out fix".to_string()),
+            ..Default::default()
+        };
+        rt.update_note(&tok, note.id, patch)
+            .await
+            .expect("update_note must succeed");
+
+        use khive_storage::types::VectorSearchRequest;
+        let query_vec = vec![1.0_f32; DIMS];
+
+        let hits_a = rt
+            .vectors_for_model(&tok, "embed-a")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec.clone()],
+                top_k: 10,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("embed-a".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_a.iter().any(|h| h.subject_id == note.id),
+            "embed-a must hold a vector for the note after update; got {hits_a:?}"
+        );
+
+        let hits_b = rt
+            .vectors_for_model(&tok, "embed-b")
+            .unwrap()
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec],
+                top_k: 10,
+                namespace: Some(ns.as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some("embed-b".to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits_b.iter().any(|h| h.subject_id == note.id),
+            "embed-b must hold a vector for the note after update; got {hits_b:?}"
         );
     }
 }
