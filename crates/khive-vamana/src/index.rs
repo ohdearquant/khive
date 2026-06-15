@@ -14,11 +14,14 @@ use crate::{
     config::VamanaConfig,
     distance::l2_squared,
     error::{Result, VamanaError},
-    graph::{VamanaGraph, VisitedSet},
+    graph::{is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, VamanaGraph, VisitedSet},
 };
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
+
+/// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
+const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
 
 /// Format identifier string stored in every `VamanaSnapshot`.
 pub const VAMANA_SNAPSHOT_FORMAT: &str = "khive-vamana-index";
@@ -281,6 +284,19 @@ pub struct VamanaIndex {
     config: VamanaConfig,
     num_vectors: usize,
     dimensions: usize,
+    // ---- PR2: lifecycle fields (ADR-052 §2) ----
+    /// Bit-packed tombstone marks. Bit `i` set ⇒ node `i` is soft-deleted.
+    /// `Vec<u64>` with manual manipulation; no `bitvec` crate dependency (OQ3 resolution).
+    tombstones: Vec<u64>,
+    /// Count of currently tombstoned nodes.
+    tombstone_count: usize,
+    /// Cumulative delete+insert churn since the last consolidation.
+    ops_since_consolidation: usize,
+    /// Recycled ordinal slots from previous tombstone calls; consumed by insert (PR3).
+    free_slots: Vec<u32>,
+    /// Trigger tau for consolidation: fire when `ops_since_consolidation >= consolidation_tau`.
+    /// Field on `VamanaIndex`, not `VamanaConfig` — this is operational policy, not topology (OQ5).
+    consolidation_tau: usize,
 }
 
 struct IndexMetadata {
@@ -329,6 +345,11 @@ impl VamanaIndex {
             config,
             num_vectors,
             dimensions,
+            tombstones: tombstone_words_for(num_vectors),
+            tombstone_count: 0,
+            ops_since_consolidation: 0,
+            free_slots: Vec::new(),
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
         })
     }
 
@@ -345,6 +366,11 @@ impl VamanaIndex {
         }
         require_finite(query, "search query")?;
 
+        let tombstones = if self.tombstone_count > 0 {
+            Some(self.tombstones.as_slice())
+        } else {
+            None
+        };
         let mut visited = VisitedSet::new(self.num_vectors);
         let result = self.graph.greedy_search(
             self.vectors()?,
@@ -353,6 +379,7 @@ impl VamanaIndex {
             k,
             self.config.search_list_size,
             &mut visited,
+            tombstones,
         )?;
 
         let mut output = result.results;
@@ -415,6 +442,11 @@ impl VamanaIndex {
             config,
             num_vectors: meta.num_vectors,
             dimensions: meta.dimensions,
+            tombstones: tombstone_words_for(meta.num_vectors),
+            tombstone_count: 0,
+            ops_since_consolidation: 0,
+            free_slots: Vec::new(),
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
         })
     }
 
@@ -437,11 +469,18 @@ impl VamanaIndex {
 
         let vecs = self.vectors()?;
         let num_queries = queries.len() / self.dimensions;
-        let denom = k.min(self.num_vectors) as f64;
+        let live_count = self.num_vectors - self.tombstone_count;
+        let denom = k.min(live_count) as f64;
+
+        let tombstones = if self.tombstone_count > 0 {
+            Some(self.tombstones.as_slice())
+        } else {
+            None
+        };
 
         let total_recall: f64 = (0..num_queries).try_fold(0.0f64, |acc, qi| {
             let query = &queries[qi * self.dimensions..(qi + 1) * self.dimensions];
-            let exact = exact_search(vecs, self.dimensions, query, k);
+            let exact = exact_search(vecs, self.dimensions, query, k, tombstones);
             let ann = self.search(query, k)?;
 
             let exact_ids: std::collections::HashSet<u32> =
@@ -597,6 +636,11 @@ impl VamanaIndex {
             config,
             num_vectors,
             dimensions,
+            tombstones: tombstone_words_for(num_vectors),
+            tombstone_count: 0,
+            ops_since_consolidation: 0,
+            free_slots: Vec::new(),
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
         })
     }
 
@@ -624,12 +668,391 @@ impl VamanaIndex {
     pub fn vectors(&self) -> Result<&[f32]> {
         self.vectors.as_slice()
     }
+
+    // ---- PR2: lifecycle API (ADR-052 §2) ----
+
+    /// True if `node_id` has been soft-deleted.
+    pub fn is_tombstoned(&self, node_id: u32) -> bool {
+        is_tombstoned_bit(&self.tombstones, node_id as usize)
+    }
+
+    /// Count of currently tombstoned (soft-deleted) nodes.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstone_count
+    }
+
+    /// True when `ops_since_consolidation >= consolidation_tau`.
+    pub fn needs_consolidation(&self) -> bool {
+        self.ops_since_consolidation >= self.consolidation_tau
+    }
+
+    /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2).
+    ///
+    /// For each live in-neighbor `p` of `node_id`, the repair rebuilds `p`'s adjacency
+    /// by running RobustPrune over the union of `node_id`'s out-neighbors and `p`'s
+    /// current neighbors (minus `node_id`). All tombstoned candidates are excluded.
+    /// `reverse_adj` is updated in lockstep on every rewire.
+    ///
+    /// If `node_id` was the medoid, a new medoid is elected (centroid-nearest live node).
+    ///
+    /// Returns an error without mutating any state if the op would leave zero live nodes.
+    pub fn tombstone(&mut self, node_id: u32) -> Result<()> {
+        let idx = node_id as usize;
+        if idx >= self.num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "tombstone: node_id {node_id} out of range ({} nodes)",
+                self.num_vectors
+            )));
+        }
+        if is_tombstoned_bit(&self.tombstones, idx) {
+            return Err(VamanaError::invalid_format(format!(
+                "tombstone: node_id {node_id} is already tombstoned"
+            )));
+        }
+        // Preflight: reject if this would leave zero live nodes (elect_medoid would fail
+        // with EmptyInput; guard here so no state is mutated on the error path).
+        if self.tombstone_count + 1 >= self.num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "tombstone: deleting node {node_id} would leave zero live nodes"
+            )));
+        }
+
+        // Step 1: mark tombstoned, update counters.
+        set_tombstone_bit(&mut self.tombstones, idx);
+        self.tombstone_count += 1;
+        self.ops_since_consolidation += 1;
+
+        let vecs = self.vectors.as_slice()?;
+        wolverine_repair(
+            vecs,
+            self.dimensions,
+            &mut self.graph,
+            node_id,
+            &self.tombstones,
+            self.config.alpha,
+            self.config.max_degree,
+        );
+
+        // Step 9: if the deleted node was the medoid, re-elect.
+        if self.graph.medoid() == node_id {
+            let new_medoid =
+                elect_medoid(vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+            self.graph.set_medoid(new_medoid);
+        }
+
+        // Step 10: push to free_slots for future insert recycling (PR3).
+        self.free_slots.push(node_id);
+
+        // OQ4: after repair, the deleted node's in-neighbor set must be empty.
+        debug_assert!(
+            self.graph.reverse_adjacency()[idx].is_empty(),
+            "tombstone: node {node_id} still has live in-neighbors post-repair"
+        );
+
+        Ok(())
+    }
+
+    /// Tombstone a batch of node ordinals, deferring medoid re-election to once per batch.
+    ///
+    /// Performs all structural rewires (Wolverine 2-hop repair, reverse_adj updates) for
+    /// every node in `ordinals` first. Re-elects the medoid exactly once at the end, only
+    /// if the current medoid is in the batch. Single-delete callers should use `tombstone()`.
+    ///
+    /// Returns an error without mutating any state if the batch would leave zero live nodes.
+    pub fn tombstone_batch(&mut self, ordinals: &[u32]) -> Result<()> {
+        if ordinals.is_empty() {
+            return Ok(());
+        }
+
+        // Preflight: validate all ordinals and check the all-tombstoned case before any
+        // mutation. This keeps the error path clean — no partial state on Err.
+        let mut unique_live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+            if idx >= self.num_vectors {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch: node_id {node_id} out of range ({} nodes)",
+                    self.num_vectors
+                )));
+            }
+            if is_tombstoned_bit(&self.tombstones, idx) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch: node_id {node_id} is already tombstoned"
+                )));
+            }
+            if !unique_live.insert(node_id) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch: duplicate ordinal {node_id} in batch"
+                )));
+            }
+        }
+        let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
+        if new_live == 0 {
+            return Err(VamanaError::invalid_format(
+                "tombstone_batch: batch would leave zero live nodes".into(),
+            ));
+        }
+
+        let vecs = self.vectors.as_slice()?;
+        let vecs: Vec<f32> = vecs.to_vec(); // clone to avoid borrow conflict with &mut self
+
+        let mut medoid_affected = false;
+
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+
+            // Track whether the current medoid is in this batch.
+            if self.graph.medoid() == node_id {
+                medoid_affected = true;
+            }
+
+            set_tombstone_bit(&mut self.tombstones, idx);
+            self.tombstone_count += 1;
+            self.ops_since_consolidation += 1;
+
+            wolverine_repair(
+                &vecs,
+                self.dimensions,
+                &mut self.graph,
+                node_id,
+                &self.tombstones,
+                self.config.alpha,
+                self.config.max_degree,
+            );
+
+            self.free_slots.push(node_id);
+        }
+
+        // Single medoid re-election after all rewires — O(N*dims) once, not K times.
+        if medoid_affected {
+            let new_medoid =
+                elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+            self.graph.set_medoid(new_medoid);
+        }
+
+        Ok(())
+    }
+
+    /// Tombstone a batch without Wolverine in-neighbor rewiring. Test support only.
+    ///
+    /// Sets tombstone bits and clears each deleted node's own forward adjacency (updating
+    /// `reverse_adj` in lockstep), but does NOT reselect in-neighbor lists via RobustPrune.
+    /// The medoid is re-elected once at the end if it falls in the batch.
+    ///
+    /// Used by the OQ1 empirical drift test to build a genuine no-repair control: search
+    /// still skips tombstoned nodes via the `Option<&[u64]>` guard in `greedy_search_inner`,
+    /// but in-neighbors that previously pointed to deleted nodes are NOT rewired, so the
+    /// graph retains dead-end paths that Wolverine would have bypassed.
+    #[doc(hidden)]
+    pub fn tombstone_batch_no_repair(&mut self, ordinals: &[u32]) -> Result<()> {
+        if ordinals.is_empty() {
+            return Ok(());
+        }
+
+        // Same preflight as tombstone_batch.
+        let mut unique_live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+            if idx >= self.num_vectors {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: node_id {node_id} out of range ({} nodes)",
+                    self.num_vectors
+                )));
+            }
+            if is_tombstoned_bit(&self.tombstones, idx) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: node_id {node_id} is already tombstoned"
+                )));
+            }
+            if !unique_live.insert(node_id) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: duplicate ordinal {node_id} in batch"
+                )));
+            }
+        }
+        let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
+        if new_live == 0 {
+            return Err(VamanaError::invalid_format(
+                "tombstone_batch_no_repair: batch would leave zero live nodes".into(),
+            ));
+        }
+
+        let mut medoid_affected = false;
+
+        for &node_id in ordinals {
+            let idx = node_id as usize;
+
+            if self.graph.medoid() == node_id {
+                medoid_affected = true;
+            }
+
+            set_tombstone_bit(&mut self.tombstones, idx);
+            self.tombstone_count += 1;
+            self.ops_since_consolidation += 1;
+
+            // No Wolverine rewire. Just clear the deleted node's own forward adjacency so
+            // there are no outgoing edges from a dead node (reverse_adj updated in lockstep).
+            self.graph
+                .replace_adjacency_and_update_reverse(node_id, Vec::new());
+
+            self.free_slots.push(node_id);
+        }
+
+        if medoid_affected {
+            let vecs = self.vectors.as_slice()?.to_vec();
+            let new_medoid =
+                elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+            self.graph.set_medoid(new_medoid);
+        }
+
+        Ok(())
+    }
 }
 
-fn exact_search(vectors: &[f32], dimensions: usize, query: &[f32], k: usize) -> Vec<(u32, f32)> {
+// ---- PR2: tombstone bit helpers (Vec<u64> bitvec, no external crate) ----
+
+/// Number of `u64` words needed for `n` bits.
+fn tombstone_words_for(n: usize) -> Vec<u64> {
+    let words = n.div_ceil(64);
+    vec![0u64; words]
+}
+
+#[inline]
+fn set_tombstone_bit(tombstones: &mut Vec<u64>, idx: usize) {
+    let word = idx / 64;
+    if word >= tombstones.len() {
+        tombstones.resize(word + 1, 0);
+    }
+    tombstones[word] |= 1u64 << (idx % 64);
+}
+
+// ---- PR2: Wolverine 2-hop repair (ADR-052 §2 steps 3-8) ----
+
+/// Core Wolverine repair: rewire each live in-neighbor of `deleted` so it bypasses
+/// the deleted node. Monotonic-path preservation: the new neighbor list is derived
+/// from a RobustPrune over `deleted`'s out-neighbors ∪ the in-neighbor's current
+/// neighbors (minus `deleted`), with all tombstoned candidates excluded.
+///
+/// `reverse_adj` is updated in lockstep on every rewire (the PR1 invariant).
+///
+/// # References
+/// - Wolverine: PVLDB 18(7):2268-2280, VLDB 2025 (Liu/Zheng/Yue/Ruan/Zhou/Jensen)
+/// - FreshDiskANN: SIGMOD 2022 (>95% recall at 20% deletion with eager repair)
+fn wolverine_repair(
+    vectors: &[f32],
+    dimensions: usize,
+    graph: &mut VamanaGraph,
+    deleted: u32,
+    tombstones: &[u64],
+    alpha: f64,
+    max_degree: usize,
+) {
+    // Collect in-neighbors and out-neighbors before any mutation.
+    let in_neighbors: Vec<u32> = graph.reverse_adjacency()[deleted as usize]
+        .iter()
+        .copied()
+        .filter(|&p| !is_tombstoned_bit(tombstones, p as usize))
+        .collect();
+
+    let out_neighbors: Vec<u32> = graph.adjacency()[deleted as usize]
+        .iter()
+        .copied()
+        .filter(|&v| !is_tombstoned_bit(tombstones, v as usize))
+        .collect();
+
+    for p in in_neighbors {
+        // Build candidate pool: out(deleted) ∪ (adj(p) \ {deleted}), drop tombstoned.
+        let mut pool: Vec<u32> = out_neighbors
+            .iter()
+            .copied()
+            .chain(
+                graph.adjacency()[p as usize]
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != deleted),
+            )
+            .filter(|&v| !is_tombstoned_bit(tombstones, v as usize) && v != p)
+            .collect();
+        sort_dedup_u32(&mut pool);
+
+        let new_neighbors = robust_prune_inner(vectors, dimensions, p, pool, alpha, max_degree);
+
+        // Replace adjacency[p] and update reverse_adj in lockstep (PR1 invariant).
+        graph.replace_adjacency_and_update_reverse(p, new_neighbors);
+    }
+
+    // Remove `deleted` from its own reverse_adj entry of every out-neighbor
+    // (the deleted node's forward edges are now dead; reverse_adj must reflect this).
+    for v in graph.adjacency()[deleted as usize].clone() {
+        let rev = graph.adjacency_and_reverse_mut().1;
+        if let Some(pos) = rev[v as usize].iter().position(|&x| x == deleted) {
+            rev[v as usize].swap_remove(pos);
+        }
+    }
+
+    // Clear the deleted node's own adjacency list so it has no live forward edges.
+    graph.replace_adjacency_and_update_reverse(deleted, Vec::new());
+}
+
+/// Elect a new medoid: centroid of all live (non-tombstoned) vectors, nearest live node.
+fn elect_medoid(
+    vectors: &[f32],
+    dimensions: usize,
+    num_vectors: usize,
+    tombstones: &[u64],
+) -> Result<u32> {
+    // Compute mean of live vectors.
+    let mut centroid = vec![0.0f32; dimensions];
+    let mut live_count = 0usize;
+    for i in 0..num_vectors {
+        if !is_tombstoned_bit(tombstones, i) {
+            let v = &vectors[i * dimensions..(i + 1) * dimensions];
+            for (c, x) in centroid.iter_mut().zip(v.iter()) {
+                *c += x;
+            }
+            live_count += 1;
+        }
+    }
+    if live_count == 0 {
+        return Err(VamanaError::EmptyInput);
+    }
+    let scale = 1.0 / live_count as f32;
+    for c in &mut centroid {
+        *c *= scale;
+    }
+
+    // Find live node nearest the centroid.
+    let mut best_id = u32::MAX;
+    let mut best_dist = f32::INFINITY;
+    for i in 0..num_vectors {
+        if is_tombstoned_bit(tombstones, i) {
+            continue;
+        }
+        let v = &vectors[i * dimensions..(i + 1) * dimensions];
+        let d = l2_squared(&centroid, v);
+        if d < best_dist || (d == best_dist && (i as u32) < best_id) {
+            best_dist = d;
+            best_id = i as u32;
+        }
+    }
+    Ok(best_id)
+}
+
+fn exact_search(
+    vectors: &[f32],
+    dimensions: usize,
+    query: &[f32],
+    k: usize,
+    tombstones: Option<&[u64]>,
+) -> Vec<(u32, f32)> {
     let n = vectors.len() / dimensions;
     let mut dists: Vec<(u32, f32)> = (0..n as u32)
         .into_par_iter()
+        .filter(|&id| {
+            tombstones
+                .map(|ts| !is_tombstoned_bit(ts, id as usize))
+                .unwrap_or(true)
+        })
         .map(|id| {
             let v = &vectors[id as usize * dimensions..(id as usize + 1) * dimensions];
             (id, l2_squared(query, v))

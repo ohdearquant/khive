@@ -176,6 +176,7 @@ impl VamanaGraph {
                             config.max_degree,
                             config.search_list_size,
                             &mut visited,
+                            None, // no tombstones during build
                         );
 
                         let mut candidates: Vec<u32> = search
@@ -286,6 +287,48 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
+    /// Mutable access to both adjacency and reverse_adj for Wolverine repair.
+    pub(crate) fn adjacency_and_reverse_mut(&mut self) -> (&mut Vec<Vec<u32>>, &mut Vec<Vec<u32>>) {
+        (&mut self.adjacency, &mut self.reverse_adj)
+    }
+
+    /// Replace `adjacency[node]` with `new_neighbors` and update `reverse_adj` in lockstep.
+    ///
+    /// For every node removed from the old list, `node` is removed from its `reverse_adj`
+    /// entry. For every node added, `node` is appended. Called by Wolverine repair.
+    pub(crate) fn replace_adjacency_and_update_reverse(
+        &mut self,
+        node: u32,
+        new_neighbors: Vec<u32>,
+    ) {
+        let node_idx = node as usize;
+        let old = std::mem::take(&mut self.adjacency[node_idx]);
+
+        // Remove `node` from reverse_adj of nodes no longer in the list.
+        for &v in &old {
+            if !new_neighbors.contains(&v) {
+                let rev = &mut self.reverse_adj[v as usize];
+                if let Some(pos) = rev.iter().position(|&x| x == node) {
+                    rev.swap_remove(pos);
+                }
+            }
+        }
+
+        // Add `node` to reverse_adj of newly added nodes.
+        for &v in &new_neighbors {
+            if !old.contains(&v) {
+                self.reverse_adj[v as usize].push(node);
+            }
+        }
+
+        self.adjacency[node_idx] = new_neighbors;
+    }
+
+    /// Set the medoid (entry point for greedy search).
+    pub(crate) fn set_medoid(&mut self, medoid: u32) {
+        self.medoid = medoid;
+    }
+
     /// Return the neighbor list for `node`, or an error if out of range.
     pub fn neighbors(&self, node: u32) -> Result<&[u32]> {
         let idx = node as usize;
@@ -317,6 +360,13 @@ impl VamanaGraph {
     }
 
     /// Run greedy beam search from the medoid and return the `k` nearest candidates.
+    ///
+    /// `tombstones` is an optional bit-packed slice produced by `VamanaIndex`.
+    /// Tombstoned nodes are skipped during beam expansion (defense-in-depth for
+    /// the pre-PR4 window where the Wolverine invariant is not crash-safe).
+    // REASON: `tombstones` was added to the existing 7-parameter signature (PR2);
+    // bundling params into a struct would add allocation overhead on the hot path.
+    #[allow(clippy::too_many_arguments)]
     pub fn greedy_search(
         &self,
         vectors: &[f32],
@@ -325,6 +375,7 @@ impl VamanaGraph {
         k: usize,
         search_list_size: usize,
         visited: &mut VisitedSet,
+        tombstones: Option<&[u64]>,
     ) -> Result<GreedySearchResult> {
         if query.len() != dimensions {
             return Err(VamanaError::DimensionMismatch {
@@ -357,6 +408,7 @@ impl VamanaGraph {
             k,
             search_list_size,
             visited,
+            tombstones,
         ))
     }
 
@@ -409,11 +461,12 @@ struct Candidate {
     expanded: bool,
 }
 
-// REASON: greedy_search_inner requires all eight parameters (vectors, dimensions,
-// adjacency, query, start, k, search_list_size, visited) to avoid bundling them
-// into a struct that would add allocation overhead on the hot search path.
+// REASON: greedy_search_inner requires nine parameters to avoid bundling them into
+// a struct that would add allocation overhead on the hot search path. The extra
+// `tombstones` parameter is `None` during build (no tombstones exist) and
+// `Some(&[u64])` during live search (defense-in-depth pre-PR4).
 #[allow(clippy::too_many_arguments)]
-fn greedy_search_inner(
+pub(crate) fn greedy_search_inner(
     vectors: &[f32],
     dimensions: usize,
     adjacency: &[Vec<u32>],
@@ -422,9 +475,22 @@ fn greedy_search_inner(
     k: usize,
     search_list_size: usize,
     visited: &mut VisitedSet,
+    tombstones: Option<&[u64]>,
 ) -> GreedySearchResult {
     let effective_l = search_list_size.max(k);
     visited.clear();
+
+    // Defense-in-depth: if the medoid seed is tombstoned (possible in the window between
+    // a crash-truncated medoid tombstone and PR4's crash-safe medoid update), skip seeding
+    // it and return an empty result rather than surfacing a deleted node in results.
+    if let Some(ts) = tombstones {
+        if is_tombstoned_bit(ts, start as usize) {
+            return GreedySearchResult {
+                results: Vec::new(),
+                expanded: Vec::new(),
+            };
+        }
+    }
 
     let start_dist = l2_squared(query, row(vectors, dimensions, start));
     visited.mark_if_new(start as usize);
@@ -452,6 +518,15 @@ fn greedy_search_inner(
         expanded.push((current_id, current_dist));
 
         for &neighbor in &adjacency[current_id as usize] {
+            // Defense-in-depth: skip tombstoned neighbors during live search.
+            // Under a correct Wolverine repair no live forward edge should point
+            // at a tombstoned node, but this guard catches crash-truncated repairs
+            // before PR4 makes the invariant crash-safe.
+            if let Some(ts) = tombstones {
+                if is_tombstoned_bit(ts, neighbor as usize) {
+                    continue;
+                }
+            }
             if !visited.mark_if_new(neighbor as usize) {
                 continue;
             }
@@ -480,8 +555,15 @@ fn greedy_search_inner(
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    // Filter tombstoned nodes from the result set (defense-in-depth for the no-repair
+    // control path and crash-truncated repair windows pre-PR4).
     let results = frontier
         .iter()
+        .filter(|c| {
+            tombstones
+                .map(|ts| !is_tombstoned_bit(ts, c.id as usize))
+                .unwrap_or(true)
+        })
         .take(k)
         .map(|c| (c.id, c.distance))
         .collect();
@@ -489,7 +571,17 @@ fn greedy_search_inner(
     GreedySearchResult { results, expanded }
 }
 
-fn robust_prune_inner(
+/// Test whether bit `idx` is set in a `Vec<u64>` tombstone bitvec.
+#[inline]
+pub(crate) fn is_tombstoned_bit(tombstones: &[u64], idx: usize) -> bool {
+    let word = idx / 64;
+    if word >= tombstones.len() {
+        return false;
+    }
+    tombstones[word] & (1u64 << (idx % 64)) != 0
+}
+
+pub(crate) fn robust_prune_inner(
     vectors: &[f32],
     dimensions: usize,
     node: u32,
@@ -569,7 +661,7 @@ fn validate_graph_vectors(vectors: &[f32], dimensions: usize, graph_nodes: usize
     Ok(())
 }
 
-fn row(vectors: &[f32], dimensions: usize, node: u32) -> &[f32] {
+pub(crate) fn row(vectors: &[f32], dimensions: usize, node: u32) -> &[f32] {
     let start = node as usize * dimensions;
     &vectors[start..start + dimensions]
 }
@@ -667,7 +759,7 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
     Ok(adjacency)
 }
 
-fn sort_dedup_u32(values: &mut Vec<u32>) {
+pub(crate) fn sort_dedup_u32(values: &mut Vec<u32>) {
     values.sort_unstable();
     values.dedup();
 }
@@ -772,7 +864,7 @@ mod tests {
         let query = [0.81f32];
         let mut visited = VisitedSet::new(5);
         let result = g
-            .greedy_search(&vectors, 1, &query, 1, 5, &mut visited)
+            .greedy_search(&vectors, 1, &query, 1, 5, &mut visited, None)
             .unwrap();
 
         assert_eq!(result.results[0].0, 4);
@@ -789,7 +881,7 @@ mod tests {
         let query = [1.0f32];
         let mut visited = VisitedSet::new(2);
         let result = g
-            .greedy_search(&vectors, 1, &query, 2, 5, &mut visited)
+            .greedy_search(&vectors, 1, &query, 2, 5, &mut visited, None)
             .unwrap();
 
         assert!(result.results.len() >= 2);
@@ -802,7 +894,7 @@ mod tests {
         let vectors = vec![0.1f32, 0.2, 0.3, 0.4];
         let g = VamanaGraph::new(2, 0).unwrap();
         let mut visited = VisitedSet::new(2);
-        let err = g.greedy_search(&vectors, 2, &[0.1f32], 1, 5, &mut visited);
+        let err = g.greedy_search(&vectors, 2, &[0.1f32], 1, 5, &mut visited, None);
         assert!(matches!(err, Err(VamanaError::DimensionMismatch { .. })));
     }
 
@@ -1152,7 +1244,7 @@ mod tests {
         let g = VamanaGraph::new(3, 0).unwrap();
         let mut visited = VisitedSet::new(3);
         let query = [0.5f32, 0.5];
-        let err = g.greedy_search(&vectors, 2, &query, 1, 5, &mut visited);
+        let err = g.greedy_search(&vectors, 2, &query, 1, 5, &mut visited, None);
         assert!(
             matches!(err, Err(VamanaError::InvalidFormat { .. })),
             "expected InvalidFormat, got {err:?}"
