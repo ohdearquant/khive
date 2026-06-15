@@ -589,13 +589,16 @@ impl MemoryPack {
             fts_gather,
         } = opts;
 
-        // FTS recall fans out across all visible namespaces (global table with
-        // namespace column, supports IN filter).
+        // FTS recall fans out across all visible namespaces by iterating each
+        // namespace's own FTS virtual table (fts_notes_{ns}) — there is NO global
+        // FTS table and TextFilter.namespaces does NOT yield cross-namespace hits.
+        // Each namespace is selected by minting a token via token.with_namespace(ns)
+        // (see multi-namespace fanout path below at line 633+).
         //
         // Phase-1.5 limitation: vector/ANN recall stays primary-namespace-only.
         // Each namespace owns a separate ANN index instance; cross-namespace
         // recall on the vector path requires fanout+fusion across index instances,
-        // which ships in a follow-up PR. FTS-path recall is cross-namespace today.
+        // which is deferred to a follow-up PR.
         let visible = token.visible_namespace_strs();
         let primary_ns = token.namespace().as_str().to_string();
 

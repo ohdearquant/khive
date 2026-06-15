@@ -3880,33 +3880,34 @@ fn compute_config_id_is_stable_under_visible_namespace_reorder() {
 // but mutations on visible-only records must return NotFound.
 // =============================================================================
 
-/// An actor configured with `visible_namespaces = ["vis-b"]` must be able to
-/// READ entities from `vis-b`, but a mutation that targets a `vis-b` entity
-/// by UUID must return NotFound (ADR-007:215-219 timing-oracle mitigation).
+/// Proves the full config→dispatch wiring: an actor configured with
+/// `visible_namespaces = ["vis-b"]` (in RuntimeConfig) has that visible set
+/// flow through `KhiveMcpServer::with_packs` → `VerbRegistryBuilder::with_visible_namespaces`
+/// → `VerbRegistry::dispatch` → `NamespaceToken::mint_with_visibility`.
 ///
-/// Test setup:
-/// - Builds a RuntimeConfig as if loaded from:
-///     [actor]
-///     id = "vis-a"
-///     visible_namespaces = ["vis-b"]
-/// - Creates an entity in `vis-b`.
-/// - With the vis-a visible-set token: `get` the entity (must succeed).
-/// - With the vis-a visible-set token: try to `link` with the vis-b entity
-///   as a target; the runtime's `resolve_primary` must return NotFound for
-///   vis-b entities, so the link must fail.
+/// Two assertions dispatched through the REAL registry boundary:
+///   (a) `get(id=<vis-b-entity>)` returns ok:true  — cross-namespace read works.
+///   (b) `link(source_id=<vis-a>, target_id=<vis-b>, ...)` returns ok:false
+///       with a "not found" error — visible-only record cannot be a mutation target
+///       (ADR-007:215-219 timing-oracle mitigation).
+///
+/// The test does NOT call rt.authorize_with_visibility / rt.get_entity / rt.link
+/// directly — all reads and mutations go through dispatch_request_local so a
+/// future regression in the with_packs / token-minting path would fail here.
 #[tokio::test]
-async fn visible_namespaces_config_read_allowed_mutation_rejected() {
-    use khive_mcp::server::compute_config_id;
+async fn visible_namespaces_config_wires_through_dispatch_boundary() {
+    use khive_mcp::{server::compute_config_id, tools::request::RequestParams};
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
-    use khive_types::EdgeRelation;
+
+    disable_daemon();
+
+    let ns_a = Namespace::parse("vcfg-a").unwrap();
+    let ns_b = Namespace::parse("vcfg-b").unwrap();
 
     // Build a RuntimeConfig equivalent to:
     //   [actor]
-    //   id = "vis-a"
-    //   visible_namespaces = ["vis-b"]
-    let ns_a = Namespace::parse("vis-a").unwrap();
-    let ns_b = Namespace::parse("vis-b").unwrap();
-
+    //   id = "vcfg-a"
+    //   visible_namespaces = ["vcfg-b"]
     let cfg = RuntimeConfig {
         db_path: None,
         default_namespace: ns_a.clone(),
@@ -3917,68 +3918,93 @@ async fn visible_namespaces_config_read_allowed_mutation_rejected() {
         ..RuntimeConfig::default()
     };
 
-    // Verify the config_id encodes vis-b (Finding 1 integration check).
+    // Verify the config_id encodes vcfg-b (Finding 1 integration check).
     let cid = compute_config_id(&cfg);
     assert!(
-        cid.contains("vis-b"),
-        "config_id must encode visible namespace vis-b; got: {cid}"
+        cid.contains("vcfg-b"),
+        "config_id must encode visible namespace vcfg-b; got: {cid}"
     );
 
     let rt = KhiveRuntime::new(cfg).expect("in-memory runtime");
 
-    // Create an entity in vis-b using vis-b's own token.
-    let tok_b = rt
-        .authorize(ns_b.clone())
-        .expect("authorize vis-b must succeed");
+    // Seed data: create an entity in vcfg-b and one in vcfg-a.
+    // These must go through direct runtime calls (not dispatch) because the
+    // server's default namespace is vcfg-a — we need to write into vcfg-b
+    // without overriding the server's namespace.
+    let tok_b = rt.authorize(ns_b.clone()).expect("authorize vcfg-b");
     let entity_in_b = rt
-        .create_entity(&tok_b, "concept", None, "Vis-B-Entity", None, None, vec![])
+        .create_entity(&tok_b, "concept", None, "VcfgB-Entity", None, None, vec![])
         .await
-        .expect("create entity in vis-b");
-
-    // Create an entity in vis-a (owned by the actor).
-    let tok_a = rt
-        .authorize(ns_a.clone())
-        .expect("authorize vis-a must succeed");
+        .expect("create entity in vcfg-b");
+    let tok_a = rt.authorize(ns_a.clone()).expect("authorize vcfg-a");
     let entity_in_a = rt
-        .create_entity(&tok_a, "concept", None, "Vis-A-Entity", None, None, vec![])
+        .create_entity(&tok_a, "concept", None, "VcfgA-Entity", None, None, vec![])
         .await
-        .expect("create entity in vis-a");
+        .expect("create entity in vcfg-a");
 
-    // Mint a visible-set token: primary = vis-a, also sees vis-b.
-    let tok_vis = rt
-        .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
-        .expect("authorize_with_visibility must succeed");
+    // Build the server through with_packs so the visible set flows through the
+    // full wiring chain: RuntimeConfig → with_packs → builder.with_visible_namespaces
+    // → VerbRegistry.visible_namespaces → dispatch → mint_with_visibility.
+    let server = KhiveMcpServer::with_packs(rt, &["kg".to_string()])
+        .expect("server builds with visible_namespaces set");
 
-    // READ: get vis-b entity via the visible-set token (must succeed).
-    let got = rt
-        .get_entity(&tok_vis, entity_in_b.id)
+    // ── (a) READ: get the vcfg-b entity via registry dispatch ────────────────
+    //
+    // dispatch_request_local mints a token with primary=vcfg-a + visible=[vcfg-b].
+    // The `get` handler calls resolve() (visible-aware) — must find the entity.
+    let get_out = server
+        .dispatch_request_local(RequestParams {
+            ops: format!(r#"get(id="{}")"#, entity_in_b.id),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+        })
         .await
-        .expect("get_entity must succeed for visible-namespace entity");
+        .expect("dispatch get must not error at the MCP level");
+
+    let get_body: Value = serde_json::from_str(&get_out).expect("get response must be valid JSON");
+    let get_result = &get_body["results"][0];
     assert_eq!(
-        got.id, entity_in_b.id,
-        "get_entity via visible-set token must return the vis-b entity"
+        get_result["ok"],
+        json!(true),
+        "get(id=<vcfg-b entity>) via config-derived dispatch token must return ok:true; \
+         visible_namespaces in RuntimeConfig must flow through with_packs to the dispatch token; \
+         got: {get_result}"
+    );
+    assert_eq!(
+        get_result["result"]["id"].as_str().unwrap_or(""),
+        entity_in_b.id.as_hyphenated().to_string(),
+        "returned entity id must match the vcfg-b entity"
     );
 
-    // MUTATION: link with vis-b entity as the *target* — resolve_primary must
-    // return None for vis-b entities (they are not in the primary namespace),
-    // and the link must fail.
+    // ── (b) MUTATION: link targeting vcfg-b entity must return NotFound ───────
     //
-    // Note: link validates both endpoints via resolve_primary (for entity-relation
-    // endpoint validation). A vis-b entity as target is NotFound in the primary.
-    let link_result = rt
-        .link(
-            &tok_vis,
-            entity_in_a.id, // source is primary — OK
-            entity_in_b.id, // target is visible-only — must be rejected
-            EdgeRelation::Extends,
-            1.0,
-            None,
-        )
-        .await;
+    // dispatch_request_local mints a token with primary=vcfg-a + visible=[vcfg-b].
+    // link calls resolve_primary() on both endpoints; vcfg-b entity is NotFound
+    // in the primary namespace → link must fail (ADR-007:215-219).
+    let link_out = server
+        .dispatch_request_local(RequestParams {
+            ops: format!(
+                r#"link(source_id="{}", target_id="{}", relation="extends")"#,
+                entity_in_a.id, entity_in_b.id,
+            ),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+        })
+        .await
+        .expect("dispatch link must not error at the MCP level");
 
+    let link_body: Value =
+        serde_json::from_str(&link_out).expect("link response must be valid JSON");
+    let link_result = &link_body["results"][0];
+    assert_eq!(
+        link_result["ok"],
+        json!(false),
+        "link(target_id=<vcfg-b entity>) via config-derived dispatch token must return ok:false; \
+         visible-only record must not be a mutation endpoint; got: {link_result}"
+    );
+    let err_msg = link_result["error"].to_string().to_lowercase();
     assert!(
-        link_result.is_err(),
-        "link with visible-only (vis-b) entity as target must fail; \
-         a visible-only record must not be a mutation endpoint"
+        err_msg.contains("not found") || err_msg.contains("notfound"),
+        "link error must be NotFound (not Forbidden, per ADR-007:215-219); got: {link_result}"
     );
 }
