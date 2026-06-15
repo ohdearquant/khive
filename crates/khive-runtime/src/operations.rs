@@ -40,24 +40,27 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 // isolated from one another.
 //
 // `FTS_FAIL_FLAG` / `VECTOR_FAIL_FLAG`: global atomics, armed via `arm_fts_fail` /
-// `arm_vector_fail`.  Atomics (not cfg(test) thread-locals) so that external
-// integration test crates can arm them via the exported functions — the
-// thread-local approach only works within the same crate's test binary.
-// Overhead is negligible: a single `load(Relaxed)` on the hot path, only in
-// configurations that call `create_note`.
+// `arm_vector_fail`.  Gated behind `cfg(any(test, feature = "fault-injection"))`
+// so they compile out of release builds entirely — no atomic ops on the hot path
+// in production, and no fault-injection surface in published binaries.
+// External integration test crates enable the feature via a dev-dependency:
+//   khive-runtime = { workspace = true, features = ["fault-injection"] }
 #[cfg(test)]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arm the FTS failure injection for `create_note_inner`.
 ///
 /// After this is called, the next `create_note` call returns an injected error
 /// at the FTS upsert step (after the note row is committed), then disarms.
-/// Callable from external integration test crates.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail() {
     FTS_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -66,7 +69,8 @@ pub fn arm_fts_fail() {
 ///
 /// After this is called, the next `create_note` call returns an injected error
 /// at the first vector insert step, then disarms.
-/// Callable from external integration test crates.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail() {
     VECTOR_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1403,7 +1407,13 @@ impl KhiveRuntime {
         // FTS step — compensate note row on failure.
         {
             // Injection: check the FTS_FAIL_FLAG (armed by `arm_fts_fail()`).
+            // The swap only exists when fault-injection is compiled in; the
+            // cfg(not) branch is a const false so the compiler eliminates the
+            // if-branch and there is no atomic op in release builds.
+            #[cfg(any(test, feature = "fault-injection"))]
             let fts_inject = FTS_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
                 Err(RuntimeError::Internal("injected FTS failure".to_string()))
             } else {
@@ -1436,7 +1446,12 @@ impl KhiveRuntime {
 
             // Injection: check VECTOR_FAIL_FLAG (armed by `arm_vector_fail()`).
             // Swap-false atomically so the flag resets after one trigger.
+            // The swap only exists when fault-injection is compiled in; the
+            // cfg(not) branch is a const false eliminating the if-branch in release.
+            #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = VECTOR_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
                 Err(RuntimeError::Internal(
                     "injected vector failure".to_string(),

@@ -48,9 +48,9 @@ pub use objectives::{
     MemoryRecallPipeline, NoteCandidate, RerankerObjective, RetrievalCandidate, RrfFusionObjective,
     TemporalRecencyObjective, TextRelevanceObjective, VectorSimilarityObjective,
 };
-pub use operations::{
-    arm_fts_fail, arm_vector_fail, LinkSpec, NoteSearchHit, QueryResult, Resolved,
-};
+#[cfg(any(test, feature = "fault-injection"))]
+pub use operations::{arm_fts_fail, arm_vector_fail};
+pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackFactory,
     PackLoadError, PackRegistration, PackRegistry, PackRuntime, PackSchemaPlan, ParamDef,

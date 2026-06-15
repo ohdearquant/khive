@@ -3012,6 +3012,11 @@ async fn t12_allowlist_is_one_directional() {
 //
 // Uses `arm_fts_fail()` (khive_runtime::arm_fts_fail, cfg(test) only) to
 // inject the failure deterministically after the note row is committed.
+//
+// #[serial] is required because arm_fts_fail() sets a global AtomicBool that
+// concurrent tests can consume, causing races with other tests that call
+// create_note.
+#[serial_test::serial]
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     use khive_runtime::arm_fts_fail;
