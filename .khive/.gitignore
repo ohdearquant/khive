@@ -5,7 +5,6 @@
 !.gitignore
 !kg/
 !kg/**
-!config.toml
 
 # Remote cache and derived working state are never committed.
 kg/.remote-cache/
