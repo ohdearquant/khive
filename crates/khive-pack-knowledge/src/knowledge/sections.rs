@@ -9,11 +9,12 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
 };
+use super::sections_index::embed_sections;
 use super::util::resolve_atom_id;
 use super::util::{
-    content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content, EMBED_BATCH,
-    MAX_EMBED_BYTES,
+    content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content,
 };
+use super::vamana;
 use super::KnowledgeHandlers;
 
 // ─── section helpers ──────────────────────────────────────────────────────────
@@ -168,6 +169,7 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: EditParams = deser(params)?;
         if p.sections.is_empty() {
@@ -322,143 +324,26 @@ impl KnowledgeHandlers {
             }));
         }
 
-        // Inline re-embed for this atom's newly-written sections (those with
-        // embedding = NULL). Byte-identical sections retain their existing vector
-        // and are excluded by the NULL filter. The ANN snapshot rebuild is
-        // deferred: writing section vectors immediately makes hybrid section-cosine
-        // recall fresh, while per-edit ANN rebuilds would be prohibitively costly.
-        // ANN-approximate recall over the new vector lags until the next
-        // `kkernel reindex` or scheduled rebuild.
-        //
-        // Missing embedder: if no default embedder is configured the edit still
-        // succeeds — the same early-return as embed_sections (sections_index.rs).
-        if !runtime.default_embedder_name().is_empty() {
-            // Fetch the atom name once for breadcrumb enrichment.
-            let atom_name = {
-                let mut reader = sql
-                    .reader()
-                    .await
-                    .map_err(|e| sql_err("edit embed atom name reader", e))?;
-                reader
-                    .query_row(SqlStatement {
-                        sql: "SELECT name FROM knowledge_atoms WHERE id = ?1 LIMIT 1".into(),
-                        params: vec![SqlValue::Text(atom_id.clone())],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("edit embed atom name query", e))?
-                    .and_then(|r| row_str(&r, "name"))
-                    .unwrap_or_default()
-            };
+        // Inline re-embed: newly-inserted section rows (embedding IS NULL) are embedded
+        // via the shared embed_sections path so the hybrid section-cosine read path
+        // (ADR-051) is fresh without a manual reindex. Byte-identical sections go
+        // through the metadata-only UPDATE branch above and keep their existing vector.
+        // The Vamana ANN snapshot rebuild is deferred (per-edit cost too high);
+        // approximate ANN recall over new vectors lags until the next kkernel reindex.
+        // Missing embedder: embed_sections returns (0,0,0) immediately, so edit succeeds.
+        embed_sections(runtime, token, false, 32, None, Some(&atom_id)).await?;
 
-            // Select only sections for this atom whose embedding is still NULL
-            // (the newly-inserted rows from this edit call).
-            let null_sections = {
-                let mut reader = sql
-                    .reader()
-                    .await
-                    .map_err(|e| sql_err("edit embed null sections reader", e))?;
-                reader
-                    .query_all(SqlStatement {
-                        sql: "SELECT id, heading, content FROM knowledge_sections \
-                              WHERE atom_id = ?1 AND embedding IS NULL \
-                              ORDER BY id"
-                            .into(),
-                        params: vec![SqlValue::Text(atom_id.clone())],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("edit embed null sections query", e))?
-            };
-
-            if !null_sections.is_empty() {
-                // Build (id, breadcrumb-enriched text) pairs, matching the format
-                // used by embed_sections (sections_index.rs).
-                let staged: Vec<(String, String)> = null_sections
-                    .iter()
-                    .filter_map(|r| {
-                        let id = row_str(r, "id")?;
-                        let heading = row_str(r, "heading").unwrap_or_default();
-                        let content = row_str(r, "content").unwrap_or_default();
-                        let text = format!("{atom_name}\n{heading}\n\n{content}");
-                        if text.trim().is_empty() {
-                            return None;
-                        }
-                        // Truncate to model budget, preserving char boundaries.
-                        let truncated = if text.len() <= MAX_EMBED_BYTES {
-                            text
-                        } else {
-                            let mut end = MAX_EMBED_BYTES;
-                            while !text.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            text[..end].to_string()
-                        };
-                        Some((id, truncated))
-                    })
-                    .collect();
-
-                for chunk in staged.chunks(EMBED_BATCH) {
-                    let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
-                    let embeddings = match runtime.embed_document_batch(&texts).await {
-                        Ok(e) if e.len() == chunk.len() => e,
-                        Ok(_) => {
-                            tracing::warn!(
-                                atom_id = %atom_id,
-                                batch = chunk.len(),
-                                "edit section embed_batch returned wrong vector count; skipping"
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                atom_id = %atom_id,
-                                error = %e,
-                                batch = chunk.len(),
-                                "edit section embed_batch failed; skipping"
-                            );
-                            continue;
-                        }
-                    };
-                    let mut writer = sql
-                        .writer()
-                        .await
-                        .map_err(|e| sql_err("edit section embed writer", e))?;
-                    let now = now_us();
-                    for ((id, _), mut emb) in chunk.iter().zip(embeddings.into_iter()) {
-                        // Unit-normalise so dot product equals cosine similarity,
-                        // matching the invariant enforced by embed_sections.
-                        let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-                        if norm > 1e-12 {
-                            for x in emb.iter_mut() {
-                                *x /= norm;
-                            }
-                        }
-                        let blob: Vec<u8> = emb.iter().flat_map(|x| x.to_le_bytes()).collect();
-                        if let Err(e) = writer
-                            .execute(SqlStatement {
-                                sql: "UPDATE knowledge_sections \
-                                      SET embedding = ?1, updated_at = ?2 \
-                                      WHERE id = ?3"
-                                    .into(),
-                                params: vec![
-                                    SqlValue::Blob(blob),
-                                    SqlValue::Integer(now),
-                                    SqlValue::Text(id.clone()),
-                                ],
-                                label: None,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                id = %id,
-                                error = %e,
-                                "edit section embedding UPDATE failed; skipping"
-                            );
-                        }
-                    }
-                }
-            }
+        // Refresh this atom's vector-store entry (knowledge.atom field) so atom-granularity
+        // semantic recall is also fresh. rebuild_ann=false writes the vector immediately
+        // while deferring the Vamana ANN snapshot build — the same ANN-deferral tradeoff
+        // taken for sections above. Missing embedder: index returns early with reason.
+        {
+            let atom_params = serde_json::json!({
+                "ids": [atom_id],
+                "rebuild_ann": false,
+                "insert_only": false,
+            });
+            KnowledgeHandlers::index(runtime, token, atom_params, ann, None).await?;
         }
 
         Ok(json!({
@@ -472,6 +357,7 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: ImportParams = deser(params)?;
         let path_str = p.path.trim().to_string();
@@ -609,7 +495,7 @@ impl KnowledgeHandlers {
                         "id": slug,
                         "sections": section_updates,
                     });
-                    let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
+                    let result = KnowledgeHandlers::edit(runtime, token, edit_params, ann).await?;
                     if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
                         imported_sections += n as usize;
                     }

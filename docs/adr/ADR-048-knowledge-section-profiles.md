@@ -173,8 +173,10 @@ early-return degradation as `embed_sections` in `kkernel reindex`. `knowledge.up
 remains batch-only and does not perform inline re-embed.
 
 `knowledge.index` indexes atoms only. Full section write-side embedding backfill is shipped
-via `kkernel reindex` (ADR-051 phase 1); section-aware compose and read-side scoring remain
-deferred.
+via `kkernel reindex` (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search`
+and `knowledge.compose` is shipped (see `search.rs` section candidate path and
+`compose.rs` section rerank path); profile-weighted section compose and the Vamana ANN
+snapshot rebuild remain deferred.
 
 **Sections link to atoms structurally (FK), not via graph edges.** The section→atom
 relationship is always 1:N containment — there's no semantic edge type needed. All

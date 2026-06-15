@@ -41,15 +41,18 @@ fn truncate_bytes(t: &str) -> String {
 /// Embed sections in `token`'s namespace into `knowledge_sections.embedding`.
 ///
 /// With `drop_existing`, every section is re-embedded; otherwise only sections
-/// whose `embedding` is currently NULL are filled. Returns `(indexed, skipped,
-/// failed)`. Genuine skips (blank section text) go to `skipped`; embed errors
-/// and vector-count mismatches go to `failed` (fail-closed contract).
+/// whose `embedding` is currently NULL are filled. When `atom_id` is `Some`, only
+/// sections belonging to that atom are processed (used by `knowledge.edit` for
+/// inline re-embed after a write). Returns `(indexed, skipped, failed)`. Genuine
+/// skips (blank section text) go to `skipped`; embed errors and vector-count
+/// mismatches go to `failed` (fail-closed contract).
 pub(crate) async fn embed_sections(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     drop_existing: bool,
     batch_size: usize,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    atom_id: Option<&str>,
 ) -> Result<(usize, usize, usize), RuntimeError> {
     if runtime.default_embedder_name().is_empty() {
         return Ok((0, 0, 0));
@@ -58,12 +61,23 @@ pub(crate) async fn embed_sections(
     let sql = runtime.sql();
     let page = batch_size.clamp(1, 1000) as i64;
 
+    // Build the atom-scope fragment and its bind parameter once.
+    let atom_filter = if atom_id.is_some() {
+        " AND atom_id = ?2"
+    } else {
+        ""
+    };
+
     let total: u64 = {
-        let filter = if drop_existing {
+        let null_filter = if drop_existing {
             ""
         } else {
             " AND embedding IS NULL"
         };
+        let mut params = vec![SqlValue::Text(ns.clone())];
+        if let Some(id) = atom_id {
+            params.push(SqlValue::Text(id.to_owned()));
+        }
         let mut reader = sql
             .reader()
             .await
@@ -72,9 +86,9 @@ pub(crate) async fn embed_sections(
             .query_row(SqlStatement {
                 sql: format!(
                     "SELECT count(*) AS cnt FROM knowledge_sections \
-                     WHERE namespace = ?1{filter}"
+                     WHERE namespace = ?1{atom_filter}{null_filter}"
                 ),
-                params: vec![SqlValue::Text(ns.clone())],
+                params,
                 label: None,
             })
             .await
@@ -105,19 +119,46 @@ pub(crate) async fn embed_sections(
         // advance the offset past THEM each pass (see the offset update below) —
         // otherwise a full page of persistent failures would re-select forever.
         // A full re-embed has a stable result set, so we paginate by row count.
-        let (filter, query_offset) = if drop_existing {
-            ("", offset)
+        let null_filter = if drop_existing {
+            ""
         } else {
-            (" AND s.embedding IS NULL", offset)
+            " AND s.embedding IS NULL"
         };
-        let query = format!(
-            "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
-                    a.name AS atom_name \
-             FROM knowledge_sections s \
-             JOIN knowledge_atoms a ON a.id = s.atom_id \
-             WHERE s.namespace = ?1{filter} \
-             ORDER BY s.id LIMIT ?2 OFFSET ?3"
-        );
+        // atom_filter uses ?2 when present; pagination params follow at ?2/?3 or ?3/?4.
+        let (query, page_params) = if let Some(id) = atom_id {
+            (
+                format!(
+                    "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
+                            a.name AS atom_name \
+                     FROM knowledge_sections s \
+                     JOIN knowledge_atoms a ON a.id = s.atom_id \
+                     WHERE s.namespace = ?1 AND s.atom_id = ?2{null_filter} \
+                     ORDER BY s.id LIMIT ?3 OFFSET ?4"
+                ),
+                vec![
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Text(id.to_owned()),
+                    SqlValue::Integer(page),
+                    SqlValue::Integer(offset),
+                ],
+            )
+        } else {
+            (
+                format!(
+                    "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
+                            a.name AS atom_name \
+                     FROM knowledge_sections s \
+                     JOIN knowledge_atoms a ON a.id = s.atom_id \
+                     WHERE s.namespace = ?1{null_filter} \
+                     ORDER BY s.id LIMIT ?2 OFFSET ?3"
+                ),
+                vec![
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Integer(page),
+                    SqlValue::Integer(offset),
+                ],
+            )
+        };
         let mut reader = sql
             .reader()
             .await
@@ -125,11 +166,7 @@ pub(crate) async fn embed_sections(
         let rows = reader
             .query_all(SqlStatement {
                 sql: query,
-                params: vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Integer(page),
-                    SqlValue::Integer(query_offset),
-                ],
+                params: page_params,
                 label: None,
             })
             .await

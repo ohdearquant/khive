@@ -3196,6 +3196,70 @@ mod edit_inline_reembed {
         }
     }
 
+    /// knowledge.edit must refresh the atom-level vector-store entry (knowledge.atom field)
+    /// so atom-granularity semantic recall is fresh without a manual kkernel reindex.
+    #[tokio::test]
+    async fn edit_refreshes_atom_vector_store_entry() {
+        let rt = rt_with_embedder();
+        let f = pack(rt.clone());
+
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "atom-vec-test",
+                    "name": "Atom Vector Test",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        // Fetch the atom UUID.
+        let atom_row = f
+            .sql_query_one(
+                "SELECT id FROM knowledge_atoms WHERE slug = ?1 LIMIT 1",
+                vec![SqlValue::Text("atom-vec-test".into())],
+            )
+            .await
+            .expect("atom must exist");
+        let atom_uuid = match atom_row.get("id") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => panic!("atom id must be text"),
+        };
+
+        // Edit the atom: trigger inline re-embed for both sections and atom vector.
+        f.dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "atom-vec-test",
+                "sections": [{
+                    "section_type": "overview",
+                    "content": "Overview for atom vector refresh test. Must be well above the eighty-character minimum length for knowledge sections. dense sparse retrieval transformer attention."
+                }]
+            }),
+        )
+        .await
+        .expect("edit");
+
+        // The atom-level vector-store row must exist after edit.
+        // Table: vec_all_minilm_l6_v2 (sanitize_model_key("all-minilm-l6-v2")).
+        let vec_row = f
+            .sql_query_one(
+                "SELECT subject_id FROM vec_all_minilm_l6_v2 \
+                 WHERE subject_id = ?1 AND field = 'knowledge.atom' LIMIT 1",
+                vec![SqlValue::Text(atom_uuid.clone())],
+            )
+            .await;
+
+        assert!(
+            vec_row.is_some(),
+            "atom vector-store row must exist in vec_all_minilm_l6_v2 after knowledge.edit \
+             (atom_id = {atom_uuid})"
+        );
+    }
+
     /// When no default embedder is configured, knowledge.edit must still succeed
     /// (degrade gracefully — same contract as reindex_knowledge with no embedder).
     #[tokio::test]

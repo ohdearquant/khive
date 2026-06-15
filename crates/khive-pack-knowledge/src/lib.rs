@@ -80,6 +80,7 @@ pub async fn reindex_knowledge(
             opts.drop_existing,
             batch,
             on_section_progress,
+            None,
         )
         .await?;
         sections_indexed = indexed as u64;

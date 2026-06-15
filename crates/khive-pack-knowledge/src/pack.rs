@@ -131,8 +131,12 @@ impl PackRuntime for KnowledgePack {
             "knowledge.compose" => {
                 KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann).await
             }
-            "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
-            "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,
+            "knowledge.edit" => {
+                KnowledgeHandlers::edit(&self.runtime, token, params, &self.ann).await
+            }
+            "knowledge.import" => {
+                KnowledgeHandlers::import(&self.runtime, token, params, &self.ann).await
+            }
             "knowledge.challenge" => {
                 KnowledgeHandlers::challenge(&self.runtime, token, params).await
             }
