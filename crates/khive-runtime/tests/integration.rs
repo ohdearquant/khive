@@ -571,6 +571,7 @@ async fn file_backed_runtime_persists() {
             additional_embedding_models: vec![],
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -591,6 +592,7 @@ async fn file_backed_runtime_persists() {
             additional_embedding_models: vec![],
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -1079,6 +1081,7 @@ mod embedder_registry_tests {
             backend_id: khive_runtime::BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         })
         .expect("in-memory runtime")
     }
@@ -1138,6 +1141,7 @@ mod embedder_registry_tests {
             backend_id: khive_runtime::BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         })
         .expect("runtime with two models");
 

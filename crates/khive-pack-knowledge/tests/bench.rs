@@ -35,6 +35,7 @@ fn rt_with_embedder() -> KhiveRuntime {
         backend_id: BackendId::main(),
         brain_profile: None,
         visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
     })
     .expect("runtime with embedder")
 }

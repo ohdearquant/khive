@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
+[features]
+fault-injection = []
+
 [dependencies]
 khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
 khive-storage = { version = "0.2.11", path = "../khive-storage" }

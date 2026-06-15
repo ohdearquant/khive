@@ -38,9 +38,46 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 // link failure")` instead of calling the real implementation.  The counter is
 // reset to 0 after each call regardless of whether it triggered, so tests are
 // isolated from one another.
+//
+// `FTS_FAIL_NS` / `VECTOR_FAIL_NS`: namespace-targeted injection mutexes, armed via
+// `arm_fts_fail(ns)` / `arm_vector_fail(ns)`.  Gated behind
+// `cfg(any(test, feature = "fault-injection"))` so they compile out of release builds
+// entirely — no lock acquisitions on the hot path in production, and no fault-injection
+// surface in published binaries.  Namespace-targeting means only `create_note` calls
+// for the armed namespace fire the injection; concurrent tests on other namespaces are
+// unaffected, eliminating cross-test races without requiring `#[serial]`.
+// External integration test crates enable the feature via a dev-dependency:
+//   khive-runtime = { ..., features = ["fault-injection"] }
 #[cfg(test)]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(any(test, feature = "fault-injection"))]
+static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
+///
+/// The next `create_note` call whose note namespace equals `ns` returns an injected
+/// error at the FTS upsert step (after the note row is committed), then disarms.
+/// Calls on other namespaces are unaffected.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_fail(ns: &str) {
+    *FTS_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
+///
+/// The next `create_note` call whose note namespace equals `ns` returns an injected
+/// error at the first vector insert step, then disarms.  Calls on other namespaces
+/// are unaffected.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_vector_fail(ns: &str) {
+    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// A note search result with UUID, salience-weighted RRF score, and display text.
@@ -1343,14 +1380,18 @@ impl KhiveRuntime {
         }
         self.notes(token)?.upsert_note(note.clone()).await?;
 
-        self.text_for_notes(token)?
-            .upsert_document(note_fts_document(&note))
-            .await?;
+        // From here on, any error must compensate by removing the note row, its
+        // FTS document, and any vector entries already inserted — the same
+        // cleanup used by the annotates-edge block below.  A local closure
+        // captures those operations so both this block and the edge block share
+        // the same cleanup path without duplication.
+        //
+        // Note: the closure borrows `self`, `token`, `ns`, `note`, and
+        // `embed_model_names` (populated after the FTS step); because the
+        // vector-model list is only known after embedding is decided, we collect
+        // it once before the FTS step and thread it through.
 
-        // Multi-model vector embedding:
-        //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
-        //   - None + no models configured → skip (text-only)
+        // Decide which embedding models to use (before touching FTS/vectors).
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -1368,21 +1409,108 @@ impl KhiveRuntime {
             }
         };
 
+        // FTS step — compensate note row on failure.
+        {
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Fires only when the armed namespace matches this note's namespace,
+            // then clears (one-shot).  No lock acquisition in release builds —
+            // the cfg(not) branch is a const false so the compiler eliminates
+            // the if-branch entirely.
+            #[cfg(any(test, feature = "fault-injection"))]
+            let fts_inject = {
+                let mut g = FTS_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let fts_inject = false;
+            let fts_result: RuntimeResult<()> = if fts_inject {
+                Err(RuntimeError::Internal("injected FTS failure".to_string()))
+            } else {
+                match self.text_for_notes(token) {
+                    Ok(fts) => fts
+                        .upsert_document(note_fts_document(&note))
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                }
+            };
+
+            if let Err(e) = fts_result {
+                // Best-effort compensation — ignore cleanup errors.
+                if let Ok(store) = self.notes(token) {
+                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                }
+                return Err(e);
+            }
+        }
+
+        // Vector embedding + insert step — compensate note row + FTS doc on failure.
+        // Multi-model vector embedding:
+        //   - explicit embedding_model → single model (existing behaviour)
+        //   - None + any models registered → ALL registered models in parallel
+        //   - None + no models configured → skip (text-only)
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vector = self
+            let vec_result = self
                 .embed_document_with_model(model_name, &note.content)
-                .await?;
-            self.vectors_for_model(token, model_name)?
-                .insert(
-                    note.id,
-                    SubstrateKind::Note,
-                    ns,
-                    "note.content",
-                    vec![vector],
-                )
-                .await?;
+                .await;
+
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`).
+            // Fires only when the armed namespace matches this note's namespace,
+            // then clears (one-shot).  No lock acquisition in release builds —
+            // the cfg(not) branch is a const false eliminating the if-branch.
+            #[cfg(any(test, feature = "fault-injection"))]
+            let vec_inject = {
+                let mut g = VECTOR_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let vec_inject = false;
+            let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
+                Err(RuntimeError::Internal(
+                    "injected vector failure".to_string(),
+                ))
+            } else {
+                vec_result
+            };
+
+            let single_model_result: RuntimeResult<()> = match vec_result {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => vs
+                        .insert(
+                            note.id,
+                            SubstrateKind::Note,
+                            ns,
+                            "note.content",
+                            vec![vector],
+                        )
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(e) = single_model_result {
+                // Compensate note row + FTS.
+                if let Ok(store) = self.notes(token) {
+                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                }
+                if let Ok(fts) = self.text_for_notes(token) {
+                    let _ = fts.delete_document(ns, note.id).await;
+                }
+                return Err(e);
+            }
         } else if !embed_model_names.is_empty() {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
@@ -1399,22 +1527,65 @@ impl KhiveRuntime {
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
             for handle in handles {
-                let vec = handle
+                let join_result = handle
                     .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")))??;
-                vectors.push(vec);
+                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                match join_result {
+                    Err(e) => {
+                        // Compensate note row + FTS (no vectors inserted yet).
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(e);
+                    }
+                    Ok(Err(e)) => {
+                        // Embed call failed — compensate note row + FTS.
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(e);
+                    }
+                    Ok(Ok(vec)) => vectors.push(vec),
+                }
             }
             // TODO(P2): parallelize vector inserts (codex review #444)
+            let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
-                self.vectors_for_model(token, model_name)?
-                    .insert(
-                        note.id,
-                        SubstrateKind::Note,
-                        ns,
-                        "note.content",
-                        vec![vector],
-                    )
-                    .await?;
+                let insert_result = match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => vs
+                        .insert(
+                            note.id,
+                            SubstrateKind::Note,
+                            ns,
+                            "note.content",
+                            vec![vector],
+                        )
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = insert_result {
+                    // Compensate note row + FTS + already-inserted vectors.
+                    if let Ok(store) = self.notes(token) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                    }
+                    if let Ok(fts) = self.text_for_notes(token) {
+                        let _ = fts.delete_document(ns, note.id).await;
+                    }
+                    for m in &inserted_models {
+                        if let Ok(vs) = self.vectors_for_model(token, m) {
+                            let _ = vs.delete(note.id).await;
+                        }
+                    }
+                    return Err(e);
+                }
+                inserted_models.push(model_name.clone());
             }
         }
 
@@ -5452,6 +5623,95 @@ mod tests {
         assert!(
             edges_from_t2.is_empty(),
             "no second annotates edge must exist; got {edges_from_t2:?}"
+        );
+    }
+
+    // Inject an FTS failure after the note row is committed and assert the note
+    // row is removed (no stranded row).  arm_fts_fail() arms the flag before
+    // the call and it resets automatically after one trigger.
+    #[tokio::test]
+    async fn create_note_fts_failure_rolls_back_note_row() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        arm_fts_fail("local");
+
+        let result = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "fts-fail rollback target",
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note must propagate the injected FTS failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected FTS failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove the note row after FTS failure; got {notes:?}"
+        );
+    }
+
+    // Inject a vector insertion failure after note row + FTS commit and assert
+    // both the note row and the FTS document are removed (no stranded rows).
+    // arm_vector_fail("local") targets the "local" namespace; since the single
+    // registered provider fires embed_document before the injection check, the
+    // injection converts the successful embedding into an error just before the
+    // VectorStore insert, then disarms.
+    #[tokio::test]
+    async fn create_note_vector_failure_rolls_back_note_row_and_fts() {
+        const MODEL: &str = "test-vec-inject";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL, DIMS);
+        rt.register_embedder(provider);
+
+        let tok = NamespaceToken::local();
+
+        arm_vector_fail("local");
+
+        let result = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "vec-fail rollback target",
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note must propagate the injected vector failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected vector failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove note row after vector failure; got {notes:?}"
         );
     }
 

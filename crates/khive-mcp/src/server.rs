@@ -59,14 +59,22 @@ pub fn compute_config_id(config: &RuntimeConfig) -> String {
         .collect();
     visible.sort();
     visible.dedup();
+    let mut outbound: Vec<String> = config
+        .allowed_outbound_namespaces
+        .iter()
+        .map(|ns| ns.as_str().to_owned())
+        .collect();
+    outbound.sort();
+    outbound.dedup();
     format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}]",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}];outbound=[{}]",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
         visible.join(","),
+        outbound.join(","),
     )
 }
 

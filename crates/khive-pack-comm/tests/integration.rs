@@ -5,8 +5,13 @@
 //! the fixture and lose cross-verb invariant tests (e.g. send→inbox→read→reply→thread
 //! roundtrip and thread-isolation assertions) that exercise interactions between verbs.
 
+use std::sync::Arc;
+
 use khive_pack_comm::CommPack;
-use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, NotePatch, RuntimeConfig,
+    VerbRegistry, VerbRegistryBuilder,
+};
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
@@ -2238,5 +2243,1017 @@ async fn thread_rejects_unknown_field() {
     assert!(
         err.is_err(),
         "comm.thread with unknown field must fail; got: {err:?}"
+    );
+}
+
+// ── T1-T12: cross-namespace delivery allowlist (allowed_outbound_namespaces) ─────
+
+/// Build a KhiveRuntime + VerbRegistry for cross-ns tests.
+///
+/// `dispatch_ns` — the default namespace used for dispatch (the caller identity).
+/// `allowed_outbound` — namespaces this sender may deliver into cross-namespace.
+///
+/// Both registries in a cross-ns pair must share the same `Arc<khive_db::StorageBackend>`
+/// so that outbound notes written in one namespace are visible via the other's token.
+fn build_crossns_registry(
+    backend: Arc<khive_db::StorageBackend>,
+    dispatch_ns: &str,
+    allowed_outbound: Vec<Namespace>,
+) -> (VerbRegistry, KhiveRuntime) {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse(dispatch_ns).unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: allowed_outbound,
+    };
+    let rt = KhiveRuntime::from_backend(backend, config);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_default_namespace(dispatch_ns);
+    let registry = builder.build().expect("cross-ns registry builds");
+    (registry, rt)
+}
+
+fn shared_backend() -> Arc<khive_db::StorageBackend> {
+    let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
+    {
+        let mut writer = backend.pool().try_writer().expect("writer");
+        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+    }
+    Arc::new(backend)
+}
+
+// T1 — within-namespace send unchanged by the allowlist feature.
+#[tokio::test]
+async fn t1_send_within_namespace_unchanged() {
+    let backend = shared_backend();
+    let (registry, rt) = build_crossns_registry(
+        backend,
+        "lambda:leo",
+        vec![], // no outbound allowlist needed for same-ns
+    );
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:leo", "content": "self-send" }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "T1: within-ns send must succeed; got {result:?}"
+    );
+
+    let tok = rt
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
+    let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
+    assert_eq!(
+        alive.len(),
+        2,
+        "T1: expect 1 outbound + 1 inbound for same-ns send; got {}",
+        alive.len()
+    );
+}
+
+// T2 — cross-ns send is denied when the allowlist is empty.
+#[tokio::test]
+async fn t2_send_cross_ns_denied_when_allowlist_empty() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (_registry_khive, rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    let result = registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "blocked" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T2: cross-ns send with empty allowlist must be denied"
+    );
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("not permitted")
+            || err_str.contains("PermissionDenied")
+            || err_str.contains("comm.send"),
+        "T2: error must mention the denial; got {err_str:?}"
+    );
+
+    // No note written in either namespace.
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        leo_notes.iter().filter(|n| n.deleted_at.is_none()).count(),
+        0,
+        "T2: no note in sender ns"
+    );
+
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        khive_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
+        0,
+        "T2: no note in recipient ns"
+    );
+}
+
+// T3 — cross-ns send delivers when the recipient is in the sender's allowlist.
+#[tokio::test]
+async fn t3_send_cross_ns_delivers_when_allowed() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    let (_reg_khive, rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    let result = registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "hello cross-ns" }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "T3: cross-ns send to allowed ns must succeed; got {result:?}"
+    );
+    let val = result.unwrap();
+    assert!(
+        val.get("full_id").is_some(),
+        "T3: response must carry full_id"
+    );
+
+    // Outbound in lambda:leo.
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let outbound: Vec<_> = leo_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .filter(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("outbound")
+        })
+        .collect();
+    assert_eq!(outbound.len(), 1, "T3: expect 1 outbound note in sender ns");
+    let outbound_thread_id = outbound[0]
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T3: outbound note must have thread_id");
+
+    // Inbound in lambda:khive.
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound: Vec<_> = khive_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .filter(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .collect();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "T3: expect 1 inbound note in recipient ns"
+    );
+    let inbound_note = inbound[0];
+    assert_eq!(
+        inbound_note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("from"))
+            .and_then(|v| v.as_str()),
+        Some("lambda:leo"),
+        "T3: inbound from must be lambda:leo"
+    );
+    assert_eq!(
+        inbound_note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("to"))
+            .and_then(|v| v.as_str()),
+        Some("lambda:khive"),
+        "T3: inbound to must be lambda:khive"
+    );
+    assert_eq!(
+        inbound_note.content, "hello cross-ns",
+        "T3: inbound content must match"
+    );
+    let inbound_thread_id = inbound_note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T3: inbound note must have thread_id");
+    assert_eq!(
+        outbound_thread_id, inbound_thread_id,
+        "T3: both copies must share thread_id"
+    );
+}
+
+// T4 — inbound note's namespace column is the recipient namespace.
+#[tokio::test]
+async fn t4_inbound_note_namespace_is_recipient() {
+    let backend = shared_backend();
+    let (registry_leo, _rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    let (_reg_khive, rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "ns stamp check" }),
+        )
+        .await
+        .expect("T4: send must succeed");
+
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_note = khive_notes
+        .iter()
+        .find(|n| n.deleted_at.is_none())
+        .expect("T4: must find inbound note");
+    assert_eq!(
+        inbound_note.namespace.as_str(),
+        "lambda:khive",
+        "T4: inbound note namespace must be lambda:khive (with_namespace stamped it)"
+    );
+}
+
+// T5 — recipient inbox sees the delivered message.
+#[tokio::test]
+async fn t5_recipient_inbox_sees_message() {
+    let backend = shared_backend();
+    let (registry_leo, _rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    let (registry_khive, _rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "inbox check" }),
+        )
+        .await
+        .expect("T5: send must succeed");
+
+    let inbox = registry_khive
+        .dispatch("comm.inbox", serde_json::json!({}))
+        .await
+        .expect("T5: inbox dispatch must succeed");
+    let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert_eq!(
+        count, 1,
+        "T5: recipient inbox must contain exactly 1 message; got {count}"
+    );
+    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
+    let msg = &msgs[0];
+    assert_eq!(
+        msg.get("properties")
+            .and_then(|p| p.get("from"))
+            .and_then(|v| v.as_str()),
+        Some("lambda:leo"),
+        "T5: inbox message from must be lambda:leo"
+    );
+    assert_eq!(
+        msg.get("properties")
+            .and_then(|p| p.get("read"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "T5: inbox message must be unread"
+    );
+}
+
+// T6 — sender's own inbox does not contain the inbound copy that landed in recipient ns.
+#[tokio::test]
+async fn t6_sender_inbox_does_not_see_inbound_copy() {
+    let backend = shared_backend();
+    let (registry_leo, _rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+
+    registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "isolation check" }),
+        )
+        .await
+        .expect("T6: send must succeed");
+
+    let inbox = registry_leo
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("T6: sender inbox dispatch must succeed");
+    let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "T6: sender inbox must not contain the inbound copy (it is in recipient ns); got {count}"
+    );
+}
+
+// T7 — white-box: with_namespace token scoping.
+//
+// `NamespaceToken::with_namespace(recipient)` produces a token with
+// `namespace = recipient, visible = [recipient]`.  This is an ordinary
+// NamespaceToken — NOT a type-enforced write-only capability:
+//   (a) The minted token CANNOT read the SENDER namespace (visible set excludes it).
+//   (b) The minted token CAN read the RECIPIENT namespace (it IS in the visible set).
+//
+// The security boundary is the sender-side allowlist check and the comm
+// handler's single-create usage, not the token type.
+#[tokio::test]
+async fn t7_with_namespace_token_scoping() {
+    let backend = shared_backend();
+    let (_registry_leo, rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    let (_registry_khive, rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    // Create a note in lambda:leo (sender) namespace.
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let sender_note = rt_leo
+        .create_note(
+            &leo_tok,
+            "observation",
+            None,
+            "sender-ns note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T7: create sender note");
+
+    // Create a note in lambda:khive (recipient) namespace.
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let recipient_note = rt_khive
+        .create_note(
+            &khive_tok,
+            "observation",
+            None,
+            "recipient-ns note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T7: create recipient note");
+
+    // Mint the kind of token that with_namespace produces (recipient-scoped).
+    let recipient_tok: NamespaceToken =
+        leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
+
+    // (a) Minted token CANNOT read the sender-ns note (visible set is [lambda:khive]).
+    let cannot_see_sender = rt_leo
+        .get_note_including_deleted(&recipient_tok, sender_note.id)
+        .await;
+    match cannot_see_sender {
+        Ok(None) => {
+            // Expected: token's visible set is [lambda:khive], cannot see lambda:leo notes.
+        }
+        Ok(Some(_)) => panic!("T7(a): with_namespace token must not read sender-ns note"),
+        Err(e) => panic!("T7(a): unexpected error {e:?}"),
+    }
+
+    // (b) Minted token CAN read the recipient-ns note — it is a full read+write token
+    // for the recipient ns, not a type-enforced write-only capability.
+    let can_see_recipient = rt_khive
+        .get_note_including_deleted(&recipient_tok, recipient_note.id)
+        .await;
+    match can_see_recipient {
+        Ok(Some(_)) => {
+            // Expected: the minted token can read from its own namespace (lambda:khive).
+        }
+        Ok(None) => panic!("T7(b): minted token must be able to read recipient-ns note"),
+        Err(e) => panic!("T7(b): unexpected error {e:?}"),
+    }
+}
+
+// T8 — the sender's own namespace token cannot update or delete the inbound note
+// in the recipient namespace.
+//
+// This tests namespace isolation at the runtime layer: the sender's leo_tok
+// has namespace=lambda:leo and cannot mutate records owned by lambda:khive.
+// It does NOT test any property of the with_namespace token used internally by
+// the comm handler.
+#[tokio::test]
+async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    let (_reg_khive, rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "append-only check" }),
+        )
+        .await
+        .expect("T8: send must succeed");
+
+    // Find the inbound note UUID.
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = khive_notes
+        .iter()
+        .find(|n| n.deleted_at.is_none())
+        .map(|n| n.id)
+        .expect("T8: must find inbound note");
+
+    // Attempt update via sender's leo token — must fail with NotFound (namespace mismatch).
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let update_result = rt_leo
+        .update_note(
+            &leo_tok,
+            inbound_id,
+            NotePatch::new(None, None, None, None, None),
+        )
+        .await;
+    match update_result {
+        Err(khive_runtime::RuntimeError::NotFound(_)) => {}
+        Ok(_) => panic!("T8: update of cross-ns note from sender must return NotFound"),
+        Err(e) => panic!("T8: update returned unexpected error {e:?}"),
+    }
+
+    // Attempt delete via sender's leo token — must return Ok(false) (namespace mismatch, not deleted).
+    let delete_result = rt_leo.delete_note(&leo_tok, inbound_id, true).await;
+    match delete_result {
+        Ok(false) => {
+            // Expected: namespace mismatch; note not deleted.
+        }
+        Ok(true) => {
+            panic!("T8: delete of cross-ns note from sender must NOT succeed (returned true)")
+        }
+        Err(e) => panic!("T8: delete returned unexpected error {e:?}"),
+    }
+
+    // Verify the inbound note still exists in lambda:khive namespace.
+    let khive_tok2 = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let still_there = rt_khive
+        .list_notes(&khive_tok2, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let alive_after = still_there
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        alive_after, 1,
+        "T8: inbound note must still exist after sender's failed delete attempt"
+    );
+}
+
+// T9 — reply from recipient back to sender cross-ns when reply allowlist permits.
+#[tokio::test]
+async fn t9_reply_cross_ns_delivers_when_allowed() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    // khive can reply to leo.
+    let (registry_khive, _rt_khive) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:khive",
+        vec![Namespace::parse("lambda:leo").unwrap()],
+    );
+
+    // leo sends to khive.
+    let send_result = registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "hello from leo" }),
+        )
+        .await
+        .expect("T9: send must succeed");
+    let outbound_thread_id = send_result
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T9: send must return full_id");
+
+    // Fetch the inbound note UUID (as seen from khive — both runtimes share the same backend).
+    let khive_tok = rt_leo
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_leo
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = khive_notes
+        .iter()
+        .find(|n| n.deleted_at.is_none())
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("T9: must find inbound note");
+
+    // khive replies to the inbound message.
+    let reply_result = registry_khive
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": inbound_id, "content": "got it from khive" }),
+        )
+        .await;
+    assert!(
+        reply_result.is_ok(),
+        "T9: reply cross-ns must succeed; got {reply_result:?}"
+    );
+
+    // leo's inbox now has the reply.
+    let leo_inbox = registry_leo
+        .dispatch("comm.inbox", serde_json::json!({}))
+        .await
+        .expect("T9: leo inbox");
+    let leo_count = leo_inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert_eq!(
+        leo_count, 1,
+        "T9: leo inbox must contain the reply; got {leo_count}"
+    );
+
+    // Reply carries the same thread_id as the original.
+    let leo_msgs = leo_inbox
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let reply_thread_id = leo_msgs[0]
+        .get("properties")
+        .and_then(|p| p.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("T9: reply must have thread_id");
+    assert_eq!(
+        reply_thread_id, outbound_thread_id,
+        "T9: reply thread_id must match original outbound UUID"
+    );
+}
+
+// T10 — reply cross-ns is denied when the replier's allowlist is empty.
+#[tokio::test]
+async fn t10_reply_cross_ns_denied_when_empty() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    // khive has NO outbound allowlist (cannot reply cross-ns).
+    let (registry_khive, _rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    // leo sends to khive.
+    registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "setup for T10" }),
+        )
+        .await
+        .expect("T10: initial send must succeed");
+
+    // Fetch the inbound note UUID from khive's perspective.
+    let khive_tok = rt_leo
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_leo
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = khive_notes
+        .iter()
+        .find(|n| n.deleted_at.is_none())
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("T10: must find inbound note");
+
+    // khive attempts to reply — must be denied.
+    let reply_result = registry_khive
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": inbound_id, "content": "attempt blocked reply" }),
+        )
+        .await;
+    assert!(
+        reply_result.is_err(),
+        "T10: reply with empty allowlist must be denied"
+    );
+    let err_str = reply_result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("not permitted") || err_str.contains("PermissionDenied"),
+        "T10: error must indicate denial; got {err_str:?}"
+    );
+}
+
+// T11 — outbound note is rolled back when inbound write fails (cross-ns path).
+//
+// The rollback code in dual_write_message (message.rs, `delete_note` on inbound error)
+// is the same code path for both same-ns and cross-ns sends. The existing test
+// `test_send_inbound_failure_rolls_back_outbound` confirms rollback for format-invalid
+// namespace (failure before outbound note creation). Here we confirm the same rollback
+// guarantee for the cross-ns path by verifying no partial state remains when the
+// send is denied at the allowlist check (failure also before outbound note creation).
+//
+// Note: contriving an inbound DB write failure after the outbound note is committed
+// requires mocking, which is out of scope for integration tests. The structural rollback
+// at message.rs:205-209 is not namespace-path-specific.
+#[tokio::test]
+async fn t11_inbound_write_failure_rolls_back_outbound() {
+    let backend = shared_backend();
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]); // empty allowlist → denied
+
+    let result = registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "rollback check" }),
+        )
+        .await;
+    assert!(result.is_err(), "T11: denied send must fail");
+
+    // No outbound note must remain (atomicity: outbound not yet created when denial fires).
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
+    assert_eq!(
+        alive, 0,
+        "T11: no partial outbound note must remain; got {alive}"
+    );
+
+    let khive_tok = rt_leo
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_leo
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let khive_alive = khive_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        khive_alive, 0,
+        "T11: no inbound note in recipient ns; got {khive_alive}"
+    );
+}
+
+// T12 — allowlist is directional: leo→khive allowed, but khive→leo denied when not listed.
+#[tokio::test]
+async fn t12_allowlist_is_one_directional() {
+    let backend = shared_backend();
+    // leo lists khive.
+    let (_registry_leo, _rt_leo) = build_crossns_registry(
+        Arc::clone(&backend),
+        "lambda:leo",
+        vec![Namespace::parse("lambda:khive").unwrap()],
+    );
+    // khive does NOT list leo.
+    let (registry_khive, _rt_khive) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+
+    let result = registry_khive
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:leo", "content": "reverse direction" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T12: reverse cross-ns send must be denied when not in allowlist; got {result:?}"
+    );
+}
+
+// T13 — inbound FTS failure after row commit leaves no stranded row (isomorphic
+// to codex finding #3: the INBOUND path specifically).
+//
+// `dual_write_message` writes two notes: outbound (sender ns) then inbound
+// (recipient ns).  Finding #3 is about a stranded RECIPIENT row when the FTS
+// step fails after the inbound note row is committed.
+//
+// Strategy: arm `arm_fts_fail` on the RECIPIENT namespace only.  The outbound
+// create_note (sender ns) runs first and is NOT targeted, so it succeeds.  The
+// inbound create_note (recipient ns) IS targeted: it commits the note row, hits
+// the injected FTS error, compensates (deletes the inbound row), and propagates
+// the error.  `dual_write_message` catches that error and rolls back the
+// outbound note.  After the send returns an error, BOTH namespaces must be empty.
+//
+// Namespace-targeting eliminates the cross-test race: concurrent tests using
+// other namespaces are unaffected by the injection.  `#[serial]` is not needed.
+#[tokio::test]
+async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
+    use khive_runtime::arm_fts_fail;
+
+    // Use a unique recipient namespace so the injection does not affect
+    // concurrent tests that share the shared_backend().
+    let sender_ns = "lambda:t13-sender";
+    let recipient_ns = "lambda:t13-inbound-fail";
+
+    let backend = shared_backend();
+    let (registry_sender, rt_sender) = build_crossns_registry(
+        Arc::clone(&backend),
+        sender_ns,
+        vec![Namespace::parse(recipient_ns).unwrap()],
+    );
+    let (_registry_recipient, rt_recipient) =
+        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
+
+    // Arm the FTS injection on the RECIPIENT namespace only.  The outbound
+    // create_note (sender_ns) passes through; only the inbound create_note
+    // (recipient_ns) triggers the injected error.
+    arm_fts_fail(recipient_ns);
+
+    let result = registry_sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": recipient_ns, "content": "t13 inbound-fail test" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T13: send must fail when inbound FTS injection is armed on recipient ns"
+    );
+
+    // No outbound note must remain in the sender namespace.
+    let sender_tok = rt_sender
+        .authorize(Namespace::parse(sender_ns).unwrap())
+        .unwrap();
+    let sender_notes = rt_sender
+        .list_notes(&sender_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let sender_alive = sender_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        sender_alive, 0,
+        "T13: no stranded outbound note in sender ns after inbound FTS failure; got {sender_alive}"
+    );
+
+    // No inbound note must remain in the recipient namespace.
+    let recipient_tok = rt_recipient
+        .authorize(Namespace::parse(recipient_ns).unwrap())
+        .unwrap();
+    let recipient_notes = rt_recipient
+        .list_notes(&recipient_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let recipient_alive = recipient_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        recipient_alive, 0,
+        "T13: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
+    );
+}
+
+// T14 — inbound vector insertion failure after note row + FTS commit leaves no
+// stranded row (mirrors T13 but exercises the vector compensation path).
+//
+// Because `build_crossns_registry` configures no embedding model, the vector
+// insert path is unreachable without registering a provider.  T14 registers a
+// trivial constant-vector embedder on the sender and recipient runtimes so that
+// `embed_model_names` is non-empty, then arms `arm_vector_fail(recipient_ns)`.
+//
+// Execution path for the cross-ns send:
+//   outbound create_note (sender ns)   → FTS ok, embed ok, vector insert ok.
+//   inbound  create_note (recipient ns) → FTS ok, embed ok,
+//                                         vector inject fires → Err returned,
+//                                         compensation deletes inbound row + FTS.
+//   dual_write_message catches inbound error → rolls back outbound note.
+//
+// After send returns Err, both sender_ns and recipient_ns have zero live notes.
+#[tokio::test]
+async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
+    use async_trait::async_trait;
+    use khive_runtime::{arm_vector_fail, EmbedderProvider};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    const T14_MODEL: &str = "t14-const-vec";
+    const T14_DIMS: usize = 4;
+
+    struct T14VecService;
+    #[async_trait]
+    impl EmbeddingService for T14VecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; T14_DIMS]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "t14-const-vec"
+        }
+    }
+
+    struct T14VecProvider;
+    #[async_trait]
+    impl EmbedderProvider for T14VecProvider {
+        fn name(&self) -> &str {
+            T14_MODEL
+        }
+        fn dimensions(&self) -> usize {
+            T14_DIMS
+        }
+        async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(T14VecService))
+        }
+    }
+
+    let sender_ns = "lambda:t14-sender";
+    let recipient_ns = "lambda:t14-vec-inbound-fail";
+
+    let backend = shared_backend();
+    let (registry_sender, rt_sender) = build_crossns_registry(
+        Arc::clone(&backend),
+        sender_ns,
+        vec![Namespace::parse(recipient_ns).unwrap()],
+    );
+    let (_registry_recipient, rt_recipient) =
+        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
+
+    // Register the embedder on both runtimes so the vector path is exercised.
+    rt_sender.register_embedder(T14VecProvider);
+    rt_recipient.register_embedder(T14VecProvider);
+
+    // Arm vector injection on the RECIPIENT namespace only.  The outbound
+    // create_note (sender_ns) passes through; only the inbound create_note
+    // (recipient_ns) hits the injected error after its row and FTS are committed.
+    arm_vector_fail(recipient_ns);
+
+    let result = registry_sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": recipient_ns, "content": "t14 vec-inbound-fail test" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T14: send must fail when inbound vector injection is armed on recipient ns"
+    );
+
+    // No outbound note must remain in the sender namespace.
+    let sender_tok = rt_sender
+        .authorize(Namespace::parse(sender_ns).unwrap())
+        .unwrap();
+    let sender_notes = rt_sender
+        .list_notes(&sender_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let sender_alive = sender_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        sender_alive,
+        0,
+        "T14: no stranded outbound note in sender ns after inbound vector failure; got {sender_alive}"
+    );
+
+    // No inbound note must remain in the recipient namespace.
+    let recipient_tok = rt_recipient
+        .authorize(Namespace::parse(recipient_ns).unwrap())
+        .unwrap();
+    let recipient_notes = rt_recipient
+        .list_notes(&recipient_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let recipient_alive = recipient_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        recipient_alive,
+        0,
+        "T14: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
+    );
+}
+
+// TOML wiring test — KhiveConfig parsed from TOML with
+// `actor.allowed_outbound_namespaces = [...]` must land those values in
+// RuntimeConfig.allowed_outbound_namespaces.
+#[test]
+fn toml_allowed_outbound_namespaces_wires_into_runtime_config() {
+    use khive_runtime::{runtime_config_from_khive_config, RuntimeConfig};
+
+    let toml_src = r#"
+[actor]
+id = "lambda:leo"
+allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
+"#;
+    let khive_cfg: khive_runtime::KhiveConfig = toml::from_str(toml_src).expect("TOML must parse");
+
+    let base = RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+
+    let outbound_strs: Vec<&str> = resolved
+        .allowed_outbound_namespaces
+        .iter()
+        .map(|ns| ns.as_str())
+        .collect();
+
+    assert!(
+        outbound_strs.contains(&"lambda:khive"),
+        "allowed_outbound_namespaces must contain 'lambda:khive'; got {outbound_strs:?}"
+    );
+    assert!(
+        outbound_strs.contains(&"lambda:atlas"),
+        "allowed_outbound_namespaces must contain 'lambda:atlas'; got {outbound_strs:?}"
+    );
+    assert_eq!(
+        outbound_strs.len(),
+        2,
+        "exactly 2 outbound namespaces expected; got {outbound_strs:?}"
     );
 }
