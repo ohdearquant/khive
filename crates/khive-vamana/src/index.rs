@@ -14,7 +14,7 @@ use crate::{
     config::VamanaConfig,
     distance::l2_squared,
     error::{Result, VamanaError},
-    graph::{is_tombstoned_bit, robust_prune_inner, row, sort_dedup_u32, VamanaGraph, VisitedSet},
+    graph::{is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, VamanaGraph, VisitedSet},
 };
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
@@ -849,97 +849,74 @@ impl VamanaIndex {
             self.graph
                 .replace_adjacency_and_update_reverse(ordinal, new_neighbors.clone());
 
-            // Back-edge pruning: for each out-neighbor v, add ordinal and re-prune if needed.
-            let vecs = self.vectors.as_slice()?;
-            for &v in &new_neighbors {
-                let mut v_candidates: Vec<u32> = self.graph.adjacency()[v as usize]
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(ordinal))
-                    .filter(|&x| x != v)
-                    .collect();
-                sort_dedup_u32(&mut v_candidates);
-                if v_candidates.len() > self.config.max_degree {
-                    let pruned = robust_prune_inner(
-                        vecs,
-                        self.dimensions,
-                        v,
-                        v_candidates,
-                        self.config.alpha,
-                        self.config.max_degree,
-                    );
-                    self.graph.replace_adjacency_and_update_reverse(v, pruned);
-                } else {
-                    self.graph
-                        .replace_adjacency_and_update_reverse(v, v_candidates);
+            // INVARIANT (never-drop insert):
+            // insert() never removes any existing node's inbound edge. Every node
+            // reachable before this insert therefore remains reachable after it.
+            // The inserted node receives at least one inbound edge from an always-
+            // reachable node (a free-slot out-neighbor, or the medoid), so it is
+            // reachable too. No successful insert can make a previously-findable
+            // vector unfindable.
+            //
+            // Back-edge rule (Option E): for each selected out-neighbor j, add the
+            // back-edge j→ordinal ONLY IF j has a free slot (|adj(j)| < max_degree).
+            // If j is already full, SKIP the back-edge entirely — do NOT call
+            // robust_prune_inner(j) and do NOT drop any of j's existing edges.
+            // Pruning j's adjacency to make room is what caused the round-1 and
+            // round-2 orphan/disconnect defects.
+            //
+            // Trade-off: skipping back-edges on saturated neighbors lowers incremental
+            // graph quality on heavily-saturated graphs (ordinal becomes less
+            // well-connected via back-edges, increasing reliance on the medoid hub for
+            // routing). This is a quality trade-off, not a correctness issue — recall
+            // is bounded and ADR-052-acceptable. A future consolidate-side redistri-
+            // bution pass (separate issue + ADR-052 amendment) can repair it.
+            for &j in &new_neighbors {
+                if self.graph.adjacency()[j as usize].len() < self.config.max_degree {
+                    // j has a free slot: add the back-edge without dropping anything.
+                    let mut j_adj: Vec<u32> = self.graph.adjacency()[j as usize]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(ordinal))
+                        .filter(|&x| x != j)
+                        .collect();
+                    sort_dedup_u32(&mut j_adj);
+                    self.graph.replace_adjacency_and_update_reverse(j, j_adj);
                 }
+                // j is full: skip the back-edge to preserve all of j's existing edges.
             }
 
-            // Orphan postcondition: the inserted node MUST have at least one inbound edge.
+            // Medoid-pin eager repair: if no selected out-neighbor had a free slot,
+            // the inserted node has zero inbound edges and is unreachable. Pin it by
+            // adding the edge medoid→ordinal. The medoid is the search entry point and
+            // is always reachable; it is the designated overflow node (DiskANN treats
+            // the entry point this way). The medoid is permitted to exceed max_degree
+            // for this one edge so that no existing edge is dropped — correctness over
+            // degree bound.
             //
-            // The back-edge loop can evict `ordinal` from a neighbor's adjacency when
-            // robust_prune_inner trims to max_degree without keeping it. This leaves
-            // `ordinal` with forward edges but zero inbound edges — unreachable via
-            // forward-edge search descending from the medoid.
-            //
-            // Fix: if orphaned, pin `ordinal` into its CLOSEST out-neighbor. Pinning
-            // into the closest neighbor is safe because all out-neighbors were found via
-            // greedy search from the medoid, so they are in the reachable component.
-            // If the pin target is at max_degree, EVICT its farthest neighbor (the one
-            // most distant from it by L2²) to make room — never exceed max_degree.
-            //
-            // new_neighbors is non-empty whenever live_before > 0 (the else branch), so
-            // there is always a valid pin target.
+            // Edge case: if the graph was empty before this insert and ordinal became
+            // the medoid (live_before == 0 branch), no pin is needed — handled by the
+            // `if live_before == 0` branch above this block.
             debug_assert!(
                 !new_neighbors.is_empty(),
-                "insert: new_neighbors empty in live_before>0 branch — impossible"
+                "insert: new_neighbors must be non-empty when live_before > 0"
             );
             if self.graph.reverse_adjacency()[ordinal as usize].is_empty() {
-                let vecs = self.vectors.as_slice()?;
-                let inserted_vec = row(vecs, self.dimensions, ordinal);
-
-                // Pick the closest out-neighbor by L2² from the inserted node.
-                let pin_target = new_neighbors
-                    .iter()
-                    .copied()
-                    .min_by(|&a, &b| {
-                        let da = l2_squared(inserted_vec, row(vecs, self.dimensions, a));
-                        let db = l2_squared(inserted_vec, row(vecs, self.dimensions, b));
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .expect("insert: new_neighbors non-empty in else branch");
-
-                let mut pin_adj: Vec<u32> = self.graph.adjacency()[pin_target as usize]
+                let medoid = self.graph.medoid();
+                debug_assert_ne!(
+                    medoid, ordinal,
+                    "insert: medoid == ordinal in live_before>0 branch — impossible"
+                );
+                let mut medoid_adj: Vec<u32> = self.graph.adjacency()[medoid as usize]
                     .iter()
                     .copied()
                     .chain(std::iter::once(ordinal))
-                    .filter(|&x| x != pin_target)
+                    .filter(|&x| x != medoid)
                     .collect();
-                sort_dedup_u32(&mut pin_adj);
-
-                if pin_adj.len() > self.config.max_degree {
-                    // Evict the farthest neighbor from pin_target's perspective,
-                    // BUT never evict `ordinal` itself — that is the node we are pinning.
-                    let pin_vec = row(vecs, self.dimensions, pin_target);
-                    let (evict_pos, _) = pin_adj
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, &nb)| nb != ordinal) // never evict the just-inserted node
-                        .map(|(i, &nb)| (i, l2_squared(pin_vec, row(vecs, self.dimensions, nb))))
-                        .max_by(|(_, da), (_, db)| {
-                            da.partial_cmp(db).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .expect("pin_adj has a non-ordinal entry to evict");
-                    pin_adj.swap_remove(evict_pos);
-                    sort_dedup_u32(&mut pin_adj);
-                }
-
-                debug_assert!(
-                    pin_adj.contains(&ordinal),
-                    "insert: pin failed — ordinal not in pin_adj after eviction"
-                );
+                sort_dedup_u32(&mut medoid_adj);
+                // Medoid may now exceed max_degree — intentional overflow per the
+                // never-drop invariant. Existing medoid edges are never removed.
                 self.graph
-                    .replace_adjacency_and_update_reverse(pin_target, pin_adj);
+                    .replace_adjacency_and_update_reverse(medoid, medoid_adj);
             }
         }
 

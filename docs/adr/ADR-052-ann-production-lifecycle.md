@@ -141,13 +141,33 @@ Repair is local (the deleted node's 2-hop neighborhood), so per-delete cost is b
 not corpus size. Because repair happens at delete time, **recall stays bounded between
 consolidations** -- consolidation is then a pure compaction, not a recall-recovery step.
 
-**`insert(vector) -> Result<u32>` -- incremental.** Before any mutation,
-`ensure_owned()` promotes `VectorStorage::Mmap` to `VectorStorage::Owned` (a one-time
-copy of the mapping into a `Vec<f32>`; subsequent inserts pay no promotion cost). Recycles
-a `free_slots` ordinal if available (LIFO; double-use guard: slot must be tombstoned before
-popping), else appends. Greedy-search for an entry neighborhood, `RobustPrune` to select
-the new node's out-edges, add back-edges with `RobustPrune` on each affected neighbor,
-update `reverse_adj`, increment `ops_since_consolidation`. Returns the assigned ordinal.
+**`insert(vector) -> Result<u32>` -- incremental.** Preflight checks (dimension, finite,
+capacity) run before any state mutation; a rejected insert never touches the Mmap store.
+`ensure_owned()` then promotes `VectorStorage::Mmap` to `VectorStorage::Owned` (one-time
+copy; subsequent inserts pay no promotion cost). Recycles a `free_slots` ordinal if
+available (LIFO; double-use guard: slot must be tombstoned before popping), else appends.
+Greedy-search finds an entry neighborhood; `RobustPrune` selects the new node's out-edges.
+
+**Never-drop back-edge rule.** For each selected out-neighbor `j`, the back-edge `j→ordinal`
+is added ONLY IF `j` has a free slot (`|adj(j)| < max_degree`). If `j` is full, the
+back-edge is skipped entirely -- `RobustPrune` is NOT called on `j` and none of `j`'s
+existing edges are removed. Correctness invariant: insert() never removes any existing
+node's inbound edge, so every node reachable before the insert remains reachable after it.
+
+**Medoid-pin eager repair (insert-time analog of Wolverine for delete).** If, after the
+back-edge loop, the inserted node has zero inbound edges (all selected neighbors were full),
+it is pinned by adding the edge `medoid→ordinal`. The medoid is the search entry point and
+is always reachable; it is the designated overflow node (the same role it plays in DiskANN).
+The medoid is permitted to exceed `max_degree` for this one edge -- never dropping any
+existing medoid edge -- so the never-drop invariant is preserved. This guarantees the
+inserted node is reachable without disconnecting any existing node.
+
+**Quality trade-off.** Skipping back-edges on saturated neighbors lowers incremental-insert
+graph quality on heavily-saturated corpora (ordinal becomes less well-connected via
+back-edges, increasing reliance on the medoid hub for routing). This is a quality trade-off,
+not a correctness issue (recall is bounded and ADR-052-acceptable). A future
+consolidate-side redistribution pass (separate issue + ADR-052 amendment) will repair the
+degree imbalance if bench measurements show it is material.
 
 **Ordinal stability invariant:** ordinals returned by `insert()` are stable until the next
 `consolidate()` call. After consolidation the ordinal space is renumbered; callers that
