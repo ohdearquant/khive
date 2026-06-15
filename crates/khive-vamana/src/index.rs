@@ -681,9 +681,295 @@ impl VamanaIndex {
         self.tombstone_count
     }
 
+    /// Count of live (non-tombstoned) nodes.
+    pub fn live_count(&self) -> usize {
+        self.num_vectors - self.tombstone_count
+    }
+
+    /// Cumulative delete+insert churn since the last consolidation.
+    pub fn ops_since_consolidation(&self) -> usize {
+        self.ops_since_consolidation
+    }
+
     /// True when `ops_since_consolidation >= consolidation_tau`.
     pub fn needs_consolidation(&self) -> bool {
         self.ops_since_consolidation >= self.consolidation_tau
+    }
+
+    // ---- PR3: Mmap-to-Owned promotion helper ----
+
+    /// Promote `VectorStorage::Mmap` to `Owned` by copying the mapping into a `Vec<f32>`.
+    ///
+    /// Called as the first statement of both `insert` and `consolidate` so that all
+    /// subsequent vector reads/writes operate on a mutable owned buffer. If already
+    /// `Owned`, this is a no-op. O(N × dim) once per promotion; the next `save`
+    /// creates a fresh mmap at next load.
+    fn ensure_owned(&mut self) -> Result<()> {
+        if let VectorStorage::Mmap { .. } = &self.vectors {
+            let owned: Vec<f32> = self.vectors.as_slice()?.to_vec();
+            self.vectors = VectorStorage::Owned(owned);
+        }
+        Ok(())
+    }
+
+    // ---- PR3: insert and consolidate (ADR-052 §2) ----
+
+    /// Insert a new vector into the index. Returns the ordinal assigned to the new node.
+    ///
+    /// If `free_slots` is non-empty a recycled ordinal is reused; otherwise a new slot
+    /// is appended. Either way, the call runs greedy search from the current medoid,
+    /// selects out-edges via RobustPrune, wires back-edges with reverse_adj update, and
+    /// increments `ops_since_consolidation`.
+    ///
+    /// Mmap-backed indexes are promoted to Owned on the first insert call. Callers that
+    /// held ordinals across a previous consolidate must treat those ordinals as invalid;
+    /// ordinals are NOT stable across consolidate().
+    ///
+    /// Returns `Err` without mutating state if the vector is non-finite, wrong dimension,
+    /// or would push `num_vectors` past `u32::MAX`.
+    pub fn insert(&mut self, vector: &[f32]) -> Result<u32> {
+        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
+        self.ensure_owned()?;
+
+        // Preflight — validate before any state change.
+        if vector.len() != self.dimensions {
+            return Err(VamanaError::DimensionMismatch {
+                expected: self.dimensions,
+                actual: vector.len(),
+            });
+        }
+        require_finite(vector, "insert vector")?;
+        if self.num_vectors >= u32::MAX as usize {
+            return Err(VamanaError::TooManyVectors {
+                count: self.num_vectors,
+            });
+        }
+
+        // Slot assignment: recycle or append.
+        let ordinal: u32;
+        if !self.free_slots.is_empty() {
+            // Recycle path: LIFO pop. Guard against corrupted free_slots entry.
+            let candidate = *self.free_slots.last().unwrap();
+            if !is_tombstoned_bit(&self.tombstones, candidate as usize) {
+                return Err(VamanaError::invalid_format(format!(
+                    "insert: free slot {candidate} is not tombstoned"
+                )));
+            }
+            self.free_slots.pop();
+            ordinal = candidate;
+
+            // Clear tombstone bit and decrement count before graph wiring.
+            let word = ordinal as usize / 64;
+            self.tombstones[word] &= !(1u64 << (ordinal as usize % 64));
+            self.tombstone_count -= 1;
+
+            // Write vector into recycled slot in-place.
+            let start = ordinal as usize * self.dimensions;
+            let end = start + self.dimensions;
+            match &mut self.vectors {
+                VectorStorage::Owned(v) => v[start..end].copy_from_slice(vector),
+                VectorStorage::Mmap { .. } => {
+                    return Err(VamanaError::invalid_format(
+                        "insert: unexpected Mmap after ensure_owned".into(),
+                    ))
+                }
+            }
+        } else {
+            // Append path: assign next ordinal and extend storage.
+            ordinal = self.num_vectors as u32;
+            self.num_vectors += 1;
+
+            // Extend graph: adjacency and reverse_adj grow atomically.
+            self.graph.add_node()?;
+
+            // Extend tombstone bitvec if the new ordinal falls in a new word.
+            let word = ordinal as usize / 64;
+            if word >= self.tombstones.len() {
+                self.tombstones.resize(word + 1, 0);
+            }
+
+            // Append vector to Owned storage.
+            match &mut self.vectors {
+                VectorStorage::Owned(v) => v.extend_from_slice(vector),
+                VectorStorage::Mmap { .. } => {
+                    return Err(VamanaError::invalid_format(
+                        "insert: unexpected Mmap after ensure_owned".into(),
+                    ))
+                }
+            }
+        }
+
+        // Graph wiring.
+        let live_before = self.num_vectors - self.tombstone_count - 1; // before this insert contributed
+        if live_before == 0 {
+            // Only one live node (the one just inserted); skip greedy search and set medoid.
+            self.graph.set_medoid(ordinal);
+        } else {
+            let vecs = self.vectors.as_slice()?;
+
+            let tombstones_opt = if self.tombstone_count > 0 {
+                Some(self.tombstones.as_slice())
+            } else {
+                None
+            };
+
+            let mut visited = VisitedSet::new(self.num_vectors);
+            let search_result = self.graph.greedy_search(
+                vecs,
+                self.dimensions,
+                vector,
+                self.config.search_list_size,
+                self.config.search_list_size,
+                &mut visited,
+                tombstones_opt,
+            )?;
+
+            // Candidate pool: expanded ∪ results, excluding ordinal itself, deduped.
+            let mut candidates: Vec<u32> = search_result
+                .expanded
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(search_result.results.iter().map(|(id, _)| *id))
+                .filter(|&id| id != ordinal)
+                .collect();
+            sort_dedup_u32(&mut candidates);
+
+            let vecs = self.vectors.as_slice()?;
+            let new_neighbors = robust_prune_inner(
+                vecs,
+                self.dimensions,
+                ordinal,
+                candidates,
+                self.config.alpha,
+                self.config.max_degree,
+            );
+
+            // Wire new node's forward adjacency and reverse_adj in lockstep.
+            self.graph
+                .replace_adjacency_and_update_reverse(ordinal, new_neighbors.clone());
+
+            // Back-edge pruning: for each out-neighbor v, add ordinal and re-prune if needed.
+            let vecs = self.vectors.as_slice()?;
+            for &v in &new_neighbors {
+                let mut v_candidates: Vec<u32> = self.graph.adjacency()[v as usize]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(ordinal))
+                    .filter(|&x| x != v)
+                    .collect();
+                sort_dedup_u32(&mut v_candidates);
+                if v_candidates.len() > self.config.max_degree {
+                    let pruned = robust_prune_inner(
+                        vecs,
+                        self.dimensions,
+                        v,
+                        v_candidates,
+                        self.config.alpha,
+                        self.config.max_degree,
+                    );
+                    self.graph.replace_adjacency_and_update_reverse(v, pruned);
+                } else {
+                    self.graph
+                        .replace_adjacency_and_update_reverse(v, v_candidates);
+                }
+            }
+        }
+
+        self.ops_since_consolidation += 1;
+        Ok(ordinal)
+    }
+
+    /// Compact tombstoned slots: renumber live nodes to contiguous ordinals `0..M`,
+    /// rebuild adjacency and `reverse_adj` over the new ordinals, and reset
+    /// tombstone/free-slot state. Does NOT re-run graph construction.
+    ///
+    /// Returns `new_to_old` where `new_to_old[new_ordinal] == old_ordinal`, allowing
+    /// callers that hold external-id maps (e.g., `AnnBridge`'s ordinal→UUID table) to
+    /// remap their data. An empty `Vec` is returned on the no-op fast path (zero
+    /// tombstones), signaling that ordinals are unchanged and no remap is needed.
+    ///
+    /// **Ordinals are NOT stable across consolidate().** Any external holder of a `u32`
+    /// ordinal must rebuild its mapping using the returned `new_to_old` vector after
+    /// each non-no-op consolidation. This is an invariant break visible to callers.
+    ///
+    /// After return: `tombstone_count == 0`, `free_slots` is empty,
+    /// `ops_since_consolidation == 0`, `num_vectors == prior live_count`.
+    pub fn consolidate(&mut self) -> Result<Vec<u32>> {
+        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
+        self.ensure_owned()?;
+
+        // No-op fast path: no tombstones.
+        if self.tombstone_count == 0 {
+            self.ops_since_consolidation = 0;
+            return Ok(Vec::new());
+        }
+
+        let m = self.num_vectors - self.tombstone_count;
+
+        // Build old→new and new→old remap tables.
+        let mut old_to_new: Vec<u32> = vec![u32::MAX; self.num_vectors];
+        let mut new_to_old: Vec<u32> = Vec::with_capacity(m);
+        let mut new_ord: u32 = 0;
+        for (old, slot) in old_to_new.iter_mut().enumerate() {
+            if !is_tombstoned_bit(&self.tombstones, old) {
+                *slot = new_ord;
+                new_to_old.push(old as u32);
+                new_ord += 1;
+            }
+        }
+        debug_assert_eq!(new_ord as usize, m);
+
+        // Build compacted vector store (always Owned after consolidation).
+        let old_vecs = self.vectors.as_slice()?;
+        let mut new_vecs: Vec<f32> = Vec::with_capacity(m * self.dimensions);
+        for &old in &new_to_old {
+            let src =
+                &old_vecs[old as usize * self.dimensions..(old as usize + 1) * self.dimensions];
+            new_vecs.extend_from_slice(src);
+        }
+
+        // Build compacted adjacency lists with remapped ordinals.
+        let mut new_adj: Vec<Vec<u32>> = vec![Vec::new(); m];
+        for new_u in 0..m {
+            let old_u = new_to_old[new_u] as usize;
+            let remapped: Vec<u32> = self.graph.adjacency()[old_u]
+                .iter()
+                .filter_map(|&old_v| {
+                    let nv = old_to_new[old_v as usize];
+                    if nv == u32::MAX {
+                        None // tombstoned target — drop
+                    } else {
+                        Some(nv)
+                    }
+                })
+                .collect();
+            new_adj[new_u] = remapped;
+        }
+
+        // Remap medoid.
+        let old_medoid = self.graph.medoid() as usize;
+        let new_medoid = old_to_new[old_medoid];
+        debug_assert!(
+            new_medoid != u32::MAX,
+            "consolidate: medoid {old_medoid} is tombstoned — invariant violated"
+        );
+
+        // Swap in new graph state.
+        let mut new_graph = VamanaGraph::new(m, new_medoid)?;
+        for (i, neighbors) in new_adj.into_iter().enumerate() {
+            new_graph.adjacency_mut_for_load()[i] = neighbors;
+        }
+        new_graph.rebuild_reverse_adj_from_adjacency();
+
+        self.graph = new_graph;
+        self.vectors = VectorStorage::Owned(new_vecs);
+        self.num_vectors = m;
+        self.tombstones = tombstone_words_for(m);
+        self.tombstone_count = 0;
+        self.free_slots.clear();
+        self.ops_since_consolidation = 0;
+
+        Ok(new_to_old)
     }
 
     /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2).

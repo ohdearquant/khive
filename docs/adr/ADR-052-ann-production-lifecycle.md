@@ -141,20 +141,35 @@ Repair is local (the deleted node's 2-hop neighborhood), so per-delete cost is b
 not corpus size. Because repair happens at delete time, **recall stays bounded between
 consolidations** -- consolidation is then a pure compaction, not a recall-recovery step.
 
-**`insert(vector)` -- incremental.** Recycle a `free_slots` ordinal if available, else append.
-Greedy-search for an entry neighborhood, `RobustPrune` to select the new node's out-edges, add
-back-edges with `RobustPrune` on each affected neighbor, update `reverse_adj`, increment
-`ops_since_consolidation`.
+**`insert(vector) -> Result<u32>` -- incremental.** Before any mutation,
+`ensure_owned()` promotes `VectorStorage::Mmap` to `VectorStorage::Owned` (a one-time
+copy of the mapping into a `Vec<f32>`; subsequent inserts pay no promotion cost). Recycles
+a `free_slots` ordinal if available (LIFO; double-use guard: slot must be tombstoned before
+popping), else appends. Greedy-search for an entry neighborhood, `RobustPrune` to select
+the new node's out-edges, add back-edges with `RobustPrune` on each affected neighbor,
+update `reverse_adj`, increment `ops_since_consolidation`. Returns the assigned ordinal.
 
-**`consolidate()` -- compaction with ordinal remapping**, triggered when
+**Ordinal stability invariant:** ordinals returned by `insert()` are stable until the next
+`consolidate()` call. After consolidation the ordinal space is renumbered; callers that
+maintain external id→ordinal tables **must** apply the returned remap (see below).
+
+**`consolidate() -> Result<Vec<u32>>` -- compaction with ordinal remapping**, triggered when
 `ops_since_consolidation >= tau` (default `tau = 40_000`):
 
+0. Fast-path: if `tombstone_count == 0`, reset `ops_since_consolidation` and return
+   `Ok(Vec::new())`. An empty return signals "ordinals unchanged; no remap needed."
 1. Build `old -> new` ordinal remap assigning live nodes contiguous ordinals `0..M`.
 2. Allocate a fresh vector store of size `M`; copy live vectors to new ordinals.
 3. Rewrite every adjacency list through the remap, dropping any tombstoned targets.
 4. Rebuild `reverse_adj` from the compacted forward graph.
 5. Remap the medoid.
 6. Clear `tombstones`, `free_slots`; reset `tombstone_count` and `ops_since_consolidation`.
+7. Return `Ok(new_to_old)` where `new_to_old[new_ordinal] = old_ordinal`.
+
+Callers that maintain external id→ordinal mappings (e.g. the knowledge pack's ANN bridge)
+must invert the returned `new_to_old` slice to rebuild their table; a non-empty return is
+an epoch boundary. `ensure_owned()` is called at the top of `consolidate()` for the same
+Mmap-promotion reason as `insert()`.
 
 Consolidation does **not** re-run graph construction -- the Wolverine repairs already kept the
 graph navigable. It reclaims space and restores dense ordinals. (FreshDiskANN / SPFresh use the
@@ -208,6 +223,10 @@ the claim is made load-bearing.
    recall parity by probe.
 3. Add the five lifecycle fields + `tombstone`/`insert`/`consolidate` to khive-vamana with
    isomorphic tests (delete-then-search recall, churn-then-consolidate identity, insert recall).
+   `insert` returns the assigned `u32` ordinal; `consolidate` returns `Result<Vec<u32>>`
+   (the `new_to_old` remap, or an empty `Vec` when no-op). `ensure_owned()` is called at
+   the top of both mutating functions to promote Mmap storage before any write. Ordinals
+   are NOT stable across a non-no-op `consolidate`. (Implemented: PR3.)
 4. Add the v2 format + `save_atomic` + `load_or_build`; verify crash-consistency by a
    kill-during-save probe and restore-correctness by a fingerprint-match probe.
 5. Add `build_batch_sq8`/`search_layer_sq8` to khive-hnsw as an opt-in path; enable per-corpus
