@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, NotePatch, RuntimeConfig,
-    VerbRegistry, VerbRegistryBuilder,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
+    VerbRegistryBuilder,
 };
 use khive_types::Pack;
 
@@ -841,8 +841,9 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
 /// not be persisted either.
 #[tokio::test]
 async fn test_send_inbound_failure_rolls_back_outbound() {
-    // An invalid namespace that will fail Namespace::parse.
-    let invalid_recipient = "this namespace has spaces!";
+    // ADR-057 Q1: control characters are rejected by validate_actor_label.
+    // A label with a tab character ('\t') must fail validation.
+    let invalid_recipient = "lambda\tcontrol";
 
     let (registry, rt) = build_registry_for_ns("lambda:khive");
 
@@ -853,13 +854,13 @@ async fn test_send_inbound_failure_rolls_back_outbound() {
         )
         .await;
 
-    // The send must fail because the recipient is not a valid namespace.
+    // The send must fail because the recipient label contains a control character.
     assert!(
         result.is_err(),
-        "send to invalid namespace must fail; got {result:?}"
+        "send to label with control character must fail; got {result:?}"
     );
 
-    // Atomicity: no outbound note should remain in lambda:khive.
+    // Atomicity: validation rejects before any write, so no note in lambda:khive.
     let caller_token = rt
         .authorize(Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -871,7 +872,7 @@ async fn test_send_inbound_failure_rolls_back_outbound() {
     assert_eq!(
         alive.len(),
         0,
-        "failed send must not leave an outbound note in caller namespace; got {alive:?}"
+        "failed send must not leave any note in caller namespace; got {alive:?}"
     );
 }
 
@@ -1768,29 +1769,32 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
     );
 }
 
-// ── #481 regression: cross-namespace send is denied (ACL gate) ────────────────
+// ── ADR-057: actor-addressed send allows lambda↔lambda messaging ──────────────
+//
+// Before ADR-057, comm.send(to="lambda:leo") from lambda:khive was denied by the
+// cross-namespace ACL gate (#481 fix). ADR-057 supersedes that gate for actor-
+// addressed sends: both copies land in the caller's namespace (lambda:khive).
+// The recipient namespace (lambda:leo) receives nothing — isolation is preserved.
 
 #[tokio::test]
 async fn test_cross_namespace_send_denied_issue_481() {
+    // ADR-057: actor-addressed send must succeed even across actor boundaries.
+    // Both copies land in the caller's namespace; no write to lambda:leo ns.
     let (registry, rt) = build_registry_for_ns("lambda:khive");
 
     let result = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "should be denied" }),
+            serde_json::json!({ "to": "lambda:leo", "content": "actor-addressed send" }),
         )
         .await;
 
     assert!(
-        result.is_err(),
-        "#481 regression: cross-namespace send must be denied; got ok: {result:?}"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("cross-namespace") || err.contains("lambda:leo"),
-        "#481 regression: error must mention the denied namespace or 'cross-namespace'; got {err:?}"
+        result.is_ok(),
+        "ADR-057: actor-addressed send from lambda:khive to lambda:leo must succeed; got err: {result:?}"
     );
 
+    // No note must appear in lambda:leo namespace — isolation preserved.
     let recipient_token = rt
         .authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -1798,8 +1802,13 @@ async fn test_cross_namespace_send_denied_issue_481() {
         .list_notes(&recipient_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in recipient ns");
-    assert_eq!(notes.len(), 0, "#481 regression: no note in recipient ns");
+    assert_eq!(
+        notes.len(),
+        0,
+        "ADR-057: no note in recipient (lambda:leo) namespace; both copies stay in caller ns"
+    );
 
+    // Both copies must appear in lambda:khive namespace.
     let sender_token = rt
         .authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -1807,11 +1816,49 @@ async fn test_cross_namespace_send_denied_issue_481() {
         .list_notes(&sender_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in sender ns");
+    let alive: Vec<_> = sender_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .collect();
     assert_eq!(
-        sender_notes.len(),
-        0,
-        "#481 regression: no note in sender ns"
+        alive.len(),
+        2,
+        "ADR-057: both outbound and inbound copies must land in caller (lambda:khive) ns; got {alive:?}"
     );
+
+    // One outbound, one inbound.
+    let directions: Vec<&str> = alive
+        .iter()
+        .filter_map(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+        })
+        .collect();
+    assert!(
+        directions.contains(&"outbound"),
+        "ADR-057: caller ns must have an outbound copy; got {directions:?}"
+    );
+    assert!(
+        directions.contains(&"inbound"),
+        "ADR-057: caller ns must have an inbound copy (the recipient's inbox); got {directions:?}"
+    );
+
+    // Actor labels must be stored on both copies.
+    for note in &alive {
+        let props = note.properties.as_ref().unwrap();
+        assert_eq!(
+            props.get("from_actor").and_then(|v| v.as_str()),
+            Some("lambda:khive"),
+            "ADR-057: from_actor must be lambda:khive"
+        );
+        assert_eq!(
+            props.get("to_actor").and_then(|v| v.as_str()),
+            Some("lambda:leo"),
+            "ADR-057: to_actor must be lambda:leo"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2324,7 +2371,8 @@ async fn t1_send_within_namespace_unchanged() {
     );
 }
 
-// T2 — cross-ns send is denied when the allowlist is empty.
+// T2 — cross-ns send is actor-addressed (ADR-057): succeeds regardless of allowlist,
+// both copies land in the SENDER's namespace with actor labels.
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
@@ -2332,25 +2380,19 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let (_registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
+    // ADR-057: actor-addressed sends always succeed; allowlist no longer gates comm.send.
     let result = registry_leo
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "blocked" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed" }),
         )
         .await;
     assert!(
-        result.is_err(),
-        "T2: cross-ns send with empty allowlist must be denied"
-    );
-    let err_str = result.unwrap_err().to_string();
-    assert!(
-        err_str.contains("not permitted")
-            || err_str.contains("PermissionDenied")
-            || err_str.contains("comm.send"),
-        "T2: error must mention the denial; got {err_str:?}"
+        result.is_ok(),
+        "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    // No note written in either namespace.
+    // Both outbound + inbound copies land in the SENDER namespace (lambda:leo).
     let leo_tok = rt_leo
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -2358,12 +2400,42 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         .list_notes(&leo_tok, Some("message"), 100, 0)
         .await
         .unwrap();
+    let leo_alive: Vec<_> = leo_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .collect();
     assert_eq!(
-        leo_notes.iter().filter(|n| n.deleted_at.is_none()).count(),
-        0,
-        "T2: no note in sender ns"
+        leo_alive.len(),
+        2,
+        "T2: expect 1 outbound + 1 inbound in sender ns (lambda:leo); got {}",
+        leo_alive.len()
     );
 
+    // Verify actor labels on both copies.
+    for note in &leo_alive {
+        let from_actor = note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("from_actor"))
+            .and_then(|v| v.as_str());
+        let to_actor = note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("to_actor"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            from_actor,
+            Some("lambda:leo"),
+            "T2: from_actor must be lambda:leo on every note"
+        );
+        assert_eq!(
+            to_actor,
+            Some("lambda:khive"),
+            "T2: to_actor must be lambda:khive on every note"
+        );
+    }
+
+    // No note written in the recipient namespace (lambda:khive).
     let khive_tok = rt_khive
         .authorize(Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -2377,19 +2449,16 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
             .filter(|n| n.deleted_at.is_none())
             .count(),
         0,
-        "T2: no note in recipient ns"
+        "T2: no note in recipient ns (lambda:khive)"
     );
 }
 
-// T3 — cross-ns send delivers when the recipient is in the sender's allowlist.
+// T3 — actor-addressed send (ADR-057): both copies land in the SENDER's namespace.
+// The inbound copy has actor labels from_actor/to_actor for routing.
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -2401,7 +2470,7 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         .await;
     assert!(
         result.is_ok(),
-        "T3: cross-ns send to allowed ns must succeed; got {result:?}"
+        "T3: actor-addressed send must succeed; got {result:?}"
     );
     let val = result.unwrap();
     assert!(
@@ -2409,7 +2478,7 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    // Outbound in lambda:leo.
+    // Outbound in lambda:leo (sender ns).
     let leo_tok = rt_leo
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -2437,15 +2506,8 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T3: outbound note must have thread_id");
 
-    // Inbound in lambda:khive.
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let inbound: Vec<_> = khive_notes
+    // ADR-057: inbound copy also lands in the SENDER namespace (lambda:leo).
+    let inbound: Vec<_> = leo_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .filter(|n| {
@@ -2459,26 +2521,27 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
     assert_eq!(
         inbound.len(),
         1,
-        "T3: expect 1 inbound note in recipient ns"
+        "T3: expect 1 inbound note in SENDER ns (lambda:leo) — ADR-057 actor-addressed"
     );
     let inbound_note = inbound[0];
+    // Actor labels identify the routing participants.
     assert_eq!(
         inbound_note
             .properties
             .as_ref()
-            .and_then(|p| p.get("from"))
+            .and_then(|p| p.get("from_actor"))
             .and_then(|v| v.as_str()),
         Some("lambda:leo"),
-        "T3: inbound from must be lambda:leo"
+        "T3: inbound from_actor must be lambda:leo"
     );
     assert_eq!(
         inbound_note
             .properties
             .as_ref()
-            .and_then(|p| p.get("to"))
+            .and_then(|p| p.get("to_actor"))
             .and_then(|v| v.as_str()),
         Some("lambda:khive"),
-        "T3: inbound to must be lambda:khive"
+        "T3: inbound to_actor must be lambda:khive"
     );
     assert_eq!(
         inbound_note.content, "hello cross-ns",
@@ -2495,17 +2558,31 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         outbound_thread_id, inbound_thread_id,
         "T3: both copies must share thread_id"
     );
+
+    // No notes in the recipient namespace (lambda:khive).
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        khive_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
+        0,
+        "T3: no notes in recipient ns (lambda:khive) under ADR-057"
+    );
 }
 
-// T4 — inbound note's namespace column is the recipient namespace.
+// T4 — inbound note's namespace column is the SENDER namespace (ADR-057).
+// Under actor-addressed delivery both copies land in the caller's namespace.
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -2517,6 +2594,32 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
+    // ADR-057: inbound note is in the SENDER namespace (lambda:leo).
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_note = leo_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .find(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .expect("T4: must find inbound note in sender ns");
+    assert_eq!(
+        inbound_note.namespace.as_str(),
+        "lambda:leo",
+        "T4: inbound note namespace must be lambda:leo (sender ns) under ADR-057"
+    );
+
+    // No notes in the recipient namespace.
     let khive_tok = rt_khive
         .authorize(Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -2524,26 +2627,22 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .list_notes(&khive_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let inbound_note = khive_notes
-        .iter()
-        .find(|n| n.deleted_at.is_none())
-        .expect("T4: must find inbound note");
     assert_eq!(
-        inbound_note.namespace.as_str(),
-        "lambda:khive",
-        "T4: inbound note namespace must be lambda:khive (with_namespace stamped it)"
+        khive_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
+        0,
+        "T4: no notes in recipient ns (lambda:khive) under ADR-057"
     );
 }
 
-// T5 — recipient inbox sees the delivered message.
+// T5 — ADR-057: recipient inbox sees 0 messages (inbound is in sender ns, not recipient ns).
+// Both copies land in lambda:leo; lambda:khive cannot see them.
 #[tokio::test]
 async fn t5_recipient_inbox_sees_message() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -2555,30 +2654,29 @@ async fn t5_recipient_inbox_sees_message() {
         .await
         .expect("T5: send must succeed");
 
+    // ADR-057: recipient (lambda:khive) inbox is empty — inbound is in sender ns.
     let inbox = registry_khive
         .dispatch("comm.inbox", serde_json::json!({}))
         .await
         .expect("T5: inbox dispatch must succeed");
     let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     assert_eq!(
-        count, 1,
-        "T5: recipient inbox must contain exactly 1 message; got {count}"
+        count, 0,
+        "T5: recipient inbox must be empty under ADR-057 (inbound lives in sender ns); got {count}"
     );
-    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
-    let msg = &msgs[0];
+
+    // Both outbound + inbound copies are in the sender namespace (lambda:leo).
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let leo_alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
-        msg.get("properties")
-            .and_then(|p| p.get("from"))
-            .and_then(|v| v.as_str()),
-        Some("lambda:leo"),
-        "T5: inbox message from must be lambda:leo"
-    );
-    assert_eq!(
-        msg.get("properties")
-            .and_then(|p| p.get("read"))
-            .and_then(|v| v.as_bool()),
-        Some(false),
-        "T5: inbox message must be unread"
+        leo_alive, 2,
+        "T5: sender ns must hold both outbound + inbound copies; got {leo_alive}"
     );
 }
 
@@ -2696,21 +2794,13 @@ async fn t7_with_namespace_token_scoping() {
     }
 }
 
-// T8 — the sender's own namespace token cannot update or delete the inbound note
-// in the recipient namespace.
-//
-// This tests namespace isolation at the runtime layer: the sender's leo_tok
-// has namespace=lambda:leo and cannot mutate records owned by lambda:khive.
-// It does NOT test any property of the with_namespace token used internally by
-// the comm handler.
+// T8 — ADR-057: inbound note is in the SENDER namespace (lambda:leo).
+// Sender token CAN read the inbound (it's in their own ns). Recipient (lambda:khive)
+// has 0 notes and cannot see the inbound.
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
@@ -2722,7 +2812,38 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    // Find the inbound note UUID.
+    // ADR-057: inbound note is in SENDER namespace (lambda:leo).
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = leo_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .find(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .map(|n| n.id)
+        .expect("T8: must find inbound note in sender ns");
+
+    // Sender token CAN read the inbound note (it lives in their own ns).
+    let can_read = rt_leo
+        .get_note_including_deleted(&leo_tok, inbound_id)
+        .await;
+    match can_read {
+        Ok(Some(_)) => {}
+        Ok(None) => panic!("T8: sender token must be able to read own-ns inbound note"),
+        Err(e) => panic!("T8: unexpected error reading inbound note: {e:?}"),
+    }
+
+    // Recipient (lambda:khive) has 0 notes — inbound was never written to khive ns.
     let khive_tok = rt_khive
         .authorize(Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -2730,77 +2851,32 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .list_notes(&khive_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let inbound_id = khive_notes
-        .iter()
-        .find(|n| n.deleted_at.is_none())
-        .map(|n| n.id)
-        .expect("T8: must find inbound note");
-
-    // Attempt update via sender's leo token — must fail with NotFound (namespace mismatch).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
-        .unwrap();
-    let update_result = rt_leo
-        .update_note(
-            &leo_tok,
-            inbound_id,
-            NotePatch::new(None, None, None, None, None),
-        )
-        .await;
-    match update_result {
-        Err(khive_runtime::RuntimeError::NotFound(_)) => {}
-        Ok(_) => panic!("T8: update of cross-ns note from sender must return NotFound"),
-        Err(e) => panic!("T8: update returned unexpected error {e:?}"),
-    }
-
-    // Attempt delete via sender's leo token — must return Ok(false) (namespace mismatch, not deleted).
-    let delete_result = rt_leo.delete_note(&leo_tok, inbound_id, true).await;
-    match delete_result {
-        Ok(false) => {
-            // Expected: namespace mismatch; note not deleted.
-        }
-        Ok(true) => {
-            panic!("T8: delete of cross-ns note from sender must NOT succeed (returned true)")
-        }
-        Err(e) => panic!("T8: delete returned unexpected error {e:?}"),
-    }
-
-    // Verify the inbound note still exists in lambda:khive namespace.
-    let khive_tok2 = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let still_there = rt_khive
-        .list_notes(&khive_tok2, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let alive_after = still_there
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
     assert_eq!(
-        alive_after, 1,
-        "T8: inbound note must still exist after sender's failed delete attempt"
+        khive_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
+        0,
+        "T8: recipient ns (lambda:khive) must have 0 notes under ADR-057"
     );
 }
 
-// T9 — reply from recipient back to sender cross-ns when reply allowlist permits.
+// T9 — actor-addressed reply within a shared namespace (ADR-057).
+//
+// Under ADR-057 all messages land in the caller's namespace. To test reply
+// round-trip we use a single shared namespace so both "actors" can read each
+// other's messages. Leo sends to khive (both copies in shared ns). Leo then
+// replies to the inbound copy on behalf of khive (simulated by same registry),
+// verifying that the reply inherits the canonical thread_id.
 #[tokio::test]
 async fn t9_reply_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
-    // khive can reply to leo.
-    let (registry_khive, _rt_khive) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:khive",
-        vec![Namespace::parse("lambda:leo").unwrap()],
-    );
+    // Both actors share the same namespace so either can find the other's messages.
+    let (registry_shared, rt_shared) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:shared", vec![]);
 
-    // leo sends to khive.
-    let send_result = registry_leo
+    // "Leo" (operating as lambda:shared) sends to "khive".
+    let send_result = registry_shared
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "hello from leo" }),
@@ -2813,74 +2889,79 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T9: send must return full_id");
 
-    // Fetch the inbound note UUID (as seen from khive — both runtimes share the same backend).
-    let khive_tok = rt_leo
-        .authorize(Namespace::parse("lambda:khive").unwrap())
+    // Fetch the inbound note UUID (in the shared namespace).
+    let shared_tok = rt_shared
+        .authorize(Namespace::parse("lambda:shared").unwrap())
         .unwrap();
-    let khive_notes = rt_leo
-        .list_notes(&khive_tok, Some("message"), 100, 0)
+    let all_notes = rt_shared
+        .list_notes(&shared_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let inbound_id = khive_notes
+    let inbound_id = all_notes
         .iter()
-        .find(|n| n.deleted_at.is_none())
+        .filter(|n| n.deleted_at.is_none())
+        .find(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
         .map(|n| n.id.as_hyphenated().to_string())
-        .expect("T9: must find inbound note");
+        .expect("T9: must find inbound note in shared ns");
 
-    // khive replies to the inbound message.
-    let reply_result = registry_khive
+    // Reply to the inbound message using the same shared registry.
+    let reply_result = registry_shared
         .dispatch(
             "comm.reply",
-            serde_json::json!({ "id": inbound_id, "content": "got it from khive" }),
+            serde_json::json!({ "id": inbound_id, "content": "got it" }),
         )
         .await;
     assert!(
         reply_result.is_ok(),
-        "T9: reply cross-ns must succeed; got {reply_result:?}"
+        "T9: reply must succeed; got {reply_result:?}"
     );
+    let reply_val = reply_result.unwrap();
 
-    // leo's inbox now has the reply.
-    let leo_inbox = registry_leo
-        .dispatch("comm.inbox", serde_json::json!({}))
-        .await
-        .expect("T9: leo inbox");
-    let leo_count = leo_inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-    assert_eq!(
-        leo_count, 1,
-        "T9: leo inbox must contain the reply; got {leo_count}"
-    );
-
-    // Reply carries the same thread_id as the original.
-    let leo_msgs = leo_inbox
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .unwrap();
-    let reply_thread_id = leo_msgs[0]
-        .get("properties")
-        .and_then(|p| p.get("thread_id"))
+    // Reply carries the same thread_id as the original send.
+    let reply_thread_id = reply_val
+        .get("thread_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .expect("T9: reply must have thread_id");
+        .expect("T9: reply response must carry thread_id");
     assert_eq!(
         reply_thread_id, outbound_thread_id,
         "T9: reply thread_id must match original outbound UUID"
     );
+
+    // Four notes in shared ns: outbound1 + inbound1 + outbound2 (reply) + inbound2 (reply inbound).
+    let notes_after = rt_shared
+        .list_notes(&shared_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let alive = notes_after
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        alive, 4,
+        "T9: expect 4 notes after send + reply (2 outbound + 2 inbound); got {alive}"
+    );
 }
 
-// T10 — reply cross-ns is denied when the replier's allowlist is empty.
+// T10 — ADR-057: reply to a non-existent message ID fails with NotFound.
+// Under actor-addressed delivery, the inbound note is in the SENDER's namespace
+// (lambda:leo), not the recipient's (lambda:khive). A reply attempt by khive
+// using a random ID fails because the note is not visible in khive's namespace.
 #[tokio::test]
 async fn t10_reply_cross_ns_denied_when_empty() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
-    // khive has NO outbound allowlist (cannot reply cross-ns).
+    let (registry_leo, _rt_leo) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // leo sends to khive.
+    // leo sends to khive — both copies land in leo ns, khive ns gets nothing.
     registry_leo
         .dispatch(
             "comm.send",
@@ -2889,64 +2970,49 @@ async fn t10_reply_cross_ns_denied_when_empty() {
         .await
         .expect("T10: initial send must succeed");
 
-    // Fetch the inbound note UUID from khive's perspective.
-    let khive_tok = rt_leo
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_leo
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let inbound_id = khive_notes
-        .iter()
-        .find(|n| n.deleted_at.is_none())
-        .map(|n| n.id.as_hyphenated().to_string())
-        .expect("T10: must find inbound note");
-
-    // khive attempts to reply — must be denied.
+    // khive attempts to reply using a well-formed but non-existent UUID.
+    // The inbound note is in lambda:leo ns, invisible to lambda:khive registry.
+    let nonexistent_id = "00000000-0000-0000-0000-000000000000";
     let reply_result = registry_khive
         .dispatch(
             "comm.reply",
-            serde_json::json!({ "id": inbound_id, "content": "attempt blocked reply" }),
+            serde_json::json!({ "id": nonexistent_id, "content": "attempt reply to unknown" }),
         )
         .await;
     assert!(
         reply_result.is_err(),
-        "T10: reply with empty allowlist must be denied"
+        "T10: reply to non-existent message must fail"
     );
     let err_str = reply_result.unwrap_err().to_string();
     assert!(
-        err_str.contains("not permitted") || err_str.contains("PermissionDenied"),
-        "T10: error must indicate denial; got {err_str:?}"
+        err_str.contains("not found")
+            || err_str.contains("NotFound")
+            || err_str.contains("no record"),
+        "T10: error must indicate not found; got {err_str:?}"
     );
 }
 
-// T11 — outbound note is rolled back when inbound write fails (cross-ns path).
-//
-// The rollback code in dual_write_message (message.rs, `delete_note` on inbound error)
-// is the same code path for both same-ns and cross-ns sends. The existing test
-// `test_send_inbound_failure_rolls_back_outbound` confirms rollback for format-invalid
-// namespace (failure before outbound note creation). Here we confirm the same rollback
-// guarantee for the cross-ns path by verifying no partial state remains when the
-// send is denied at the allowlist check (failure also before outbound note creation).
-//
-// Note: contriving an inbound DB write failure after the outbound note is committed
-// requires mocking, which is out of scope for integration tests. The structural rollback
-// at message.rs:205-209 is not namespace-path-specific.
+// T11 — ADR-057: actor-addressed send always succeeds (allowlist no longer gates comm.send).
+// Even with an empty `allowed_outbound_namespaces`, the send produces 2 notes in sender ns.
+// The rollback path (dual_write_message) is tested by T13/T14 via FTS/vector injection.
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]); // empty allowlist → denied
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
 
+    // ADR-057: send is actor-addressed and always succeeds regardless of allowlist.
     let result = registry_leo
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "rollback check" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed always succeeds" }),
         )
         .await;
-    assert!(result.is_err(), "T11: denied send must fail");
+    assert!(
+        result.is_ok(),
+        "T11: actor-addressed send must succeed; got {result:?}"
+    );
 
-    // No outbound note must remain (atomicity: outbound not yet created when denial fires).
+    // Both outbound + inbound copies land in the sender namespace (lambda:leo).
     let leo_tok = rt_leo
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -2956,104 +3022,112 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         .unwrap();
     let alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
-        alive, 0,
-        "T11: no partial outbound note must remain; got {alive}"
-    );
-
-    let khive_tok = rt_leo
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_leo
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let khive_alive = khive_notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
-    assert_eq!(
-        khive_alive, 0,
-        "T11: no inbound note in recipient ns; got {khive_alive}"
+        alive, 2,
+        "T11: expect 1 outbound + 1 inbound in sender ns; got {alive}"
     );
 }
 
-// T12 — allowlist is directional: leo→khive allowed, but khive→leo denied when not listed.
+// T12 — ADR-057: both directions succeed (actor-addressed, allowlist no longer gates comm.send).
+// Each send produces 2 notes in the respective sender's namespace.
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
-    // leo lists khive.
-    let (_registry_leo, _rt_leo) = build_crossns_registry(
-        Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
-    );
-    // khive does NOT list leo.
-    let (registry_khive, _rt_khive) =
+    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result = registry_khive
+    // leo → khive: succeeds, 2 notes in leo ns.
+    let result_leo = registry_leo
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "leo to khive" }),
+        )
+        .await;
+    assert!(
+        result_leo.is_ok(),
+        "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
+    );
+
+    let leo_tok = rt_leo
+        .authorize(Namespace::parse("lambda:leo").unwrap())
+        .unwrap();
+    let leo_notes = rt_leo
+        .list_notes(&leo_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        leo_notes.iter().filter(|n| n.deleted_at.is_none()).count(),
+        2,
+        "T12: 2 notes (outbound+inbound) in leo ns after leo→khive send"
+    );
+
+    // khive → leo: also succeeds, 2 notes in khive ns.
+    let result_khive = registry_khive
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "reverse direction" }),
         )
         .await;
     assert!(
-        result.is_err(),
-        "T12: reverse cross-ns send must be denied when not in allowlist; got {result:?}"
+        result_khive.is_ok(),
+        "T12: khive→leo send must succeed under ADR-057; got {result_khive:?}"
+    );
+
+    let khive_tok = rt_khive
+        .authorize(Namespace::parse("lambda:khive").unwrap())
+        .unwrap();
+    let khive_notes = rt_khive
+        .list_notes(&khive_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        khive_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
+        2,
+        "T12: 2 notes (outbound+inbound) in khive ns after khive→leo send"
     );
 }
 
-// T13 — inbound FTS failure after row commit leaves no stranded row (isomorphic
-// to codex finding #3: the INBOUND path specifically).
+// T13 — FTS failure on outbound write leaves no stranded row (ADR-057 actor-addressed path).
 //
-// `dual_write_message` writes two notes: outbound (sender ns) then inbound
-// (recipient ns).  Finding #3 is about a stranded RECIPIENT row when the FTS
-// step fails after the inbound note row is committed.
+// Under ADR-057 both outbound and inbound copies land in the SENDER namespace.
+// `dual_write_message` writes outbound first (sender ns) then inbound (sender ns).
+// Arming FTS on the SENDER namespace causes the OUTBOUND create_note to fail:
+// create_note_inner commits the row, hits the injected FTS error, compensates
+// (deletes the outbound row), and propagates the error. dual_write_message returns
+// that error before the inbound write is attempted.
+// After the send returns an error, the sender namespace must have 0 live notes.
 //
-// Strategy: arm `arm_fts_fail` on the RECIPIENT namespace only.  The outbound
-// create_note (sender ns) runs first and is NOT targeted, so it succeeds.  The
-// inbound create_note (recipient ns) IS targeted: it commits the note row, hits
-// the injected FTS error, compensates (deletes the inbound row), and propagates
-// the error.  `dual_write_message` catches that error and rolls back the
-// outbound note.  After the send returns an error, BOTH namespaces must be empty.
-//
-// Namespace-targeting eliminates the cross-test race: concurrent tests using
-// other namespaces are unaffected by the injection.  `#[serial]` is not needed.
+// Namespace-targeting eliminates cross-test races. `#[serial]` is not needed.
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     use khive_runtime::arm_fts_fail;
 
-    // Use a unique recipient namespace so the injection does not affect
-    // concurrent tests that share the shared_backend().
     let sender_ns = "lambda:t13-sender";
     let recipient_ns = "lambda:t13-inbound-fail";
 
     let backend = shared_backend();
-    let (registry_sender, rt_sender) = build_crossns_registry(
-        Arc::clone(&backend),
-        sender_ns,
-        vec![Namespace::parse(recipient_ns).unwrap()],
-    );
-    let (_registry_recipient, rt_recipient) =
-        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), sender_ns, vec![]);
 
-    // Arm the FTS injection on the RECIPIENT namespace only.  The outbound
-    // create_note (sender_ns) passes through; only the inbound create_note
-    // (recipient_ns) triggers the injected error.
-    arm_fts_fail(recipient_ns);
+    // ADR-057: arm FTS injection on the SENDER namespace.
+    // The outbound create_note (sender_ns) triggers the injected error.
+    arm_fts_fail(sender_ns);
 
     let result = registry_sender
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": recipient_ns, "content": "t13 inbound-fail test" }),
+            serde_json::json!({ "to": recipient_ns, "content": "t13 fts-fail test" }),
         )
         .await;
     assert!(
         result.is_err(),
-        "T13: send must fail when inbound FTS injection is armed on recipient ns"
+        "T13: send must fail when FTS injection is armed on sender ns"
     );
 
-    // No outbound note must remain in the sender namespace.
+    // No note must remain in the sender namespace (outbound row compensated by create_note_inner).
     let sender_tok = rt_sender
         .authorize(Namespace::parse(sender_ns).unwrap())
         .unwrap();
@@ -3067,43 +3141,18 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
         .count();
     assert_eq!(
         sender_alive, 0,
-        "T13: no stranded outbound note in sender ns after inbound FTS failure; got {sender_alive}"
-    );
-
-    // No inbound note must remain in the recipient namespace.
-    let recipient_tok = rt_recipient
-        .authorize(Namespace::parse(recipient_ns).unwrap())
-        .unwrap();
-    let recipient_notes = rt_recipient
-        .list_notes(&recipient_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let recipient_alive = recipient_notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
-    assert_eq!(
-        recipient_alive, 0,
-        "T13: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
+        "T13: no stranded note in sender ns after FTS failure; got {sender_alive}"
     );
 }
 
-// T14 — inbound vector insertion failure after note row + FTS commit leaves no
-// stranded row (mirrors T13 but exercises the vector compensation path).
+// T14 — vector insertion failure on outbound write leaves no stranded row (ADR-057).
 //
-// Because `build_crossns_registry` configures no embedding model, the vector
-// insert path is unreachable without registering a provider.  T14 registers a
-// trivial constant-vector embedder on the sender and recipient runtimes so that
-// `embed_model_names` is non-empty, then arms `arm_vector_fail(recipient_ns)`.
-//
-// Execution path for the cross-ns send:
-//   outbound create_note (sender ns)   → FTS ok, embed ok, vector insert ok.
-//   inbound  create_note (recipient ns) → FTS ok, embed ok,
-//                                         vector inject fires → Err returned,
-//                                         compensation deletes inbound row + FTS.
-//   dual_write_message catches inbound error → rolls back outbound note.
-//
-// After send returns Err, both sender_ns and recipient_ns have zero live notes.
+// Under ADR-057 both copies land in the SENDER namespace. Arming vector fail on
+// the SENDER namespace causes the OUTBOUND create_note to fail after row + FTS
+// are committed: create_note_inner runs compensation (deletes row + FTS entry)
+// and returns an error. dual_write_message propagates that error before any
+// inbound write occurs.
+// After send returns Err, the sender namespace must have 0 live notes.
 #[tokio::test]
 async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     use async_trait::async_trait;
@@ -3149,35 +3198,29 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     let recipient_ns = "lambda:t14-vec-inbound-fail";
 
     let backend = shared_backend();
-    let (registry_sender, rt_sender) = build_crossns_registry(
-        Arc::clone(&backend),
-        sender_ns,
-        vec![Namespace::parse(recipient_ns).unwrap()],
-    );
-    let (_registry_recipient, rt_recipient) =
-        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), sender_ns, vec![]);
 
-    // Register the embedder on both runtimes so the vector path is exercised.
+    // Register the embedder on the sender runtime so the vector path is exercised.
     rt_sender.register_embedder(T14VecProvider);
-    rt_recipient.register_embedder(T14VecProvider);
 
-    // Arm vector injection on the RECIPIENT namespace only.  The outbound
-    // create_note (sender_ns) passes through; only the inbound create_note
-    // (recipient_ns) hits the injected error after its row and FTS are committed.
-    arm_vector_fail(recipient_ns);
+    // ADR-057: arm vector injection on the SENDER namespace.
+    // The outbound create_note (sender_ns) hits the injected error after row + FTS commit;
+    // create_note_inner compensates (deletes row + FTS), returns error.
+    arm_vector_fail(sender_ns);
 
     let result = registry_sender
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": recipient_ns, "content": "t14 vec-inbound-fail test" }),
+            serde_json::json!({ "to": recipient_ns, "content": "t14 vec-fail test" }),
         )
         .await;
     assert!(
         result.is_err(),
-        "T14: send must fail when inbound vector injection is armed on recipient ns"
+        "T14: send must fail when vector injection is armed on sender ns"
     );
 
-    // No outbound note must remain in the sender namespace.
+    // No note must remain in the sender namespace.
     let sender_tok = rt_sender
         .authorize(Namespace::parse(sender_ns).unwrap())
         .unwrap();
@@ -3190,27 +3233,8 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
         .filter(|n| n.deleted_at.is_none())
         .count();
     assert_eq!(
-        sender_alive,
-        0,
-        "T14: no stranded outbound note in sender ns after inbound vector failure; got {sender_alive}"
-    );
-
-    // No inbound note must remain in the recipient namespace.
-    let recipient_tok = rt_recipient
-        .authorize(Namespace::parse(recipient_ns).unwrap())
-        .unwrap();
-    let recipient_notes = rt_recipient
-        .list_notes(&recipient_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let recipient_alive = recipient_notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
-    assert_eq!(
-        recipient_alive,
-        0,
-        "T14: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
+        sender_alive, 0,
+        "T14: no stranded note in sender ns after vector failure; got {sender_alive}"
     );
 }
 

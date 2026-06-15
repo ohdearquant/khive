@@ -13,13 +13,20 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// condition is always satisfied and the index is eligible.
 /// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
 /// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
         WHERE deleted_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_comm_message_thread \
         ON notes(namespace, kind, json_extract(properties, '$.thread_id'), created_at DESC) \
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor \
+        ON notes(namespace, kind, \
+        json_extract(properties, '$.to_actor'), \
+        json_extract(properties, '$.direction'), \
+        json_extract(properties, '$.read'), \
+        created_at DESC) \
         WHERE deleted_at IS NULL",
 ];
 
@@ -34,7 +41,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 5] = [
                 name: "to",
                 param_type: "string",
                 required: true,
-                description: "Recipient namespace (e.g. \"lambda:leo\"). Must not be empty.",
+                description: "Actor label to send to (e.g. \"lambda:leo\"). Both copies land in the caller's namespace; no cross-namespace write occurs.",
             },
             ParamDef {
                 name: "content",
