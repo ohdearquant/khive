@@ -16,8 +16,8 @@ use khive_storage::EdgeRelation;
 use crate::config::ScoreBreakdown;
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, needs_multilingual, normalize_min_score, normalize_rank_fusion_scores,
-    normalize_rrf_scores, ScoreInput,
+    calculate_score, contains_cjk, needs_multilingual, normalize_min_score,
+    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
 };
 use crate::MemoryPack;
 
@@ -110,7 +110,9 @@ impl MemoryPack {
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
 
-        let is_cjk = scoring_cfg.enable_cjk_routing && needs_multilingual(query_trimmed);
+        let cjk_fts_bypass = scoring_cfg.enable_multilingual_routing && contains_cjk(query_trimmed);
+        let use_multilingual =
+            scoring_cfg.enable_multilingual_routing && needs_multilingual(query_trimmed);
 
         let candidate_limit =
             recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);
@@ -132,7 +134,8 @@ impl MemoryPack {
                 RecallCandidateParams {
                     candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
-                    is_cjk,
+                    cjk_fts_bypass,
+                    use_multilingual,
                     scoring_cfg: &scoring_cfg,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
@@ -157,7 +160,7 @@ impl MemoryPack {
             t_stage = Some(Instant::now());
         }
 
-        let actual_cjk_routed = candidates.cjk_routed;
+        let actual_multilingual_routed = candidates.multilingual_routed;
         let (memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
 
@@ -505,8 +508,8 @@ impl MemoryPack {
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }
-                if actual_cjk_routed {
-                    result["cjk_routed"] = json!(true);
+                if actual_multilingual_routed {
+                    result["multilingual_routed"] = json!(true);
                 }
                 result
             })

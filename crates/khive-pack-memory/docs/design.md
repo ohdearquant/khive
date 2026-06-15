@@ -55,8 +55,8 @@
   that model is preferred over other registered models.
 - CJK routing only activates when a multilingual model is actually present; detection falls
   back to all registered models when none is found, ensuring CJK queries still return results.
-- The model preference is configured via `ScoringConfig.cjk_model` or by matching registered
-  model names against known multilingual substrings.
+- The model preference is configured via `ScoringConfig.multilingual_model` or by matching
+  registered model names against known multilingual substrings.
 
 ### ADR-002: Edge Ontology — Supersedes Suppression
 

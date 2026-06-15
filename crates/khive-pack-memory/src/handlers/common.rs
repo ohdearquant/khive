@@ -280,8 +280,8 @@ pub(super) struct RecallCandidateSet {
     pub(super) text_hits: Vec<TextSearchHit>,
     /// One entry per embedding model: (model_name, hits).
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
-    /// True when CJK routing was requested AND a multilingual model was found.
-    pub(super) cjk_routed: bool,
+    /// True when multilingual dense routing was requested AND a multilingual model was found.
+    pub(super) multilingual_routed: bool,
 }
 
 impl RecallCandidateSet {
@@ -336,7 +336,10 @@ pub(super) struct CandidateMeta {
 pub(super) struct RecallCandidateParams<'a> {
     pub(super) candidate_limit: u32,
     pub(super) embedding_model: Option<&'a str>,
-    pub(super) is_cjk: bool,
+    /// Route the FTS path through the CJK-bypass tokenizer. Keyed on `contains_cjk`.
+    pub(super) cjk_fts_bypass: bool,
+    /// Route the dense/vector path to the multilingual model. Keyed on `needs_multilingual`.
+    pub(super) use_multilingual: bool,
     pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
@@ -345,13 +348,14 @@ pub(super) struct RecallCandidateParams<'a> {
 pub(super) struct RecallVectorCandidateParams<'a> {
     pub(super) candidate_limit: u32,
     pub(super) embedding_model: Option<&'a str>,
-    pub(super) is_cjk: bool,
+    /// Route the dense/vector path to the multilingual model. Keyed on `needs_multilingual`.
+    pub(super) use_multilingual: bool,
     pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
 }
 
 pub(super) struct RecallVectorCandidateResult {
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
-    pub(super) cjk_routed: bool,
+    pub(super) multilingual_routed: bool,
 }
 
 pub(super) fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
@@ -523,7 +527,7 @@ impl MemoryPack {
         ns: &str,
         candidate_limit: u32,
         snippet_policy: TextSnippetPolicy,
-        is_cjk: bool,
+        cjk_fts_bypass: bool,
         fts_gather: &crate::config::RecallFtsGatherConfig,
     ) -> Result<Vec<TextSearchHit>, RuntimeError> {
         let terms = recall_text_terms(query);
@@ -542,7 +546,7 @@ impl MemoryPack {
                 ns,
                 candidate_limit,
                 snippet_policy,
-                is_cjk,
+                cjk_fts_bypass,
                 fts_gather,
                 &terms,
             )
@@ -583,7 +587,8 @@ impl MemoryPack {
         let RecallCandidateParams {
             candidate_limit,
             embedding_model,
-            is_cjk,
+            cjk_fts_bypass,
+            use_multilingual,
             scoring_cfg,
             snippet_policy,
             fts_gather,
@@ -610,7 +615,7 @@ impl MemoryPack {
                 &primary_ns,
                 candidate_limit,
                 snippet_policy,
-                is_cjk,
+                cjk_fts_bypass,
                 fts_gather,
             );
             let vector_fut = self.collect_recall_vector_hits(
@@ -620,7 +625,7 @@ impl MemoryPack {
                 RecallVectorCandidateParams {
                     candidate_limit,
                     embedding_model,
-                    is_cjk,
+                    use_multilingual,
                     scoring_cfg,
                 },
             );
@@ -629,7 +634,7 @@ impl MemoryPack {
                 namespace: primary_ns,
                 text_hits,
                 vector_hits_per_model: vector_result.vector_hits_per_model,
-                cjk_routed: vector_result.cjk_routed,
+                multilingual_routed: vector_result.multilingual_routed,
             });
         }
 
@@ -653,7 +658,7 @@ impl MemoryPack {
                     ns_str,
                     candidate_limit,
                     snippet_policy,
-                    is_cjk,
+                    cjk_fts_bypass,
                     fts_gather,
                 )
                 .await?;
@@ -668,7 +673,7 @@ impl MemoryPack {
                 RecallVectorCandidateParams {
                     candidate_limit,
                     embedding_model,
-                    is_cjk,
+                    use_multilingual,
                     scoring_cfg,
                 },
             )
@@ -678,7 +683,7 @@ impl MemoryPack {
             namespace: primary_ns,
             text_hits: all_text_hits,
             vector_hits_per_model: vector_result.vector_hits_per_model,
-            cjk_routed: vector_result.cjk_routed,
+            multilingual_routed: vector_result.multilingual_routed,
         })
     }
 
@@ -693,22 +698,22 @@ impl MemoryPack {
         let RecallVectorCandidateParams {
             candidate_limit,
             embedding_model,
-            is_cjk,
+            use_multilingual,
             scoring_cfg,
         } = opts;
         let prof = recall_profile_enabled();
         let call_id = PROF_CID.with(|c| c.get());
 
-        let mut cjk_routed = false;
+        let mut multilingual_routed = false;
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
             let names = self.runtime.registered_embedding_model_names();
             if names.is_empty() {
                 vec![]
-            } else if is_cjk {
+            } else if use_multilingual {
                 let multilingual_model = scoring_cfg
-                    .cjk_model
+                    .multilingual_model
                     .as_deref()
                     .and_then(|m| names.iter().find(|n| n.as_str() == m).cloned())
                     .or_else(|| {
@@ -719,7 +724,7 @@ impl MemoryPack {
                     });
                 match multilingual_model {
                     Some(model) => {
-                        cjk_routed = true;
+                        multilingual_routed = true;
                         vec![model]
                     }
                     None => names,
@@ -896,7 +901,7 @@ impl MemoryPack {
 
         Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
-            cjk_routed,
+            multilingual_routed,
         })
     }
 
