@@ -2092,6 +2092,7 @@ async fn test_inbox_read_filter_json_type_truth_table() {
             },
         ],
         order_by: None,
+        ..Default::default()
     };
     let unread_page = store
         .query_notes_filtered("local", &unread_filter, PageRequest::default())
@@ -2140,6 +2141,7 @@ async fn test_inbox_read_filter_json_type_truth_table() {
             },
         ],
         order_by: None,
+        ..Default::default()
     };
     let read_page = store
         .query_notes_filtered("local", &read_filter, PageRequest::default())

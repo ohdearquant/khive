@@ -68,14 +68,17 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if note.namespace == token.namespace().as_str() {
+            if token
+                .visible_namespace_strs()
+                .contains(&note.namespace.as_str())
+            {
                 let note_val = normalize_entity_timestamps(to_json(&note)?);
                 let remapped = remap_note_status(note_val);
                 return flatten_get_result("note", remapped);
             }
         }
 
-        if let Some(edge) = self.runtime.get_edge(graph_token, id).await? {
+        if let Some(edge) = self.runtime.get_edge_visible(token, id).await? {
             return flatten_get_result("edge", to_json(&edge)?);
         }
 
@@ -86,7 +89,10 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if event.namespace == token.namespace().as_str() {
+            if token
+                .visible_namespace_strs()
+                .contains(&event.namespace.as_str())
+            {
                 return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
             }
         }

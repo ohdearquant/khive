@@ -267,6 +267,8 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
+    /// Extra readable namespaces threaded into dispatch tokens.
+    visible_namespaces: Vec<Namespace>,
     /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
@@ -289,9 +291,19 @@ impl VerbRegistryBuilder {
             packs: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
+            visible_namespaces: vec![],
             event_store: None,
             dispatch_hook: None,
         }
+    }
+
+    /// Set the extra readable namespaces threaded into dispatch tokens.
+    ///
+    /// These are the namespaces from `actor.visible_namespaces` in `khive.toml`.
+    /// The primary namespace is always readable and need not appear here.
+    pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
+        self.visible_namespaces = ns;
+        self
     }
 
     /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
@@ -449,6 +461,7 @@ impl VerbRegistryBuilder {
             packs: Arc::new(ordered_packs),
             gate: self.gate,
             default_namespace: self.default_namespace,
+            visible_namespaces: self.visible_namespaces,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -576,6 +589,8 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
+    /// Extra readable namespaces for dispatch tokens (from `actor.visible_namespaces`).
+    visible_namespaces: Vec<Namespace>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -747,9 +762,11 @@ impl VerbRegistry {
 
         // Mint the authorized namespace token at the dispatch boundary.
         // ns_str was already validated above when building the gate request.
-        let token = NamespaceToken::mint_authorized(
-            Namespace::parse(&ns_str)
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?,
+        let primary = Namespace::parse(&ns_str)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+        let token = NamespaceToken::mint_with_visibility(
+            primary,
+            self.visible_namespaces.clone(),
             ActorRef::anonymous(),
         );
 

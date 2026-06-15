@@ -330,6 +330,25 @@ impl KhiveRuntime {
     /// The fused candidate set is kept untruncated until after the alive + kind filter so
     /// that right-kind hits ranked below `limit` in the raw fusion still surface when
     /// higher-ranked candidates are wrong-kind or soft-deleted.
+    ///
+    /// # Cross-namespace visibility (Phase 1.5 limitation — primary namespace only)
+    ///
+    /// Both the **FTS leg** and the **vector/ANN leg** are currently restricted to
+    /// the **primary namespace only** for search.
+    ///
+    /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
+    /// and a separate ANN index instance. Cross-namespace fanout requires iterating
+    /// over every visible namespace's store, issuing parallel search requests, and
+    /// fusing the results — this is deferred to Phase 1.5.
+    ///
+    /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
+    /// which limits results to those namespaces within the primary store. Because
+    /// entities from extra namespaces live in their own FTS tables, this filter has
+    /// no cross-namespace effect today.
+    ///
+    /// Callers with a multi-namespace visible set can READ cross-namespace entities
+    /// directly via `get_entity` / `resolve`, but `hybrid_search` returns only
+    /// primary-namespace hits until Phase 1.5 cross-namespace fanout ships.
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,
@@ -342,14 +361,18 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = token.namespace().as_str().to_owned();
+        let visible_ns: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let text_hits = self
             .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
                 filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
+                    namespaces: visible_ns.clone(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -387,6 +410,7 @@ impl KhiveRuntime {
                         ids: candidate_ids,
                         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
                         entity_types: entity_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
+                        namespaces: visible_ns,
                         ..EntityFilter::default()
                     },
                     PageRequest {

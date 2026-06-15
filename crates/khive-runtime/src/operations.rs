@@ -386,26 +386,26 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID, enforcing namespace isolation.
+    /// Retrieve an entity by ID, enforcing namespace visibility.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
-    /// different namespace (indistinguishable — no cross-namespace existence oracle).
+    /// Returns `Err(NotFound)` if the entity does not exist or its namespace is
+    /// not in the token's visible set (indistinguishable — no cross-namespace
+    /// existence oracle).
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
         let entity = self
             .entities(token)?
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
-        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
+        Self::ensure_namespace_visible(&entity.namespace, token)?;
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace isolation.
+    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace visibility.
     ///
-    /// Returns `Ok(Some(entity))` when the entity exists in the caller's namespace
-    /// regardless of `deleted_at`. Returns `Ok(None)` when the UUID was never created
-    /// or belongs to a different namespace. Callers use this to distinguish
-    /// "soft-deleted" from "never existed".
+    /// Returns `Ok(Some(entity))` when the entity exists in a namespace visible
+    /// to the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
+    /// was never created or is not visible to the caller.
     pub async fn get_entity_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -419,17 +419,17 @@ impl KhiveRuntime {
             Some(e) => e,
             None => return Ok(None),
         };
-        if entity.namespace != token.namespace().as_str() {
+        if Self::ensure_namespace_visible(&entity.namespace, token).is_err() {
             return Ok(None);
         }
         Ok(Some(entity))
     }
 
-    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace isolation.
+    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace visibility.
     ///
-    /// Returns `Ok(Some(note))` when the note exists in the caller's namespace regardless
-    /// of `deleted_at`. Returns `Ok(None)` when the UUID was never created or belongs to
-    /// a different namespace.
+    /// Returns `Ok(Some(note))` when the note exists in a namespace visible to
+    /// the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
+    /// was never created or is not visible to the caller.
     pub async fn get_note_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -439,7 +439,7 @@ impl KhiveRuntime {
             Some(n) => n,
             None => return Ok(None),
         };
-        if note.namespace != token.namespace().as_str() {
+        if Self::ensure_namespace_visible(&note.namespace, token).is_err() {
             return Ok(None);
         }
         Ok(Some(note))
@@ -474,18 +474,43 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Enforce that `record_ns` matches `caller_ns`.
+    /// Enforce that `record_ns` is within the caller's visible namespace set.
     ///
-    /// Returns `Err(NotFound)` when they differ — wrong-namespace
-    /// and absent UUIDs must be indistinguishable externally (no existence oracle).
-    pub(crate) fn ensure_namespace(record_ns: &str, caller_ns: &str) -> RuntimeResult<()> {
-        if record_ns == caller_ns {
+    /// Returns `Err(NotFound)` when the record namespace is not in the visible
+    /// set — wrong-namespace and absent UUIDs must be indistinguishable
+    /// externally (no existence oracle).
+    ///
+    /// When the visible set is a single entry equal to `caller_primary_ns`, this
+    /// is identical to the former strict-equality check (backward-compatible).
+    pub(crate) fn ensure_namespace(record_ns: &str, caller_primary_ns: &str) -> RuntimeResult<()> {
+        if record_ns == caller_primary_ns {
             return Ok(());
         }
         Err(RuntimeError::NotFound("not found in this namespace".into()))
     }
 
-    /// List entities in a namespace, optionally filtered by kind and entity_type.
+    /// Enforce that `record_ns` is a member of the token's visible namespace set.
+    ///
+    /// This is the multi-namespace-aware variant used when the token carries an
+    /// extended visibility set. For single-namespace tokens (visible == [primary])
+    /// this degenerates to the same strict-equality check as `ensure_namespace`.
+    pub(crate) fn ensure_namespace_visible(
+        record_ns: &str,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<()> {
+        for ns in token.visible_namespaces() {
+            if record_ns == ns.as_str() {
+                return Ok(());
+            }
+        }
+        Err(RuntimeError::NotFound("not found in this namespace".into()))
+    }
+
+    /// List entities visible to the token, optionally filtered by kind and entity_type.
+    ///
+    /// When the token carries a multi-namespace visible set, entities from all
+    /// visible namespaces are returned. When the visible set is `[primary]`
+    /// (the default) this behaves identically to the pre-visibility behaviour.
     pub async fn list_entities(
         &self,
         token: &NamespaceToken,
@@ -494,6 +519,11 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -503,6 +533,7 @@ impl KhiveRuntime {
                 Some(t) => vec![t.to_string()],
                 None => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         let page = self
@@ -524,7 +555,7 @@ impl KhiveRuntime {
     /// When `domain_tag` is Some, the query is restricted at the storage layer via
     /// `EntityFilter::tags_any` so the page result already reflects the domain
     /// constraint.  This avoids the silent truncation that occurs when filtering
-    /// post-page (K-3).
+    /// post-page (K-3). Multi-namespace visibility from the token is applied.
     pub async fn list_entities_tagged(
         &self,
         token: &NamespaceToken,
@@ -533,6 +564,11 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -542,6 +578,7 @@ impl KhiveRuntime {
                 Some(t) if !t.is_empty() => vec![t.to_string()],
                 _ => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         let page = self
@@ -561,12 +598,18 @@ impl KhiveRuntime {
     /// Count entities filtered by kind and optional domain tag.
     ///
     /// Used to report a meaningful `total` alongside a paginated listing (K-6).
+    /// Multi-namespace visibility from the token is applied.
     pub async fn count_entities_tagged(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
         domain_tag: Option<&str>,
     ) -> RuntimeResult<u64> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -576,6 +619,7 @@ impl KhiveRuntime {
                 Some(t) if !t.is_empty() => vec![t.to_string()],
                 _ => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         Ok(self
@@ -623,8 +667,8 @@ impl KhiveRuntime {
             ));
         }
         if relation == EdgeRelation::Annotates {
-            // Source must be a note in namespace.
-            match self.resolve(token, source_id).await? {
+            // Source must be a note in the primary namespace.
+            match self.resolve_primary(token, source_id).await? {
                 Some(Resolved::Note(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -643,8 +687,8 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            // Target may be any substrate (entity, note, event, or edge).
-            if !self.substrate_exists_in_ns(token, target_id).await? {
+            // Target may be any substrate (entity, note, event, or edge) — primary only.
+            if !self.substrate_exists_in_primary(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
                     "link target {target_id} not found in namespace"
                 )));
@@ -656,7 +700,7 @@ impl KhiveRuntime {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
             let rel_name = relation.as_str();
-            let src = match self.resolve(token, source_id).await? {
+            let src = match self.resolve_primary(token, source_id).await? {
                 Some(r) => r,
                 None => {
                     if self.get_edge(token, source_id).await?.is_some() {
@@ -669,7 +713,7 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            let tgt = match self.resolve(token, target_id).await? {
+            let tgt = match self.resolve_primary(token, target_id).await? {
                 Some(r) => r,
                 None => {
                     if self.get_edge(token, target_id).await?.is_some() {
@@ -728,10 +772,10 @@ impl KhiveRuntime {
             // restrictions (see base allowlist). Packs may extend the allowlist
             // additively via EDGE_RULES.
             //
-            // Strategy: resolve both endpoints once, consult pack rules; on
+            // Strategy: resolve both endpoints once (primary-only), consult pack rules; on
             // miss, fall through to the original base-rule error messages.
-            let src_res = self.resolve(token, source_id).await?;
-            let tgt_res = self.resolve(token, target_id).await?;
+            let src_res = self.resolve_primary(token, source_id).await?;
+            let tgt_res = self.resolve_primary(token, target_id).await?;
 
             if pack_rule_allows(
                 &self.pack_edge_rules(),
@@ -883,16 +927,37 @@ impl KhiveRuntime {
         Ok(persisted)
     }
 
-    /// Returns `true` if `id` resolves to a live substrate record in `namespace`.
+    /// Returns `true` if `id` resolves to a live substrate record in the
+    /// caller's visible namespace set.
     ///
-    /// Covers entity, note, event (via `resolve`) and edge (via `get_edge`).
-    /// A record that exists in a different namespace returns `false` (fail-closed).
+    /// Covers entity, note, event (via `resolve`) and edge (via `get_edge_visible`).
+    /// Only records that are accessible to the caller (primary or configured visible
+    /// namespaces) return `true`; absent or foreign-invisible records return `false`.
     pub(crate) async fn substrate_exists_in_ns(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<bool> {
         if self.resolve(token, id).await?.is_some() {
+            return Ok(true);
+        }
+        match self.get_edge_visible(token, id).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(RuntimeError::NotFound(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Returns `true` if `id` resolves to a live substrate record in the PRIMARY namespace only.
+    ///
+    /// Used from mutation endpoint validation where visible-set membership is not
+    /// sufficient — the record must belong to the caller's write namespace.
+    pub(crate) async fn substrate_exists_in_primary(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<bool> {
+        if self.resolve_primary(token, id).await?.is_some() {
             return Ok(true);
         }
         match self.get_edge(token, id).await {
@@ -952,7 +1017,14 @@ impl KhiveRuntime {
 
         query.direction =
             normalize_symmetric_direction(query.direction, query.relations.as_deref());
-        let mut hits = self.graph(token)?.neighbors(node_id, query).await?;
+        let mut hits = Vec::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let mut ns_hits = self.graph(&temp)?.neighbors(node_id, query.clone()).await?;
+            hits.append(&mut ns_hits);
+        }
+        hits.sort_by_key(|h| (h.node_id, h.edge_id));
+        hits.dedup_by_key(|h| (h.node_id, h.edge_id));
         self.enrich_neighbor_hits(token, &mut hits).await;
         // Filter out soft-deleted entity nodes (Fix 2).
         let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
@@ -984,7 +1056,12 @@ impl KhiveRuntime {
             return Ok(Vec::new());
         }
 
-        let mut paths = self.graph(token)?.traverse(request).await?;
+        let mut paths = Vec::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
+            paths.append(&mut ns_paths);
+        }
         self.enrich_path_nodes(token, &mut paths).await;
         // Filter out soft-deleted entity nodes from all path nodes (Fix 2).
         let all_node_ids: Vec<Uuid> = paths
@@ -1216,8 +1293,10 @@ impl KhiveRuntime {
         let ns = token.namespace().as_str();
 
         // Validate all annotates targets before any write (atomicity: all-or-nothing).
+        // Targets must be in the primary namespace — visible-set membership is not
+        // sufficient for mutation endpoint validation.
         for &target_id in &annotates {
-            if !self.substrate_exists_in_ns(token, target_id).await? {
+            if !self.substrate_exists_in_primary(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
                     "create_note annotates target {target_id} not found in namespace"
                 )));
@@ -1429,7 +1508,11 @@ impl KhiveRuntime {
         Ok(note)
     }
 
-    /// List notes, optionally filtered by kind.
+    /// List notes visible to the token, optionally filtered by kind.
+    ///
+    /// When the token carries a multi-namespace visible set, notes from all
+    /// visible namespaces are returned. When the visible set is `[primary]`
+    /// (the default) this behaves identically to the pre-visibility behaviour.
     pub async fn list_notes(
         &self,
         token: &NamespaceToken,
@@ -1437,11 +1520,35 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Note>> {
+        let visible = token.visible_namespaces();
+        if visible.len() == 1 {
+            // Fast path: single namespace — use the dedicated query_notes method.
+            let page = self
+                .notes(token)?
+                .query_notes(
+                    token.namespace().as_str(),
+                    kind,
+                    PageRequest {
+                        offset: offset.into(),
+                        limit,
+                    },
+                )
+                .await?;
+            return Ok(page.items);
+        }
+        // Multi-namespace path: use query_notes_filtered with the visible set.
+        use khive_storage::note::NoteFilter;
+        let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
+        let filter = NoteFilter {
+            kind: kind.map(|k| k.to_string()),
+            namespaces: ns_strs,
+            ..Default::default()
+        };
         let page = self
             .notes(token)?
-            .query_notes(
+            .query_notes_filtered(
                 token.namespace().as_str(),
-                kind,
+                &filter,
                 PageRequest {
                     offset: offset.into(),
                     limit,
@@ -1471,16 +1578,20 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
-        let ns = token.namespace().as_str().to_owned();
+        let visible_ns: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
 
-        // FTS5 over the notes index.
+        // FTS5 over the notes index — search all visible namespaces.
         let text_hits = self
             .text_for_notes(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
                 filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
+                    namespaces: visible_ns.clone(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -1692,8 +1803,6 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        let ns = token.namespace().as_str();
-
         // Entity: use the namespace-checked getter (errors on mismatch/absent).
         match self.get_entity(token, id).await {
             Ok(entity) => return Ok(Some(Resolved::Entity(entity))),
@@ -1701,14 +1810,49 @@ impl KhiveRuntime {
             Err(e) => return Err(e),
         }
 
-        // Note: storage get_note is ID-only — verify namespace after fetch.
+        // Note: storage get_note is ID-only — verify against visible set.
+        if let Some(note) = self.notes(token)?.get_note(id).await? {
+            if Self::ensure_namespace_visible(&note.namespace, token).is_ok() {
+                return Ok(Some(Resolved::Note(note)));
+            }
+        }
+
+        // Event: storage get_event is ID-only — verify against visible set.
+        if let Some(event) = self.events(token)?.get_event(id).await? {
+            if Self::ensure_namespace_visible(&event.namespace, token).is_ok() {
+                return Ok(Some(Resolved::Event(event)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve a UUID to its substrate kind using primary-namespace-only enforcement.
+    ///
+    /// Unlike `resolve`, never consults the visible set. Use from mutation validation
+    /// paths (link, annotate, build_edge) where strict primary ownership is required.
+    pub async fn resolve_primary(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        let ns = token.namespace().as_str();
+
+        // Entity: primary-only check (exclude entities in visible-only namespaces).
+        if let Some(entity) = self.entities(token)?.get_entity(id).await? {
+            if Self::ensure_namespace(&entity.namespace, ns).is_ok() {
+                return Ok(Some(Resolved::Entity(entity)));
+            }
+        }
+
+        // Note: primary-only check.
         if let Some(note) = self.notes(token)?.get_note(id).await? {
             if Self::ensure_namespace(&note.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Note(note)));
             }
         }
 
-        // Event: storage get_event is ID-only — verify namespace after fetch.
+        // Event: primary-only check.
         if let Some(event) = self.events(token)?.get_event(id).await? {
             if Self::ensure_namespace(&event.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Event(event)));
@@ -1876,9 +2020,12 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ns = token.namespace().as_str();
         let ast = khive_query::parse_auto(query)?;
-        opts.scopes = vec![ns.to_string()];
+        opts.scopes = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_string())
+            .collect();
         let compiled = khive_query::compile(&ast, &opts)?;
         let warnings = compiled.warnings;
 
@@ -2026,6 +2173,41 @@ impl KhiveRuntime {
         Ok(self.graph(token)?.get_edge(LinkId::from(edge_id)).await?)
     }
 
+    /// Fetch a single edge by id from any namespace in the token's visible set.
+    ///
+    /// Returns `Ok(None)` when the edge is absent or its namespace is not in the
+    /// visible set. Used by read paths (e.g. `get` verb) so that a caller with
+    /// cross-namespace visibility can retrieve edges from non-primary namespaces.
+    pub async fn get_edge_visible(
+        &self,
+        token: &NamespaceToken,
+        edge_id: Uuid,
+    ) -> RuntimeResult<Option<Edge>> {
+        let mut reader = self.sql().reader().await?;
+        let record_ns = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT namespace FROM graph_edges \
+                      WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(edge_id.to_string())],
+                label: Some("get_edge_visible_namespace".into()),
+            })
+            .await?;
+        let Some(SqlValue::Text(record_ns)) = record_ns else {
+            return Ok(None);
+        };
+        if Self::ensure_namespace_visible(&record_ns, token).is_err() {
+            return Ok(None);
+        }
+        // Re-use the primary-namespace graph store; the edge row is already confirmed
+        // visible so the namespace token is just used for backend routing here.
+        let temp = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        Ok(self.graph(&temp)?.get_edge(LinkId::from(edge_id)).await?)
+    }
+
     /// Fetch an edge by UUID including soft-deleted rows, returning `None` if absent or if the
     /// record belongs to a different namespace. Used by the hard-delete path so that a
     /// soft-deleted primary edge can still be purged via its edge ID.
@@ -2064,18 +2246,26 @@ impl KhiveRuntime {
         limit: u32,
     ) -> RuntimeResult<Vec<Edge>> {
         let limit = limit.clamp(1, 1000);
-        let page = self
-            .graph(token)?
-            .query_edges(
-                filter.into(),
-                vec![SortOrder {
-                    field: EdgeSortField::CreatedAt,
-                    direction: khive_storage::types::SortDirection::Asc,
-                }],
-                PageRequest { offset: 0, limit },
-            )
-            .await?;
-        Ok(page.items)
+        let mut results = Vec::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let page = self
+                .graph(&temp)?
+                .query_edges(
+                    filter.clone().into(),
+                    vec![SortOrder {
+                        field: EdgeSortField::CreatedAt,
+                        direction: khive_storage::types::SortDirection::Asc,
+                    }],
+                    PageRequest { offset: 0, limit },
+                )
+                .await?;
+            results.extend(page.items);
+        }
+        results.sort_by_key(|e| Uuid::from(e.id));
+        results.dedup_by_key(|e| Uuid::from(e.id));
+        results.truncate(limit as usize);
+        Ok(results)
     }
 
     /// Patch-style edge update. Only `Some(_)` fields are applied.
@@ -3069,6 +3259,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(just_extends, 1);
+    }
+
+    // ---- Finding 4 regression: substrate_exists_in_ns must use get_edge_visible ----
+
+    /// An edge owned by a visible (non-primary) namespace must be found by
+    /// `substrate_exists_in_ns` and therefore usable as a graph root in
+    /// `neighbors` and `traverse`.
+    #[tokio::test]
+    async fn edge_in_visible_namespace_reachable_as_graph_root() {
+        let rt = rt();
+        let ns_a = Namespace::parse("vis-edge-a").unwrap();
+        let ns_b = Namespace::parse("vis-edge-b").unwrap();
+
+        // Create two entities and an edge in namespace B.
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+        let src = rt
+            .create_entity(&tok_b, "concept", None, "SrcB", None, None, vec![])
+            .await
+            .unwrap();
+        let tgt = rt
+            .create_entity(&tok_b, "concept", None, "TgtB", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok_b, src.id, tgt.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Namespace A with B in its visible set should be able to get the
+        // edge and use it as a traverse root.
+        let tok_a_vis = rt
+            .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+            .unwrap();
+
+        // Direct get of the edge must succeed (visible namespace).
+        let got = rt.get_edge_visible(&tok_a_vis, edge.id.0).await.unwrap();
+        assert!(
+            got.is_some(),
+            "edge in visible namespace must be retrievable via get_edge_visible"
+        );
+
+        // neighbors/traverse use substrate_exists_in_ns which now calls
+        // get_edge_visible — they must not return empty for a visible-ns edge root.
+        let neighbors = rt
+            .neighbors(&tok_a_vis, src.id, Direction::Out, Some(16), None)
+            .await
+            .unwrap();
+        assert!(
+            neighbors.iter().any(|h| h.node_id == tgt.id),
+            "neighbors of visible-ns node must include its visible-ns neighbor; got: {neighbors:?}"
+        );
     }
 
     #[tokio::test]

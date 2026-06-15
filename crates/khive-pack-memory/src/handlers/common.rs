@@ -588,34 +588,95 @@ impl MemoryPack {
             snippet_policy,
             fts_gather,
         } = opts;
-        let ns = token.namespace().as_str().to_string();
 
-        let text_fut = self.collect_recall_text_hits(
-            token,
-            query,
-            &ns,
-            candidate_limit,
-            snippet_policy,
-            is_cjk,
-            fts_gather,
-        );
-        let vector_fut = self.collect_recall_vector_hits(
-            token,
-            query,
-            &ns,
-            RecallVectorCandidateParams {
+        // FTS recall fans out across all visible namespaces by iterating each
+        // namespace's own FTS virtual table (fts_notes_{ns}) — there is NO global
+        // FTS table and TextFilter.namespaces does NOT yield cross-namespace hits.
+        // Each namespace is selected by minting a token via token.with_namespace(ns)
+        // (see multi-namespace fanout path below at line 633+).
+        //
+        // Phase-1.5 limitation: vector/ANN recall stays primary-namespace-only.
+        // Each namespace owns a separate ANN index instance; cross-namespace
+        // recall on the vector path requires fanout+fusion across index instances,
+        // which is deferred to a follow-up PR.
+        let visible = token.visible_namespace_strs();
+        let primary_ns = token.namespace().as_str().to_string();
+
+        // For single-namespace (common case) take the fast path.
+        if visible.len() <= 1 {
+            let text_fut = self.collect_recall_text_hits(
+                token,
+                query,
+                &primary_ns,
                 candidate_limit,
-                embedding_model,
+                snippet_policy,
                 is_cjk,
-                scoring_cfg,
-            },
-        );
+                fts_gather,
+            );
+            let vector_fut = self.collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    is_cjk,
+                    scoring_cfg,
+                },
+            );
+            let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+            return Ok(RecallCandidateSet {
+                namespace: primary_ns,
+                text_hits,
+                vector_hits_per_model: vector_result.vector_hits_per_model,
+                cjk_routed: vector_result.cjk_routed,
+            });
+        }
 
-        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        // Multi-namespace: fanout FTS across all visible namespaces.
+        //
+        // Each namespace has its own FTS virtual table (fts_notes_{ns}); we must
+        // select that table by minting a token whose primary namespace matches the
+        // target namespace. `token.with_namespace` creates such a token while
+        // preserving the actor context.
+        let mut all_text_hits = Vec::new();
+        for ns_str in &visible {
+            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
+                Ok(ns) => ns,
+                Err(_) => continue,
+            };
+            let ns_token = token.with_namespace(ns_parsed);
+            let hits = self
+                .collect_recall_text_hits(
+                    &ns_token,
+                    query,
+                    ns_str,
+                    candidate_limit,
+                    snippet_policy,
+                    is_cjk,
+                    fts_gather,
+                )
+                .await?;
+            all_text_hits.extend(hits);
+        }
+        // Vector recall stays in primary namespace (single index).
+        let vector_result = self
+            .collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    is_cjk,
+                    scoring_cfg,
+                },
+            )
+            .await?;
 
         Ok(RecallCandidateSet {
-            namespace: ns,
-            text_hits,
+            namespace: primary_ns,
+            text_hits: all_text_hits,
             vector_hits_per_model: vector_result.vector_hits_per_model,
             cjk_routed: vector_result.cjk_routed,
         })

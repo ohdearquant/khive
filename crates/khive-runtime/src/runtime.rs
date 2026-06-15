@@ -155,6 +155,7 @@ impl KhiveRuntime {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         })
     }
 
@@ -164,6 +165,14 @@ impl KhiveRuntime {
     /// to identify which backend owns a given node, and to detect cross-backend merges.
     pub fn backend_id(&self) -> &BackendId {
         &self.config.backend_id
+    }
+
+    /// Return the extra-visible namespaces from config (beyond the primary).
+    ///
+    /// Used by pack dispatch to mint tokens that can read across namespaces
+    /// configured in `actor.visible_namespaces` in `khive.toml`.
+    pub fn visible_namespaces(&self) -> &[Namespace] {
+        &self.config.visible_namespaces
     }
 
     /// Return a reference to the runtime config.
@@ -305,6 +314,10 @@ impl KhiveRuntime {
     /// `AllowAllGate` this always succeeds. When a real policy-backed gate is
     /// installed, this method enforces it and returns `PermissionDenied` on
     /// denial.
+    ///
+    /// The returned token's read visibility set defaults to `[ns]` — identical
+    /// to the pre-visibility-set behaviour. Use [`authorize_with_visibility`]
+    /// to mint a token that can read additional namespaces.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
         let actor = ActorRef::anonymous();
         let req = GateRequest::new(
@@ -325,6 +338,63 @@ impl KhiveRuntime {
                     }
                 }
                 Ok(NamespaceToken::mint_authorized(ns, actor))
+            }
+            Ok(khive_gate::GateDecision::Deny { reason }) => {
+                Err(crate::RuntimeError::PermissionDenied {
+                    verb: "authorize".to_string(),
+                    reason,
+                })
+            }
+            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
+                verb: "authorize".to_string(),
+                reason: "gate denied".to_string(),
+            }),
+            Err(e) => Err(crate::RuntimeError::Internal(format!("gate error: {e}"))),
+        }
+    }
+
+    /// Mint an authorization token with an explicit read-visibility set.
+    ///
+    /// `primary` is the **write namespace** — all records created via the
+    /// returned token land there. `extra_visible` lists additional namespaces
+    /// the token may read. The primary is always included in the visible set
+    /// regardless of `extra_visible`.
+    ///
+    /// Usage (lambda:leo reading both leo and khive namespaces):
+    /// ```rust,ignore
+    /// let tok = rt.authorize_with_visibility(
+    ///     Namespace::parse("lambda:leo").unwrap(),
+    ///     vec![Namespace::parse("lambda:khive").unwrap()],
+    /// )?;
+    /// ```
+    pub fn authorize_with_visibility(
+        &self,
+        primary: Namespace,
+        extra_visible: Vec<Namespace>,
+    ) -> RuntimeResult<NamespaceToken> {
+        let actor = ActorRef::anonymous();
+        let req = GateRequest::new(
+            actor.clone(),
+            primary.clone(),
+            "authorize",
+            serde_json::Value::Null,
+        );
+        match self.config.gate.check(&req) {
+            Ok(ref decision) if decision.is_allow() => {
+                if let khive_gate::GateDecision::Allow { ref obligations } = decision {
+                    if !obligations.is_empty() {
+                        tracing::debug!(
+                            namespace = %primary.as_str(),
+                            "authorize_with_visibility: obligations={:?}",
+                            obligations
+                        );
+                    }
+                }
+                Ok(NamespaceToken::mint_with_visibility(
+                    primary,
+                    extra_visible,
+                    actor,
+                ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
                 Err(crate::RuntimeError::PermissionDenied {
@@ -659,6 +729,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -677,6 +748,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::new("lore"),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -804,6 +876,7 @@ mod tests {
             actor: ActorConfig {
                 id: Some(id.to_string()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         }
@@ -820,6 +893,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -837,12 +911,14 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![],
             actor: ActorConfig {
                 id: Some(String::new()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };
@@ -865,6 +941,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -886,6 +963,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -898,6 +976,7 @@ mod tests {
             actor: ActorConfig {
                 id: Some("lambda:test".to_string()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };

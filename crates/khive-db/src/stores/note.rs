@@ -224,11 +224,31 @@ fn build_note_filter_where(
     namespace: &str,
     filter: &NoteFilter,
 ) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
-    let mut conditions = vec![
-        "namespace = ?1".to_string(),
-        "deleted_at IS NULL".to_string(),
-    ];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
+    // When filter.namespaces is non-empty use `namespace IN (...)` for
+    // multi-namespace read visibility. Otherwise fall back to equality.
+    let (ns_condition, ns_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        if !filter.namespaces.is_empty() {
+            let placeholders: Vec<String> = (1..=filter.namespaces.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = filter
+                .namespaces
+                .iter()
+                .map(|ns| -> Box<dyn rusqlite::types::ToSql> { Box::new(ns.clone()) })
+                .collect();
+            (
+                format!("namespace IN ({})", placeholders.join(", ")),
+                params,
+            )
+        } else {
+            (
+                "namespace = ?1".to_string(),
+                vec![Box::new(namespace.to_string())],
+            )
+        };
+
+    let mut conditions = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if let Some(kind) = &filter.kind {
         params.push(Box::new(kind.clone()));

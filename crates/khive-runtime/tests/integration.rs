@@ -570,6 +570,7 @@ async fn file_backed_runtime_persists() {
             backend_id: khive_runtime::BackendId::main(),
             additional_embedding_models: vec![],
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -589,6 +590,7 @@ async fn file_backed_runtime_persists() {
             backend_id: khive_runtime::BackendId::main(),
             additional_embedding_models: vec![],
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -1076,6 +1078,7 @@ mod embedder_registry_tests {
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         })
         .expect("in-memory runtime")
     }
@@ -1134,6 +1137,7 @@ mod embedder_registry_tests {
             packs: vec!["kg".to_string()],
             backend_id: khive_runtime::BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         })
         .expect("runtime with two models");
 
@@ -1874,4 +1878,442 @@ async fn update_edge_note_note_to_refutes_accepted() {
         .await
         .expect("update_edge note→note supports → refutes must be accepted");
     assert_eq!(updated.relation, EdgeRelation::Refutes);
+}
+
+// =============================================================================
+// Multi-namespace read visibility (visible-set tokens)
+// =============================================================================
+
+/// A token with visible=[a,b] can list/get entities+notes in both namespaces,
+/// but not in a third namespace c. Writes land in the primary (a) only.
+#[tokio::test]
+async fn visible_set_reads_primary_and_extra_not_third() {
+    let rt = rt();
+
+    // Mint single-namespace write tokens for three isolated namespaces.
+    let tok_a = rt.authorize(Namespace::parse("vis-a").unwrap()).unwrap();
+    let tok_b = rt.authorize(Namespace::parse("vis-b").unwrap()).unwrap();
+    let tok_c = rt.authorize(Namespace::parse("vis-c").unwrap()).unwrap();
+
+    // Write one entity and one note in each namespace.
+    let entity_a = rt
+        .create_entity(&tok_a, "concept", None, "EntityA", None, None, vec![])
+        .await
+        .unwrap();
+    let entity_b = rt
+        .create_entity(&tok_b, "concept", None, "EntityB", None, None, vec![])
+        .await
+        .unwrap();
+    let entity_c = rt
+        .create_entity(&tok_c, "concept", None, "EntityC", None, None, vec![])
+        .await
+        .unwrap();
+
+    let note_a = rt
+        .create_note(&tok_a, "observation", None, "NoteA", None, None, vec![])
+        .await
+        .unwrap();
+    let note_b = rt
+        .create_note(&tok_b, "observation", None, "NoteB", None, None, vec![])
+        .await
+        .unwrap();
+    let note_c = rt
+        .create_note(&tok_c, "observation", None, "NoteC", None, None, vec![])
+        .await
+        .unwrap();
+
+    // Mint a visible-set token: primary=vis-a, visible=[vis-a, vis-b].
+    let vis_tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("vis-a").unwrap(),
+            vec![Namespace::parse("vis-b").unwrap()],
+        )
+        .unwrap();
+
+    // --- list_entities sees a+b, not c ---
+    let visible_entities = rt.list_entities(&vis_tok, None, None, 50, 0).await.unwrap();
+    let entity_names: Vec<&str> = visible_entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(entity_names.contains(&"EntityA"), "EntityA must be visible");
+    assert!(entity_names.contains(&"EntityB"), "EntityB must be visible");
+    assert!(
+        !entity_names.contains(&"EntityC"),
+        "EntityC must NOT be visible"
+    );
+
+    // --- list_notes sees a+b, not c ---
+    let visible_notes = rt.list_notes(&vis_tok, None, 50, 0).await.unwrap();
+    let note_contents: Vec<&str> = visible_notes.iter().map(|n| n.content.as_str()).collect();
+    assert!(note_contents.contains(&"NoteA"), "NoteA must be visible");
+    assert!(note_contents.contains(&"NoteB"), "NoteB must be visible");
+    assert!(
+        !note_contents.contains(&"NoteC"),
+        "NoteC must NOT be visible"
+    );
+
+    // --- get_entity: a and b succeed, c returns NotFound ---
+    rt.get_entity(&vis_tok, entity_a.id)
+        .await
+        .expect("get entity_a must succeed");
+    rt.get_entity(&vis_tok, entity_b.id)
+        .await
+        .expect("get entity_b (visible non-primary) must succeed");
+    let err_c = rt.get_entity(&vis_tok, entity_c.id).await;
+    assert!(
+        err_c.is_err(),
+        "get entity_c (non-visible) must return NotFound"
+    );
+
+    // --- get_note: a and b visible, c filtered out ---
+    // get_note_including_deleted returns Ok(None) when namespace not visible.
+    let fetched_note_a = rt
+        .get_note_including_deleted(&vis_tok, note_a.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_a.is_some(),
+        "note_a (primary namespace) must be returned"
+    );
+
+    let fetched_note_b = rt
+        .get_note_including_deleted(&vis_tok, note_b.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_b.is_some(),
+        "note_b (visible non-primary) must be returned"
+    );
+
+    let fetched_note_c = rt
+        .get_note_including_deleted(&vis_tok, note_c.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_c.is_none(),
+        "note_c (non-visible namespace) must be filtered out"
+    );
+
+    // --- WRITE via vis_tok lands in primary (vis-a) only, not in vis-b ---
+    let written = rt
+        .create_entity(
+            &vis_tok,
+            "concept",
+            None,
+            "WrittenViaVisToken",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        written.namespace.as_str(),
+        "vis-a",
+        "write must stamp primary namespace, not any extra-visible one"
+    );
+
+    // Verify vis-b does not contain the newly written entity.
+    let b_entities = rt.list_entities(&tok_b, None, None, 50, 0).await.unwrap();
+    let b_names: Vec<&str> = b_entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !b_names.contains(&"WrittenViaVisToken"),
+        "write must NOT appear in vis-b"
+    );
+
+    // Suppress unused-variable warnings for IDs we intentionally only inserted.
+    let _ = note_a;
+    let _ = note_c;
+    let _ = entity_c;
+}
+
+/// Backward compatibility: a token minted via `authorize()` (no visibility)
+/// behaves exactly as before — single namespace, strict equality on reads/writes.
+/// This is the original namespace_isolation test reproduced verbatim to confirm
+/// nothing regressed.
+#[tokio::test]
+async fn namespace_isolation_backward_compat() {
+    let rt = rt();
+    let ns_a_tok = rt.authorize(Namespace::parse("bc-a").unwrap()).unwrap();
+    let ns_b_tok = rt.authorize(Namespace::parse("bc-b").unwrap()).unwrap();
+
+    rt.create_entity(&ns_a_tok, "concept", None, "EntityA", None, None, vec![])
+        .await
+        .unwrap();
+    rt.create_entity(&ns_b_tok, "concept", None, "EntityB", None, None, vec![])
+        .await
+        .unwrap();
+
+    let a_entities = rt
+        .list_entities(&ns_a_tok, None, None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(a_entities.len(), 1);
+    assert_eq!(a_entities[0].name, "EntityA");
+
+    let b_entities = rt
+        .list_entities(&ns_b_tok, None, None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(b_entities.len(), 1);
+    assert_eq!(b_entities[0].name, "EntityB");
+}
+
+// =============================================================================
+// Fix 4: visible-set token invariants (primary always included, no duplicates)
+// =============================================================================
+
+/// No extra-visible namespaces → visible set contains only the primary.
+#[test]
+fn mint_with_visibility_empty_extra_yields_primary_only() {
+    let rt = rt();
+    let tok = rt
+        .authorize_with_visibility(Namespace::parse("ns-primary-only").unwrap(), vec![])
+        .unwrap();
+
+    let vis = tok.visible_namespaces();
+    assert_eq!(vis.len(), 1, "primary only when no extras given");
+    assert_eq!(vis[0].as_str(), "ns-primary-only");
+    assert_eq!(tok.namespace().as_str(), "ns-primary-only");
+}
+
+/// When the primary is repeated in the extra list it must not appear twice.
+#[test]
+fn mint_with_visibility_deduplicates_primary_in_extras() {
+    let rt = rt();
+    let tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("ns-dedup").unwrap(),
+            vec![
+                Namespace::parse("ns-dedup").unwrap(),
+                Namespace::parse("ns-extra").unwrap(),
+            ],
+        )
+        .unwrap();
+
+    let vis = tok.visible_namespaces();
+    assert_eq!(vis.len(), 2, "primary counted once, one distinct extra");
+    assert_eq!(vis[0].as_str(), "ns-dedup");
+    assert_eq!(vis[1].as_str(), "ns-extra");
+}
+
+// =============================================================================
+// Fix 1: mutations confined to primary namespace; reads use visible set
+// =============================================================================
+
+/// A note written into an extra-visible namespace can be read back through
+/// the visible-set token (resolve uses the visible set for notes).
+#[tokio::test]
+async fn resolve_uses_visible_set_for_note_in_extra_namespace() {
+    let rt = rt();
+    let _tok_a = rt.authorize(Namespace::parse("res-a").unwrap()).unwrap();
+    let tok_b = rt.authorize(Namespace::parse("res-b").unwrap()).unwrap();
+
+    let note_b = rt
+        .create_note(&tok_b, "observation", None, "NoteInB", None, None, vec![])
+        .await
+        .unwrap();
+
+    // visible-set token: primary=res-a, sees res-b too.
+    let vis_tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("res-a").unwrap(),
+            vec![Namespace::parse("res-b").unwrap()],
+        )
+        .unwrap();
+
+    // get_note_including_deleted uses resolve() which should honour visible set.
+    let fetched = rt
+        .get_note_including_deleted(&vis_tok, note_b.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched.is_some(),
+        "note in extra-visible namespace must be readable via visible-set token"
+    );
+    assert_eq!(fetched.unwrap().content, "NoteInB");
+}
+
+/// A link whose target lives in the extra-visible (but not primary) namespace
+/// must be rejected — mutation endpoints must both be in the primary namespace.
+#[tokio::test]
+async fn link_refuses_target_in_visible_but_not_primary_namespace() {
+    let rt = rt();
+    let tok_a = rt
+        .authorize(Namespace::parse("link-mut-a").unwrap())
+        .unwrap();
+    let tok_b = rt
+        .authorize(Namespace::parse("link-mut-b").unwrap())
+        .unwrap();
+
+    let entity_a = rt
+        .create_entity(&tok_a, "concept", None, "SrcEntity", None, None, vec![])
+        .await
+        .unwrap();
+    let entity_b = rt
+        .create_entity(&tok_b, "concept", None, "TgtEntity", None, None, vec![])
+        .await
+        .unwrap();
+
+    // primary=link-mut-a, visible=[link-mut-a, link-mut-b].
+    // entity_b lives in link-mut-b (visible, not primary).
+    let vis_tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("link-mut-a").unwrap(),
+            vec![Namespace::parse("link-mut-b").unwrap()],
+        )
+        .unwrap();
+
+    let result = rt
+        .link(
+            &vis_tok,
+            entity_a.id,
+            entity_b.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "link with target in visible-only namespace must be rejected by mutation endpoint validation"
+    );
+}
+
+/// An annotates note whose annotated target lives in the extra-visible (but not
+/// primary) namespace must be rejected by create_note's mutation gate.
+#[tokio::test]
+async fn create_note_annotates_refuses_target_in_visible_only_namespace() {
+    let rt = rt();
+    let _tok_a = rt
+        .authorize(Namespace::parse("ann-mut-a").unwrap())
+        .unwrap();
+    let tok_b = rt
+        .authorize(Namespace::parse("ann-mut-b").unwrap())
+        .unwrap();
+
+    let entity_b = rt
+        .create_entity(&tok_b, "concept", None, "AnnotTarget", None, None, vec![])
+        .await
+        .unwrap();
+
+    // primary=ann-mut-a, visible=[ann-mut-a, ann-mut-b].
+    // entity_b lives in ann-mut-b (visible, not primary).
+    let vis_tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("ann-mut-a").unwrap(),
+            vec![Namespace::parse("ann-mut-b").unwrap()],
+        )
+        .unwrap();
+
+    let result = rt
+        .create_note(
+            &vis_tok,
+            "observation",
+            None,
+            "AnnotNote",
+            None,
+            None,
+            vec![entity_b.id],
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "annotates with target in visible-only namespace must be rejected"
+    );
+}
+
+// =============================================================================
+// Finding 5: hybrid_search cross-namespace Option B limitation documented + tested
+// =============================================================================
+
+/// Documents the Phase 1.5 limitation: `hybrid_search` is primary-namespace-only
+/// for both the FTS and vector legs (each namespace owns its own FTS table and
+/// ANN index; cross-namespace fanout is deferred to Phase 1.5).
+///
+/// This test verifies the actual current behavior:
+/// - The primary-namespace entity appears in results.
+/// - The extra-namespace entity does NOT appear in results (its FTS data lives
+///   in `fts_entities_{extra-ns}`, a separate table not queried here).
+///
+/// A caller with a visible set can READ the extra-namespace entity directly via
+/// `get_entity`, but `hybrid_search` does not surface it today.
+#[tokio::test]
+async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
+    let rt = rt();
+
+    let ns_primary = Namespace::parse("hs-primary-ns").unwrap();
+    let ns_extra = Namespace::parse("hs-extra-ns").unwrap();
+
+    let tok_primary = rt.authorize(ns_primary.clone()).unwrap();
+    let tok_extra = rt.authorize(ns_extra.clone()).unwrap();
+
+    // Create an entity in primary namespace with a distinctive term.
+    let entity_in_primary = rt
+        .create_entity(
+            &tok_primary,
+            "concept",
+            None,
+            "StellarPrimary",
+            Some("unique stellar primary concept"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Create an entity in the extra namespace with the same distinctive term.
+    let entity_in_extra = rt
+        .create_entity(
+            &tok_extra,
+            "concept",
+            None,
+            "StellarExtra",
+            Some("unique stellar extra concept"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Visible-set token: primary = hs-primary-ns, also sees hs-extra-ns.
+    let vis_tok = rt
+        .authorize_with_visibility(ns_primary.clone(), vec![ns_extra.clone()])
+        .unwrap();
+
+    // Search: FTS-only (no embedding model in test runtime).
+    // Current behavior: only primary-namespace results surface.
+    let hits = rt
+        .hybrid_search(&vis_tok, "stellar", None, 20, None, None)
+        .await
+        .unwrap();
+
+    let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+
+    // Primary entity must surface.
+    assert!(
+        hit_ids.contains(&entity_in_primary.id),
+        "hybrid_search must return entity from primary namespace; \
+         expected entity_id={}, got: {hit_ids:?}",
+        entity_in_primary.id,
+    );
+
+    // Extra-namespace entity does NOT surface — Phase 1.5 limitation.
+    // Each namespace has its own FTS table; cross-namespace FTS fanout is deferred.
+    assert!(
+        !hit_ids.contains(&entity_in_extra.id),
+        "hybrid_search must NOT return entity from extra (visible-only) namespace \
+         until Phase 1.5 cross-namespace fanout ships; \
+         entity_id={} unexpectedly appeared in: {hit_ids:?}",
+        entity_in_extra.id,
+    );
+
+    // Direct read of the extra-namespace entity via get_entity must still work
+    // (this proves the visible set wiring is correct — only search is primary-scoped).
+    let fetched = rt
+        .get_entity(&vis_tok, entity_in_extra.id)
+        .await
+        .expect("get_entity via visible-set token must return extra-namespace entity");
+    assert_eq!(
+        fetched.id, entity_in_extra.id,
+        "visible-set read of extra-namespace entity must succeed"
+    );
 }

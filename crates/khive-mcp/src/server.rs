@@ -52,13 +52,21 @@ pub fn compute_config_id(config: &RuntimeConfig) -> String {
         .map(|m| format!("{m:?}"))
         .collect();
     extra.sort();
+    let mut visible: Vec<String> = config
+        .visible_namespaces
+        .iter()
+        .map(|ns| ns.as_str().to_owned())
+        .collect();
+    visible.sort();
+    visible.dedup();
     format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?}",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}]",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
+        visible.join(","),
     )
 }
 
@@ -198,9 +206,11 @@ impl KhiveMcpServer {
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
         let config_id = compute_config_id(runtime.config());
+        let visible_namespaces = runtime.config().visible_namespaces.clone();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
+        builder.with_visible_namespaces(visible_namespaces);
         // Wire the EventStore into the registry for audit persistence.
         if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
             if let Ok(event_store) = runtime.events(&tok) {

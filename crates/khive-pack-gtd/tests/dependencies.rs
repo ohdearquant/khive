@@ -408,3 +408,104 @@ async fn assign_rejects_malformed_context_entity_id() {
         "error must echo the malformed value; got: {msg}"
     );
 }
+
+// ---- Finding 2 regression: depends_on and context_entity_id must be primary-only ----
+
+/// A task in a visible (non-primary) namespace must be treated as NotFound
+/// when referenced as a `depends_on` target.
+///
+/// This is a direct runtime-layer test: `resolve_primary` must return None
+/// for a foreign-visible note, while `resolve` (visible-aware) returns Some.
+/// The distinction is what the fixed code path relies on.
+#[tokio::test]
+async fn resolve_primary_rejects_visible_only_task() {
+    use khive_runtime::{KhiveRuntime, Namespace};
+
+    let rt = KhiveRuntime::memory().unwrap();
+
+    let ns_primary = Namespace::parse("dep-primary-ns").unwrap();
+    let ns_foreign = Namespace::parse("dep-foreign-ns").unwrap();
+
+    // Create a task in the foreign namespace.
+    let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
+    let foreign_task = rt
+        .create_note(
+            &tok_foreign,
+            "task",
+            Some("foreign blocker"),
+            "foreign blocker",
+            Some(0.5),
+            Some(serde_json::json!({"status": "inbox", "priority": "p2"})),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Build a visible-set token: primary-ns can see foreign-ns.
+    let tok_vis = rt
+        .authorize_with_visibility(ns_primary.clone(), vec![ns_foreign.clone()])
+        .unwrap();
+
+    // resolve (visible-aware) finds the foreign task.
+    let resolved_visible = rt.resolve(&tok_vis, foreign_task.id).await.unwrap();
+    assert!(
+        resolved_visible.is_some(),
+        "visible-aware resolve must find the foreign task"
+    );
+
+    // resolve_primary must NOT find it (foreign namespace).
+    let resolved_primary = rt.resolve_primary(&tok_vis, foreign_task.id).await.unwrap();
+    assert!(
+        resolved_primary.is_none(),
+        "resolve_primary must return None for a visible-only task; \
+         the depends_on validator uses resolve_primary and must reject it as NotFound"
+    );
+}
+
+/// A KG entity in a visible (non-primary) namespace must be treated as NotFound
+/// by `resolve_primary`, which is what `context_entity_id` validation now uses.
+#[tokio::test]
+async fn resolve_primary_rejects_visible_only_entity() {
+    use khive_runtime::{KhiveRuntime, Namespace};
+
+    let rt = KhiveRuntime::memory().unwrap();
+
+    let ns_primary = Namespace::parse("ctx-dep-primary-ns").unwrap();
+    let ns_foreign = Namespace::parse("ctx-dep-foreign-ns").unwrap();
+
+    let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
+    let foreign_entity = rt
+        .create_entity(
+            &tok_foreign,
+            "concept",
+            None,
+            "Foreign Concept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let tok_vis = rt
+        .authorize_with_visibility(ns_primary.clone(), vec![ns_foreign.clone()])
+        .unwrap();
+
+    // resolve (visible-aware) finds the foreign entity.
+    let resolved_visible = rt.resolve(&tok_vis, foreign_entity.id).await.unwrap();
+    assert!(
+        resolved_visible.is_some(),
+        "visible-aware resolve must find the foreign entity"
+    );
+
+    // resolve_primary must NOT find it — context_entity_id validation uses this.
+    let resolved_primary = rt
+        .resolve_primary(&tok_vis, foreign_entity.id)
+        .await
+        .unwrap();
+    assert!(
+        resolved_primary.is_none(),
+        "resolve_primary must return None for a visible-only entity; \
+         context_entity_id validation uses resolve_primary and must reject it as NotFound"
+    );
+}
