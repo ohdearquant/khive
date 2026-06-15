@@ -218,13 +218,13 @@ on counter advance. The projection math already exists and is tested.
 
 ### Trade-off table
 
-| Dimension | (a) per-recall | (b-amended) counter-keyed cache (chosen) | (c) TTL cache |
-| --- | --- | --- | --- |
-| Recall latency | 2 registry dispatches + brain `Mutex` lock, **every call** | dispatch on cache miss / counter advance only; O(1) lookup otherwise | same as (b) plus a clock check per call |
-| Staleness window | none (always fresh) | ≤ one recall after `change_counter` advances | ≤ min(TTL, one recall after counter advance) |
-| Complexity | lowest (no cache state) | one cache map keyed on `(namespace, profile_id, change_counter)` + `u64` increment in feedback path | (b-amended) + TTL bookkeeping and a tuning knob |
-| Correctness under concurrent feedback | exact | exact — counter advances on every feedback apply | bounded by TTL; may serve stale for up to the TTL window even after feedback |
-| New brain surface | a verb to fetch projected weights / state | same | same |
+| Dimension                             | (a) per-recall                                             | (b-amended) counter-keyed cache (chosen)                                                            | (c) TTL cache                                                                |
+| ------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Recall latency                        | 2 registry dispatches + brain `Mutex` lock, **every call** | dispatch on cache miss / counter advance only; O(1) lookup otherwise                                | same as (b) plus a clock check per call                                      |
+| Staleness window                      | none (always fresh)                                        | ≤ one recall after `change_counter` advances                                                        | ≤ min(TTL, one recall after counter advance)                                 |
+| Complexity                            | lowest (no cache state)                                    | one cache map keyed on `(namespace, profile_id, change_counter)` + `u64` increment in feedback path | (b-amended) + TTL bookkeeping and a tuning knob                              |
+| Correctness under concurrent feedback | exact                                                      | exact — counter advances on every feedback apply                                                    | bounded by TTL; may serve stale for up to the TTL window even after feedback |
+| New brain surface                     | a verb to fetch projected weights / state                  | same                                                                                                | same                                                                         |
 
 ### Option c (TTL) — rejected
 
@@ -350,6 +350,7 @@ push-into-one-slot model structurally cannot do.
 ### Q1 — RESOLVED: `exploration_epoch` does not advance on feedback
 
 **Confirmed closed.** Source evidence:
+
 - `exploration_epoch` advances in `reset_posteriors()` only
   (`crates/khive-brain-core/src/profile.rs:96`) and the reset handler's non-Bayesian branch
   (`crates/khive-pack-brain/src/handlers.rs:781`).
