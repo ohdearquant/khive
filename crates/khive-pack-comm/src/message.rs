@@ -53,6 +53,7 @@ pub(crate) fn note_to_message_json(note: &Note) -> Value {
 /// rolling back the outbound note if the inbound write fails (atomicity guarantee).
 ///
 /// `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for both copies.
+/// `from_actor` and `to_actor` are optional actor labels (ADR-057) stored in properties.
 ///
 /// Cross-namespace thread root invariant: when a root message is sent (i.e., `thread_id`
 /// is `None`), both the outbound and inbound copies must share the same canonical
@@ -77,41 +78,48 @@ pub(crate) async fn dual_write_message(
     content: &str,
     thread_id: Option<&str>,
     sent_at: &str,
+    from_actor: Option<&str>,
+    to_actor: Option<&str>,
 ) -> Result<Note, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
-        // 1. Validate recipient namespace string format first.
-        let recipient_ns = match Namespace::parse(recipient_ns_str) {
-            Ok(ns) => ns,
-            Err(e) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "send: invalid recipient namespace {to:?}: {e}"
-                )));
+        // When actor labels are provided this is an actor-addressed local send;
+        // both copies land in the caller's namespace so no cross-namespace check applies.
+        // Only run the cross-namespace gate when no actor routing is in use.
+        if from_actor.is_none() {
+            // 1. Validate recipient namespace string format first.
+            let recipient_ns = match Namespace::parse(recipient_ns_str) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "send: invalid recipient namespace {to:?}: {e}"
+                    )));
+                }
+            };
+
+            // 2. Check sender-side outbound allowlist from config.
+            //    Cross-namespace delivery is permitted only for declared recipients.
+            let allowed = runtime
+                .config()
+                .allowed_outbound_namespaces
+                .iter()
+                .any(|ns| ns == &recipient_ns);
+
+            if !allowed {
+                return Err(RuntimeError::PermissionDenied {
+                    verb: "comm.send".to_string(),
+                    reason: format!(
+                        "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
+                         add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
+                         the sender's khive.toml to enable delivery"
+                    ),
+                });
             }
-        };
-
-        // 2. Check sender-side outbound allowlist from config.
-        //    Cross-namespace delivery is permitted only for declared recipients.
-        let allowed = runtime
-            .config()
-            .allowed_outbound_namespaces
-            .iter()
-            .any(|ns| ns == &recipient_ns);
-
-        if !allowed {
-            return Err(RuntimeError::PermissionDenied {
-                verb: "comm.send".to_string(),
-                reason: format!(
-                    "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
-                     add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
-                     the sender's khive.toml to enable delivery"
-                ),
-            });
+            // 3. Allowlist hit: fall through to outbound note creation.
         }
-        // 3. Allowlist hit: fall through to outbound note creation.
     }
 
-    let outbound_props = json!({
+    let mut outbound_props = json!({
         "from": from,
         "to": to,
         "direction": "outbound",
@@ -120,6 +128,12 @@ pub(crate) async fn dual_write_message(
         "read": false,
         "sent_at": sent_at,
     });
+    if let Some(fa) = from_actor {
+        outbound_props["from_actor"] = json!(fa);
+    }
+    if let Some(ta) = to_actor {
+        outbound_props["to_actor"] = json!(ta);
+    }
 
     let outbound_note = runtime
         .create_note(
@@ -164,13 +178,16 @@ pub(crate) async fn dual_write_message(
     }
 
     {
+        // When actor labels are provided (ADR-057 actor-addressed path), both copies
+        // land in the caller's namespace — no cross-namespace write occurs.
         // When sender and recipient are in different namespaces (allowed cross-ns path),
         // mint a recipient-scoped read+write token used for exactly one inbound
         // `create_note` call after the allowlist check so the inbound note lands in the
         // correct inbox. For same-namespace sends (from == to), use caller_token
         // unchanged (preserves existing behavior).
         let cross_ns_token;
-        let inbound_tok: &NamespaceToken = if from == recipient_ns_str {
+        let inbound_tok: &NamespaceToken = if from_actor.is_some() || from == recipient_ns_str {
+            // Actor-addressed path or same-namespace send: inbound copy stays in caller ns.
             caller_token
         } else {
             cross_ns_token = caller_token.with_namespace(
@@ -180,7 +197,7 @@ pub(crate) async fn dual_write_message(
             &cross_ns_token
         };
 
-        let inbound_props = json!({
+        let mut inbound_props = json!({
             "from": from,
             "to": to,
             "direction": "inbound",
@@ -190,6 +207,12 @@ pub(crate) async fn dual_write_message(
             "sent_at": sent_at,
             "outbound_ref": outbound_note.id,
         });
+        if let Some(fa) = from_actor {
+            inbound_props["from_actor"] = json!(fa);
+        }
+        if let Some(ta) = to_actor {
+            inbound_props["to_actor"] = json!(ta);
+        }
 
         let inbound_result = runtime
             .create_note(

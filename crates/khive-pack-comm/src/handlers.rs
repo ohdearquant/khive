@@ -15,24 +15,46 @@ use khive_storage::types::{PageRequest, SqlValue};
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{deser, InboxParams, ReadParams, ReplyParams, SendParams, ThreadParams};
 
-/// `send` — create a message note in the caller's namespace (outbound) AND the
-/// recipient's namespace (inbound).
+/// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
+fn validate_actor_label(label: &str, field: &str) -> Result<(), RuntimeError> {
+    if label.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "send: `{field}` must not be empty"
+        )));
+    }
+    if label.len() > 255 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "send: `{field}` must not exceed 255 bytes"
+        )));
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "send: `{field}` must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// `send` — create a message note in the caller's namespace (outbound) AND deliver
+/// an inbound copy addressed to the actor label supplied in `to` (ADR-057).
 ///
-/// Two writes are made atomically via `dual_write_message`: if the inbound write
-/// fails the outbound note is deleted before returning the error. When sender and
-/// recipient are the same namespace both copies are written to the caller's namespace
-/// (one outbound, one inbound) so that `inbox()` surfaces self-sent messages.
+/// Both copies land in the caller's namespace; no cross-namespace write occurs.
+/// `from_actor` is set to `token.namespace().as_str()`. `to_actor` is set to the
+/// `to` argument. When the caller's actor label is `"local"` (single-actor fallback),
+/// `comm.inbox` does not apply an actor filter, preserving backward compatibility.
+///
+/// The routing `from` and `to` passed to `dual_write_message` are both set to the
+/// caller's namespace string so that `from == recipient_ns_str` is always true: this
+/// naturally bypasses the cross-namespace allowlist gate in `dual_write_message`
+/// (ADR-057 §"Interaction with ADR-040"). The actor labels are propagated via the
+/// `from_actor`/`to_actor` arguments and stored in message properties.
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: SendParams = deser(params)?;
-    if p.to.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput(
-            "send: `to` must not be empty".into(),
-        ));
-    }
+    validate_actor_label(&p.to, "to")?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "send: `content` must not be empty".into(),
@@ -47,37 +69,44 @@ pub(crate) async fn handle_send(
         }
     }
 
-    let from = token.namespace().as_str().to_string();
+    let caller_ns = token.namespace().as_str().to_string();
+    let from_actor = caller_ns.clone();
+    let to_actor = p.to.trim().to_string();
     let sent_at = Utc::now().to_rfc3339();
 
+    // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
+    // dual_write_message, naturally bypassing the cross-namespace allowlist gate
+    // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
     let outbound_note = dual_write_message(
         runtime,
         token,
-        &from,
-        &p.to,
+        &caller_ns,
+        &caller_ns,
         p.subject.as_deref(),
         &p.content,
         p.thread_id.as_deref(),
         &sent_at,
+        Some(&from_actor),
+        Some(&to_actor),
     )
     .await?;
 
     Ok(json!({
         "id": short_id(outbound_note.id),
         "full_id": outbound_note.id.as_hyphenated().to_string(),
-        "from": from,
+        "from": from_actor,
         "to": p.to,
         "subject": p.subject,
         "sent_at": sent_at,
     }))
 }
 
-/// `inbox` — list inbound messages for the caller namespace.
+/// `inbox` — list inbound messages for the caller's actor label (ADR-057).
 ///
-/// Implements a paginated scan so that matching messages are never lost when
-/// the newest unfiltered page contains no inbound rows. Each page fetches up
-/// to PAGE_SIZE messages; scanning stops when `limit` filtered rows are
-/// collected or the store is exhausted.
+/// When the caller's actor label is `"local"` (single-actor fallback), no `to_actor`
+/// filter is applied and the inbox behaves as before (party-line). When the caller has
+/// a non-`"local"` actor label, only messages addressed to that actor are returned.
+/// Legacy messages without a `to_actor` field are visible regardless (Q3: OR IS NULL).
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -98,6 +127,8 @@ pub(crate) async fn handle_inbox(
             )));
         }
     };
+
+    let caller_actor = token.namespace().as_str().to_string();
 
     // Push direction + read-status filters into SQL so idx_comm_message_direction is usable.
     // Read filter uses json_type to match the old as_bool().unwrap_or(false) semantics:
@@ -120,6 +151,20 @@ pub(crate) async fn handle_inbox(
         }),
         _ => {} // "all" — no read-status filter
     }
+
+    // ADR-057 Q3: when caller has a non-"local" actor label, filter by to_actor.
+    // FilterOp::EqOrMissing matches rows where json_extract(properties, '$.to_actor')
+    // equals the caller's label OR the field is absent/NULL (legacy messages without
+    // a to_actor remain visible). The "local" fallback skips this filter entirely for
+    // backward compatibility.
+    if caller_actor != "local" {
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Text(caller_actor.clone()),
+        });
+    }
+
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
@@ -251,16 +296,25 @@ pub(crate) async fn handle_reply(
         .map(|u| u.as_hyphenated().to_string())
         .unwrap_or_else(|| original.id.as_hyphenated().to_string());
 
-    let original_from = orig_props
-        .get("from")
+    // ADR-057: prefer from_actor/to_actor fields when present (actor-addressed messages).
+    // Fall back to from/to namespace strings for legacy messages.
+    let original_from_actor = orig_props
+        .get("from_actor")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .map(|s| s.to_string());
+    let original_to_actor = orig_props
+        .get("to_actor")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    let original_from = original_from_actor
+        .as_deref()
+        .unwrap_or_else(|| orig_props.get("from").and_then(Value::as_str).unwrap_or(""))
         .to_string();
 
-    let original_to = orig_props
-        .get("to")
-        .and_then(Value::as_str)
-        .unwrap_or("")
+    let original_to = original_to_actor
+        .as_deref()
+        .unwrap_or_else(|| orig_props.get("to").and_then(Value::as_str).unwrap_or(""))
         .to_string();
 
     let original_subject = orig_props
@@ -279,16 +333,23 @@ pub(crate) async fn handle_reply(
     let sent_at = Utc::now().to_rfc3339();
 
     // UE6-H1: route reply to the "other party" — not always to the original sender.
-    // If the reply caller is the original sender (from), route to the original
-    // recipient (to). If the reply caller is the original recipient, route back
-    // to the original sender. This ensures both A→B and B→A reply correctly.
+    // If the reply caller is the original sender (from_actor or from), route to the
+    // original recipient. If the reply caller is the original recipient, route back
+    // to the original sender.
     let reply_to = if from == original_from {
-        // Caller was the sender of the original; reply goes to the original recipient.
         original_to.clone()
     } else {
-        // Caller was the recipient (or a third party); reply goes to the original sender.
         original_from.clone()
     };
+
+    // ADR-057: always set from_actor/to_actor on replies (fail-closed on cross-namespace
+    // write). Both copies land in the caller's namespace regardless of whether the
+    // original message carried actor labels. The reply_to label is derived from the
+    // original's actor fields when present, else from the legacy from/to strings treated
+    // as labels. No legacy code path can cause dual_write_message to mint a token in a
+    // foreign namespace.
+    let reply_from_actor = from.clone();
+    let reply_to_actor = reply_to.clone();
 
     let reply_subject_opt = if reply_subject.is_empty() {
         None
@@ -296,17 +357,20 @@ pub(crate) async fn handle_reply(
         Some(reply_subject.as_str())
     };
 
-    // dual_write_message writes outbound to caller namespace and inbound to
-    // recipient namespace, matching the same delivery semantics as `send`.
+    // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
+    // dual_write_message, naturally bypassing the cross-namespace allowlist gate
+    // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
     let reply_note = dual_write_message(
         runtime,
         token,
         &from,
-        &reply_to,
+        &from,
         reply_subject_opt,
         &p.content,
         Some(&thread_id),
         &sent_at,
+        Some(&reply_from_actor),
+        Some(&reply_to_actor),
     )
     .await?;
 
