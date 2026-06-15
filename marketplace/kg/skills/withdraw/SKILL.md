@@ -9,10 +9,10 @@ Use `withdraw` when an open proposal is obsolete, duplicated, or should no longe
 The MCP server exposes one tool, `request`, that takes the verb call as a string:
 
 ```text
-request(ops="withdraw(proposal_id=\"00000000-0000-0000-0000-000000000001\", rationale=\"Superseded by a narrower proposal.\")")
+request(ops="withdraw(id=\"00000000-0000-0000-0000-000000000001\", rationale=\"Superseded by a narrower proposal.\")")
 ```
 
-Required args: `proposal_id`. Optional args: `rationale`, `namespace`.
+Required args: `id`. Optional args: `rationale`, `namespace`.
 
 **Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`). Do NOT
 override the namespace with `lambda:*` actor namespaces.
@@ -39,7 +39,7 @@ worker has claimed it and is executing), or `rejected`. Only proposals in `open`
 ### 2. Withdraw with rationale
 
 ```text
-request(ops="withdraw(proposal_id=\"<id>\", rationale=\"Duplicate of proposal <other-id> which is already approved.\")")
+request(ops="withdraw(id=\"<id>\", rationale=\"Duplicate of proposal <other-id> which is already approved.\")")
 ```
 
 The `rationale` is stored as `reason` on the `ProposalWithdrawn` event payload, not on the proposal

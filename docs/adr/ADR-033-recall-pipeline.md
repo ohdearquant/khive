@@ -309,6 +309,13 @@ cross-verb coherence — `create`, `remember`, and `recall` all return `id` for 
 field collision (annotation-edge ids remain `edge_id`). Clean break, no dual-emit.
 When weights are empty, returns candidates with empty `rerank_scores` (pass-through).
 
+Amendment (2026-06-14): proposal lifecycle identity key rename — `proposal_id` → `id` in all
+verb wire responses and input params. `propose` result, `review` result and `id` input param,
+`withdraw` result and `id` input param, `list(kind=proposal)` row identity, and
+`get(id=<proposal_uuid>)` result all use `id`. Internal struct fields (`ProposalCreatedPayload.proposal_id`),
+DB columns (`proposals_open.proposal_id`), and event filter fields (`EventFilter.payload_proposal_id`)
+are unchanged permanently. Clean break per PR #109 discipline.
+
 ### 6.3 Multi-model vector fusion (v024/multi-vector-fusion)
 
 When multiple embedding models are registered in the runtime (via `RuntimeConfig.embedding_model`

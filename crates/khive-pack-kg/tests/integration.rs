@@ -3893,8 +3893,12 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
         .await
         .expect("propose must succeed");
     assert!(
-        propose_result.get("proposal_id").is_some(),
-        "propose must return proposal_id; got {propose_result}"
+        propose_result.get("id").is_some(),
+        "propose must return id; got {propose_result}"
+    );
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose must NOT emit the old proposal_id key (clean break); got {propose_result}"
     );
 
     // List proposal_created events.
@@ -3973,17 +3977,27 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
         .await
         .expect("propose must succeed");
 
-    let proposal_id = propose_result["proposal_id"]
+    let proposal_id = propose_result["id"]
         .as_str()
-        .expect("must have proposal_id")
+        .expect("must have id")
         .to_string();
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose_result}"
+    );
 
-    pack.dispatch(
-        "review",
-        json!({"proposal_id": proposal_id, "decision": "approve"}),
-    )
-    .await
-    .expect("approve must succeed");
+    let review_result = pack
+        .dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("approve must succeed");
+    assert!(
+        review_result.get("id").is_some(),
+        "review must return id; got {review_result}"
+    );
+    assert!(
+        review_result.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review_result}"
+    );
 
     let events = pack
         .dispatch(
@@ -4135,18 +4149,15 @@ async fn proposal_applied_event_applied_at_is_iso8601_string() {
         .await
         .expect("propose must succeed");
     let proposal_id = propose_result
-        .get("proposal_id")
+        .get("id")
         .and_then(Value::as_str)
-        .expect("propose must return proposal_id")
+        .expect("propose must return id")
         .to_string();
 
     // Approve the proposal — actor is "local" so self-approval is allowed.
-    pack.dispatch(
-        "review",
-        json!({"proposal_id": proposal_id, "decision": "approve"}),
-    )
-    .await
-    .expect("review(approve) must succeed");
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
 
     // List proposal_applied events.
     let events = pack
@@ -4306,14 +4317,11 @@ async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
-    f.dispatch(
-        "review",
-        json!({ "proposal_id": pid, "decision": "approve" }),
-    )
-    .await
-    .expect("review must succeed");
+    f.dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("review must succeed");
 
     // list(kind=proposal) returns a JSON array directly (not wrapped in {"items":[...]}).
     let list = f
@@ -4326,7 +4334,7 @@ async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
     let proposal = items
         .iter()
         .find(|v| {
-            v["proposal_id"]
+            v["id"]
                 .as_str()
                 .is_some_and(|id| id == pid || id.starts_with(&pid[..8]))
         })
@@ -4360,20 +4368,14 @@ async fn review_approve_on_already_approved_proposal_returns_error() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
-    f.dispatch(
-        "review",
-        json!({ "proposal_id": pid, "decision": "approve" }),
-    )
-    .await
-    .expect("first review(approve) must succeed");
+    f.dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("first review(approve) must succeed");
 
     let second_review = f
-        .dispatch(
-            "review",
-            json!({ "proposal_id": pid, "decision": "approve" }),
-        )
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
         .await;
 
     assert!(
@@ -4443,13 +4445,13 @@ async fn withdraw_on_already_withdrawn_proposal_returns_error() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
-    f.dispatch("withdraw", json!({ "proposal_id": pid }))
+    f.dispatch("withdraw", json!({ "id": pid }))
         .await
         .expect("first withdraw must succeed");
 
-    let second_withdraw = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+    let second_withdraw = f.dispatch("withdraw", json!({ "id": pid })).await;
 
     assert!(
         second_withdraw.is_err(),
@@ -4815,14 +4817,11 @@ async fn propose_review_approve_lifecycle() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
     // Approve — single-reviewer, self-approval is allowed on local actor.
     let review = f
-        .dispatch(
-            "review",
-            json!({ "proposal_id": pid, "decision": "approve" }),
-        )
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
         .await
         .expect("review(approve) must succeed");
 
@@ -4841,7 +4840,7 @@ async fn propose_review_approve_lifecycle() {
     let items = list.as_array().expect("list must return an array");
     let found = items
         .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
     assert!(
         found,
         "#393 approve: proposal {pid} not found in list(status=applied); items: {list}"
@@ -4878,14 +4877,15 @@ async fn propose_review_reject_lifecycle() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
 
     // Reject the proposal.
     let review = f
-        .dispatch(
-            "review",
-            json!({ "proposal_id": pid, "decision": "reject" }),
-        )
+        .dispatch("review", json!({ "id": pid, "decision": "reject" }))
         .await
         .expect("review(reject) must succeed");
 
@@ -4893,6 +4893,10 @@ async fn propose_review_reject_lifecycle() {
     assert_eq!(
         status_after, "rejected",
         "#393 reject: review response status must be 'rejected', got {status_after:?}; full: {review}"
+    );
+    assert!(
+        review.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review}"
     );
 
     // list(kind=proposal, status=rejected) must contain this proposal.
@@ -4903,10 +4907,19 @@ async fn propose_review_reject_lifecycle() {
     let items = list.as_array().expect("list must return an array");
     let found = items
         .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
     assert!(
         found,
         "#393 reject: proposal {pid} not found in list(status=rejected); items: {list}"
+    );
+    // list rows must not expose the old key either.
+    let row = items
+        .iter()
+        .find(|v| v["id"].as_str().is_some_and(|id| id == pid))
+        .expect("rejected proposal row must be findable");
+    assert!(
+        row.get("proposal_id").is_none(),
+        "list(kind=proposal) row must NOT contain proposal_id key; got {row}"
     );
 }
 
@@ -4926,11 +4939,15 @@ async fn propose_withdraw_lifecycle() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
 
     // Withdraw the proposal.
     let withdraw = f
-        .dispatch("withdraw", json!({ "proposal_id": pid }))
+        .dispatch("withdraw", json!({ "id": pid }))
         .await
         .expect("withdraw must succeed");
 
@@ -4938,6 +4955,10 @@ async fn propose_withdraw_lifecycle() {
     assert_eq!(
         status_after, "withdrawn",
         "#393 withdraw: response status must be 'withdrawn', got {status_after:?}; full: {withdraw}"
+    );
+    assert!(
+        withdraw.get("proposal_id").is_none(),
+        "withdraw must NOT emit old proposal_id key; got {withdraw}"
     );
 
     // list(kind=proposal, status=withdrawn) must contain this proposal.
@@ -4948,10 +4969,19 @@ async fn propose_withdraw_lifecycle() {
     let items = list.as_array().expect("list must return an array");
     let found = items
         .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
     assert!(
         found,
         "#393 withdraw: proposal {pid} not found in list(status=withdrawn); items: {list}"
+    );
+    // list rows must not expose the old key.
+    let row = items
+        .iter()
+        .find(|v| v["id"].as_str().is_some_and(|id| id == pid))
+        .expect("withdrawn proposal row must be findable");
+    assert!(
+        row.get("proposal_id").is_none(),
+        "list(kind=proposal) row must NOT contain proposal_id key; got {row}"
     );
 }
 
@@ -4975,7 +5005,7 @@ async fn list_proposals_status_filter() {
         )
         .await
         .expect("propose A must succeed");
-    let pid_open = pa["proposal_id"].as_str().expect("proposal_id");
+    let pid_open = pa["id"].as_str().expect("id");
 
     // Proposal B — immediately withdrawn.
     let pb = f
@@ -4989,9 +5019,9 @@ async fn list_proposals_status_filter() {
         )
         .await
         .expect("propose B must succeed");
-    let pid_withdrawn = pb["proposal_id"].as_str().expect("proposal_id");
+    let pid_withdrawn = pb["id"].as_str().expect("id");
 
-    f.dispatch("withdraw", json!({ "proposal_id": pid_withdrawn }))
+    f.dispatch("withdraw", json!({ "id": pid_withdrawn }))
         .await
         .expect("withdraw B must succeed");
 
@@ -5004,12 +5034,10 @@ async fn list_proposals_status_filter() {
 
     let has_open = open_items
         .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid_open));
-    let has_withdrawn = open_items.iter().any(|v| {
-        v["proposal_id"]
-            .as_str()
-            .is_some_and(|id| id == pid_withdrawn)
-    });
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid_open));
+    let has_withdrawn = open_items
+        .iter()
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid_withdrawn));
 
     assert!(
         has_open,
@@ -5038,16 +5066,13 @@ async fn withdraw_after_apply_returns_error() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
-    f.dispatch(
-        "review",
-        json!({ "proposal_id": pid, "decision": "approve" }),
-    )
-    .await
-    .expect("review(approve) must succeed");
+    f.dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("review(approve) must succeed");
 
-    let withdraw_result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+    let withdraw_result = f.dispatch("withdraw", json!({ "id": pid })).await;
 
     assert!(
         withdraw_result.is_err(),
@@ -5077,20 +5102,14 @@ async fn review_after_reject_returns_error() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
-    f.dispatch(
-        "review",
-        json!({ "proposal_id": pid, "decision": "reject" }),
-    )
-    .await
-    .expect("review(reject) must succeed");
+    f.dispatch("review", json!({ "id": pid, "decision": "reject" }))
+        .await
+        .expect("review(reject) must succeed");
 
     let second_review = f
-        .dispatch(
-            "review",
-            json!({ "proposal_id": pid, "decision": "approve" }),
-        )
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
         .await;
 
     assert!(
@@ -5126,18 +5145,15 @@ async fn withdraw_cas_divergence_after_approval() {
         )
         .await
         .expect("propose must succeed");
-    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+    let pid = propose["id"].as_str().expect("id");
 
     // Approve moves status → approved → applied (inline apply worker).
-    f.dispatch(
-        "review",
-        json!({ "proposal_id": pid, "decision": "approve" }),
-    )
-    .await
-    .expect("review(approve) must succeed");
+    f.dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("review(approve) must succeed");
 
     // Withdraw now — status is applied, CAS should reject.
-    let result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+    let result = f.dispatch("withdraw", json!({ "id": pid })).await;
     assert!(
         result.is_err(),
         "CAS divergence: withdraw must fail after approval; got: {result:?}"
@@ -5151,7 +5167,7 @@ async fn withdraw_cas_divergence_after_approval() {
     let items = list.as_array().expect("must be array");
     let found = items
         .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+        .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
     assert!(
         found,
         "CAS divergence: proposal must still be 'applied' after failed withdraw; items: {list}"
@@ -5374,16 +5390,14 @@ async fn review_blocks_secret_in_comment() {
         )
         .await
         .expect("clean propose must succeed");
-    let proposal_id = propose_result["proposal_id"]
-        .as_str()
-        .expect("proposal_id in response");
+    let proposal_id = propose_result["id"].as_str().expect("id in response");
 
     // Review with a secret in the comment must be rejected.
     let result = f
         .dispatch(
             "review",
             json!({
-                "proposal_id": proposal_id,
+                "id": proposal_id,
                 "decision": "comment",
                 "comment": "Here is my secret: AKIAFAKEKEY000000000", // gitleaks:allow
             }),
@@ -5412,16 +5426,14 @@ async fn withdraw_blocks_secret_in_rationale() {
         )
         .await
         .expect("clean propose must succeed");
-    let proposal_id = propose_result["proposal_id"]
-        .as_str()
-        .expect("proposal_id in response");
+    let proposal_id = propose_result["id"].as_str().expect("id in response");
 
     // Withdraw with a secret in the rationale must be rejected.
     let result = f
         .dispatch(
             "withdraw",
             json!({
-                "proposal_id": proposal_id,
+                "id": proposal_id,
                 "rationale": "Withdrawn: token AKIAFAKEKEY000000000", // gitleaks:allow
             }),
         )
@@ -5753,5 +5765,165 @@ async fn hard_delete_soft_deleted_edge_without_kind_purges_row() {
     assert_eq!(
         row_count, 0,
         "hard delete must physically remove the edge row from graph_edges"
+    );
+}
+
+// ── PR #121: proposal_id → id wire-key clean break ───────────────────────────
+//
+// These tests pin the contract that the old `proposal_id` wire key is ABSENT
+// from every handler output and that the old input param name is rejected.
+// Positive `id` presence is already asserted in the lifecycle tests above;
+// here we add the complementary absence / negative-input coverage.
+
+/// get(id=<proposal_uuid>) result must expose `id`, NOT `proposal_id`.
+///
+/// The get handler (get.rs:211-214) removes `proposal_id` from the
+/// deserialized ProposalCreatedPayload and inserts `id`.  This test asserts
+/// the absence side so a dual-emit regression would be caught immediately.
+#[tokio::test]
+async fn get_proposal_wire_key_is_id_not_proposal_id() {
+    let f = pack_with_events();
+
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "WireKeyAbsenceTest",
+                "description": "get must return id, not proposal_id",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose_result["id"]
+        .as_str()
+        .expect("propose must return id")
+        .to_string();
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose result must NOT contain proposal_id; got {propose_result}"
+    );
+
+    let get_result = f
+        .dispatch("get", json!({ "id": pid }))
+        .await
+        .expect("get must succeed");
+
+    assert!(
+        get_result.get("id").is_some(),
+        "get(id=proposal_uuid) must return id field; got {get_result}"
+    );
+    assert!(
+        get_result.get("proposal_id").is_none(),
+        "get(id=proposal_uuid) must NOT return proposal_id (clean break); got {get_result}"
+    );
+}
+
+/// review(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+///
+/// ReviewParams declares `id` (required) with deny_unknown_fields — `proposal_id` is
+/// unknown. Supplying both keys proves the rejection is triggered by the unknown field,
+/// not by a missing required field: if deny_unknown_fields were removed the call would
+/// succeed (id is present, proposal_id silently ignored), so a passing test here is a
+/// genuine regression guard.
+#[tokio::test]
+async fn review_with_old_proposal_id_param_is_rejected() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "deny_unknown review guard",
+                "description": "guard test",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id");
+
+    let err = f
+        .dispatch(
+            "review",
+            json!({
+                "id": pid,
+                "proposal_id": pid,
+                "decision": "reject"
+            }),
+        )
+        .await;
+
+    assert!(
+        err.is_err(),
+        "review(id=..., proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    let e = err.unwrap_err();
+    assert!(
+        is_invalid_input(&e),
+        "review(id=..., proposal_id=...) must produce InvalidInput; got {e:?}"
+    );
+    let msg = invalid_input_message(&e);
+    assert!(
+        msg.contains("unknown field"),
+        "error must mention 'unknown field'; got: {msg}"
+    );
+    assert!(
+        msg.contains("proposal_id"),
+        "error must mention 'proposal_id'; got: {msg}"
+    );
+}
+
+/// withdraw(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+///
+/// WithdrawParams declares `id` (required) with deny_unknown_fields — `proposal_id` is
+/// unknown. Supplying both keys proves the rejection is triggered by the unknown field,
+/// not by a missing required field: if deny_unknown_fields were removed the call would
+/// succeed (id is present, proposal_id silently ignored), so a passing test here is a
+/// genuine regression guard.
+#[tokio::test]
+async fn withdraw_with_old_proposal_id_param_is_rejected() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "deny_unknown withdraw guard",
+                "description": "guard test",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id");
+
+    let err = f
+        .dispatch(
+            "withdraw",
+            json!({
+                "id": pid,
+                "proposal_id": pid
+            }),
+        )
+        .await;
+
+    assert!(
+        err.is_err(),
+        "withdraw(id=..., proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    let e = err.unwrap_err();
+    assert!(
+        is_invalid_input(&e),
+        "withdraw(id=..., proposal_id=...) must produce InvalidInput; got {e:?}"
+    );
+    let msg = invalid_input_message(&e);
+    assert!(
+        msg.contains("unknown field"),
+        "error must mention 'unknown field'; got: {msg}"
+    );
+    assert!(
+        msg.contains("proposal_id"),
+        "error must mention 'proposal_id'; got: {msg}"
     );
 }

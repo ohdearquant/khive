@@ -547,12 +547,10 @@ mod tests {
             "note_id": uuid,
             "source_id": uuid,
             "target_id": uuid,
-            "proposal_id": uuid,
         }));
 
         assert_eq!(out["note_id"], json!("a1b2c3d4"));
         assert_eq!(out["source_id"], json!("a1b2c3d4"));
         assert_eq!(out["target_id"], json!("a1b2c3d4"));
-        assert_eq!(out["proposal_id"], json!("a1b2c3d4"));
     }
 }

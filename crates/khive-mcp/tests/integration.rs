@@ -2157,11 +2157,11 @@ async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()
         parent_first["ok"], true,
         "parent propose must succeed; got: {parent_first}"
     );
-    let parent_id = parent_first["result"]["proposal_id"]
+    let parent_id = parent_first["result"]["id"]
         .as_str()
-        .expect("parent proposal_id")
+        .expect("parent id")
         .to_string();
-    assert_eq!(parent_id.len(), 36, "parent proposal_id must be full UUID");
+    assert_eq!(parent_id.len(), 36, "parent id must be full UUID");
 
     // Propose with all optional fields populated: description, reviewers, parent_id,
     // and a changeset that carries a named entity.
@@ -2191,14 +2191,15 @@ async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], true, "propose must succeed; got: {first}");
-    let proposal_id = first["result"]["proposal_id"]
+    let proposal_id = first["result"]["id"]
         .as_str()
-        .expect("propose must return proposal_id")
+        .expect("propose must return id")
         .to_string();
-    assert_eq!(
-        proposal_id.len(),
-        36,
-        "proposal_id from propose must be full UUID"
+    assert_eq!(proposal_id.len(), 36, "id from propose must be full UUID");
+    assert!(
+        first["result"].get("proposal_id").is_none(),
+        "propose result must NOT contain old proposal_id key; got: {}",
+        first["result"]
     );
 
     // Now get(id=<proposal_id>) — must return the ProposalCreated event payload.
@@ -2240,6 +2241,10 @@ async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()
     assert!(
         !get_result["parent_id"].is_null(),
         "get(id=proposal_id) must return parent_id when set; got: {get_result}"
+    );
+    assert!(
+        get_result.get("proposal_id").is_none(),
+        "get(id=proposal_uuid) must NOT return old proposal_id key; got: {get_result}"
     );
 
     Ok(())
@@ -2295,16 +2300,21 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
         body["results"][1]["ok"], true,
         "second propose must succeed"
     );
-    let pid_a = body["results"][0]["result"]["proposal_id"]
+    let pid_a = body["results"][0]["result"]["id"]
         .as_str()
         .unwrap()
         .to_string();
+    assert!(
+        body["results"][0]["result"].get("proposal_id").is_none(),
+        "propose result must NOT contain old proposal_id key; got: {}",
+        body["results"][0]["result"]
+    );
 
     // Withdraw proposal A so it moves to a terminal status.
     let ops_withdraw = serde_json::to_string(&json!([{
         "tool": "withdraw",
         "args": {
-            "proposal_id": pid_a,
+            "id": pid_a,
             "rationale": "test withdrawal for audit list"
         }
     }]))
@@ -2321,6 +2331,11 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
         "withdraw must succeed; got: {}",
         wr_body["results"][0]
     );
+    assert!(
+        wr_body["results"][0]["result"].get("proposal_id").is_none(),
+        "withdraw result must NOT contain old proposal_id key; got: {}",
+        wr_body["results"][0]["result"]
+    );
 
     // list(kind=proposal) without status — must return BOTH rows (open + withdrawn).
     // The list result is a bare JSON array (same shape as other list verbs).
@@ -2334,6 +2349,17 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
          got {} items — withdrawn proposal must not be hidden",
         items.len()
     );
+    // All list rows must expose `id`, not the old `proposal_id` key.
+    for item in items.iter() {
+        assert!(
+            item.get("proposal_id").is_none(),
+            "list(kind=proposal) row must NOT contain proposal_id key; got: {item}"
+        );
+        assert!(
+            item.get("id").is_some(),
+            "list(kind=proposal) row must contain id key; got: {item}"
+        );
+    }
 
     // list(kind=proposal, status=open) — must return only the open one.
     let list_open = ok_one(&client, r#"list(kind="proposal", status="open")"#).await?;
@@ -3631,5 +3657,142 @@ async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> any
         actual, "2099-01-01T00:00",
         "trigger_at must not be truncated to minute granularity"
     );
+    Ok(())
+}
+
+// ── PR #121: proposal_id → id wire-key — DSL chain tests ─────────────────────
+//
+// These tests prove that `$prev.id` substitution works end-to-end through the
+// request envelope for the proposal lifecycle.  Direct handler dispatch in
+// crates/khive-pack-kg/tests/ does NOT prove this path — it bypasses the MCP
+// request envelope, presentation mode selection, and $prev resolver.
+//
+// Each test uses the `|` DSL chain operator so the MCP server exercises the
+// full substitution path defined in ADR-016.
+
+/// Chain: propose(...) | review(id=$prev.id, decision="reject").
+///
+/// Asserts that $prev.id from the propose result is correctly substituted into
+/// the review call, and that the resulting proposal status is "rejected".
+/// Also asserts the old `proposal_id` wire key is absent from both results.
+#[tokio::test]
+async fn test_propose_pipe_review_reject_chain() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // DSL chain: propose then immediately review with $prev.id.
+    // The changeset uses DSL object syntax (JSON keys: "key":"value").
+    let ops = r#"propose(title="ChainReviewRejectTest", description="pr121 chain test", changeset={"kind":"add_note","note":{"kind":"observation","content":"chain-review-reject"}}) | review(id=$prev.id, decision="reject")"#;
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 2, "expected 2 ops in chain");
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "propose (op 0) must succeed: {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["ok"],
+        json!(true),
+        "review(id=$prev.id) (op 1) must succeed — $prev.id from propose not resolved: {}",
+        results[1]
+    );
+    assert_eq!(
+        body["summary"]["succeeded"],
+        json!(2),
+        "both ops must succeed"
+    );
+    assert_eq!(body["summary"]["aborted"], json!(0));
+
+    // The review result must report status "rejected".
+    let review_result = &results[1]["result"];
+    assert_eq!(
+        review_result["status"].as_str().unwrap_or(""),
+        "rejected",
+        "review(decision=reject) must yield status rejected; got: {review_result}"
+    );
+
+    // Clean-break: neither result must expose the old wire key.
+    assert!(
+        results[0]["result"].get("proposal_id").is_none(),
+        "propose result must NOT contain proposal_id; got: {}",
+        results[0]["result"]
+    );
+    assert!(
+        results[1]["result"].get("proposal_id").is_none(),
+        "review result must NOT contain proposal_id; got: {}",
+        results[1]["result"]
+    );
+
+    Ok(())
+}
+
+/// Chain: propose(...) | withdraw(id=$prev.id).
+///
+/// Asserts that $prev.id from the propose result is correctly substituted into
+/// the withdraw call, and that the resulting proposal status is "withdrawn".
+/// Also asserts the old `proposal_id` wire key is absent from both results.
+#[tokio::test]
+async fn test_propose_pipe_withdraw_chain() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // DSL chain: propose then immediately withdraw with $prev.id.
+    let ops = r#"propose(title="ChainWithdrawTest", description="pr121 chain test", changeset={"kind":"add_note","note":{"kind":"observation","content":"chain-withdraw"}}) | withdraw(id=$prev.id)"#;
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 2, "expected 2 ops in chain");
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "propose (op 0) must succeed: {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["ok"],
+        json!(true),
+        "withdraw(id=$prev.id) (op 1) must succeed — $prev.id from propose not resolved: {}",
+        results[1]
+    );
+    assert_eq!(
+        body["summary"]["succeeded"],
+        json!(2),
+        "both ops must succeed"
+    );
+    assert_eq!(body["summary"]["aborted"], json!(0));
+
+    // The withdraw result must report status "withdrawn".
+    let withdraw_result = &results[1]["result"];
+    assert_eq!(
+        withdraw_result["status"].as_str().unwrap_or(""),
+        "withdrawn",
+        "withdraw must yield status withdrawn; got: {withdraw_result}"
+    );
+
+    // Clean-break: neither result must expose the old wire key.
+    assert!(
+        results[0]["result"].get("proposal_id").is_none(),
+        "propose result must NOT contain proposal_id; got: {}",
+        results[0]["result"]
+    );
+    assert!(
+        results[1]["result"].get("proposal_id").is_none(),
+        "withdraw result must NOT contain proposal_id; got: {}",
+        results[1]["result"]
+    );
+
     Ok(())
 }

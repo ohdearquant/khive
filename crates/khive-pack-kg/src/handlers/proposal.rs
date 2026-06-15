@@ -71,7 +71,7 @@ impl KgPack {
             };
         }
         Err(RuntimeError::InvalidInput(format!(
-            "invalid proposal_id {raw:?}: must be a full UUID or 8-char hex prefix"
+            "invalid id {raw:?}: must be a full UUID or 8-char hex prefix"
         )))
     }
 
@@ -179,7 +179,7 @@ impl KgPack {
             .await?;
 
         to_json(&serde_json::json!({
-            "proposal_id": proposal_id.to_string(),
+            "id": proposal_id.to_string(),
             "status": "open",
             "proposer": actor,
             "title": p.title,
@@ -193,7 +193,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: ReviewParams = deser(params)?;
-        let proposal_id = self.resolve_proposal_uuid(token, &p.proposal_id).await?;
+        let proposal_id = self.resolve_proposal_uuid(token, &p.id).await?;
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
 
@@ -225,7 +225,7 @@ impl KgPack {
             })
             .await
             .map_err(RuntimeError::Storage)?
-            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
             .get("proposer")
@@ -255,7 +255,7 @@ impl KgPack {
         ) {
             return Err(RuntimeError::InvalidInput(format!(
                 "proposal {} is already {current_status} and cannot be reviewed",
-                p.proposal_id
+                p.id
             )));
         }
 
@@ -308,7 +308,7 @@ impl KgPack {
                 "proposal {} status changed concurrently; review was not recorded — \
                  the proposal may have been withdrawn or approved by another reviewer \
                  simultaneously",
-                p.proposal_id
+                p.id
             )));
         }
 
@@ -319,7 +319,7 @@ impl KgPack {
         }
 
         to_json(&serde_json::json!({
-            "proposal_id": proposal_id.to_string(),
+            "id": proposal_id.to_string(),
             "reviewer": actor,
             "decision": p.decision,
             "status": new_status,
@@ -332,7 +332,7 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: WithdrawParams = deser(params)?;
-        let proposal_id = self.resolve_proposal_uuid(token, &p.proposal_id).await?;
+        let proposal_id = self.resolve_proposal_uuid(token, &p.id).await?;
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
 
@@ -352,7 +352,7 @@ impl KgPack {
             })
             .await
             .map_err(RuntimeError::Storage)?
-            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
             .get("proposer")
@@ -385,7 +385,7 @@ impl KgPack {
         if matches!(current_status, "applied" | "withdrawn" | "applying") {
             return Err(RuntimeError::InvalidInput(format!(
                 "proposal {} is already {current_status} and cannot be withdrawn",
-                p.proposal_id
+                p.id
             )));
         }
 
@@ -421,12 +421,12 @@ impl KgPack {
         if !updated {
             return Err(RuntimeError::InvalidInput(format!(
                 "proposal {} is already in a terminal or in-flight state and cannot be withdrawn",
-                p.proposal_id
+                p.id
             )));
         }
 
         to_json(&serde_json::json!({
-            "proposal_id": proposal_id.to_string(),
+            "id": proposal_id.to_string(),
             "status": "withdrawn",
             "by": actor,
         }))
@@ -525,7 +525,7 @@ impl KgPack {
                     }
                 };
                 serde_json::json!({
-                    "proposal_id": get_text("proposal_id"),
+                    "id": get_text("proposal_id"),
                     "proposer": get_text("proposer"),
                     "title": get_text("title"),
                     "status": get_text("status"),

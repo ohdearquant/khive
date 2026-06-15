@@ -203,7 +203,7 @@ pub(crate) struct ProposeParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewParams {
-    pub(crate) proposal_id: String,
+    pub(crate) id: String,
     pub(crate) decision: String,
     pub(crate) comment: Option<String>,
     pub(crate) max_new_entries: Option<u64>,
@@ -212,7 +212,7 @@ pub(crate) struct ReviewParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WithdrawParams {
-    pub(crate) proposal_id: String,
+    pub(crate) id: String,
     pub(crate) rationale: Option<String>,
 }
 
