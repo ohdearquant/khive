@@ -25,6 +25,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.2.11", path = "../khive-pack-kg" }
+khive-db = { version = "0.2.11", path = "../khive-db" }
 criterion = { workspace = true }
 
 [[bench]]

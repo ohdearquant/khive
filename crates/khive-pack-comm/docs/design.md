@@ -45,19 +45,17 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 
-### ADR-018: ACL Policy (not yet implemented)
+### Cross-namespace delivery policy (OSS, specified 2026-06-15)
 
-Cross-namespace messaging is currently denied (fail-closed). The `dual_write_message` function
-returns `CrossNamespaceWrite` for any send where `from != to`. This will be relaxed once ADR-018
-specifies the ACL policy for inter-namespace writes.
+Cross-namespace messaging is controlled by the **sender-side outbound allowlist**. The
+`dual_write_message` function returns `RuntimeError::PermissionDenied` when the recipient
+namespace is not in the sender's `actor.allowed_outbound_namespaces` allowlist. An empty
+allowlist (default) reproduces the prior deny-all behavior.
 
 ## Consistency Notes
 
-- **Cross-namespace delivery**: the current deny-all policy is more restrictive than what ADR-040
-  specifies for the long-term vision. This is intentional and documented in the code: the
-  `dual_write_message` function explains that full cross-namespace delivery awaits ADR-018 ACL
-  policy. No inconsistency with the current spec; both ADR-040 and the code agree on the interim
-  fail-closed posture.
+- **Cross-namespace delivery**: the sender-side `actor.allowed_outbound_namespaces` allowlist is
+  the OSS ACL gate (2026-06-15). The default is empty (deny-all). ADR-040 is updated to match.
 - **Thread root resolution**: `comm.thread` resolves the canonical thread root by inspecting
   `properties.thread_id` on the resolved note. If the stored `thread_id` differs from the note's
   own UUID (inbound copy case), it uses the stored value. This cross-namespace root resolution

@@ -132,17 +132,27 @@ reconstruct conversation order from `sent_at` on messages sharing a `thread_id`.
 is propagated; otherwise the target message's own UUID becomes the `thread_id` for the new
 message chain.
 
-#### Cross-namespace messaging
+#### Cross-namespace messaging (OSS policy — specified 2026-06-15)
 
-`send` writes into the recipient's namespace. This requires an authorization gate check per
-ADR-018 before the write proceeds. If the recipient namespace does not permit inbound
-messages from the sender namespace, the op returns `RuntimeError::Forbidden`.
+`send` writes the inbound copy into the recipient's namespace. Whether this write is allowed
+depends on the **sender-side outbound allowlist** (`actor.allowed_outbound_namespaces` in the
+sender's `khive.toml`). This is an explicit, fail-closed control: the field is empty by
+default, so all cross-namespace sends are denied unless the sender opts in.
 
-Cross-namespace ACL policy definition is deferred to the namespace authority (ADR-018). The
-pack enforces the gate but does not specify ACL configuration format.
+When a recipient namespace appears in the sender's allowlist, `dual_write_message` mints a
+narrowed `NamespaceToken` (via `NamespaceToken::with_namespace`) scoped to the recipient
+namespace and uses it to write the inbound note, keeping the write operation namespace-isolated.
+The sender token's read visibility is not propagated — the minted token is write-only for the
+recipient namespace. The denial error is `RuntimeError::PermissionDenied { verb: "comm.send" }`.
 
-Within-namespace messaging (agent sends to self, or to another agent in the same namespace)
-proceeds without cross-namespace ACL check.
+Within-namespace messaging (sender and recipient in the same namespace) proceeds without any
+allowlist check.
+
+The `RuntimeError::CrossNamespaceWrite` variant is retained for the VCS/remote semantics; it
+is no longer returned by `comm.send`.
+
+The recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in, ADR-057 cloud path)
+is reserved for a future cloud release and is not part of this OSS implementation.
 
 #### Message-to-entity attachment
 
@@ -483,9 +493,10 @@ standard `delete(id)` path.
 - Trigger evaluation for scheduled events is out of scope for the pack. Operators must wire
   either daemon mode (future) or an external scheduler. This is the correct separation but
   creates an operator onboarding step not present in the other three packs.
-- Cross-namespace messaging is gated on ADR-018's ACL mechanism. Until ACL policy
-  configuration is specified, cross-namespace `send` is rejected. Within-namespace messaging
-  is unblocked.
+- Cross-namespace messaging is gated on the sender's `actor.allowed_outbound_namespaces`
+  allowlist (specified 2026-06-15; see "Cross-namespace messaging" section above). The field
+  defaults to empty, preserving the prior deny-all behavior for existing deployments.
+  Within-namespace messaging is unblocked.
 
 ### Neutral
 
@@ -516,6 +527,8 @@ standard `delete(id)` path.
 4. **Message namespace write path**: `comm.send(to="agent:khive")` must resolve `agent:khive` to
    a namespace and write a note into that namespace. The exact resolution contract (namespace
    registry, alias table, or unresolved string) is deferred to ADR-018's namespace authority.
+
+   _Resolved 2026-06-15: see "Cross-namespace messaging (OSS policy)" section above._
 
 ## Implementation
 

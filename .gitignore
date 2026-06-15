@@ -21,6 +21,7 @@ htmlcov/
 
 # Rust
 target/
+.cargo-target/
 **/*.rs.bk
 Cargo.lock
 

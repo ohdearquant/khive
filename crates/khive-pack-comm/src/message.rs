@@ -78,24 +78,37 @@ pub(crate) async fn dual_write_message(
     thread_id: Option<&str>,
     sent_at: &str,
 ) -> Result<Note, RuntimeError> {
-    // Cross-namespace delivery is DENIED until ACL policy is specified.
-    // This prevents unauthorized writes into arbitrary recipient namespaces.
-    //
-    // The recipient namespace must equal the caller namespace. Sending to a
-    // different namespace would bypass the recipient's authorization gate.
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
-        // Validate the recipient namespace string format before returning the
-        // denial — so callers get InvalidInput for malformed strings rather than
-        // a misleading CrossNamespaceWrite.
-        if let Err(e) = Namespace::parse(recipient_ns_str) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "send: invalid recipient namespace {to:?}: {e}"
-            )));
+        // 1. Validate recipient namespace string format first.
+        let recipient_ns = match Namespace::parse(recipient_ns_str) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "send: invalid recipient namespace {to:?}: {e}"
+                )));
+            }
+        };
+
+        // 2. Check sender-side outbound allowlist from config.
+        //    Cross-namespace delivery is permitted only for declared recipients.
+        let allowed = runtime
+            .config()
+            .allowed_outbound_namespaces
+            .iter()
+            .any(|ns| ns == &recipient_ns);
+
+        if !allowed {
+            return Err(RuntimeError::PermissionDenied {
+                verb: "comm.send".to_string(),
+                reason: format!(
+                    "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
+                     add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
+                     the sender's khive.toml to enable delivery"
+                ),
+            });
         }
-        return Err(RuntimeError::CrossNamespaceWrite {
-            namespace: recipient_ns_str.to_string(),
-        });
+        // 3. Allowlist hit: fall through to outbound note creation.
     }
 
     let outbound_props = json!({
@@ -151,9 +164,20 @@ pub(crate) async fn dual_write_message(
     }
 
     {
-        // Inbound note lands in the caller's own namespace: cross-namespace send is
-        // denied earlier in this function, so sender and recipient are always equal.
-        let inbound_tok: &NamespaceToken = caller_token;
+        // When sender and recipient are in different namespaces (allowed cross-ns path),
+        // mint a narrowed write-only token for the recipient namespace so the inbound
+        // note lands in the correct inbox. For same-namespace sends (from == to),
+        // use caller_token unchanged (preserves existing behavior).
+        let cross_ns_token;
+        let inbound_tok: &NamespaceToken = if from == recipient_ns_str {
+            caller_token
+        } else {
+            cross_ns_token = caller_token.with_namespace(
+                Namespace::parse(recipient_ns_str)
+                    .expect("recipient_ns_str already validated above"),
+            );
+            &cross_ns_token
+        };
 
         let inbound_props = json!({
             "from": from,

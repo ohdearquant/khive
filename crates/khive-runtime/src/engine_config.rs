@@ -120,6 +120,19 @@ pub struct ActorConfig {
     /// here. When absent or empty, visibility defaults to `[id]` only.
     #[serde(default)]
     pub visible_namespaces: Option<Vec<String>>,
+
+    /// Namespaces this actor's comm.send/reply may deliver messages INTO
+    /// (outbound, sender-side). Empty by default — cross-namespace delivery
+    /// denied unless explicitly declared. Grants write-only inbound-append
+    /// access to the listed namespaces; does NOT grant read access. The
+    /// recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in)
+    /// is reserved for the ADR-057 cloud path.
+    ///
+    /// Each entry must be a valid `Namespace` string; validated at
+    /// config-load time. An empty list preserves the prior deny-all behavior
+    /// for any actor that does not add this field.
+    #[serde(default)]
+    pub allowed_outbound_namespaces: Vec<String>,
 }
 
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
@@ -298,6 +311,20 @@ impl KhiveConfig {
                     reason: format!("invalid visible namespace: {e}"),
                 })?;
             }
+        }
+
+        // Validate actor.allowed_outbound_namespaces (fail-closed at startup on malformed entry).
+        for ns_str in &self.actor.allowed_outbound_namespaces {
+            if ns_str.is_empty() {
+                return Err(ConfigError::InvalidActorId {
+                    id: ns_str.clone(),
+                    reason: "allowed_outbound_namespaces entries must not be empty".to_string(),
+                });
+            }
+            Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
+                id: ns_str.clone(),
+                reason: format!("invalid allowed_outbound_namespaces entry: {e}"),
+            })?;
         }
 
         if self.engines.is_empty() {

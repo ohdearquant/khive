@@ -156,6 +156,7 @@ impl KhiveRuntime {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         })
     }
 
@@ -730,6 +731,7 @@ mod tests {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -749,6 +751,7 @@ mod tests {
             backend_id: BackendId::new("lore"),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -894,6 +897,7 @@ mod tests {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -912,6 +916,7 @@ mod tests {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -942,6 +947,7 @@ mod tests {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -964,6 +970,7 @@ mod tests {
             backend_id: BackendId::main(),
             brain_profile: None,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {

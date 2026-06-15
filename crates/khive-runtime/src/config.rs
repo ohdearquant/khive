@@ -161,10 +161,18 @@ impl NamespaceToken {
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// Used by packs that apply a namespace policy (e.g. the KG pack overrides the
-    /// caller's namespace to `Namespace::local()` so that entity/edge/note records
-    /// always land in the shared graph). The visible set is also replaced with
-    /// `[ns]` so isolation is maintained for the overridden namespace.
+    /// The visible set is replaced with `[ns]` — the new token cannot read from
+    /// the original token's namespaces. This is a capability-transfer primitive,
+    /// not a policy gate: the caller is responsible for enforcing any ACL check
+    /// before calling this method.
+    ///
+    /// Callers today:
+    /// - `khive-pack-memory` FTS fanout: iterates token's own visible set; no escalation.
+    /// - `khive-pack-comm` inbound delivery: mints a write token for the recipient ns,
+    ///   gated by `actor.allowed_outbound_namespaces` allowlist check immediately before.
+    ///
+    /// Under a security model (cloud, mutual auth), replace this call pattern with a
+    /// `comm.ingest` Subhandler dispatch (ADR-056/ADR-053) that goes through the Gate.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }
@@ -233,6 +241,14 @@ pub struct RuntimeConfig {
     /// namespace (actor.id) is always implicitly readable and need not appear
     /// here. Empty by default (single-namespace behaviour).
     pub visible_namespaces: Vec<Namespace>,
+    /// Namespaces this actor's comm.send/reply may deliver messages INTO
+    /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
+    /// in `khive.toml`. Empty by default — cross-namespace delivery denied
+    /// unless explicitly declared. Grants write-only inbound-append access
+    /// to the listed namespaces; does NOT grant read access. The recipient-side
+    /// `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for
+    /// the ADR-057 cloud path.
+    pub allowed_outbound_namespaces: Vec<Namespace>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -290,6 +306,7 @@ impl Default for RuntimeConfig {
             backend_id: BackendId::main(),
             brain_profile,
             visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
         }
     }
 }
@@ -415,11 +432,28 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
+    // KhiveConfig::validate() guarantees every entry in allowed_outbound_namespaces is a
+    // structurally valid Namespace string, so Namespace::parse failures here are unreachable
+    // for validated configs. We still filter_map with a warn so a runtime bug doesn't panic.
+    let allowed_outbound_namespaces: Vec<Namespace> = khive_cfg
+        .actor
+        .allowed_outbound_namespaces
+        .iter()
+        .filter_map(|s| match Namespace::parse(s) {
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                tracing::warn!(ns = %s, error = %e, "actor.allowed_outbound_namespaces: invalid namespace; skipped");
+                None
+            }
+        })
+        .collect();
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
             brain_profile,
             visible_namespaces,
+            allowed_outbound_namespaces,
             ..base
         };
     }
@@ -452,6 +486,7 @@ pub fn runtime_config_from_khive_config(
         default_namespace,
         brain_profile,
         visible_namespaces,
+        allowed_outbound_namespaces,
         ..base
     }
 }
