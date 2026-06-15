@@ -1,0 +1,150 @@
+# perf/targets.toml — scale-proof assertion thresholds
+# Changes that loosen any threshold require a PR comment from lambda:khive citing the cause.
+#
+# Threshold format: hard limit with optional relative tolerance (fractional).
+# A tolerance of 0.10 means:
+#   for <=: measured <= threshold * 1.10 = PASS
+#   for >=: measured >= threshold * 0.90 = PASS
+
+[scale-proof]
+# -------------------------------------------------------------------
+# Target 1: khive-real-384 (production workload, 3-point 100K/200K/500K)
+#
+# Measured baselines (probe-results-khive-real-3pt.json, 2026-06-14):
+#   recall@10:  0.9907 / 0.9899 / 0.9875  (all well above 0.95)
+#   beam:       64 (floor) at all 3 N — exponent ≈ 0.0
+#   query p50:  283–330 µs  (well below 600 µs)
+#   query p95:  359–455 µs  (well below 900 µs)
+#   speedup:    12–57x at 100K–500K
+#
+# Thresholds set from measured values with headroom as noted.
+# -------------------------------------------------------------------
+
+[[scale-proof.target]]
+name = "khive-vamana/scale-proof/khive-real-384"
+
+  # Scaling criteria — no tolerance; these are structural invariants.
+  # Measured: recall 0.987–0.991 @500K; threshold 0.95 gives ample margin.
+  [[scale-proof.target.check]]
+  metric = "recall_at_10"
+  scope = "all_rows"
+  operator = ">="
+  threshold = 0.95
+  tolerance = 0.0
+
+  # Measured beam exponent ≈ 0.0 (pinned at floor 64 across all N).
+  # Threshold 0.5 is generous; even 0.3 would pass.
+  [[scale-proof.target.check]]
+  metric = "beam_growth_exponent"
+  scope = "fits"
+  operator = "<="
+  threshold = 0.5
+  tolerance = 0.0
+
+  # Measured query exponent ≈ 0.04 (R²=0.20, nearly flat).
+  # Threshold 0.8 is generous; even 0.3 would pass.
+  [[scale-proof.target.check]]
+  metric = "iso_recall_query_exponent_warm"
+  scope = "fits"
+  operator = "<"
+  threshold = 0.8
+  tolerance = 0.0
+
+  # Measured speedup at max_n (500K): 57x. Threshold 10x is a conservative floor.
+  [[scale-proof.target.check]]
+  metric = "speedup_vs_brute_force"
+  scope = "max_n"
+  operator = ">="
+  threshold = 10.0
+  tolerance = 0.0
+
+  # Latency regression gates — 10% tolerance for hardware variance.
+  # Measured p50 at 500K: 307 µs. Threshold 600 µs = ~2x headroom.
+  [[scale-proof.target.check]]
+  metric = "query_warm_p50_us"
+  scope = "max_n"
+  operator = "<="
+  threshold = 600.0
+  tolerance = 0.10
+
+  # Measured p95 at 500K: 403 µs. Threshold 900 µs = ~2.2x headroom.
+  # FLAG: λ-review — p95 threshold set from 500K measurement (403 µs) with 2.2x margin.
+  # If the 1M khive-real run is added later, tighten or re-measure.
+  [[scale-proof.target.check]]
+  metric = "query_warm_p95_us"
+  scope = "max_n"
+  operator = "<="
+  threshold = 900.0
+  tolerance = 0.10
+
+# -------------------------------------------------------------------
+# Target 2: SIFT-1M (reproducible 1M proof; 128-dim, 4-point 100K/200K/500K/1M)
+#
+# Measured baselines (probe-results-sift-3pt.json + 1M probe, 2026-06-14):
+#   recall@10:  0.986 @1M
+#   beam:       64 (floor); exponent ≈ 0.303 (R²=0.99) over 100K–1M
+#   query p50:  ~334 µs @1M, warm
+#   query p95:  estimated ~430–500 µs @1M  # FLAG: λ-review — p95 not directly measured
+#   speedup:    ~34x @1M vs brute-force
+#
+# SIFT is harder than khive-real (ID ~10 vs 14, but unnormalized 128-dim).
+# Beam exponent 0.303 < 0.5 passes the flat criterion.
+# -------------------------------------------------------------------
+
+[[scale-proof.target]]
+name = "khive-vamana/1m-scale-proof/sift-1m"
+
+  [[scale-proof.target.check]]
+  metric = "recall_at_10"
+  scope = "all_rows"
+  operator = ">="
+  threshold = 0.95
+  tolerance = 0.0
+
+  # Measured SIFT beam exponent ≈ 0.303 (4-point, 100K–1M, R²=0.99).
+  # Threshold 0.5 passes with margin; 0.303 < 0.5.
+  [[scale-proof.target.check]]
+  metric = "beam_growth_exponent"
+  scope = "fits"
+  operator = "<="
+  threshold = 0.5
+  tolerance = 0.0
+
+  # Measured SIFT query exponent: not directly reported for 4-point fit.
+  # FLAG: λ-review — iso_recall_query_exponent_warm threshold for SIFT-1M set
+  # conservatively at 0.8 (same as khive-real). SIFT has higher intrinsic dim
+  # than khive-real; if the 4-point fit shows a higher exponent, tighten
+  # after the actual 1M run. Measured 3-point SIFT showed near-sublinear.
+  [[scale-proof.target.check]]
+  metric = "iso_recall_query_exponent_warm"
+  scope = "fits"
+  operator = "<"
+  threshold = 0.8
+  tolerance = 0.0
+
+  # Measured SIFT speedup at 1M: ~34x. Threshold 10x is a conservative floor.
+  [[scale-proof.target.check]]
+  metric = "speedup_vs_brute_force"
+  scope = "max_n"
+  operator = ">="
+  threshold = 10.0
+  tolerance = 0.0
+
+  # Measured SIFT p50 @1M: ~334 µs. Threshold 600 µs = ~1.8x headroom.
+  [[scale-proof.target.check]]
+  metric = "query_warm_p50_us"
+  scope = "max_n"
+  operator = "<="
+  threshold = 600.0
+  tolerance = 0.10
+
+  # FLAG: λ-review — SIFT-1M p95 threshold set at 900 µs.
+  # p95 was not directly measured in the 3-point probe. Estimate based on
+  # p95/p50 ratio from khive-real (~1.3x): 334 * 1.3 ≈ 434 µs.
+  # 900 µs = ~2x the p50 estimate — conservative; tighten after real 1M run.
+  [[scale-proof.target.check]]
+  metric = "query_warm_p95_us"
+  scope = "max_n"
+  operator = "<="
+  threshold = 900.0
+  tolerance = 0.10
