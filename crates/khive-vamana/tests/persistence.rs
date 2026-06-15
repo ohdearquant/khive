@@ -788,3 +788,103 @@ fn v2_v1_metadata_with_staged_v2_segments_not_torn() {
     let query = rand_unit_vectors(1, dim, 0xA3_04);
     assert!(!loaded.search(&query, 3).unwrap().is_empty());
 }
+
+// ---- Fix 5: parse_lifecycle count-overflow: huge ts_words / fs_count must not panic ----
+
+/// Helper: write `body` as lifecycle.bin, recompute its blake3, and patch the
+/// lifecycle_hash field in metadata.bin so the checksum gate passes.  Returns the
+/// mutated on-disk state ready for load_or_build / VamanaIndex::load.
+fn install_corrupt_lifecycle(dir: &std::path::Path, lifecycle_body: &[u8]) {
+    let lhash = *blake3::hash(lifecycle_body).as_bytes();
+    fs::write(dir.join("lifecycle.bin"), lifecycle_body).unwrap();
+
+    let mut meta = fs::read(dir.join("metadata.bin")).unwrap();
+    // lifecycle_hash is at offset 8 (magic) + 32 (vectors_hash) + 32 (graph_hash) = 72.
+    const LIFECYCLE_HASH_OFFSET: usize = 8 + 32 + 32;
+    meta[LIFECYCLE_HASH_OFFSET..LIFECYCLE_HASH_OFFSET + 32].copy_from_slice(&lhash);
+    fs::write(dir.join("metadata.bin"), &meta).unwrap();
+}
+
+/// Regression for overflow hardening in parse_lifecycle.
+///
+/// Targets the `checked_mul` guards added for ts_words and fs_count.  Without the fix
+/// the multiply wraps to a small value on release builds, the bounds check passes
+/// spuriously, and the subsequent loop panics on an out-of-range slice read.  With the
+/// fix parse_lifecycle returns InvalidFormat before the loop, load_or_build rebuilds, and
+/// load returns InvalidFormat — no panic on either path.
+///
+/// The lifecycle.bin blob is crafted so the blake3/commit-record gate passes (hash
+/// recomputed and patched into metadata.bin); the overflowing multiply is the gate
+/// that must trip, not the checksum.
+#[test]
+fn v2_parse_lifecycle_huge_ts_words_returns_invalid_format_not_panic() {
+    let dim = 4usize;
+    let n = 8usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA4_01);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // Craft a lifecycle.bin: magic + ts_words = u64::MAX/2, then nothing.
+    // ts_words * 8 wraps to a small value on release (old code); checked_mul traps it.
+    let mut lifecycle_body = b"KHVVLIF1".to_vec();
+    lifecycle_body.extend_from_slice(&(u64::MAX / 2).to_le_bytes()); // ts_words
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    // Strict path: InvalidFormat, no panic.
+    assert!(
+        matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ),
+        "load must return InvalidFormat, not panic, on huge ts_words"
+    );
+
+    // Permissive path: load_or_build rebuilds successfully, no panic.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+    let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
+    assert_eq!(&meta_after[..8], b"KHVVAMG2");
+}
+
+#[test]
+fn v2_parse_lifecycle_huge_fs_count_returns_invalid_format_not_panic() {
+    let dim = 4usize;
+    let n = 8usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA4_02);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // Craft a lifecycle.bin: magic + ts_words=0 (passes tombstone check) + fs_count = u64::MAX/2.
+    // fs_count * 4 wraps on release (old code); checked_mul traps it.
+    let mut lifecycle_body = b"KHVVLIF1".to_vec();
+    lifecycle_body.extend_from_slice(&0u64.to_le_bytes()); // ts_words = 0
+    lifecycle_body.extend_from_slice(&(u64::MAX / 2).to_le_bytes()); // fs_count
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    // Strict path: InvalidFormat, no panic.
+    assert!(
+        matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ),
+        "load must return InvalidFormat, not panic, on huge fs_count"
+    );
+
+    // Permissive path: load_or_build rebuilds successfully, no panic.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+}
