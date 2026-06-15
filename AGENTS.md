@@ -66,10 +66,10 @@ or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` f
 
 ### Memory pack — 3 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                           | When to use                                |
-| ----------------- | ------------------------------------------------------ | ------------------------------------------ |
-| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state         |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions |
+| Verb              | What it does                                           | When to use                                 |
+| ----------------- | ------------------------------------------------------ | ------------------------------------------- |
+| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state          |
+| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions  |
 | `memory.feedback` | Emit explicit feedback on a recalled memory            | Signal useful/not_useful to tune posteriors |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
