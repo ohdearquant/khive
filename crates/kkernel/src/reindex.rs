@@ -239,9 +239,10 @@ impl ReindexReport {
 /// per model — mirroring the multi-model write path in the runtime. Returns the
 /// number of vector inserts that failed.
 ///
-/// With `drop_existing`, each model's prior vector for an id is deleted before
-/// insert. Otherwise (`--keep-existing`), ids already embedded in a given model
-/// are skipped for that model only.
+/// With `drop_existing`, all staged ids are (re)embedded — existing vectors are
+/// atomically replaced by `SqliteVecStore::insert`'s internal DELETE+INSERT
+/// transaction (no-worse-than-stale on failure). Otherwise (`--keep-existing`),
+/// ids already embedded in a given model are skipped for that model only.
 // REASON: each argument is a distinct embed dimension (runtime, token, models,
 // namespace, batch, substrate kind, field, drop flag); a struct would add
 // indirection without grouping anything cohesive.
@@ -291,10 +292,11 @@ async fn embed_and_store_batch(
         let texts: Vec<String> = subset.iter().map(|(_, t)| truncate_text(t)).collect();
         match rt.embed_document_batch_with_model(model_name, &texts).await {
             Ok(embeddings) if embeddings.len() == subset.len() => {
+                // No pre-delete: SqliteVecStore::insert wraps DELETE+INSERT in
+                // a single transaction so a failed INSERT rolls back the DELETE
+                // and the prior vector survives (no-worse-than-stale). A separate
+                // committed delete before insert re-introduces the stranding window.
                 for ((id, _), emb) in subset.iter().zip(embeddings.iter()) {
-                    if drop_existing {
-                        let _ = vectors.delete(*id).await;
-                    }
                     if let Err(e) = vectors
                         .insert(*id, kind, namespace, field, vec![emb.clone()])
                         .await

@@ -9,10 +9,12 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
 };
+use super::sections_index::embed_sections;
 use super::util::resolve_atom_id;
 use super::util::{
     content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content,
 };
+use super::vamana;
 use super::KnowledgeHandlers;
 
 // ─── section helpers ──────────────────────────────────────────────────────────
@@ -167,6 +169,7 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: EditParams = deser(params)?;
         if p.sections.is_empty() {
@@ -321,10 +324,46 @@ impl KnowledgeHandlers {
             }));
         }
 
+        // Inline re-embed: newly-inserted section rows (embedding IS NULL) are embedded
+        // via the shared embed_sections path so the hybrid section-cosine read path
+        // (ADR-051) is fresh without a manual reindex. Byte-identical sections go
+        // through the metadata-only UPDATE branch above and keep their existing vector.
+        // The Vamana ANN snapshot rebuild is deferred (per-edit cost too high);
+        // approximate ANN recall over new vectors lags until the next kkernel reindex.
+        // Missing embedder: embed_sections returns (0,0,0) immediately, so edit succeeds.
+        embed_sections(runtime, token, false, 32, None, Some(&atom_id)).await?;
+
+        // Refresh this atom's vector-store entry (knowledge.atom field) so atom-granularity
+        // semantic recall is also fresh. rebuild_ann=false writes the vector immediately
+        // while deferring the Vamana ANN snapshot build — the same ANN-deferral tradeoff
+        // taken for sections above.
+        // Missing embedder: index early-returns {failed:0, reason:"no embedding model
+        // configured"} — failed==0 but nothing was written, so check for reason too.
+        let atom_vector_refreshed = {
+            let atom_params = serde_json::json!({
+                "ids": [atom_id],
+                "rebuild_ann": false,
+                "insert_only": false,
+            });
+            let result = KnowledgeHandlers::index(runtime, token, atom_params, ann, None).await?;
+            let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let skipped_no_embedder = result.get("reason").is_some();
+            if failed > 0 {
+                tracing::warn!(
+                    atom_id = %atom_id,
+                    failed = failed,
+                    "knowledge.edit: atom vector refresh failed; \
+                     hybrid recall for this atom may be stale until next reindex"
+                );
+            }
+            failed == 0 && !skipped_no_embedder
+        };
+
         Ok(json!({
             "atom_id": atom_id,
             "upserted": upserted,
             "sections": section_results,
+            "atom_vector_refreshed": atom_vector_refreshed,
         }))
     }
 
@@ -332,6 +371,7 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: ImportParams = deser(params)?;
         let path_str = p.path.trim().to_string();
@@ -469,7 +509,7 @@ impl KnowledgeHandlers {
                         "id": slug,
                         "sections": section_updates,
                     });
-                    let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
+                    let result = KnowledgeHandlers::edit(runtime, token, edit_params, ann).await?;
                     if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
                         imported_sections += n as usize;
                     }

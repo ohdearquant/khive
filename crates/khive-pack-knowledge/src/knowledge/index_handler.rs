@@ -31,7 +31,10 @@ impl KnowledgeHandlers {
 
         let sql = runtime.sql();
         let batch_size = p.batch_size.unwrap_or(500).clamp(1, 1000);
-        let insert_only = p.insert_only.unwrap_or(false);
+        // insert_only is accepted for API compatibility but no longer drives a
+        // pre-delete loop: SqliteVecStore::insert atomically replaces via its own
+        // transacted DELETE+INSERT regardless of this flag.
+        let _insert_only = p.insert_only.unwrap_or(false);
 
         let atoms: Vec<Atom> = if let Some(ref ids) = p.ids {
             let mut out = Vec::with_capacity(ids.len());
@@ -150,15 +153,15 @@ impl KnowledgeHandlers {
             // failed insert is reported as `failed` rather than silently counted
             // as `indexed`. A failed vector write means recall cannot retrieve
             // that atom — that is a failure, not a success.
+            //
+            // No pre-delete loop: SqliteVecStore::insert wraps its own DELETE+INSERT
+            // in a single transaction, so a failed INSERT rolls back the DELETE and
+            // the prior vector survives (no-worse-than-stale). A separate pre-delete
+            // committed before insert would re-introduce the stranding window.
             let mut chunk_ok: Vec<bool> = vec![true; staged.len()];
             match runtime.vectors(token) {
                 Ok(vectors) => {
                     let ns_str = token.namespace().as_str();
-                    if !insert_only {
-                        for (id, _) in &staged {
-                            let _ = vectors.delete(*id).await;
-                        }
-                    }
                     for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
                         if let Err(e) = vectors
                             .insert(

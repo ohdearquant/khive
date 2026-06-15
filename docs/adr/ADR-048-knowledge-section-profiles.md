@@ -10,18 +10,18 @@ This ADR is accepted as the governing record for shipped knowledge sections and 
 profile primitives, while explicitly deferring broader resource dual-write, profile-weighted
 compose/suggest, hooks, lint, export, and observability phases.
 
-| Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                          |
-| ------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                  |
-| Section write-side embedding backfill                         | shipped  | `kkernel reindex` populates `knowledge_sections.embedding` via breadcrumb-enriched embed text (ADR-051 phase 1). `knowledge.index` remains atom-only. Read-side section scoring in compose is deferred (ADR-051 phase 2). |
-| V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                            |
-| `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                        |
-| `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                        |
-| `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                       |
-| Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                             |
-| `knowledge.suggest` / `knowledge.compose` profile weighting   | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests.   |
-| Resource entity dual-write                                    | deferred | `knowledge.upsert_atoms` and `knowledge.upsert_domains` write corpus tables; domain mirror is into `knowledge_atoms` for FTS, not graph `entities`.                                                                       |
-| `knowledge.lint`, `knowledge.lint_config`, `knowledge.export` | deferred | These verbs are not registered in the shipped knowledge pack.                                                                                                                                                             |
+| Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                                                                                                                                                   |
+| Section write-side embedding backfill                         | shipped  | `kkernel reindex` and `knowledge.edit` (inline atom-scoped re-embed) populate `knowledge_sections.embedding` via breadcrumb-enriched embed text (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search` and `knowledge.compose` is shipped (ADR-051 phase 2). Profile-weighted compose and the Vamana section ANN snapshot remain deferred. |
+| V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                                                                                                                                                             |
+| `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                                                                                                                                                         |
+| `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                                                                                                                                                         |
+| `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                                                                                                                                                        |
+| Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                                                                                                                                                              |
+| `knowledge.suggest` / `knowledge.compose` profile weighting   | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests.                                                                                                                                    |
+| Resource entity dual-write                                    | deferred | `knowledge.upsert_atoms` and `knowledge.upsert_domains` write corpus tables; domain mirror is into `knowledge_atoms` for FTS, not graph `entities`.                                                                                                                                                                                                        |
+| `knowledge.lint`, `knowledge.lint_config`, `knowledge.export` | deferred | These verbs are not registered in the shipped knowledge pack.                                                                                                                                                                                                                                                                                              |
 
 ## Governance for Shipped Knowledge Sections and Profiles
 
@@ -153,10 +153,30 @@ Section_type is a closed enum matching the atlas schema v1: `overview`, `core_mo
 `expert_lens`, `references`, `other`.
 
 **Editing a section does not touch other sections.** `knowledge.edit(slug, sections=[...])`
-updates only the named section rows. Each section has a nullable `embedding` column. Shipped `knowledge.edit` clears
-`embedding=NULL` on section updates; `knowledge.index` indexes atoms only. Section
-write-side embedding backfill is shipped via `kkernel reindex` (ADR-051 phase 1);
-section-aware compose and read-side scoring remain deferred.
+updates only the named section rows. Each section has a nullable `embedding` column.
+
+`knowledge.edit` performs an **inline, atom-scoped re-embed** immediately after writing
+section rows: it queries `knowledge_sections WHERE atom_id = ? AND embedding IS NULL` and
+embeds those rows using the same breadcrumb-enriched text format as `kkernel reindex`
+(`{atom_name}\n{heading}\n\n{content}`, truncated to 32 768 bytes). Byte-identical sections
+retain their prior embedding (they were updated via the `UNIQUE(atom_id, content_hash)` hit
+path, which does not clear `embedding`), so the re-embed pass is incremental by construction.
+Section vectors are written to `knowledge_sections.embedding` immediately, making the hybrid
+section-cosine read path (ADR-051) fresh without a manual reindex.
+
+The Vamana ANN snapshot rebuild is **deferred**: per-edit ANN rebuilds are prohibitively
+costly. Approximate ANN recall over newly-written vectors lags until the next `kkernel reindex`
+or scheduled rebuild; the direct section-cosine (non-ANN) path uses the new vectors immediately.
+
+If no default embedder is configured, `knowledge.edit` succeeds without embedding — the same
+early-return degradation as `embed_sections` in `kkernel reindex`. `knowledge.upsert_atoms`
+remains batch-only and does not perform inline re-embed.
+
+`knowledge.index` indexes atoms only. Full section write-side embedding backfill is shipped
+via `kkernel reindex` (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search`
+and `knowledge.compose` is shipped (see `search.rs` section candidate path and
+`compose.rs` section rerank path); profile-weighted section compose and the Vamana ANN
+snapshot rebuild remain deferred.
 
 **Sections link to atoms structurally (FK), not via graph edges.** The section→atom
 relationship is always 1:N containment — there's no semantic edge type needed. All
@@ -586,6 +606,12 @@ Profile-weighted `knowledge.compose` is deferred. Shipped `knowledge.compose` re
 explicit `domain_ids` and/or `atom_ids`, reranks atom text, and returns atom-body markdown.
 The shipped function does not call `brain.resolve` and does not assemble section-weighted
 manifests.
+
+**Inline re-embed on `knowledge.edit`** (shipped, issue #11): after section rows are written,
+`knowledge.edit` embeds the atom's newly-inserted sections inline (those whose `embedding` is
+NULL). This ensures the hybrid section-cosine read path is fresh without a manual reindex.
+The Vamana ANN snapshot rebuild remains deferred (per-edit cost too high). If no embedder is
+configured the edit still succeeds. `knowledge.upsert_atoms` is not changed.
 
 The original spec described a profile-weighted compose step:
 
