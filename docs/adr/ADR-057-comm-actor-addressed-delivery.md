@@ -1,6 +1,6 @@
 # ADR-057: Comm Actor-Addressed Delivery
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-06-15\
 **Authors**: Ocean, lambda:khive\
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and

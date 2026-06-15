@@ -14,7 +14,7 @@ concepts, links ideas, records decisions — khive gives that work a typed, quer
 persists across sessions.
 
 It is NOT a general-purpose database, a vector DB, or a chat memory system. It has opinions:
-8 entity kinds, 15 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
+9 entity kinds, 17 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
 schema, change how you model it, not the schema. Schema changes require an ADR.
 
 ---
@@ -55,9 +55,9 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg     — KG vocabulary + 11 verb handlers (ADR-017)     │
+│  khive-pack-kg     — KG vocabulary + 16 verb handlers (ADR-017)     │
 │  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-019, optional)     │
-│  khive-pack-memory — memory/recall verbs + decay (ADR-021, optional)│
+│  khive-pack-memory — memory/recall verbs + feedback + decay (ADR-021, optional)│
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039)                   │
 └──────────────────────────────────────────────────────────────┘
@@ -99,9 +99,9 @@ not shipped.
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                         |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                                                                 |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 16 verb handlers, kind validation                                                                 |
 | `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                           |
-| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))             |
+| `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))  |
 | `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
 | `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
 | `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
@@ -114,11 +114,11 @@ not shipped.
 
 ## Closed taxonomies (DO NOT extend without an ADR)
 
-### 8 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
+### 9 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-resource-entity-kind.md))
 
-`concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service`
+`concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service` | `resource`
 
-### 15 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md))
+### 17 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
 
 Structure: `contains` | `part_of` | `instance_of`
 Derivation: `extends` | `variant_of` | `introduced_by` | `supersedes`
@@ -128,6 +128,7 @@ Dependency: `depends_on` | `enables`
 Implementation: `implements`
 Lateral: `competes_with` | `composed_with`
 Annotation: `annotates`
+Epistemic: `supports` | `refutes`
 
 ### 5 note kinds ([ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
 
@@ -166,9 +167,9 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 7 production packs: kg, gtd, memory, brain, comm, schedule, knowledge
-(63 verbs total).
+(65 verbs total).
 
-### KG pack verbs (11 — ADR-017)
+### KG pack verbs (16 — ADR-017, ADR-046)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
@@ -180,6 +181,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `create`    | `kind=<substrate\|granular>` + fields        | Create an entity or note                                      |
 | `get`       | `id` (UUID)                                  | Fetch any record — auto-detects entity/note/edge              |
 | `list`      | `kind=<substrate\|granular>\|edge` + filters | Structured browse with pagination                             |
+| `stats`     | —                                            | Return aggregate KG substrate counts (entities, edges, notes) |
 | `update`    | `id` + patch fields                          | Patch entity (name/desc/props/tags) or edge (relation/weight) |
 | `delete`    | `id`, `hard?`                                | Soft-delete (default) or hard-delete with edge cascade        |
 | `merge`     | `into_id`, `from_id`                         | Deduplicate two entities (v0.1: entity-only)                  |
@@ -188,6 +190,10 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `neighbors` | `node_id`, `direction?`, `relations?`        | Immediate graph neighbors                                     |
 | `traverse`  | `roots`, `max_depth?`, `relations?`          | Multi-hop BFS with filters                                    |
 | `query`     | GQL or SPARQL string                         | Pattern matching compiled to SQL                              |
+| `propose`   | `title`, `description`, `changeset`          | Create an event-sourced change proposal (ADR-046)             |
+| `review`    | `id`, `decision`, `comment?`                 | Approve, reject, or comment on a proposal                     |
+| `withdraw`  | `id`, `rationale?`                           | Rescind an open proposal (proposer-only)                      |
+| `verbs`     | `category?`, `pack?`                         | List all MCP-callable verbs registered on this server         |
 
 ### GTD pack verbs (5 — ADR-019, optional)
 
@@ -201,14 +207,15 @@ Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 | `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
 | `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
 
-### Memory pack verbs (2 — ADR-021, optional)
+### Memory pack verbs (3 — ADR-021, optional)
 
 Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
 
-| Verb       | Args                                                                  | What it does                                                              |
-| ---------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
-| `recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`      | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
+| Verb              | Args                                                                  | What it does                                                              |
+| ----------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
+| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`      | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
+| `memory.feedback` | `target_id`, `signal`                                                 | Emit explicit feedback on a recalled entity; updates recall posteriors    |
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
@@ -328,19 +335,19 @@ ADRs specify. Changing the schema or interface requires an ADR **before** code l
 
 Key ADRs for contributors:
 
-| ADR                                                  | What it governs                                      |
-| ---------------------------------------------------- | ---------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 8 entity kinds — don't add without this              |
-| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 edge relations — closed set                       |
-| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary            |
-| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation   |
-| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                    |
-| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema       |
-| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`     |
-| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints  |
-| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition       |
-| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration           |
-| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration |
+| ADR                                                  | What it governs                                                     |
+| ---------------------------------------------------- | ------------------------------------------------------------------- |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 9 entity kinds (8 base + resource ADR-048) — don't add without this |
+| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 base edge relations; +2 epistemic via ADR-055 = 17 total         |
+| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary                           |
+| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation                  |
+| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                                   |
+| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema                      |
+| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`                    |
+| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints                 |
+| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition                      |
+| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration                          |
+| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration                |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 

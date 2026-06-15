@@ -147,7 +147,7 @@ corruption at scale).
 
 ### ANN warm-start
 
-ANN warm-start is owned by the **daemon** process (`khive-mcp --daemon`), not by
+ANN warm-start is owned by the **daemon** process (`kkernel mcp --daemon`), not by
 the stdio server. After the daemon socket is bound, `warm_all()` runs in a
 background task, loading persisted Vamana snapshots into memory. The stdio MCP
 server forwards requests to the warm daemon via Unix socket (`forward_or_spawn`);

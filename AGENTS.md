@@ -14,7 +14,7 @@ khive gives your agent:
 8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
 9. **Brain** — Bayesian profile tuning from feedback signals
 
-All 7 packs load by default. **63 public verbs** across the packs.
+All 7 packs load by default. **65 public verbs** across the packs.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -232,18 +232,19 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 8 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
+## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-resource-entity-kind.md))
 
-| Kind       | What it represents                                      |
-| ---------- | ------------------------------------------------------- |
-| `concept`  | Algorithms, techniques, architectures, theories, models |
-| `document` | Papers, preprints, technical reports, blog posts, books |
-| `dataset`  | Benchmarks, corpora, evaluation sets                    |
-| `project`  | Codebases, libraries, tools, frameworks                 |
-| `person`   | Researchers, engineers, authors                         |
-| `org`      | Labs, companies, institutions                           |
-| `artifact` | Binaries, model checkpoints, Docker images, packages    |
-| `service`  | APIs, hosted endpoints, SaaS products                   |
+| Kind       | What it represents                                                         |
+| ---------- | -------------------------------------------------------------------------- |
+| `concept`  | Algorithms, techniques, architectures, theories, models                    |
+| `document` | Papers, preprints, technical reports, blog posts, books                    |
+| `dataset`  | Benchmarks, corpora, evaluation sets                                       |
+| `project`  | Codebases, libraries, tools, frameworks                                    |
+| `person`   | Researchers, engineers, authors                                            |
+| `org`      | Labs, companies, institutions                                              |
+| `artifact` | Binaries, model checkpoints, Docker images, packages                       |
+| `service`  | APIs, hosted endpoints, SaaS products                                      |
+| `resource` | Actionable content agents consume: atoms, domains, skills, tools, runbooks |
 
 `concept` is the default. Use `properties` for finer distinctions (`type: "paper"`,
 `domain: "attention"`, `status: "implemented"`).
@@ -265,7 +266,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 15-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md))
+## The 17-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
 
 When you `link` nodes, use ONLY these relations:
 
