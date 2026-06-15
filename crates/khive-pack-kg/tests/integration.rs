@@ -3896,6 +3896,10 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
         propose_result.get("id").is_some(),
         "propose must return id; got {propose_result}"
     );
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose must NOT emit the old proposal_id key (clean break); got {propose_result}"
+    );
 
     // List proposal_created events.
     let events = pack
@@ -3977,10 +3981,23 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
         .as_str()
         .expect("must have id")
         .to_string();
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose_result}"
+    );
 
-    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+    let review_result = pack
+        .dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
         .await
         .expect("approve must succeed");
+    assert!(
+        review_result.get("id").is_some(),
+        "review must return id; got {review_result}"
+    );
+    assert!(
+        review_result.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review_result}"
+    );
 
     let events = pack
         .dispatch(
@@ -4861,6 +4878,10 @@ async fn propose_review_reject_lifecycle() {
         .await
         .expect("propose must succeed");
     let pid = propose["id"].as_str().expect("id");
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
 
     // Reject the proposal.
     let review = f
@@ -4872,6 +4893,10 @@ async fn propose_review_reject_lifecycle() {
     assert_eq!(
         status_after, "rejected",
         "#393 reject: review response status must be 'rejected', got {status_after:?}; full: {review}"
+    );
+    assert!(
+        review.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review}"
     );
 
     // list(kind=proposal, status=rejected) must contain this proposal.
@@ -4886,6 +4911,15 @@ async fn propose_review_reject_lifecycle() {
     assert!(
         found,
         "#393 reject: proposal {pid} not found in list(status=rejected); items: {list}"
+    );
+    // list rows must not expose the old key either.
+    let row = items
+        .iter()
+        .find(|v| v["id"].as_str().is_some_and(|id| id == pid))
+        .expect("rejected proposal row must be findable");
+    assert!(
+        row.get("proposal_id").is_none(),
+        "list(kind=proposal) row must NOT contain proposal_id key; got {row}"
     );
 }
 
@@ -4906,6 +4940,10 @@ async fn propose_withdraw_lifecycle() {
         .await
         .expect("propose must succeed");
     let pid = propose["id"].as_str().expect("id");
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
 
     // Withdraw the proposal.
     let withdraw = f
@@ -4917,6 +4955,10 @@ async fn propose_withdraw_lifecycle() {
     assert_eq!(
         status_after, "withdrawn",
         "#393 withdraw: response status must be 'withdrawn', got {status_after:?}; full: {withdraw}"
+    );
+    assert!(
+        withdraw.get("proposal_id").is_none(),
+        "withdraw must NOT emit old proposal_id key; got {withdraw}"
     );
 
     // list(kind=proposal, status=withdrawn) must contain this proposal.
@@ -4931,6 +4973,15 @@ async fn propose_withdraw_lifecycle() {
     assert!(
         found,
         "#393 withdraw: proposal {pid} not found in list(status=withdrawn); items: {list}"
+    );
+    // list rows must not expose the old key.
+    let row = items
+        .iter()
+        .find(|v| v["id"].as_str().is_some_and(|id| id == pid))
+        .expect("withdrawn proposal row must be findable");
+    assert!(
+        row.get("proposal_id").is_none(),
+        "list(kind=proposal) row must NOT contain proposal_id key; got {row}"
     );
 }
 
@@ -5714,5 +5765,115 @@ async fn hard_delete_soft_deleted_edge_without_kind_purges_row() {
     assert_eq!(
         row_count, 0,
         "hard delete must physically remove the edge row from graph_edges"
+    );
+}
+
+// ── PR #121: proposal_id → id wire-key clean break ───────────────────────────
+//
+// These tests pin the contract that the old `proposal_id` wire key is ABSENT
+// from every handler output and that the old input param name is rejected.
+// Positive `id` presence is already asserted in the lifecycle tests above;
+// here we add the complementary absence / negative-input coverage.
+
+/// get(id=<proposal_uuid>) result must expose `id`, NOT `proposal_id`.
+///
+/// The get handler (get.rs:211-214) removes `proposal_id` from the
+/// deserialized ProposalCreatedPayload and inserts `id`.  This test asserts
+/// the absence side so a dual-emit regression would be caught immediately.
+#[tokio::test]
+async fn get_proposal_wire_key_is_id_not_proposal_id() {
+    let f = pack_with_events();
+
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "WireKeyAbsenceTest",
+                "description": "get must return id, not proposal_id",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose_result["id"]
+        .as_str()
+        .expect("propose must return id")
+        .to_string();
+    assert!(
+        propose_result.get("proposal_id").is_none(),
+        "propose result must NOT contain proposal_id; got {propose_result}"
+    );
+
+    let get_result = f
+        .dispatch("get", json!({ "id": pid }))
+        .await
+        .expect("get must succeed");
+
+    assert!(
+        get_result.get("id").is_some(),
+        "get(id=proposal_uuid) must return id field; got {get_result}"
+    );
+    assert!(
+        get_result.get("proposal_id").is_none(),
+        "get(id=proposal_uuid) must NOT return proposal_id (clean break); got {get_result}"
+    );
+}
+
+/// review(proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+///
+/// ReviewParams declares `id`, not `proposal_id`, with deny_unknown_fields.
+/// Passing the old key must produce an InvalidInput error, not silently succeed.
+#[tokio::test]
+async fn review_with_old_proposal_id_param_is_rejected() {
+    let f = pack_with_events();
+
+    // Propose so there is a valid target UUID — we pass a fake one intentionally
+    // because the deny_unknown_fields rejection fires at deserialization, before
+    // any UUID lookup.
+    let err = f
+        .dispatch(
+            "review",
+            json!({
+                "proposal_id": "00000000-0000-0000-0000-000000000001",
+                "decision": "reject"
+            }),
+        )
+        .await;
+
+    assert!(
+        err.is_err(),
+        "review(proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    assert!(
+        is_invalid_input(err.as_ref().unwrap_err()),
+        "review(proposal_id=...) must produce InvalidInput; got {:?}",
+        err.unwrap_err()
+    );
+}
+
+/// withdraw(proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
+///
+/// WithdrawParams declares `id`, not `proposal_id`, with deny_unknown_fields.
+#[tokio::test]
+async fn withdraw_with_old_proposal_id_param_is_rejected() {
+    let f = pack_with_events();
+
+    let err = f
+        .dispatch(
+            "withdraw",
+            json!({
+                "proposal_id": "00000000-0000-0000-0000-000000000001"
+            }),
+        )
+        .await;
+
+    assert!(
+        err.is_err(),
+        "withdraw(proposal_id=...) must be rejected by deny_unknown_fields; got Ok"
+    );
+    assert!(
+        is_invalid_input(err.as_ref().unwrap_err()),
+        "withdraw(proposal_id=...) must produce InvalidInput; got {:?}",
+        err.unwrap_err()
     );
 }

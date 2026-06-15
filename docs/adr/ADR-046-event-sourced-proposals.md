@@ -225,15 +225,19 @@ pub struct ProposeArgs {
 }
 
 // review verb signature
+// SUPERSEDED by 2026-06-14 amendment (see §Amendment below):
+// wire input param renamed proposal_id → id; internal payload field unchanged.
 pub struct ReviewArgs {
-    pub proposal_id: Uuid,
+    pub proposal_id: Uuid,  // SUPERSEDED wire name; current wire param is `id`
     pub decision:    ProposalDecision,
     pub comment:     Option<String>,
 }
 
 // withdraw verb signature
+// SUPERSEDED by 2026-06-14 amendment (see §Amendment below):
+// wire input param renamed proposal_id → id; internal payload field unchanged.
 pub struct WithdrawArgs {
-    pub proposal_id: Uuid,
+    pub proposal_id: Uuid,  // SUPERSEDED wire name; current wire param is `id`
     pub rationale:   Option<String>,
 }
 ```
