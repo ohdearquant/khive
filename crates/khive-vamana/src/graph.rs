@@ -1067,7 +1067,8 @@ mod tests {
     }
 
     /// After `add_node`, reverse_adj grows in sync with adjacency so the
-    /// graph remains consistent for any subsequent rebuild.
+    /// graph remains consistent for any subsequent rebuild. The new node
+    /// starts with no in-neighbors, and the bidirectional invariant holds.
     #[test]
     fn add_node_extends_reverse_adj_in_sync() {
         let mut g = VamanaGraph::new(2, 0).unwrap();
@@ -1079,6 +1080,35 @@ mod tests {
             "reverse_adj must grow with adjacency after add_node"
         );
         assert_eq!(g.node_count(), 3);
+
+        // The freshly added node carries no forward or reverse edges yet.
+        let new_id = g.node_count() as u32 - 1;
+        assert!(
+            g.in_neighbors(new_id).unwrap().is_empty(),
+            "newly added node must have no in-neighbors"
+        );
+        assert!(
+            g.reverse_adjacency()[new_id as usize].is_empty(),
+            "reverse_adj for newly added node must be empty"
+        );
+
+        // Full bidirectional invariant still holds after the mutation.
+        for (u, outs) in g.adjacency().iter().enumerate() {
+            for &v in outs {
+                assert!(
+                    g.reverse_adjacency()[v as usize].contains(&(u as u32)),
+                    "forward edge {u}→{v} missing from reverse_adj[{v}] after add_node"
+                );
+            }
+        }
+        for (v, ins) in g.reverse_adjacency().iter().enumerate() {
+            for &u in ins {
+                assert!(
+                    g.adjacency()[u as usize].contains(&(v as u32)),
+                    "reverse edge {v}←{u} missing from adjacency[{u}] after add_node"
+                );
+            }
+        }
     }
 
     // ---- Regression tests for P0/P1 fixes ----
