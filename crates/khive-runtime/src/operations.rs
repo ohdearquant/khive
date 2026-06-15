@@ -39,40 +39,45 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 // reset to 0 after each call regardless of whether it triggered, so tests are
 // isolated from one another.
 //
-// `FTS_FAIL_FLAG` / `VECTOR_FAIL_FLAG`: global atomics, armed via `arm_fts_fail` /
-// `arm_vector_fail`.  Gated behind `cfg(any(test, feature = "fault-injection"))`
-// so they compile out of release builds entirely — no atomic ops on the hot path
-// in production, and no fault-injection surface in published binaries.
+// `FTS_FAIL_NS` / `VECTOR_FAIL_NS`: namespace-targeted injection mutexes, armed via
+// `arm_fts_fail(ns)` / `arm_vector_fail(ns)`.  Gated behind
+// `cfg(any(test, feature = "fault-injection"))` so they compile out of release builds
+// entirely — no lock acquisitions on the hot path in production, and no fault-injection
+// surface in published binaries.  Namespace-targeting means only `create_note` calls
+// for the armed namespace fire the injection; concurrent tests on other namespaces are
+// unaffected, eliminating cross-test races without requiring `#[serial]`.
 // External integration test crates enable the feature via a dev-dependency:
-//   khive-runtime = { workspace = true, features = ["fault-injection"] }
+//   khive-runtime = { ..., features = ["fault-injection"] }
 #[cfg(test)]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
-static FTS_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(any(test, feature = "fault-injection"))]
-static VECTOR_FAIL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// Arm the FTS failure injection for `create_note_inner`.
+/// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
 ///
-/// After this is called, the next `create_note` call returns an injected error
-/// at the FTS upsert step (after the note row is committed), then disarms.
+/// The next `create_note` call whose note namespace equals `ns` returns an injected
+/// error at the FTS upsert step (after the note row is committed), then disarms.
+/// Calls on other namespaces are unaffected.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_fts_fail() {
-    FTS_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+pub fn arm_fts_fail(ns: &str) {
+    *FTS_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
-/// Arm the vector insertion failure injection for `create_note_inner`.
+/// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
 ///
-/// After this is called, the next `create_note` call returns an injected error
-/// at the first vector insert step, then disarms.
+/// The next `create_note` call whose note namespace equals `ns` returns an injected
+/// error at the first vector insert step, then disarms.  Calls on other namespaces
+/// are unaffected.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
-pub fn arm_vector_fail() {
-    VECTOR_FAIL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+pub fn arm_vector_fail(ns: &str) {
+    *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// A note search result with UUID, salience-weighted RRF score, and display text.
@@ -1406,12 +1411,21 @@ impl KhiveRuntime {
 
         // FTS step — compensate note row on failure.
         {
-            // Injection: check the FTS_FAIL_FLAG (armed by `arm_fts_fail()`).
-            // The swap only exists when fault-injection is compiled in; the
-            // cfg(not) branch is a const false so the compiler eliminates the
-            // if-branch and there is no atomic op in release builds.
+            // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail(ns)`).
+            // Fires only when the armed namespace matches this note's namespace,
+            // then clears (one-shot).  No lock acquisition in release builds —
+            // the cfg(not) branch is a const false so the compiler eliminates
+            // the if-branch entirely.
             #[cfg(any(test, feature = "fault-injection"))]
-            let fts_inject = FTS_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let fts_inject = {
+                let mut g = FTS_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
             #[cfg(not(any(test, feature = "fault-injection")))]
             let fts_inject = false;
             let fts_result: RuntimeResult<()> = if fts_inject {
@@ -1444,12 +1458,20 @@ impl KhiveRuntime {
                 .embed_document_with_model(model_name, &note.content)
                 .await;
 
-            // Injection: check VECTOR_FAIL_FLAG (armed by `arm_vector_fail()`).
-            // Swap-false atomically so the flag resets after one trigger.
-            // The swap only exists when fault-injection is compiled in; the
-            // cfg(not) branch is a const false eliminating the if-branch in release.
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`).
+            // Fires only when the armed namespace matches this note's namespace,
+            // then clears (one-shot).  No lock acquisition in release builds —
+            // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = VECTOR_FAIL_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let vec_inject = {
+                let mut g = VECTOR_FAIL_NS.lock().unwrap();
+                if g.as_deref() == Some(ns) {
+                    *g = None;
+                    true
+                } else {
+                    false
+                }
+            };
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
             let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
@@ -5606,7 +5628,7 @@ mod tests {
         let rt = rt();
         let tok = NamespaceToken::local();
 
-        arm_fts_fail();
+        arm_fts_fail("local");
 
         let result = rt
             .create_note(

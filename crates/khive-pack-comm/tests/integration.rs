@@ -3003,96 +3003,88 @@ async fn t12_allowlist_is_one_directional() {
     );
 }
 
-// T13 — inbound indexing failure (FTS) after row commit leaves no stranded row.
+// T13 — inbound FTS failure after row commit leaves no stranded row (isomorphic
+// to codex finding #3: the INBOUND path specifically).
 //
-// This is the isomorphic replacement for T11: it contrives an actual post-row
-// inbound write failure (FTS step) and asserts that the compensation path in
-// create_note_inner removes the inbound note row, so no stranded cross-ns row
-// is visible to the recipient.
+// `dual_write_message` writes two notes: outbound (sender ns) then inbound
+// (recipient ns).  Finding #3 is about a stranded RECIPIENT row when the FTS
+// step fails after the inbound note row is committed.
 //
-// Uses `arm_fts_fail()` (khive_runtime::arm_fts_fail, cfg(test) only) to
-// inject the failure deterministically after the note row is committed.
+// Strategy: arm `arm_fts_fail` on the RECIPIENT namespace only.  The outbound
+// create_note (sender ns) runs first and is NOT targeted, so it succeeds.  The
+// inbound create_note (recipient ns) IS targeted: it commits the note row, hits
+// the injected FTS error, compensates (deletes the inbound row), and propagates
+// the error.  `dual_write_message` catches that error and rolls back the
+// outbound note.  After the send returns an error, BOTH namespaces must be empty.
 //
-// #[serial] is required because arm_fts_fail() sets a global AtomicBool that
-// concurrent tests can consume, causing races with other tests that call
-// create_note.
-#[serial_test::serial]
+// Namespace-targeting eliminates the cross-test race: concurrent tests using
+// other namespaces are unaffected by the injection.  `#[serial]` is not needed.
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     use khive_runtime::arm_fts_fail;
 
+    // Use a unique recipient namespace so the injection does not affect
+    // concurrent tests that share the shared_backend().
+    let sender_ns = "lambda:t13-sender";
+    let recipient_ns = "lambda:t13-inbound-fail";
+
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(
+    let (registry_sender, rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
-        "lambda:leo",
-        vec![Namespace::parse("lambda:khive").unwrap()],
+        sender_ns,
+        vec![Namespace::parse(recipient_ns).unwrap()],
     );
-    let (_registry_khive, rt_khive) =
-        build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
+    let (_registry_recipient, rt_recipient) =
+        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
 
-    // Send without injection first to ensure the outbound write succeeds but
-    // the injection fires on the INBOUND create_note call.  The tricky part
-    // is that dual_write_message calls create_note twice: first for the
-    // outbound (caller ns), then for the inbound (recipient ns).  We need to
-    // arm the injection so it fires on the SECOND create_note call.
-    //
-    // Strategy: arm_fts_fail resets after one trigger.  The outbound create_note
-    // fires first.  So we arm it now — the first FTS step (outbound) will
-    // consume the injection and the send will fail with the outbound FTS error.
-    // The compensation then removes the outbound row.
-    //
-    // To specifically test the inbound path, we perform two sends:
-    //   (a) same-namespace send (no FTS injection) to verify normal flow,
-    //   (b) then arm the flag and perform the cross-ns send — this time the
-    //       outbound create fires first and consumes the flag, causing the
-    //       outbound to fail.  With atomic compensation, no outbound row persists.
-    //
-    // The key assertion is: after the injection, NEITHER namespace has a
-    // stranded message row.
+    // Arm the FTS injection on the RECIPIENT namespace only.  The outbound
+    // create_note (sender_ns) passes through; only the inbound create_note
+    // (recipient_ns) triggers the injected error.
+    arm_fts_fail(recipient_ns);
 
-    // Arm the injection — the next FTS upsert in any create_note call will fail.
-    arm_fts_fail();
-
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "inbound-fail test" }),
+            serde_json::json!({ "to": recipient_ns, "content": "t13 inbound-fail test" }),
         )
         .await;
     assert!(
         result.is_err(),
-        "T13: send must fail when FTS injection armed"
+        "T13: send must fail when inbound FTS injection is armed on recipient ns"
     );
 
-    // No outbound note must remain in lambda:leo.
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // No outbound note must remain in the sender namespace.
+    let sender_tok = rt_sender
+        .authorize(Namespace::parse(sender_ns).unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let sender_notes = rt_sender
+        .list_notes(&sender_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let leo_alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
-    assert_eq!(
-        leo_alive, 0,
-        "T13: no stranded outbound note in sender ns; got {leo_alive}"
-    );
-
-    // No inbound note must remain in lambda:khive.
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let khive_alive = khive_notes
+    let sender_alive = sender_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .count();
     assert_eq!(
-        khive_alive, 0,
-        "T13: no stranded inbound note in recipient ns; got {khive_alive}"
+        sender_alive, 0,
+        "T13: no stranded outbound note in sender ns after inbound FTS failure; got {sender_alive}"
+    );
+
+    // No inbound note must remain in the recipient namespace.
+    let recipient_tok = rt_recipient
+        .authorize(Namespace::parse(recipient_ns).unwrap())
+        .unwrap();
+    let recipient_notes = rt_recipient
+        .list_notes(&recipient_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let recipient_alive = recipient_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        recipient_alive, 0,
+        "T13: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
     );
 }
 
