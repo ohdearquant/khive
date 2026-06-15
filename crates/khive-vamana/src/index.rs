@@ -721,7 +721,25 @@ impl VamanaIndex {
             }
 
             // Fast path: load all segments, restore lifecycle state.
-            Self::load_v2_fast(path, &lifecycle_data)
+            // A corrupt-but-checksum-valid lifecycle segment (e.g. reverse_adj not the inverse
+            // of graph.bin) passes the blake3 gate but fails the new bidirectional check inside
+            // load_v2_fast.  Route that InvalidFormat error through the same corrupt-snapshot →
+            // rebuild path used by the unknown-magic and checksum-mismatch cases above.
+            match Self::load_v2_fast(path, &lifecycle_data) {
+                Ok(index) => Ok(index),
+                Err(VamanaError::InvalidFormat { .. }) => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    Ok(index)
+                }
+                Err(e) => Err(e),
+            }
         } else if &metadata_bytes[..8] == METADATA_MAGIC {
             // V1 format: upgrade to v2. Remove any stale staged segments first.
             for suffix in &[
@@ -780,6 +798,39 @@ impl VamanaIndex {
 
         // Parse lifecycle.bin and restore state directly (no O(N*R) rebuild).
         let lifecycle = parse_lifecycle(lifecycle_data, num_vectors, max_degree)?;
+
+        // Validate bidirectional consistency: the persisted reverse_adj must be the exact
+        // inverse of the loaded forward graph. A checksum-valid but writer-bugged lifecycle
+        // segment can pass parse_lifecycle's per-list shape checks (in-range, no dup, no
+        // self-ref) while still being semantically wrong (phantom sources, missing entries).
+        // Wolverine delete-repair relies on the invariant at graph.rs:96-98 that
+        // reverse_adj[v] == { u | v ∈ adjacency[u] }; a false in-neighbor corrupts repair.
+        {
+            let adjacency = graph.adjacency();
+            let rev = &lifecycle.reverse_adj;
+            // Rebuild expected reverse_adj from the forward graph in O(N*R).
+            let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
+            for (u, neighbors) in adjacency.iter().enumerate() {
+                for &v in neighbors {
+                    expected[v as usize].push(u as u32);
+                }
+            }
+            // Sort both sides before comparing (persisted lists may not be sorted).
+            for e in expected.iter_mut() {
+                e.sort_unstable();
+            }
+            for (v, (exp, got)) in expected.iter().zip(rev.iter()).enumerate() {
+                let mut got_sorted = got.clone();
+                got_sorted.sort_unstable();
+                if *exp != got_sorted {
+                    return Err(VamanaError::invalid_format(format!(
+                        "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
+                         forward adjacency: expected {exp:?}, got {got_sorted:?}"
+                    )));
+                }
+            }
+        }
+
         graph.restore_reverse_adj(lifecycle.reverse_adj);
 
         let tombstone_count = lifecycle

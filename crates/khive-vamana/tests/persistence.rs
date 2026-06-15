@@ -631,6 +631,139 @@ fn v2_missing_lifecycle_bin_falls_back_to_rebuild() {
     assert_eq!(rebuilt.num_vectors(), 10);
 }
 
+// ---- Fix 4: checksum-valid but semantically-corrupt reverse_adj triggers rebuild ----
+
+/// Regression test for the bidirectional-consistency check added to load_v2_fast.
+///
+/// This test targets the NEW VALIDATOR inside load_v2_fast, NOT the blake3/commit-record
+/// gate.  The lifecycle.bin is mutated so that reverse_adj[0] contains a phantom source
+/// node that has no u->0 forward edge in graph.bin.  The blake3 hash in metadata.bin is
+/// then RECOMPUTED over the mutated lifecycle.bin so the checksum gate passes and the
+/// corrupt bytes reach the new bidirectional check.
+///
+/// Asserts both recovery paths:
+///   (a) load_or_build REBUILDS — fresh KHVVAMG2 written, a query returns sane results.
+///   (b) VamanaIndex::load returns InvalidFormat (strict path, no fallback).
+#[test]
+fn v2_corrupt_reverse_adj_not_inverse_of_graph_triggers_rebuild() {
+    let dim = 4usize;
+    let n = 10usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA3_10);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // --- Step 1: find a phantom_src that has no forward edge to node 0. ---
+    // We pick the first node u != 0 such that adjacency[u] does NOT contain 0.
+    let adj = idx.graph().adjacency();
+    let phantom_src: u32 = (1..n as u32)
+        .find(|&u| !adj[u as usize].contains(&0))
+        .expect("must find a node with no 0 in its forward adjacency for a 10-node graph");
+
+    // --- Step 2: parse lifecycle.bin and inject phantom_src into reverse_adj[0]. ---
+    let mut lifecycle_bytes = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+
+    // Skip magic (8) + ts_words_count (8) + ts_words*8 (ts_words * 8) + fs_count (8)
+    // + free_slots (fs_count * 4) + ops (8) + rev_num_nodes (8)
+    // to reach the per-node reverse-adj data.
+    let magic_len = 8usize;
+    let ts_words = u64::from_le_bytes(
+        lifecycle_bytes[magic_len..magic_len + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let after_tombstones = magic_len + 8 + ts_words * 8;
+    let fs_count = u64::from_le_bytes(
+        lifecycle_bytes[after_tombstones..after_tombstones + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let after_free_slots = after_tombstones + 8 + fs_count * 4;
+    // Skip ops (8) + rev_num_nodes (8).
+    let node0_offset = after_free_slots + 8 + 8;
+
+    // Read current degree of node 0.
+    let degree0 = u32::from_le_bytes(
+        lifecycle_bytes[node0_offset..node0_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+
+    // Verify phantom_src is not already in reverse_adj[0] (must not create a dup).
+    let neighbors_start = node0_offset + 4;
+    let neighbors_end = neighbors_start + degree0 * 4;
+    let already_present = lifecycle_bytes[neighbors_start..neighbors_end]
+        .chunks_exact(4)
+        .any(|b| u32::from_le_bytes(b.try_into().unwrap()) == phantom_src);
+    assert!(
+        !already_present,
+        "phantom_src {phantom_src} is already in reverse_adj[0] — pick a different seed"
+    );
+
+    // Inject phantom_src: increment degree and append the new neighbor ID.
+    // We write the new degree (degree0 + 1) then insert the new neighbor at the end of
+    // node 0's neighbor list.  All subsequent bytes (nodes 1..n) shift right by 4 bytes.
+    let new_degree = (degree0 + 1) as u32;
+    lifecycle_bytes[node0_offset..node0_offset + 4].copy_from_slice(&new_degree.to_le_bytes());
+    let insert_at = neighbors_end;
+    lifecycle_bytes.splice(insert_at..insert_at, phantom_src.to_le_bytes());
+
+    // --- Step 3: recompute blake3(mutated lifecycle) and patch metadata.bin. ---
+    // This ensures the checksum gate in load_or_build passes; the NEW BIDIRECTIONAL CHECK
+    // inside load_v2_fast is what the corrupt bytes must reach and trip.
+    let new_lhash = *blake3::hash(&lifecycle_bytes).as_bytes();
+    let mut meta_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
+    // lifecycle_hash is at offset 8 (magic) + 32 (vectors_hash) + 32 (graph_hash) = 72.
+    const LIFECYCLE_HASH_OFFSET: usize = 8 + 32 + 32;
+    meta_bytes[LIFECYCLE_HASH_OFFSET..LIFECYCLE_HASH_OFFSET + 32].copy_from_slice(&new_lhash);
+
+    fs::write(dir.path().join("lifecycle.bin"), &lifecycle_bytes).unwrap();
+    fs::write(dir.path().join("metadata.bin"), &meta_bytes).unwrap();
+
+    // --- Step 4 (b): VamanaIndex::load (strict path) must return InvalidFormat. ---
+    // Test the strict path FIRST while the corrupt state is still on disk.  load_or_build
+    // (step 4a) overwrites lifecycle.bin with a fresh rebuild, so the strict-path check
+    // must come before the permissive one.
+    assert!(
+        matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ),
+        "VamanaIndex::load must return InvalidFormat on corrupt reverse_adj \
+         (no recovery on the strict path)"
+    );
+
+    // --- Step 4 (a): load_or_build must REBUILD, not propagate the error. ---
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(
+        rebuilt.num_vectors(),
+        n,
+        "rebuilt index must have all vectors"
+    );
+
+    // The rebuilt snapshot must be a fresh KHVVAMG2 with consistent reverse_adj.
+    let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
+    assert_eq!(
+        &meta_after[..8],
+        b"KHVVAMG2",
+        "rebuilt index must be saved as v2"
+    );
+    assert_rev_adj_consistent(rebuilt.graph());
+
+    // A query must return sane (non-empty) results.
+    let query = rand_unit_vectors(1, dim, 0xA3_11);
+    assert!(
+        !rebuilt.search(&query, 3).unwrap().is_empty(),
+        "rebuilt index must answer queries"
+    );
+}
+
 // ---- Fix 3: staged v2new segments do not corrupt v1 restore ----
 
 #[test]
