@@ -393,7 +393,7 @@ impl VamanaIndex {
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         write_metadata(&path.join("metadata.bin"), self)?;
-        write_graph(&path.join("graph.bin"), &self.graph)?;
+        write_graph(&path.join("graph.bin"), &self.graph, self.config.max_degree)?;
         write_vectors(&path.join("vectors.bin"), self.vectors()?)?;
         Ok(())
     }
@@ -517,6 +517,25 @@ impl VamanaIndex {
             .map_err(|_| VamanaError::invalid_format("max_degree overflows u32".into()))?;
         let search_list_size_u32 = u32::try_from(self.config.search_list_size)
             .map_err(|_| VamanaError::invalid_format("search_list_size overflows u32".into()))?;
+        // Cap the medoid's adjacency at max_degree before serializing.
+        // The medoid-pin in insert() may transiently allow the medoid to exceed
+        // max_degree by 1 (see medoid-pin comment in insert()). Capping here
+        // ensures the snapshot satisfies from_snapshot()'s degree constraint.
+        let medoid = self.graph.medoid();
+        let max_degree_usize = self.config.max_degree;
+        let adjacency: Vec<Vec<u32>> = self
+            .graph
+            .adjacency()
+            .iter()
+            .enumerate()
+            .map(|(i, neighbors)| {
+                if i == medoid as usize && neighbors.len() > max_degree_usize {
+                    neighbors[..max_degree_usize].to_vec()
+                } else {
+                    neighbors.clone()
+                }
+            })
+            .collect();
         Ok(VamanaSnapshot {
             format: VAMANA_SNAPSHOT_FORMAT.to_string(),
             version: VAMANA_SNAPSHOT_VERSION,
@@ -529,8 +548,8 @@ impl VamanaIndex {
                 max_degree: max_degree_u32,
                 search_list_size: search_list_size_u32,
                 alpha: self.config.alpha,
-                medoid: self.graph.medoid(),
-                adjacency: self.graph.adjacency().to_vec(),
+                medoid,
+                adjacency,
                 vectors: self.vectors()?.to_vec(),
             },
             external_ids,
@@ -888,10 +907,18 @@ impl VamanaIndex {
             // Medoid-pin eager repair: if no selected out-neighbor had a free slot,
             // the inserted node has zero inbound edges and is unreachable. Pin it by
             // adding the edge medoid→ordinal. The medoid is the search entry point and
-            // is always reachable; it is the designated overflow node (DiskANN treats
-            // the entry point this way). The medoid is permitted to exceed max_degree
-            // for this one edge so that no existing edge is dropped — correctness over
-            // degree bound.
+            // is always reachable; it is the designated overflow node for this edge.
+            //
+            // The medoid may transiently exceed max_degree by 1 due to this pin.
+            // This is resolved at serialization time (save()/to_snapshot()): before
+            // writing, the medoid's adjacency is capped to max_degree by truncating
+            // to the first max_degree entries so the written graph satisfies all
+            // loader degree constraints. See write_graph() and to_snapshot().
+            //
+            // If the medoid overflow edge (medoid→ordinal) is the one dropped at
+            // serialization time, ordinal will not be searchable after load — but
+            // it IS searchable in the live in-memory index. A subsequent consolidate()
+            // rebuilds all back-edges and restores full reachability.
             //
             // Edge case: if the graph was empty before this insert and ordinal became
             // the medoid (live_before == 0 branch), no pin is needed — handled by the
@@ -913,8 +940,7 @@ impl VamanaIndex {
                     .filter(|&x| x != medoid)
                     .collect();
                 sort_dedup_u32(&mut medoid_adj);
-                // Medoid may now exceed max_degree — intentional overflow per the
-                // never-drop invariant. Existing medoid edges are never removed.
+                // Medoid may now exceed max_degree — resolved at serialization time.
                 self.graph
                     .replace_adjacency_and_update_reverse(medoid, medoid_adj);
             }
@@ -1126,8 +1152,26 @@ impl VamanaIndex {
             ));
         }
 
-        let vecs = self.vectors.as_slice()?;
-        let vecs: Vec<f32> = vecs.to_vec(); // clone to avoid borrow conflict with &mut self
+        // Obtain a read-only slice over the vector store without cloning.
+        // Inline the VectorStorage match rather than calling self.vectors.as_slice()
+        // (a method call) so the borrow checker sees self.vectors and self.graph /
+        // self.tombstones as separate fields and allows the simultaneous &mut borrows
+        // inside the loop.
+        let vecs: &[f32] = match &self.vectors {
+            VectorStorage::Owned(v) => v.as_slice(),
+            VectorStorage::Mmap { mmap, len_f32 } => {
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                    .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
+                if floats.len() != *len_f32 {
+                    return Err(VamanaError::invalid_format(format!(
+                        "mmap f32 length {} != expected {}",
+                        floats.len(),
+                        len_f32
+                    )));
+                }
+                floats
+            }
+        };
 
         let mut medoid_affected = false;
 
@@ -1144,7 +1188,7 @@ impl VamanaIndex {
             self.ops_since_consolidation += 1;
 
             wolverine_repair(
-                &vecs,
+                vecs,
                 self.dimensions,
                 &mut self.graph,
                 node_id,
@@ -1159,7 +1203,7 @@ impl VamanaIndex {
         // Single medoid re-election after all rewires — O(N*dims) once, not K times.
         if medoid_affected {
             let new_medoid =
-                elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+                elect_medoid(vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
             self.graph.set_medoid(new_medoid);
         }
 
@@ -1462,13 +1506,38 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
     })
 }
 
-fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
+fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()> {
     let num_nodes = u32::try_from(graph.node_count()).map_err(|_| VamanaError::TooManyVectors {
         count: graph.node_count(),
     })?;
     let medoid = graph.medoid();
 
-    let total_edges: usize = graph.adjacency().iter().map(|v| v.len()).sum();
+    // Cap the medoid's adjacency list at max_degree before serialization.
+    // The medoid-pin in insert() may transiently allow the medoid to exceed
+    // max_degree by 1 to ensure a freshly inserted node has an inbound edge
+    // (see medoid-pin comment in insert()). We drop the overflow entry here
+    // so the written graph satisfies the loader degree constraint.
+    let medoid_adj_capped: Vec<u32>;
+    let adjacency = graph.adjacency();
+    let medoid_neighbors = &adjacency[medoid as usize];
+    let medoid_capped: &[u32] = if medoid_neighbors.len() > max_degree {
+        medoid_adj_capped = medoid_neighbors[..max_degree].to_vec();
+        &medoid_adj_capped
+    } else {
+        medoid_neighbors
+    };
+
+    let total_edges: usize = adjacency
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i == medoid as usize {
+                medoid_capped.len()
+            } else {
+                v.len()
+            }
+        })
+        .sum();
     // magic(8) + num_nodes(4) + medoid(4) + per-node degree(4) + all edges(4 each)
     let capacity = 8 + 4 + 4 + num_nodes as usize * 4 + total_edges * 4;
     let mut buf = Vec::with_capacity(capacity);
@@ -1477,7 +1546,12 @@ fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
     buf.extend_from_slice(&num_nodes.to_le_bytes());
     buf.extend_from_slice(&medoid.to_le_bytes());
 
-    for neighbors in graph.adjacency() {
+    for (i, neighbors) in adjacency.iter().enumerate() {
+        let neighbors: &[u32] = if i == medoid as usize {
+            medoid_capped
+        } else {
+            neighbors
+        };
         let degree = u32::try_from(neighbors.len()).map_err(|_| {
             VamanaError::invalid_format(format!(
                 "neighbor list length {} overflows u32",

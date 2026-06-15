@@ -158,9 +158,18 @@ node's inbound edge, so every node reachable before the insert remains reachable
 back-edge loop, the inserted node has zero inbound edges (all selected neighbors were full),
 it is pinned by adding the edge `medoid→ordinal`. The medoid is the search entry point and
 is always reachable; it is the designated overflow node (the same role it plays in DiskANN).
-The medoid is permitted to exceed `max_degree` for this one edge -- never dropping any
-existing medoid edge -- so the never-drop invariant is preserved. This guarantees the
-inserted node is reachable without disconnecting any existing node.
+The medoid is permitted to exceed `max_degree` by 1 in the live in-memory index while that
+inserted node has no other in-edges. No existing medoid edge is removed, so the never-drop
+invariant is preserved.
+
+**Save/load + snapshot round-trip invariant.** `save()` and `to_snapshot()` cap the medoid's
+adjacency to `max_degree` before writing. If the medoid has exactly one overflow edge
+(`medoid→ordinal`), that edge is dropped at serialization time. The result is a written graph
+that satisfies all v1 loader degree constraints (`degree ≤ max_degree` everywhere). After
+load, `ordinal` may lack the medoid in-edge and may not be immediately searchable; a
+subsequent `consolidate()` rebuilds all back-edges and restores full reachability. Tests
+verify that the post-insert `save()`/`load()` and `to_snapshot()`/`from_snapshot()` round-trips
+succeed without degree-violation errors, and that existing nodes remain findable.
 
 **Quality trade-off.** Skipping back-edges on saturated neighbors lowers incremental-insert
 graph quality on heavily-saturated corpora (ordinal becomes less well-connected via
