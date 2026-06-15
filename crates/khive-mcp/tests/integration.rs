@@ -3796,3 +3796,189 @@ async fn test_propose_pipe_withdraw_chain() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Finding 1: compute_config_id must include visible_namespaces so two configs
+// with different visible sets produce distinct fingerprints.
+// =============================================================================
+
+/// Two RuntimeConfigs that are identical except for their `visible_namespaces`
+/// must produce different `compute_config_id` fingerprints.
+///
+/// Without this, a daemon started for `primary=vis-a, visible=[]` could be
+/// reused for `primary=vis-a, visible=[vis-b]` — granting cross-namespace
+/// reads to a caller that should be namespace-isolated.
+#[test]
+fn compute_config_id_differs_when_visible_namespaces_differ() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::{Namespace, RuntimeConfig};
+
+    let base = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("vis-a").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        visible_namespaces: vec![],
+        ..RuntimeConfig::default()
+    };
+    let with_visible = RuntimeConfig {
+        visible_namespaces: vec![Namespace::parse("vis-b").unwrap()],
+        ..base.clone()
+    };
+
+    let id_no_vis = compute_config_id(&base);
+    let id_with_vis = compute_config_id(&with_visible);
+
+    assert_ne!(
+        id_no_vis, id_with_vis,
+        "compute_config_id must differ when visible_namespaces differs; \
+         same id would allow wrong-visibility daemon reuse"
+    );
+    assert!(
+        id_with_vis.contains("vis-b"),
+        "visible namespace 'vis-b' must appear in config_id string; got: {id_with_vis}"
+    );
+}
+
+/// Order of entries in visible_namespaces must not change the fingerprint
+/// (the fingerprint sorts + deduplicates before hashing).
+#[test]
+fn compute_config_id_is_stable_under_visible_namespace_reorder() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::{Namespace, RuntimeConfig};
+
+    let cfg_ab = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("vis-a").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        visible_namespaces: vec![
+            Namespace::parse("vis-b").unwrap(),
+            Namespace::parse("vis-c").unwrap(),
+        ],
+        ..RuntimeConfig::default()
+    };
+    let cfg_ba = RuntimeConfig {
+        visible_namespaces: vec![
+            Namespace::parse("vis-c").unwrap(),
+            Namespace::parse("vis-b").unwrap(),
+        ],
+        ..cfg_ab.clone()
+    };
+
+    assert_eq!(
+        compute_config_id(&cfg_ab),
+        compute_config_id(&cfg_ba),
+        "compute_config_id must be stable under reordering of visible_namespaces"
+    );
+}
+
+// =============================================================================
+// Finding 6: actor.visible_namespaces from config wires cross-namespace reads
+// but mutations on visible-only records must return NotFound.
+// =============================================================================
+
+/// An actor configured with `visible_namespaces = ["vis-b"]` must be able to
+/// READ entities from `vis-b`, but a mutation that targets a `vis-b` entity
+/// by UUID must return NotFound (ADR-007:215-219 timing-oracle mitigation).
+///
+/// Test setup:
+/// - Builds a RuntimeConfig as if loaded from:
+///     [actor]
+///     id = "vis-a"
+///     visible_namespaces = ["vis-b"]
+/// - Creates an entity in `vis-b`.
+/// - With the vis-a visible-set token: `get` the entity (must succeed).
+/// - With the vis-a visible-set token: try to `link` with the vis-b entity
+///   as a target; the runtime's `resolve_primary` must return NotFound for
+///   vis-b entities, so the link must fail.
+#[tokio::test]
+async fn visible_namespaces_config_read_allowed_mutation_rejected() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+    use khive_types::EdgeRelation;
+
+    // Build a RuntimeConfig equivalent to:
+    //   [actor]
+    //   id = "vis-a"
+    //   visible_namespaces = ["vis-b"]
+    let ns_a = Namespace::parse("vis-a").unwrap();
+    let ns_b = Namespace::parse("vis-b").unwrap();
+
+    let cfg = RuntimeConfig {
+        db_path: None,
+        default_namespace: ns_a.clone(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        visible_namespaces: vec![ns_b.clone()],
+        ..RuntimeConfig::default()
+    };
+
+    // Verify the config_id encodes vis-b (Finding 1 integration check).
+    let cid = compute_config_id(&cfg);
+    assert!(
+        cid.contains("vis-b"),
+        "config_id must encode visible namespace vis-b; got: {cid}"
+    );
+
+    let rt = KhiveRuntime::new(cfg).expect("in-memory runtime");
+
+    // Create an entity in vis-b using vis-b's own token.
+    let tok_b = rt
+        .authorize(ns_b.clone())
+        .expect("authorize vis-b must succeed");
+    let entity_in_b = rt
+        .create_entity(&tok_b, "concept", None, "Vis-B-Entity", None, None, vec![])
+        .await
+        .expect("create entity in vis-b");
+
+    // Create an entity in vis-a (owned by the actor).
+    let tok_a = rt
+        .authorize(ns_a.clone())
+        .expect("authorize vis-a must succeed");
+    let entity_in_a = rt
+        .create_entity(&tok_a, "concept", None, "Vis-A-Entity", None, None, vec![])
+        .await
+        .expect("create entity in vis-a");
+
+    // Mint a visible-set token: primary = vis-a, also sees vis-b.
+    let tok_vis = rt
+        .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+        .expect("authorize_with_visibility must succeed");
+
+    // READ: get vis-b entity via the visible-set token (must succeed).
+    let got = rt
+        .get_entity(&tok_vis, entity_in_b.id)
+        .await
+        .expect("get_entity must succeed for visible-namespace entity");
+    assert_eq!(
+        got.id, entity_in_b.id,
+        "get_entity via visible-set token must return the vis-b entity"
+    );
+
+    // MUTATION: link with vis-b entity as the *target* — resolve_primary must
+    // return None for vis-b entities (they are not in the primary namespace),
+    // and the link must fail.
+    //
+    // Note: link validates both endpoints via resolve_primary (for entity-relation
+    // endpoint validation). A vis-b entity as target is NotFound in the primary.
+    let link_result = rt
+        .link(
+            &tok_vis,
+            entity_in_a.id, // source is primary — OK
+            entity_in_b.id, // target is visible-only — must be rejected
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await;
+
+    assert!(
+        link_result.is_err(),
+        "link with visible-only (vis-b) entity as target must fail; \
+         a visible-only record must not be a mutation endpoint"
+    );
+}

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use khive_pack_brain::BrainPack;
 use khive_pack_kg::KgPack;
-use khive_runtime::{DispatchHook, KhiveRuntime, PackRuntime, VerbRegistryBuilder};
+use khive_runtime::{DispatchHook, KhiveRuntime, Namespace, PackRuntime, VerbRegistryBuilder};
 use serde_json::json;
 
 /// Promote `namespace` on `brain` via the production dispatch path.
@@ -344,5 +344,74 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
         "active snapshot for 'local' must equal persisted total ({persisted_total}) + \
          1 saved-state signal; got {}",
         snap.balanced_recall.total_events
+    );
+}
+
+// ---- Finding 3 regression: brain.feedback target_id must be primary-only ----
+
+/// `brain.feedback` must reject a `target_id` that lives in a visible (non-primary)
+/// namespace. A visible-only record must not be the target of a feedback mutation.
+///
+/// This tests that the fix from `resolve` to `resolve_primary` is in effect:
+/// a record the caller can READ but not MUTATE returns NotFound on feedback.
+#[tokio::test]
+async fn brain_feedback_rejects_visible_only_target_id() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+    let ns_primary = Namespace::parse("brain-primary-ns").unwrap();
+    let ns_foreign = Namespace::parse("brain-foreign-ns").unwrap();
+
+    // Create a KG entity in the foreign namespace.
+    let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
+    let foreign_entity = rt
+        .create_entity(
+            &tok_foreign,
+            "concept",
+            None,
+            "ForeignTarget",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let foreign_id = foreign_entity.id.as_hyphenated().to_string();
+
+    // Build a visible-set token: primary-ns can read (but not mutate) foreign-ns.
+    let tok_vis = rt
+        .authorize_with_visibility(ns_primary.clone(), vec![ns_foreign.clone()])
+        .unwrap();
+
+    // Verify the visible-set token CAN read the foreign entity (control check).
+    let found = rt.get_entity(&tok_vis, foreign_entity.id).await;
+    assert!(
+        found.is_ok(),
+        "visible-set token must be able to read the foreign entity; got: {found:?}"
+    );
+
+    // brain.feedback with the foreign entity as target_id must fail NotFound.
+    let brain = BrainPack::new(rt.clone());
+    let empty_registry = VerbRegistryBuilder::new().build().unwrap();
+
+    // First promote the primary namespace.
+    brain
+        .dispatch("brain.profiles", json!({}), &empty_registry, &tok_vis)
+        .await
+        .expect("promote primary namespace");
+
+    let err = brain
+        .dispatch(
+            "brain.feedback",
+            json!({ "target_id": foreign_id, "signal": "useful" }),
+            &empty_registry,
+            &tok_vis,
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("not found"),
+        "brain.feedback with visible-only target_id must return NotFound; got: {msg}"
     );
 }

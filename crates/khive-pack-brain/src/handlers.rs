@@ -839,10 +839,12 @@ impl BrainPack {
             }
         };
 
-        // Validate target_id resolves to an existing record in this namespace.
+        // Validate target_id in the PRIMARY namespace only. A visible-only
+        // (foreign) record must not be targeted by a mutation (feedback event).
+        // NotFound (not Forbidden) per ADR-007:215-219.
         let resolved = self
             .runtime
-            .resolve(token, target)
+            .resolve_primary(token, target)
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         if resolved.is_none() {

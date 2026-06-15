@@ -52,13 +52,21 @@ pub fn compute_config_id(config: &RuntimeConfig) -> String {
         .map(|m| format!("{m:?}"))
         .collect();
     extra.sort();
+    let mut visible: Vec<String> = config
+        .visible_namespaces
+        .iter()
+        .map(|ns| ns.as_str().to_owned())
+        .collect();
+    visible.sort();
+    visible.dedup();
     format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?}",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}]",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
+        visible.join(","),
     )
 }
 

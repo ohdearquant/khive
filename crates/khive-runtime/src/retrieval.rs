@@ -330,6 +330,25 @@ impl KhiveRuntime {
     /// The fused candidate set is kept untruncated until after the alive + kind filter so
     /// that right-kind hits ranked below `limit` in the raw fusion still surface when
     /// higher-ranked candidates are wrong-kind or soft-deleted.
+    ///
+    /// # Cross-namespace visibility (Phase 1.5 limitation — primary namespace only)
+    ///
+    /// Both the **FTS leg** and the **vector/ANN leg** are currently restricted to
+    /// the **primary namespace only** for search.
+    ///
+    /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
+    /// and a separate ANN index instance. Cross-namespace fanout requires iterating
+    /// over every visible namespace's store, issuing parallel search requests, and
+    /// fusing the results — this is deferred to Phase 1.5.
+    ///
+    /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
+    /// which limits results to those namespaces within the primary store. Because
+    /// entities from extra namespaces live in their own FTS tables, this filter has
+    /// no cross-namespace effect today.
+    ///
+    /// Callers with a multi-namespace visible set can READ cross-namespace entities
+    /// directly via `get_entity` / `resolve`, but `hybrid_search` returns only
+    /// primary-namespace hits until Phase 1.5 cross-namespace fanout ships.
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,

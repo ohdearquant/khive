@@ -240,7 +240,9 @@ async fn resolve_context_entity_id(
         ))
     })?;
 
-    match runtime.resolve(token, uuid).await? {
+    // Mutation rule: the annotated entity must live in the PRIMARY namespace.
+    // A visible-only (foreign) entity returns NotFound here per ADR-007:215-219.
+    match runtime.resolve_primary(token, uuid).await? {
         Some(Resolved::Entity(_)) => Ok(uuid),
         Some(Resolved::Note(n)) => Err(RuntimeError::InvalidInput(format!(
             "context_entity_id {uuid} must reference a KG entity; got note kind {:?}",
@@ -508,7 +510,10 @@ impl GtdPack {
         // from `create(note_kind="task")` and violate the "no failure after
         // successful write" rule).
         for dep_uuid in &resolved_deps {
-            match self.runtime().resolve(token, *dep_uuid).await? {
+            // Mutation rule: depends_on targets must be in the PRIMARY namespace.
+            // A visible-only (foreign) task is NotFound here — callers must own both
+            // sides of a dependency edge. NotFound (not Forbidden) per ADR-007:215-219.
+            match self.runtime().resolve_primary(token, *dep_uuid).await? {
                 Some(Resolved::Note(n)) if n.kind == "task" => {}
                 Some(Resolved::Note(n)) => {
                     return Err(RuntimeError::InvalidInput(format!(

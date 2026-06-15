@@ -2220,3 +2220,100 @@ async fn create_note_annotates_refuses_target_in_visible_only_namespace() {
         "annotates with target in visible-only namespace must be rejected"
     );
 }
+
+// =============================================================================
+// Finding 5: hybrid_search cross-namespace Option B limitation documented + tested
+// =============================================================================
+
+/// Documents the Phase 1.5 limitation: `hybrid_search` is primary-namespace-only
+/// for both the FTS and vector legs (each namespace owns its own FTS table and
+/// ANN index; cross-namespace fanout is deferred to Phase 1.5).
+///
+/// This test verifies the actual current behavior:
+/// - The primary-namespace entity appears in results.
+/// - The extra-namespace entity does NOT appear in results (its FTS data lives
+///   in `fts_entities_{extra-ns}`, a separate table not queried here).
+///
+/// A caller with a visible set can READ the extra-namespace entity directly via
+/// `get_entity`, but `hybrid_search` does not surface it today.
+#[tokio::test]
+async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
+    let rt = rt();
+
+    let ns_primary = Namespace::parse("hs-primary-ns").unwrap();
+    let ns_extra = Namespace::parse("hs-extra-ns").unwrap();
+
+    let tok_primary = rt.authorize(ns_primary.clone()).unwrap();
+    let tok_extra = rt.authorize(ns_extra.clone()).unwrap();
+
+    // Create an entity in primary namespace with a distinctive term.
+    let entity_in_primary = rt
+        .create_entity(
+            &tok_primary,
+            "concept",
+            None,
+            "StellarPrimary",
+            Some("unique stellar primary concept"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Create an entity in the extra namespace with the same distinctive term.
+    let entity_in_extra = rt
+        .create_entity(
+            &tok_extra,
+            "concept",
+            None,
+            "StellarExtra",
+            Some("unique stellar extra concept"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Visible-set token: primary = hs-primary-ns, also sees hs-extra-ns.
+    let vis_tok = rt
+        .authorize_with_visibility(ns_primary.clone(), vec![ns_extra.clone()])
+        .unwrap();
+
+    // Search: FTS-only (no embedding model in test runtime).
+    // Current behavior: only primary-namespace results surface.
+    let hits = rt
+        .hybrid_search(&vis_tok, "stellar", None, 20, None, None)
+        .await
+        .unwrap();
+
+    let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+
+    // Primary entity must surface.
+    assert!(
+        hit_ids.contains(&entity_in_primary.id),
+        "hybrid_search must return entity from primary namespace; \
+         expected entity_id={}, got: {hit_ids:?}",
+        entity_in_primary.id,
+    );
+
+    // Extra-namespace entity does NOT surface — Phase 1.5 limitation.
+    // Each namespace has its own FTS table; cross-namespace FTS fanout is deferred.
+    assert!(
+        !hit_ids.contains(&entity_in_extra.id),
+        "hybrid_search must NOT return entity from extra (visible-only) namespace \
+         until Phase 1.5 cross-namespace fanout ships; \
+         entity_id={} unexpectedly appeared in: {hit_ids:?}",
+        entity_in_extra.id,
+    );
+
+    // Direct read of the extra-namespace entity via get_entity must still work
+    // (this proves the visible set wiring is correct — only search is primary-scoped).
+    let fetched = rt
+        .get_entity(&vis_tok, entity_in_extra.id)
+        .await
+        .expect("get_entity via visible-set token must return extra-namespace entity");
+    assert_eq!(
+        fetched.id, entity_in_extra.id,
+        "visible-set read of extra-namespace entity must succeed"
+    );
+}

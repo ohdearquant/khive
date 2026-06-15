@@ -927,10 +927,12 @@ impl KhiveRuntime {
         Ok(persisted)
     }
 
-    /// Returns `true` if `id` resolves to a live substrate record in `namespace`.
+    /// Returns `true` if `id` resolves to a live substrate record in the
+    /// caller's visible namespace set.
     ///
-    /// Covers entity, note, event (via `resolve`) and edge (via `get_edge`).
-    /// A record that exists in a different namespace returns `false` (fail-closed).
+    /// Covers entity, note, event (via `resolve`) and edge (via `get_edge_visible`).
+    /// Only records that are accessible to the caller (primary or configured visible
+    /// namespaces) return `true`; absent or foreign-invisible records return `false`.
     pub(crate) async fn substrate_exists_in_ns(
         &self,
         token: &NamespaceToken,
@@ -939,7 +941,7 @@ impl KhiveRuntime {
         if self.resolve(token, id).await?.is_some() {
             return Ok(true);
         }
-        match self.get_edge(token, id).await {
+        match self.get_edge_visible(token, id).await {
             Ok(Some(_)) => Ok(true),
             Ok(None) | Err(RuntimeError::NotFound(_)) => Ok(false),
             Err(err) => Err(err),
@@ -3257,6 +3259,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(just_extends, 1);
+    }
+
+    // ---- Finding 4 regression: substrate_exists_in_ns must use get_edge_visible ----
+
+    /// An edge owned by a visible (non-primary) namespace must be found by
+    /// `substrate_exists_in_ns` and therefore usable as a graph root in
+    /// `neighbors` and `traverse`.
+    #[tokio::test]
+    async fn edge_in_visible_namespace_reachable_as_graph_root() {
+        let rt = rt();
+        let ns_a = Namespace::parse("vis-edge-a").unwrap();
+        let ns_b = Namespace::parse("vis-edge-b").unwrap();
+
+        // Create two entities and an edge in namespace B.
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+        let src = rt
+            .create_entity(&tok_b, "concept", None, "SrcB", None, None, vec![])
+            .await
+            .unwrap();
+        let tgt = rt
+            .create_entity(&tok_b, "concept", None, "TgtB", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok_b, src.id, tgt.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Namespace A with B in its visible set should be able to get the
+        // edge and use it as a traverse root.
+        let tok_a_vis = rt
+            .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+            .unwrap();
+
+        // Direct get of the edge must succeed (visible namespace).
+        let got = rt.get_edge_visible(&tok_a_vis, edge.id.0).await.unwrap();
+        assert!(
+            got.is_some(),
+            "edge in visible namespace must be retrievable via get_edge_visible"
+        );
+
+        // neighbors/traverse use substrate_exists_in_ns which now calls
+        // get_edge_visible — they must not return empty for a visible-ns edge root.
+        let neighbors = rt
+            .neighbors(&tok_a_vis, src.id, Direction::Out, Some(16), None)
+            .await
+            .unwrap();
+        assert!(
+            neighbors.iter().any(|h| h.node_id == tgt.id),
+            "neighbors of visible-ns node must include its visible-ns neighbor; got: {neighbors:?}"
+        );
     }
 
     #[tokio::test]
