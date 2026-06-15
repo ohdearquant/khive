@@ -214,11 +214,15 @@ impl VectorStore for SqliteVecStore {
             }
 
             // vec0 does not support INSERT OR REPLACE — delete then insert.
+            // Wrap in a transaction so a failed INSERT rolls back the DELETE,
+            // leaving the previous vector intact (no-worse-than-stale guarantee).
+            let tx = conn.unchecked_transaction()?;
+
             let del_sql = format!(
                 "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
                 table
             );
-            conn.execute(
+            tx.execute(
                 &del_sql,
                 rusqlite::params![subject_id.to_string(), &namespace],
             )?;
@@ -229,7 +233,7 @@ impl VectorStore for SqliteVecStore {
                 table
             );
             let blob = f32_slice_as_bytes(&embedding);
-            conn.execute(
+            tx.execute(
                 &ins_sql,
                 rusqlite::params![
                     subject_id.to_string(),
@@ -240,7 +244,8 @@ impl VectorStore for SqliteVecStore {
                     blob
                 ],
             )?;
-            Ok(())
+
+            tx.commit()
         })
         .await
     }

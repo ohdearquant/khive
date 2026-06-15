@@ -337,19 +337,30 @@ impl KnowledgeHandlers {
         // semantic recall is also fresh. rebuild_ann=false writes the vector immediately
         // while deferring the Vamana ANN snapshot build — the same ANN-deferral tradeoff
         // taken for sections above. Missing embedder: index returns early with reason.
-        {
+        let atom_vector_refreshed = {
             let atom_params = serde_json::json!({
                 "ids": [atom_id],
                 "rebuild_ann": false,
                 "insert_only": false,
             });
-            KnowledgeHandlers::index(runtime, token, atom_params, ann, None).await?;
-        }
+            let result = KnowledgeHandlers::index(runtime, token, atom_params, ann, None).await?;
+            let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+            if failed > 0 {
+                tracing::warn!(
+                    atom_id = %atom_id,
+                    failed = failed,
+                    "knowledge.edit: atom vector refresh failed; \
+                     hybrid recall for this atom may be stale until next reindex"
+                );
+            }
+            failed == 0
+        };
 
         Ok(json!({
             "atom_id": atom_id,
             "upserted": upserted,
             "sections": section_results,
+            "atom_vector_refreshed": atom_vector_refreshed,
         }))
     }
 
