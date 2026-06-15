@@ -153,10 +153,28 @@ Section_type is a closed enum matching the atlas schema v1: `overview`, `core_mo
 `expert_lens`, `references`, `other`.
 
 **Editing a section does not touch other sections.** `knowledge.edit(slug, sections=[...])`
-updates only the named section rows. Each section has a nullable `embedding` column. Shipped `knowledge.edit` clears
-`embedding=NULL` on section updates; `knowledge.index` indexes atoms only. Section
-write-side embedding backfill is shipped via `kkernel reindex` (ADR-051 phase 1);
-section-aware compose and read-side scoring remain deferred.
+updates only the named section rows. Each section has a nullable `embedding` column.
+
+`knowledge.edit` performs an **inline, atom-scoped re-embed** immediately after writing
+section rows: it queries `knowledge_sections WHERE atom_id = ? AND embedding IS NULL` and
+embeds those rows using the same breadcrumb-enriched text format as `kkernel reindex`
+(`{atom_name}\n{heading}\n\n{content}`, truncated to 32 768 bytes). Byte-identical sections
+retain their prior embedding (they were updated via the `UNIQUE(atom_id, content_hash)` hit
+path, which does not clear `embedding`), so the re-embed pass is incremental by construction.
+Section vectors are written to `knowledge_sections.embedding` immediately, making the hybrid
+section-cosine read path (ADR-051) fresh without a manual reindex.
+
+The Vamana ANN snapshot rebuild is **deferred**: per-edit ANN rebuilds are prohibitively
+costly. Approximate ANN recall over newly-written vectors lags until the next `kkernel reindex`
+or scheduled rebuild; the direct section-cosine (non-ANN) path uses the new vectors immediately.
+
+If no default embedder is configured, `knowledge.edit` succeeds without embedding — the same
+early-return degradation as `embed_sections` in `kkernel reindex`. `knowledge.upsert_atoms`
+remains batch-only and does not perform inline re-embed.
+
+`knowledge.index` indexes atoms only. Full section write-side embedding backfill is shipped
+via `kkernel reindex` (ADR-051 phase 1); section-aware compose and read-side scoring remain
+deferred.
 
 **Sections link to atoms structurally (FK), not via graph edges.** The section→atom
 relationship is always 1:N containment — there's no semantic edge type needed. All
@@ -586,6 +604,12 @@ Profile-weighted `knowledge.compose` is deferred. Shipped `knowledge.compose` re
 explicit `domain_ids` and/or `atom_ids`, reranks atom text, and returns atom-body markdown.
 The shipped function does not call `brain.resolve` and does not assemble section-weighted
 manifests.
+
+**Inline re-embed on `knowledge.edit`** (shipped, issue #11): after section rows are written,
+`knowledge.edit` embeds the atom's newly-inserted sections inline (those whose `embedding` is
+NULL). This ensures the hybrid section-cosine read path is fresh without a manual reindex.
+The Vamana ANN snapshot rebuild remains deferred (per-edit cost too high). If no embedder is
+configured the edit still succeeds. `knowledge.upsert_atoms` is not changed.
 
 The original spec described a profile-weighted compose step:
 

@@ -2963,3 +2963,277 @@ async fn stats_total_events_counts_knowledge_verbs() {
          non-knowledge `create` events; expected 2 or 3, got {total_events}"
     );
 }
+
+// ── knowledge.edit inline re-embed (issue #11) ────────────────────────────────
+//
+// knowledge.edit must embed new/changed sections immediately after writing them
+// so that semantic recall is fresh without a manual `kkernel reindex`.
+// Byte-identical sections (metadata-only refresh) keep their existing embedding
+// and must NOT be needlessly re-embedded.
+
+mod edit_inline_reembed {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+    const DIM: usize = 384;
+
+    struct EmbedService;
+
+    #[async_trait]
+    impl EmbeddingService for EmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            // Distinct unit vectors per position so each section gets a real vector.
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let v = (i + 1) as f32;
+                    let norm = (DIM as f32 * v * v).sqrt();
+                    vec![v / norm; DIM]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "edit-reembed-service"
+        }
+    }
+
+    struct EmbedProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for EmbedProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(EmbedService))
+        }
+    }
+
+    fn rt_with_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+        })
+        .expect("runtime");
+        rt.register_embedder(EmbedProvider);
+        rt
+    }
+
+    /// knowledge.edit must embed newly-written sections inline: after edit,
+    /// a NEW section (distinct content hash) must have a non-NULL embedding,
+    /// while a byte-identical section (metadata-only refresh) must retain its
+    /// previously-set embedding and not be re-embedded into a different blob.
+    #[tokio::test]
+    async fn edit_embeds_new_sections_and_preserves_unchanged_embedding() {
+        let rt = rt_with_embedder();
+        let f = pack(rt.clone());
+
+        // Create an atom.
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "reembed-test-atom",
+                    "name": "Re-embed Test Atom",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        let overview_content =
+            "Overview section content that is well above the eighty-character minimum. \
+            dense sparse retrieval corpus benchmark search latency gradient descent transformer.";
+
+        // First edit: insert an overview section. It has no prior embedding (new row).
+        f.dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "reembed-test-atom",
+                "sections": [{
+                    "section_type": "overview",
+                    "content": overview_content
+                }]
+            }),
+        )
+        .await
+        .expect("first edit");
+
+        // Assert the newly-inserted section has a non-NULL embedding.
+        let row_after_first = f
+            .sql_query_one(
+                "SELECT id, embedding FROM knowledge_sections \
+                 WHERE atom_id = (SELECT id FROM knowledge_atoms WHERE slug = ?1) \
+                 AND section_type = 'overview' \
+                 LIMIT 1",
+                vec![SqlValue::Text("reembed-test-atom".into())],
+            )
+            .await
+            .expect("section row must exist after first edit");
+
+        let section_id = match row_after_first.get("id") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => panic!("section id must be text"),
+        };
+        let first_embedding_blob = match row_after_first.get("embedding") {
+            Some(SqlValue::Blob(b)) => b.clone(),
+            Some(SqlValue::Null) | None => {
+                panic!("newly-inserted section must have a non-NULL embedding after knowledge.edit")
+            }
+            other => panic!("unexpected embedding value: {other:?}"),
+        };
+        assert!(
+            !first_embedding_blob.is_empty(),
+            "embedding blob must be non-empty"
+        );
+
+        // Second edit: re-submit the IDENTICAL content. The section is a metadata-only
+        // refresh (same content_hash); the embedding must be preserved unchanged.
+        f.dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "reembed-test-atom",
+                "sections": [{
+                    "section_type": "overview",
+                    "content": overview_content
+                }]
+            }),
+        )
+        .await
+        .expect("second edit (identical content)");
+
+        let row_after_second = f
+            .sql_query_one(
+                "SELECT embedding FROM knowledge_sections WHERE id = ?1 LIMIT 1",
+                vec![SqlValue::Text(section_id.clone())],
+            )
+            .await
+            .expect("section row must still exist after second edit");
+
+        let second_embedding_blob = match row_after_second.get("embedding") {
+            Some(SqlValue::Blob(b)) => b.clone(),
+            Some(SqlValue::Null) | None => {
+                panic!("byte-identical section must retain its existing embedding after re-edit")
+            }
+            other => panic!("unexpected embedding value after second edit: {other:?}"),
+        };
+
+        assert_eq!(
+            first_embedding_blob, second_embedding_blob,
+            "byte-identical section must NOT be re-embedded: blob must be unchanged"
+        );
+
+        // Third edit: different content → new sibling row → must also be embedded.
+        let new_content = "Updated overview section with completely different content that also \
+            exceeds the eighty character minimum. gradient descent transformer attention vector.";
+
+        f.dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "reembed-test-atom",
+                "sections": [{
+                    "section_type": "overview",
+                    "content": new_content
+                }]
+            }),
+        )
+        .await
+        .expect("third edit (new content)");
+
+        // The new sibling row (different content_hash) must have a non-NULL embedding.
+        let new_section_row = f
+            .sql_query_one(
+                "SELECT id, embedding FROM knowledge_sections \
+                 WHERE atom_id = (SELECT id FROM knowledge_atoms WHERE slug = ?1) \
+                 AND section_type = 'overview' \
+                 AND id != ?2 \
+                 LIMIT 1",
+                vec![
+                    SqlValue::Text("reembed-test-atom".into()),
+                    SqlValue::Text(section_id.clone()),
+                ],
+            )
+            .await
+            .expect("new sibling section row must exist after third edit");
+
+        match new_section_row.get("embedding") {
+            Some(SqlValue::Blob(b)) if !b.is_empty() => {}
+            Some(SqlValue::Null) | None => {
+                panic!("new sibling section inserted by edit must have a non-NULL embedding")
+            }
+            other => panic!("unexpected embedding value for new sibling: {other:?}"),
+        }
+    }
+
+    /// When no default embedder is configured, knowledge.edit must still succeed
+    /// (degrade gracefully — same contract as reindex_knowledge with no embedder).
+    #[tokio::test]
+    async fn edit_succeeds_without_embedder() {
+        // Plain memory runtime has no embedder configured (default_embedder_name is "").
+        let f = pack(rt());
+
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "no-embed-atom",
+                    "name": "No Embed Atom",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        let result = f
+            .dispatch(
+                "knowledge.edit",
+                json!({
+                    "id": "no-embed-atom",
+                    "sections": [{
+                        "section_type": "overview",
+                        "content": "Overview section content that is well above the eighty character minimum length requirement for knowledge sections. dense sparse retrieval corpus benchmark search."
+                    }]
+                }),
+            )
+            .await
+            .expect("edit must succeed even without an embedder configured");
+
+        assert_eq!(
+            result["upserted"].as_u64().unwrap_or(0),
+            1,
+            "edit must report one upserted section: {result:?}"
+        );
+    }
+}
