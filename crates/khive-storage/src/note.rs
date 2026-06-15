@@ -269,6 +269,12 @@ pub struct NoteFilter {
     pub property_filters: Vec<PropertyFilter>,
     /// `(json_path, direction)` — `None` defaults to `created_at DESC`.
     pub order_by: Option<(String, SortDir)>,
+    /// When non-empty, restricts results to any of these namespaces using
+    /// `namespace IN (...)`. Takes precedence over the `namespace` string
+    /// parameter passed to `query_notes_filtered`. When empty the
+    /// caller-supplied `namespace` parameter is used (backward-compatible).
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.

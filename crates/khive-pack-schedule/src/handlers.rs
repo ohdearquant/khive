@@ -407,6 +407,7 @@ pub(crate) async fn handle_agenda(
             value: SqlValue::Text("pending".to_string()),
         }],
         order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
+        ..Default::default()
     };
 
     const PAGE_SIZE: u32 = 200;

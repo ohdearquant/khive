@@ -181,11 +181,32 @@ fn build_entity_where(
     namespace: &str,
     filter: &EntityFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut conditions: Vec<String> = vec![
-        "namespace = ?1".to_string(),
-        "deleted_at IS NULL".to_string(),
-    ];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
+    // When filter.namespaces is non-empty use `namespace IN (...)` so that
+    // multi-namespace read visibility works.  Otherwise fall back to the
+    // single-namespace equality check for backward compatibility.
+    let (ns_condition, ns_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        if !filter.namespaces.is_empty() {
+            let placeholders: Vec<String> = (1..=filter.namespaces.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = filter
+                .namespaces
+                .iter()
+                .map(|ns| -> Box<dyn rusqlite::types::ToSql> { Box::new(ns.clone()) })
+                .collect();
+            (
+                format!("namespace IN ({})", placeholders.join(", ")),
+                params,
+            )
+        } else {
+            (
+                "namespace = ?1".to_string(),
+                vec![Box::new(namespace.to_string())],
+            )
+        };
+
+    let mut conditions: Vec<String> = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if !filter.ids.is_empty() {
         let placeholders: Vec<String> = filter

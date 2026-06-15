@@ -62,21 +62,48 @@ mod private {
 /// Created by [`VerbRegistry::dispatch`] after the gate approves the request.
 /// The sealed inner field prevents external code from constructing a token
 /// without going through the authorization path.
+///
+/// The `namespace` field is the **write namespace**: all records created via
+/// this token land in that namespace. `visible` is the **read visibility set**:
+/// list/search/get operations will return records from any namespace in this
+/// set. The write namespace is always a member of the visible set.
+///
+/// Single-namespace behaviour (backward-compatible default): `visible` contains
+/// exactly `[namespace]` — identical to the old strict-equality checks.
 #[derive(Clone, Debug)]
 pub struct NamespaceToken {
     namespace: Namespace,
+    visible: Vec<Namespace>,
     actor: ActorRef,
     _sealed: private::Sealed,
 }
 
 impl NamespaceToken {
-    /// Mint an authorized token. Only callable from within `khive-runtime`.
-    pub(crate) fn mint_authorized(namespace: Namespace, actor: ActorRef) -> Self {
+    /// Mint an authorized token with an explicit visibility set.
+    ///
+    /// `visible` MUST contain `namespace`; callers are responsible for this
+    /// invariant. The `mint_authorized` convenience form enforces it by
+    /// defaulting `visible` to `[namespace]`.
+    pub(crate) fn mint_with_visibility(
+        namespace: Namespace,
+        visible: Vec<Namespace>,
+        actor: ActorRef,
+    ) -> Self {
         Self {
             namespace,
+            visible,
             actor,
             _sealed: private::Sealed,
         }
+    }
+
+    /// Mint an authorized token. Only callable from within `khive-runtime`.
+    ///
+    /// The visible set defaults to `[namespace]` — backward-compatible with
+    /// single-namespace enforcement.
+    pub(crate) fn mint_authorized(namespace: Namespace, actor: ActorRef) -> Self {
+        let visible = vec![namespace.clone()];
+        Self::mint_with_visibility(namespace, visible, actor)
     }
 
     /// Convenience constructor for the local namespace with an anonymous actor.
@@ -99,9 +126,26 @@ impl NamespaceToken {
         Self::mint_authorized(ns, ActorRef::anonymous())
     }
 
-    /// Return the namespace this token authorises access to.
+    /// Return the write namespace this token authorises.
+    ///
+    /// All records created via this token land in this namespace.
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
+    }
+
+    /// Return the read-visibility set.
+    ///
+    /// List, search, and get operations must accept records whose namespace is
+    /// a member of this set. The write namespace is always included.
+    pub fn visible_namespaces(&self) -> &[Namespace] {
+        &self.visible
+    }
+
+    /// Return a deduplicated list of visible namespace strings (borrowed).
+    ///
+    /// Convenience for passing directly to storage layer filters.
+    pub fn visible_namespace_strs(&self) -> Vec<&str> {
+        self.visible.iter().map(|ns| ns.as_str()).collect()
     }
 
     /// Return the actor reference embedded in this token.
@@ -113,7 +157,8 @@ impl NamespaceToken {
     ///
     /// Used by packs that apply a namespace policy (e.g. the KG pack overrides the
     /// caller's namespace to `Namespace::local()` so that entity/edge/note records
-    /// always land in the shared graph).
+    /// always land in the shared graph). The visible set is also replaced with
+    /// `[ns]` so isolation is maintained for the overridden namespace.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }

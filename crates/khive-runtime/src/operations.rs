@@ -386,26 +386,26 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID, enforcing namespace isolation.
+    /// Retrieve an entity by ID, enforcing namespace visibility.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
-    /// different namespace (indistinguishable — no cross-namespace existence oracle).
+    /// Returns `Err(NotFound)` if the entity does not exist or its namespace is
+    /// not in the token's visible set (indistinguishable — no cross-namespace
+    /// existence oracle).
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
         let entity = self
             .entities(token)?
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
-        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
+        Self::ensure_namespace_visible(&entity.namespace, token)?;
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace isolation.
+    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace visibility.
     ///
-    /// Returns `Ok(Some(entity))` when the entity exists in the caller's namespace
-    /// regardless of `deleted_at`. Returns `Ok(None)` when the UUID was never created
-    /// or belongs to a different namespace. Callers use this to distinguish
-    /// "soft-deleted" from "never existed".
+    /// Returns `Ok(Some(entity))` when the entity exists in a namespace visible
+    /// to the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
+    /// was never created or is not visible to the caller.
     pub async fn get_entity_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -419,17 +419,17 @@ impl KhiveRuntime {
             Some(e) => e,
             None => return Ok(None),
         };
-        if entity.namespace != token.namespace().as_str() {
+        if Self::ensure_namespace_visible(&entity.namespace, token).is_err() {
             return Ok(None);
         }
         Ok(Some(entity))
     }
 
-    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace isolation.
+    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace visibility.
     ///
-    /// Returns `Ok(Some(note))` when the note exists in the caller's namespace regardless
-    /// of `deleted_at`. Returns `Ok(None)` when the UUID was never created or belongs to
-    /// a different namespace.
+    /// Returns `Ok(Some(note))` when the note exists in a namespace visible to
+    /// the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
+    /// was never created or is not visible to the caller.
     pub async fn get_note_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -439,7 +439,7 @@ impl KhiveRuntime {
             Some(n) => n,
             None => return Ok(None),
         };
-        if note.namespace != token.namespace().as_str() {
+        if Self::ensure_namespace_visible(&note.namespace, token).is_err() {
             return Ok(None);
         }
         Ok(Some(note))
@@ -474,18 +474,43 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Enforce that `record_ns` matches `caller_ns`.
+    /// Enforce that `record_ns` is within the caller's visible namespace set.
     ///
-    /// Returns `Err(NotFound)` when they differ — wrong-namespace
-    /// and absent UUIDs must be indistinguishable externally (no existence oracle).
-    pub(crate) fn ensure_namespace(record_ns: &str, caller_ns: &str) -> RuntimeResult<()> {
-        if record_ns == caller_ns {
+    /// Returns `Err(NotFound)` when the record namespace is not in the visible
+    /// set — wrong-namespace and absent UUIDs must be indistinguishable
+    /// externally (no existence oracle).
+    ///
+    /// When the visible set is a single entry equal to `caller_primary_ns`, this
+    /// is identical to the former strict-equality check (backward-compatible).
+    pub(crate) fn ensure_namespace(record_ns: &str, caller_primary_ns: &str) -> RuntimeResult<()> {
+        if record_ns == caller_primary_ns {
             return Ok(());
         }
         Err(RuntimeError::NotFound("not found in this namespace".into()))
     }
 
-    /// List entities in a namespace, optionally filtered by kind and entity_type.
+    /// Enforce that `record_ns` is a member of the token's visible namespace set.
+    ///
+    /// This is the multi-namespace-aware variant used when the token carries an
+    /// extended visibility set. For single-namespace tokens (visible == [primary])
+    /// this degenerates to the same strict-equality check as `ensure_namespace`.
+    pub(crate) fn ensure_namespace_visible(
+        record_ns: &str,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<()> {
+        for ns in token.visible_namespaces() {
+            if record_ns == ns.as_str() {
+                return Ok(());
+            }
+        }
+        Err(RuntimeError::NotFound("not found in this namespace".into()))
+    }
+
+    /// List entities visible to the token, optionally filtered by kind and entity_type.
+    ///
+    /// When the token carries a multi-namespace visible set, entities from all
+    /// visible namespaces are returned. When the visible set is `[primary]`
+    /// (the default) this behaves identically to the pre-visibility behaviour.
     pub async fn list_entities(
         &self,
         token: &NamespaceToken,
@@ -494,6 +519,11 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -503,6 +533,7 @@ impl KhiveRuntime {
                 Some(t) => vec![t.to_string()],
                 None => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         let page = self
@@ -524,7 +555,7 @@ impl KhiveRuntime {
     /// When `domain_tag` is Some, the query is restricted at the storage layer via
     /// `EntityFilter::tags_any` so the page result already reflects the domain
     /// constraint.  This avoids the silent truncation that occurs when filtering
-    /// post-page (K-3).
+    /// post-page (K-3). Multi-namespace visibility from the token is applied.
     pub async fn list_entities_tagged(
         &self,
         token: &NamespaceToken,
@@ -533,6 +564,11 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -542,6 +578,7 @@ impl KhiveRuntime {
                 Some(t) if !t.is_empty() => vec![t.to_string()],
                 _ => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         let page = self
@@ -561,12 +598,18 @@ impl KhiveRuntime {
     /// Count entities filtered by kind and optional domain tag.
     ///
     /// Used to report a meaningful `total` alongside a paginated listing (K-6).
+    /// Multi-namespace visibility from the token is applied.
     pub async fn count_entities_tagged(
         &self,
         token: &NamespaceToken,
         kind: Option<&str>,
         domain_tag: Option<&str>,
     ) -> RuntimeResult<u64> {
+        let ns_strs: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
@@ -576,6 +619,7 @@ impl KhiveRuntime {
                 Some(t) if !t.is_empty() => vec![t.to_string()],
                 _ => vec![],
             },
+            namespaces: ns_strs,
             ..Default::default()
         };
         Ok(self
@@ -1429,7 +1473,11 @@ impl KhiveRuntime {
         Ok(note)
     }
 
-    /// List notes, optionally filtered by kind.
+    /// List notes visible to the token, optionally filtered by kind.
+    ///
+    /// When the token carries a multi-namespace visible set, notes from all
+    /// visible namespaces are returned. When the visible set is `[primary]`
+    /// (the default) this behaves identically to the pre-visibility behaviour.
     pub async fn list_notes(
         &self,
         token: &NamespaceToken,
@@ -1437,11 +1485,35 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Note>> {
+        let visible = token.visible_namespaces();
+        if visible.len() == 1 {
+            // Fast path: single namespace — use the dedicated query_notes method.
+            let page = self
+                .notes(token)?
+                .query_notes(
+                    token.namespace().as_str(),
+                    kind,
+                    PageRequest {
+                        offset: offset.into(),
+                        limit,
+                    },
+                )
+                .await?;
+            return Ok(page.items);
+        }
+        // Multi-namespace path: use query_notes_filtered with the visible set.
+        use khive_storage::note::NoteFilter;
+        let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
+        let filter = NoteFilter {
+            kind: kind.map(|k| k.to_string()),
+            namespaces: ns_strs,
+            ..Default::default()
+        };
         let page = self
             .notes(token)?
-            .query_notes(
+            .query_notes_filtered(
                 token.namespace().as_str(),
-                kind,
+                &filter,
                 PageRequest {
                     offset: offset.into(),
                     limit,
@@ -1471,16 +1543,20 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
-        let ns = token.namespace().as_str().to_owned();
+        let visible_ns: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
 
-        // FTS5 over the notes index.
+        // FTS5 over the notes index — search all visible namespaces.
         let text_hits = self
             .text_for_notes(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
                 filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
+                    namespaces: visible_ns.clone(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -1876,9 +1952,12 @@ impl KhiveRuntime {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
-        let ns = token.namespace().as_str();
         let ast = khive_query::parse_auto(query)?;
-        opts.scopes = vec![ns.to_string()];
+        opts.scopes = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_string())
+            .collect();
         let compiled = khive_query::compile(&ast, &opts)?;
         let warnings = compiled.warnings;
 

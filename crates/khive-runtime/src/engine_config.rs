@@ -90,9 +90,15 @@ pub struct EngineConfig {
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:khive"          # default namespace (required)
-/// display_name = "Ocean's khive lambda"  # human label (optional)
+/// id = "lambda:leo"                          # write namespace (required)
+/// display_name = "Leo global orchestrator"   # human label (optional)
+/// visible_namespaces = ["lambda:khive", "local"]  # additional readable namespaces
 /// ```
+///
+/// The `visible_namespaces` list extends the read visibility of the token
+/// minted for this actor. Records in any of those namespaces will appear in
+/// list / search / get results alongside records in the primary `id` namespace.
+/// The primary namespace is always visible regardless of this list.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ActorConfig {
     /// Namespace identifier used as the default actor for all operations.
@@ -107,6 +113,13 @@ pub struct ActorConfig {
     /// surfaced in introspection and log output only.
     #[serde(default)]
     pub display_name: Option<String>,
+
+    /// Additional namespaces this actor can read from (beyond its own write
+    /// namespace). Each string must be a valid `Namespace`. The primary `id`
+    /// namespace is always included in the visible set — no need to repeat it
+    /// here. When absent or empty, visibility defaults to `[id]` only.
+    #[serde(default)]
+    pub visible_namespaces: Option<Vec<String>>,
 }
 
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
@@ -269,6 +282,22 @@ impl KhiveConfig {
                 id: id.to_string(),
                 reason: e.to_string(),
             })?;
+        }
+
+        // Validate actor.visible_namespaces when present.
+        if let Some(ref vis) = self.actor.visible_namespaces {
+            for ns_str in vis {
+                if ns_str.is_empty() {
+                    return Err(ConfigError::InvalidActorId {
+                        id: ns_str.clone(),
+                        reason: "visible_namespaces entries must not be empty".to_string(),
+                    });
+                }
+                Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
+                    id: ns_str.clone(),
+                    reason: format!("invalid visible namespace: {e}"),
+                })?;
+            }
         }
 
         if self.engines.is_empty() {
@@ -796,6 +825,7 @@ id = "lambda:"
             actor: ActorConfig {
                 id: Some("lambda:test-actor".to_string()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };
@@ -822,6 +852,7 @@ id = "lambda:"
             actor: ActorConfig {
                 id: None,
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };

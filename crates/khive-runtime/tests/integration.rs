@@ -1875,3 +1875,180 @@ async fn update_edge_note_note_to_refutes_accepted() {
         .expect("update_edge note→note supports → refutes must be accepted");
     assert_eq!(updated.relation, EdgeRelation::Refutes);
 }
+
+// =============================================================================
+// Multi-namespace read visibility (visible-set tokens)
+// =============================================================================
+
+/// A token with visible=[a,b] can list/get entities+notes in both namespaces,
+/// but not in a third namespace c. Writes land in the primary (a) only.
+#[tokio::test]
+async fn visible_set_reads_primary_and_extra_not_third() {
+    let rt = rt();
+
+    // Mint single-namespace write tokens for three isolated namespaces.
+    let tok_a = rt.authorize(Namespace::parse("vis-a").unwrap()).unwrap();
+    let tok_b = rt.authorize(Namespace::parse("vis-b").unwrap()).unwrap();
+    let tok_c = rt.authorize(Namespace::parse("vis-c").unwrap()).unwrap();
+
+    // Write one entity and one note in each namespace.
+    let entity_a = rt
+        .create_entity(&tok_a, "concept", None, "EntityA", None, None, vec![])
+        .await
+        .unwrap();
+    let entity_b = rt
+        .create_entity(&tok_b, "concept", None, "EntityB", None, None, vec![])
+        .await
+        .unwrap();
+    let entity_c = rt
+        .create_entity(&tok_c, "concept", None, "EntityC", None, None, vec![])
+        .await
+        .unwrap();
+
+    let note_a = rt
+        .create_note(&tok_a, "observation", None, "NoteA", None, None, vec![])
+        .await
+        .unwrap();
+    let note_b = rt
+        .create_note(&tok_b, "observation", None, "NoteB", None, None, vec![])
+        .await
+        .unwrap();
+    let note_c = rt
+        .create_note(&tok_c, "observation", None, "NoteC", None, None, vec![])
+        .await
+        .unwrap();
+
+    // Mint a visible-set token: primary=vis-a, visible=[vis-a, vis-b].
+    let vis_tok = rt
+        .authorize_with_visibility(
+            Namespace::parse("vis-a").unwrap(),
+            vec![Namespace::parse("vis-b").unwrap()],
+        )
+        .unwrap();
+
+    // --- list_entities sees a+b, not c ---
+    let visible_entities = rt.list_entities(&vis_tok, None, None, 50, 0).await.unwrap();
+    let entity_names: Vec<&str> = visible_entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(entity_names.contains(&"EntityA"), "EntityA must be visible");
+    assert!(entity_names.contains(&"EntityB"), "EntityB must be visible");
+    assert!(
+        !entity_names.contains(&"EntityC"),
+        "EntityC must NOT be visible"
+    );
+
+    // --- list_notes sees a+b, not c ---
+    let visible_notes = rt.list_notes(&vis_tok, None, 50, 0).await.unwrap();
+    let note_contents: Vec<&str> = visible_notes.iter().map(|n| n.content.as_str()).collect();
+    assert!(note_contents.contains(&"NoteA"), "NoteA must be visible");
+    assert!(note_contents.contains(&"NoteB"), "NoteB must be visible");
+    assert!(
+        !note_contents.contains(&"NoteC"),
+        "NoteC must NOT be visible"
+    );
+
+    // --- get_entity: a and b succeed, c returns NotFound ---
+    rt.get_entity(&vis_tok, entity_a.id)
+        .await
+        .expect("get entity_a must succeed");
+    rt.get_entity(&vis_tok, entity_b.id)
+        .await
+        .expect("get entity_b (visible non-primary) must succeed");
+    let err_c = rt.get_entity(&vis_tok, entity_c.id).await;
+    assert!(
+        err_c.is_err(),
+        "get entity_c (non-visible) must return NotFound"
+    );
+
+    // --- get_note: a and b visible, c filtered out ---
+    // get_note_including_deleted returns Ok(None) when namespace not visible.
+    let fetched_note_a = rt
+        .get_note_including_deleted(&vis_tok, note_a.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_a.is_some(),
+        "note_a (primary namespace) must be returned"
+    );
+
+    let fetched_note_b = rt
+        .get_note_including_deleted(&vis_tok, note_b.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_b.is_some(),
+        "note_b (visible non-primary) must be returned"
+    );
+
+    let fetched_note_c = rt
+        .get_note_including_deleted(&vis_tok, note_c.id)
+        .await
+        .expect("call must not error");
+    assert!(
+        fetched_note_c.is_none(),
+        "note_c (non-visible namespace) must be filtered out"
+    );
+
+    // --- WRITE via vis_tok lands in primary (vis-a) only, not in vis-b ---
+    let written = rt
+        .create_entity(
+            &vis_tok,
+            "concept",
+            None,
+            "WrittenViaVisToken",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        written.namespace.as_str(),
+        "vis-a",
+        "write must stamp primary namespace, not any extra-visible one"
+    );
+
+    // Verify vis-b does not contain the newly written entity.
+    let b_entities = rt.list_entities(&tok_b, None, None, 50, 0).await.unwrap();
+    let b_names: Vec<&str> = b_entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !b_names.contains(&"WrittenViaVisToken"),
+        "write must NOT appear in vis-b"
+    );
+
+    // Suppress unused-variable warnings for IDs we intentionally only inserted.
+    let _ = note_a;
+    let _ = note_c;
+    let _ = entity_c;
+}
+
+/// Backward compatibility: a token minted via `authorize()` (no visibility)
+/// behaves exactly as before — single namespace, strict equality on reads/writes.
+/// This is the original namespace_isolation test reproduced verbatim to confirm
+/// nothing regressed.
+#[tokio::test]
+async fn namespace_isolation_backward_compat() {
+    let rt = rt();
+    let ns_a_tok = rt.authorize(Namespace::parse("bc-a").unwrap()).unwrap();
+    let ns_b_tok = rt.authorize(Namespace::parse("bc-b").unwrap()).unwrap();
+
+    rt.create_entity(&ns_a_tok, "concept", None, "EntityA", None, None, vec![])
+        .await
+        .unwrap();
+    rt.create_entity(&ns_b_tok, "concept", None, "EntityB", None, None, vec![])
+        .await
+        .unwrap();
+
+    let a_entities = rt
+        .list_entities(&ns_a_tok, None, None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(a_entities.len(), 1);
+    assert_eq!(a_entities[0].name, "EntityA");
+
+    let b_entities = rt
+        .list_entities(&ns_b_tok, None, None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(b_entities.len(), 1);
+    assert_eq!(b_entities[0].name, "EntityB");
+}

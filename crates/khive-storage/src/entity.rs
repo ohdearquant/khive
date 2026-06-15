@@ -88,6 +88,13 @@ pub struct EntityFilter {
     pub entity_types: Vec<String>,
     pub name_prefix: Option<String>,
     pub tags_any: Vec<String>,
+    /// When non-empty, restricts results to any of these namespaces using
+    /// `namespace IN (...)`. Takes precedence over the `namespace` string
+    /// parameter passed to `query_entities` / `count_entities`. When empty the
+    /// caller-supplied `namespace` parameter is used (single-namespace path,
+    /// backward-compatible default).
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 /// Entity CRUD operations over the entities substrate table.

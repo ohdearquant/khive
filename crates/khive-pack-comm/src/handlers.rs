@@ -124,6 +124,7 @@ pub(crate) async fn handle_inbox(
         kind: Some("message".to_string()),
         property_filters,
         order_by: None, // preserves existing created_at DESC ordering
+        ..Default::default()
     };
     let page = runtime
         .notes(token)?
@@ -402,6 +403,7 @@ pub(crate) async fn handle_thread(
             value: SqlValue::Text(canonical_thread_id.clone()),
         }],
         order_by: None,
+        ..Default::default()
     };
     const PAGE_SIZE: u32 = 200;
     let mut messages: Vec<Value> = Vec::new();

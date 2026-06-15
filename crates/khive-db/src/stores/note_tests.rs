@@ -229,6 +229,7 @@ async fn test_filtered_namespace_and_kind_isolation() {
             value: SqlValue::Text("pending".to_string()),
         }],
         order_by: None,
+        ..Default::default()
     };
 
     let page = store
@@ -282,6 +283,7 @@ async fn test_filtered_order_by_json_path_asc() {
             value: SqlValue::Text("pending".to_string()),
         }],
         order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
+        ..Default::default()
     };
 
     let page = store
@@ -319,6 +321,7 @@ async fn test_filtered_soft_deleted_excluded() {
             value: SqlValue::Text("pending".to_string()),
         }],
         order_by: None,
+        ..Default::default()
     };
 
     let page = store
@@ -343,6 +346,7 @@ async fn test_filtered_invalid_json_path_rejected() {
             value: SqlValue::Text("x".to_string()),
         }],
         order_by: None,
+        ..Default::default()
     };
 
     let result = store

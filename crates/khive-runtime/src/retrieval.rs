@@ -342,14 +342,18 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = token.namespace().as_str().to_owned();
+        let visible_ns: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
         let text_hits = self
             .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
                 filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
+                    namespaces: visible_ns.clone(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -387,6 +391,7 @@ impl KhiveRuntime {
                         ids: candidate_ids,
                         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
                         entity_types: entity_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
+                        namespaces: visible_ns,
                         ..EntityFilter::default()
                     },
                     PageRequest {

@@ -305,6 +305,10 @@ impl KhiveRuntime {
     /// `AllowAllGate` this always succeeds. When a real policy-backed gate is
     /// installed, this method enforces it and returns `PermissionDenied` on
     /// denial.
+    ///
+    /// The returned token's read visibility set defaults to `[ns]` — identical
+    /// to the pre-visibility-set behaviour. Use [`authorize_with_visibility`]
+    /// to mint a token that can read additional namespaces.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
         let actor = ActorRef::anonymous();
         let req = GateRequest::new(
@@ -325,6 +329,68 @@ impl KhiveRuntime {
                     }
                 }
                 Ok(NamespaceToken::mint_authorized(ns, actor))
+            }
+            Ok(khive_gate::GateDecision::Deny { reason }) => {
+                Err(crate::RuntimeError::PermissionDenied {
+                    verb: "authorize".to_string(),
+                    reason,
+                })
+            }
+            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
+                verb: "authorize".to_string(),
+                reason: "gate denied".to_string(),
+            }),
+            Err(e) => Err(crate::RuntimeError::Internal(format!("gate error: {e}"))),
+        }
+    }
+
+    /// Mint an authorization token with an explicit read-visibility set.
+    ///
+    /// `primary` is the **write namespace** — all records created via the
+    /// returned token land there. `extra_visible` lists additional namespaces
+    /// the token may read. The primary is always included in the visible set
+    /// regardless of `extra_visible`.
+    ///
+    /// Usage (lambda:leo reading both leo and khive namespaces):
+    /// ```rust,ignore
+    /// let tok = rt.authorize_with_visibility(
+    ///     Namespace::parse("lambda:leo").unwrap(),
+    ///     vec![Namespace::parse("lambda:khive").unwrap()],
+    /// )?;
+    /// ```
+    pub fn authorize_with_visibility(
+        &self,
+        primary: Namespace,
+        extra_visible: Vec<Namespace>,
+    ) -> RuntimeResult<NamespaceToken> {
+        let actor = ActorRef::anonymous();
+        let req = GateRequest::new(
+            actor.clone(),
+            primary.clone(),
+            "authorize",
+            serde_json::Value::Null,
+        );
+        match self.config.gate.check(&req) {
+            Ok(ref decision) if decision.is_allow() => {
+                if let khive_gate::GateDecision::Allow { ref obligations } = decision {
+                    if !obligations.is_empty() {
+                        tracing::debug!(
+                            namespace = %primary.as_str(),
+                            "authorize_with_visibility: obligations={:?}",
+                            obligations
+                        );
+                    }
+                }
+                // Build the full visible set: primary + extras, deduplicated.
+                let mut visible = vec![primary.clone()];
+                for ns in extra_visible {
+                    if !visible.contains(&ns) {
+                        visible.push(ns);
+                    }
+                }
+                Ok(NamespaceToken::mint_with_visibility(
+                    primary, visible, actor,
+                ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
                 Err(crate::RuntimeError::PermissionDenied {
@@ -804,6 +870,7 @@ mod tests {
             actor: ActorConfig {
                 id: Some(id.to_string()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         }
@@ -843,6 +910,7 @@ mod tests {
             actor: ActorConfig {
                 id: Some(String::new()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };
@@ -898,6 +966,7 @@ mod tests {
             actor: ActorConfig {
                 id: Some("lambda:test".to_string()),
                 display_name: None,
+                ..Default::default()
             },
             runtime: RuntimeSectionConfig::default(),
         };
