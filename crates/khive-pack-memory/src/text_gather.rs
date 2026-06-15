@@ -87,7 +87,7 @@ pub async fn collect_text_hits(
     ns: &str,
     candidate_limit: u32,
     snippet_policy: TextSnippetPolicy,
-    is_cjk: bool,
+    cjk_fts_bypass: bool,
     cfg: &RecallFtsGatherConfig,
     all_terms: &[String],
 ) -> Result<Vec<TextSearchHit>, RuntimeError> {
@@ -100,7 +100,7 @@ pub async fn collect_text_hits(
     });
 
     // CJK bypass: skip term selection and use existing ranked path.
-    if is_cjk && cfg.cjk_bypass_ranked {
+    if cjk_fts_bypass && cfg.cjk_bypass_ranked {
         let selected_terms: Vec<String> = all_terms.iter().take(cfg.term_k).cloned().collect();
         let join_query = if selected_terms.is_empty() {
             return Ok(Vec::new());
@@ -539,7 +539,7 @@ mod collect_text_hits_tests {
     // ── CJK case: trigram path stays covered ──────────────────────────────────
 
     /// Insert a doc with Chinese text, query via trigram bypass path.
-    /// Verifies the CJK bypass (`is_cjk=true, cjk_bypass_ranked=true`) finds it.
+    /// Verifies the CJK bypass (`cjk_fts_bypass=true, cjk_bypass_ranked=true`) finds it.
     #[tokio::test]
     async fn gather_cjk_bypass_finds_cjk_document() {
         let searcher = backend_text("ctf_cjk");
@@ -577,7 +577,7 @@ mod collect_text_hits_tests {
             ns,
             10,
             TextSnippetPolicy::Omit,
-            true, // is_cjk=true
+            true, // cjk_fts_bypass=true
             &cfg,
             &terms,
         )
