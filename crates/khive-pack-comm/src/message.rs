@@ -165,9 +165,10 @@ pub(crate) async fn dual_write_message(
 
     {
         // When sender and recipient are in different namespaces (allowed cross-ns path),
-        // mint a narrowed write-only token for the recipient namespace so the inbound
-        // note lands in the correct inbox. For same-namespace sends (from == to),
-        // use caller_token unchanged (preserves existing behavior).
+        // mint a recipient-scoped read+write token used for exactly one inbound
+        // `create_note` call after the allowlist check so the inbound note lands in the
+        // correct inbox. For same-namespace sends (from == to), use caller_token
+        // unchanged (preserves existing behavior).
         let cross_ns_token;
         let inbound_tok: &NamespaceToken = if from == recipient_ns_str {
             caller_token

@@ -1431,10 +1431,13 @@ impl KhiveRuntime {
             let fts_result: RuntimeResult<()> = if fts_inject {
                 Err(RuntimeError::Internal("injected FTS failure".to_string()))
             } else {
-                self.text_for_notes(token)?
-                    .upsert_document(note_fts_document(&note))
-                    .await
-                    .map_err(RuntimeError::from)
+                match self.text_for_notes(token) {
+                    Ok(fts) => fts
+                        .upsert_document(note_fts_document(&note))
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                }
             };
 
             if let Err(e) = fts_result {
@@ -1482,10 +1485,9 @@ impl KhiveRuntime {
                 vec_result
             };
 
-            match vec_result {
-                Ok(vector) => {
-                    let insert_result = self
-                        .vectors_for_model(token, model_name)?
+            let single_model_result: RuntimeResult<()> = match vec_result {
+                Ok(vector) => match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => vs
                         .insert(
                             note.id,
                             SubstrateKind::Note,
@@ -1494,28 +1496,20 @@ impl KhiveRuntime {
                             vec![vector],
                         )
                         .await
-                        .map_err(RuntimeError::from);
-                    if let Err(e) = insert_result {
-                        // Compensate note row + FTS.
-                        if let Ok(store) = self.notes(token) {
-                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                        }
-                        if let Ok(fts) = self.text_for_notes(token) {
-                            let _ = fts.delete_document(ns, note.id).await;
-                        }
-                        return Err(e);
-                    }
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(e) = single_model_result {
+                // Compensate note row + FTS.
+                if let Ok(store) = self.notes(token) {
+                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                 }
-                Err(e) => {
-                    // Compensate note row + FTS.
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
-                    }
-                    return Err(e);
+                if let Ok(fts) = self.text_for_notes(token) {
+                    let _ = fts.delete_document(ns, note.id).await;
                 }
+                return Err(e);
             }
         } else if !embed_model_names.is_empty() {
             // Multi-model path: embed with each model in parallel via spawned tasks,
@@ -1533,13 +1527,12 @@ impl KhiveRuntime {
             }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
             for handle in handles {
-                match handle
+                let join_result = handle
                     .await
-                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")))?
-                {
-                    Ok(vec) => vectors.push(vec),
+                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")));
+                match join_result {
                     Err(e) => {
-                        // Compensate note row + FTS.
+                        // Compensate note row + FTS (no vectors inserted yet).
                         if let Ok(store) = self.notes(token) {
                             let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                         }
@@ -1548,22 +1541,35 @@ impl KhiveRuntime {
                         }
                         return Err(e);
                     }
+                    Ok(Err(e)) => {
+                        // Embed call failed — compensate note row + FTS.
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(e);
+                    }
+                    Ok(Ok(vec)) => vectors.push(vec),
                 }
             }
             // TODO(P2): parallelize vector inserts (codex review #444)
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
-                let insert_result = self
-                    .vectors_for_model(token, model_name)?
-                    .insert(
-                        note.id,
-                        SubstrateKind::Note,
-                        ns,
-                        "note.content",
-                        vec![vector],
-                    )
-                    .await
-                    .map_err(RuntimeError::from);
+                let insert_result = match self.vectors_for_model(token, model_name) {
+                    Ok(vs) => vs
+                        .insert(
+                            note.id,
+                            SubstrateKind::Note,
+                            ns,
+                            "note.content",
+                            vec![vector],
+                        )
+                        .await
+                        .map_err(RuntimeError::from),
+                    Err(e) => Err(e),
+                };
                 if let Err(e) = insert_result {
                     // Compensate note row + FTS + already-inserted vectors.
                     if let Ok(store) = self.notes(token) {
@@ -5657,6 +5663,55 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove the note row after FTS failure; got {notes:?}"
+        );
+    }
+
+    // Inject a vector insertion failure after note row + FTS commit and assert
+    // both the note row and the FTS document are removed (no stranded rows).
+    // arm_vector_fail("local") targets the "local" namespace; since the single
+    // registered provider fires embed_document before the injection check, the
+    // injection converts the successful embedding into an error just before the
+    // VectorStore insert, then disarms.
+    #[tokio::test]
+    async fn create_note_vector_failure_rolls_back_note_row_and_fts() {
+        const MODEL: &str = "test-vec-inject";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL, DIMS);
+        rt.register_embedder(provider);
+
+        let tok = NamespaceToken::local();
+
+        arm_vector_fail("local");
+
+        let result = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "vec-fail rollback target",
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note must propagate the injected vector failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected vector failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove note row after vector failure; got {notes:?}"
         );
     }
 

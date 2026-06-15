@@ -3088,6 +3088,132 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     );
 }
 
+// T14 — inbound vector insertion failure after note row + FTS commit leaves no
+// stranded row (mirrors T13 but exercises the vector compensation path).
+//
+// Because `build_crossns_registry` configures no embedding model, the vector
+// insert path is unreachable without registering a provider.  T14 registers a
+// trivial constant-vector embedder on the sender and recipient runtimes so that
+// `embed_model_names` is non-empty, then arms `arm_vector_fail(recipient_ns)`.
+//
+// Execution path for the cross-ns send:
+//   outbound create_note (sender ns)   → FTS ok, embed ok, vector insert ok.
+//   inbound  create_note (recipient ns) → FTS ok, embed ok,
+//                                         vector inject fires → Err returned,
+//                                         compensation deletes inbound row + FTS.
+//   dual_write_message catches inbound error → rolls back outbound note.
+//
+// After send returns Err, both sender_ns and recipient_ns have zero live notes.
+#[tokio::test]
+async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
+    use async_trait::async_trait;
+    use khive_runtime::{arm_vector_fail, EmbedderProvider};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    const T14_MODEL: &str = "t14-const-vec";
+    const T14_DIMS: usize = 4;
+
+    struct T14VecService;
+    #[async_trait]
+    impl EmbeddingService for T14VecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; T14_DIMS]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "t14-const-vec"
+        }
+    }
+
+    struct T14VecProvider;
+    #[async_trait]
+    impl EmbedderProvider for T14VecProvider {
+        fn name(&self) -> &str {
+            T14_MODEL
+        }
+        fn dimensions(&self) -> usize {
+            T14_DIMS
+        }
+        async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(T14VecService))
+        }
+    }
+
+    let sender_ns = "lambda:t14-sender";
+    let recipient_ns = "lambda:t14-vec-inbound-fail";
+
+    let backend = shared_backend();
+    let (registry_sender, rt_sender) = build_crossns_registry(
+        Arc::clone(&backend),
+        sender_ns,
+        vec![Namespace::parse(recipient_ns).unwrap()],
+    );
+    let (_registry_recipient, rt_recipient) =
+        build_crossns_registry(Arc::clone(&backend), recipient_ns, vec![]);
+
+    // Register the embedder on both runtimes so the vector path is exercised.
+    rt_sender.register_embedder(T14VecProvider);
+    rt_recipient.register_embedder(T14VecProvider);
+
+    // Arm vector injection on the RECIPIENT namespace only.  The outbound
+    // create_note (sender_ns) passes through; only the inbound create_note
+    // (recipient_ns) hits the injected error after its row and FTS are committed.
+    arm_vector_fail(recipient_ns);
+
+    let result = registry_sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": recipient_ns, "content": "t14 vec-inbound-fail test" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T14: send must fail when inbound vector injection is armed on recipient ns"
+    );
+
+    // No outbound note must remain in the sender namespace.
+    let sender_tok = rt_sender
+        .authorize(Namespace::parse(sender_ns).unwrap())
+        .unwrap();
+    let sender_notes = rt_sender
+        .list_notes(&sender_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let sender_alive = sender_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        sender_alive,
+        0,
+        "T14: no stranded outbound note in sender ns after inbound vector failure; got {sender_alive}"
+    );
+
+    // No inbound note must remain in the recipient namespace.
+    let recipient_tok = rt_recipient
+        .authorize(Namespace::parse(recipient_ns).unwrap())
+        .unwrap();
+    let recipient_notes = rt_recipient
+        .list_notes(&recipient_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let recipient_alive = recipient_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
+    assert_eq!(
+        recipient_alive,
+        0,
+        "T14: no stranded inbound note in recipient ns; compensation must clean it up; got {recipient_alive}"
+    );
+}
+
 // TOML wiring test — KhiveConfig parsed from TOML with
 // `actor.allowed_outbound_namespaces = [...]` must land those values in
 // RuntimeConfig.allowed_outbound_namespaces.

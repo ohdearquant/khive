@@ -29,6 +29,7 @@ khive-db = { version = "0.2.11", path = "../khive-db" }
 criterion = { workspace = true }
 toml = { workspace = true }
 khive-runtime = { version = "0.2.11", path = "../khive-runtime", features = ["fault-injection"] }
+lattice-embed = { workspace = true }
 
 [[bench]]
 name = "comm_bench"
