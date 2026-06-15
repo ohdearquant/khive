@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "khive-types",
     "khive-score",
+    "khive-quant",
     "khive-fold",
     "khive-storage",
     "khive-text",
