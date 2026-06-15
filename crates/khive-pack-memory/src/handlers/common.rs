@@ -588,34 +588,77 @@ impl MemoryPack {
             snippet_policy,
             fts_gather,
         } = opts;
-        let ns = token.namespace().as_str().to_string();
 
-        let text_fut = self.collect_recall_text_hits(
-            token,
-            query,
-            &ns,
-            candidate_limit,
-            snippet_policy,
-            is_cjk,
-            fts_gather,
-        );
-        let vector_fut = self.collect_recall_vector_hits(
-            token,
-            query,
-            &ns,
-            RecallVectorCandidateParams {
+        // Use all visible namespaces for FTS; fall back to primary for vector
+        // recall (vector index is per-namespace, primary is the write namespace).
+        let visible = token.visible_namespace_strs();
+        let primary_ns = token.namespace().as_str().to_string();
+
+        // For single-namespace (common case) take the fast path.
+        if visible.len() <= 1 {
+            let text_fut = self.collect_recall_text_hits(
+                token,
+                query,
+                &primary_ns,
                 candidate_limit,
-                embedding_model,
+                snippet_policy,
                 is_cjk,
-                scoring_cfg,
-            },
-        );
+                fts_gather,
+            );
+            let vector_fut = self.collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    is_cjk,
+                    scoring_cfg,
+                },
+            );
+            let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+            return Ok(RecallCandidateSet {
+                namespace: primary_ns,
+                text_hits,
+                vector_hits_per_model: vector_result.vector_hits_per_model,
+                cjk_routed: vector_result.cjk_routed,
+            });
+        }
 
-        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        // Multi-namespace: fanout FTS across all visible namespaces, aggregate.
+        let mut all_text_hits = Vec::new();
+        for ns_str in &visible {
+            let hits = self
+                .collect_recall_text_hits(
+                    token,
+                    query,
+                    ns_str,
+                    candidate_limit,
+                    snippet_policy,
+                    is_cjk,
+                    fts_gather,
+                )
+                .await?;
+            all_text_hits.extend(hits);
+        }
+        // Vector recall stays in primary namespace (single index).
+        let vector_result = self
+            .collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    is_cjk,
+                    scoring_cfg,
+                },
+            )
+            .await?;
 
         Ok(RecallCandidateSet {
-            namespace: ns,
-            text_hits,
+            namespace: primary_ns,
+            text_hits: all_text_hits,
             vector_hits_per_model: vector_result.vector_hits_per_model,
             cjk_routed: vector_result.cjk_routed,
         })

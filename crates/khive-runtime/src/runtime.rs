@@ -155,6 +155,7 @@ impl KhiveRuntime {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         })
     }
 
@@ -164,6 +165,14 @@ impl KhiveRuntime {
     /// to identify which backend owns a given node, and to detect cross-backend merges.
     pub fn backend_id(&self) -> &BackendId {
         &self.config.backend_id
+    }
+
+    /// Return the extra-visible namespaces from config (beyond the primary).
+    ///
+    /// Used by pack dispatch to mint tokens that can read across namespaces
+    /// configured in `actor.visible_namespaces` in `khive.toml`.
+    pub fn visible_namespaces(&self) -> &[Namespace] {
+        &self.config.visible_namespaces
     }
 
     /// Return a reference to the runtime config.
@@ -381,15 +390,10 @@ impl KhiveRuntime {
                         );
                     }
                 }
-                // Build the full visible set: primary + extras, deduplicated.
-                let mut visible = vec![primary.clone()];
-                for ns in extra_visible {
-                    if !visible.contains(&ns) {
-                        visible.push(ns);
-                    }
-                }
                 Ok(NamespaceToken::mint_with_visibility(
-                    primary, visible, actor,
+                    primary,
+                    extra_visible,
+                    actor,
                 ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
@@ -725,6 +729,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -743,6 +748,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::new("lore"),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -887,6 +893,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -904,6 +911,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -933,6 +941,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -954,6 +963,7 @@ mod tests {
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
             brain_profile: None,
+            visible_namespaces: vec![],
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {

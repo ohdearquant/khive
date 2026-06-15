@@ -82,6 +82,11 @@ impl KgPack {
                                 .map(|t| vec![t.to_string()])
                                 .unwrap_or_default(),
                             tags_any: tag_list.clone(),
+                            namespaces: token
+                                .visible_namespace_strs()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
                             ..Default::default()
                         };
                         let page = self

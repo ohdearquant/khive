@@ -34,6 +34,7 @@ fn rt_with_embedder() -> KhiveRuntime {
         packs: vec!["kg".to_string(), "knowledge".to_string()],
         backend_id: BackendId::main(),
         brain_profile: None,
+        visible_namespaces: vec![],
     })
     .expect("runtime with embedder")
 }

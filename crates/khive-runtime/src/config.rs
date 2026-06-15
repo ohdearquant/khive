@@ -79,16 +79,23 @@ pub struct NamespaceToken {
 }
 
 impl NamespaceToken {
-    /// Mint an authorized token with an explicit visibility set.
+    /// Mint an authorized token with an extended visibility set.
     ///
-    /// `visible` MUST contain `namespace`; callers are responsible for this
-    /// invariant. The `mint_authorized` convenience form enforces it by
-    /// defaulting `visible` to `[namespace]`.
+    /// `extra_visible` lists namespaces beyond the primary that the token may
+    /// read. The primary namespace is always included in the visible set
+    /// regardless of what `extra_visible` contains. Duplicates are removed.
     pub(crate) fn mint_with_visibility(
         namespace: Namespace,
-        visible: Vec<Namespace>,
+        extra_visible: Vec<Namespace>,
         actor: ActorRef,
     ) -> Self {
+        let mut visible = vec![namespace.clone()];
+        for ns in extra_visible {
+            if !visible.contains(&ns) {
+                visible.push(ns);
+            }
+        }
+        debug_assert!(!visible.is_empty(), "visible set must be non-empty");
         Self {
             namespace,
             visible,
@@ -102,8 +109,7 @@ impl NamespaceToken {
     /// The visible set defaults to `[namespace]` — backward-compatible with
     /// single-namespace enforcement.
     pub(crate) fn mint_authorized(namespace: Namespace, actor: ActorRef) -> Self {
-        let visible = vec![namespace.clone()];
-        Self::mint_with_visibility(namespace, visible, actor)
+        Self::mint_with_visibility(namespace, vec![], actor)
     }
 
     /// Convenience constructor for the local namespace with an anonymous actor.
@@ -221,6 +227,12 @@ pub struct RuntimeConfig {
     /// 2. Namespace-bound profile resolved via `brain.resolve` at feedback time
     /// 3. Pack-local global tuning prior (default fallback)
     pub brain_profile: Option<String>,
+    /// Extra namespaces the pack-dispatch token may read (beyond the primary).
+    ///
+    /// Populated from `actor.visible_namespaces` in `khive.toml`. The primary
+    /// namespace (actor.id) is always implicitly readable and need not appear
+    /// here. Empty by default (single-namespace behaviour).
+    pub visible_namespaces: Vec<Namespace>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -277,6 +289,7 @@ impl Default for RuntimeConfig {
             packs,
             backend_id: BackendId::main(),
             brain_profile,
+            visible_namespaces: vec![],
         }
     }
 }
@@ -387,10 +400,26 @@ pub fn runtime_config_from_khive_config(
             .filter(|s| !s.trim().is_empty())
     });
 
+    let visible_namespaces: Vec<Namespace> = khive_cfg
+        .actor
+        .visible_namespaces
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| match Namespace::parse(s) {
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                tracing::warn!(ns = %s, error = %e, "actor.visible_namespaces: invalid namespace; skipped");
+                None
+            }
+        })
+        .collect();
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
             brain_profile,
+            visible_namespaces,
             ..base
         };
     }
@@ -422,6 +451,7 @@ pub fn runtime_config_from_khive_config(
         additional_embedding_models: additional,
         default_namespace,
         brain_profile,
+        visible_namespaces,
         ..base
     }
 }

@@ -80,6 +80,11 @@ impl KgPack {
                                 token.namespace().as_str(),
                                 EntityFilter {
                                     ids: candidate_ids,
+                                    namespaces: token
+                                        .visible_namespace_strs()
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect(),
                                     ..EntityFilter::default()
                                 },
                                 PageRequest {
