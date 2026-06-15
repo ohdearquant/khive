@@ -519,8 +519,9 @@ impl VamanaIndex {
             .map_err(|_| VamanaError::invalid_format("search_list_size overflows u32".into()))?;
         // Cap the medoid's adjacency at max_degree before serializing.
         // The medoid-pin in insert() may transiently allow the medoid to exceed
-        // max_degree by 1 (see medoid-pin comment in insert()). Capping here
-        // ensures the snapshot satisfies from_snapshot()'s degree constraint.
+        // max_degree (by one edge per orphan-pinned insert; K consecutive inserts
+        // can accumulate K overflow edges). Capping here ensures the snapshot
+        // satisfies from_snapshot()'s degree constraint.
         let medoid = self.graph.medoid();
         let max_degree_usize = self.config.max_degree;
         let adjacency: Vec<Vec<u32>> = self
@@ -909,16 +910,18 @@ impl VamanaIndex {
             // adding the edge medoid→ordinal. The medoid is the search entry point and
             // is always reachable; it is the designated overflow node for this edge.
             //
-            // The medoid may transiently exceed max_degree by 1 due to this pin.
-            // This is resolved at serialization time (save()/to_snapshot()): before
-            // writing, the medoid's adjacency is capped to max_degree by truncating
-            // to the first max_degree entries so the written graph satisfies all
-            // loader degree constraints. See write_graph() and to_snapshot().
+            // The medoid may transiently exceed max_degree due to this pin (by one
+            // edge per orphan-pinned insert; K consecutive inserts can accumulate K
+            // overflow edges). This is resolved at serialization time
+            // (save()/to_snapshot()): the medoid's adjacency is capped to max_degree
+            // so the written graph satisfies all loader degree constraints. See
+            // write_graph() and to_snapshot().
             //
-            // If the medoid overflow edge (medoid→ordinal) is the one dropped at
-            // serialization time, ordinal will not be searchable after load — but
-            // it IS searchable in the live in-memory index. A subsequent consolidate()
-            // rebuilds all back-edges and restores full reachability.
+            // If overflow edges are dropped at serialization, the affected ordinals
+            // will not be searchable after load — but they ARE searchable in the
+            // live in-memory index. Today's consolidate() handles tombstone
+            // compaction only; a future redistribution pass will recover
+            // post-load reachability for truncation-affected nodes.
             //
             // Edge case: if the graph was empty before this insert and ordinal became
             // the medoid (live_before == 0 branch), no pin is needed — handled by the
@@ -1514,9 +1517,9 @@ fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()
 
     // Cap the medoid's adjacency list at max_degree before serialization.
     // The medoid-pin in insert() may transiently allow the medoid to exceed
-    // max_degree by 1 to ensure a freshly inserted node has an inbound edge
-    // (see medoid-pin comment in insert()). We drop the overflow entry here
-    // so the written graph satisfies the loader degree constraint.
+    // max_degree (by one edge per orphan-pinned insert; K consecutive inserts
+    // can accumulate K overflow edges). We drop all overflow entries here so
+    // the written graph satisfies the loader degree constraint.
     let medoid_adj_capped: Vec<u32>;
     let adjacency = graph.adjacency();
     let medoid_neighbors = &adjacency[medoid as usize];

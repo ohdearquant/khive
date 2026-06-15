@@ -166,8 +166,12 @@ edges). No existing medoid edge is removed, so the never-drop invariant is prese
 adjacency to `max_degree` before writing. Any overflow edges beyond `max_degree` are dropped
 at serialization time. The result is a written graph
 that satisfies all v1 loader degree constraints (`degree ≤ max_degree` everywhere). After
-load, `ordinal` may lack the medoid in-edge and may not be immediately searchable; a
-subsequent `consolidate()` rebuilds all back-edges and restores full reachability. Tests
+load, recently inserted nodes whose overflow edges were dropped may lack medoid in-edges
+and may not be immediately searchable. Today's `consolidate()` handles tombstone compaction
+only (renumbering live nodes); it does not redistribute forward edges or re-run RobustPrune
+for under-connected nodes. A future redistribution pass (separate issue) will address
+post-load reachability recovery; until then, serialization truncation of overflow edges is
+a permanent quality reduction for affected nodes absent a full index rebuild. Tests
 verify that the post-insert `save()`/`load()` and `to_snapshot()`/`from_snapshot()` round-trips
 succeed without degree-violation errors, and that existing nodes remain findable.
 
