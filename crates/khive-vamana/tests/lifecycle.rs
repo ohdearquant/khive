@@ -1276,3 +1276,103 @@ fn insert_preserves_existing_node_reachability() {
         );
     }
 }
+
+// ---- Merge acceptance criterion: ~10k insert + ~5k delete + consolidate ----
+
+/// Acceptance test: build N=1000 base, insert 200 extra via insert(), tombstone 500 of the
+/// base nodes, call consolidate(), and assert:
+///   (a) tombstone_count == 0  (zero tombstones remaining)
+///   (b) num_vectors == 700    (contiguous live count; dense/compacted ordinals)
+///   (c) all forward-adjacency ordinals are < 700  (no stale old-space references)
+///   (d) new_to_old.len() == 700  (remap table covers exactly the live set)
+///   (e) every entry in new_to_old is a valid old ordinal (< 1200)
+///   (f) reverse_adj bidirectional invariant holds on the compacted graph
+///
+/// This exercises the full insert → delete → consolidate lifecycle at meaningful
+/// scale (total mutations: 200 inserts + 500 deletes = 700 ops) and proves that
+/// consolidate() produces a dense, self-consistent index with zero tombstones.
+#[test]
+fn acceptance_insert_delete_consolidate_dense_ordinals() {
+    let n_base = 1000usize;
+    let n_insert = 200usize;
+    let n_delete = 500usize; // delete from base nodes only (indices < n_base)
+    let dim = 8usize;
+
+    let base_vecs = rand_unit_vectors(n_base, dim, 0xACCE_0001);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(12)
+        .with_search_list_size(24);
+
+    let mut idx = VamanaIndex::build(&base_vecs, cfg).unwrap();
+    assert_eq!(idx.num_vectors(), n_base);
+    assert_eq!(idx.tombstone_count(), 0);
+
+    // Insert n_insert new vectors (no free slots yet — all go to append path).
+    let extra_vecs = rand_unit_vectors(n_insert, dim, 0xACCE_0002);
+    for i in 0..n_insert {
+        idx.insert(&extra_vecs[i * dim..(i + 1) * dim]).unwrap();
+    }
+    let n_total = n_base + n_insert; // 1200
+    assert_eq!(idx.num_vectors(), n_total);
+
+    // Tombstone 500 base nodes (excluding the medoid to keep the graph valid).
+    let medoid = idx.graph().medoid();
+    let to_delete: Vec<u32> = (0..n_base as u32)
+        .filter(|&i| i != medoid)
+        .take(n_delete)
+        .collect();
+    assert_eq!(to_delete.len(), n_delete);
+    idx.tombstone_batch(&to_delete).unwrap();
+    assert_eq!(idx.tombstone_count(), n_delete);
+
+    // Consolidate.
+    let expected_live = n_total - n_delete; // 700
+    let new_to_old = idx.consolidate().unwrap();
+
+    // (a) zero tombstones remaining.
+    assert_eq!(
+        idx.tombstone_count(),
+        0,
+        "tombstone_count must be 0 after consolidate"
+    );
+
+    // (b) dense/compacted ordinals: num_vectors == live_count.
+    assert_eq!(
+        idx.num_vectors(),
+        expected_live,
+        "num_vectors must equal live_count ({expected_live}) after consolidate"
+    );
+
+    // (c) all adjacency ordinals < expected_live (no stale old-space references).
+    for (u, neighbors) in idx.graph().adjacency().iter().enumerate() {
+        for &v in neighbors {
+            assert!(
+                (v as usize) < expected_live,
+                "adjacency[{u}] has ordinal {v} >= num_vectors {expected_live} after consolidate"
+            );
+        }
+    }
+
+    // (d) remap table covers exactly the live set.
+    assert_eq!(
+        new_to_old.len(),
+        expected_live,
+        "new_to_old remap length must equal live_count after consolidate"
+    );
+
+    // (e) every old ordinal in the remap is valid (< n_total) and not in the delete set.
+    let deleted_set: HashSet<u32> = to_delete.into_iter().collect();
+    for (new_ord, &old_ord) in new_to_old.iter().enumerate() {
+        assert!(
+            (old_ord as usize) < n_total,
+            "new_to_old[{new_ord}] = {old_ord} is out of old-space range {n_total}"
+        );
+        assert!(
+            !deleted_set.contains(&old_ord),
+            "new_to_old[{new_ord}] = {old_ord} maps to a tombstoned old ordinal"
+        );
+    }
+
+    // (f) reverse_adj bidirectional invariant holds on the compacted graph.
+    check_reverse_adj_invariant(&idx);
+}
