@@ -780,7 +780,11 @@ impl VamanaIndex {
                     "tombstone_batch: node_id {node_id} is already tombstoned"
                 )));
             }
-            unique_live.insert(node_id);
+            if !unique_live.insert(node_id) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch: duplicate ordinal {node_id} in batch"
+                )));
+            }
         }
         let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
         if new_live == 0 {
@@ -860,7 +864,11 @@ impl VamanaIndex {
                     "tombstone_batch_no_repair: node_id {node_id} is already tombstoned"
                 )));
             }
-            unique_live.insert(node_id);
+            if !unique_live.insert(node_id) {
+                return Err(VamanaError::invalid_format(format!(
+                    "tombstone_batch_no_repair: duplicate ordinal {node_id} in batch"
+                )));
+            }
         }
         let new_live = self.num_vectors - self.tombstone_count - unique_live.len();
         if new_live == 0 {

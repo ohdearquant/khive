@@ -315,6 +315,94 @@ fn tombstone_batch_rejects_all_tombstoned() {
     );
 }
 
+/// tombstone_batch() rejects a batch containing a duplicate ordinal atomically.
+///
+/// Duplicate ordinals corrupt tombstone_count (the bit-set op is idempotent but the
+/// counter increment is not). The preflight must catch duplicates and return Err before
+/// any mutation so tombstone_count stays at 0 and the node remains live.
+#[test]
+fn tombstone_batch_rejects_duplicate_ordinal() {
+    let n = 5usize;
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(n, dim, 0xDEAD_0012);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    // Batch with a repeated ordinal — must be rejected.
+    let medoid = idx.graph().medoid();
+    let target = if medoid == 0 { 1u32 } else { 0u32 };
+    let dup_batch = vec![target, target];
+    let result = idx.tombstone_batch(&dup_batch);
+    assert!(
+        result.is_err(),
+        "tombstone_batch with duplicate ordinal must return Err"
+    );
+
+    // Atomicity: no state mutation.
+    assert_eq!(
+        idx.tombstone_count(),
+        0,
+        "tombstone_count mutated on duplicate-ordinal Err path"
+    );
+    assert!(
+        !idx.is_tombstoned(target),
+        "node {target} incorrectly marked tombstoned after rejected duplicate batch"
+    );
+
+    // Search still works.
+    let q = &vectors[0..dim];
+    let results = idx.search(q, 1).unwrap();
+    assert!(
+        !results.is_empty(),
+        "search must still work after rejected tombstone_batch"
+    );
+}
+
+/// tombstone_batch_no_repair() rejects a batch containing a duplicate ordinal atomically.
+///
+/// Same invariant as tombstone_batch: duplicate ordinals must be caught in preflight
+/// before any mutation so tombstone_count stays at 0 and the node remains live.
+#[test]
+fn tombstone_batch_no_repair_rejects_duplicate_ordinal() {
+    let n = 5usize;
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(n, dim, 0xDEAD_0013);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+    let medoid = idx.graph().medoid();
+    let target = if medoid == 0 { 1u32 } else { 0u32 };
+    let dup_batch = vec![target, target];
+    let result = idx.tombstone_batch_no_repair(&dup_batch);
+    assert!(
+        result.is_err(),
+        "tombstone_batch_no_repair with duplicate ordinal must return Err"
+    );
+
+    // Atomicity: no state mutation.
+    assert_eq!(
+        idx.tombstone_count(),
+        0,
+        "tombstone_count mutated on duplicate-ordinal Err path"
+    );
+    assert!(
+        !idx.is_tombstoned(target),
+        "node {target} incorrectly marked tombstoned after rejected duplicate batch"
+    );
+
+    // Search still works.
+    let q = &vectors[0..dim];
+    let results = idx.search(q, 1).unwrap();
+    assert!(
+        !results.is_empty(),
+        "search must still work after rejected tombstone_batch_no_repair"
+    );
+}
+
 /// tombstone_count() and is_tombstoned() are accurate.
 #[test]
 fn tombstone_count_and_is_tombstoned_accurate() {
