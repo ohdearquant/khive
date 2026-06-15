@@ -463,40 +463,67 @@ impl VamanaIndex {
     ///
     /// If a crash interrupts before the rename the previous metadata.bin (v1 or v2) is
     /// still valid. load_or_build never observes a torn v2 commit.
+    ///
+    /// Segments are staged under `.v2new` suffixes so a crash between segment write and
+    /// metadata rename does not corrupt a live v1-format set of segments.
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
 
+        // Stage under .v2new so a crash before the metadata rename leaves the previous
+        // segments (v1 or v2) intact and readable.
+        let vectors_new = path.join("vectors.bin.v2new");
+        let graph_new = path.join("graph.bin.v2new");
+        let lifecycle_new = path.join("lifecycle.bin.v2new");
         let vectors_path = path.join("vectors.bin");
         let graph_path = path.join("graph.bin");
         let lifecycle_path = path.join("lifecycle.bin");
         let metadata_path = path.join("metadata.bin");
         let metadata_tmp = path.join("metadata.bin.tmp");
 
-        // 1. Write vectors.bin (identical format to v1).
-        write_vectors(&vectors_path, self.vectors()?)?;
+        // 1. Write vectors.bin.v2new (identical format to v1).
+        write_vectors(&vectors_new, self.vectors()?)?;
 
-        // 2. Write graph.bin (identical format to v1, medoid-overflow capped).
-        write_graph(&graph_path, &self.graph, self.config.max_degree)?;
+        // 2. Write graph.bin.v2new (identical format to v1, medoid-overflow capped).
+        write_graph(&graph_new, &self.graph, self.config.max_degree)?;
 
-        // 3. Write lifecycle.bin (new in v2).
+        // 3. Compute the capped reverse adjacency that matches what write_graph wrote.
+        //    The medoid's forward list may exceed max_degree in-memory; write_graph caps it
+        //    before serialization. Build reverse adj from the same capped view so that
+        //    lifecycle.bin stays consistent with graph.bin after restore.
+        let adjacency = self.graph.adjacency();
+        let medoid = self.graph.medoid() as usize;
+        let max_degree = self.config.max_degree;
+        let mut capped_reverse_adj: Vec<Vec<u32>> = vec![Vec::new(); adjacency.len()];
+        for (u, neighbors) in adjacency.iter().enumerate() {
+            let effective: &[u32] = if u == medoid {
+                &neighbors[..max_degree.min(neighbors.len())]
+            } else {
+                neighbors
+            };
+            for &v in effective {
+                capped_reverse_adj[v as usize].push(u as u32);
+            }
+        }
+
+        // 4. Write lifecycle.bin.v2new with the capped reverse adjacency.
         write_lifecycle(
-            &lifecycle_path,
+            &lifecycle_new,
             &self.tombstones,
             &self.free_slots,
-            &self.graph,
+            &capped_reverse_adj,
             self.ops_since_consolidation,
         )?;
 
-        // 4. Compute blake3 checksums of the three segments.
-        let vectors_data = fs::read(&vectors_path)?;
-        let graph_data = fs::read(&graph_path)?;
-        let lifecycle_data = fs::read(&lifecycle_path)?;
+        // 5. Compute blake3 checksums of the three staged segments.
+        let vectors_data = fs::read(&vectors_new)?;
+        let graph_data = fs::read(&graph_new)?;
+        let lifecycle_data = fs::read(&lifecycle_new)?;
 
         let vectors_hash = blake3::hash(&vectors_data);
         let graph_hash = blake3::hash(&graph_data);
         let lifecycle_hash = blake3::hash(&lifecycle_data);
 
-        // 5. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
+        // 6. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
         let content_hash = *vectors_hash.as_bytes();
         let fp = V2CorpusFingerprint {
             vector_count: self.num_vectors as u64,
@@ -504,7 +531,7 @@ impl VamanaIndex {
             content_hash,
         };
 
-        // 6. Write metadata.bin.tmp then rename atomically.
+        // 7. Write metadata.bin.tmp then rename atomically (the commit gate).
         write_v2_commit_full(
             &metadata_tmp,
             vectors_hash.as_bytes(),
@@ -519,27 +546,50 @@ impl VamanaIndex {
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
+        // 8. Promote staged segments to their final names.
+        fs::rename(&vectors_new, &vectors_path)?;
+        fs::rename(&graph_new, &graph_path)?;
+        fs::rename(&lifecycle_new, &lifecycle_path)?;
+
+        // 9. Sync the directory entry so all renames are durable.
+        let dir_file = File::open(path)?;
+        dir_file.sync_all()?;
+
         Ok(())
     }
 
     /// Fingerprint-gated restore. On a corpus fingerprint match, loads all segments including
     /// lifecycle state in O(N) without rebuilding reverse_adj. On mismatch or missing v2
-    /// commit, falls back to rebuild.
+    /// commit, falls back to rebuild using `fallback_config`.
     ///
     /// `corpus_vectors` is the raw flat f32 slice from the caller's database layer.
+    /// `fallback_config` is used when no saved config is available (clean first run or total
+    /// corruption).
     ///
     /// Decision tree:
     /// - metadata.bin with KHVVAMG2 magic AND checksums valid AND fingerprint matches → fast path
-    /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild + save_atomic
+    /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild from commit config + save_atomic
     /// - metadata.bin with KHVVAMM1 (v1) → v1 load + save_atomic upgrade
-    /// - metadata.bin missing → rebuild + save_atomic
-    pub fn load_or_build(path: &Path, corpus_vectors: &[f32]) -> Result<Self> {
+    /// - metadata.bin missing or corrupt → rebuild from fallback_config + save_atomic
+    pub fn load_or_build(
+        path: &Path,
+        corpus_vectors: &[f32],
+        fallback_config: VamanaConfig,
+    ) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
 
         let metadata_bytes = match fs::read(&metadata_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                // Clean first run: no saved state at all. Remove any stale staged segments.
+                for suffix in &[
+                    "vectors.bin.v2new",
+                    "graph.bin.v2new",
+                    "lifecycle.bin.v2new",
+                ] {
+                    let _ = fs::remove_file(path.join(suffix));
+                }
+                let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
                 index.save_atomic(path)?;
                 return Ok(index);
             }
@@ -547,25 +597,67 @@ impl VamanaIndex {
         };
 
         if metadata_bytes.len() < 8 {
-            return Err(VamanaError::invalid_format(
-                "metadata.bin too short to detect magic".into(),
-            ));
+            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+            index.save_atomic(path)?;
+            return Ok(index);
         }
 
         if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
             let commit = match parse_v2_commit(&metadata_bytes) {
                 Ok(c) => c,
                 Err(_) => {
-                    let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                    let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
                     index.save_atomic(path)?;
                     return Ok(index);
                 }
             };
 
             // Verify checksums of all three segments.
-            let vectors_data = fs::read(path.join("vectors.bin"))?;
-            let graph_data = fs::read(path.join("graph.bin"))?;
-            let lifecycle_data = fs::read(path.join("lifecycle.bin"))?;
+            let vectors_data = match fs::read(path.join("vectors.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let graph_data = match fs::read(path.join("graph.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let lifecycle_data = match fs::read(path.join("lifecycle.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             let vhash = *blake3::hash(&vectors_data).as_bytes();
             let ghash = *blake3::hash(&graph_data).as_bytes();
@@ -575,7 +667,13 @@ impl VamanaIndex {
                 || ghash != commit.graph_hash
                 || lhash != commit.lifecycle_hash
             {
-                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
                 index.save_atomic(path)?;
                 return Ok(index);
             }
@@ -583,7 +681,13 @@ impl VamanaIndex {
             // Verify corpus fingerprint: dimensions, count, and content hash.
             let dim = commit.index_meta.dimensions;
             if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
-                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
                 index.save_atomic(path)?;
                 return Ok(index);
             }
@@ -595,7 +699,13 @@ impl VamanaIndex {
                 && commit.fingerprint.content_hash == live_content_hash;
 
             if !fp_matches {
-                let index = Self::rebuild_from_corpus(corpus_vectors, path)?;
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
                 index.save_atomic(path)?;
                 return Ok(index);
             }
@@ -603,7 +713,14 @@ impl VamanaIndex {
             // Fast path: load all segments, restore lifecycle state.
             Self::load_v2_fast(path, &lifecycle_data)
         } else if &metadata_bytes[..8] == METADATA_MAGIC {
-            // V1 format: upgrade to v2.
+            // V1 format: upgrade to v2. Remove any stale staged segments first.
+            for suffix in &[
+                "vectors.bin.v2new",
+                "graph.bin.v2new",
+                "lifecycle.bin.v2new",
+            ] {
+                let _ = fs::remove_file(path.join(suffix));
+            }
             let mut index = Self::load(path)?;
             // Release the mmap before save_atomic overwrites the same files.
             index.ensure_owned()?;
@@ -672,35 +789,9 @@ impl VamanaIndex {
         })
     }
 
-    /// Build a fresh VamanaIndex from `corpus_vectors`, recovering config from saved metadata.
-    /// Used when fingerprint mismatches or metadata is corrupt/missing.
-    fn rebuild_from_corpus(corpus_vectors: &[f32], path: &Path) -> Result<Self> {
-        if corpus_vectors.is_empty() {
-            return Err(VamanaError::EmptyInput);
-        }
-        let metadata_path = path.join("metadata.bin");
-        if !metadata_path.exists() {
-            return Err(VamanaError::invalid_format(
-                "cannot rebuild: no saved config (metadata.bin missing)".into(),
-            ));
-        }
-        let meta_bytes = fs::read(&metadata_path)?;
-        let meta = if meta_bytes.len() >= 8 && &meta_bytes[..8] == V2_COMMIT_MAGIC {
-            let commit = parse_v2_commit(&meta_bytes)?;
-            commit.index_meta
-        } else if meta_bytes.len() >= 8 && &meta_bytes[..8] == METADATA_MAGIC {
-            read_metadata_bytes(&meta_bytes)?
-        } else {
-            return Err(VamanaError::invalid_format("unknown metadata magic".into()));
-        };
-
-        let config = VamanaConfig {
-            dimensions: meta.dimensions,
-            max_degree: meta.max_degree,
-            search_list_size: meta.search_list_size,
-            alpha: meta.alpha,
-        };
-        config.validate()?;
+    /// Build a fresh VamanaIndex from `corpus_vectors` using the supplied `config`.
+    /// Used when fingerprint mismatches, metadata is corrupt/missing, or on a clean first run.
+    fn rebuild_from_corpus(corpus_vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         VamanaIndex::build(corpus_vectors, config)
     }
 
@@ -1768,7 +1859,8 @@ fn write_v2_commit_full(
     w.write_all(&(max_degree as u64).to_le_bytes())?;
     w.write_all(&(search_list_size as u64).to_le_bytes())?;
     w.write_all(&alpha.to_le_bytes())?;
-    w.flush()?;
+    let file = w.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -1883,7 +1975,7 @@ fn write_lifecycle(
     path: &Path,
     tombstones: &[u64],
     free_slots: &[u32],
-    graph: &VamanaGraph,
+    reverse_adj: &[Vec<u32>],
     ops_since_consolidation: usize,
 ) -> Result<()> {
     let file = File::create(path)?;
@@ -1908,11 +2000,10 @@ fn write_lifecycle(
     // ops_since_consolidation.
     w.write_all(&(ops_since_consolidation as u64).to_le_bytes())?;
 
-    // Reverse adjacency.
-    let rev = graph.reverse_adjacency();
-    let rev_nodes = rev.len() as u64;
+    // Reverse adjacency (already capped to match the written forward graph).
+    let rev_nodes = reverse_adj.len() as u64;
     w.write_all(&rev_nodes.to_le_bytes())?;
-    for neighbors in rev {
+    for neighbors in reverse_adj {
         let degree = neighbors.len() as u32;
         w.write_all(&degree.to_le_bytes())?;
         for &nb in neighbors {
@@ -1920,7 +2011,8 @@ fn write_lifecycle(
         }
     }
 
-    w.flush()?;
+    let file = w.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -2052,41 +2144,6 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, max_degree: usize) -> Result
     })
 }
 
-/// Parse metadata fields from a KHVVAMM1 (v1) metadata.bin byte slice.
-fn read_metadata_bytes(data: &[u8]) -> Result<IndexMetadata> {
-    let expected_len = 8 + 5 * 8;
-    if data.len() < expected_len {
-        return Err(VamanaError::invalid_format("metadata.bin truncated".into()));
-    }
-    if &data[..8] != METADATA_MAGIC {
-        return Err(VamanaError::invalid_format(
-            "metadata.bin magic mismatch".into(),
-        ));
-    }
-    let num_vectors = usize::try_from(u64::from_le_bytes(data[8..16].try_into().unwrap()))
-        .map_err(|_| VamanaError::invalid_format("num_vectors overflows usize".into()))?;
-    let dimensions = usize::try_from(u64::from_le_bytes(data[16..24].try_into().unwrap()))
-        .map_err(|_| VamanaError::invalid_format("dimensions overflows usize".into()))?;
-    let max_degree = usize::try_from(u64::from_le_bytes(data[24..32].try_into().unwrap()))
-        .map_err(|_| VamanaError::invalid_format("max_degree overflows usize".into()))?;
-    let search_list_size = usize::try_from(u64::from_le_bytes(data[32..40].try_into().unwrap()))
-        .map_err(|_| VamanaError::invalid_format("search_list_size overflows usize".into()))?;
-    let alpha = f64::from_le_bytes(data[40..48].try_into().unwrap());
-    if num_vectors == 0 {
-        return Err(VamanaError::invalid_format("num_vectors is 0".into()));
-    }
-    if dimensions == 0 {
-        return Err(VamanaError::invalid_format("dimensions is 0".into()));
-    }
-    Ok(IndexMetadata {
-        num_vectors,
-        dimensions,
-        max_degree,
-        search_list_size,
-        alpha,
-    })
-}
-
 fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(METADATA_MAGIC);
@@ -2197,7 +2254,9 @@ fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()
         }
     }
 
-    fs::write(path, &buf)?;
+    let mut f = File::create(path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -2301,7 +2360,9 @@ fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<Vama
 
 fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
     let bytes: &[u8] = cast_slice(vectors);
-    fs::write(path, bytes)?;
+    let mut f = File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
 }
 

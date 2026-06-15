@@ -254,13 +254,36 @@ fn v2_roundtrip_preserves_lifecycle_state() {
     let tc = idx.tombstone_count();
     let live = idx.live_count();
     let ops = idx.ops_since_consolidation();
-    let rev_adj_snapshot: Vec<Vec<u32>> = idx.graph().reverse_adjacency().to_vec();
+
+    // Compute the expected reverse adj as it will be after save_atomic/load:
+    // save_atomic caps the medoid's forward list to max_degree before writing
+    // graph.bin, and derives reverse adj from that capped view. So the restored
+    // reverse adj reflects the capped graph, not the potentially-overflowed
+    // in-memory adjacency.
+    let max_degree = 6usize;
+    let medoid = idx.graph().medoid() as usize;
+    let adj = idx.graph().adjacency();
+    let mut expected_rev: Vec<std::collections::BTreeSet<u32>> =
+        vec![Default::default(); adj.len()];
+    for (u, neighbors) in adj.iter().enumerate() {
+        let effective: &[u32] = if u == medoid {
+            &neighbors[..max_degree.min(neighbors.len())]
+        } else {
+            neighbors
+        };
+        for &v in effective {
+            expected_rev[v as usize].insert(u as u32);
+        }
+    }
 
     let corpus = idx.vectors().unwrap().to_vec();
     let dir = tempfile::tempdir().unwrap();
     idx.save_atomic(dir.path()).unwrap();
 
-    let loaded = VamanaIndex::load_or_build(dir.path(), &corpus).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(6)
+        .with_search_list_size(12);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &corpus, fallback).unwrap();
 
     assert_eq!(
         loaded.tombstone_count(),
@@ -273,11 +296,15 @@ fn v2_roundtrip_preserves_lifecycle_state() {
         ops,
         "ops_since_consolidation must be preserved"
     );
-    assert_eq!(
-        loaded.graph().reverse_adjacency(),
-        rev_adj_snapshot.as_slice(),
-        "reverse_adj must be preserved (no rebuild)"
-    );
+    // Verify the loaded reverse adj matches the expected capped version.
+    let loaded_rev = loaded.graph().reverse_adjacency();
+    for v in 0..loaded_rev.len() {
+        let actual: std::collections::BTreeSet<u32> = loaded_rev[v].iter().copied().collect();
+        assert_eq!(
+            actual, expected_rev[v],
+            "reverse_adj[{v}] must be preserved (capped to match graph.bin)"
+        );
+    }
 }
 
 /// Crash consistency: corrupt metadata.bin after writing segments → load_or_build rebuilds.
@@ -300,7 +327,10 @@ fn v2_crash_corrupted_metadata_falls_back_to_rebuild() {
     fs::write(&meta_path, &meta).unwrap();
 
     // load_or_build should detect checksum mismatch and rebuild without error.
-    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
     assert_eq!(rebuilt.num_vectors(), idx.num_vectors());
     // Search must still work.
     let query = rand_unit_vectors(1, dim, 0xabc);
@@ -325,7 +355,10 @@ fn v2_fingerprint_mismatch_triggers_rebuild() {
     new_corpus.extend_from_slice(&rand_unit_vectors(1, dim, 0xfff));
 
     // load_or_build with modified corpus → fingerprint mismatch → rebuild.
-    let rebuilt = VamanaIndex::load_or_build(dir.path(), &new_corpus).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &new_corpus, fallback).unwrap();
     assert_eq!(rebuilt.num_vectors(), new_corpus.len() / dim);
     let query = rand_unit_vectors(1, dim, 0xbcd);
     assert!(!rebuilt.search(&query, 3).unwrap().is_empty());
@@ -350,7 +383,10 @@ fn v2_upgrades_v1_format_to_v2() {
     assert_eq!(&meta[..8], b"KHVVAMM1", "should be v1 magic before upgrade");
 
     // load_or_build detects v1, loads it, then saves v2.
-    let upgraded = VamanaIndex::load_or_build(dir.path(), &vectors).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let upgraded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
     assert_eq!(upgraded.num_vectors(), idx.num_vectors());
 
     // After upgrade, metadata.bin should be KHVVAMG2.
@@ -383,7 +419,10 @@ fn v2_search_correctness_matches_in_memory() {
     let dir = tempfile::tempdir().unwrap();
     idx.save_atomic(dir.path()).unwrap();
 
-    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(16);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
 
     let queries = rand_unit_vectors(5, dim, 0x4242);
     for i in 0..5 {
@@ -395,4 +434,157 @@ fn v2_search_correctness_matches_in_memory() {
             "query {i}: v2-loaded search must match in-memory search"
         );
     }
+}
+
+// ---- Fix 1: reverse-adj consistency after saturated insert ----
+
+fn assert_rev_adj_consistent(graph: &khive_vamana::VamanaGraph) {
+    let adj = graph.adjacency();
+    let rev = graph.reverse_adjacency();
+    let n = adj.len();
+    let mut expected: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); n];
+    for (u, neighbors) in adj.iter().enumerate() {
+        for &v in neighbors {
+            expected[v as usize].insert(u as u32);
+        }
+    }
+    for v in 0..n {
+        let actual: std::collections::BTreeSet<u32> = rev[v].iter().copied().collect();
+        assert_eq!(actual, expected[v], "reverse_adj[{v}] inconsistent");
+    }
+}
+
+#[test]
+fn v2_reverse_adj_consistent_after_saturated_insert() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(8, dim, 0xA2_AA);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(2)
+        .with_search_list_size(2);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let extra = rand_unit_vectors(4, dim, 0xA2_BB);
+    for chunk in extra.chunks(dim) {
+        idx.insert(chunk).unwrap();
+    }
+    let corpus = idx.vectors().unwrap().to_vec();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(2)
+        .with_search_list_size(2);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &corpus, fallback).unwrap();
+    assert_rev_adj_consistent(loaded.graph());
+}
+
+// ---- Fix 2: rebuild on clean first run and missing segments ----
+
+#[test]
+fn v2_empty_dir_falls_back_to_build() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(10, dim, 0xA2CC);
+    let dir = tempfile::tempdir().unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(idx.num_vectors(), 10);
+}
+
+#[test]
+fn v2_truncated_metadata_falls_back_to_rebuild() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(10, dim, 0xA2DD);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+    let mut garbage = b"KHVVAMG2".to_vec();
+    garbage.extend_from_slice(&[0xffu8; 10]);
+    fs::write(dir.path().join("metadata.bin"), &garbage).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), 10);
+}
+
+#[test]
+fn v2_missing_vectors_bin_falls_back_to_rebuild() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(10, dim, 0xA2EE);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+    fs::remove_file(dir.path().join("vectors.bin")).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), 10);
+}
+
+#[test]
+fn v2_missing_graph_bin_falls_back_to_rebuild() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(10, dim, 0xA3_01);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+    fs::remove_file(dir.path().join("graph.bin")).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), 10);
+}
+
+#[test]
+fn v2_missing_lifecycle_bin_falls_back_to_rebuild() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(10, dim, 0xA3_02);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+    fs::remove_file(dir.path().join("lifecycle.bin")).unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), 10);
+}
+
+// ---- Fix 3: staged v2new segments do not corrupt v1 restore ----
+
+#[test]
+fn v2_v1_metadata_with_staged_v2_segments_not_torn() {
+    let dim = 4usize;
+    let vectors = rand_unit_vectors(12, dim, 0xA3_03);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Save as v1 format (KHVVAMM1).
+    idx.save(dir.path()).unwrap();
+    // Simulate half-done save_atomic: .v2new files exist but metadata.bin was not renamed.
+    fs::write(dir.path().join("vectors.bin.v2new"), b"garbage").unwrap();
+    fs::write(dir.path().join("graph.bin.v2new"), b"garbage").unwrap();
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(loaded.num_vectors(), idx.num_vectors());
+    let query = rand_unit_vectors(1, dim, 0xA3_04);
+    assert!(!loaded.search(&query, 3).unwrap().is_empty());
 }
