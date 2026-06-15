@@ -589,8 +589,13 @@ impl MemoryPack {
             fts_gather,
         } = opts;
 
-        // Use all visible namespaces for FTS; fall back to primary for vector
-        // recall (vector index is per-namespace, primary is the write namespace).
+        // FTS recall fans out across all visible namespaces (global table with
+        // namespace column, supports IN filter).
+        //
+        // Phase-1.5 limitation: vector/ANN recall stays primary-namespace-only.
+        // Each namespace owns a separate ANN index instance; cross-namespace
+        // recall on the vector path requires fanout+fusion across index instances,
+        // which ships in a follow-up PR. FTS-path recall is cross-namespace today.
         let visible = token.visible_namespace_strs();
         let primary_ns = token.namespace().as_str().to_string();
 
@@ -625,12 +630,22 @@ impl MemoryPack {
             });
         }
 
-        // Multi-namespace: fanout FTS across all visible namespaces, aggregate.
+        // Multi-namespace: fanout FTS across all visible namespaces.
+        //
+        // Each namespace has its own FTS virtual table (fts_notes_{ns}); we must
+        // select that table by minting a token whose primary namespace matches the
+        // target namespace. `token.with_namespace` creates such a token while
+        // preserving the actor context.
         let mut all_text_hits = Vec::new();
         for ns_str in &visible {
+            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
+                Ok(ns) => ns,
+                Err(_) => continue,
+            };
+            let ns_token = token.with_namespace(ns_parsed);
             let hits = self
                 .collect_recall_text_hits(
-                    token,
+                    &ns_token,
                     query,
                     ns_str,
                     candidate_limit,
