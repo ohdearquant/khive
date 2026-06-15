@@ -3299,5 +3299,10 @@ mod edit_inline_reembed {
             1,
             "edit must report one upserted section: {result:?}"
         );
+        assert_eq!(
+            result["atom_vector_refreshed"].as_bool(),
+            Some(false),
+            "no embedder configured: atom_vector_refreshed must be false, not true: {result:?}"
+        );
     }
 }
