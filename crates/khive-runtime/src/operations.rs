@@ -2202,6 +2202,65 @@ impl KhiveRuntime {
         }
     }
 
+    /// Resolve a UUID to its substrate kind with NO namespace filter.
+    ///
+    /// By-ID contract (ADR-007): UUID v4 is globally unique — by-ID substrate
+    /// inference must return the record regardless of caller namespace.  Used by
+    /// the public `update` and `delete` verb handlers when no explicit `kind` is
+    /// supplied (PR-A1 / codex r2).
+    ///
+    /// Does NOT consult the visible set or the primary-namespace check.  The
+    /// token is still required to route to the correct backend pool but its
+    /// namespace value is not used as a filter.
+    pub async fn resolve_by_id(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        // Entity: direct by-UUID fetch (ID-only, no namespace check).
+        if let Some(entity) = self.entities(token)?.get_entity(id).await? {
+            return Ok(Some(Resolved::Entity(entity)));
+        }
+
+        // Note: direct by-UUID fetch (ID-only).
+        if let Some(note) = self.notes(token)?.get_note(id).await? {
+            return Ok(Some(Resolved::Note(note)));
+        }
+
+        // Edges and events are not returned here; the caller's `_` arm handles
+        // those with a separate get_edge / get_event check.
+        Ok(None)
+    }
+
+    /// Resolve a UUID to its substrate kind with NO namespace filter, including
+    /// soft-deleted rows.
+    ///
+    /// Used by the hard-delete path when no explicit `kind` is supplied, so
+    /// already-soft-deleted records can still be located by UUID alone.
+    pub async fn resolve_by_id_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        // Entity: including soft-deleted, no namespace check.
+        if let Some(entity) = self
+            .entities(token)?
+            .get_entity_including_deleted(id)
+            .await?
+        {
+            return Ok(Some(Resolved::Entity(entity)));
+        }
+
+        // Note: including soft-deleted, no namespace check.
+        if let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? {
+            return Ok(Some(Resolved::Note(note)));
+        }
+
+        // Edges and events are not returned here; the caller's `_` arm handles
+        // those with a separate get_edge_including_deleted check.
+        Ok(None)
+    }
+
     /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
     ///
     /// Returns `None` if the UUID is not found in any substrate.
@@ -2688,16 +2747,31 @@ impl KhiveRuntime {
         edge_id: Uuid,
         patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
-        let graph = self.graph(token)?;
-        let mut edge = graph
+        // Fetch the edge by UUID — ID-only, no namespace check (PR-A1).
+        // get_edge already uses the record's stored namespace internally (codex r1 fix).
+        let graph_for_fetch = self.graph(token)?;
+        let mut edge = graph_for_fetch
             .get_edge(LinkId::from(edge_id))
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
+        // PR-A1 (codex r2): after fetching, all mutations and validation must use the
+        // RECORD's namespace, not the caller's.  Derive record_tok from the stored edge
+        // namespace so that endpoint validation, raw-SQL predicates, and graph routing
+        // all address the correct backend partition.
+        let record_ns: String = edge.namespace.clone();
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        let graph = self.graph(&record_tok)?;
+
         let mut changed_fields: Vec<&'static str> = Vec::new();
         if let Some(r) = patch.relation {
             // Validate before mutating — use the existing endpoints with the new relation.
-            self.validate_edge_relation_endpoints(token, edge.source_id, edge.target_id, r)
+            // Validate before mutating — use the existing endpoints with the new relation.
+            // Use record_tok so that endpoint existence checks look in the edge's own namespace.
+            self.validate_edge_relation_endpoints(&record_tok, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
             changed_fields.push("relation");
@@ -2731,7 +2805,9 @@ impl KhiveRuntime {
 
         if edge.relation.is_symmetric() {
             // Raw-SQL path (mirrors merge_entity_sql).
-            let ns = token.namespace().as_str().to_string();
+            // Use record_ns (the stored edge namespace) — NOT token.namespace() — so that
+            // WHERE namespace = ?N predicates match the actual row.
+            let ns = record_ns.clone();
             let edge_id_str = edge_id.to_string();
             let relation_str = edge.relation.to_string();
             let canon_src_str = canon_src.to_string();
@@ -2783,42 +2859,57 @@ impl KhiveRuntime {
                             rusqlite::params![&ns, &edge_id_str],
                         )
                         .map_err(SqliteError::Rusqlite)?;
-                        conn.execute(
-                            "UPDATE graph_edges SET \
-                             weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                             target_backend = ?3, metadata = ?4 \
-                             WHERE namespace = ?5 AND id = ?6",
-                            rusqlite::params![
-                                weight,
-                                now_ts,
-                                target_backend,
-                                metadata,
-                                &ns,
-                                &existing_id,
-                            ],
-                        )
-                        .map_err(SqliteError::Rusqlite)?;
+                        let affected = conn
+                            .execute(
+                                "UPDATE graph_edges SET \
+                                 weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                                 target_backend = ?3, metadata = ?4 \
+                                 WHERE namespace = ?5 AND id = ?6",
+                                rusqlite::params![
+                                    weight,
+                                    now_ts,
+                                    target_backend,
+                                    metadata,
+                                    &ns,
+                                    &existing_id,
+                                ],
+                            )
+                            .map_err(SqliteError::Rusqlite)?;
+                        if affected == 0 {
+                            return Err(SqliteError::InvalidData(format!(
+                                "update_edge: surviving canonical row {existing_id} vanished during update"
+                            )));
+                        }
                         Ok(Some(existing_id))
                     } else {
                         // Case (a): no conflict — update source_id/target_id in-place,
                         // preserving the original edge UUID.
-                        conn.execute(
-                            "UPDATE graph_edges SET \
-                             source_id = ?1, target_id = ?2, relation = ?3, \
-                             weight = ?4, updated_at = ?5, metadata = ?6 \
-                             WHERE namespace = ?7 AND id = ?8",
-                            rusqlite::params![
-                                &canon_src_str,
-                                &canon_tgt_str,
-                                &relation_str,
-                                weight,
-                                now_ts,
-                                metadata,
-                                &ns,
-                                &edge_id_str,
-                            ],
-                        )
-                        .map_err(SqliteError::Rusqlite)?;
+                        let affected = conn
+                            .execute(
+                                "UPDATE graph_edges SET \
+                                 source_id = ?1, target_id = ?2, relation = ?3, \
+                                 weight = ?4, updated_at = ?5, metadata = ?6 \
+                                 WHERE namespace = ?7 AND id = ?8",
+                                rusqlite::params![
+                                    &canon_src_str,
+                                    &canon_tgt_str,
+                                    &relation_str,
+                                    weight,
+                                    now_ts,
+                                    metadata,
+                                    &ns,
+                                    &edge_id_str,
+                                ],
+                            )
+                            .map_err(SqliteError::Rusqlite)?;
+                        if affected == 0 {
+                            // The edge row was not found under the record's namespace.
+                            // This must never happen because ns = record_ns (fetched above).
+                            return Err(SqliteError::InvalidData(format!(
+                                "update_edge: zero rows affected updating edge {edge_id_str} \
+                                 in namespace {ns} — row vanished between fetch and update"
+                            )));
+                        }
                         Ok(None)
                     }
                 })
@@ -2830,11 +2921,12 @@ impl KhiveRuntime {
             if let Some(sid) = surviving_id {
                 // A conflict was absorbed: re-fetch the surviving canonical row so the
                 // caller receives its real id (Bug 1 fix).
+                // Use record_tok — the surviving row lives in the same namespace as the original.
                 let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
                     RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
                 })?;
                 edge = self
-                    .get_edge(token, surviving_uuid)
+                    .get_edge(&record_tok, surviving_uuid)
                     .await?
                     .ok_or_else(|| {
                         RuntimeError::Internal(format!(
@@ -2847,13 +2939,16 @@ impl KhiveRuntime {
                 edge.target_id = canon_tgt;
             }
         } else {
+            // Non-symmetric: upsert_edge takes namespace from edge.namespace (not from the
+            // graph store's routing namespace), so this is already record-namespace correct.
+            // `graph` is already self.graph(&record_tok)?.
             graph.upsert_edge(edge.clone()).await?;
         }
 
-        let event_store = self.events(token)?;
-        let ns = token.namespace().as_str().to_string();
+        // Audit event: use the record's namespace (record_ns) for the event payload.
+        let event_store = self.events(&record_tok)?;
         let event = khive_storage::event::Event::new(
-            ns.clone(),
+            record_ns.clone(),
             "update",
             EventKind::EdgeUpdated,
             SubstrateKind::Entity,
@@ -2861,7 +2956,7 @@ impl KhiveRuntime {
         )
         .with_target(edge_id)
         .with_payload(
-            serde_json::json!({"id": edge_id, "namespace": ns, "changed_fields": changed_fields}),
+            serde_json::json!({"id": edge_id, "namespace": record_ns, "changed_fields": changed_fields}),
         );
         event_store.append_event(event).await.map_err(|e| {
             RuntimeError::Internal(format!("update_edge: event store write failed: {e}"))

@@ -3861,6 +3861,239 @@ async fn update_edge_to_symmetric_relation_no_duplicate_when_canonical_exists() 
     );
 }
 
+/// Cross-namespace update_edge (weight-only, non-symmetric): must succeed.
+///
+/// ADR-007 rule 2: by-ID update applies NO namespace filter. UUID v4 is globally
+/// unique. The caller's namespace is attribution only.
+#[tokio::test]
+async fn update_edge_cross_namespace_weight_update_succeeds() {
+    let f = pack();
+
+    let src = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CrossNsEdgeSrc"}),
+        )
+        .await
+        .expect("create src");
+    let tgt = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CrossNsEdgeTgt"}),
+        )
+        .await
+        .expect("create tgt");
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+
+    // Link in the default (local) namespace.
+    let link = f
+        .dispatch(
+            "link",
+            json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends", "weight": 0.5}),
+        )
+        .await
+        .expect("link extends must succeed");
+    let edge_id = link["id"].as_str().unwrap().to_string();
+
+    // Update weight from a DIFFERENT namespace — must succeed (by-ID contract).
+    let updated = f
+        .dispatch(
+            "update",
+            json!({"kind": "edge", "id": edge_id, "weight": 0.9, "namespace": "ns-caller"}),
+        )
+        .await;
+    assert!(
+        updated.is_ok(),
+        "cross-namespace weight update must succeed (ADR-007); got: {updated:?}"
+    );
+    let updated = updated.unwrap();
+    assert_eq!(
+        updated.get("weight").and_then(Value::as_f64),
+        Some(0.9),
+        "weight must be updated to 0.9"
+    );
+    // The stored namespace must remain the record's original namespace (local), not the caller's.
+    assert_eq!(
+        updated.get("namespace").and_then(Value::as_str),
+        Some("local"),
+        "edge namespace must remain the record's stored namespace after cross-ns update"
+    );
+}
+
+/// Cross-namespace update_edge (weight-only, symmetric relation): must succeed.
+///
+/// Symmetric relations use the raw-SQL path with namespace predicates. Confirm that
+/// `record_ns` (not caller ns) is used so the UPDATE matches the row.
+#[tokio::test]
+async fn update_edge_cross_namespace_weight_update_symmetric_succeeds() {
+    let f = pack();
+
+    let a = f
+        .dispatch("create", json!({"kind": "concept", "name": "CrossNsSymA"}))
+        .await
+        .expect("create A");
+    let b = f
+        .dispatch("create", json!({"kind": "concept", "name": "CrossNsSymB"}))
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap();
+    let b_id = b["id"].as_str().unwrap();
+
+    // Link as competes_with (symmetric) in the default namespace.
+    let link = f
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "competes_with", "weight": 0.4}),
+        )
+        .await
+        .expect("link competes_with must succeed");
+    let edge_id = link["id"].as_str().unwrap().to_string();
+
+    // Update weight from a DIFFERENT namespace (symmetric raw-SQL path).
+    let updated = f
+        .dispatch(
+            "update",
+            json!({"kind": "edge", "id": edge_id, "weight": 0.8, "namespace": "ns-caller"}),
+        )
+        .await;
+    assert!(
+        updated.is_ok(),
+        "cross-namespace weight update (symmetric) must succeed; got: {updated:?}"
+    );
+    assert_eq!(
+        updated.unwrap().get("weight").and_then(Value::as_f64),
+        Some(0.8),
+        "weight must be updated to 0.8"
+    );
+}
+
+/// Cross-namespace update_edge (relation change): must succeed.
+///
+/// Relation validation uses `record_tok` (not caller token) to look up endpoints.
+/// Endpoints live in the edge's own namespace (local); caller is in ns-caller.
+#[tokio::test]
+async fn update_edge_cross_namespace_relation_change_succeeds() {
+    let f = pack();
+
+    let src = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CrossNsRelSrc"}),
+        )
+        .await
+        .expect("create src");
+    let tgt = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "CrossNsRelTgt"}),
+        )
+        .await
+        .expect("create tgt");
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+
+    // Link as extends in the default (local) namespace.
+    let link = f
+        .dispatch(
+            "link",
+            json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link extends must succeed");
+    let edge_id = link["id"].as_str().unwrap().to_string();
+
+    // Change relation to supersedes from a DIFFERENT namespace.
+    // Endpoint validation must use record_tok (local) — src and tgt are in local ns.
+    let updated = f
+        .dispatch(
+            "update",
+            json!({"kind": "edge", "id": edge_id, "relation": "supersedes", "namespace": "ns-caller"}),
+        )
+        .await;
+    assert!(
+        updated.is_ok(),
+        "cross-namespace relation change must succeed when endpoints are in record ns; got: {updated:?}"
+    );
+    assert_eq!(
+        updated.unwrap().get("relation").and_then(Value::as_str),
+        Some("supersedes"),
+        "relation must be updated to supersedes"
+    );
+}
+
+/// Update a note's content from a DIFFERENT namespace — must succeed.
+///
+/// ADR-007 rule 2: by-ID update applies NO namespace filter. This test exercises
+/// `infer_kind_from_uuid`, which uses `resolve_by_id` (not `resolve`). The old
+/// `resolve` gated notes on the visible-set, which excluded the record's namespace
+/// when the caller token's primary ns differed — causing spurious NotFound.
+///
+/// Non-vacuity: this test FAILS if `infer_kind_from_uuid` calls `resolve` instead
+/// of `resolve_by_id`, because `resolve` applies `ensure_namespace_visible`, which
+/// rejects the note in "local" when the token's primary is "ns-caller".
+#[tokio::test]
+async fn update_note_cross_namespace_succeeds() {
+    let f = pack();
+
+    // Create note in the default (local) namespace.
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "original content"}),
+        )
+        .await
+        .expect("create note must succeed");
+    let note_id = created["id"].as_str().unwrap().to_string();
+
+    // Update the note from a DIFFERENT namespace — must succeed (by-ID contract).
+    let updated = f
+        .dispatch(
+            "update",
+            json!({"id": note_id, "content": "updated content", "namespace": "ns-caller"}),
+        )
+        .await;
+    assert!(
+        updated.is_ok(),
+        "cross-namespace note update must succeed (ADR-007 rule 2); got: {updated:?}"
+    );
+    assert_eq!(
+        updated.unwrap().get("content").and_then(Value::as_str),
+        Some("updated content"),
+        "content must be updated"
+    );
+}
+
+/// Soft-delete a note from a DIFFERENT namespace — must succeed.
+///
+/// Same ADR-007 rule 2 contract as above, but exercises the soft-delete path
+/// through `infer_kind_from_uuid`. Non-vacuity: FAILS with old `resolve`.
+#[tokio::test]
+async fn delete_note_cross_namespace_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "delete me cross ns"}),
+        )
+        .await
+        .expect("create note must succeed");
+    let note_id = created["id"].as_str().unwrap().to_string();
+
+    let result = f
+        .dispatch("delete", json!({"id": note_id, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        result.is_ok(),
+        "cross-namespace soft delete of a note must succeed (ADR-007); got: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
 // ADR-045 §5 round-5 blocker: payload-level Timestamp fields must be ISO-8601
 // strings at the MCP boundary, not raw integer microseconds.
 //
@@ -5597,11 +5830,15 @@ async fn hard_delete_soft_deleted_entity_cascades_edges() {
     );
 }
 
-/// Hard-delete a soft-deleted entity from a different namespace must be denied.
+/// Hard-delete a soft-deleted entity from a different namespace must SUCCEED.
+///
+/// ADR-007 rule 2: by-ID delete applies NO namespace filter. UUID v4 is globally unique.
+/// The caller's namespace is attribution only — it does not gate the operation.
 #[tokio::test]
-async fn hard_delete_soft_deleted_entity_cross_namespace_denied() {
+async fn hard_delete_soft_deleted_entity_cross_namespace_succeeds() {
     let f = pack();
 
+    // Create entity in the default (local) namespace.
     let created = f
         .dispatch(
             "create",
@@ -5611,19 +5848,33 @@ async fn hard_delete_soft_deleted_entity_cross_namespace_denied() {
         .expect("create must succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
+    // Soft-delete from the record's own namespace.
     f.dispatch("delete", json!({"id": id}))
         .await
         .expect("soft delete must succeed");
 
+    // Hard-delete from a DIFFERENT namespace — must succeed (by-ID contract).
     let result = f
         .dispatch(
             "delete",
-            json!({"id": id, "hard": true, "namespace": "ns-attacker"}),
+            json!({"id": id, "hard": true, "namespace": "ns-caller"}),
         )
         .await;
     assert!(
-        result.is_err(),
-        "cross-namespace hard delete of a soft-deleted entity must be denied; got: {result:?}"
+        result.is_ok(),
+        "cross-namespace hard delete of a soft-deleted entity must succeed (ADR-007); got: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true),
+        "hard delete result must carry deleted=true"
+    );
+
+    // Confirm the row is physically gone — a second hard delete must return not-found.
+    let second = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        second.is_err(),
+        "second hard delete must fail — entity row is physically gone; got: {second:?}"
     );
 }
 
@@ -5665,11 +5916,14 @@ async fn hard_delete_purges_soft_deleted_note() {
     );
 }
 
-/// Hard-delete a soft-deleted note from a different namespace must be denied.
+/// Hard-delete a soft-deleted note from a different namespace must SUCCEED.
+///
+/// ADR-007 rule 2: by-ID delete applies NO namespace filter. UUID v4 is globally unique.
 #[tokio::test]
-async fn hard_delete_soft_deleted_note_cross_namespace_denied() {
+async fn hard_delete_soft_deleted_note_cross_namespace_succeeds() {
     let f = pack();
 
+    // Create note in the default (local) namespace.
     let created = f
         .dispatch(
             "create",
@@ -5679,19 +5933,33 @@ async fn hard_delete_soft_deleted_note_cross_namespace_denied() {
         .expect("create note must succeed");
     let id = created["id"].as_str().unwrap().to_string();
 
+    // Soft-delete from the record's own namespace.
     f.dispatch("delete", json!({"id": id}))
         .await
         .expect("soft delete must succeed");
 
+    // Hard-delete from a DIFFERENT namespace — must succeed (by-ID contract).
     let result = f
         .dispatch(
             "delete",
-            json!({"id": id, "hard": true, "namespace": "ns-attacker"}),
+            json!({"id": id, "hard": true, "namespace": "ns-caller"}),
         )
         .await;
     assert!(
-        result.is_err(),
-        "cross-namespace hard delete of a soft-deleted note must be denied; got: {result:?}"
+        result.is_ok(),
+        "cross-namespace hard delete of a soft-deleted note must succeed (ADR-007); got: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true),
+        "hard delete result must carry deleted=true"
+    );
+
+    // Confirm the row is physically gone — a second hard delete must return not-found.
+    let second = f.dispatch("delete", json!({"id": id, "hard": true})).await;
+    assert!(
+        second.is_err(),
+        "second hard delete must fail — note row is physically gone; got: {second:?}"
     );
 }
 
