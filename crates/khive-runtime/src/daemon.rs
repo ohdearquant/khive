@@ -36,9 +36,9 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// (`make local` rebuilds the client binary).
 ///
 /// Version history:
-///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`)
-///   2 — added `probe_only` to request frame; probe-ack sentinel shape in response
-pub const PROTOCOL_VERSION: u32 = 2;
+///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`);
+///       added `probe_only` request field + probe-ack sentinel shape in response
+pub const PROTOCOL_VERSION: u32 = 1;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
