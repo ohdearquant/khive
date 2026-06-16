@@ -888,3 +888,94 @@ fn v2_parse_lifecycle_huge_fs_count_returns_invalid_format_not_panic() {
     let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
     assert_eq!(rebuilt.num_vectors(), n);
 }
+
+// ---- Fix 5 / codex R5: checked_add for offset + ts_bytes / offset + fs_bytes ----
+//
+// These two tests target the ADDITION overflow, not the multiplication.
+// ts_words = usize::MAX/8 passes checked_mul (ts_bytes = usize::MAX-7), but
+// offset (=16) + ts_bytes wraps to a small value without checked_add, causing the
+// bounds check to pass spuriously and the subsequent loop to panic on an
+// out-of-range slice read.  Same pattern for fs_count = usize::MAX/4.
+//
+// Both tests confirm the two recovery paths:
+//   (a) VamanaIndex::load returns InvalidFormat (no panic).
+//   (b) load_or_build rebuilds successfully (no panic).
+
+#[test]
+fn v2_parse_lifecycle_ts_add_overflow_returns_invalid_format_not_panic() {
+    let dim = 4usize;
+    let n = 8usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA5_01);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // ts_words = usize::MAX/8.
+    //   checked_mul: (usize::MAX/8) * 8 = usize::MAX - 7  → fits in usize, passes mul check.
+    //   offset (=16) + (usize::MAX - 7) wraps to 8 without checked_add → spurious pass.
+    let ts_words = (usize::MAX / 8) as u64;
+    let mut lifecycle_body = b"KHVVLIF1".to_vec();
+    lifecycle_body.extend_from_slice(&ts_words.to_le_bytes());
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    // Strict path: InvalidFormat (not panic).
+    assert!(
+        matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ),
+        "load must return InvalidFormat, not panic, when offset + ts_bytes overflows"
+    );
+
+    // Permissive path: load_or_build rebuilds, no panic.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+    let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
+    assert_eq!(&meta_after[..8], b"KHVVAMG2");
+}
+
+#[test]
+fn v2_parse_lifecycle_fs_add_overflow_returns_invalid_format_not_panic() {
+    let dim = 4usize;
+    let n = 8usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA5_02);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    // ts_words=0 so tombstone section is skipped; fs_count = usize::MAX/4.
+    //   checked_mul: (usize::MAX/4) * 4 = usize::MAX - 3  → fits in usize, passes mul check.
+    //   offset (=24) + (usize::MAX - 3) wraps to 20 without checked_add → spurious pass.
+    let fs_count = (usize::MAX / 4) as u64;
+    let mut lifecycle_body = b"KHVVLIF1".to_vec();
+    lifecycle_body.extend_from_slice(&0u64.to_le_bytes()); // ts_words = 0
+    lifecycle_body.extend_from_slice(&fs_count.to_le_bytes());
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    // Strict path: InvalidFormat (not panic).
+    assert!(
+        matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ),
+        "load must return InvalidFormat, not panic, when offset + fs_bytes overflows"
+    );
+
+    // Permissive path: load_or_build rebuilds, no panic.
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+    let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
+    assert_eq!(&meta_after[..8], b"KHVVAMG2");
+}

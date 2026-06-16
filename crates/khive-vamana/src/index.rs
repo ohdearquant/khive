@@ -2106,7 +2106,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
     let ts_bytes = ts_words
         .checked_mul(8)
         .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin ts_words overflows".into()))?;
-    if offset + ts_bytes > data.len() {
+    let ts_end = offset
+        .checked_add(ts_bytes)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin ts_end overflows".into()))?;
+    if ts_end > data.len() {
         return Err(VamanaError::invalid_format(
             "lifecycle.bin truncated at tombstone data".into(),
         ));
@@ -2134,7 +2137,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
     let fs_bytes = fs_count
         .checked_mul(4)
         .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin fs_count overflows".into()))?;
-    if offset + fs_bytes > data.len() {
+    let fs_end = offset
+        .checked_add(fs_bytes)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin fs_end overflows".into()))?;
+    if fs_end > data.len() {
         return Err(VamanaError::invalid_format(
             "lifecycle.bin truncated at free_slots data".into(),
         ));
@@ -2189,9 +2195,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
                 "lifecycle.bin node {node} rev degree {degree} > num_vectors-1"
             )));
         }
-        // `degree * 4` cannot overflow usize on 64-bit targets: degree is already bounded
-        // above by num_vectors-1 <= u32::MAX-1, so degree*4 <= ~17 GiB, well within usize.
-        if offset + degree * 4 > data.len() {
+        let neighbors_end = offset.checked_add(degree * 4).ok_or_else(|| {
+            VamanaError::invalid_format("lifecycle.bin neighbors_end overflows".into())
+        })?;
+        if neighbors_end > data.len() {
             return Err(VamanaError::invalid_format(
                 "lifecycle.bin truncated at rev neighbors".into(),
             ));
