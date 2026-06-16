@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod secret_gate;
 pub mod validation;
 
+pub use config::actor_ref_from_configured_namespace_str;
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,

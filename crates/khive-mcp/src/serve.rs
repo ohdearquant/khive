@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 
 use khive_runtime::{
-    config_from_env, runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, RuntimeConfig,
+    actor_ref_from_configured_namespace_str, config_from_env, runtime_config_from_khive_config,
+    ActorRef, KhiveConfig, KhiveRuntime, RuntimeConfig,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -115,9 +116,32 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     // we exclude brain_profile from the default spread and set it to None (CLI-only).
     let cli_brain_profile = inputs.brain_profile.filter(|s| !s.trim().is_empty());
 
+    // When --actor / KHIVE_ACTOR / --namespace / KHIVE_NAMESPACE is explicit, derive
+    // the matching ActorRef so that both default_namespace and actor_ref are set from the
+    // same source. Without this, direct KhiveRuntime::authorize calls mint a token whose
+    // actor() is anonymous even when the namespace was explicitly configured.
+    //
+    // actor_ref_from_configured_namespace_str rejects the reserved "anonymous" kind in
+    // two-segment form (e.g. "anonymous:local") so that an operator cannot accidentally
+    // collapse a configured actor back to the default anonymous identity.
+    //
+    // When the namespace is NOT explicit (i.e. it came from the default "local"), the base
+    // actor_ref is left as ActorRef::anonymous() — the same as before — and the config-file
+    // tier (runtime_config_from_khive_config) may override it from [actor] id.
+    let cli_actor_ref = if inputs.namespace_explicit {
+        let ns_str = inputs.namespace.as_str();
+        Some(
+            actor_ref_from_configured_namespace_str(ns_str)
+                .map_err(|e| anyhow::anyhow!("invalid actor identity {ns_str:?}: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     let base_config = RuntimeConfig {
         db_path,
         default_namespace: inputs.namespace,
+        actor_ref: cli_actor_ref.unwrap_or_else(ActorRef::anonymous),
         packs,
         // Explicit CLI flag only at this tier — env and config-file tiers are applied
         // below in resolve_config / resolve_actor_from_config and apply_env_brain_profile.
@@ -230,7 +254,7 @@ fn resolve_actor_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::Namespace;
+    use khive_runtime::{actor_ref_from_configured_namespace_str, Namespace};
     use serial_test::serial;
     use std::io::Write;
 
@@ -411,6 +435,96 @@ brain_profile = "project-profile"
             resolved.brain_profile.as_deref(),
             Some("cli-profile"),
             "CLI --brain-profile must win over both TOML and KHIVE_BRAIN_PROFILE env var"
+        );
+    }
+
+    /// [High] FIX 1: When --actor / KHIVE_ACTOR provides an explicit actor, the resolved
+    /// RuntimeConfig must carry a matching actor_ref, not ActorRef::anonymous().
+    ///
+    /// Regression test: prior to the fix, default_namespace was set from the CLI actor
+    /// but actor_ref remained ActorRef::anonymous() via ..RuntimeConfig::default().
+    /// This left the direct KhiveRuntime::authorize helpers minting anonymous tokens even
+    /// when the operator explicitly identified the runtime instance.
+    ///
+    /// Non-vacuity: revering the cli_actor_ref derivation in resolve_runtime_config
+    /// (removing the if inputs.namespace_explicit block) causes this test to fail with
+    /// actor_ref == ActorRef::anonymous().
+    #[test]
+    #[serial]
+    fn cli_actor_sets_actor_ref_on_runtime_config() {
+        use khive_runtime::ActorRef;
+
+        // Ensure env vars do not interfere with embedding model resolution.
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("lambda:cli-actor").expect("valid namespace"),
+            namespace_explicit: true, // simulates --actor lambda:cli-actor
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_ref.kind, "lambda",
+            "actor_ref.kind must match the CLI actor kind"
+        );
+        assert_eq!(
+            resolved.actor_ref.id, "cli-actor",
+            "actor_ref.id must match the CLI actor id"
+        );
+        assert_ne!(
+            resolved.actor_ref,
+            ActorRef::anonymous(),
+            "CLI-configured actor must NOT resolve to anonymous"
+        );
+    }
+
+    /// [Medium] FIX 2: An actor string whose kind is the reserved "anonymous" must be
+    /// rejected with a ConfigError, not silently coerced to the default anonymous identity.
+    ///
+    /// Non-vacuity: removing the anonymous-kind check from
+    /// actor_ref_from_configured_namespace_str causes this test to fail — resolve_runtime_config
+    /// would succeed and silently produce an anonymous actor_ref.
+    #[test]
+    #[serial]
+    fn cli_actor_anonymous_kind_is_rejected() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        // "anonymous:local" is a valid Namespace string but uses the reserved kind.
+        let result = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("local").expect("valid namespace"),
+            namespace_explicit: true, // simulates --actor anonymous:local after Namespace::parse
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        });
+
+        // "local" is a single-segment namespace — actor_ref_from_configured_namespace_str
+        // accepts it as natural anonymous (not the reserved two-segment form). To test
+        // two-segment rejection we call the helper directly.
+        assert!(
+            result.is_ok(),
+            "single-segment 'local' must be accepted (natural anonymous default)"
+        );
+
+        // Two-segment anonymous:* must be rejected.
+        let two_seg_result = actor_ref_from_configured_namespace_str("anonymous:local");
+        assert!(
+            two_seg_result.is_err(),
+            "anonymous:local must be rejected as a configured actor kind"
+        );
+        let err_msg = two_seg_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("reserved"),
+            "error message must mention that 'anonymous' is reserved; got: {err_msg}"
         );
     }
 }

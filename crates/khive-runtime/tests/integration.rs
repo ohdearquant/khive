@@ -3,7 +3,7 @@
 //! Tests cover entity CRUD, graph operations, note memory, GQL query,
 //! and namespace isolation using an in-memory runtime.
 
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_runtime::{ActorRef, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
 use khive_storage::{EdgeRelation, Event};
 use khive_types::{EventKind, SubstrateKind};
@@ -2323,5 +2323,84 @@ async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
     assert_eq!(
         fetched.id, entity_in_extra.id,
         "visible-set read of extra-namespace entity must succeed"
+    );
+}
+
+// =============================================================================
+// ST1 actor_ref wiring — direct authorize helpers (PR #147 / issue #75-ST1)
+// =============================================================================
+
+/// [ST1-FIX3] KhiveRuntime::authorize must embed the configured actor_ref in the
+/// minted NamespaceToken, not hard-code ActorRef::anonymous().
+///
+/// This is the direct-helper proof for ST1's deliverable: a typed ActorRef is
+/// correctly stored on RuntimeConfig and flows through to every token minted by
+/// the authorize / authorize_with_visibility helpers. The live MCP dispatch path
+/// (GateRequest + NamespaceToken minted inside VerbRegistry::dispatch) is wired
+/// in #75-ST2 and is intentionally NOT covered here.
+///
+/// Non-vacuity: removing the `actor: self.config.actor_ref.clone()` lines from
+/// KhiveRuntime::authorize / authorize_with_visibility (reverting to
+/// ActorRef::anonymous()) causes this test to fail — both assertions would produce
+/// `actor_ref == anonymous:local` instead of the expected lambda actor.
+#[test]
+fn st1_authorize_embeds_configured_actor_ref() {
+    let configured_actor = ActorRef::new("lambda", "cli-actor");
+    let cfg = RuntimeConfig {
+        db_path: None, // in-memory
+        actor_ref: configured_actor.clone(),
+        ..RuntimeConfig::default()
+    };
+    let rt = KhiveRuntime::new(cfg).expect("runtime from config");
+    let ns = Namespace::parse("lambda:cli-actor").expect("valid namespace");
+
+    // authorize: token actor must match the configured actor.
+    let tok = rt.authorize(ns.clone()).expect("authorize must succeed");
+    assert_eq!(
+        tok.actor(),
+        &configured_actor,
+        "authorize: token actor must be the configured actor, not anonymous"
+    );
+
+    // authorize_with_visibility: same guarantee with an extra visibility set.
+    let extra = vec![Namespace::parse("lambda:other").expect("valid ns")];
+    let vis_tok = rt
+        .authorize_with_visibility(ns, extra)
+        .expect("authorize_with_visibility must succeed");
+    assert_eq!(
+        vis_tok.actor(),
+        &configured_actor,
+        "authorize_with_visibility: token actor must be the configured actor, not anonymous"
+    );
+}
+
+/// [ST1-FIX2-config] The reserved "anonymous" kind in a two-segment actor.id must
+/// be rejected at config load time, not silently coerced to anonymous identity.
+///
+/// Non-vacuity: removing the anonymous-kind check from KhiveConfig::validate causes
+/// this test to fail — KhiveConfig::load succeeds and silently produces an anonymous
+/// actor_ref when runtime_config_from_khive_config is called.
+#[test]
+fn st1_config_file_anonymous_kind_is_rejected_at_load() {
+    use khive_runtime::ConfigError;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    writeln!(
+        std::fs::File::create(&path).unwrap(),
+        "[actor]\nid = \"anonymous:local\"\n"
+    )
+    .unwrap();
+
+    let err = KhiveConfig::load(Some(&path))
+        .expect_err("anonymous:local actor.id must fail at config load");
+    assert!(
+        matches!(err, ConfigError::InvalidActorRef { .. }),
+        "expected ConfigError::InvalidActorRef for reserved anonymous kind, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("reserved"),
+        "error message must explain the reserved-kind rejection; got: {err}"
     );
 }

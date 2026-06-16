@@ -299,6 +299,24 @@ impl KhiveConfig {
                 id: id.to_string(),
                 reason: e.to_string(),
             })?;
+            // Reject the reserved "anonymous" kind in two-segment form (e.g.
+            // "anonymous:local"). A two-segment actor.id whose kind is "anonymous"
+            // collapses back to the default anonymous identity, creating an
+            // undetectable identity split. Fail closed at config load time.
+            // Single-segment values (e.g. "local") are accepted — they are the
+            // natural anonymous default, not an explicit misconfiguration.
+            if let Some(colon_pos) = id.find(':') {
+                let kind = &id[..colon_pos];
+                if kind == "anonymous" {
+                    return Err(ConfigError::InvalidActorRef {
+                        id: id.to_string(),
+                        reason: "\"anonymous\" is a reserved actor kind and may not be configured \
+                             explicitly; use \"lambda:name\", \"agent:name\", \"user:name\", \
+                             or a single-segment namespace like \"local\""
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         // Validate actor.visible_namespaces when present.

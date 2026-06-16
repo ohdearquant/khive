@@ -323,6 +323,37 @@ pub(crate) fn actor_ref_from_namespace_str(
     }
 }
 
+/// Parse a validated namespace string into a typed `ActorRef` for a
+/// user-configured (CLI/env/config-file) actor.
+///
+/// Same as [`actor_ref_from_namespace_str`] but additionally rejects the
+/// reserved `anonymous` kind in two-segment form (e.g. `"anonymous:local"`).
+/// Explicit configuration of an `anonymous:*` actor collapses back into the
+/// default anonymous identity, creating an undetectable identity split. Fail
+/// closed on this class of misconfiguration so the operator is informed at
+/// startup rather than silently operating anonymously.
+///
+/// Single-segment namespaces (e.g. `"local"`) naturally resolve to
+/// `ActorRef::anonymous()` and are still accepted — they are the default, not
+/// an explicit misconfiguration.
+pub fn actor_ref_from_configured_namespace_str(
+    id: &str,
+) -> Result<ActorRef, crate::engine_config::ConfigError> {
+    if let Some(pos) = id.find(':') {
+        let kind = &id[..pos];
+        if kind == "anonymous" {
+            return Err(crate::engine_config::ConfigError::InvalidActorRef {
+                id: id.to_string(),
+                reason: "\"anonymous\" is a reserved actor kind and may not be configured \
+                     explicitly; use \"lambda:name\", \"agent:name\", \"user:name\", \
+                     or a single-segment namespace like \"local\""
+                    .to_string(),
+            });
+        }
+    }
+    actor_ref_from_namespace_str(id)
+}
+
 /// Parse a comma- or whitespace-separated pack list from a single string.
 ///
 /// Empty entries are dropped, surrounding whitespace is trimmed.
