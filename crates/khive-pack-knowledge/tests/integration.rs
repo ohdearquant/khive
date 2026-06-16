@@ -2158,3 +2158,128 @@ async fn resolver_generic_update_atom_returns_invalid_input() {
         "expected InvalidInput, got: {err:?}"
     );
 }
+
+/// Hard-delete an atom that has sections via `knowledge.edit`.
+///
+/// Without the fix this fails with `FOREIGN KEY constraint failed` because
+/// `knowledge_sections` has a FK to `knowledge_atoms(id)` without `ON DELETE
+/// CASCADE`.
+#[tokio::test]
+async fn resolver_generic_hard_delete_atom_with_sections() {
+    let f = pack_via_registry(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": "hard-delete-atom-with-sections",
+                "name": "Hard Delete Atom With Sections",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+            }]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let by_slug = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "hard-delete-atom-with-sections" }),
+        )
+        .await
+        .expect("get atom before edit");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    // Add sections to the atom.
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "hard-delete-atom-with-sections",
+            "sections": [{
+                "section_type": "overview",
+                "content": "This section tests that hard-delete correctly removes dependent knowledge_sections rows before deleting the parent atom to satisfy the foreign key constraint."
+            }]
+        }),
+    )
+    .await
+    .expect("add section to atom");
+
+    // Hard-delete must succeed even though sections exist.
+    let hard_del = f
+        .dispatch("delete", json!({ "id": uuid, "hard": true }))
+        .await
+        .expect("hard delete atom with sections");
+    assert_eq!(
+        hard_del["deleted"], true,
+        "hard delete response: {hard_del}"
+    );
+
+    // Generic get must now return NotFound.
+    let not_found = f.dispatch("get", json!({ "id": uuid })).await;
+    assert!(
+        matches!(not_found, Err(RuntimeError::NotFound(_))),
+        "expected NotFound after hard delete, got: {not_found:?}"
+    );
+}
+
+/// Hard-delete a domain whose mirror atom has sections via `knowledge.edit`.
+///
+/// Without the fix the domain row is deleted first and then the mirror atom
+/// delete fails with `FOREIGN KEY constraint failed`, leaving a partial delete.
+#[tokio::test]
+async fn resolver_generic_hard_delete_domain_with_mirror_sections() {
+    let f = pack_via_registry(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [{
+                "slug": "hard-delete-domain-with-sections",
+                "name": "Hard Delete Domain With Sections",
+                "description": "Domain whose mirror atom will have sections before hard-delete to verify that cascade-delete of dependent knowledge_sections rows works correctly here."
+            }]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "hard-delete-domain-with-sections" }),
+        )
+        .await
+        .expect("get domain before edit");
+    let domain_uuid = domain["id"].as_str().expect("id string").to_string();
+
+    // Add sections to the mirror atom (same UUID as the domain).
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "hard-delete-domain-with-sections",
+            "sections": [{
+                "section_type": "overview",
+                "content": "This section tests that hard-delete of a domain removes dependent knowledge_sections rows from the mirror atom before deleting the atom and domain rows."
+            }]
+        }),
+    )
+    .await
+    .expect("add section to domain mirror atom");
+
+    // Hard-delete the domain — must succeed even though mirror atom has sections.
+    let hard_del = f
+        .dispatch("delete", json!({ "id": domain_uuid, "hard": true }))
+        .await
+        .expect("hard delete domain with mirror sections");
+    assert_eq!(
+        hard_del["deleted"], true,
+        "hard delete response: {hard_del}"
+    );
+
+    // Domain must now be NotFound.
+    let domain_not_found = f.dispatch("get", json!({ "id": domain_uuid })).await;
+    assert!(
+        matches!(domain_not_found, Err(RuntimeError::NotFound(_))),
+        "expected NotFound for domain after hard delete, got: {domain_not_found:?}"
+    );
+}

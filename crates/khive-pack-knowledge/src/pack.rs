@@ -336,29 +336,33 @@ impl PackByIdResolver for KnowledgePack {
         match kind.as_str() {
             "domain" => {
                 if hard {
+                    // Hard-delete: sections → mirror atom → domain (all in one transaction).
+                    // knowledge_sections has a FK to knowledge_atoms(id) without ON DELETE
+                    // CASCADE, so sections must go before the atom row.
                     writer
-                        .execute(SqlStatement {
-                            sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
-                            params: vec![SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.domain.hard".into()),
-                        })
+                        .execute_batch(vec![
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some(
+                                    "knowledge.delete_by_id.domain_mirror_sections.hard".into(),
+                                ),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.domain.hard".into()),
+                            },
+                        ])
                         .await
                         .map_err(|e| {
                             RuntimeError::Internal(format!(
                                 "knowledge delete_by_id domain hard: {e}"
-                            ))
-                        })?;
-                    // Also hard-delete the mirror atom.
-                    writer
-                        .execute(SqlStatement {
-                            sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
-                            params: vec![SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
-                        })
-                        .await
-                        .map_err(|e| {
-                            RuntimeError::Internal(format!(
-                                "knowledge delete_by_id domain mirror hard: {e}"
                             ))
                         })?;
                 } else {
@@ -395,12 +399,20 @@ impl PackByIdResolver for KnowledgePack {
             }
             "atom" => {
                 if hard {
+                    // Hard-delete: sections first (FK constraint), then the atom row.
                     writer
-                        .execute(SqlStatement {
-                            sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
-                            params: vec![SqlValue::Text(id_str.clone())],
-                            label: Some("knowledge.delete_by_id.atom.hard".into()),
-                        })
+                        .execute_batch(vec![
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.atom.hard".into()),
+                            },
+                        ])
                         .await
                         .map_err(|e| {
                             RuntimeError::Internal(format!("knowledge delete_by_id atom hard: {e}"))
