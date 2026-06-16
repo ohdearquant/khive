@@ -41,6 +41,9 @@ pub enum ConfigError {
 
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
+
+    #[error("actor.id {id:?} cannot be parsed into a typed ActorRef: {reason}")]
+    InvalidActorRef { id: String, reason: String },
 }
 
 // ---- Config structs ----

@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
-use khive_gate::{ActorRef, AllowAllGate, GateRequest};
+use khive_gate::{AllowAllGate, GateRequest};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use khive_types::{EdgeEndpointRule, Namespace};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -149,6 +149,7 @@ impl KhiveRuntime {
         Self::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_gate::ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -320,7 +321,7 @@ impl KhiveRuntime {
     /// to the pre-visibility-set behaviour. Use [`authorize_with_visibility`]
     /// to mint a token that can read additional namespaces.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
-        let actor = ActorRef::anonymous();
+        let actor = self.config.actor_ref.clone();
         let req = GateRequest::new(
             actor.clone(),
             ns.clone(),
@@ -373,7 +374,7 @@ impl KhiveRuntime {
         primary: Namespace,
         extra_visible: Vec<Namespace>,
     ) -> RuntimeResult<NamespaceToken> {
-        let actor = ActorRef::anonymous();
+        let actor = self.config.actor_ref.clone();
         let req = GateRequest::new(
             actor.clone(),
             primary.clone(),
@@ -724,6 +725,7 @@ mod tests {
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
             default_namespace: Namespace::parse("test").unwrap(),
+            actor_ref: khive_gate::ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -744,6 +746,7 @@ mod tests {
         let config = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_gate::ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -887,9 +890,11 @@ mod tests {
 
     #[test]
     fn runtime_config_from_khive_config_applies_actor_id_as_default_namespace() {
+        use khive_gate::ActorRef;
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -902,13 +907,17 @@ mod tests {
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(result.default_namespace.as_str(), "lambda:khive");
+        assert_eq!(result.actor_ref.kind, "lambda");
+        assert_eq!(result.actor_ref.id, "khive");
     }
 
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
+        use khive_gate::ActorRef;
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
+            actor_ref: ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -933,13 +942,20 @@ mod tests {
             "lambda:base",
             "empty actor.id must not override base namespace"
         );
+        assert_eq!(
+            result.actor_ref,
+            ActorRef::anonymous(),
+            "empty actor.id must leave actor_ref as anonymous"
+        );
     }
 
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
+        use khive_gate::ActorRef;
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
+            actor_ref: ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -956,13 +972,20 @@ mod tests {
             "lambda:base",
             "absent actor.id must not override base namespace"
         );
+        assert_eq!(
+            result.actor_ref,
+            ActorRef::anonymous(),
+            "absent actor.id must leave actor_ref as anonymous"
+        );
     }
 
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
+        use khive_gate::ActorRef;
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -990,6 +1013,8 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(result.default_namespace.as_str(), "lambda:test");
         assert!(result.embedding_model.is_some());
+        assert_eq!(result.actor_ref.kind, "lambda");
+        assert_eq!(result.actor_ref.id, "test");
     }
 
     // ---- list_embedding_models tests ----

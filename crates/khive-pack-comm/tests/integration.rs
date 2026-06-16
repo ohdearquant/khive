@@ -2310,6 +2310,7 @@ fn build_crossns_registry(
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse(dispatch_ns).unwrap(),
+        actor_ref: khive_runtime::ActorRef::anonymous(),
         embedding_model: None,
         additional_embedding_models: vec![],
         gate: Arc::new(AllowAllGate),

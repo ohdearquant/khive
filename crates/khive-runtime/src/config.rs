@@ -202,6 +202,18 @@ pub struct RuntimeConfig {
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
+    /// Typed caller identity for this khive instance.
+    ///
+    /// Derived from the `[actor]` section of `khive.toml`. When `actor.id`
+    /// is present (e.g. `"lambda:khive"`), the first colon-delimited segment
+    /// becomes `kind` and the remainder becomes `id`
+    /// (`ActorRef { kind: "lambda", id: "khive" }`). When `actor.id` is absent,
+    /// defaults to `ActorRef::anonymous()`.
+    ///
+    /// The `authorize` and `authorize_with_visibility` methods embed this
+    /// `actor_ref` into every minted `NamespaceToken`, replacing the prior
+    /// hard-coded `ActorRef::anonymous()`.
+    pub actor_ref: ActorRef,
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     ///
@@ -259,6 +271,58 @@ pub struct RuntimeConfig {
     pub allowed_outbound_namespaces: Vec<Namespace>,
 }
 
+// ---- actor_ref parsing ----
+
+/// Parse a validated namespace string into a typed `ActorRef`.
+///
+/// The namespace string must already have passed `Namespace::parse` (i.e. it
+/// is structurally valid). The parsing rule is:
+///
+/// - If the string contains a `:`, the first segment is the `kind` and everything
+///   after the first `:` is the `id`. For example `"lambda:khive"` yields
+///   `ActorRef { kind: "lambda", id: "khive" }` and `"lambda:khive:sub"` yields
+///   `ActorRef { kind: "lambda", id: "khive:sub" }`.
+/// - If there is no `:`, the entire string is treated as `id` with kind
+///   `"anonymous"`. This covers the `"local"` single-segment namespace, which
+///   maps to `ActorRef::anonymous()`.
+///
+/// Returns `Err` with a descriptive message listing valid forms when the parsed
+/// kind or id would be empty (enforced by `ActorRef::try_new`). Because the
+/// input is a pre-validated namespace string, the only reachable error here is
+/// when a validated namespace unexpectedly produces an empty segment — which
+/// signals a logic bug rather than user input.
+pub(crate) fn actor_ref_from_namespace_str(
+    id: &str,
+) -> Result<ActorRef, crate::engine_config::ConfigError> {
+    match id.find(':') {
+        Some(pos) => {
+            let kind = &id[..pos];
+            let rest = &id[pos + 1..];
+            ActorRef::try_new(kind, rest).map_err(|e| {
+                crate::engine_config::ConfigError::InvalidActorRef {
+                    id: id.to_string(),
+                    reason: format!(
+                        "{e}; valid forms: \"lambda:name\", \"agent:name\", \
+                         \"user:name\", \"local\""
+                    ),
+                }
+            })
+        }
+        None => {
+            // Single-segment namespace (e.g. "local") — treat as anonymous kind.
+            ActorRef::try_new("anonymous", id).map_err(|e| {
+                crate::engine_config::ConfigError::InvalidActorRef {
+                    id: id.to_string(),
+                    reason: format!(
+                        "{e}; valid forms: \"lambda:name\", \"agent:name\", \
+                         \"user:name\", \"local\""
+                    ),
+                }
+            })
+        }
+    }
+}
+
 /// Parse a comma- or whitespace-separated pack list from a single string.
 ///
 /// Empty entries are dropped, surrounding whitespace is trimmed.
@@ -307,6 +371,7 @@ impl Default for RuntimeConfig {
         Self {
             db_path,
             default_namespace: Namespace::local(),
+            actor_ref: ActorRef::anonymous(),
             embedding_model,
             additional_embedding_models,
             gate: Arc::new(AllowAllGate),
@@ -393,16 +458,26 @@ pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
     base: RuntimeConfig,
 ) -> RuntimeConfig {
-    // Apply actor.id as default_namespace when present and valid.
+    // Apply actor.id as default_namespace and actor_ref when present and valid.
     // KhiveConfig::validate() guarantees that actor.id, when present, is a
     // structurally valid Namespace — so the Err arm here is unreachable for
     // any config that passed load(). A panic here signals a caller contract
     // violation (passing an unvalidated config).
-    let default_namespace = match khive_cfg.actor.id.as_deref() {
+    let (default_namespace, actor_ref) = match khive_cfg.actor.id.as_deref() {
         Some(id) if !id.is_empty() => match Namespace::parse(id) {
             Ok(ns) => {
                 tracing::debug!(actor_id = id, "actor.id from config sets default_namespace");
-                ns
+                // actor_ref_from_namespace_str is infallible for any id that
+                // passed Namespace::parse — panic here signals a caller
+                // contract violation (unvalidated config).
+                let aref = actor_ref_from_namespace_str(id).unwrap_or_else(|e| {
+                    panic!(
+                        "actor.id {id:?} passed validation but actor_ref parsing failed: {e}; \
+                         this is a bug — KhiveConfig must be validated before calling \
+                         runtime_config_from_khive_config"
+                    )
+                });
+                (ns, aref)
             }
             Err(e) => {
                 panic!(
@@ -412,7 +487,7 @@ pub fn runtime_config_from_khive_config(
                 );
             }
         },
-        _ => base.default_namespace.clone(),
+        _ => (base.default_namespace.clone(), base.actor_ref.clone()),
     };
 
     // base.brain_profile must carry ONLY the explicit CLI tier — never an env
@@ -459,6 +534,7 @@ pub fn runtime_config_from_khive_config(
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
+            actor_ref,
             brain_profile,
             visible_namespaces,
             allowed_outbound_namespaces,
@@ -492,6 +568,7 @@ pub fn runtime_config_from_khive_config(
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,
+        actor_ref,
         brain_profile,
         visible_namespaces,
         allowed_outbound_namespaces,
@@ -523,5 +600,101 @@ pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> 
     match normalized.as_str() {
         "paraphrase" => Some(EmbeddingModel::ParaphraseMultilingualMiniLmL12V2),
         _ => normalized.parse().ok(),
+    }
+}
+
+// INLINE TEST JUSTIFICATION: tests here directly exercise `actor_ref_from_namespace_str`,
+// which is `pub(crate)` and not accessible from the integration test suite.
+#[cfg(test)]
+mod actor_ref_tests {
+    use super::*;
+
+    // 1. Two-segment namespace -> kind=first segment, id=second segment.
+    #[test]
+    fn actor_ref_from_two_segment_namespace() {
+        let result = actor_ref_from_namespace_str("lambda:khive").unwrap();
+        assert_eq!(result.kind, "lambda");
+        assert_eq!(result.id, "khive");
+    }
+
+    // 2. Single-segment namespace ("local") -> anonymous kind, id = full string.
+    #[test]
+    fn actor_ref_from_single_segment_namespace_is_anonymous() {
+        let result = actor_ref_from_namespace_str("local").unwrap();
+        assert_eq!(result.kind, "anonymous");
+        assert_eq!(result.id, "local");
+        assert_eq!(result, ActorRef::anonymous());
+    }
+
+    // 3. Three-segment namespace -> kind=first segment, id=rest (including inner colon).
+    #[test]
+    fn actor_ref_from_three_segment_namespace() {
+        let result = actor_ref_from_namespace_str("lambda:khive:sub").unwrap();
+        assert_eq!(result.kind, "lambda");
+        assert_eq!(result.id, "khive:sub");
+    }
+
+    // 4. agent: namespace parses correctly.
+    #[test]
+    fn actor_ref_from_agent_namespace() {
+        let result = actor_ref_from_namespace_str("agent:kg-polisher").unwrap();
+        assert_eq!(result.kind, "agent");
+        assert_eq!(result.id, "kg-polisher");
+    }
+
+    // 5. user: namespace parses correctly.
+    #[test]
+    fn actor_ref_from_user_namespace() {
+        let result = actor_ref_from_namespace_str("user:ocean").unwrap();
+        assert_eq!(result.kind, "user");
+        assert_eq!(result.id, "ocean");
+    }
+
+    // 6. RuntimeConfig::default() provides actor_ref = anonymous.
+    #[test]
+    fn runtime_config_default_actor_ref_is_anonymous() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.actor_ref, ActorRef::anonymous());
+    }
+
+    // 7. runtime_config_from_khive_config with valid actor.id sets actor_ref correctly.
+    #[test]
+    fn runtime_config_from_khive_config_sets_actor_ref() {
+        use crate::engine_config::{ActorConfig, KhiveConfig, RuntimeSectionConfig};
+        let khive_cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: Some("lambda:leo".to_string()),
+                display_name: None,
+                ..Default::default()
+            },
+            runtime: RuntimeSectionConfig::default(),
+        };
+        khive_cfg.validate().expect("valid config");
+        let base = RuntimeConfig::default();
+        let result = crate::runtime::runtime_config_from_khive_config(&khive_cfg, base);
+        assert_eq!(result.actor_ref.kind, "lambda");
+        assert_eq!(result.actor_ref.id, "leo");
+    }
+
+    // 8. runtime_config_from_khive_config without actor.id preserves base actor_ref.
+    #[test]
+    fn runtime_config_from_khive_config_absent_actor_preserves_base_actor_ref() {
+        use crate::engine_config::{ActorConfig, KhiveConfig, RuntimeSectionConfig};
+        let khive_cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: None,
+                ..Default::default()
+            },
+            runtime: RuntimeSectionConfig::default(),
+        };
+        let custom_actor = ActorRef::new("user", "ocean");
+        let base = RuntimeConfig {
+            actor_ref: custom_actor.clone(),
+            ..RuntimeConfig::default()
+        };
+        let result = crate::runtime::runtime_config_from_khive_config(&khive_cfg, base);
+        assert_eq!(result.actor_ref, custom_actor);
     }
 }

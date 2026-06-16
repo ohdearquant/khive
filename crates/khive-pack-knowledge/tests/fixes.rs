@@ -1410,6 +1410,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::local(),
+        actor_ref: khive_runtime::ActorRef::anonymous(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
         additional_embedding_models: vec![],
         gate: Arc::new(AllowAllGate),
@@ -2080,6 +2081,7 @@ mod embed_failure_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -2441,6 +2443,7 @@ mod ann_bypass_regression {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -3035,6 +3038,7 @@ mod edit_inline_reembed {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),

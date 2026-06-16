@@ -564,6 +564,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
@@ -585,6 +586,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
@@ -1074,6 +1076,7 @@ mod embedder_registry_tests {
         KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
@@ -1134,6 +1137,7 @@ mod embedder_registry_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
+            actor_ref: khive_runtime::ActorRef::anonymous(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
             gate: Arc::new(AllowAllGate),
