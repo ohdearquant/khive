@@ -376,8 +376,25 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             ProbeOutcome::Timeout
         }
         Ok(ForwardOutcome::Response(resp)) => {
-            // Positive identity confirmation: no mismatches, protocol matches.
-            if !resp.version_mismatch
+            // Positive probe-ack confirmation: the response must carry the exact
+            // probe-ack sentinel shape (ok=true, result=None, error=None) plus
+            // pass all identity checks.
+            //
+            // Why the sentinel is necessary: `probe_only` is `#[serde(default)]`
+            // and the schema has no deny_unknown_fields. A daemon built before this
+            // field existed (same protocol version, older binary) deserialises the
+            // probe frame without error and falls through to normal dispatch on the
+            // empty `ops` string. That produces ok=false (parse error) with matching
+            // identity fields — it would be misclassified as Alive by identity
+            // checks alone, leaving a stale daemon in place. Requiring the probe-ack
+            // shape makes the classifier fail-closed: only the explicit probe branch
+            // in handle_conn produces ok=true + result=None + error=None.
+            //
+            // A normal successful dispatch always sets result=Some(_) (never None).
+            // A normal error dispatch sets ok=false. So the sentinel is unambiguous.
+            let is_probe_ack = resp.ok && resp.result.is_none() && resp.error.is_none();
+            if is_probe_ack
+                && !resp.version_mismatch
                 && !resp.namespace_mismatch
                 && !resp.config_mismatch
                 && resp.daemon_protocol_version == PROTOCOL_VERSION
@@ -387,10 +404,11 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
                 ProbeOutcome::Alive
             } else {
                 tracing::debug!(
+                    is_probe_ack,
                     version_mismatch = resp.version_mismatch,
                     namespace_mismatch = resp.namespace_mismatch,
                     config_mismatch = resp.config_mismatch,
-                    "under-lock probe: daemon identity mismatch — will kill+spawn"
+                    "under-lock probe: daemon did not return probe-ack or identity mismatch — will kill+spawn"
                 );
                 ProbeOutcome::Dead
             }
@@ -1598,6 +1616,14 @@ mod tests {
     // the probe (try_forward_inner(frame) under the lock), CountingDispatch.dispatch()
     // is called for the probe (DAEMON_DISPATCH == 1), and again at the call site
     // (DAEMON_DISPATCH == 2).  The assert_eq!(DAEMON_DISPATCH, 1) then fails.
+    //
+    // FOLLOWUP: this test calls kill_and_respawn + try_forward_inner directly to
+    // avoid the two-socket problem (stale socket for first forward, real socket
+    // for probe).  A future enhancement could drive the full forward_or_spawn
+    // entry point using a proxy fake-socket that serves garbage on the first
+    // connection then falls through to the real daemon — catching any future
+    // call-site that double-forwards after RecoveryOutcome::Skipped without
+    // going through the seam functions.  File a follow-up issue if needed.
 
     /// A minimal DaemonDispatch that increments DAEMON_DISPATCH on every real
     /// (non-probe) dispatch.  probe_only frames never reach dispatch() — they
@@ -1746,6 +1772,98 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stale_handle).await;
         counting_handle.abort();
         let _ = counting_handle.await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── probe classifier is fail-CLOSED for same-protocol pre-probe daemons ──
+    //
+    // Regression test for the version-skew gap: a daemon built BEFORE probe_only
+    // was introduced but carrying PROTOCOL_VERSION (same numeric version, older
+    // binary) deserialises the probe frame via serde default and falls through to
+    // dispatch on the empty `ops` string.  It returns ok=false (parse error on
+    // empty ops) WITH matching identity fields (namespace / config / protocol all
+    // match).  Before leg-1 of the round-5 fix, probe_daemon_identity classified
+    // ANY response with matching identity as Alive, leaving the stale daemon in
+    // place.
+    //
+    // After the fix, the classifier requires the probe-ack sentinel shape:
+    //   resp.ok && resp.result.is_none() && resp.error.is_none()
+    // An ok=false response fails this predicate → Dead → kill+spawn.
+    //
+    // Fail-if-reverted: removing the `is_probe_ack` check from the classifier
+    // causes the ok=false identity-matching response to be classified Alive →
+    // kill_and_respawn returns Skipped → KILL_COUNT stays 0 → assertion fails.
+
+    /// Build a response that matches all identity fields but has ok=false (the
+    /// shape a pre-probe daemon produces when dispatching the empty-ops probe).
+    fn pre_probe_daemon_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some("parse error: empty ops string".to_string()),
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn probe_classifier_dead_when_same_protocol_daemon_lacks_probe_support() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        // Bind a fake socket that serves one pre-probe response, then stops
+        // accepting (simulates a same-protocol daemon without probe_only support).
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake pre-probe socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let pre_probe_resp = pre_probe_daemon_response(config_id);
+        let fake_handle = tokio::spawn(serve_one_response(listener, pre_probe_resp));
+
+        // Arm FORCE_PID_IS_DAEMON so kill_stale_daemon_inner would attempt SIGTERM
+        // IF it were called.  This makes KILL_COUNT the reliable regression signal:
+        // if the classifier incorrectly returns Alive (Skipped), kill is not called
+        // and KILL_COUNT stays 0.
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+        reset_counters();
+
+        let outcome = kill_and_respawn(config_id, "test").await;
+
+        // The fake socket served exactly one response; join it before asserting.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        // The ok=false response must NOT be classified as Alive.  kill_and_respawn
+        // must attempt kill+spawn (Spawned outcome — spawn itself fails because there
+        // is no real kkernel binary in test, but KILL_COUNT is checked BEFORE spawn).
+        assert!(
+            matches!(outcome, Ok(RecoveryOutcome::Spawned) | Err(_)),
+            "pre-probe same-protocol daemon must NOT be classified Alive; \
+             expected Spawned or spawn-error, got Skipped"
+        );
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "KILL_COUNT must be 1 — the pre-probe response must classify as Dead \
+             so kill_stale_daemon_inner is called \
+             (this fails if is_probe_ack check is removed and ok=false response \
+              is incorrectly classified as Alive)"
+        );
+
         reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
