@@ -92,6 +92,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-057](ADR-057-comm-actor-addressed-delivery.md)      | Comm Actor-Addressed Delivery (Accepted)                                                                        |
 | [ADR-058](ADR-058-brain-posterior-read-path.md)          | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking (Proposed)                            |
 | [ADR-059](ADR-059-namespace-write-tiers.md)              | Namespace Write Tiers and Cross-Namespace Link Access Control (Withdrawn — superseded by ADR-007 Rev 2)         |
+| [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)   | Pack-Extensible by-ID Resolution (Accepted)                                                                     |
 
 ## Closed Taxonomies — Quick Reference
 

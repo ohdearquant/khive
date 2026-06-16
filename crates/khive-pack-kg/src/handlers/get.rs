@@ -5,7 +5,7 @@ use std::str::FromStr;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{NamespaceToken, Resolved, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::EventKind;
 
@@ -21,6 +21,7 @@ impl KgPack {
         token: &NamespaceToken,
         graph_token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
 
@@ -92,6 +93,16 @@ impl KgPack {
                 .contains(&event.namespace.as_str())
             {
                 return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
+            }
+        }
+
+        // Pack-resolver probe: ask each registered resolver for pack-private records
+        // (e.g. knowledge_atoms, knowledge_domains) that the standard substrates cannot see.
+        for (_pack_name, resolver) in registry.resolvers() {
+            if let Some(Resolved::PackRecord { kind, data, .. }) =
+                resolver.resolve_by_id(id).await?
+            {
+                return flatten_get_result(&kind, data);
             }
         }
 
