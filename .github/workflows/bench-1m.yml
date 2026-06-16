@@ -85,13 +85,20 @@ jobs:
         #   1 — data present; one or more assertions FAIL (regression)
         #   2 — data absent; skip gracefully
         run: |
+          set +e
           bash scripts/bench_1m.sh --ci
           RC=$?
+          set -e
           if [ $RC -eq 2 ]; then
             echo "::notice::SIFT data not found at SIFT_DIR=${SIFT_DIR:-<unset>} — bench skipped. Provision a SIFT-capable runner to enable regression gating."
             exit 0
+          elif [ $RC -eq 0 ]; then
+            echo "::notice::Vamana CI bench PASSED."
+            exit 0
+          else
+            echo "::warning::Vamana CI bench FAILED (regression detected, exit $RC)."
+            exit $RC
           fi
-          exit $RC
         env:
           SIFT_DIR: ${{ env.SIFT_DIR || '' }}
           BENCH_OUT: /tmp/bench-out

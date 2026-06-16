@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         default="perf/ledger.csv",
         help="Path to ledger CSV (created if absent, default: perf/ledger.csv)",
     )
+    p.add_argument(
+        "--ledger-only",
+        action="store_true",
+        help="Append row even when assertions.overall != PASS and exit 0 (archival mode).",
+    )
     return p.parse_args()
 
 
@@ -164,6 +169,14 @@ def main() -> None:
             f"p50={r['p50_us']}µs  p95={r['p95_us']}µs  "
             f"speedup={r['speedup']}x  {r['pass']}  sha={sha_short}"
         )
+
+    if overall != "PASS" and not args.ledger_only:
+        print(
+            f"ERROR: assertions.overall={overall!r} — bench did not PASS. "
+            "Use --ledger-only to append failed rows for archival.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

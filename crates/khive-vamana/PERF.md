@@ -51,7 +51,7 @@ YES — all criteria met:
 - beam flat (exponent 0.213 < threshold 0.5)
 - query sub-linear (exponent 0.381 < threshold 0.8)
 - recall >= 0.95 at all three N
-- ANN beats brute-force (341x at 1M)
+- ANN exceeds the configured 10x sanity threshold at 1M (measured 341x only against naive scalar L2, not FAISS / vectorized flat search — see Speedup note)
 
 ## Speedup note
 

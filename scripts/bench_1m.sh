@@ -14,7 +14,7 @@
 #
 # Environment:
 #   SIFT_DIR   directory containing sift_base.fvecs and sift_query.fvecs
-#              (default: /Users/lion/projects/khive/khive-sublinear/data/sift)
+#              (required; no default — script exits 2 if unset or empty)
 #   BENCH_OUT  output directory for bench JSON and logs
 #              (default: target/bench-out; gitignored via target/)
 #
@@ -40,7 +40,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRATES_DIR="$REPO_ROOT/crates"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-SIFT_DIR="${SIFT_DIR:-/Users/lion/projects/khive/khive-sublinear/data/sift}"
+SIFT_DIR="${SIFT_DIR:-}"
 BENCH_OUT="${BENCH_OUT:-$REPO_ROOT/target/bench-out}"
 NS="100000,316228,1000000"
 DATASET="SIFT-1M-honest-3pt"
@@ -91,6 +91,11 @@ echo "" | tee -a "$LOG_FILE"
 # ── Prerequisites ────────────────────────────────────────────────────────────
 prereq_fail=0
 
+if [[ -z "$SIFT_DIR" ]]; then
+  echo "ERROR: SIFT_DIR is not set. Set SIFT_DIR to the directory containing sift_base.fvecs and sift_query.fvecs." >&2
+  exit 2
+fi
+
 if [[ ! -f "$BASE_FILE" ]]; then
   echo "ERROR: SIFT base vectors not found: $BASE_FILE" >&2
   echo "  Set SIFT_DIR to the directory containing sift_base.fvecs and sift_query.fvecs" >&2
@@ -119,7 +124,7 @@ fi
 # ── Run the bench ────────────────────────────────────────────────────────────
 echo "--- Running vec_bench ---" | tee -a "$LOG_FILE"
 
-BENCH_EXIT=0
+set +e
 (
   cd "$CRATES_DIR"
   cargo run --release -p khive-vamana --example vec_bench -- \
@@ -132,19 +137,21 @@ BENCH_EXIT=0
     --out "$BENCH_JSON"
 ) 2>&1 | tee -a "$LOG_FILE"
 BENCH_EXIT="${PIPESTATUS[0]}"
+set -e
 
 echo "" | tee -a "$LOG_FILE"
 echo "--- vec_bench exit code: $BENCH_EXIT ---" | tee -a "$LOG_FILE"
 
 if [[ $BENCH_EXIT -ne 0 ]]; then
   echo "ERROR: vec_bench exited with code $BENCH_EXIT" >&2
+  echo "=== RESULT: FAIL (bench assertions failed) ===" | tee -a "$LOG_FILE"
   exit 1
 fi
 
 # ── Ingest into ledger ───────────────────────────────────────────────────────
 if [[ -f "$BENCH_JSON" ]]; then
   echo "--- Ingesting into ledger: $LEDGER_CSV ---" | tee -a "$LOG_FILE"
-  INGEST_EXIT=0
+  set +e
   (
     cd "$REPO_ROOT"
     python3 scripts/perf/ingest_scale_proof.py \
@@ -152,6 +159,7 @@ if [[ -f "$BENCH_JSON" ]]; then
       --ledger "$LEDGER_CSV"
   ) 2>&1 | tee -a "$LOG_FILE"
   INGEST_EXIT="${PIPESTATUS[0]}"
+  set -e
 
   if [[ $INGEST_EXIT -ne 0 ]]; then
     echo "WARNING: ledger ingest failed (exit $INGEST_EXIT) — bench result is still valid" >&2
@@ -162,12 +170,7 @@ fi
 
 # ── Report overall result ────────────────────────────────────────────────────
 echo "" | tee -a "$LOG_FILE"
-if [[ $BENCH_EXIT -eq 0 ]]; then
-  echo "=== RESULT: PASS ===" | tee -a "$LOG_FILE"
-  echo "    JSON: $BENCH_JSON" | tee -a "$LOG_FILE"
-  echo "    Log:  $LOG_FILE" | tee -a "$LOG_FILE"
-  exit 0
-else
-  echo "=== RESULT: FAIL (bench assertions failed) ===" | tee -a "$LOG_FILE"
-  exit 1
-fi
+echo "=== RESULT: PASS ===" | tee -a "$LOG_FILE"
+echo "    JSON: $BENCH_JSON" | tee -a "$LOG_FILE"
+echo "    Log:  $LOG_FILE" | tee -a "$LOG_FILE"
+exit 0
