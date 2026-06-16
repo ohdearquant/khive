@@ -550,7 +550,7 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// prologue-prefixed updates (`PREFIX ex: <…> INSERT DATA { … }`) are also
 /// caught. Read-only forms (SELECT / ASK / CONSTRUCT / DESCRIBE) are untouched.
 fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
-    let keyword = sparql_leading_keyword(input);
+    let keyword = leading_keyword(input);
     match keyword.as_str() {
         "INSERT" | "DELETE" | "WITH" | "LOAD" | "CLEAR" | "CREATE" | "DROP" | "COPY" | "MOVE"
         | "ADD" => Err(QueryError::Unsupported(
@@ -562,9 +562,11 @@ fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
     }
 }
 
-/// Return the first meaningful SPARQL keyword, skipping line comments and the
-/// optional prologue (zero or more PREFIX / BASE declarations).
-fn sparql_leading_keyword(input: &str) -> String {
+/// Return the first meaningful query keyword, skipping SPARQL/GQL line comments
+/// and the optional SPARQL prologue (zero or more PREFIX / BASE declarations).
+/// Used by both the per-parser write guard and the public-path guard in
+/// `language::parse_auto`.
+pub(crate) fn leading_keyword(input: &str) -> String {
     let mut rest = input;
     loop {
         // Skip leading ASCII whitespace.
@@ -782,8 +784,8 @@ mod tests {
 
     #[test]
     fn sparql_with_delete_where_rejected() {
-        // WITH <g> DELETE … WHERE is a SPARQL Update op that slips past a
-        // first-token check (first token is WITH, not DELETE).
+        // WITH starts a SPARQL Update graph-management operation; the write
+        // guard rejects it via the WITH keyword in its write set.
         let err = parse("WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
