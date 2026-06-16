@@ -534,8 +534,29 @@ fn triples_to_ast(
 
 /// Parse a SPARQL query string into a [`GqlQuery`] AST. Errors on invalid or unsupported syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
+    reject_sparql_write(input.trim())?;
     let mut parser = SparqlParser::new(input.trim());
     parser.parse_query()
+}
+
+/// Reject SPARQL update operations with an explicit, actionable error.
+///
+/// SPARQL 1.1 Update defines several write operations that must never reach
+/// the compiler. Check for them before parsing so the rejection is deliberate
+/// ("the query verb is read-only") rather than a generic "expected SELECT".
+fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
+    // Extract the first token (ASCII word, case-insensitive) to identify the verb.
+    let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
+    match first.as_str() {
+        "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "ADD" | "MOVE" | "COPY" | "CREATE" => {
+            Err(QueryError::Unsupported(
+                "the query verb is read-only; \
+                 to mutate the graph use: create, update, link, merge, delete"
+                    .into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -659,5 +680,61 @@ mod tests {
             err.to_string().contains("unexpected trailing input"),
             "expected trailing-input parse error, got {err}"
         );
+    }
+
+    // --- Read-only invariant regression tests (#16) ---
+
+    #[test]
+    fn sparql_insert_data_rejected_with_readonly_message() {
+        let err = parse("INSERT DATA { <a> :extends <b> }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "INSERT DATA must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only"),
+            "error must mention 'read-only'; got: {msg}"
+        );
+        assert!(
+            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
+            "error must name the mutation verbs; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sparql_delete_data_rejected_with_readonly_message() {
+        let err = parse("DELETE DATA { <a> :extends <b> }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "DELETE DATA must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "got: {msg}");
+    }
+
+    #[test]
+    fn sparql_delete_where_rejected_with_readonly_message() {
+        let err = parse("DELETE WHERE { ?s :extends ?o }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "DELETE WHERE must return Unsupported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sparql_load_rejected_with_readonly_message() {
+        let err = parse("LOAD <http://example.org/graph>").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "LOAD must return Unsupported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sparql_select_still_compiles_after_write_guard() {
+        // Positive control: a valid SELECT must still parse correctly.
+        let q = parse("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
+        assert!(!q.pattern.elements.is_empty(), "valid SELECT must parse");
     }
 }
