@@ -259,12 +259,62 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     ) -> Result<(), RuntimeError>;
 }
 
+/// Optional sub-trait for packs that own private SQL tables and issue UUIDs
+/// that must be reachable through the generic `get(id)` and `delete(id)` verbs.
+///
+/// Implementing both methods is required — the sub-trait bundles them atomically
+/// so partial implementation is a compile-time error, not a runtime surprise.
+/// Packs whose records live in the shared entity/note substrate (gtd, memory)
+/// do not implement this sub-trait.
+#[async_trait]
+pub trait PackByIdResolver: Send + Sync {
+    /// Attempt to resolve a live (non-deleted) UUID owned by this pack's private tables.
+    ///
+    /// Returns `Some(Resolved::PackRecord { ... })` if this pack owns the UUID,
+    /// `None` if it does not (the caller continues to the next resolver),
+    /// or `Err(...)` on a storage error.
+    ///
+    /// Must query domain-authoritative tables before mirror tables.
+    /// Must NOT filter by namespace. UUID v4 is globally unique; by-ID
+    /// resolution is namespace-blind per ADR-007.
+    async fn resolve_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::Resolved>, crate::RuntimeError>;
+
+    /// Attempt to resolve a UUID including already-soft-deleted records.
+    ///
+    /// Used by the hard-delete path. Default delegates to `resolve_by_id`;
+    /// packs with `deleted_at` columns override this to query without the filter.
+    async fn resolve_by_id_including_deleted(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::Resolved>, crate::RuntimeError> {
+        self.resolve_by_id(id).await
+    }
+
+    /// Delete a record owned by this pack's private tables.
+    ///
+    /// `hard` mirrors the `delete` verb's `hard?` argument.
+    /// Default behavior for packs with a `deleted_at` column MUST be soft-delete;
+    /// `hard=true` performs permanent removal.
+    ///
+    /// Returns `Ok(Value)` with a `{ deleted: true, id, kind, hard }` body on success.
+    /// Returns `Err(RuntimeError::NotFound(...))` if the record does not exist.
+    async fn delete_by_id(
+        &self,
+        id: uuid::Uuid,
+        hard: bool,
+    ) -> Result<serde_json::Value, crate::RuntimeError>;
+}
+
 /// Builder for constructing a `VerbRegistry`.
 ///
 /// Packs are registered here; once `.build()` is called the registry is
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     gate: GateRef,
     default_namespace: String,
     /// Retained for future cloud-gate policy wiring only.
@@ -295,6 +345,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            resolvers: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
@@ -331,6 +382,19 @@ impl VerbRegistryBuilder {
     /// contract is satisfied upstream at the [`PackFactory::create`] site.
     pub(crate) fn register_boxed(&mut self, pack: Box<dyn PackRuntime>) -> &mut Self {
         self.packs.push(pack);
+        self
+    }
+
+    /// Register a by-ID resolver for a pack that owns private SQL tables.
+    ///
+    /// Packs that implement `PackByIdResolver` call this during their boot path
+    /// so that `get(id)` and `delete(id)` can reach their records.
+    pub fn register_resolver(
+        &mut self,
+        name: impl Into<String>,
+        resolver: Box<dyn PackByIdResolver>,
+    ) -> &mut Self {
+        self.resolvers.push((name.into(), resolver));
         self
     }
 
@@ -469,6 +533,7 @@ impl VerbRegistryBuilder {
 
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
+            resolvers: Arc::new(self.resolvers),
             gate: self.gate,
             default_namespace: self.default_namespace,
             event_store: self.event_store,
@@ -596,6 +661,8 @@ impl Default for VerbRegistryBuilder {
 #[derive(Clone)]
 pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    /// Pack-level by-ID resolvers, in registration order.
+    resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     gate: GateRef,
     default_namespace: String,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
@@ -862,6 +929,15 @@ impl VerbRegistry {
             "unknown verb {verb:?}; available: {}",
             available.join(", ")
         )))
+    }
+
+    /// Registered pack-level by-ID resolvers, in registration order.
+    ///
+    /// Each element is `(pack_name, resolver)`. The kg `get` and `delete` handlers
+    /// iterate this slice to probe pack-private tables when the standard KG
+    /// substrates (entity/note/edge/event) return `None` for a given UUID.
+    pub fn resolvers(&self) -> &[(String, Box<dyn PackByIdResolver>)] {
+        &self.resolvers
     }
 
     /// Find a kind hook among the registered packs.
@@ -1140,6 +1216,15 @@ pub trait PackFactory: Send + Sync + 'static {
 
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
+
+    /// Optionally create a `PackByIdResolver` for this pack.
+    ///
+    /// Packs that own private SQL tables implement this to hook into
+    /// `get(id)` and `delete(id)`. Defaults to `None` so existing packs
+    /// compile without changes.
+    fn create_resolver(&self, _runtime: KhiveRuntime) -> Option<Box<dyn PackByIdResolver>> {
+        None
+    }
 }
 
 /// Newtype wrapper collected by `inventory` so pack crates can submit
@@ -1244,6 +1329,9 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             builder.register_boxed(factory.create(runtime.clone()));
+            if let Some(resolver) = factory.create_resolver(runtime.clone()) {
+                builder.register_resolver(name.clone(), resolver);
+            }
         }
 
         Ok(())

@@ -115,7 +115,7 @@ impl PackRuntime for KgPack {
             "stats" => self.handle_stats(graph_token, params).await,
             "merge" => self.handle_merge(graph_token, params, registry).await,
             // UUID-based: entities/edges use graph token, notes/events use caller token.
-            "get" => self.handle_get(token, graph_token, params).await,
+            "get" => self.handle_get(token, graph_token, params, registry).await,
             "update" => self.handle_update(graph_token, params, registry).await,
             "delete" => self.handle_delete(graph_token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(

@@ -4,10 +4,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
-use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::pack::{PackByIdResolver, PackRuntime};
+use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_types::{HandlerDef, Pack};
 
 use crate::knowledge::vamana;
@@ -61,6 +63,13 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(KnowledgePack::new(runtime))
+    }
+
+    fn create_resolver(
+        &self,
+        runtime: KhiveRuntime,
+    ) -> Option<Box<dyn khive_runtime::PackByIdResolver>> {
+        Some(Box::new(KnowledgePack::new(runtime)))
     }
 }
 
@@ -152,4 +161,338 @@ impl PackRuntime for KnowledgePack {
             ))),
         }
     }
+}
+
+#[async_trait]
+impl PackByIdResolver for KnowledgePack {
+    /// Resolve a live knowledge record by UUID.
+    ///
+    /// Queries `knowledge_domains` first (canonical record), then
+    /// `knowledge_atoms`. The domain mirror atom shares the domain's UUID
+    /// (crud.rs:279/300) so domains must win over the mirror.
+    async fn resolve_by_id(&self, id: Uuid) -> Result<Option<Resolved>, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("knowledge resolve_by_id reader: {e}")))?;
+
+        // 1. Check knowledge_domains first (canonical over the mirror atom).
+        let domain_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, description, tags, members, \
+                      created_at, updated_at, deleted_at \
+                      FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str.clone())],
+                label: Some("knowledge.resolve_by_id.domain".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("knowledge resolve_by_id domain query: {e}"))
+            })?;
+
+        if let Some(row) = domain_row {
+            let data = domain_row_to_json(&row);
+            return Ok(Some(Resolved::PackRecord {
+                pack: "knowledge".into(),
+                kind: "domain".into(),
+                data,
+            }));
+        }
+
+        // 2. Check knowledge_atoms.
+        let atom_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
+                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
+                      FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str)],
+                label: Some("knowledge.resolve_by_id.atom".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("knowledge resolve_by_id atom query: {e}"))
+            })?;
+
+        if let Some(row) = atom_row {
+            let data = atom_row_to_json(&row);
+            return Ok(Some(Resolved::PackRecord {
+                pack: "knowledge".into(),
+                kind: "atom".into(),
+                data,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve a knowledge record including already-soft-deleted records.
+    ///
+    /// Used by the hard-delete path to locate tombstoned records.
+    async fn resolve_by_id_including_deleted(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Resolved>, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        let mut reader = sql.reader().await.map_err(|e| {
+            RuntimeError::Internal(format!(
+                "knowledge resolve_by_id_including_deleted reader: {e}"
+            ))
+        })?;
+
+        let domain_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, description, tags, members, \
+                      created_at, updated_at, deleted_at \
+                      FROM knowledge_domains WHERE id = ?1 LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str.clone())],
+                label: Some("knowledge.resolve_by_id_incl_deleted.domain".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!(
+                    "knowledge resolve_by_id_including_deleted domain query: {e}"
+                ))
+            })?;
+
+        if let Some(row) = domain_row {
+            let data = domain_row_to_json(&row);
+            return Ok(Some(Resolved::PackRecord {
+                pack: "knowledge".into(),
+                kind: "domain".into(),
+                data,
+            }));
+        }
+
+        let atom_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
+                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
+                      FROM knowledge_atoms WHERE id = ?1 LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str)],
+                label: Some("knowledge.resolve_by_id_incl_deleted.atom".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!(
+                    "knowledge resolve_by_id_including_deleted atom query: {e}"
+                ))
+            })?;
+
+        if let Some(row) = atom_row {
+            let data = atom_row_to_json(&row);
+            return Ok(Some(Resolved::PackRecord {
+                pack: "knowledge".into(),
+                kind: "atom".into(),
+                data,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Delete a knowledge domain or atom by UUID.
+    ///
+    /// Soft-delete by default (`hard=false`): sets `deleted_at = now()`.
+    /// For domains, also tombstones the mirror atom in `knowledge_atoms`.
+    /// Hard-delete (`hard=true`): permanently removes rows from the table(s).
+    async fn delete_by_id(&self, id: Uuid, hard: bool) -> Result<serde_json::Value, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        // First determine the kind (including deleted rows so hard-delete can find tombstones).
+        let kind = match self.resolve_by_id_including_deleted(id).await? {
+            Some(Resolved::PackRecord { kind, .. }) => kind,
+            _ => {
+                return Err(RuntimeError::NotFound(format!(
+                    "knowledge record not found: {id}"
+                )));
+            }
+        };
+
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+
+        let mut writer = sql
+            .writer()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("knowledge delete_by_id writer: {e}")))?;
+
+        match kind.as_str() {
+            "domain" => {
+                if hard {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
+                            params: vec![SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain.hard".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain hard: {e}"
+                            ))
+                        })?;
+                    // Also hard-delete the mirror atom.
+                    writer
+                        .execute(SqlStatement {
+                            sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                            params: vec![SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain mirror hard: {e}"
+                            ))
+                        })?;
+                } else {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_domains SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain soft: {e}"
+                            ))
+                        })?;
+                    // Tombstone the mirror atom so FTS no longer surfaces it.
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain_mirror.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain mirror soft: {e}"
+                            ))
+                        })?;
+                }
+            }
+            "atom" => {
+                if hard {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                            params: vec![SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.atom.hard".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!("knowledge delete_by_id atom hard: {e}"))
+                        })?;
+                } else {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.atom.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!("knowledge delete_by_id atom soft: {e}"))
+                        })?;
+                }
+            }
+            other => {
+                return Err(RuntimeError::Internal(format!(
+                    "knowledge delete_by_id: unexpected kind {other:?}"
+                )));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "deleted": true,
+            "id": id_str,
+            "kind": kind,
+            "hard": hard,
+        }))
+    }
+}
+
+fn domain_row_to_json(row: &SqlRow) -> serde_json::Value {
+    let get_str = |col: &str| -> serde_json::Value {
+        match row.get(col) {
+            Some(SqlValue::Text(s)) => serde_json::Value::String(s.clone()),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let get_i64 = |col: &str| -> serde_json::Value {
+        match row.get(col) {
+            Some(SqlValue::Integer(n)) => serde_json::json!(n),
+            _ => serde_json::Value::Null,
+        }
+    };
+    serde_json::json!({
+        "id": get_str("id"),
+        "namespace": get_str("namespace"),
+        "slug": get_str("slug"),
+        "name": get_str("name"),
+        "description": get_str("description"),
+        "tags": get_str("tags"),
+        "members": get_str("members"),
+        "created_at": get_i64("created_at"),
+        "updated_at": get_i64("updated_at"),
+        "deleted_at": get_i64("deleted_at"),
+        "kind": "domain",
+    })
+}
+
+fn atom_row_to_json(row: &SqlRow) -> serde_json::Value {
+    let get_str = |col: &str| -> serde_json::Value {
+        match row.get(col) {
+            Some(SqlValue::Text(s)) => serde_json::Value::String(s.clone()),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let get_i64 = |col: &str| -> serde_json::Value {
+        match row.get(col) {
+            Some(SqlValue::Integer(n)) => serde_json::json!(n),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let get_bool = |col: &str| -> serde_json::Value {
+        match row.get(col) {
+            Some(SqlValue::Integer(n)) => serde_json::json!(*n != 0),
+            _ => serde_json::json!(false),
+        }
+    };
+    serde_json::json!({
+        "id": get_str("id"),
+        "namespace": get_str("namespace"),
+        "slug": get_str("slug"),
+        "name": get_str("name"),
+        "content": get_str("content"),
+        "tags": get_str("tags"),
+        "properties": get_str("properties"),
+        "status": get_str("status"),
+        "finalized": get_bool("finalized"),
+        "source_uri": get_str("source_uri"),
+        "source_type": get_str("source_type"),
+        "created_at": get_i64("created_at"),
+        "updated_at": get_i64("updated_at"),
+        "deleted_at": get_i64("deleted_at"),
+        "kind": "atom",
+    })
 }
