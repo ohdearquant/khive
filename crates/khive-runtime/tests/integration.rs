@@ -4,8 +4,8 @@
 //! and namespace isolation using an in-memory runtime.
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
-use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
-use khive_storage::{EdgeRelation, Event};
+use khive_storage::types::{Direction, PageRequest, TraversalOptions, TraversalRequest};
+use khive_storage::{EdgeRelation, Event, EventFilter};
 use khive_types::{EventKind, SubstrateKind};
 use uuid::Uuid;
 
@@ -2438,5 +2438,198 @@ async fn delete_note_cross_namespace_succeeds() {
     assert!(
         after_hard.is_none(),
         "hard-deleted note must not appear even via including_deleted"
+    );
+}
+
+// =============================================================================
+// PR-A1: delete_edge cross-namespace audit-namespace tests
+// =============================================================================
+
+/// Soft-delete an edge via a foreign-namespace token.
+///
+/// Asserts: (1) the row is soft-deleted, (2) the EdgeDeleted audit event's
+/// namespace == the record's own namespace (not the caller's).
+///
+/// Non-vacuity: this test FAILS (RC 101) if `delete_edge` uses the caller token
+/// for event attribution instead of the record token derived from edge.namespace.
+#[tokio::test]
+async fn delete_edge_cross_namespace_audit_uses_record_namespace_soft() {
+    let rt = rt();
+    let tok_owner = rt.authorize(Namespace::parse("ns-owner").unwrap()).unwrap();
+    let tok_caller = rt
+        .authorize(Namespace::parse("ns-caller").unwrap())
+        .unwrap();
+
+    // Create two entities in ns-owner and link them.
+    let src = rt
+        .create_entity(
+            &tok_owner,
+            "concept",
+            None,
+            "AuditSrcSoft",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let tgt = rt
+        .create_entity(
+            &tok_owner,
+            "concept",
+            None,
+            "AuditTgtSoft",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok_owner, src.id, tgt.id, EdgeRelation::Extends, 0.5, None)
+        .await
+        .unwrap();
+    let edge_id: Uuid = edge.id.into();
+
+    // Soft-delete via a foreign-namespace caller token — must succeed.
+    let deleted = rt.delete_edge(&tok_caller, edge_id, false).await.unwrap();
+    assert!(deleted, "cross-namespace soft delete_edge must return true");
+
+    // Row must be soft-deleted (gone from live query, present via including_deleted).
+    let live = rt.get_edge(&tok_owner, edge_id).await.unwrap();
+    assert!(
+        live.is_none(),
+        "soft-deleted edge must not appear in live get_edge"
+    );
+    let incl = rt
+        .get_edge_including_deleted(&tok_owner, edge_id)
+        .await
+        .unwrap();
+    assert!(
+        incl.is_some(),
+        "soft-deleted edge must appear via get_edge_including_deleted"
+    );
+
+    // Audit event namespace must be the record's namespace (ns-owner), not the caller's (ns-caller).
+    let events = rt
+        .list_events(
+            &tok_owner,
+            EventFilter {
+                kinds: vec![EventKind::EdgeDeleted],
+                ..Default::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .unwrap();
+    let delete_event = events
+        .items
+        .iter()
+        .find(|e| e.target_id == Some(edge_id))
+        .expect("EdgeDeleted event must exist for the deleted edge");
+    assert_eq!(
+        delete_event.namespace, "ns-owner",
+        "EdgeDeleted event namespace must be the record's namespace (ns-owner), not the caller's"
+    );
+    assert_eq!(
+        delete_event
+            .payload
+            .get("namespace")
+            .and_then(|v| v.as_str()),
+        Some("ns-owner"),
+        "EdgeDeleted payload.namespace must be the record's namespace (ns-owner)"
+    );
+}
+
+/// Hard-delete an edge via a foreign-namespace token.
+///
+/// Asserts: (1) the row is hard-removed, (2) the EdgeDeleted audit event's
+/// namespace == the record's own namespace (not the caller's).
+///
+/// Non-vacuity: this test FAILS (RC 101) if `delete_edge` uses the caller token
+/// for event attribution instead of the record token derived from edge.namespace.
+#[tokio::test]
+async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
+    let rt = rt();
+    let tok_owner = rt
+        .authorize(Namespace::parse("ns-owner-hard").unwrap())
+        .unwrap();
+    let tok_caller = rt
+        .authorize(Namespace::parse("ns-caller-hard").unwrap())
+        .unwrap();
+
+    // Create two entities in ns-owner-hard and link them.
+    let src = rt
+        .create_entity(
+            &tok_owner,
+            "concept",
+            None,
+            "AuditSrcHard",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let tgt = rt
+        .create_entity(
+            &tok_owner,
+            "concept",
+            None,
+            "AuditTgtHard",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let edge = rt
+        .link(&tok_owner, src.id, tgt.id, EdgeRelation::Extends, 0.6, None)
+        .await
+        .unwrap();
+    let edge_id: Uuid = edge.id.into();
+
+    // Hard-delete via a foreign-namespace caller token — must succeed.
+    let deleted = rt.delete_edge(&tok_caller, edge_id, true).await.unwrap();
+    assert!(deleted, "cross-namespace hard delete_edge must return true");
+
+    // Row must be hard-removed (not present even via including_deleted).
+    let incl = rt
+        .get_edge_including_deleted(&tok_owner, edge_id)
+        .await
+        .unwrap();
+    assert!(
+        incl.is_none(),
+        "hard-deleted edge must not appear via get_edge_including_deleted"
+    );
+
+    // Audit event namespace must be the record's namespace (ns-owner-hard), not the caller's.
+    let events = rt
+        .list_events(
+            &tok_owner,
+            EventFilter {
+                kinds: vec![EventKind::EdgeDeleted],
+                ..Default::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .unwrap();
+    let delete_event = events
+        .items
+        .iter()
+        .find(|e| e.target_id == Some(edge_id))
+        .expect("EdgeDeleted event must exist for the hard-deleted edge");
+    assert_eq!(
+        delete_event.namespace, "ns-owner-hard",
+        "EdgeDeleted event namespace must be record's namespace (ns-owner-hard), not caller's"
+    );
+    assert_eq!(
+        delete_event
+            .payload
+            .get("namespace")
+            .and_then(|v| v.as_str()),
+        Some("ns-owner-hard"),
+        "EdgeDeleted payload.namespace must be the record's namespace (ns-owner-hard)"
     );
 }

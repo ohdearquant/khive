@@ -2981,28 +2981,33 @@ impl KhiveRuntime {
         edge_id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let graph = self.graph(token)?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
             DeleteMode::Soft
         };
 
-        // Guard: verify `edge_id` is actually an edge (not an entity/note UUID) before touching
-        // anything. For soft delete, the live-only check is correct — there is nothing to do if
-        // the row is already soft-deleted. For hard delete, also check soft-deleted rows so that
-        // a soft-deleted edge can still be purged via its edge ID (namespace check is preserved:
-        // get_edge_including_deleted returns None for foreign-namespace IDs).
-        let edge_exists = if hard {
-            self.get_edge_including_deleted(token, edge_id)
-                .await?
-                .is_some()
+        // PR-A1: fetch the edge first to obtain the record's own namespace.
+        // By-ID ops cross namespace boundaries; all graph routing and audit
+        // events must use the record namespace, not the caller's (mirrors update_edge).
+        // For hard delete we also check soft-deleted rows so a soft-deleted edge
+        // can still be purged via its edge ID.
+        let edge = if hard {
+            self.get_edge_including_deleted(token, edge_id).await?
         } else {
-            graph.get_edge(LinkId::from(edge_id)).await?.is_some()
+            self.get_edge(token, edge_id).await?
         };
-        if !edge_exists {
+        let Some(edge) = edge else {
             return Ok(false);
-        }
+        };
+
+        // Derive record_ns / record_tok from the fetched edge (mirrors update_edge at ~2762-2767).
+        let record_ns: String = edge.namespace.clone();
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        let graph = self.graph(&record_tok)?;
 
         // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
         // already-soft-deleted ones — to prevent dangling graph_edges rows (ADR-002).
@@ -3014,17 +3019,17 @@ impl KhiveRuntime {
 
         let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
         if deleted {
-            let event_store = self.events(token)?;
-            let ns = token.namespace().as_str().to_string();
+            // Audit event: use the record's namespace (record_ns), not the caller's namespace.
+            let event_store = self.events(&record_tok)?;
             let event = khive_storage::event::Event::new(
-                ns.clone(),
+                record_ns.clone(),
                 "delete",
                 EventKind::EdgeDeleted,
                 SubstrateKind::Entity,
                 "",
             )
             .with_target(edge_id)
-            .with_payload(serde_json::json!({"id": edge_id, "namespace": ns, "hard": hard}));
+            .with_payload(serde_json::json!({"id": edge_id, "namespace": record_ns, "hard": hard}));
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("delete_edge: event store write failed: {e}"))
             })?;

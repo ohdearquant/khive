@@ -3919,6 +3919,24 @@ async fn update_edge_cross_namespace_weight_update_succeeds() {
         Some("local"),
         "edge namespace must remain the record's stored namespace after cross-ns update"
     );
+
+    // Non-vacuity: re-fetch the edge from storage and assert the persisted row has
+    // the new weight and original record namespace. This test FAILS (RC 101) if the
+    // non-symmetric upsert_edge persistence call is removed/no-op'd.
+    let fetched = f
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge after cross-ns update must succeed");
+    assert_eq!(
+        fetched.get("weight").and_then(Value::as_f64),
+        Some(0.9),
+        "persisted weight must be 0.9 after cross-ns update (storage persistence check)"
+    );
+    assert_eq!(
+        fetched.get("namespace").and_then(Value::as_str),
+        Some("local"),
+        "persisted namespace must remain 'local' (record ns) after cross-ns update"
+    );
 }
 
 /// Cross-namespace update_edge (weight-only, symmetric relation): must succeed.
