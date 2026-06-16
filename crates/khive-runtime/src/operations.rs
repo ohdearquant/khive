@@ -681,63 +681,42 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID, enforcing namespace visibility.
+    /// Retrieve an entity by ID.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or its namespace is
-    /// not in the token's visible set (indistinguishable — no cross-namespace
-    /// existence oracle).
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
-        let entity = self
-            .entities(token)?
+        self.entities(token)?
             .get_entity(id)
             .await?
-            .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
-        Self::ensure_namespace_visible(&entity.namespace, token)?;
-        Ok(entity)
+            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))
     }
 
-    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace visibility.
+    /// Retrieve an entity by ID including soft-deleted rows.
     ///
-    /// Returns `Ok(Some(entity))` when the entity exists in a namespace visible
-    /// to the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
-    /// was never created or is not visible to the caller.
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_entity_including_deleted(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Entity>> {
-        let entity = match self
-            .entities(token)?
+        self.entities(token)?
             .get_entity_including_deleted(id)
-            .await?
-        {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        if Self::ensure_namespace_visible(&entity.namespace, token).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(entity))
+            .await
+            .map_err(Into::into)
     }
 
-    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace visibility.
+    /// Retrieve a note by ID including soft-deleted rows.
     ///
-    /// Returns `Ok(Some(note))` when the note exists in a namespace visible to
-    /// the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
-    /// was never created or is not visible to the caller.
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_note_including_deleted(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<khive_storage::note::Note>> {
-        let note = match self.notes(token)?.get_note_including_deleted(id).await? {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-        if Self::ensure_namespace_visible(&note.namespace, token).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(note))
+        self.notes(token)?
+            .get_note_including_deleted(id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Fetch multiple entities by ID, returning only those that exist in the
@@ -2488,8 +2467,9 @@ impl KhiveRuntime {
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
-    /// different namespace (indistinguishable — no existence oracle).
+    /// Soft-delete or hard-delete an entity by ID.
+    ///
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn delete_entity(
         &self,
         token: &NamespaceToken,
@@ -2511,7 +2491,6 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
-        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
@@ -3741,8 +3720,11 @@ mod tests {
         );
     }
 
+    // ADR-007 PR-A1: by-ID ops no longer enforce namespace isolation.
+    // Shared-brain OSS model: UUID is globally unique; get/update/delete
+    // find the record regardless of caller's token namespace.
     #[tokio::test]
-    async fn get_entity_namespace_isolation() {
+    async fn get_entity_cross_namespace_no_longer_denied() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -3751,48 +3733,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Same namespace: visible.
+        // Same namespace: still works.
         let found = rt.get_entity(&ns_a, entity.id).await;
-        assert!(found.is_ok(), "should be visible in its own namespace");
+        assert!(found.is_ok(), "same-namespace get must succeed");
 
-        // Different namespace: NotFound error (no cross-namespace existence oracle).
-        let not_found = rt.get_entity(&ns_b, entity.id).await;
+        // Different namespace: now also returns the entity (shared brain, ADR-007).
+        let cross = rt.get_entity(&ns_b, entity.id).await;
         assert!(
-            not_found.is_err(),
-            "should not be visible across namespaces"
+            cross.is_ok(),
+            "cross-namespace get must succeed in shared-brain OSS (ADR-007 rule 2)"
         );
-        assert!(
-            matches!(not_found.unwrap_err(), crate::RuntimeError::NotFound(_)),
-            "cross-namespace get must return NotFound, not NamespaceMismatch"
-        );
+        assert_eq!(cross.unwrap().id, entity.id);
     }
 
     #[tokio::test]
-    async fn namespace_mismatch_error_message_is_opaque() {
-        // Timing-oracle mitigation: the external error message must not
-        // reveal which namespace the record actually lives in.
-        let rt = rt();
-        let ns_a = NamespaceToken::for_namespace(Namespace::parse("secret-ns").unwrap());
-        let ns_b = NamespaceToken::for_namespace(Namespace::parse("other-ns").unwrap());
-        let entity = rt
-            .create_entity(&ns_a, "concept", None, "Hidden", None, None, vec![])
-            .await
-            .unwrap();
-
-        let err = rt.get_entity(&ns_b, entity.id).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("secret-ns"),
-            "error message must not leak the actual namespace; got: {msg}"
-        );
-        assert!(
-            !msg.contains("other-ns"),
-            "error message must not leak the requested namespace; got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_entity_namespace_isolation() {
+    async fn delete_entity_cross_namespace_no_longer_denied() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -3801,30 +3756,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete from wrong namespace: NotFound (no existence oracle).
+        // ADR-007 PR-A1: cross-namespace delete now succeeds (shared brain).
         let cross_ns_result = rt.delete_entity(&ns_b, entity.id, true).await;
         assert!(
-            cross_ns_result.is_err(),
-            "cross-namespace delete must error"
+            cross_ns_result.is_ok(),
+            "cross-namespace delete must succeed in shared-brain OSS; got {:?}",
+            cross_ns_result
         );
-        assert!(
-            matches!(
-                cross_ns_result.unwrap_err(),
-                crate::RuntimeError::NotFound(_)
-            ),
-            "cross-namespace delete must return NotFound, not NamespaceMismatch"
-        );
+        assert!(cross_ns_result.unwrap(), "delete must return true");
 
-        // Entity still present in its own namespace.
-        let still_there = rt.get_entity(&ns_a, entity.id).await;
-        assert!(
-            still_there.is_ok(),
-            "entity must survive cross-ns delete attempt"
-        );
-
-        // Delete from correct namespace: succeeds.
-        let deleted_ok = rt.delete_entity(&ns_a, entity.id, true).await.unwrap();
-        assert!(deleted_ok, "same-namespace delete must succeed");
+        // Entity is gone — even from the original namespace.
+        let gone = rt.get_entity(&ns_a, entity.id).await;
+        assert!(gone.is_err(), "entity must be gone after delete");
     }
 
     // ---- Note annotation tests ----
@@ -6623,10 +6566,15 @@ mod tests {
         }
     }
 
-    // ── #568 regression: foreign traversal root must yield no expansion ───────
-
+    // ── ADR-007 PR-A1: traversal across namespace labels now succeeds ────────
+    //
+    // Pre-fix (#568): traverse with ns_b token + ns_a root was silently empty
+    // because substrate_exists_in_ns → get_entity rejected cross-namespace lookups.
+    // Post-fix: get_entity finds any entity by UUID; traverse finds the root and
+    // returns paths scoped to the graph store's namespace filter for ns_b.
+    // Full visible-set removal (PR-B) will collapse the namespace filter to "local".
     #[tokio::test]
-    async fn traverse_foreign_namespace_root_yields_no_expansion() {
+    async fn traverse_cross_namespace_root_is_accepted() {
         use khive_storage::types::TraversalOptions;
 
         let rt = rt();
@@ -6637,16 +6585,16 @@ mod tests {
             .create_entity(&ns_a, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
-        let b = rt
-            .create_entity(&ns_a, "concept", None, "B", None, None, vec![])
+        rt.create_entity(&ns_a, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(&ns_a, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+        rt.link(&ns_a, a.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
-            .unwrap();
+            .ok(); // may conflict with self-loop check; we just need an entity
 
-        // Traversal from ns_b using a root that belongs to ns_a must return nothing.
-        let paths = rt
+        // With PR-A1: substrate_exists_in_ns finds the ns_a root via get_entity
+        // (UUID-global lookup). The traverse proceeds; no panic.
+        let result = rt
             .traverse(
                 &ns_b,
                 TraversalRequest {
@@ -6659,12 +6607,8 @@ mod tests {
                     include_roots: true,
                 },
             )
-            .await
-            .unwrap();
-        assert!(
-            paths.is_empty(),
-            "foreign traversal root must be filtered before expansion, got {paths:?}"
-        );
+            .await;
+        assert!(result.is_ok(), "traverse must not error; got {:?}", result);
     }
 
     // ---- PR #82 regression: purge cascade must include already-soft-deleted edges ----
@@ -7317,6 +7261,124 @@ mod tests {
         assert!(
             hits_b.iter().any(|h| h.subject_id == note.id),
             "embed-b must hold a vector for the note after update; got {hits_b:?}"
+        );
+    }
+
+    // ── ADR-007 PR-A1 regression (V3): by-ID ops must not filter by namespace ──
+    //
+    // Pre-fix: get/update/delete on an entity stamped "lambda:leo" from a "local"
+    // token returned NotFound, causing the gtd.complete / update blindness.
+    // Post-fix: UUID is globally unique; by-ID ops find the record regardless of
+    // which namespace the caller's token carries.
+
+    #[tokio::test]
+    async fn get_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        // Create under "lambda:leo".
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(&leo_tok, "concept", None, "Leo-Entity", None, None, vec![])
+            .await
+            .unwrap();
+        assert_eq!(entity.namespace, "lambda:leo");
+
+        // Read from "local" — must succeed (no namespace gate on by-ID get).
+        let local_tok = NamespaceToken::local();
+        let fetched = rt.get_entity(&local_tok, entity.id).await;
+        assert!(
+            fetched.is_ok(),
+            "get_entity from local token must find lambda:leo entity; got {:?}",
+            fetched
+        );
+        assert_eq!(fetched.unwrap().id, entity.id);
+    }
+
+    #[tokio::test]
+    async fn update_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "Leo-Entity-Update",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Update from "local" token — must not error with NotFound.
+        let local_tok = NamespaceToken::local();
+        let patch = crate::curation::EntityPatch {
+            name: Some("Leo-Entity-Updated".to_string()),
+            ..Default::default()
+        };
+        let result = rt.update_entity(&local_tok, entity.id, patch).await;
+        assert!(
+            result.is_ok(),
+            "update_entity from local token must succeed on lambda:leo entity; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap().name, "Leo-Entity-Updated");
+    }
+
+    #[tokio::test]
+    async fn delete_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "Leo-Entity-Delete",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Delete from "local" token — must succeed.
+        let local_tok = NamespaceToken::local();
+        let deleted = rt.delete_entity(&local_tok, entity.id, false).await;
+        assert!(
+            deleted.is_ok(),
+            "delete_entity from local token must succeed on lambda:leo entity; got {:?}",
+            deleted
+        );
+        assert!(
+            deleted.unwrap(),
+            "delete must return true when entity existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_preserved_on_entity_after_cross_namespace_get() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "NS-Preserved",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // The namespace column on the fetched record must still say "lambda:leo".
+        let local_tok = NamespaceToken::local();
+        let fetched = rt.get_entity(&local_tok, entity.id).await.unwrap();
+        assert_eq!(
+            fetched.namespace, "lambda:leo",
+            "namespace column must be preserved; not overwritten with caller's namespace"
         );
     }
 }

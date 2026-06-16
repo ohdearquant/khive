@@ -32,11 +32,20 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    /// Default namespace for multi-record queries (ADR-007 PARAM-ONLY: used as a
+    /// WHERE filter on `query_edges`/`neighbors`/`traverse`, never as an
+    /// enforcement gate on by-ID operations).
     namespace: String,
 }
 
 impl SqlGraphStore {
-    /// Create a new store scoped to one namespace.
+    /// Create a new store with a default namespace for multi-record query filtering.
+    ///
+    /// The namespace is a PARAM-ONLY hint (ADR-007 rule 4) — it is used as a
+    /// WHERE filter in multi-record queries and as the write namespace stamped on
+    /// upserted edges, but it does NOT enforce isolation: `upsert_edge` accepts
+    /// edges from any namespace, and by-ID ops (`get_edge`, `delete_edge`) ignore
+    /// the namespace entirely.
     pub fn new_scoped(
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,
@@ -321,17 +330,7 @@ fn canonical_edge_endpoints(
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
-        let namespace = self.namespace.clone();
-        if edge.namespace != namespace {
-            return Err(StorageError::InvalidInput {
-                capability: StorageCapability::Graph,
-                operation: "upsert_edge".into(),
-                message: format!(
-                    "edge namespace {:?} does not match store namespace {:?}",
-                    edge.namespace, namespace
-                ),
-            });
-        }
+        let namespace = edge.namespace.clone();
         let id_str = Uuid::from(edge.id).to_string();
         let (source_id, target_id) =
             canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
@@ -386,21 +385,6 @@ impl GraphStore for SqlGraphStore {
 
     async fn upsert_edges(&self, edges: Vec<Edge>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = edges.len() as u64;
-        let namespace = self.namespace.clone();
-
-        // Validate namespaces before acquiring writer.
-        for edge in &edges {
-            if edge.namespace != namespace {
-                return Err(StorageError::InvalidInput {
-                    capability: StorageCapability::Graph,
-                    operation: "upsert_edges".into(),
-                    message: format!(
-                        "edge namespace {:?} does not match store namespace {:?}",
-                        edge.namespace, namespace
-                    ),
-                });
-            }
-        }
 
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -440,7 +424,7 @@ impl GraphStore for SqlGraphStore {
                          metadata = excluded.metadata, \
                          target_backend = excluded.target_backend",
                     rusqlite::params![
-                        &namespace,
+                        edge.namespace.as_str(),
                         id_str,
                         src_str,
                         tgt_str,
@@ -474,16 +458,15 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn get_edge(&self, id: LinkId) -> Result<Option<Edge>, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();
 
         self.with_reader("get_edge", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT namespace, id, source_id, target_id, relation, weight, \
                         created_at, updated_at, deleted_at, metadata, target_backend \
-                 FROM graph_edges WHERE namespace = ?1 AND id = ?2 AND deleted_at IS NULL",
+                 FROM graph_edges WHERE id = ?1 AND deleted_at IS NULL",
             )?;
-            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_edge(row)?)),
                 None => Ok(None),
@@ -493,16 +476,15 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn get_edge_including_deleted(&self, id: LinkId) -> Result<Option<Edge>, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();
 
         self.with_reader("get_edge_including_deleted", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT namespace, id, source_id, target_id, relation, weight, \
                         created_at, updated_at, deleted_at, metadata, target_backend \
-                 FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                 FROM graph_edges WHERE id = ?1",
             )?;
-            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_edge(row)?)),
                 None => Ok(None),
@@ -512,19 +494,18 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();
 
         self.with_writer("delete_edge", move |conn| {
             let affected = match mode {
                 DeleteMode::Soft => conn.execute(
-                    "UPDATE graph_edges SET deleted_at = ?3, updated_at = ?3 \
-                     WHERE namespace = ?1 AND id = ?2 AND deleted_at IS NULL",
-                    rusqlite::params![namespace, id_str, chrono::Utc::now().timestamp_micros(),],
+                    "UPDATE graph_edges SET deleted_at = ?2, updated_at = ?2 \
+                     WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![id_str, chrono::Utc::now().timestamp_micros()],
                 )?,
                 DeleteMode::Hard => conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                    rusqlite::params![namespace, id_str],
+                    "DELETE FROM graph_edges WHERE id = ?1",
+                    rusqlite::params![id_str],
                 )?,
             };
             Ok(affected > 0)

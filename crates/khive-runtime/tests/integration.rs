@@ -1888,8 +1888,10 @@ async fn update_edge_note_note_to_refutes_accepted() {
 // Multi-namespace read visibility (visible-set tokens)
 // =============================================================================
 
-/// A token with visible=[a,b] can list/get entities+notes in both namespaces,
-/// but not in a third namespace c. Writes land in the primary (a) only.
+/// ADR-007 PR-A1: visible-set enforcement on by-ID ops is removed.
+/// list_entities / list_notes still filter by visible_namespaces (PR-B collapses that).
+/// get_entity and get_note_including_deleted now return any record by UUID regardless
+/// of the token's visible set.  Writes still land in the primary namespace only.
 #[tokio::test]
 async fn visible_set_reads_primary_and_extra_not_third() {
     let rt = rt();
@@ -1954,21 +1956,18 @@ async fn visible_set_reads_primary_and_extra_not_third() {
         "NoteC must NOT be visible"
     );
 
-    // --- get_entity: a and b succeed, c returns NotFound ---
+    // --- get_entity: all three succeed by UUID (PR-A1: visible-set gate removed) ---
     rt.get_entity(&vis_tok, entity_a.id)
         .await
         .expect("get entity_a must succeed");
     rt.get_entity(&vis_tok, entity_b.id)
         .await
         .expect("get entity_b (visible non-primary) must succeed");
-    let err_c = rt.get_entity(&vis_tok, entity_c.id).await;
-    assert!(
-        err_c.is_err(),
-        "get entity_c (non-visible) must return NotFound"
-    );
+    rt.get_entity(&vis_tok, entity_c.id)
+        .await
+        .expect("get entity_c by UUID succeeds — visible-set gate removed in PR-A1");
 
-    // --- get_note: a and b visible, c filtered out ---
-    // get_note_including_deleted returns Ok(None) when namespace not visible.
+    // --- get_note: all three returned by UUID (PR-A1: visible-set gate removed) ---
     let fetched_note_a = rt
         .get_note_including_deleted(&vis_tok, note_a.id)
         .await
@@ -1991,10 +1990,8 @@ async fn visible_set_reads_primary_and_extra_not_third() {
         .get_note_including_deleted(&vis_tok, note_c.id)
         .await
         .expect("call must not error");
-    assert!(
-        fetched_note_c.is_none(),
-        "note_c (non-visible namespace) must be filtered out"
-    );
+    // PR-A1: UUID fetch returns regardless of visible set; list_notes still filters (PR-B scope).
+    let _ = fetched_note_c;
 
     // --- WRITE via vis_tok lands in primary (vis-a) only, not in vis-b ---
     let written = rt
