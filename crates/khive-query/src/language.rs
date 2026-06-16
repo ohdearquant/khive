@@ -133,19 +133,31 @@ mod tests {
 
     #[test]
     fn parse_auto_gql_match_not_rejected() {
-        let result = parse_auto("MATCH (a:concept) RETURN a");
-        assert!(
-            !matches!(result, Err(QueryError::Unsupported(_))),
-            "valid GQL MATCH must not be rejected as a write form; got {result:?}"
-        );
+        let q = parse_auto("MATCH (a:concept) RETURN a").unwrap();
+        assert!(!q.pattern.elements.is_empty(), "valid GQL MATCH must parse");
     }
 
     #[test]
     fn parse_auto_sparql_select_not_rejected() {
-        let result = parse_auto("SELECT ?a WHERE { ?a :extends ?b . }");
+        let q = parse_auto("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
         assert!(
-            !matches!(result, Err(QueryError::Unsupported(_))),
-            "valid SPARQL SELECT must not be rejected as a write form; got {result:?}"
+            !q.pattern.elements.is_empty(),
+            "valid SPARQL SELECT must parse"
         );
+    }
+
+    #[test]
+    fn parse_auto_load_rejected() {
+        // LOAD is in reject_write's union set but NOT in reject_gql_write, so
+        // if reject_write is reverted this routes to GQL and returns a Parse
+        // error, not Unsupported. This test is therefore sensitive to the
+        // parse_auto guard specifically.
+        let err = parse_auto("LOAD <http://e/data>").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "LOAD must return Unsupported on the public path; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "got: {msg}");
     }
 }
