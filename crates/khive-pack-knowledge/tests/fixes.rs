@@ -31,16 +31,6 @@ impl Fixture {
         self.registry.dispatch(verb, args).await
     }
 
-    async fn dispatch_ns(
-        &self,
-        verb: &str,
-        ns: &str,
-        mut args: Value,
-    ) -> Result<Value, RuntimeError> {
-        args["namespace"] = json!(ns);
-        self.registry.dispatch(verb, args).await
-    }
-
     async fn sql_exec(&self, sql: &str, params: Vec<SqlValue>) {
         let access = self.rt.sql();
         let mut w = access.writer().await.expect("writer");
@@ -965,97 +955,63 @@ async fn w10_import_section_only_markdown_synthesizes_atom_content() {
     );
 }
 
-// ── S4: namespace guard on UPDATE WHERE clauses ───────────────────────────────
+// ── S4: upsert-on-duplicate-slug updates in place (ADR-007 Rev 2: single local ns) ──
 
 #[tokio::test]
-async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
+async fn s4_upsert_atoms_update_on_duplicate_slug() {
     let f = pack(rt());
 
-    // Insert same slug in two different namespaces.
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.upsert_atoms",
-        "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "atoms": [{ "slug": "s4-atom", "name": "Original", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert alpha");
+    .expect("initial upsert");
 
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.upsert_atoms",
-        "ns-beta",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Beta Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "atoms": [{ "slug": "s4-atom", "name": "Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert beta");
+    .expect("update upsert");
 
-    // Update in ns-alpha only.
-    f.dispatch_ns(
-        "knowledge.upsert_atoms",
-        "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
-    )
-    .await
-    .expect("update alpha");
-
-    // ns-beta must be unchanged.
-    let beta = f
-        .dispatch_ns("knowledge.get", "ns-beta", json!({ "id": "shared-slug" }))
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "s4-atom" }))
         .await
-        .expect("get beta");
+        .expect("get atom");
     assert_eq!(
-        beta["name"].as_str().unwrap_or(""),
-        "Beta Name",
-        "update in ns-alpha must not affect ns-beta atom"
-    );
-
-    // ns-alpha must have the updated name.
-    let alpha = f
-        .dispatch_ns("knowledge.get", "ns-alpha", json!({ "id": "shared-slug" }))
-        .await
-        .expect("get alpha");
-    assert_eq!(
-        alpha["name"].as_str().unwrap_or(""),
-        "Alpha Name Updated",
-        "ns-alpha atom must reflect the update"
+        atom["name"].as_str().unwrap_or(""),
+        "Updated",
+        "upsert on duplicate slug must update the name"
     );
 }
 
 #[tokio::test]
-async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
+async fn s4_upsert_domains_update_on_duplicate_slug() {
     let f = pack(rt());
 
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.upsert_domains",
-        "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "s4-domain", "name": "Original Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert alpha domain");
+    .expect("initial domain upsert");
 
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.upsert_domains",
-        "ns-beta",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "domains": [{ "slug": "s4-domain", "name": "Updated Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert beta domain");
+    .expect("update domain upsert");
 
-    f.dispatch_ns(
-        "knowledge.upsert_domains",
-        "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
-    )
-    .await
-    .expect("update alpha domain");
-
-    let beta = f
-        .dispatch_ns("knowledge.get", "ns-beta", json!({ "id": "shared-domain" }))
+    let domain = f
+        .dispatch("knowledge.get", json!({ "id": "s4-domain" }))
         .await
-        .expect("get beta domain");
+        .expect("get domain");
     assert_eq!(
-        beta["name"].as_str().unwrap_or(""),
-        "Beta Domain",
-        "update in ns-alpha must not affect ns-beta domain"
+        domain["name"].as_str().unwrap_or(""),
+        "Updated Domain",
+        "upsert on duplicate slug must update the domain name"
     );
 }
 
