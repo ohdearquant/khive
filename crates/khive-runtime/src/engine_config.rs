@@ -150,13 +150,12 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
 
-    /// Default actor (namespace) for this khive instance.
+    /// Default actor identity for this khive instance.
     ///
-    /// When present, `actor.id` becomes the `default_namespace` used by the
-    /// runtime when no per-operation `namespace` argument is supplied. OSS
-    /// model: no enforcement — any operation may still pass `namespace=` to
-    /// use a different namespace. Cloud model derives namespace from an
-    /// authenticated token and ignores this field.
+    /// When present, `actor.id` feeds configuration identity and gate/attribution
+    /// policy input.  OSS dispatch pins storage to the shared `local` namespace
+    /// regardless of this setting (ADR-007 Rev 2).  Cloud model derives actor
+    /// identity from an authenticated token.
     #[serde(default)]
     pub actor: ActorConfig,
 
