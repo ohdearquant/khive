@@ -27,6 +27,7 @@ pub use curation::{
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
 };
 #[cfg(unix)]
+pub use daemon::acquire_recovery_lock;
 pub use daemon::{
     pid_path, run_daemon, socket_path, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
     PROTOCOL_VERSION,

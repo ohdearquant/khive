@@ -14,8 +14,12 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use libc;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -79,6 +83,39 @@ pub fn lock_path() -> PathBuf {
         }
     }
     khive_dir().join("khived.recovery.lock")
+}
+
+/// Acquire an exclusive advisory flock on the recovery/startup lock file.
+///
+/// The returned `File` holds the lock for its lifetime; dropping it releases
+/// it.  Used by both the client (serializing kill+spawn) and the daemon server
+/// (serializing cleanup+bind+pid-write) so the two critical sections are
+/// mutually exclusive across processes.
+#[cfg(unix)]
+pub fn acquire_recovery_lock() -> Option<std::fs::File> {
+    let path = lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "cannot open recovery lock file");
+            return None;
+        }
+    };
+    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("flock LOCK_EX failed on recovery lock");
+        return None;
+    }
+    Some(file)
 }
 
 // ── wire types ────────────────────────────────────────────────────────────────
@@ -293,7 +330,38 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
 
     match serde_json::to_vec(&resp) {
         Ok(payload) => {
-            if let Err(e) = write_frame(&mut stream, &payload).await {
+            if payload.len() > MAX_FRAME_BYTES {
+                // The serialized response exceeds the IPC frame cap.  Send a
+                // small explicit error frame so the client can distinguish a
+                // per-request payload-size failure from a daemon crash.  A
+                // client that receives this error frame will NOT trigger
+                // stale-daemon kill/respawn (ParseFailure requires a read_frame
+                // error, not an ok=false result).
+                tracing::warn!(
+                    bytes = payload.len(),
+                    limit = MAX_FRAME_BYTES,
+                    "daemon response exceeds MAX_FRAME_BYTES; sending explicit error frame"
+                );
+                let err_resp = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(format!(
+                        "response too large: {} bytes exceeds {} byte IPC cap",
+                        payload.len(),
+                        MAX_FRAME_BYTES,
+                    )),
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: resp.served_config_id,
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                };
+                if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
+                    if let Err(e) = write_frame(&mut stream, &err_payload).await {
+                        tracing::debug!(error = %e, "failed to write oversized-response error frame");
+                    }
+                }
+            } else if let Err(e) = write_frame(&mut stream, &payload).await {
                 tracing::debug!(error = %e, "failed to write daemon response frame");
             }
         }
@@ -315,6 +383,19 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
         }
     }
 
+    // Hold the startup lock across cleanup → bind → pid-write so a concurrent
+    // client's kill_and_respawn (which also holds this lock) cannot unlink the
+    // socket between our bind and our pid-write.  The lock is released once the
+    // listener is bound and the PID file is written — at that point any racing
+    // client will find a live socket+pid and skip the stale-cleanup path.
+    //
+    // Deadlock note: the client holds this lock only during kill+spawn and
+    // releases it before the spawned daemon process starts (the lock guard is
+    // dropped when kill_and_respawn returns, before the readiness probe loop).
+    // The daemon then acquires the lock here without any client holding it.
+    #[cfg(unix)]
+    let _startup_lock = acquire_recovery_lock();
+
     if !cleanup_stale_daemon(&sock, &pid_file).await {
         tracing::info!("a responsive khived is already running; exiting");
         return Ok(());
@@ -327,6 +408,11 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     }
 
     write_pid_file(&pid_file)?;
+    // Release the startup lock now: the listener is bound and the PID file is
+    // written.  Any concurrent client or daemon startup will observe a live
+    // socket+pid and take the non-recovery path.
+    #[cfg(unix)]
+    drop(_startup_lock);
     tracing::info!(socket = ?sock, pid = std::process::id(), "khived listening");
 
     {
