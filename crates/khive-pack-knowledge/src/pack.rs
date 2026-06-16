@@ -9,9 +9,10 @@ use uuid::Uuid;
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
 use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::{HandlerDef, Pack};
 
+use crate::knowledge::util::{atom_from_row, atom_to_json, domain_from_row, domain_to_json};
 use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
 use crate::vocab::KNOWLEDGE_HANDLERS;
@@ -195,12 +196,13 @@ impl PackByIdResolver for KnowledgePack {
             })?;
 
         if let Some(row) = domain_row {
-            let data = domain_row_to_json(&row);
-            return Ok(Some(Resolved::PackRecord {
-                pack: "knowledge".into(),
-                kind: "domain".into(),
-                data,
-            }));
+            if let Some(domain) = domain_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "domain".into(),
+                    data: domain_to_json(&domain),
+                }));
+            }
         }
 
         // 2. Check knowledge_atoms.
@@ -219,12 +221,13 @@ impl PackByIdResolver for KnowledgePack {
             })?;
 
         if let Some(row) = atom_row {
-            let data = atom_row_to_json(&row);
-            return Ok(Some(Resolved::PackRecord {
-                pack: "knowledge".into(),
-                kind: "atom".into(),
-                data,
-            }));
+            if let Some(atom) = atom_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "atom".into(),
+                    data: atom_to_json(&atom),
+                }));
+            }
         }
 
         Ok(None)
@@ -263,12 +266,13 @@ impl PackByIdResolver for KnowledgePack {
             })?;
 
         if let Some(row) = domain_row {
-            let data = domain_row_to_json(&row);
-            return Ok(Some(Resolved::PackRecord {
-                pack: "knowledge".into(),
-                kind: "domain".into(),
-                data,
-            }));
+            if let Some(domain) = domain_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "domain".into(),
+                    data: domain_to_json(&domain),
+                }));
+            }
         }
 
         let atom_row = reader
@@ -288,12 +292,13 @@ impl PackByIdResolver for KnowledgePack {
             })?;
 
         if let Some(row) = atom_row {
-            let data = atom_row_to_json(&row);
-            return Ok(Some(Resolved::PackRecord {
-                pack: "knowledge".into(),
-                kind: "atom".into(),
-                data,
-            }));
+            if let Some(atom) = atom_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "atom".into(),
+                    data: atom_to_json(&atom),
+                }));
+            }
         }
 
         Ok(None)
@@ -429,70 +434,4 @@ impl PackByIdResolver for KnowledgePack {
             "hard": hard,
         }))
     }
-}
-
-fn domain_row_to_json(row: &SqlRow) -> serde_json::Value {
-    let get_str = |col: &str| -> serde_json::Value {
-        match row.get(col) {
-            Some(SqlValue::Text(s)) => serde_json::Value::String(s.clone()),
-            _ => serde_json::Value::Null,
-        }
-    };
-    let get_i64 = |col: &str| -> serde_json::Value {
-        match row.get(col) {
-            Some(SqlValue::Integer(n)) => serde_json::json!(n),
-            _ => serde_json::Value::Null,
-        }
-    };
-    serde_json::json!({
-        "id": get_str("id"),
-        "namespace": get_str("namespace"),
-        "slug": get_str("slug"),
-        "name": get_str("name"),
-        "description": get_str("description"),
-        "tags": get_str("tags"),
-        "members": get_str("members"),
-        "created_at": get_i64("created_at"),
-        "updated_at": get_i64("updated_at"),
-        "deleted_at": get_i64("deleted_at"),
-        "kind": "domain",
-    })
-}
-
-fn atom_row_to_json(row: &SqlRow) -> serde_json::Value {
-    let get_str = |col: &str| -> serde_json::Value {
-        match row.get(col) {
-            Some(SqlValue::Text(s)) => serde_json::Value::String(s.clone()),
-            _ => serde_json::Value::Null,
-        }
-    };
-    let get_i64 = |col: &str| -> serde_json::Value {
-        match row.get(col) {
-            Some(SqlValue::Integer(n)) => serde_json::json!(n),
-            _ => serde_json::Value::Null,
-        }
-    };
-    let get_bool = |col: &str| -> serde_json::Value {
-        match row.get(col) {
-            Some(SqlValue::Integer(n)) => serde_json::json!(*n != 0),
-            _ => serde_json::json!(false),
-        }
-    };
-    serde_json::json!({
-        "id": get_str("id"),
-        "namespace": get_str("namespace"),
-        "slug": get_str("slug"),
-        "name": get_str("name"),
-        "content": get_str("content"),
-        "tags": get_str("tags"),
-        "properties": get_str("properties"),
-        "status": get_str("status"),
-        "finalized": get_bool("finalized"),
-        "source_uri": get_str("source_uri"),
-        "source_type": get_str("source_type"),
-        "created_at": get_i64("created_at"),
-        "updated_at": get_i64("updated_at"),
-        "deleted_at": get_i64("deleted_at"),
-        "kind": "atom",
-    })
 }

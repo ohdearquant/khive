@@ -121,7 +121,7 @@ pub(super) fn row_bool(row: &khive_storage::types::SqlRow, col: &str) -> bool {
     matches!(row.get(col), Some(SqlValue::Integer(1)))
 }
 
-pub(super) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
+pub(crate) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
     Some(Atom {
         id,
@@ -141,7 +141,7 @@ pub(super) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> 
     })
 }
 
-pub(super) fn domain_from_row(row: &khive_storage::types::SqlRow) -> Option<Domain> {
+pub(crate) fn domain_from_row(row: &khive_storage::types::SqlRow) -> Option<Domain> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
     Some(Domain {
         id,
@@ -157,7 +157,7 @@ pub(super) fn domain_from_row(row: &khive_storage::types::SqlRow) -> Option<Doma
     })
 }
 
-pub(super) fn atom_to_json(atom: &Atom) -> Value {
+pub(crate) fn atom_to_json(atom: &Atom) -> Value {
     json!({
         "id": atom.id.to_string(),
         "namespace": atom.namespace,
@@ -176,7 +176,7 @@ pub(super) fn atom_to_json(atom: &Atom) -> Value {
     })
 }
 
-pub(super) fn domain_to_json(domain: &Domain) -> Value {
+pub(crate) fn domain_to_json(domain: &Domain) -> Value {
     json!({
         "id": domain.id.to_string(),
         "namespace": domain.namespace,
