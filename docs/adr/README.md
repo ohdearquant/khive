@@ -6,23 +6,23 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 
 ## Foundation
 
-| #                                               | Title                                |
-| ----------------------------------------------- | ------------------------------------ |
-| [ADR-001](ADR-001-entity-kind-taxonomy.md)      | Entity Kind Taxonomy                 |
-| [ADR-002](ADR-002-edge-ontology.md)             | Closed Edge Ontology                 |
-| [ADR-003](ADR-003-system-architecture.md)       | System Architecture                  |
-| [ADR-004](ADR-004-substrate-observables.md)     | Substrate Observables                |
-| [ADR-005](ADR-005-storage-capability-traits.md) | Storage Capability Traits            |
-| [ADR-006](ADR-006-deterministic-scoring.md)     | Deterministic Scoring                |
-| [ADR-007](ADR-007-namespace.md)                 | Namespace                            |
-| [ADR-008](ADR-008-query-layer-separation.md)    | Query Layer Separation               |
-| [ADR-009](ADR-009-backend-architecture.md)      | Backend Architecture                 |
-| [ADR-010](ADR-010-kg-versioning.md)             | KG Versioning Strategy               |
-| [ADR-011](ADR-011-embedding-and-inference.md)   | Embedding and Inference Architecture |
-| [ADR-012](ADR-012-retrieval-composition.md)     | Retrieval Composition                |
-| [ADR-013](ADR-013-note-kind-taxonomy.md)        | Note Kind Taxonomy                   |
-| [ADR-014](ADR-014-curation-operations.md)       | Curation Operations                  |
-| [ADR-015](ADR-015-schema-migrations.md)         | Schema Migrations                    |
+| #                                               | Title                                                        |
+| ----------------------------------------------- | ------------------------------------------------------------ |
+| [ADR-001](ADR-001-entity-kind-taxonomy.md)      | Entity Kind Taxonomy                                         |
+| [ADR-002](ADR-002-edge-ontology.md)             | Closed Edge Ontology                                         |
+| [ADR-003](ADR-003-system-architecture.md)       | System Architecture                                          |
+| [ADR-004](ADR-004-substrate-observables.md)     | Substrate Observables                                        |
+| [ADR-005](ADR-005-storage-capability-traits.md) | Storage Capability Traits                                    |
+| [ADR-006](ADR-006-deterministic-scoring.md)     | Deterministic Scoring                                        |
+| [ADR-007](ADR-007-namespace.md)                 | Namespace (Rev 2 — attribution-only, all-local, single Gate) |
+| [ADR-008](ADR-008-query-layer-separation.md)    | Query Layer Separation                                       |
+| [ADR-009](ADR-009-backend-architecture.md)      | Backend Architecture                                         |
+| [ADR-010](ADR-010-kg-versioning.md)             | KG Versioning Strategy                                       |
+| [ADR-011](ADR-011-embedding-and-inference.md)   | Embedding and Inference Architecture                         |
+| [ADR-012](ADR-012-retrieval-composition.md)     | Retrieval Composition                                        |
+| [ADR-013](ADR-013-note-kind-taxonomy.md)        | Note Kind Taxonomy                                           |
+| [ADR-014](ADR-014-curation-operations.md)       | Curation Operations                                          |
+| [ADR-015](ADR-015-schema-migrations.md)         | Schema Migrations                                            |
 
 ## MCP / Pack Surface
 
@@ -89,6 +89,9 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-054](ADR-054-ann-build-strategy-scaling-limits.md)  | ANN Build Strategy and Scaling Limits (Proposed)                                                                |
 | [ADR-055](ADR-055-epistemic-edge-relations.md)           | Epistemic Edge Relations — `supports` and `refutes` (Accepted)                                                  |
 | [ADR-056](ADR-056-channel-transport-layer.md)            | Channel Transport Layer — `khive-channel` and External Messaging Adapters (Proposed)                            |
+| [ADR-057](ADR-057-comm-actor-addressed-delivery.md)      | Comm Actor-Addressed Delivery (Accepted)                                                                        |
+| [ADR-058](ADR-058-brain-posterior-read-path.md)          | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking (Proposed)                            |
+| [ADR-059](ADR-059-namespace-write-tiers.md)              | Namespace Write Tiers and Cross-Namespace Link Access Control (Withdrawn — superseded by ADR-007 Rev 2)         |
 
 ## Closed Taxonomies — Quick Reference
 
