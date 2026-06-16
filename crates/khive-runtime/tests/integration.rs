@@ -1990,8 +1990,16 @@ async fn visible_set_reads_primary_and_extra_not_third() {
         .get_note_including_deleted(&vis_tok, note_c.id)
         .await
         .expect("call must not error");
-    // PR-A1: UUID fetch returns regardless of visible set; list_notes still filters (PR-B scope).
-    let _ = fetched_note_c;
+    // PR-A1: by-ID get returns the note regardless of visible set (list_notes still filters — PR-B).
+    assert!(
+        fetched_note_c.is_some(),
+        "note_c (outside visible set) must be returned by UUID via PR-A1 by-ID contract"
+    );
+    assert_eq!(
+        fetched_note_c.as_ref().unwrap().namespace.as_str(),
+        "vis-c",
+        "fetched note_c must preserve its stored namespace"
+    );
 
     // --- WRITE via vis_tok lands in primary (vis-a) only, not in vis-b ---
     let written = rt
@@ -2316,5 +2324,119 @@ async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
     assert_eq!(
         fetched.id, entity_in_extra.id,
         "visible-set read of extra-namespace entity must succeed"
+    );
+}
+
+// =============================================================================
+// PR-A1: cross-namespace note by-ID operations (update_note / delete_note)
+// =============================================================================
+
+/// update_note via a foreign-namespace token must succeed (PR-A1).
+/// Non-vacuity: this test FAILS if the old visible-set guard is restored.
+#[tokio::test]
+async fn update_note_cross_namespace_succeeds() {
+    use khive_runtime::NotePatch;
+
+    let rt = rt();
+    let tok_a = rt
+        .authorize(Namespace::parse("note-ns-a").unwrap())
+        .unwrap();
+    let tok_b = rt
+        .authorize(Namespace::parse("note-ns-b").unwrap())
+        .unwrap();
+
+    let note = rt
+        .create_note(
+            &tok_a,
+            "observation",
+            None,
+            "original content",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(note.namespace.as_str(), "note-ns-a");
+
+    // Update from a different token — must succeed.
+    let patch = NotePatch::new(None, Some("updated content".to_string()), None, None, None);
+    let updated = rt.update_note(&tok_b, note.id, patch).await;
+    assert!(
+        updated.is_ok(),
+        "update_note from foreign token must succeed; got {:?}",
+        updated
+    );
+    let updated = updated.unwrap();
+    assert_eq!(updated.content, "updated content");
+    // Namespace on the record must NOT change to tok_b's namespace.
+    assert_eq!(
+        updated.namespace.as_str(),
+        "note-ns-a",
+        "namespace must remain the record's stored namespace after cross-ns update"
+    );
+}
+
+/// delete_note (soft and hard) via a foreign-namespace token must succeed (PR-A1).
+/// Non-vacuity: this test FAILS if the old ensure_namespace guard is restored.
+#[tokio::test]
+async fn delete_note_cross_namespace_succeeds() {
+    let rt = rt();
+    let tok_a = rt.authorize(Namespace::parse("del-ns-a").unwrap()).unwrap();
+    let tok_b = rt.authorize(Namespace::parse("del-ns-b").unwrap()).unwrap();
+
+    // --- soft delete from foreign token ---
+    let note_soft = rt
+        .create_note(
+            &tok_a,
+            "observation",
+            None,
+            "soft target",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let soft_result = rt.delete_note(&tok_b, note_soft.id, false).await;
+    assert!(
+        soft_result.unwrap(),
+        "cross-namespace soft delete_note must return true"
+    );
+    // Confirm gone via live query.
+    let after_soft = rt
+        .get_note_including_deleted(&tok_a, note_soft.id)
+        .await
+        .unwrap();
+    assert!(
+        after_soft.is_some(),
+        "soft-deleted note must still appear in including_deleted"
+    );
+
+    // --- hard delete from foreign token ---
+    let note_hard = rt
+        .create_note(
+            &tok_a,
+            "observation",
+            None,
+            "hard target",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let hard_result = rt.delete_note(&tok_b, note_hard.id, true).await;
+    assert!(
+        hard_result.unwrap(),
+        "cross-namespace hard delete_note must return true"
+    );
+    let after_hard = rt
+        .get_note_including_deleted(&tok_a, note_hard.id)
+        .await
+        .unwrap();
+    assert!(
+        after_hard.is_none(),
+        "hard-deleted note must not appear even via including_deleted"
     );
 }

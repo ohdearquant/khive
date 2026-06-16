@@ -864,13 +864,14 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = node_id.to_string();
+        // No namespace filter: UUID v4 is globally unique. Hard-delete cascade must
+        // remove ALL incident edges regardless of which namespace they were written in
+        // (ADR-002 no-dangling-references, ADR-007 by-ID contract).
         self.with_writer("purge_incident_edges", move |conn| {
             let affected = conn.execute(
-                "DELETE FROM graph_edges \
-                 WHERE namespace = ?1 AND (source_id = ?2 OR target_id = ?2)",
-                rusqlite::params![namespace, id_str],
+                "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1",
+                rusqlite::params![id_str],
             )?;
             Ok(affected as u64)
         })
