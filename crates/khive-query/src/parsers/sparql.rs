@@ -544,18 +544,60 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// SPARQL 1.1 Update defines several write operations that must never reach
 /// the compiler. Check for them before parsing so the rejection is deliberate
 /// ("the query verb is read-only") rather than a generic "expected SELECT".
+///
+/// We skip the optional prologue (PREFIX / BASE declarations) and line comments
+/// before inspecting the leading keyword so that `WITH <g> DELETE …` and
+/// prologue-prefixed updates (`PREFIX ex: <…> INSERT DATA { … }`) are also
+/// caught. Read-only forms (SELECT / ASK / CONSTRUCT / DESCRIBE) are untouched.
 fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
-    // Extract the first token (ASCII word, case-insensitive) to identify the verb.
-    let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
-    match first.as_str() {
-        "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "ADD" | "MOVE" | "COPY" | "CREATE" => {
-            Err(QueryError::Unsupported(
-                "the query verb is read-only; \
-                 to mutate the graph use: create, update, link, merge, delete"
-                    .into(),
-            ))
-        }
+    let keyword = sparql_leading_keyword(input);
+    match keyword.as_str() {
+        "INSERT" | "DELETE" | "WITH" | "LOAD" | "CLEAR" | "CREATE" | "DROP" | "COPY" | "MOVE"
+        | "ADD" => Err(QueryError::Unsupported(
+            "the query verb is read-only; \
+             to mutate the graph use: create, update, link, merge, delete"
+                .into(),
+        )),
         _ => Ok(()),
+    }
+}
+
+/// Return the first meaningful SPARQL keyword, skipping line comments and the
+/// optional prologue (zero or more PREFIX / BASE declarations).
+fn sparql_leading_keyword(input: &str) -> String {
+    let mut rest = input;
+    loop {
+        // Skip leading ASCII whitespace.
+        rest = rest.trim_start();
+
+        // Skip a line comment: # … \n
+        if rest.starts_with('#') {
+            rest = match rest.find('\n') {
+                Some(pos) => &rest[pos + 1..],
+                None => "",
+            };
+            continue;
+        }
+
+        // Peel off one PREFIX or BASE declaration and loop.
+        let upper: String = rest
+            .chars()
+            .take(6)
+            .flat_map(|c| c.to_uppercase())
+            .collect();
+        if upper.starts_with("PREFIX") || upper.starts_with("BASE") {
+            // Advance past the keyword.
+            let skip = if upper.starts_with("PREFIX") { 6 } else { 4 };
+            rest = &rest[skip..];
+            // Skip to end of the IRI in angle brackets, if present.
+            if let Some(close) = rest.find('>') {
+                rest = &rest[close + 1..];
+            }
+            continue;
+        }
+
+        // The next whitespace-delimited token is the operative keyword.
+        return rest.split_whitespace().next().unwrap_or("").to_uppercase();
     }
 }
 
@@ -736,5 +778,62 @@ mod tests {
         // Positive control: a valid SELECT must still parse correctly.
         let q = parse("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
         assert!(!q.pattern.elements.is_empty(), "valid SELECT must parse");
+    }
+
+    #[test]
+    fn sparql_with_delete_where_rejected() {
+        // WITH <g> DELETE … WHERE is a SPARQL Update op that slips past a
+        // first-token check (first token is WITH, not DELETE).
+        let err = parse("WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "WITH … DELETE … must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only"),
+            "error must mention 'read-only'; got: {msg}"
+        );
+        assert!(
+            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
+            "error must name the mutation verbs; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sparql_prefixed_insert_data_rejected() {
+        // A prologue-prefixed INSERT DATA must also be caught.
+        let err =
+            parse("PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:b ex:c }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "prefixed INSERT DATA must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "got: {msg}");
+    }
+
+    #[test]
+    fn sparql_clear_graph_rejected() {
+        let err = parse("CLEAR GRAPH <http://example.org/graph>").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "CLEAR GRAPH must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "got: {msg}");
+    }
+
+    #[test]
+    fn sparql_prefixed_select_write_guard_passes_through() {
+        // Positive control: the write guard must NOT trip on a prefixed SELECT.
+        // The underlying parser does not support PREFIX prologues, so this
+        // returns a Parse error — but it must NOT return Unsupported.
+        let err =
+            parse("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ?p ?o }").unwrap_err();
+        assert!(
+            !matches!(err, QueryError::Unsupported(_)),
+            "prefixed SELECT must not be rejected by the write guard; got {err:?}"
+        );
     }
 }

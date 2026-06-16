@@ -523,7 +523,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
     // Assertive: retrieves pattern-matched results
     HandlerDef {
         name: "query",
-        description: "GQL pattern matching. When a traversal mixes fixed-length and variable-length chains, split it into separate query() calls.",
+        description: "GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is rejected; use create, update, link, merge, delete to mutate the graph. When a traversal mixes fixed-length and variable-length chains, split it into separate query() calls.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -531,7 +531,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "GQL pattern query string. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls, one for the fixed-length portion and one for the variable-length portion.",
+                description: "GQL or SPARQL pattern query string (read-only). Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
             },
             ParamDef {
                 name: "limit",

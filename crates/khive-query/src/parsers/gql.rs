@@ -519,7 +519,7 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 fn reject_gql_write(input: &str) -> Result<(), QueryError> {
     let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
     match first.as_str() {
-        "CREATE" | "DELETE" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE" => {
+        "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE" => {
             Err(QueryError::Unsupported(
                 "the query verb is read-only; \
                  to mutate the graph use: create, update, link, merge, delete"
@@ -715,5 +715,23 @@ mod tests {
         // Positive control: a valid MATCH must still parse correctly.
         let q = parse("MATCH (a:concept)-[:extends]->(b) RETURN a").unwrap();
         assert!(!q.pattern.elements.is_empty(), "valid MATCH must parse");
+    }
+
+    #[test]
+    fn gql_detach_delete_rejected() {
+        let err = parse("DETACH DELETE (n)").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "DETACH DELETE must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only"),
+            "error must mention 'read-only'; got: {msg}"
+        );
+        assert!(
+            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
+            "error must name the mutation verbs; got: {msg}"
+        );
     }
 }
