@@ -132,7 +132,11 @@ mod tests {
 
     use super::*;
 
-    /// Entity created under `tenant-a` is visible to `tenant-a` and opaque to `tenant-b`.
+    /// Entity created under `tenant-a` is namespaced correctly; by-ID get is namespace-agnostic.
+    ///
+    /// PR-A1 (ADR-007): by-ID `get` returns a record regardless of the caller's namespace.
+    /// Namespace on the returned record must still reflect the creator's namespace.
+    /// list/search still filter by namespace (PR-B scope).
     #[tokio::test]
     async fn kg_create_entity_honors_caller_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -157,7 +161,7 @@ mod tests {
                 json!({
                     "kind": "concept",
                     "name": "TenantConcept",
-                    "description": "concept visible only to tenant-a"
+                    "description": "concept created by tenant-a"
                 }),
                 &registry,
                 &tenant_a,
@@ -170,12 +174,21 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("result must contain id");
 
+        // namespace on the stored record must be tenant-a's namespace.
+        assert_eq!(
+            result
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "tenant-a",
+            "entity namespace must be the creator's namespace"
+        );
+
         // tenant-a can retrieve the entity it created.
         let get_result = pack
             .dispatch("get", json!({ "id": entity_id }), &registry, &tenant_a)
             .await
             .expect("tenant-a must retrieve entity in its own namespace");
-
         assert_eq!(
             get_result
                 .get("name")
@@ -185,14 +198,35 @@ mod tests {
             "tenant-a must read back the entity it created"
         );
 
-        // tenant-b cannot see tenant-a's entity.
-        let not_found = pack
+        // PR-A1: tenant-b can also retrieve the entity by UUID — by-ID get is namespace-agnostic.
+        let cross_ns = pack
             .dispatch("get", json!({ "id": entity_id }), &registry, &tenant_b)
-            .await;
+            .await
+            .expect("tenant-b must find entity by UUID after PR-A1");
+        assert_eq!(
+            cross_ns
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "tenant-a",
+            "namespace on fetched record must still be tenant-a (not rewritten to caller ns)"
+        );
+
+        // list from tenant-b must NOT return tenant-a's entity (list is namespace-scoped — PR-B).
+        let list = pack
+            .dispatch("list", json!({ "kind": "entity" }), &registry, &tenant_b)
+            .await
+            .expect("list must succeed");
+        let items = list
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            matches!(not_found, Err(RuntimeError::NotFound(_))),
-            "tenant-b must not see tenant-a's entity (expected NotFound, got {:?})",
-            not_found
+            items
+                .iter()
+                .all(|e| e.get("namespace").and_then(|v| v.as_str()) != Some("tenant-a")),
+            "list from tenant-b must not include tenant-a entities; got {items:?}"
         );
     }
 

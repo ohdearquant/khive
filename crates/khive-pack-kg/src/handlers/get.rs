@@ -61,6 +61,8 @@ impl KgPack {
             Err(e) => return Err(e),
         }
 
+        // PR-A1: by-ID get returns the note regardless of namespace (UUID v4 is globally unique).
+        // Visible-set gating removed here; list/search keep their namespace filter (PR-B scope).
         if let Some(note) = self
             .runtime
             .notes(token)?
@@ -68,17 +70,13 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if token
-                .visible_namespace_strs()
-                .contains(&note.namespace.as_str())
-            {
-                let note_val = normalize_entity_timestamps(to_json(&note)?);
-                let remapped = remap_note_status(note_val);
-                return flatten_get_result("note", remapped);
-            }
+            let note_val = normalize_entity_timestamps(to_json(&note)?);
+            let remapped = remap_note_status(note_val);
+            return flatten_get_result("note", remapped);
         }
 
-        if let Some(edge) = self.runtime.get_edge_visible(token, id).await? {
+        // PR-A1: by-ID edge get returns the edge regardless of namespace.
+        if let Some(edge) = self.runtime.get_edge(token, id).await? {
             return flatten_get_result("edge", to_json(&edge)?);
         }
 

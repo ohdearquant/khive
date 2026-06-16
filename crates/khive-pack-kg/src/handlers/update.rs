@@ -22,7 +22,9 @@ impl KgPack {
         id_str: &str,
     ) -> Result<KindSpec, RuntimeError> {
         use khive_runtime::Resolved;
-        match self.runtime.resolve(token, id).await? {
+        // PR-A1 (codex r2): by-ID substrate inference must NOT gate on caller namespace.
+        // UUID v4 is globally unique — resolve without visible-set or primary-ns check.
+        match self.runtime.resolve_by_id(token, id).await? {
             Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
@@ -42,7 +44,12 @@ impl KgPack {
         id_str: &str,
     ) -> Result<KindSpec, RuntimeError> {
         use khive_runtime::Resolved;
-        match self.runtime.resolve_including_deleted(token, id).await? {
+        // PR-A1 (codex r2): hard-delete path must also locate foreign records.
+        match self
+            .runtime
+            .resolve_by_id_including_deleted(token, id)
+            .await?
+        {
             Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {

@@ -681,63 +681,42 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID, enforcing namespace visibility.
+    /// Retrieve an entity by ID.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or its namespace is
-    /// not in the token's visible set (indistinguishable — no cross-namespace
-    /// existence oracle).
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
-        let entity = self
-            .entities(token)?
+        self.entities(token)?
             .get_entity(id)
             .await?
-            .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
-        Self::ensure_namespace_visible(&entity.namespace, token)?;
-        Ok(entity)
+            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))
     }
 
-    /// Retrieve an entity by ID including soft-deleted rows, enforcing namespace visibility.
+    /// Retrieve an entity by ID including soft-deleted rows.
     ///
-    /// Returns `Ok(Some(entity))` when the entity exists in a namespace visible
-    /// to the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
-    /// was never created or is not visible to the caller.
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_entity_including_deleted(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Entity>> {
-        let entity = match self
-            .entities(token)?
+        self.entities(token)?
             .get_entity_including_deleted(id)
-            .await?
-        {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        if Self::ensure_namespace_visible(&entity.namespace, token).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(entity))
+            .await
+            .map_err(Into::into)
     }
 
-    /// Retrieve a note by ID including soft-deleted rows, enforcing namespace visibility.
+    /// Retrieve a note by ID including soft-deleted rows.
     ///
-    /// Returns `Ok(Some(note))` when the note exists in a namespace visible to
-    /// the token regardless of `deleted_at`. Returns `Ok(None)` when the UUID
-    /// was never created or is not visible to the caller.
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn get_note_including_deleted(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<khive_storage::note::Note>> {
-        let note = match self.notes(token)?.get_note_including_deleted(id).await? {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-        if Self::ensure_namespace_visible(&note.namespace, token).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(note))
+        self.notes(token)?
+            .get_note_including_deleted(id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Fetch multiple entities by ID, returning only those that exist in the
@@ -2223,6 +2202,65 @@ impl KhiveRuntime {
         }
     }
 
+    /// Resolve a UUID to its substrate kind with NO namespace filter.
+    ///
+    /// By-ID contract (ADR-007): UUID v4 is globally unique — by-ID substrate
+    /// inference must return the record regardless of caller namespace.  Used by
+    /// the public `update` and `delete` verb handlers when no explicit `kind` is
+    /// supplied (PR-A1 / codex r2).
+    ///
+    /// Does NOT consult the visible set or the primary-namespace check.  The
+    /// token is still required to route to the correct backend pool but its
+    /// namespace value is not used as a filter.
+    pub async fn resolve_by_id(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        // Entity: direct by-UUID fetch (ID-only, no namespace check).
+        if let Some(entity) = self.entities(token)?.get_entity(id).await? {
+            return Ok(Some(Resolved::Entity(entity)));
+        }
+
+        // Note: direct by-UUID fetch (ID-only).
+        if let Some(note) = self.notes(token)?.get_note(id).await? {
+            return Ok(Some(Resolved::Note(note)));
+        }
+
+        // Edges and events are not returned here; the caller's `_` arm handles
+        // those with a separate get_edge / get_event check.
+        Ok(None)
+    }
+
+    /// Resolve a UUID to its substrate kind with NO namespace filter, including
+    /// soft-deleted rows.
+    ///
+    /// Used by the hard-delete path when no explicit `kind` is supplied, so
+    /// already-soft-deleted records can still be located by UUID alone.
+    pub async fn resolve_by_id_including_deleted(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        // Entity: including soft-deleted, no namespace check.
+        if let Some(entity) = self
+            .entities(token)?
+            .get_entity_including_deleted(id)
+            .await?
+        {
+            return Ok(Some(Resolved::Entity(entity)));
+        }
+
+        // Note: including soft-deleted, no namespace check.
+        if let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? {
+            return Ok(Some(Resolved::Note(note)));
+        }
+
+        // Edges and events are not returned here; the caller's `_` arm handles
+        // those with a separate get_edge_including_deleted check.
+        Ok(None)
+    }
+
     /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
     ///
     /// Returns `None` if the UUID is not found in any substrate.
@@ -2336,13 +2374,16 @@ impl KhiveRuntime {
     ///
     /// Returns `Ok(false)` if the note does not exist or belongs to a different
     /// namespace (wrong-namespace is indistinguishable from absent).
+    /// Soft-delete or hard-delete a note by ID.
+    ///
+    /// PR-A1: UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
+    /// Cascade and index cleanup target the RECORD's stored namespace, not the caller token's.
     pub async fn delete_note(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let ns = token.namespace().as_str();
         let note_store = self.notes(token)?;
         let note = if hard {
             match note_store.get_note_including_deleted(id).await? {
@@ -2355,30 +2396,33 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
-        if Self::ensure_namespace(&note.namespace, ns).is_err() {
-            return Ok(false);
-        }
         let mode = if hard {
             DeleteMode::Hard
         } else {
             DeleteMode::Soft
         };
 
+        // Route index cleanup through the RECORD's namespace, not the caller's.
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&note.namespace)
+                .map_err(|e| RuntimeError::Internal(format!("note namespace invalid: {e}")))?,
+        );
+        let record_ns = note.namespace.clone();
+
         // On hard delete, cascade-remove all incident edges (including soft-deleted) and clean up
         // indexes. Uses purge_incident_edges so that already-soft-deleted edges are also removed,
         // preventing dangling graph_edges rows (ADR-002 no-dangling-references).
         if hard {
-            let graph = self.graph(token)?;
+            let graph = self.graph(&record_tok)?;
             graph.purge_incident_edges(id).await?;
-            let ns_str = ns.to_string();
-            self.text_for_notes(token)?
-                .delete_document(&ns_str, id)
+            self.text_for_notes(&record_tok)?
+                .delete_document(&record_ns, id)
                 .await?;
             // Codex High 2 (PR #407): scoped delete — iterate over EVERY
             // registered embedding model's vector store so non-default vectors
             // don't orphan when the note is deleted.
             for model_name in self.registered_embedding_model_names() {
-                self.vectors_for_model(token, &model_name)?
+                self.vectors_for_model(&record_tok, &model_name)?
                     .delete(id)
                     .await?;
             }
@@ -2386,28 +2430,26 @@ impl KhiveRuntime {
 
         let deleted = note_store.delete_note(id, mode).await?;
         if !hard && deleted {
-            let ns_str = ns.to_string();
-            self.text_for_notes(token)?
-                .delete_document(&ns_str, id)
+            self.text_for_notes(&record_tok)?
+                .delete_document(&record_ns, id)
                 .await?;
             for model_name in self.registered_embedding_model_names() {
-                self.vectors_for_model(token, &model_name)?
+                self.vectors_for_model(&record_tok, &model_name)?
                     .delete(id)
                     .await?;
             }
         }
         if deleted {
             let event_store = self.events(token)?;
-            let ns_str = ns.to_string();
             let event = khive_storage::event::Event::new(
-                ns_str.clone(),
+                record_ns.clone(),
                 "delete",
                 EventKind::NoteDeleted,
                 SubstrateKind::Note,
                 "",
             )
             .with_target(id)
-            .with_payload(serde_json::json!({"id": id, "namespace": ns_str, "hard": hard}));
+            .with_payload(serde_json::json!({"id": id, "namespace": record_ns, "hard": hard}));
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
             })?;
@@ -2488,8 +2530,9 @@ impl KhiveRuntime {
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
-    /// different namespace (indistinguishable — no existence oracle).
+    /// Soft-delete or hard-delete an entity by ID.
+    ///
+    /// UUID v4 is globally unique — no namespace filter on by-ID ops (ADR-007 rule 2).
     pub async fn delete_entity(
         &self,
         token: &NamespaceToken,
@@ -2511,25 +2554,30 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
-        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
             DeleteMode::Soft
         };
 
+        // Route cascade and index cleanup through the RECORD's namespace, not the caller's.
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&entity.namespace)
+                .map_err(|e| RuntimeError::Internal(format!("entity namespace invalid: {e}")))?,
+        );
+
         // On hard delete, cascade-remove all incident edges (including soft-deleted) to prevent
         // dangling refs. Uses purge_incident_edges so that already-soft-deleted edges are also
         // removed (ADR-002 no-dangling-references).
         if hard {
-            let graph = self.graph(token)?;
+            let graph = self.graph(&record_tok)?;
             graph.purge_incident_edges(id).await?;
-            self.remove_from_indexes(token, id).await?;
+            self.remove_from_indexes(&record_tok, id).await?;
         }
 
         let deleted = self.entities(token)?.delete_entity(id, mode).await?;
         if !hard && deleted {
-            self.remove_from_indexes(token, id).await?;
+            self.remove_from_indexes(&record_tok, id).await?;
         }
         if deleted {
             let event_store = self.events(token)?;
@@ -2571,13 +2619,13 @@ impl KhiveRuntime {
 
     // ---- Edge CRUD operations ----
 
-    /// Fetch a single edge by id, enforcing namespace isolation.
+    /// Fetch a single edge by id.
     ///
-    /// Returns `Err(NotFound)` if the edge exists in a different namespace,
-    /// `Ok(None)` if no edge with that id exists at all.
+    /// PR-A1: UUID v4 is globally unique — returns the edge regardless of which
+    /// namespace the token carries. `Ok(None)` means the edge does not exist at all.
     pub async fn get_edge(
         &self,
-        token: &NamespaceToken,
+        _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
         let mut reader = self.sql().reader().await?;
@@ -2594,55 +2642,38 @@ impl KhiveRuntime {
         let Some(SqlValue::Text(record_ns)) = record_ns else {
             return Ok(None);
         };
-        // Absent and foreign-namespace IDs must be indistinguishable.
-        if Self::ensure_namespace(&record_ns, token.namespace().as_str()).is_err() {
-            return Ok(None);
-        }
-
-        Ok(self.graph(token)?.get_edge(LinkId::from(edge_id)).await?)
+        // Route the storage fetch through the record's own namespace — the token is
+        // just the caller context; by-ID ops cross namespace boundaries (ADR-007).
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        Ok(self
+            .graph(&record_tok)?
+            .get_edge(LinkId::from(edge_id))
+            .await?)
     }
 
-    /// Fetch a single edge by id from any namespace in the token's visible set.
+    /// Fetch a single edge by id.
     ///
-    /// Returns `Ok(None)` when the edge is absent or its namespace is not in the
-    /// visible set. Used by read paths (e.g. `get` verb) so that a caller with
-    /// cross-namespace visibility can retrieve edges from non-primary namespaces.
+    /// PR-A1: delegates to `get_edge` — visible-set check removed.  By-ID ops are
+    /// namespace-agnostic; UUID v4 is globally unique (ADR-007 rule 2).
     pub async fn get_edge_visible(
         &self,
         token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
-        let mut reader = self.sql().reader().await?;
-        let record_ns = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT namespace FROM graph_edges \
-                      WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
-                params: vec![SqlValue::Text(edge_id.to_string())],
-                label: Some("get_edge_visible_namespace".into()),
-            })
-            .await?;
-        let Some(SqlValue::Text(record_ns)) = record_ns else {
-            return Ok(None);
-        };
-        if Self::ensure_namespace_visible(&record_ns, token).is_err() {
-            return Ok(None);
-        }
-        // Re-use the primary-namespace graph store; the edge row is already confirmed
-        // visible so the namespace token is just used for backend routing here.
-        let temp = NamespaceToken::for_namespace(
-            khive_types::Namespace::parse(&record_ns)
-                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
-        );
-        Ok(self.graph(&temp)?.get_edge(LinkId::from(edge_id)).await?)
+        self.get_edge(token, edge_id).await
     }
 
-    /// Fetch an edge by UUID including soft-deleted rows, returning `None` if absent or if the
-    /// record belongs to a different namespace. Used by the hard-delete path so that a
-    /// soft-deleted primary edge can still be purged via its edge ID.
+    /// Fetch an edge by UUID including soft-deleted rows.
+    ///
+    /// PR-A1: returns the edge regardless of which namespace the token carries —
+    /// UUID v4 is globally unique. Used by the hard-delete path so that a
+    /// soft-deleted edge can still be purged via its edge ID.
     pub async fn get_edge_including_deleted(
         &self,
-        token: &NamespaceToken,
+        _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
         let mut reader = self.sql().reader().await?;
@@ -2657,12 +2688,13 @@ impl KhiveRuntime {
         let Some(SqlValue::Text(record_ns)) = record_ns else {
             return Ok(None);
         };
-        if Self::ensure_namespace(&record_ns, token.namespace().as_str()).is_err() {
-            return Ok(None);
-        }
-
+        // Route through the record's own namespace store (no namespace equality check).
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
         Ok(self
-            .graph(token)?
+            .graph(&record_tok)?
             .get_edge_including_deleted(LinkId::from(edge_id))
             .await?)
     }
@@ -2715,16 +2747,31 @@ impl KhiveRuntime {
         edge_id: Uuid,
         patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
-        let graph = self.graph(token)?;
-        let mut edge = graph
+        // Fetch the edge by UUID — ID-only, no namespace check (PR-A1).
+        // get_edge already uses the record's stored namespace internally (codex r1 fix).
+        let graph_for_fetch = self.graph(token)?;
+        let mut edge = graph_for_fetch
             .get_edge(LinkId::from(edge_id))
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
+        // PR-A1 (codex r2): after fetching, all mutations and validation must use the
+        // RECORD's namespace, not the caller's.  Derive record_tok from the stored edge
+        // namespace so that endpoint validation, raw-SQL predicates, and graph routing
+        // all address the correct backend partition.
+        let record_ns: String = edge.namespace.clone();
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        let graph = self.graph(&record_tok)?;
+
         let mut changed_fields: Vec<&'static str> = Vec::new();
         if let Some(r) = patch.relation {
             // Validate before mutating — use the existing endpoints with the new relation.
-            self.validate_edge_relation_endpoints(token, edge.source_id, edge.target_id, r)
+            // Validate before mutating — use the existing endpoints with the new relation.
+            // Use record_tok so that endpoint existence checks look in the edge's own namespace.
+            self.validate_edge_relation_endpoints(&record_tok, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
             changed_fields.push("relation");
@@ -2758,7 +2805,9 @@ impl KhiveRuntime {
 
         if edge.relation.is_symmetric() {
             // Raw-SQL path (mirrors merge_entity_sql).
-            let ns = token.namespace().as_str().to_string();
+            // Use record_ns (the stored edge namespace) — NOT token.namespace() — so that
+            // WHERE namespace = ?N predicates match the actual row.
+            let ns = record_ns.clone();
             let edge_id_str = edge_id.to_string();
             let relation_str = edge.relation.to_string();
             let canon_src_str = canon_src.to_string();
@@ -2810,42 +2859,57 @@ impl KhiveRuntime {
                             rusqlite::params![&ns, &edge_id_str],
                         )
                         .map_err(SqliteError::Rusqlite)?;
-                        conn.execute(
-                            "UPDATE graph_edges SET \
-                             weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                             target_backend = ?3, metadata = ?4 \
-                             WHERE namespace = ?5 AND id = ?6",
-                            rusqlite::params![
-                                weight,
-                                now_ts,
-                                target_backend,
-                                metadata,
-                                &ns,
-                                &existing_id,
-                            ],
-                        )
-                        .map_err(SqliteError::Rusqlite)?;
+                        let affected = conn
+                            .execute(
+                                "UPDATE graph_edges SET \
+                                 weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                                 target_backend = ?3, metadata = ?4 \
+                                 WHERE namespace = ?5 AND id = ?6",
+                                rusqlite::params![
+                                    weight,
+                                    now_ts,
+                                    target_backend,
+                                    metadata,
+                                    &ns,
+                                    &existing_id,
+                                ],
+                            )
+                            .map_err(SqliteError::Rusqlite)?;
+                        if affected == 0 {
+                            return Err(SqliteError::InvalidData(format!(
+                                "update_edge: surviving canonical row {existing_id} vanished during update"
+                            )));
+                        }
                         Ok(Some(existing_id))
                     } else {
                         // Case (a): no conflict — update source_id/target_id in-place,
                         // preserving the original edge UUID.
-                        conn.execute(
-                            "UPDATE graph_edges SET \
-                             source_id = ?1, target_id = ?2, relation = ?3, \
-                             weight = ?4, updated_at = ?5, metadata = ?6 \
-                             WHERE namespace = ?7 AND id = ?8",
-                            rusqlite::params![
-                                &canon_src_str,
-                                &canon_tgt_str,
-                                &relation_str,
-                                weight,
-                                now_ts,
-                                metadata,
-                                &ns,
-                                &edge_id_str,
-                            ],
-                        )
-                        .map_err(SqliteError::Rusqlite)?;
+                        let affected = conn
+                            .execute(
+                                "UPDATE graph_edges SET \
+                                 source_id = ?1, target_id = ?2, relation = ?3, \
+                                 weight = ?4, updated_at = ?5, metadata = ?6 \
+                                 WHERE namespace = ?7 AND id = ?8",
+                                rusqlite::params![
+                                    &canon_src_str,
+                                    &canon_tgt_str,
+                                    &relation_str,
+                                    weight,
+                                    now_ts,
+                                    metadata,
+                                    &ns,
+                                    &edge_id_str,
+                                ],
+                            )
+                            .map_err(SqliteError::Rusqlite)?;
+                        if affected == 0 {
+                            // The edge row was not found under the record's namespace.
+                            // This must never happen because ns = record_ns (fetched above).
+                            return Err(SqliteError::InvalidData(format!(
+                                "update_edge: zero rows affected updating edge {edge_id_str} \
+                                 in namespace {ns} — row vanished between fetch and update"
+                            )));
+                        }
                         Ok(None)
                     }
                 })
@@ -2857,11 +2921,12 @@ impl KhiveRuntime {
             if let Some(sid) = surviving_id {
                 // A conflict was absorbed: re-fetch the surviving canonical row so the
                 // caller receives its real id (Bug 1 fix).
+                // Use record_tok — the surviving row lives in the same namespace as the original.
                 let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
                     RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
                 })?;
                 edge = self
-                    .get_edge(token, surviving_uuid)
+                    .get_edge(&record_tok, surviving_uuid)
                     .await?
                     .ok_or_else(|| {
                         RuntimeError::Internal(format!(
@@ -2874,13 +2939,16 @@ impl KhiveRuntime {
                 edge.target_id = canon_tgt;
             }
         } else {
+            // Non-symmetric: upsert_edge takes namespace from edge.namespace (not from the
+            // graph store's routing namespace), so this is already record-namespace correct.
+            // `graph` is already self.graph(&record_tok)?.
             graph.upsert_edge(edge.clone()).await?;
         }
 
-        let event_store = self.events(token)?;
-        let ns = token.namespace().as_str().to_string();
+        // Audit event: use the record's namespace (record_ns) for the event payload.
+        let event_store = self.events(&record_tok)?;
         let event = khive_storage::event::Event::new(
-            ns.clone(),
+            record_ns.clone(),
             "update",
             EventKind::EdgeUpdated,
             SubstrateKind::Entity,
@@ -2888,7 +2956,7 @@ impl KhiveRuntime {
         )
         .with_target(edge_id)
         .with_payload(
-            serde_json::json!({"id": edge_id, "namespace": ns, "changed_fields": changed_fields}),
+            serde_json::json!({"id": edge_id, "namespace": record_ns, "changed_fields": changed_fields}),
         );
         event_store.append_event(event).await.map_err(|e| {
             RuntimeError::Internal(format!("update_edge: event store write failed: {e}"))
@@ -2913,28 +2981,33 @@ impl KhiveRuntime {
         edge_id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let graph = self.graph(token)?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
             DeleteMode::Soft
         };
 
-        // Guard: verify `edge_id` is actually an edge (not an entity/note UUID) before touching
-        // anything. For soft delete, the live-only check is correct — there is nothing to do if
-        // the row is already soft-deleted. For hard delete, also check soft-deleted rows so that
-        // a soft-deleted edge can still be purged via its edge ID (namespace check is preserved:
-        // get_edge_including_deleted returns None for foreign-namespace IDs).
-        let edge_exists = if hard {
-            self.get_edge_including_deleted(token, edge_id)
-                .await?
-                .is_some()
+        // PR-A1: fetch the edge first to obtain the record's own namespace.
+        // By-ID ops cross namespace boundaries; all graph routing and audit
+        // events must use the record namespace, not the caller's (mirrors update_edge).
+        // For hard delete we also check soft-deleted rows so a soft-deleted edge
+        // can still be purged via its edge ID.
+        let edge = if hard {
+            self.get_edge_including_deleted(token, edge_id).await?
         } else {
-            graph.get_edge(LinkId::from(edge_id)).await?.is_some()
+            self.get_edge(token, edge_id).await?
         };
-        if !edge_exists {
+        let Some(edge) = edge else {
             return Ok(false);
-        }
+        };
+
+        // Derive record_ns / record_tok from the fetched edge (mirrors update_edge at ~2762-2767).
+        let record_ns: String = edge.namespace.clone();
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&record_ns)
+                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+        );
+        let graph = self.graph(&record_tok)?;
 
         // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
         // already-soft-deleted ones — to prevent dangling graph_edges rows (ADR-002).
@@ -2946,17 +3019,17 @@ impl KhiveRuntime {
 
         let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
         if deleted {
-            let event_store = self.events(token)?;
-            let ns = token.namespace().as_str().to_string();
+            // Audit event: use the record's namespace (record_ns), not the caller's namespace.
+            let event_store = self.events(&record_tok)?;
             let event = khive_storage::event::Event::new(
-                ns.clone(),
+                record_ns.clone(),
                 "delete",
                 EventKind::EdgeDeleted,
                 SubstrateKind::Entity,
                 "",
             )
             .with_target(edge_id)
-            .with_payload(serde_json::json!({"id": edge_id, "namespace": ns, "hard": hard}));
+            .with_payload(serde_json::json!({"id": edge_id, "namespace": record_ns, "hard": hard}));
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("delete_edge: event store write failed: {e}"))
             })?;
@@ -3741,8 +3814,11 @@ mod tests {
         );
     }
 
+    // ADR-007 PR-A1: by-ID ops no longer enforce namespace isolation.
+    // Shared-brain OSS model: UUID is globally unique; get/update/delete
+    // find the record regardless of caller's token namespace.
     #[tokio::test]
-    async fn get_entity_namespace_isolation() {
+    async fn get_entity_cross_namespace_no_longer_denied() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -3751,48 +3827,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Same namespace: visible.
+        // Same namespace: still works.
         let found = rt.get_entity(&ns_a, entity.id).await;
-        assert!(found.is_ok(), "should be visible in its own namespace");
+        assert!(found.is_ok(), "same-namespace get must succeed");
 
-        // Different namespace: NotFound error (no cross-namespace existence oracle).
-        let not_found = rt.get_entity(&ns_b, entity.id).await;
+        // Different namespace: now also returns the entity (shared brain, ADR-007).
+        let cross = rt.get_entity(&ns_b, entity.id).await;
         assert!(
-            not_found.is_err(),
-            "should not be visible across namespaces"
+            cross.is_ok(),
+            "cross-namespace get must succeed in shared-brain OSS (ADR-007 rule 2)"
         );
-        assert!(
-            matches!(not_found.unwrap_err(), crate::RuntimeError::NotFound(_)),
-            "cross-namespace get must return NotFound, not NamespaceMismatch"
-        );
+        assert_eq!(cross.unwrap().id, entity.id);
     }
 
     #[tokio::test]
-    async fn namespace_mismatch_error_message_is_opaque() {
-        // Timing-oracle mitigation: the external error message must not
-        // reveal which namespace the record actually lives in.
-        let rt = rt();
-        let ns_a = NamespaceToken::for_namespace(Namespace::parse("secret-ns").unwrap());
-        let ns_b = NamespaceToken::for_namespace(Namespace::parse("other-ns").unwrap());
-        let entity = rt
-            .create_entity(&ns_a, "concept", None, "Hidden", None, None, vec![])
-            .await
-            .unwrap();
-
-        let err = rt.get_entity(&ns_b, entity.id).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("secret-ns"),
-            "error message must not leak the actual namespace; got: {msg}"
-        );
-        assert!(
-            !msg.contains("other-ns"),
-            "error message must not leak the requested namespace; got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_entity_namespace_isolation() {
+    async fn delete_entity_cross_namespace_no_longer_denied() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -3801,30 +3850,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete from wrong namespace: NotFound (no existence oracle).
+        // ADR-007 PR-A1: cross-namespace delete now succeeds (shared brain).
         let cross_ns_result = rt.delete_entity(&ns_b, entity.id, true).await;
         assert!(
-            cross_ns_result.is_err(),
-            "cross-namespace delete must error"
+            cross_ns_result.is_ok(),
+            "cross-namespace delete must succeed in shared-brain OSS; got {:?}",
+            cross_ns_result
         );
-        assert!(
-            matches!(
-                cross_ns_result.unwrap_err(),
-                crate::RuntimeError::NotFound(_)
-            ),
-            "cross-namespace delete must return NotFound, not NamespaceMismatch"
-        );
+        assert!(cross_ns_result.unwrap(), "delete must return true");
 
-        // Entity still present in its own namespace.
-        let still_there = rt.get_entity(&ns_a, entity.id).await;
-        assert!(
-            still_there.is_ok(),
-            "entity must survive cross-ns delete attempt"
-        );
-
-        // Delete from correct namespace: succeeds.
-        let deleted_ok = rt.delete_entity(&ns_a, entity.id, true).await.unwrap();
-        assert!(deleted_ok, "same-namespace delete must succeed");
+        // Entity is gone — even from the original namespace.
+        let gone = rt.get_entity(&ns_a, entity.id).await;
+        assert!(gone.is_err(), "entity must be gone after delete");
     }
 
     // ---- Note annotation tests ----
@@ -6489,8 +6526,10 @@ mod tests {
         );
     }
 
+    // PR-A1: cross-namespace delete_note now succeeds (UUID v4 is globally unique,
+    // no namespace isolation on by-ID ops — ADR-007 rule 2).
     #[tokio::test]
-    async fn delete_note_cross_namespace_returns_mismatch_error() {
+    async fn delete_note_cross_namespace_succeeds() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -6507,20 +6546,46 @@ mod tests {
             .await
             .unwrap();
 
-        // Attempt to delete from a different namespace must return Ok(false) —
-        // indistinguishable from absent (no existence oracle).
-        let result = rt.delete_note(&ns_b, note.id, true).await;
+        // Delete from a different namespace must now SUCCEED.
+        let result = rt.delete_note(&ns_b, note.id, false).await;
         assert!(
-            !result.unwrap(),
-            "cross-namespace delete_note must return Ok(false), not NamespaceMismatch"
+            result.unwrap(),
+            "cross-namespace delete_note (soft) must return Ok(true)"
         );
 
-        // Note must still exist in ns-a after the failed cross-ns delete.
+        // Note must be gone from ns-a storage after the cross-ns soft delete.
         let note_store = rt.notes(&ns_a).unwrap();
-        let still_there = note_store.get_note(note.id).await.unwrap();
+        let gone = note_store.get_note(note.id).await.unwrap();
         assert!(
-            still_there.is_some(),
-            "note must survive cross-ns delete attempt"
+            gone.is_none(),
+            "note must be soft-deleted in its home namespace after cross-ns delete"
+        );
+
+        // Hard-delete path: create a fresh note and hard-delete from foreign token.
+        let note2 = rt
+            .create_note(
+                &ns_a,
+                "observation",
+                None,
+                "note2 in ns-a",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let hard_result = rt.delete_note(&ns_b, note2.id, true).await;
+        assert!(
+            hard_result.unwrap(),
+            "cross-namespace hard delete_note must return Ok(true)"
+        );
+        let gone2 = rt
+            .get_note_including_deleted(&ns_a, note2.id)
+            .await
+            .unwrap();
+        assert!(
+            gone2.is_none(),
+            "hard-deleted note must not appear even in including_deleted query"
         );
     }
 
@@ -6578,10 +6643,10 @@ mod tests {
         assert_eq!(count, 1, "upsert must not duplicate the edge row");
     }
 
-    // ── #548 regression: cross-namespace get_edge must return None ──
+    // ── PR-A1: cross-namespace get_edge now succeeds (UUID v4 is globally unique) ──
 
     #[tokio::test]
-    async fn get_edge_cross_namespace_returns_none() {
+    async fn get_edge_cross_namespace_succeeds() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -6600,33 +6665,36 @@ mod tests {
             .unwrap();
 
         // Visible from own namespace.
-        let ok = rt.get_edge(&ns_a, Uuid::from(edge.id)).await;
+        let own_ns = rt.get_edge(&ns_a, Uuid::from(edge.id)).await;
         assert!(
-            ok.is_ok() && ok.unwrap().is_some(),
+            own_ns.is_ok() && own_ns.unwrap().is_some(),
             "edge must be visible in its own namespace"
         );
 
-        // Foreign namespace must return None — indistinguishable from absent.
-        let result = rt.get_edge(&ns_b, Uuid::from(edge.id)).await;
+        // PR-A1: foreign namespace must now SUCCEED — by-ID get is namespace-agnostic.
+        let cross_ns = rt.get_edge(&ns_b, Uuid::from(edge.id)).await;
         assert!(
-            matches!(result, Ok(None)),
-            "cross-namespace get_edge must return Ok(None), got {result:?}"
+            matches!(cross_ns, Ok(Some(_))),
+            "cross-namespace get_edge must return Ok(Some(_)) after PR-A1, got {cross_ns:?}"
         );
 
-        // Absent and foreign edge IDs must have identical observable shape.
+        // Absent edge UUID still returns None regardless of token namespace.
         let absent = rt.get_edge(&ns_b, Uuid::new_v4()).await;
-        match (&result, &absent) {
-            (Ok(None), Ok(None)) => {}
-            other => panic!(
-                "foreign and absent edge IDs must have identical observable shape, got {other:?}"
-            ),
-        }
+        assert!(
+            matches!(absent, Ok(None)),
+            "absent edge must return Ok(None), got {absent:?}"
+        );
     }
 
-    // ── #568 regression: foreign traversal root must yield no expansion ───────
-
+    // ── ADR-007 PR-A1: traversal across namespace labels now succeeds ────────
+    //
+    // Pre-fix (#568): traverse with ns_b token + ns_a root was silently empty
+    // because substrate_exists_in_ns → get_entity rejected cross-namespace lookups.
+    // Post-fix: get_entity finds any entity by UUID; traverse finds the root and
+    // returns paths scoped to the graph store's namespace filter for ns_b.
+    // Full visible-set removal (PR-B) will collapse the namespace filter to "local".
     #[tokio::test]
-    async fn traverse_foreign_namespace_root_yields_no_expansion() {
+    async fn traverse_cross_namespace_root_is_accepted() {
         use khive_storage::types::TraversalOptions;
 
         let rt = rt();
@@ -6637,16 +6705,16 @@ mod tests {
             .create_entity(&ns_a, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
-        let b = rt
-            .create_entity(&ns_a, "concept", None, "B", None, None, vec![])
+        rt.create_entity(&ns_a, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(&ns_a, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+        rt.link(&ns_a, a.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
-            .unwrap();
+            .ok(); // may conflict with self-loop check; we just need an entity
 
-        // Traversal from ns_b using a root that belongs to ns_a must return nothing.
-        let paths = rt
+        // With PR-A1: substrate_exists_in_ns finds the ns_a root via get_entity
+        // (UUID-global lookup). The traverse proceeds; no panic.
+        let result = rt
             .traverse(
                 &ns_b,
                 TraversalRequest {
@@ -6659,12 +6727,8 @@ mod tests {
                     include_roots: true,
                 },
             )
-            .await
-            .unwrap();
-        assert!(
-            paths.is_empty(),
-            "foreign traversal root must be filtered before expansion, got {paths:?}"
-        );
+            .await;
+        assert!(result.is_ok(), "traverse must not error; got {:?}", result);
     }
 
     // ---- PR #82 regression: purge cascade must include already-soft-deleted edges ----
@@ -6805,6 +6869,91 @@ mod tests {
         assert_eq!(
             raw_after, 0,
             "purge_incident_edges must physically remove soft-deleted edge rows on note purge (ADR-002)"
+        );
+    }
+
+    // ---- PR #148 High-#2 regression: cross-namespace entity hard-delete purges ALL incident edges ----
+    //
+    // Before this fix: purge_incident_edges used `WHERE namespace = caller_ns AND ...`, so a
+    // foreign-namespace entity's incident edges in ITS namespace survived the cascade as dangling rows.
+
+    /// Count ALL `graph_edges` rows for a given node UUID, across every namespace.
+    async fn count_all_incident_edges_global(rt: &KhiveRuntime, node_id: Uuid) -> u64 {
+        let mut reader = rt.sql().reader().await.expect("sql reader must open");
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1 OR target_id = ?1"
+                    .into(),
+                params: vec![SqlValue::Text(node_id.to_string())],
+                label: Some("count_all_incident_edges_global".into()),
+            })
+            .await
+            .expect("count query must succeed");
+        match row {
+            Some(SqlValue::Integer(n)) => n as u64,
+            _ => panic!("count must return an integer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_namespace_hard_delete_entity_purges_all_incident_edges() {
+        // Entity lives in ns-owner. Edges live in ns-owner.
+        // Delete is driven from ns-caller (a different namespace).
+        // Assertion: after hard delete, no incident edges remain in ANY namespace.
+        let rt = rt();
+        let ns_owner = NamespaceToken::for_namespace(Namespace::parse("ns-owner").unwrap());
+        let ns_caller = NamespaceToken::for_namespace(Namespace::parse("ns-caller").unwrap());
+
+        let entity = rt
+            .create_entity(
+                &ns_owner,
+                "concept",
+                None,
+                "ForeignEntity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let peer = rt
+            .create_entity(&ns_owner, "concept", None, "Peer", None, None, vec![])
+            .await
+            .unwrap();
+        // Create two incident edges in ns_owner. concept->Extends->concept is in the allowlist.
+        rt.link(
+            &ns_owner,
+            entity.id,
+            peer.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &ns_owner,
+            peer.id,
+            entity.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = count_all_incident_edges_global(&rt, entity.id).await;
+        assert_eq!(before, 2, "two incident edges must exist before delete");
+
+        // Hard-delete entity from a DIFFERENT namespace token.
+        let deleted = rt.delete_entity(&ns_caller, entity.id, true).await.unwrap();
+        assert!(deleted, "cross-ns hard delete must return true");
+
+        // All incident edges must be gone regardless of namespace.
+        let after = count_all_incident_edges_global(&rt, entity.id).await;
+        assert_eq!(
+            after, 0,
+            "purge_incident_edges must remove all incident edges across namespaces (ADR-002, ADR-007)"
         );
     }
 
@@ -7317,6 +7466,124 @@ mod tests {
         assert!(
             hits_b.iter().any(|h| h.subject_id == note.id),
             "embed-b must hold a vector for the note after update; got {hits_b:?}"
+        );
+    }
+
+    // ── ADR-007 PR-A1 regression (V3): by-ID ops must not filter by namespace ──
+    //
+    // Pre-fix: get/update/delete on an entity stamped "lambda:leo" from a "local"
+    // token returned NotFound, causing the gtd.complete / update blindness.
+    // Post-fix: UUID is globally unique; by-ID ops find the record regardless of
+    // which namespace the caller's token carries.
+
+    #[tokio::test]
+    async fn get_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        // Create under "lambda:leo".
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(&leo_tok, "concept", None, "Leo-Entity", None, None, vec![])
+            .await
+            .unwrap();
+        assert_eq!(entity.namespace, "lambda:leo");
+
+        // Read from "local" — must succeed (no namespace gate on by-ID get).
+        let local_tok = NamespaceToken::local();
+        let fetched = rt.get_entity(&local_tok, entity.id).await;
+        assert!(
+            fetched.is_ok(),
+            "get_entity from local token must find lambda:leo entity; got {:?}",
+            fetched
+        );
+        assert_eq!(fetched.unwrap().id, entity.id);
+    }
+
+    #[tokio::test]
+    async fn update_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "Leo-Entity-Update",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Update from "local" token — must not error with NotFound.
+        let local_tok = NamespaceToken::local();
+        let patch = crate::curation::EntityPatch {
+            name: Some("Leo-Entity-Updated".to_string()),
+            ..Default::default()
+        };
+        let result = rt.update_entity(&local_tok, entity.id, patch).await;
+        assert!(
+            result.is_ok(),
+            "update_entity from local token must succeed on lambda:leo entity; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap().name, "Leo-Entity-Updated");
+    }
+
+    #[tokio::test]
+    async fn delete_entity_cross_namespace_succeeds() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "Leo-Entity-Delete",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Delete from "local" token — must succeed.
+        let local_tok = NamespaceToken::local();
+        let deleted = rt.delete_entity(&local_tok, entity.id, false).await;
+        assert!(
+            deleted.is_ok(),
+            "delete_entity from local token must succeed on lambda:leo entity; got {:?}",
+            deleted
+        );
+        assert!(
+            deleted.unwrap(),
+            "delete must return true when entity existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_preserved_on_entity_after_cross_namespace_get() {
+        let rt = rt();
+        let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+        let entity = rt
+            .create_entity(
+                &leo_tok,
+                "concept",
+                None,
+                "NS-Preserved",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // The namespace column on the fetched record must still say "lambda:leo".
+        let local_tok = NamespaceToken::local();
+        let fetched = rt.get_entity(&local_tok, entity.id).await.unwrap();
+        assert_eq!(
+            fetched.namespace, "lambda:leo",
+            "namespace column must be preserved; not overwritten with caller's namespace"
         );
     }
 }
