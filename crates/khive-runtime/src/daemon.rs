@@ -138,6 +138,13 @@ pub struct DaemonRequestFrame {
     /// [`PROTOCOL_VERSION`] and rejects mismatches with an explicit error.
     #[serde(default)]
     pub protocol_version: u32,
+    /// When `true`, the daemon returns an identity frame (ok=true, result=None)
+    /// immediately after identity validation — without calling the dispatcher.
+    /// Used by the client's under-lock recovery probe to confirm a daemon is
+    /// alive and identity-matching without dispatching any mutating verb.
+    /// Pre-probe clients omit this field (deserializes to false → normal dispatch).
+    #[serde(default)]
+    pub probe_only: bool,
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -296,6 +303,20 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             error: None,
             namespace_mismatch: false,
             config_mismatch: true,
+            served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+        }
+    } else if frame.probe_only {
+        // Probe-only request: identity checks passed; return immediately without
+        // dispatching any verb. The client uses this to confirm the daemon is
+        // alive and identity-matching without triggering any mutation.
+        DaemonResponseFrame {
+            ok: true,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
             served_config_id,
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,

@@ -75,6 +75,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             namespace: cfg.default_namespace.as_str().to_string(),
             config_id: compute_config_id(&cfg),
             protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
         };
         if let Some(res) = khive_mcp::daemon::forward_or_spawn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
