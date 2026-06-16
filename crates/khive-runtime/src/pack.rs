@@ -461,7 +461,6 @@ impl VerbRegistryBuilder {
             packs: Arc::new(ordered_packs),
             gate: self.gate,
             default_namespace: self.default_namespace,
-            visible_namespaces: self.visible_namespaces,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -589,8 +588,6 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces for dispatch tokens (from `actor.visible_namespaces`).
-    visible_namespaces: Vec<Namespace>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -762,13 +759,16 @@ impl VerbRegistry {
 
         // Mint the authorized namespace token at the dispatch boundary.
         // ns_str was already validated above when building the gate request.
+        //
+        // ADR-007 Rev 2, Rule 3 (PR-B): visible set is collapsed to [primary] for all
+        // multi-record ops. Per-actor namespace routing via actor.visible_namespaces is
+        // dissolved; all packs store in the shared "local" namespace. Per-actor distinctions
+        // are view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
+        // The actor.visible_namespaces config field is retained for future cloud-tier gate
+        // policy input but no longer widens the dispatch token's read scope.
         let primary = Namespace::parse(&ns_str)
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = NamespaceToken::mint_with_visibility(
-            primary,
-            self.visible_namespaces.clone(),
-            ActorRef::anonymous(),
-        );
+        let token = NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {

@@ -274,4 +274,104 @@ mod tests {
             .await
             .expect("Beta must be retrievable via local token");
     }
+
+    /// ADR-007 Rev 2, Rule 3 (PR-B): shared-brain visible-set regression.
+    ///
+    /// The dispatch token minted by VerbRegistry must always have visible = [primary_namespace]
+    /// regardless of what `actor.visible_namespaces` was configured on the registry. All
+    /// multi-record ops (list) scope to the single shared "local" set.
+    ///
+    /// This test verifies two invariants:
+    ///
+    /// 1. Records written to "local" (the OSS default namespace) are visible in a list
+    ///    dispatched via the registry — the shared-brain property.
+    /// 2. A record written to a non-"local" namespace (stranded record, written via a
+    ///    directly-minted token) does NOT appear in the "local" list even when that
+    ///    extra namespace appears in the registry's visible_namespaces config — proving
+    ///    the visible set is collapsed to [primary] and not widened by the config field.
+    #[tokio::test]
+    async fn dispatch_list_scopes_to_primary_namespace_only_adr007_prb() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let extra_ns = Namespace::parse("alpha-test-ns").expect("valid namespace");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_visible_namespaces(vec![extra_ns.clone()]);
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let entity_in_local = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "SharedBrainConcept" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create in local must succeed");
+        let local_id = entity_in_local
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+        assert_eq!(
+            entity_in_local
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "local",
+            "entity written via local token must land in 'local'"
+        );
+
+        let extra_token = rt.authorize(extra_ns.clone()).expect("authorize extra-ns");
+        let entity_in_extra = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StrandedConcept" }),
+                &registry,
+                &extra_token,
+            )
+            .await
+            .expect("create in extra-ns must succeed");
+        let extra_id = entity_in_extra
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+        assert_eq!(
+            entity_in_extra
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "alpha-test-ns",
+            "entity written via extra-ns token must land in 'alpha-test-ns'"
+        );
+
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity" }))
+            .await
+            .expect("list must succeed");
+        // list returns a JSON array directly (Vec<Entity> serialized).
+        let items: Vec<serde_json::Value> = match list_result {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            ids.contains(&local_id),
+            "shared-brain: 'local' entity must appear in list; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&extra_id),
+            "visible-set collapse: 'alpha-test-ns' entity must NOT appear in list \
+             even though that namespace was in registry.visible_namespaces; got ids: {ids:?}"
+        );
+    }
 }
