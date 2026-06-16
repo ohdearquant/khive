@@ -19,6 +19,38 @@ use tokio::net::UnixStream;
 
 use crate::tools::request::RequestParams;
 
+// ── test instrumentation seams ────────────────────────────────────────────────
+//
+// These counters are only compiled in `#[cfg(test)]` builds. They allow tests
+// to assert that kill_stale_daemon_inner and spawn_daemon were called exactly
+// the expected number of times — making the recheck-under-lock test
+// fail-if-reverted: without the recheck, both counters would be non-zero even
+// when a fresh daemon is already alive.
+
+#[cfg(test)]
+pub(crate) static KILL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) static SPAWN_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// When set to `true` in tests, `pid_is_khive_daemon` returns `true` for any
+/// positive PID.  This makes every PID file entry SIGTERM-eligible so that a
+/// reverted recheck-under-lock would cause `kill_stale_daemon_inner` to attempt
+/// SIGTERM against the real daemon PID — the `KILL_COUNT` assertion catches
+/// both the SIGTERM-eligible and the skip-SIGTERM paths.
+#[cfg(test)]
+pub(crate) static FORCE_PID_IS_DAEMON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_counters() {
+    KILL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
 
 #[async_trait]
@@ -174,6 +206,9 @@ fn map_response(
 }
 
 fn spawn_daemon() -> std::io::Result<()> {
+    #[cfg(test)]
+    SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let exe = std::env::current_exe()?;
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
@@ -237,6 +272,13 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     if pid_i32 <= 0 {
         return false;
     }
+    // Test seam: when FORCE_PID_IS_DAEMON is set, treat any positive live PID
+    // as a daemon so the SIGTERM branch is reachable in tests.
+    #[cfg(test)]
+    if FORCE_PID_IS_DAEMON.load(std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: signal 0 is an existence/permission probe with no side effects.
+        return unsafe { libc::kill(pid_i32, 0) } == 0;
+    }
     // Quick liveness check before shelling out.
     // SAFETY: signal 0 is an existence/permission probe with no side effects.
     if unsafe { libc::kill(pid_i32, 0) } != 0 {
@@ -256,6 +298,9 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
 
 /// Kill the daemon and remove its PID + socket files (caller holds the lock).
 fn kill_stale_daemon_inner() {
+    #[cfg(test)]
+    KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let pid_file = pid_path();
     if let Ok(contents) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = contents.trim().parse::<u32>() {
@@ -283,22 +328,40 @@ fn kill_stale_daemon_inner() {
 
 /// Kill the stale daemon and spawn a fresh one under a single recovery lock.
 ///
-/// Holding the lock across kill+spawn ensures that N concurrent clients all
-/// observing `ParseFailure` serialize: the first acquires the lock, kills the
-/// stale daemon, spawns a replacement, and releases the lock; each subsequent
-/// client then acquires the lock, finds no stale daemon (the PID file is gone),
-/// skips the kill, finds that a fresh daemon is already being spawned (or has
-/// started), and releases the lock before its own readiness probe.
+/// Implements double-checked recovery: after acquiring the lock, re-probes the
+/// daemon socket before killing anything. If a concurrent client has already
+/// replaced the stale daemon, the under-lock probe finds a responsive,
+/// identity-matching daemon and returns `Ok(false)` without issuing SIGTERM or
+/// spawning. Only when the re-probe confirms the daemon is still absent / dead /
+/// identity-mismatched does the function proceed with kill + spawn and return
+/// `Ok(true)`.
+///
+/// This prevents the interleaving where Client B's stale `ParseFailure`
+/// (observed before Client A's recovery completed) causes Client B to SIGTERM
+/// the fresh daemon that Client A just spawned.
 ///
 /// Deadlock: the spawned daemon is a separate OS process.  The lock guard is
 /// dropped when this function returns — before the caller's readiness-probe
 /// loop runs.  The daemon's `run_daemon` then acquires the same lock for its
 /// own bind+pid-write window.  The client and daemon never hold the lock
 /// simultaneously.
-fn kill_and_respawn() -> std::io::Result<()> {
+async fn kill_and_respawn(frame: &DaemonRequestFrame) -> std::io::Result<bool> {
     let _lock = acquire_recovery_lock();
+    // Double-checked locking: re-probe under the lock before killing.
+    // If a concurrent client already replaced the stale daemon with a responsive,
+    // config-matching one, return without touching it.
+    if let ForwardOutcome::Response(resp) = try_forward_inner(frame).await {
+        if map_response(resp, &frame.config_id).is_some() {
+            tracing::debug!(
+                "under-lock re-probe: responsive daemon with matching identity found; \
+                 skipping kill+spawn"
+            );
+            return Ok(false);
+        }
+    }
     kill_stale_daemon_inner();
-    spawn_daemon()
+    spawn_daemon()?;
+    Ok(true)
 }
 
 /// Forward a request to the daemon, auto-spawning it if absent.
@@ -324,11 +387,20 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
         }
         ForwardOutcome::ParseFailure => {
             // The socket was up but the response was garbage — stale daemon.
-            // kill_and_respawn holds the recovery lock across kill + spawn so
-            // concurrent clients cannot each spawn their own daemon.
+            // kill_and_respawn holds the recovery lock across kill + spawn and
+            // re-probes under the lock (double-checked locking) so a concurrent
+            // client that already replaced the stale daemon is NOT killed again.
             tracing::info!("killing stale daemon (undecodable response) and respawning");
-            if kill_and_respawn().is_err() {
-                return None;
+            match kill_and_respawn(frame).await {
+                Err(_) => return None,
+                Ok(false) => {
+                    // Under-lock re-probe found a live matching daemon; forward to it.
+                    return match try_forward_inner(frame).await {
+                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        _ => None,
+                    };
+                }
+                Ok(true) => {}
             }
             // Give the kernel a moment to release the socket path and let the
             // spawned daemon process start.
@@ -364,18 +436,35 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
         ForwardOutcome::ProtocolMismatch => {
             // The response was decodable but `daemon_protocol_version` does not
             // match PROTOCOL_VERSION (old daemon silently omits the field → 0).
-            // kill_and_respawn holds the recovery lock across kill + spawn.
+            // kill_and_respawn holds the recovery lock across kill + spawn and
+            // re-probes under the lock to avoid killing a freshly-spawned daemon.
             tracing::info!(
                 "killing stale daemon (protocol version mismatch, old daemon) and respawning"
             );
-            if kill_and_respawn().is_err() {
-                return Some(Err(McpError::internal_error(
-                    format!(
-                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                         respawn failed — run `make local` to rebuild the daemon binary"
-                    ),
-                    None,
-                )));
+            match kill_and_respawn(frame).await {
+                Err(_) => {
+                    return Some(Err(McpError::internal_error(
+                        format!(
+                            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                             respawn failed — run `make local` to rebuild the daemon binary"
+                        ),
+                        None,
+                    )));
+                }
+                Ok(false) => {
+                    // Under-lock re-probe found a live matching daemon; forward to it.
+                    return match try_forward_inner(frame).await {
+                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        _ => Some(Err(McpError::internal_error(
+                            format!(
+                                "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                                 run `make local` to rebuild the daemon binary"
+                            ),
+                            None,
+                        ))),
+                    };
+                }
+                Ok(true) => {}
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1128,25 +1217,35 @@ mod tests {
         ));
     }
 
-    // ── concurrent recovery — only one daemon spawned under the lock (#150) ────
+    // ── concurrent recovery — second client skips kill+spawn when daemon alive ──
     //
-    // Drives N=3 concurrent clients through the ParseFailure recovery path
-    // (fake socket that reads the request then drops the connection).
-    // Asserts that kill_and_respawn is called under a lock so only one
-    // spawn_daemon() succeeds; the others see no stale daemon and skip the kill.
+    // Exercises the recheck-under-lock (double-checked locking) in
+    // kill_and_respawn.  Scenario:
     //
-    // Full multi-process assertion (exactly one surviving daemon process) is not
-    // feasible in a unit-test context because spawn_daemon() tries to exec the
-    // real kkernel binary.  Instead, the test asserts the observable invariant
-    // that the concurrent-recovery path does NOT panic, does NOT return an Ok
-    // result from a stale/crashed daemon, and serializes kill→spawn under the
-    // recovery lock so at most one kill_and_respawn wins the kill (all others
-    // find the PID file already removed and skip SIGTERM).
+    //   1. A real daemon is running (via run_daemon).
+    //   2. A recovering client calls kill_and_respawn directly — simulating a
+    //      client that observed ParseFailure (from a now-dead OLD daemon) and
+    //      wants to replace it, but a concurrent first-recoverer has ALREADY
+    //      spawned a healthy daemon before this client reached the lock.
+    //   3. Under the lock, kill_and_respawn re-probes the socket and finds a
+    //      responsive, config-matching daemon → returns Ok(false).
+    //   4. KILL_COUNT must be 0 and SPAWN_COUNT must be 0.
+    //   5. The fresh daemon's PID file and socket must survive intact.
+    //
+    // FORCE_PID_IS_DAEMON=true makes every live PID SIGTERM-eligible so that
+    // if the recheck is removed (reverted) kill_stale_daemon_inner would
+    // attempt SIGTERM against the real daemon PID, KILL_COUNT would be 1, and
+    // the assertion below would catch the regression.
+    //
+    // Fail-if-reverted assertion: the `assert_eq!(KILL_COUNT, 0)` below catches
+    // a reverted recheck because without the recheck, kill_stale_daemon_inner is
+    // called unconditionally and KILL_COUNT increments to 1.
 
     #[tokio::test]
     #[serial]
-    async fn concurrent_recovery_lock_serializes_kill_and_spawn() {
+    async fn concurrent_recovery_second_client_skips_kill_when_daemon_alive() {
         clear_daemon_env();
+        reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -1157,70 +1256,90 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", &lock_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
 
-        // Write a placeholder PID that pid_is_khive_daemon() will reject
-        // (current exe is the test binary, not "kkernel"), so no SIGTERM is
-        // sent.  This exercises the lock serialization path safely.
-        std::fs::write(&pid_file, std::process::id().to_string()).expect("write placeholder pid");
-
-        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
-
-        // Bind a fake socket that accepts connections, reads the frame, then
-        // drops the stream (simulating a daemon crash mid-dispatch → ParseFailure).
-        // We serve N connections, one per concurrent client.
-        let n: usize = 3;
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake crash socket");
-
-        // Spawn a task that serves exactly N connections then stops.
-        let serve_n = tokio::spawn(async move {
-            for _ in 0..n {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let _ = read_frame(&mut stream).await;
-                    // Drop stream without response → ParseFailure on client side.
-                }
-            }
+        // Run a real daemon so the re-probe in kill_and_respawn finds a live,
+        // responsive, config-matching daemon when it looks under the lock.
+        let server = make_test_server();
+        let config_id = server.config_id().to_string();
+        let daemon_server = server.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
         });
+
+        // Wait for the daemon to bind the socket and write its PID file.
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        // Record the daemon PID as written by run_daemon.
+        let daemon_pid_str =
+            std::fs::read_to_string(&pid_file).expect("daemon must have written a pid file");
+        let daemon_pid: u32 = daemon_pid_str
+            .trim()
+            .parse()
+            .expect("daemon pid file must contain a u32");
+
+        // Arm the SIGTERM-eligible hook: pid_is_khive_daemon() will now return
+        // true for the live daemon PID.  Without the recheck-under-lock, a
+        // reverted kill_and_respawn would send SIGTERM to that PID and unlink
+        // the socket — the KILL_COUNT assertion catches both paths.
+        FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+        reset_counters();
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
-            config_id: config_id.to_string(),
+            config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
         };
 
-        // Launch N concurrent forward_or_spawn calls.  Each will observe
-        // ParseFailure and call kill_and_respawn under the recovery lock.
-        // The first one through will call kill_stale_daemon_inner (which skips
-        // SIGTERM because the PID is not a kkernel process) and then
-        // spawn_daemon (which fails because there is no kkernel binary in
-        // tests).  The subsequent callers will find the socket gone (the fake
-        // listener served N connections and dropped) and return None via their
-        // own ReadDeadline loop.  The key invariant: none of them return an
-        // accepted stale result (Some(Ok(...))).
-        let frame = std::sync::Arc::new(frame);
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let f = frame.clone();
-                tokio::spawn(async move { forward_or_spawn(&f).await })
-            })
-            .collect();
+        // Call kill_and_respawn directly — this simulates a second recovering
+        // client that already holds the lock's turn.  The recheck-under-lock
+        // must find the live daemon and return Ok(false) without killing it.
+        let outcome = kill_and_respawn(&frame).await;
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), serve_n).await;
-
-        let mut accepted_stale = 0usize;
-        for h in handles {
-            if let Ok(Ok(Some(Ok(_)))) =
-                tokio::time::timeout(std::time::Duration::from_secs(8), h).await
-            {
-                accepted_stale += 1;
-            }
-        }
+        assert!(
+            matches!(outcome, Ok(false)),
+            "kill_and_respawn must return Ok(false) when a live matching daemon \
+             already exists under the lock; got {:?}",
+            outcome
+        );
         assert_eq!(
-            accepted_stale, 0,
-            "no concurrent client should accept a stale crashed-daemon result"
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "KILL_COUNT must be 0: the recheck-under-lock found the daemon alive \
+             so kill_stale_daemon_inner must NOT be called \
+             (this assertion fails if the recheck-under-lock is removed)"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "SPAWN_COUNT must be 0: no respawn needed when the daemon is alive \
+             (this assertion fails if the recheck-under-lock is removed)"
         );
 
+        // The daemon's PID file and socket must be intact.
+        assert!(
+            pid_file.exists(),
+            "PID file must survive: kill_and_respawn must NOT unlink it"
+        );
+        assert!(
+            sock.exists(),
+            "socket must survive: kill_and_respawn must NOT unlink it"
+        );
+        let surviving_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid file is a u32");
+        assert_eq!(
+            surviving_pid, daemon_pid,
+            "PID in file must be the original daemon PID — no new daemon was spawned"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
@@ -1228,53 +1347,62 @@ mod tests {
     // ── oversized daemon response does not trigger kill/respawn ───────────────
     //
     // When the daemon's serialized response exceeds MAX_FRAME_BYTES the server
-    // now sends a small explicit error frame (ok=false, "response too large")
-    // instead of closing the connection.  The client receives this as a
-    // ForwardOutcome::Response (decodable frame), which map_response maps to
-    // Some(Err(..)) — NOT ParseFailure → not a kill/respawn trigger.
+    // sends a small explicit error frame (ok=false, "response too large") instead
+    // of closing the connection without a response.  The client receives this as
+    // ForwardOutcome::Response (decodable frame) → map_response → Some(Err(..));
+    // NOT ParseFailure, so no kill/respawn is triggered.
     //
-    // This test uses a fake daemon that writes back a response whose `result`
-    // field is just large enough to push the serialized JSON over MAX_FRAME_BYTES,
-    // then asserts the client does NOT return ParseFailure and does NOT kill the
-    // daemon (the PID file remains after the call).
+    // This test drives the REAL handle_conn server path via run_daemon with a
+    // BigDispatch that returns a string larger than MAX_FRAME_BYTES.  The client
+    // calls forward_or_spawn and must receive Some(Err(..)) containing "too large".
+    // The daemon's PID file and socket must survive the call.
+    //
+    // Fail-if-reverted: if the handle_conn oversized gate (the `if payload.len()
+    // > MAX_FRAME_BYTES` branch that sends the small error frame) is removed,
+    // handle_conn falls through to write_frame with the oversized payload, which
+    // write_frame REJECTS (its own guard returns Err), causing the connection to
+    // close without a response → the client sees ParseFailure → kill_and_respawn
+    // runs → KILL_COUNT > 0 and the PID file assertion fails.
 
-    /// Fake daemon: reads one request frame, then writes back a well-formed
-    /// response whose serialized length exceeds MAX_FRAME_BYTES.  This simulates
-    /// what the daemon server does when it sends the explicit error frame for
-    /// an oversized result: the error frame itself is small, so write_frame
-    /// succeeds and the client receives a decodable ForwardOutcome::Response.
-    async fn serve_oversized_error_frame(
-        listener: tokio::net::UnixListener,
-        config_id: &'static str,
-    ) {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            if read_frame(&mut stream).await.is_ok() {
-                // Send the small explicit error frame that the server-side fix
-                // produces when a real response would exceed MAX_FRAME_BYTES.
-                let err_resp = DaemonResponseFrame {
-                    ok: false,
-                    result: None,
-                    error: Some(format!(
-                        "response too large: 9999999 bytes exceeds {} byte IPC cap",
-                        khive_runtime::daemon::MAX_FRAME_BYTES,
-                    )),
-                    namespace_mismatch: false,
-                    config_mismatch: false,
-                    served_config_id: Some(config_id.to_string()),
-                    version_mismatch: false,
-                    daemon_protocol_version: PROTOCOL_VERSION,
-                };
-                if let Ok(payload) = serde_json::to_vec(&err_resp) {
-                    let _ = write_frame(&mut stream, &payload).await;
-                }
-            }
+    /// A minimal DaemonDispatch that returns a payload larger than MAX_FRAME_BYTES
+    /// so handle_conn's oversized guard fires and emits the "response too large"
+    /// error frame.
+    #[derive(Clone)]
+    struct BigDispatch {
+        namespace: String,
+        config_id: String,
+    }
+
+    #[async_trait]
+    impl daemon::DaemonDispatch for BigDispatch {
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+        ) -> Result<String, String> {
+            // Return a string whose serialized DaemonResponseFrame JSON length
+            // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
+            // a result of this size is comfortably over the cap.
+            Ok("X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1))
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            &self.namespace
+        }
+
+        fn config_id(&self) -> &str {
+            &self.config_id
         }
     }
 
     #[tokio::test]
     #[serial]
-    async fn oversized_daemon_response_does_not_kill_daemon() {
+    async fn oversized_daemon_response_sends_error_frame_not_kills_daemon() {
         clear_daemon_env();
+        reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -1285,13 +1413,26 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", &lock_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
 
-        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
-        // Write a sentinel PID so we can confirm it survives the call.
-        std::fs::write(&pid_file, "12345").expect("write sentinel pid");
+        let config_id = "test-oversized-config";
+        let dispatcher = BigDispatch {
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+        };
 
-        let listener =
-            tokio::net::UnixListener::bind(&sock).expect("bind fake oversized-error socket");
-        let fake_handle = tokio::spawn(serve_oversized_error_frame(listener, config_id));
+        // Run the real daemon server (with handle_conn's oversized gate live).
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(dispatcher).await;
+        });
+
+        // Wait for the daemon to bind and write its PID.
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let daemon_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("daemon must have written a pid file")
+            .trim()
+            .parse()
+            .expect("daemon pid must be a u32");
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
@@ -1304,35 +1445,53 @@ mod tests {
 
         let result = forward_or_spawn(&frame).await;
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
-
-        // The client received a decodable error frame — this is Some(Err(..)),
-        // not ParseFailure.  The PID file must still exist (daemon was NOT killed).
+        // Primary assertion: the daemon's PID file and socket must be intact
+        // (no kill/respawn triggered).
         assert!(
             pid_file.exists(),
-            "PID file must not be removed: oversized response is NOT a daemon crash"
+            "PID file must survive: oversized response is NOT a daemon crash"
+        );
+        assert!(
+            sock.exists(),
+            "socket must survive: oversized response is NOT a daemon crash"
+        );
+        let surviving_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid file is a u32");
+        assert_eq!(
+            surviving_pid, daemon_pid,
+            "daemon PID must not change — no kill+respawn occurred"
+        );
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "KILL_COUNT must be 0 — oversized response must NOT trigger \
+             kill_stale_daemon_inner (fails if handle_conn oversized gate is removed)"
         );
 
-        // The result is either Some(Err(..)) (map_response treated the served_config_id
-        // as matching → explicit error) or None (config echo didn't match our expected
-        // id).  Either way it must NOT be Some(Ok(..)) — the operation was not served.
+        // The result must be Some(Err(..)) containing "too large" — the explicit
+        // error frame the server sends when the real response is oversized.
         match result {
-            Some(Ok(_)) => panic!("oversized-response error frame must not yield Ok result"),
             Some(Err(e)) => {
-                // Good: an error was returned (not a stale kill/respawn).
                 assert!(
-                    !e.message.contains("stale"),
-                    "error must not reference stale daemon; got: {}",
+                    e.message.contains("too large"),
+                    "error must describe the oversized response; got: {}",
                     e.message
                 );
             }
-            None => {
-                // Also acceptable: map_response returned None (config mismatch
-                // on the echo), falling back to local dispatch.  The key
-                // invariant — PID file survives — is already asserted above.
-            }
+            Some(Ok(_)) => panic!("oversized response must not produce Ok result"),
+            None => panic!(
+                "oversized response must produce Some(Err(..)) from the explicit \
+                 error frame, not None (None would mean map_response fell back to \
+                 local dispatch, hiding the server-side error)"
+            ),
         }
 
+        handle.abort();
+        let _ = handle.await;
+        reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
