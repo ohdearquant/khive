@@ -27,16 +27,6 @@ impl Fixture {
     async fn dispatch(&self, verb: &str, args: Value) -> Result<Value, RuntimeError> {
         self.registry.dispatch(verb, args).await
     }
-
-    async fn dispatch_ns(
-        &self,
-        verb: &str,
-        ns: &str,
-        mut args: Value,
-    ) -> Result<Value, RuntimeError> {
-        args["namespace"] = json!(ns);
-        self.registry.dispatch(verb, args).await
-    }
 }
 
 fn pack(rt: KhiveRuntime) -> Fixture {
@@ -824,41 +814,39 @@ async fn get_include_sections_by_uuid() {
 async fn get_include_sections_namespace_isolation() {
     let f = pack(rt());
 
-    f.dispatch_ns(
+    // ADR-007 Rev 2: all storage routes to local. Two DISTINCT slugs each get
+    // their own sections; sections from one atom must not leak to the other.
+    f.dispatch(
         "knowledge.upsert_atoms",
-        "ns-a",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "NSA", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "atoms": [{ "slug": "iso-atom-a", "name": "NSA", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert ns-a");
+    .expect("upsert atom-a");
 
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.edit",
-        "ns-a",
-        json!({ "id": "shared-slug", "sections": [{ "section_type": "overview", "content": "This section belongs exclusively to namespace A and must not be visible from namespace B under any circumstances." }] }),
+        json!({ "id": "iso-atom-a", "sections": [{ "section_type": "overview", "content": "This section belongs exclusively to atom A and must not be visible when fetching atom B under any circumstances." }] }),
     )
     .await
-    .expect("edit ns-a");
+    .expect("edit atom-a");
 
-    f.dispatch_ns(
+    f.dispatch(
         "knowledge.upsert_atoms",
-        "ns-b",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "NSB", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        json!({ "atoms": [{ "slug": "iso-atom-b", "name": "NSB", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
-    .expect("upsert ns-b");
+    .expect("upsert atom-b");
 
     let got_b = f
-        .dispatch_ns(
+        .dispatch(
             "knowledge.get",
-            "ns-b",
-            json!({ "id": "shared-slug", "include_sections": true }),
+            json!({ "id": "iso-atom-b", "include_sections": true }),
         )
         .await
-        .expect("get ns-b");
+        .expect("get atom-b");
 
     let sections_b = got_b["sections"].as_array().expect("sections array");
-    assert_eq!(sections_b.len(), 0, "ns-b atom must not see ns-a sections");
+    assert_eq!(sections_b.len(), 0, "atom-b must not see atom-a sections");
 }
 
 // Regression: two sections sharing the same sort_order must come back in a
