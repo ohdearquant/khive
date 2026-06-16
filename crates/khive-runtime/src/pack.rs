@@ -267,7 +267,13 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces threaded into dispatch tokens.
+    /// Retained for future cloud-gate policy wiring only.
+    ///
+    /// After ADR-007 Rev 2 (PR-B), `VerbRegistry::dispatch` always mints the
+    /// storage token with `Namespace::local()` and an empty extra-visible set.
+    /// This field is NOT a read-scope-widening mechanism and is ignored by the
+    /// OSS dispatch path.  A cloud gate implementation may consult it as a
+    /// policy input, but it does not flow into the storage token.
     visible_namespaces: Vec<Namespace>,
     /// Optional audit event sink.
     ///
@@ -297,10 +303,14 @@ impl VerbRegistryBuilder {
         }
     }
 
-    /// Set the extra readable namespaces threaded into dispatch tokens.
+    /// Store extra namespaces for future cloud-gate policy wiring.
     ///
-    /// These are the namespaces from `actor.visible_namespaces` in `khive.toml`.
-    /// The primary namespace is always readable and need not appear here.
+    /// After ADR-007 Rev 2 (PR-B), these namespaces are **not** threaded into
+    /// dispatch tokens and do **not** widen read scope.  The OSS dispatch path
+    /// always mints `Namespace::local()` with an empty extra-visible set
+    /// regardless of what is supplied here.  This setter is retained so that a
+    /// cloud gate implementation can read the value as policy input without
+    /// requiring a builder API change.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
         self
