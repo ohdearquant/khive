@@ -2872,16 +2872,23 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
     );
 }
 
-// T7 — white-box: with_namespace token scoping.
+// T7 — white-box: with_namespace token scoping (realigned to ADR-007 by-ID contract, #148).
 //
-// `NamespaceToken::with_namespace(recipient)` produces a token with
-// `namespace = recipient, visible = [recipient]`.  This is an ordinary
-// NamespaceToken — NOT a type-enforced write-only capability:
-//   (a) The minted token CANNOT read the SENDER namespace (visible set excludes it).
-//   (b) The minted token CAN read the RECIPIENT namespace (it IS in the visible set).
+// `NamespaceToken::with_namespace(recipient)` produces a token scoped to the
+// recipient namespace.  It is an ordinary NamespaceToken — NOT a type-enforced
+// write-only capability.
 //
-// The security boundary is the sender-side allowlist check and the comm
-// handler's single-create usage, not the token type.
+// Under ADR-007 rule 2 (PR #148), by-ID operations are namespace-blind: the token's
+// namespace is used for WRITE attribution and multi-record LIST filtering only.
+// A `get_note_including_deleted` call resolves a globally-unique UUID and returns
+// the record regardless of which namespace the token carries.
+//
+//   (a) The minted token CAN read the SENDER-namespace note by UUID (by-ID reads are
+//       namespace-blind; the gate, not the token's visible set, is the auth boundary).
+//   (b) The minted token CAN read the RECIPIENT-namespace note by UUID (same contract).
+//
+// The security boundary remains the sender-side allowlist check on comm.send;
+// the token type does not enforce read isolation on by-ID fetches.
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
@@ -2931,26 +2938,40 @@ async fn t7_with_namespace_token_scoping() {
     let recipient_tok: NamespaceToken =
         leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    // (a) Minted token CANNOT read the sender-ns note (visible set is [lambda:khive]).
-    let cannot_see_sender = rt_leo
+    // (a) By-ID reads are namespace-blind (ADR-007 rule 2, PR #148): the minted
+    // token CAN read a sender-namespace note by UUID. The stored namespace of
+    // the returned note must still reflect where it was created (lambda:leo).
+    let can_see_sender = rt_leo
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
-    match cannot_see_sender {
-        Ok(None) => {
-            // Expected: token's visible set is [lambda:khive], cannot see lambda:leo notes.
+    match can_see_sender {
+        Ok(Some(note)) => {
+            // Expected: by-ID fetch ignores the token's namespace; record is returned.
+            // The note's own namespace must be the write namespace it was created in.
+            assert_eq!(
+                note.namespace, "lambda:leo",
+                "T7(a): stored namespace must be the sender's write namespace"
+            );
         }
-        Ok(Some(_)) => panic!("T7(a): with_namespace token must not read sender-ns note"),
+        Ok(None) => panic!(
+            "T7(a): by-ID read must return the sender-ns note regardless of token namespace \
+             (ADR-007 rule 2, PR #148 removed by-ID namespace enforcement)"
+        ),
         Err(e) => panic!("T7(a): unexpected error {e:?}"),
     }
 
     // (b) Minted token CAN read the recipient-ns note — it is a full read+write token
-    // for the recipient ns, not a type-enforced write-only capability.
+    // for the recipient ns; by-ID reads are namespace-blind in any case (#148).
     let can_see_recipient = rt_khive
         .get_note_including_deleted(&recipient_tok, recipient_note.id)
         .await;
     match can_see_recipient {
-        Ok(Some(_)) => {
+        Ok(Some(note)) => {
             // Expected: the minted token can read from its own namespace (lambda:khive).
+            assert_eq!(
+                note.namespace, "lambda:khive",
+                "T7(b): stored namespace must be the recipient's write namespace"
+            );
         }
         Ok(None) => panic!("T7(b): minted token must be able to read recipient-ns note"),
         Err(e) => panic!("T7(b): unexpected error {e:?}"),
