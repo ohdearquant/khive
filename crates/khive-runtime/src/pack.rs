@@ -758,17 +758,19 @@ impl VerbRegistry {
         }
 
         // Mint the authorized namespace token at the dispatch boundary.
-        // ns_str was already validated above when building the gate request.
         //
-        // ADR-007 Rev 2, Rule 3 (PR-B): visible set is collapsed to [primary] for all
-        // multi-record ops. Per-actor namespace routing via actor.visible_namespaces is
-        // dissolved; all packs store in the shared "local" namespace. Per-actor distinctions
-        // are view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
-        // The actor.visible_namespaces config field is retained for future cloud-tier gate
-        // policy input but no longer widens the dispatch token's read scope.
-        let primary = Namespace::parse(&ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous());
+        // ADR-007 Rev 2, Rule 0 + Rule 3 (PR-B): the OSS dispatch path pins the storage
+        // token's primary to `local`. Actor identity, CLI `--actor`, and config `[actor] id`
+        // are gate/attribution inputs only — they never route storage. The request/default
+        // namespace (`ns_str`) reaches the gate via `gate_req` for policy evaluation, but
+        // the token handed to packs always has primary = local, so all packs write and read
+        // the shared "local" store regardless of which actor is configured.
+        // `actor.visible_namespaces` is dissolved; per-actor distinctions are view-layer tag
+        // filters (assignee, actor_id, from/to), not namespace partitions.
+        // `with_visible_namespaces()` is retained on the builder for future cloud-gate policy
+        // input but no longer widens this dispatch token's read scope.
+        let token =
+            NamespaceToken::mint_with_visibility(Namespace::local(), vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
