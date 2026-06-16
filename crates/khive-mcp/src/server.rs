@@ -746,6 +746,7 @@ result (e.g. create then link with the new entity's id)."#)]
                 namespace: self.default_namespace.clone(),
                 config_id: self.config_id.clone(),
                 protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
+                probe_only: false,
             };
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;
