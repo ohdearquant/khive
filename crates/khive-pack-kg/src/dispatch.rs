@@ -217,11 +217,12 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }), &registry, &tenant_b)
             .await
             .expect("list must succeed");
-        let items = list
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // list returns a JSON array directly (Vec<Entity> serialized) — not an object with
+        // an "items" key. Panic on any other shape so the assertion is never vacuous.
+        let items: Vec<serde_json::Value> = match list {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
         assert!(
             items
                 .iter()
@@ -273,5 +274,200 @@ mod tests {
         pack.dispatch("get", json!({ "id": id2 }), &registry, &local_token)
             .await
             .expect("Beta must be retrievable via local token");
+    }
+
+    /// ADR-007 Rev 2, Rule 3 (PR-B): shared-brain visible-set regression.
+    ///
+    /// The dispatch token minted by VerbRegistry must always have visible = [primary_namespace]
+    /// regardless of what `actor.visible_namespaces` was configured on the registry. All
+    /// multi-record ops (list) scope to the single shared "local" set.
+    ///
+    /// This test verifies two invariants:
+    ///
+    /// 1. Records written to "local" (the OSS default namespace) are visible in a list
+    ///    dispatched via the registry — the shared-brain property.
+    /// 2. A record written to a non-"local" namespace (stranded record, written via a
+    ///    directly-minted token) does NOT appear in the "local" list even when that
+    ///    extra namespace appears in the registry's visible_namespaces config — proving
+    ///    the visible set is collapsed to [primary] and not widened by the config field.
+    #[tokio::test]
+    async fn dispatch_list_scopes_to_primary_namespace_only_adr007_prb() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let extra_ns = Namespace::parse("alpha-test-ns").expect("valid namespace");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_visible_namespaces(vec![extra_ns.clone()]);
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let entity_in_local = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "SharedBrainConcept" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create in local must succeed");
+        let local_id = entity_in_local
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+        assert_eq!(
+            entity_in_local
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "local",
+            "entity written via local token must land in 'local'"
+        );
+
+        let extra_token = rt.authorize(extra_ns.clone()).expect("authorize extra-ns");
+        let entity_in_extra = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "StrandedConcept" }),
+                &registry,
+                &extra_token,
+            )
+            .await
+            .expect("create in extra-ns must succeed");
+        let extra_id = entity_in_extra
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+        assert_eq!(
+            entity_in_extra
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "alpha-test-ns",
+            "entity written via extra-ns token must land in 'alpha-test-ns'"
+        );
+
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity" }))
+            .await
+            .expect("list must succeed");
+        // list returns a JSON array directly (Vec<Entity> serialized).
+        let items: Vec<serde_json::Value> = match list_result {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            ids.contains(&local_id),
+            "shared-brain: 'local' entity must appear in list; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&extra_id),
+            "visible-set collapse: 'alpha-test-ns' entity must NOT appear in list \
+             even though that namespace was in registry.visible_namespaces; got ids: {ids:?}"
+        );
+    }
+
+    /// ADR-007 Rev 2, Rule 0 regression: non-local actor config does NOT route storage.
+    ///
+    /// Builds a VerbRegistry whose `default_namespace` is `"lambda:leo"` (simulating
+    /// `[actor] id = "lambda:leo"` or `--actor lambda:leo`).  Dispatches `create` and
+    /// `list` through `VerbRegistry::dispatch` (the real MCP path — not `pack.dispatch`).
+    ///
+    /// Asserts:
+    /// 1. The created entity lands in `"local"`, not `"lambda:leo"`.
+    /// 2. A subsequent `list` via the registry returns the entity, proving write+read both
+    ///    operate on `"local"` regardless of the non-local actor configuration.
+    /// 3. A direct-token `list` scoped to `"lambda:leo"` returns an empty set, proving the
+    ///    storage was never written to the actor namespace.
+    #[tokio::test]
+    async fn non_local_actor_config_does_not_route_storage_adr007_rule0() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        // Registry whose default namespace mirrors what `[actor] id = "lambda:leo"` sets.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("lambda:leo");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        // Create via VerbRegistry::dispatch — this exercises the real mint path.
+        let create_result = registry
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "ActorRouteProbe" }),
+            )
+            .await
+            .expect("create must succeed through registry dispatch");
+
+        let entity_id = create_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("create result must carry 'id'");
+
+        // ADR-007 Rule 0: storage namespace must be 'local', not the actor/default namespace.
+        assert_eq!(
+            create_result
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "local",
+            "entity must land in 'local' even when default_namespace='lambda:leo'; \
+             actor identity must not silently become the storage namespace (ADR-007 Rule 0)"
+        );
+
+        // list via the registry must return the entity from 'local'.
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity" }))
+            .await
+            .expect("list must succeed through registry dispatch");
+        let ids_in_registry_list: Vec<&str> = match &list_result {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+                .collect(),
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+        assert!(
+            ids_in_registry_list.contains(&entity_id),
+            "entity created via non-local actor registry must be readable from 'local' list; \
+             got ids: {ids_in_registry_list:?}"
+        );
+
+        // A token pinned to the actor namespace must see an empty store — nothing was
+        // written there, confirming storage was not routed through the actor namespace.
+        let pack = KgPack::new(rt.clone());
+        let actor_ns_token = rt
+            .authorize(Namespace::parse("lambda:leo").expect("valid namespace"))
+            .expect("authorize lambda:leo token");
+        let actor_list_result = pack
+            .dispatch(
+                "list",
+                json!({ "kind": "entity" }),
+                &registry,
+                &actor_ns_token,
+            )
+            .await
+            .expect("direct pack list via actor-ns token must succeed");
+        let ids_in_actor_ns: Vec<&str> = match &actor_list_result {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+                .collect(),
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+        assert!(
+            !ids_in_actor_ns.contains(&entity_id),
+            "storage must not have been routed to 'lambda:leo'; \
+             entity must NOT appear when listing directly under that namespace; \
+             got ids: {ids_in_actor_ns:?}"
+        );
     }
 }

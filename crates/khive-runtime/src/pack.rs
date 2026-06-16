@@ -267,7 +267,13 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces threaded into dispatch tokens.
+    /// Retained for future cloud-gate policy wiring only.
+    ///
+    /// After ADR-007 Rev 2 (PR-B), `VerbRegistry::dispatch` always mints the
+    /// storage token with `Namespace::local()` and an empty extra-visible set.
+    /// This field is NOT a read-scope-widening mechanism and is ignored by the
+    /// OSS dispatch path.  A cloud gate implementation may consult it as a
+    /// policy input, but it does not flow into the storage token.
     visible_namespaces: Vec<Namespace>,
     /// Optional audit event sink.
     ///
@@ -297,10 +303,14 @@ impl VerbRegistryBuilder {
         }
     }
 
-    /// Set the extra readable namespaces threaded into dispatch tokens.
+    /// Store extra namespaces for future cloud-gate policy wiring.
     ///
-    /// These are the namespaces from `actor.visible_namespaces` in `khive.toml`.
-    /// The primary namespace is always readable and need not appear here.
+    /// After ADR-007 Rev 2 (PR-B), these namespaces are **not** threaded into
+    /// dispatch tokens and do **not** widen read scope.  The OSS dispatch path
+    /// always mints `Namespace::local()` with an empty extra-visible set
+    /// regardless of what is supplied here.  This setter is retained so that a
+    /// cloud gate implementation can read the value as policy input without
+    /// requiring a builder API change.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
         self
@@ -461,7 +471,6 @@ impl VerbRegistryBuilder {
             packs: Arc::new(ordered_packs),
             gate: self.gate,
             default_namespace: self.default_namespace,
-            visible_namespaces: self.visible_namespaces,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -589,8 +598,6 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces for dispatch tokens (from `actor.visible_namespaces`).
-    visible_namespaces: Vec<Namespace>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -761,14 +768,19 @@ impl VerbRegistry {
         }
 
         // Mint the authorized namespace token at the dispatch boundary.
-        // ns_str was already validated above when building the gate request.
-        let primary = Namespace::parse(&ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = NamespaceToken::mint_with_visibility(
-            primary,
-            self.visible_namespaces.clone(),
-            ActorRef::anonymous(),
-        );
+        //
+        // ADR-007 Rev 2, Rule 0 + Rule 3 (PR-B): the OSS dispatch path pins the storage
+        // token's primary to `local`. Actor identity, CLI `--actor`, and config `[actor] id`
+        // are gate/attribution inputs only — they never route storage. The request/default
+        // namespace (`ns_str`) reaches the gate via `gate_req` for policy evaluation, but
+        // the token handed to packs always has primary = local, so all packs write and read
+        // the shared "local" store regardless of which actor is configured.
+        // `actor.visible_namespaces` is dissolved; per-actor distinctions are view-layer tag
+        // filters (assignee, actor_id, from/to), not namespace partitions.
+        // `with_visible_namespaces()` is retained on the builder for future cloud-gate policy
+        // input but no longer widens this dispatch token's read scope.
+        let token =
+            NamespaceToken::mint_with_visibility(Namespace::local(), vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
