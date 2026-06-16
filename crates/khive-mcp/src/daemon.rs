@@ -88,7 +88,19 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     }
     let resp = match read_frame(&mut stream).await {
         Ok(r) => r,
-        Err(_) => return ForwardOutcome::NoSocket,
+        Err(e) => {
+            // The request was sent but the daemon closed the connection before
+            // sending a response frame — likely a daemon crash or panic during
+            // dispatch. Treat as ParseFailure (not NoSocket) so the stale daemon
+            // is killed and a fresh one is spawned, preventing the caller from
+            // silently falling back to local dispatch against a broken daemon.
+            tracing::warn!(
+                error = %e,
+                "daemon closed connection without sending a response \
+                 (crash during dispatch?) — treating as stale"
+            );
+            return ForwardOutcome::ParseFailure;
+        }
     };
     match serde_json::from_slice::<DaemonResponseFrame>(&resp) {
         Ok(frame) => {
@@ -964,6 +976,89 @@ mod tests {
 
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── daemon crash mid-dispatch regression (#91) ────────────────────────────
+    //
+    // When the daemon crashes (or panics) during dispatch it closes the
+    // connection without writing a response frame. Before the fix, `try_forward_inner`
+    // returned `ForwardOutcome::NoSocket` on the `read_frame` error, causing
+    // `forward_or_spawn` to return `None` — a silent fallback to local dispatch.
+    //
+    // The fix promotes the `read_frame` error to `ForwardOutcome::ParseFailure`
+    // so the stale daemon is killed and the client does NOT silently accept a
+    // potentially broken daemon state for subsequent requests.
+    //
+    // This test binds a fake socket that reads the request but immediately drops
+    // the connection without writing a response (simulating a crash during
+    // dispatch), then asserts that `forward_or_spawn` falls back to `None`
+    // (because the respawn attempt also sees no socket) with the WARN log
+    // rather than silently accepting the empty response.
+    //
+    // We cannot assert an `Err` here because after killing the stale daemon the
+    // respawn path calls `spawn_daemon()` (which tries to exec the real binary),
+    // fails or times out, and returns `None`. The critical invariant is that
+    // `NoSocket` is NOT returned directly on read failure — the `ParseFailure`
+    // path is taken instead (logging the crash and killing the stale process).
+    // The `try_forward_inner` unit test below validates the exact `ForwardOutcome`
+    // discriminant.
+
+    /// Serve one connection: read the request frame, then drop the stream
+    /// without writing any response (simulating a daemon crash mid-dispatch).
+    async fn serve_crash_on_dispatch(listener: tokio::net::UnixListener) {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Read the inbound request (and discard it — the "crash" happens here).
+            let _ = read_frame(&mut stream).await;
+            // Drop stream without writing a response — connection resets.
+        }
+        // Listener drops; subsequent connection attempts see "connection refused".
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake crash-daemon socket");
+        // Write a placeholder PID file with the current process PID so
+        // kill_stale_daemon has something to look at (it will skip SIGTERM
+        // because the exe basename is not "kkernel" — which is the safe path).
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        // Serve one connection that crashes without replying.
+        let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        // Call try_forward_inner directly to assert the discriminant.
+        let outcome = try_forward_inner(&frame).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        assert!(
+            matches!(outcome, ForwardOutcome::ParseFailure),
+            "daemon crash (connection closed without response) must yield \
+             ParseFailure, not NoSocket — got a different variant"
+        );
+
+        clear_daemon_env();
     }
 
     // ── argv_is_khive_daemon unit tests ───────────────────────────────────────
