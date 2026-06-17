@@ -13,5 +13,5 @@ mod index_handler;
 mod search;
 mod sections;
 pub(crate) mod sections_index;
-pub(super) mod util;
+pub(crate) mod util;
 pub(crate) struct KnowledgeHandlers;

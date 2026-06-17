@@ -242,11 +242,9 @@ pub struct RuntimeConfig {
     /// 2. Namespace-bound profile resolved via `brain.resolve` at feedback time
     /// 3. Pack-local global tuning prior (default fallback)
     pub brain_profile: Option<String>,
-    /// Extra namespaces the pack-dispatch token may read (beyond the primary).
-    ///
-    /// Populated from `actor.visible_namespaces` in `khive.toml`. The primary
-    /// namespace (actor.id) is always implicitly readable and need not appear
-    /// here. Empty by default (single-namespace behaviour).
+    /// Extra namespaces retained for configuration identity; NOT consumed by
+    /// OSS dispatch (storage token is always pinned to `local`, ADR-007 Rev 2).
+    /// Populated from `actor.visible_namespaces` in `khive.toml`.
     pub visible_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`

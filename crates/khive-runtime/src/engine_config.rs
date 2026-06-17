@@ -83,22 +83,22 @@ pub struct EngineConfig {
 
 /// Actor configuration — the default namespace / identity for this khive instance.
 ///
-/// Corresponds to the `[actor]` TOML section. In OSS mode the runtime uses
-/// `id` as the `default_namespace` stamped on every write operation. Cloud
-/// deployments derive the namespace from an authenticated `NamespaceToken`
-/// instead; the `[actor]` section is ignored there.
+/// Corresponds to the `[actor]` TOML section. `id` is used as the
+/// `default_namespace` for gate/attribution policy input. OSS dispatch pins
+/// storage to the shared `local` namespace regardless of this value (ADR-007
+/// Rev 2); cloud deployments derive the namespace from an authenticated
+/// `NamespaceToken` instead.
 ///
 /// ```toml
 /// [actor]
-/// id = "lambda:leo"                          # write namespace (required)
+/// id = "lambda:leo"                          # attribution identity (required)
 /// display_name = "Leo global orchestrator"   # human label (optional)
-/// visible_namespaces = ["lambda:khive", "local"]  # additional readable namespaces
+/// visible_namespaces = ["lambda:khive", "local"]  # configuration identity; not consumed by OSS dispatch
 /// ```
 ///
-/// The `visible_namespaces` list extends the read visibility of the token
-/// minted for this actor. Records in any of those namespaces will appear in
-/// list / search / get results alongside records in the primary `id` namespace.
-/// The primary namespace is always visible regardless of this list.
+/// `visible_namespaces` is retained for configuration identity and future
+/// cloud-gate policy. OSS dispatch does NOT use it to widen read scope
+/// (storage token is always local-only, ADR-007 Rev 2).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ActorConfig {
     /// Namespace identifier used as the default actor for all operations.
@@ -114,10 +114,10 @@ pub struct ActorConfig {
     #[serde(default)]
     pub display_name: Option<String>,
 
-    /// Additional namespaces this actor can read from (beyond its own write
-    /// namespace). Each string must be a valid `Namespace`. The primary `id`
-    /// namespace is always included in the visible set — no need to repeat it
-    /// here. When absent or empty, visibility defaults to `[id]` only.
+    /// Additional namespaces retained for configuration identity and future
+    /// cloud-gate policy. Each string must be a valid `Namespace`. OSS
+    /// dispatch does NOT consume this list — storage is always pinned to
+    /// `local` regardless (ADR-007 Rev 2).
     #[serde(default)]
     pub visible_namespaces: Option<Vec<String>>,
 
@@ -150,13 +150,12 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
 
-    /// Default actor (namespace) for this khive instance.
+    /// Default actor identity for this khive instance.
     ///
-    /// When present, `actor.id` becomes the `default_namespace` used by the
-    /// runtime when no per-operation `namespace` argument is supplied. OSS
-    /// model: no enforcement — any operation may still pass `namespace=` to
-    /// use a different namespace. Cloud model derives namespace from an
-    /// authenticated token and ignores this field.
+    /// When present, `actor.id` feeds configuration identity and gate/attribution
+    /// policy input.  OSS dispatch pins storage to the shared `local` namespace
+    /// regardless of this setting (ADR-007 Rev 2).  Cloud model derives actor
+    /// identity from an authenticated token.
     #[serde(default)]
     pub actor: ActorConfig,
 

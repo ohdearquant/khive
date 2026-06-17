@@ -87,7 +87,24 @@ impl KgPack {
         let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
         let spec: KindSpec = match explicit_spec {
             Some(s) => s,
-            None => self.infer_kind_from_uuid(token, id, &p.id).await?,
+            None => match self.infer_kind_from_uuid(token, id, &p.id).await {
+                Ok(s) => s,
+                Err(RuntimeError::NotFound(_)) => {
+                    // Check if a pack resolver claims this UUID; if so, update is deferred.
+                    for (_pack_name, resolver) in registry.resolvers() {
+                        if resolver.resolve_by_id(id).await?.is_some() {
+                            return Err(RuntimeError::InvalidInput(
+                                "update of pack-private records is not yet supported; \
+                                 use the pack's own verbs (e.g. knowledge.upsert_atoms, \
+                                 knowledge.upsert_domains, knowledge.edit)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+                }
+                Err(e) => return Err(e),
+            },
         };
 
         match spec {
@@ -164,17 +181,38 @@ impl KgPack {
         } else {
             resolve_uuid_async(&p.id, &self.runtime, token).await?
         };
-        let spec: KindSpec = match explicit_spec {
-            Some(s) => s,
+        let spec: Option<KindSpec> = match explicit_spec {
+            Some(s) => Some(s),
             None => {
-                if hard {
+                let infer_result = if hard {
                     self.infer_kind_from_uuid_including_deleted(token, id, &p.id)
-                        .await?
+                        .await
                 } else {
-                    self.infer_kind_from_uuid(token, id, &p.id).await?
+                    self.infer_kind_from_uuid(token, id, &p.id).await
+                };
+                match infer_result {
+                    Ok(s) => Some(s),
+                    Err(RuntimeError::NotFound(_)) => {
+                        // Second-chance: probe pack resolvers for pack-private records.
+                        for (_pack_name, resolver) in registry.resolvers() {
+                            let maybe = if hard {
+                                resolver.resolve_by_id_including_deleted(id).await?
+                            } else {
+                                resolver.resolve_by_id(id).await?
+                            };
+                            if maybe.is_some() {
+                                return resolver.delete_by_id(id, hard).await;
+                            }
+                        }
+                        return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         };
+
+        // Unwrap is safe: None branch above always returns early.
+        let spec = spec.unwrap();
 
         match spec {
             KindSpec::Entity { specific } => {

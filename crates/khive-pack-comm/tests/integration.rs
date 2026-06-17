@@ -428,10 +428,8 @@ async fn test_send_writes_outbound_in_caller_ns() {
         .await
         .expect("same-namespace send succeeds");
 
-    // Verify: lambda:khive namespace has exactly 1 outbound note.
-    let caller_token = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
+    let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -450,14 +448,16 @@ async fn test_send_writes_outbound_in_caller_ns() {
     assert_eq!(
         outbound.len(),
         1,
-        "caller namespace must have exactly 1 outbound note; got {outbound:?}"
+        "local namespace must have exactly 1 outbound note (ADR-007 all-local); got {outbound:?}"
     );
+    // ADR-007 Rev 2: `to_actor` carries the intended recipient ("lambda:khive").
+    // The `to` property is caller_ns ("local") per dual_write_message's actor-addressed path.
     assert_eq!(
         outbound[0]
             .properties
             .as_ref()
             .unwrap()
-            .get("to")
+            .get("to_actor")
             .and_then(|v| v.as_str()),
         Some("lambda:khive")
     );
@@ -479,14 +479,12 @@ async fn test_send_writes_inbound_in_recipient_ns() {
         .await
         .expect("same-namespace send succeeds");
 
-    // Verify: lambda:khive namespace has exactly 1 inbound note.
-    let caller_token = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
+    let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
-        .expect("list_notes in caller ns succeeds");
+        .expect("list_notes in local ns succeeds");
     let inbound: Vec<_> = notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
@@ -501,17 +499,12 @@ async fn test_send_writes_inbound_in_recipient_ns() {
     assert_eq!(
         inbound.len(),
         1,
-        "caller namespace must have exactly 1 inbound note; got {inbound:?}"
+        "local namespace must have exactly 1 inbound note (ADR-007 all-local); got {inbound:?}"
     );
     let props = inbound[0].properties.as_ref().unwrap();
-    assert_eq!(
-        props.get("from").and_then(|v| v.as_str()),
-        Some("lambda:khive")
-    );
-    assert_eq!(
-        props.get("to").and_then(|v| v.as_str()),
-        Some("lambda:khive")
-    );
+    // ADR-007 Rev 2: token.namespace() is always "local", so from = "local".
+    assert_eq!(props.get("from").and_then(|v| v.as_str()), Some("local"));
+    assert_eq!(props.get("to").and_then(|v| v.as_str()), Some("local"));
     assert_eq!(inbound[0].content, "meeting at 3pm");
     // inbound copy must carry an outbound_ref back to the outbound copy.
     assert!(
@@ -553,10 +546,8 @@ async fn test_inbox_returns_inbound_for_recipient() {
 
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
     let props = msgs[0].get("properties").unwrap();
-    assert_eq!(
-        props.get("from").and_then(|v| v.as_str()),
-        Some("lambda:khive")
-    );
+    // ADR-007 Rev 2: token.namespace() is always "local", so from = "local".
+    assert_eq!(props.get("from").and_then(|v| v.as_str()), Some("local"));
     assert_eq!(
         props.get("direction").and_then(|v| v.as_str()),
         Some("inbound")
@@ -578,9 +569,8 @@ async fn test_send_to_self_writes_two_notes() {
         .await
         .expect("send-to-self succeeds");
 
-    let caller_token = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
+    let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -589,7 +579,7 @@ async fn test_send_to_self_writes_two_notes() {
     assert_eq!(
         alive.len(),
         2,
-        "send-to-self must create exactly 2 notes (outbound + inbound copy); got {alive:?}"
+        "send-to-self must create exactly 2 notes in local ns (ADR-007 all-local); got {alive:?}"
     );
     let directions: Vec<&str> = alive
         .iter()
@@ -647,22 +637,23 @@ async fn test_reply_from_sender_routes_to_recipient() {
         .await
         .expect("reply succeeds");
 
-    // from == to in self-send, so reply routes back to self.
+    // ADR-007 Rev 2: reply_to = original to_actor = "lambda:khive".
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
         .expect("reply returns to");
     assert_eq!(
         reply_to, "lambda:khive",
-        "UE6-H1: self-send reply routes back to same namespace; got {reply_to}"
+        "UE6-H1: self-send reply routes back to to_actor; got {reply_to}"
     );
+    // ADR-007 Rev 2: from = token.namespace() = "local".
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
         .expect("reply returns from");
     assert_eq!(
-        reply_from, "lambda:khive",
-        "reply from must be the caller namespace"
+        reply_from, "local",
+        "reply from must be local (ADR-007 all-local, token.namespace()=local)"
     );
 }
 
@@ -710,22 +701,23 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .await
         .expect("reply succeeds");
 
-    // In same-namespace, from == to, so reply routes to the same namespace.
+    // ADR-007 Rev 2: reply_to = original to_actor = "lambda:khive".
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
         .expect("reply returns to");
     assert_eq!(
         reply_to, "lambda:khive",
-        "UE6-H1: same-namespace reply routes back to caller namespace; got {reply_to}"
+        "UE6-H1: reply routes to original to_actor; got {reply_to}"
     );
+    // ADR-007 Rev 2: from = token.namespace() = "local".
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
         .expect("reply returns from");
     assert_eq!(
-        reply_from, "lambda:khive",
-        "reply from must be the caller namespace"
+        reply_from, "local",
+        "reply from must be local (ADR-007 all-local, token.namespace()=local)"
     );
 }
 
@@ -1515,10 +1507,9 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
     // Find the inbound copy — it has a different UUID from the outbound copy.
-    let caller_token = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -1601,10 +1592,9 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .and_then(|v| v.as_str())
         .expect("outbound full_id");
 
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
     // Find the inbound copy (direction=inbound) — it has a different UUID.
-    let caller_token = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -1679,9 +1669,9 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
 async fn test_list_message_finds_match_beyond_1000_backlog() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
-    let tok = rt
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); write directly to "local"
+    // so that list(kind=message) dispatched through the registry sees the same data.
+    let tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
 
     // Write the inbound target FIRST so it is stored with the earliest created_at.
     // Notes are returned newest-first by the DB; if the target were written last it
@@ -1794,7 +1784,8 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "ADR-057: actor-addressed send from lambda:khive to lambda:leo must succeed; got err: {result:?}"
     );
 
-    // No note must appear in lambda:leo namespace — isolation preserved.
+    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); no write to lambda:leo ns.
+    // Verify isolation: lambda:leo namespace has no notes.
     let recipient_token = rt
         .authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -1805,25 +1796,25 @@ async fn test_cross_namespace_send_denied_issue_481() {
     assert_eq!(
         notes.len(),
         0,
-        "ADR-057: no note in recipient (lambda:leo) namespace; both copies stay in caller ns"
+        "ADR-057: no note in recipient (lambda:leo) namespace; both copies land in local ns"
     );
 
-    // Both copies must appear in lambda:khive namespace.
-    let sender_token = rt
-        .authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap())
+    // ADR-007 Rev 2: both copies land in "local" (not lambda:khive).
+    let local_token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
         .unwrap();
-    let sender_notes = rt
-        .list_notes(&sender_token, Some("message"), 100, 0)
+    let local_notes = rt
+        .list_notes(&local_token, Some("message"), 100, 0)
         .await
-        .expect("list_notes in sender ns");
-    let alive: Vec<_> = sender_notes
+        .expect("list_notes in local ns");
+    let alive: Vec<_> = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .collect();
     assert_eq!(
         alive.len(),
         2,
-        "ADR-057: both outbound and inbound copies must land in caller (lambda:khive) ns; got {alive:?}"
+        "ADR-057: both outbound and inbound copies must land in local ns (ADR-007 all-local); got {alive:?}"
     );
 
     // One outbound, one inbound.
@@ -1838,20 +1829,21 @@ async fn test_cross_namespace_send_denied_issue_481() {
         .collect();
     assert!(
         directions.contains(&"outbound"),
-        "ADR-057: caller ns must have an outbound copy; got {directions:?}"
+        "ADR-057: local ns must have an outbound copy; got {directions:?}"
     );
     assert!(
         directions.contains(&"inbound"),
-        "ADR-057: caller ns must have an inbound copy (the recipient's inbox); got {directions:?}"
+        "ADR-057: local ns must have an inbound copy; got {directions:?}"
     );
 
     // Actor labels must be stored on both copies.
+    // ADR-007 Rev 2: from_actor = token.namespace() = "local".
     for note in &alive {
         let props = note.properties.as_ref().unwrap();
         assert_eq!(
             props.get("from_actor").and_then(|v| v.as_str()),
-            Some("lambda:khive"),
-            "ADR-057: from_actor must be lambda:khive"
+            Some("local"),
+            "ADR-057: from_actor must be local (ADR-007 all-local, token.namespace()=local)"
         );
         assert_eq!(
             props.get("to_actor").and_then(|v| v.as_str()),
@@ -2338,6 +2330,7 @@ fn shared_backend() -> Arc<khive_db::StorageBackend> {
 }
 
 // T1 — within-namespace send unchanged by the allowlist feature.
+// ADR-007 Rev 2: all storage routes to "local". Both copies land in "local".
 #[tokio::test]
 async fn t1_send_within_namespace_unchanged() {
     let backend = shared_backend();
@@ -2358,26 +2351,26 @@ async fn t1_send_within_namespace_unchanged() {
         "T1: within-ns send must succeed; got {result:?}"
     );
 
-    let tok = rt
-        .authorize(Namespace::parse("lambda:leo").unwrap())
-        .unwrap();
+    // ADR-007 Rev 2: dispatch pins storage to "local" regardless of default_namespace.
+    let tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
     let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
     assert_eq!(
         alive.len(),
         2,
-        "T1: expect 1 outbound + 1 inbound for same-ns send; got {}",
+        "T1: expect 1 outbound + 1 inbound in local ns (ADR-007 all-local); got {}",
         alive.len()
     );
 }
 
-// T2 — cross-ns send is actor-addressed (ADR-057): succeeds regardless of allowlist,
-// both copies land in the SENDER's namespace with actor labels.
+// T2 — cross-ns send is actor-addressed (ADR-057): succeeds regardless of allowlist.
+// ADR-007 Rev 2: both copies land in "local" (the shared storage namespace).
+// Actor labels (from_actor/to_actor) in note properties distinguish sender and recipient.
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
     let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
-    let (_registry_khive, rt_khive) =
+    let (_registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
     // ADR-057: actor-addressed sends always succeed; allowlist no longer gates comm.send.
@@ -2392,27 +2385,28 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    // Both outbound + inbound copies land in the SENDER namespace (lambda:leo).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: both outbound + inbound copies land in "local" (all-local model).
+    let local_tok = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let local_notes = rt_leo
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let leo_alive: Vec<_> = leo_notes
+    let alive: Vec<_> = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .collect();
     assert_eq!(
-        leo_alive.len(),
+        alive.len(),
         2,
-        "T2: expect 1 outbound + 1 inbound in sender ns (lambda:leo); got {}",
-        leo_alive.len()
+        "T2: expect 1 outbound + 1 inbound in local ns (ADR-007 all-local); got {}",
+        alive.len()
     );
 
     // Verify actor labels on both copies.
-    for note in &leo_alive {
+    // ADR-007 Rev 2: from_actor is "local" (token.namespace()), to_actor is the "to" argument.
+    for note in &alive {
         let from_actor = note
             .properties
             .as_ref()
@@ -2425,8 +2419,8 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
             .and_then(|v| v.as_str());
         assert_eq!(
             from_actor,
-            Some("lambda:leo"),
-            "T2: from_actor must be lambda:leo on every note"
+            Some("local"),
+            "T2: from_actor must be 'local' (ADR-007 all-local; token.namespace()=local)"
         );
         assert_eq!(
             to_actor,
@@ -2434,32 +2428,15 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
             "T2: to_actor must be lambda:khive on every note"
         );
     }
-
-    // No note written in the recipient namespace (lambda:khive).
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        khive_notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .count(),
-        0,
-        "T2: no note in recipient ns (lambda:khive)"
-    );
 }
 
-// T3 — actor-addressed send (ADR-057): both copies land in the SENDER's namespace.
-// The inbound copy has actor labels from_actor/to_actor for routing.
+// T3 — actor-addressed send (ADR-057): both copies land in "local" (ADR-007 Rev 2).
+// Actor labels from_actor/to_actor in note properties identify routing participants.
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
     let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
-    let (_reg_khive, rt_khive) =
+    let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
     let result = registry_leo
@@ -2478,15 +2455,15 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    // Outbound in lambda:leo (sender ns).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: all notes land in "local", not the sender's configured namespace.
+    let local_tok = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let local_notes = rt_leo
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let outbound: Vec<_> = leo_notes
+    let outbound: Vec<_> = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .filter(|n| {
@@ -2497,7 +2474,7 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
                 == Some("outbound")
         })
         .collect();
-    assert_eq!(outbound.len(), 1, "T3: expect 1 outbound note in sender ns");
+    assert_eq!(outbound.len(), 1, "T3: expect 1 outbound note in local ns");
     let outbound_thread_id = outbound[0]
         .properties
         .as_ref()
@@ -2506,8 +2483,8 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T3: outbound note must have thread_id");
 
-    // ADR-057: inbound copy also lands in the SENDER namespace (lambda:leo).
-    let inbound: Vec<_> = leo_notes
+    // ADR-057: inbound copy also lands in "local" (ADR-007 all-local; not separate sender ns).
+    let inbound: Vec<_> = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .filter(|n| {
@@ -2521,18 +2498,18 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
     assert_eq!(
         inbound.len(),
         1,
-        "T3: expect 1 inbound note in SENDER ns (lambda:leo) — ADR-057 actor-addressed"
+        "T3: expect 1 inbound note in local ns — ADR-007 all-local + ADR-057 actor-addressed"
     );
     let inbound_note = inbound[0];
-    // Actor labels identify the routing participants.
+    // Actor labels identify routing participants; from_actor = "local" (token.namespace()).
     assert_eq!(
         inbound_note
             .properties
             .as_ref()
             .and_then(|p| p.get("from_actor"))
             .and_then(|v| v.as_str()),
-        Some("lambda:leo"),
-        "T3: inbound from_actor must be lambda:leo"
+        Some("local"),
+        "T3: inbound from_actor must be 'local' (ADR-007 all-local; token.namespace()=local)"
     );
     assert_eq!(
         inbound_note
@@ -2558,32 +2535,15 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         outbound_thread_id, inbound_thread_id,
         "T3: both copies must share thread_id"
     );
-
-    // No notes in the recipient namespace (lambda:khive).
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        khive_notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .count(),
-        0,
-        "T3: no notes in recipient ns (lambda:khive) under ADR-057"
-    );
 }
 
-// T4 — inbound note's namespace column is the SENDER namespace (ADR-057).
-// Under actor-addressed delivery both copies land in the caller's namespace.
+// T4 — inbound note's namespace column is "local" (ADR-007 Rev 2 all-local model).
+// ADR-057 actor-addressed delivery: both copies land in "local", identified by actor labels.
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
     let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
-    let (_reg_khive, rt_khive) =
+    let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
     registry_leo
@@ -2594,15 +2554,15 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
-    // ADR-057: inbound note is in the SENDER namespace (lambda:leo).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: inbound note is in "local" (not the configured sender namespace).
+    let local_tok = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let local_notes = rt_leo
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let inbound_note = leo_notes
+    let inbound_note = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .find(|n| {
@@ -2612,28 +2572,21 @@ async fn t4_inbound_note_namespace_is_recipient() {
                 .and_then(|v| v.as_str())
                 == Some("inbound")
         })
-        .expect("T4: must find inbound note in sender ns");
+        .expect("T4: must find inbound note in local ns (ADR-007 all-local)");
     assert_eq!(
         inbound_note.namespace.as_str(),
-        "lambda:leo",
-        "T4: inbound note namespace must be lambda:leo (sender ns) under ADR-057"
+        "local",
+        "T4: inbound note namespace must be 'local' (ADR-007 Rev 2 all-local model)"
     );
-
-    // No notes in the recipient namespace.
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
+    // Actor label distinguishes the intended recipient.
     assert_eq!(
-        khive_notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .count(),
-        0,
-        "T4: no notes in recipient ns (lambda:khive) under ADR-057"
+        inbound_note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("to_actor"))
+            .and_then(|v| v.as_str()),
+        Some("lambda:khive"),
+        "T4: inbound note to_actor must be lambda:khive"
     );
 }
 
@@ -2843,7 +2796,11 @@ async fn t5b_reply_always_writes_same_namespace() {
     );
 }
 
-// T6 — sender's own inbox does not contain the inbound copy that landed in recipient ns.
+// T6 — ADR-007 Rev 2: under all-local model, both outbound and inbound copies land
+// in "local". The inbound copy IS visible in the sender's inbox (they share the same
+// local namespace). The outbound copy is NOT surfaced by inbox (inbox filters direction=inbound).
+// This test verifies inbox surfaces the inbound copy (count >= 1), and that the
+// outbound copy is excluded from the default inbox view.
 #[tokio::test]
 async fn t6_sender_inbox_does_not_see_inbound_copy() {
     let backend = shared_backend();
@@ -2861,27 +2818,46 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
         .await
         .expect("T6: send must succeed");
 
+    // ADR-007 Rev 2: inbound copy is in "local" (same as sender), so inbox sees it.
+    // inbox(status=all) returns inbound messages; verify it returns exactly 1 inbound.
     let inbox = registry_leo
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
         .expect("T6: sender inbox dispatch must succeed");
     let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     assert_eq!(
-        count, 0,
-        "T6: sender inbox must not contain the inbound copy (it is in recipient ns); got {count}"
+        count, 1,
+        "T6: ADR-007 all-local: inbox must see the inbound copy (both copies in local ns); got {count}"
+    );
+    // Verify the returned message is the inbound copy (not outbound).
+    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(
+        msgs[0]
+            .get("properties")
+            .and_then(|p| p.get("direction"))
+            .and_then(|v| v.as_str()),
+        Some("inbound"),
+        "T6: inbox must only return inbound messages (not outbound)"
     );
 }
 
-// T7 — white-box: with_namespace token scoping.
+// T7 — white-box: with_namespace token scoping (realigned to ADR-007 by-ID contract, #148).
 //
-// `NamespaceToken::with_namespace(recipient)` produces a token with
-// `namespace = recipient, visible = [recipient]`.  This is an ordinary
-// NamespaceToken — NOT a type-enforced write-only capability:
-//   (a) The minted token CANNOT read the SENDER namespace (visible set excludes it).
-//   (b) The minted token CAN read the RECIPIENT namespace (it IS in the visible set).
+// `NamespaceToken::with_namespace(recipient)` produces a token scoped to the
+// recipient namespace.  It is an ordinary NamespaceToken — NOT a type-enforced
+// write-only capability.
 //
-// The security boundary is the sender-side allowlist check and the comm
-// handler's single-create usage, not the token type.
+// Under ADR-007 rule 2 (PR #148), by-ID operations are namespace-blind: the token's
+// namespace is used for WRITE attribution and multi-record LIST filtering only.
+// A `get_note_including_deleted` call resolves a globally-unique UUID and returns
+// the record regardless of which namespace the token carries.
+//
+//   (a) The minted token CAN read the SENDER-namespace note by UUID (by-ID reads are
+//       namespace-blind; the gate, not the token's visible set, is the auth boundary).
+//   (b) The minted token CAN read the RECIPIENT-namespace note by UUID (same contract).
+//
+// The security boundary remains the sender-side allowlist check on comm.send;
+// the token type does not enforce read isolation on by-ID fetches.
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
@@ -2931,40 +2907,54 @@ async fn t7_with_namespace_token_scoping() {
     let recipient_tok: NamespaceToken =
         leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    // (a) Minted token CANNOT read the sender-ns note (visible set is [lambda:khive]).
-    let cannot_see_sender = rt_leo
+    // (a) By-ID reads are namespace-blind (ADR-007 rule 2, PR #148): the minted
+    // token CAN read a sender-namespace note by UUID. The stored namespace of
+    // the returned note must still reflect where it was created (lambda:leo).
+    let can_see_sender = rt_leo
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
-    match cannot_see_sender {
-        Ok(None) => {
-            // Expected: token's visible set is [lambda:khive], cannot see lambda:leo notes.
+    match can_see_sender {
+        Ok(Some(note)) => {
+            // Expected: by-ID fetch ignores the token's namespace; record is returned.
+            // The note's own namespace must be the write namespace it was created in.
+            assert_eq!(
+                note.namespace, "lambda:leo",
+                "T7(a): stored namespace must be the sender's write namespace"
+            );
         }
-        Ok(Some(_)) => panic!("T7(a): with_namespace token must not read sender-ns note"),
+        Ok(None) => panic!(
+            "T7(a): by-ID read must return the sender-ns note regardless of token namespace \
+             (ADR-007 rule 2, PR #148 removed by-ID namespace enforcement)"
+        ),
         Err(e) => panic!("T7(a): unexpected error {e:?}"),
     }
 
     // (b) Minted token CAN read the recipient-ns note — it is a full read+write token
-    // for the recipient ns, not a type-enforced write-only capability.
+    // for the recipient ns; by-ID reads are namespace-blind in any case (#148).
     let can_see_recipient = rt_khive
         .get_note_including_deleted(&recipient_tok, recipient_note.id)
         .await;
     match can_see_recipient {
-        Ok(Some(_)) => {
+        Ok(Some(note)) => {
             // Expected: the minted token can read from its own namespace (lambda:khive).
+            assert_eq!(
+                note.namespace, "lambda:khive",
+                "T7(b): stored namespace must be the recipient's write namespace"
+            );
         }
         Ok(None) => panic!("T7(b): minted token must be able to read recipient-ns note"),
         Err(e) => panic!("T7(b): unexpected error {e:?}"),
     }
 }
 
-// T8 — ADR-057: inbound note is in the SENDER namespace (lambda:leo).
-// Sender token CAN read the inbound (it's in their own ns). Recipient (lambda:khive)
-// has 0 notes and cannot see the inbound.
+// T8 — ADR-007 Rev 2: inbound note is in "local" (all-local model).
+// A local-namespace token CAN read the inbound note. No separate recipient namespace exists.
+// Recipient isolation is provided by actor labels (to_actor), not namespace partitioning.
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
     let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
-    let (_reg_khive, rt_khive) =
+    let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
     registry_leo
@@ -2975,15 +2965,15 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    // ADR-057: inbound note is in SENDER namespace (lambda:leo).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: inbound note is in "local" (not the configured sender namespace).
+    let local_tok = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let local_notes = rt_leo
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let inbound_id = leo_notes
+    let inbound_id = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .find(|n| {
@@ -2994,47 +2984,51 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
                 == Some("inbound")
         })
         .map(|n| n.id)
-        .expect("T8: must find inbound note in sender ns");
+        .expect("T8: must find inbound note in local ns (ADR-007 all-local)");
 
-    // Sender token CAN read the inbound note (it lives in their own ns).
+    // A local-namespace token CAN read the inbound note (it lives in local).
     let can_read = rt_leo
-        .get_note_including_deleted(&leo_tok, inbound_id)
+        .get_note_including_deleted(&local_tok, inbound_id)
         .await;
     match can_read {
         Ok(Some(_)) => {}
-        Ok(None) => panic!("T8: sender token must be able to read own-ns inbound note"),
+        Ok(None) => panic!("T8: local token must be able to read local-ns inbound note"),
         Err(e) => panic!("T8: unexpected error reading inbound note: {e:?}"),
     }
 
-    // Recipient (lambda:khive) has 0 notes — inbound was never written to khive ns.
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
-        .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
-        .await
+    // Verify actor label marks the intended recipient on the inbound copy.
+    let inbound_note = local_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .find(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
         .unwrap();
     assert_eq!(
-        khive_notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .count(),
-        0,
-        "T8: recipient ns (lambda:khive) must have 0 notes under ADR-057"
+        inbound_note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("to_actor"))
+            .and_then(|v| v.as_str()),
+        Some("lambda:khive"),
+        "T8: inbound note to_actor must be lambda:khive (actor label isolation)"
     );
 }
 
-// T9 — actor-addressed reply within a shared namespace (ADR-057).
+// T9 — actor-addressed reply (ADR-057) with ADR-007 Rev 2 all-local model.
 //
-// Under ADR-057 all messages land in the caller's namespace. To test reply
-// round-trip we use a single shared namespace so both "actors" can read each
-// other's messages. Leo sends to khive (both copies in shared ns). Leo then
-// replies to the inbound copy on behalf of khive (simulated by same registry),
-// verifying that the reply inherits the canonical thread_id.
+// ADR-007: all writes go to "local". ADR-057: actor labels distinguish routing.
+// Leo (registry_shared) sends to khive (both copies in "local"). Then replies to
+// the inbound copy, verifying reply inherits the canonical thread_id.
 #[tokio::test]
 async fn t9_reply_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    // Both actors share the same namespace so either can find the other's messages.
+    // Both actors use a registry with default_namespace="lambda:shared", but ADR-007
+    // ensures all storage routes to "local".
     let (registry_shared, rt_shared) =
         build_crossns_registry(Arc::clone(&backend), "lambda:shared", vec![]);
 
@@ -3052,12 +3046,12 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T9: send must return full_id");
 
-    // Fetch the inbound note UUID (in the shared namespace).
-    let shared_tok = rt_shared
-        .authorize(Namespace::parse("lambda:shared").unwrap())
+    // ADR-007 Rev 2: all notes are in "local", not "lambda:shared".
+    let local_tok = rt_shared
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
     let all_notes = rt_shared
-        .list_notes(&shared_tok, Some("message"), 100, 0)
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
     let inbound_id = all_notes
@@ -3071,9 +3065,9 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
                 == Some("inbound")
         })
         .map(|n| n.id.as_hyphenated().to_string())
-        .expect("T9: must find inbound note in shared ns");
+        .expect("T9: must find inbound note in local ns (ADR-007 all-local)");
 
-    // Reply to the inbound message using the same shared registry.
+    // Reply to the inbound message using the same registry.
     let reply_result = registry_shared
         .dispatch(
             "comm.reply",
@@ -3097,9 +3091,9 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         "T9: reply thread_id must match original outbound UUID"
     );
 
-    // Four notes in shared ns: outbound1 + inbound1 + outbound2 (reply) + inbound2 (reply inbound).
+    // Four notes in local ns: outbound1 + inbound1 + outbound2 (reply) + inbound2.
     let notes_after = rt_shared
-        .list_notes(&shared_tok, Some("message"), 100, 0)
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
     let alive = notes_after
@@ -3108,7 +3102,7 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         .count();
     assert_eq!(
         alive, 4,
-        "T9: expect 4 notes after send + reply (2 outbound + 2 inbound); got {alive}"
+        "T9: expect 4 notes in local ns after send + reply (2 outbound + 2 inbound); got {alive}"
     );
 }
 
@@ -3156,7 +3150,7 @@ async fn t10_reply_cross_ns_denied_when_empty() {
 }
 
 // T11 — ADR-057: actor-addressed send always succeeds (allowlist no longer gates comm.send).
-// Even with an empty `allowed_outbound_namespaces`, the send produces 2 notes in sender ns.
+// ADR-007 Rev 2: both notes land in "local" (all-local model).
 // The rollback path (dual_write_message) is tested by T13/T14 via FTS/vector injection.
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
@@ -3175,23 +3169,28 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         "T11: actor-addressed send must succeed; got {result:?}"
     );
 
-    // Both outbound + inbound copies land in the sender namespace (lambda:leo).
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: both outbound + inbound copies land in "local" (not sender ns).
+    let local_tok = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let local_notes = rt_leo
+        .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
-    let alive = leo_notes.iter().filter(|n| n.deleted_at.is_none()).count();
+    let alive = local_notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .count();
     assert_eq!(
         alive, 2,
-        "T11: expect 1 outbound + 1 inbound in sender ns; got {alive}"
+        "T11: expect 1 outbound + 1 inbound in local ns (ADR-007 all-local); got {alive}"
     );
 }
 
 // T12 — ADR-057: both directions succeed (actor-addressed, allowlist no longer gates comm.send).
-// Each send produces 2 notes in the respective sender's namespace.
+// ADR-007 Rev 2: each send produces 2 notes in "local" (all-local model).
+// After 2 sends (leo→khive and khive→leo), "local" has 4 notes total.
+// Actor labels distinguish the sender/recipient for each pair.
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
@@ -3199,7 +3198,7 @@ async fn t12_allowlist_is_one_directional() {
     let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // leo → khive: succeeds, 2 notes in leo ns.
+    // leo → khive: succeeds.
     let result_leo = registry_leo
         .dispatch(
             "comm.send",
@@ -3211,20 +3210,24 @@ async fn t12_allowlist_is_one_directional() {
         "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
     );
 
-    let leo_tok = rt_leo
-        .authorize(Namespace::parse("lambda:leo").unwrap())
+    // ADR-007 Rev 2: notes from leo's send are in "local" (rt_leo's backend).
+    let local_tok_leo = rt_leo
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_notes = rt_leo
-        .list_notes(&leo_tok, Some("message"), 100, 0)
+    let leo_local_notes = rt_leo
+        .list_notes(&local_tok_leo, Some("message"), 100, 0)
         .await
         .unwrap();
     assert_eq!(
-        leo_notes.iter().filter(|n| n.deleted_at.is_none()).count(),
+        leo_local_notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count(),
         2,
-        "T12: 2 notes (outbound+inbound) in leo ns after leo→khive send"
+        "T12: 2 notes (outbound+inbound) in local ns after leo→khive send"
     );
 
-    // khive → leo: also succeeds, 2 notes in khive ns.
+    // khive → leo: also succeeds.
     let result_khive = registry_khive
         .dispatch(
             "comm.send",
@@ -3236,86 +3239,83 @@ async fn t12_allowlist_is_one_directional() {
         "T12: khive→leo send must succeed under ADR-057; got {result_khive:?}"
     );
 
-    let khive_tok = rt_khive
-        .authorize(Namespace::parse("lambda:khive").unwrap())
+    // ADR-007 Rev 2: notes from khive's send are also in "local" (shared backend).
+    let local_tok_khive = rt_khive
+        .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let khive_notes = rt_khive
-        .list_notes(&khive_tok, Some("message"), 100, 0)
+    let khive_local_notes = rt_khive
+        .list_notes(&local_tok_khive, Some("message"), 100, 0)
         .await
         .unwrap();
+    // Both registries share the same backend, so local has 4 notes total (2 per send).
     assert_eq!(
-        khive_notes
+        khive_local_notes
             .iter()
             .filter(|n| n.deleted_at.is_none())
             .count(),
-        2,
-        "T12: 2 notes (outbound+inbound) in khive ns after khive→leo send"
+        4,
+        "T12: 4 notes total in local ns after both sends (ADR-007 all-local, shared backend)"
     );
 }
 
-// T13 — FTS failure on outbound write leaves no stranded row (ADR-057 actor-addressed path).
+// T13 — FTS failure on note write leaves no stranded row.
 //
-// Under ADR-057 both outbound and inbound copies land in the SENDER namespace.
-// `dual_write_message` writes outbound first (sender ns) then inbound (sender ns).
-// Arming FTS on the SENDER namespace causes the OUTBOUND create_note to fail:
-// create_note_inner commits the row, hits the injected FTS error, compensates
-// (deletes the outbound row), and propagates the error. dual_write_message returns
-// that error before the inbound write is attempted.
-// After the send returns an error, the sender namespace must have 0 live notes.
-//
-// Namespace-targeting eliminates cross-test races. `#[serial]` is not needed.
+// Under ADR-007 Rev 2 dispatch pins the storage token to Namespace::local().
+// arm_fts_fail("local") would race against every other concurrent test that
+// writes a note to "local". To preserve namespace-targeting isolation, this
+// test uses a unique UUID namespace via rt.create_note() directly (bypassing
+// dispatch). This validates the same create_note_inner rollback behavior —
+// commit row → FTS error → compensate (delete row) → return Err — without
+// the cross-test injection race that "local" would introduce.
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     use khive_runtime::arm_fts_fail;
 
-    let sender_ns = "lambda:t13-sender";
-    let recipient_ns = "lambda:t13-inbound-fail";
+    // Unique namespace keeps the process-global FTS_FAIL_NS one-shot isolated
+    // from other concurrent tests (each test uses a different UUID).
+    let unique_ns = format!("t13-{}", uuid::Uuid::new_v4().simple());
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = rt.authorize(Namespace::parse(&unique_ns).unwrap()).unwrap();
 
-    let backend = shared_backend();
-    let (registry_sender, rt_sender) =
-        build_crossns_registry(Arc::clone(&backend), sender_ns, vec![]);
+    // Arm FTS injection on the unique namespace — fires on the next create_note
+    // call in this namespace, then clears (one-shot).
+    arm_fts_fail(&unique_ns);
 
-    // ADR-057: arm FTS injection on the SENDER namespace.
-    // The outbound create_note (sender_ns) triggers the injected error.
-    arm_fts_fail(sender_ns);
-
-    let result = registry_sender
-        .dispatch(
-            "comm.send",
-            serde_json::json!({ "to": recipient_ns, "content": "t13 fts-fail test" }),
+    // Attempt to create a note; the FTS step must fail and roll back the row.
+    let result = rt
+        .create_note(
+            &tok,
+            "message",
+            None,
+            "t13 fts-fail test",
+            None,
+            Some(serde_json::json!({ "direction": "outbound" })),
+            vec![],
         )
         .await;
     assert!(
         result.is_err(),
-        "T13: send must fail when FTS injection is armed on sender ns"
+        "T13: create_note must fail when FTS injection is armed; got: {result:?}"
     );
 
-    // No note must remain in the sender namespace (outbound row compensated by create_note_inner).
-    let sender_tok = rt_sender
-        .authorize(Namespace::parse(sender_ns).unwrap())
-        .unwrap();
-    let sender_notes = rt_sender
-        .list_notes(&sender_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let sender_alive = sender_notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
+    // No live note must remain — the row was compensated by create_note_inner.
+    let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
+    let alive = notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
-        sender_alive, 0,
-        "T13: no stranded note in sender ns after FTS failure; got {sender_alive}"
+        alive, 0,
+        "T13: no stranded note after FTS failure (create_note_inner must compensate); got {alive}"
     );
 }
 
-// T14 — vector insertion failure on outbound write leaves no stranded row (ADR-057).
+// T14 — vector insertion failure on note write leaves no stranded row.
 //
-// Under ADR-057 both copies land in the SENDER namespace. Arming vector fail on
-// the SENDER namespace causes the OUTBOUND create_note to fail after row + FTS
-// are committed: create_note_inner runs compensation (deletes row + FTS entry)
-// and returns an error. dual_write_message propagates that error before any
-// inbound write occurs.
-// After send returns Err, the sender namespace must have 0 live notes.
+// Under ADR-007 Rev 2 dispatch pins the storage token to Namespace::local().
+// arm_vector_fail("local") would race against every other concurrent test that
+// writes a note with an embedder registered. To preserve namespace-targeting
+// isolation, this test uses a unique UUID namespace via rt.create_note()
+// directly (bypassing dispatch). This validates the same create_note_inner
+// rollback behavior — commit row → FTS ok → vector error → compensate (delete
+// row + FTS) → return Err — without the cross-test injection race.
 #[tokio::test]
 async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     use async_trait::async_trait;
@@ -3357,47 +3357,40 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
         }
     }
 
-    let sender_ns = "lambda:t14-sender";
-    let recipient_ns = "lambda:t14-vec-inbound-fail";
+    // Unique namespace keeps the process-global VECTOR_FAIL_NS one-shot isolated
+    // from other concurrent tests (each test uses a different UUID).
+    let unique_ns = format!("t14-{}", uuid::Uuid::new_v4().simple());
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(T14VecProvider);
+    let tok = rt.authorize(Namespace::parse(&unique_ns).unwrap()).unwrap();
 
-    let backend = shared_backend();
-    let (registry_sender, rt_sender) =
-        build_crossns_registry(Arc::clone(&backend), sender_ns, vec![]);
+    // Arm vector injection on the unique namespace — fires on the next create_note
+    // call in this namespace after row + FTS commit, then clears (one-shot).
+    arm_vector_fail(&unique_ns);
 
-    // Register the embedder on the sender runtime so the vector path is exercised.
-    rt_sender.register_embedder(T14VecProvider);
-
-    // ADR-057: arm vector injection on the SENDER namespace.
-    // The outbound create_note (sender_ns) hits the injected error after row + FTS commit;
-    // create_note_inner compensates (deletes row + FTS), returns error.
-    arm_vector_fail(sender_ns);
-
-    let result = registry_sender
-        .dispatch(
-            "comm.send",
-            serde_json::json!({ "to": recipient_ns, "content": "t14 vec-fail test" }),
+    // Attempt to create a note; the vector step must fail and roll back row + FTS.
+    let result = rt
+        .create_note(
+            &tok,
+            "message",
+            None,
+            "t14 vec-fail test",
+            None,
+            Some(serde_json::json!({ "direction": "outbound" })),
+            vec![],
         )
         .await;
     assert!(
         result.is_err(),
-        "T14: send must fail when vector injection is armed on sender ns"
+        "T14: create_note must fail when vector injection is armed; got: {result:?}"
     );
 
-    // No note must remain in the sender namespace.
-    let sender_tok = rt_sender
-        .authorize(Namespace::parse(sender_ns).unwrap())
-        .unwrap();
-    let sender_notes = rt_sender
-        .list_notes(&sender_tok, Some("message"), 100, 0)
-        .await
-        .unwrap();
-    let sender_alive = sender_notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .count();
+    // No live note must remain — the row was compensated by create_note_inner.
+    let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
+    let alive = notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
-        sender_alive, 0,
-        "T14: no stranded note in sender ns after vector failure; got {sender_alive}"
+        alive, 0,
+        "T14: no stranded note after vector failure (create_note_inner must compensate); got {alive}"
     );
 }
 

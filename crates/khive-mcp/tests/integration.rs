@@ -3805,9 +3805,10 @@ async fn test_propose_pipe_withdraw_chain() -> anyhow::Result<()> {
 /// Two RuntimeConfigs that are identical except for their `visible_namespaces`
 /// must produce different `compute_config_id` fingerprints.
 ///
-/// Without this, a daemon started for `primary=vis-a, visible=[]` could be
-/// reused for `primary=vis-a, visible=[vis-b]` — granting cross-namespace
-/// reads to a caller that should be namespace-isolated.
+/// `visible_namespaces` is retained for configuration identity; OSS dispatch
+/// does NOT use it to widen read scope (ADR-007 Rev 2). The fingerprint still
+/// includes it so configs with different visible sets are treated as distinct
+/// daemon configurations (e.g. for future cloud-gate policy).
 #[test]
 fn compute_config_id_differs_when_visible_namespaces_differ() {
     use khive_mcp::server::compute_config_id;
@@ -3970,135 +3971,179 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
 }
 
 // =============================================================================
-// Finding 6: actor.visible_namespaces from config wires cross-namespace reads
-// but mutations on visible-only records must return NotFound.
+// ADR-007 Rev 2 Rule 0/3 (PR-B): non-local actor/default namespace must not
+// route storage — all packs write and read the shared "local" store.
 // =============================================================================
 
-/// Proves the full config→dispatch wiring: an actor configured with
-/// `visible_namespaces = ["vis-b"]` (in RuntimeConfig) has that visible set
-/// flow through `KhiveMcpServer::with_packs` → `VerbRegistryBuilder::with_visible_namespaces`
-/// → `VerbRegistry::dispatch` → `NamespaceToken::mint_with_visibility`.
+/// Proves ADR-007 Rev 2 Rule 0/3 at the real MCP server boundary.
 ///
-/// Two assertions dispatched through the REAL registry boundary:
-///   (a) `get(id=<vis-b-entity>)` returns ok:true  — cross-namespace read works.
-///   (b) `link(source_id=<vis-a>, target_id=<vis-b>, ...)` returns ok:false
-///       with a "not found" error — visible-only record cannot be a mutation target
-///       (ADR-007:215-219 timing-oracle mitigation).
+/// A server built with `KhiveMcpServer::with_packs` whose `RuntimeConfig`
+/// carries a non-local `default_namespace` ("lambda:leo") and non-empty
+/// `visible_namespaces` must still route all storage through `"local"`.
 ///
-/// The test does NOT call rt.authorize_with_visibility / rt.get_entity / rt.link
-/// directly — all reads and mutations go through dispatch_request_local so a
-/// future regression in the with_packs / token-minting path would fail here.
+/// Three assertions, all dispatched through `dispatch_request_local` so a
+/// regression at the `VerbRegistry::dispatch` mint site (`pack.rs:772`) would
+/// be caught here — not by a direct runtime helper call:
+///
+///   (a) `create` returns an entity whose `namespace` field is `"local"`, not
+///       `"lambda:leo"`.  This fails if `dispatch` regresses to using the
+///       default_namespace as the token primary.
+///
+///   (b) `list(kind=entity)` via the same server (same mint path) includes the
+///       entity id, proving that MCP reads also operate on `"local"`.  This
+///       fails if list were scoped to the non-local namespace.
+///
+///   (c) A `NamespaceToken` pinned directly to `"lambda:leo"` (bypassing
+///       dispatch) sees an empty list, confirming nothing was written to the
+///       actor namespace.  This assertion would NOT catch a mint regression on
+///       its own, but together with (a) and (b) it forms a complete sandwich
+///       proof that storage is exclusively in `"local"`.
+///
+/// Regression sensitivity: if `pack.rs:772` reverts to
+/// `NamespaceToken::mint_with_visibility(primary, ...)` where `primary` comes
+/// from `default_namespace`, assertion (a) fails because the entity's namespace
+/// field would be `"lambda:leo"`, and assertion (b) fails because
+/// `list(kind=entity)` via the minted token would scope reads to `"lambda:leo"`
+/// where the store is empty.
 #[tokio::test]
-async fn visible_namespaces_config_wires_through_dispatch_boundary() {
-    use khive_mcp::{server::compute_config_id, tools::request::RequestParams};
+async fn non_local_actor_config_routes_storage_to_local_adr007_prb() {
+    use khive_mcp::tools::request::RequestParams;
+    use khive_pack_kg::KgPack;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 
     disable_daemon();
 
-    let ns_a = Namespace::parse("vcfg-a").unwrap();
-    let ns_b = Namespace::parse("vcfg-b").unwrap();
+    let actor_ns = Namespace::parse("lambda:leo").unwrap();
 
     // Build a RuntimeConfig equivalent to:
     //   [actor]
-    //   id = "vcfg-a"
-    //   visible_namespaces = ["vcfg-b"]
+    //   id          = "lambda:leo"
+    //   visible_namespaces = ["lambda:extra"]
+    // This is the scenario where a non-local actor identity would historically
+    // route storage — PR-B must suppress that.
+    let extra_ns = Namespace::parse("lambda:extra").unwrap();
     let cfg = RuntimeConfig {
         db_path: None,
-        default_namespace: ns_a.clone(),
+        default_namespace: actor_ns.clone(),
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string()],
-        visible_namespaces: vec![ns_b.clone()],
+        visible_namespaces: vec![extra_ns.clone()],
         ..RuntimeConfig::default()
     };
 
-    // Verify the config_id encodes vcfg-b (Finding 1 integration check).
-    let cid = compute_config_id(&cfg);
-    assert!(
-        cid.contains("vcfg-b"),
-        "config_id must encode visible namespace vcfg-b; got: {cid}"
-    );
-
     let rt = KhiveRuntime::new(cfg).expect("in-memory runtime");
 
-    // Seed data: create an entity in vcfg-b and one in vcfg-a.
-    // These must go through direct runtime calls (not dispatch) because the
-    // server's default namespace is vcfg-a — we need to write into vcfg-b
-    // without overriding the server's namespace.
-    let tok_b = rt.authorize(ns_b.clone()).expect("authorize vcfg-b");
-    let entity_in_b = rt
-        .create_entity(&tok_b, "concept", None, "VcfgB-Entity", None, None, vec![])
-        .await
-        .expect("create entity in vcfg-b");
-    let tok_a = rt.authorize(ns_a.clone()).expect("authorize vcfg-a");
-    let entity_in_a = rt
-        .create_entity(&tok_a, "concept", None, "VcfgA-Entity", None, None, vec![])
-        .await
-        .expect("create entity in vcfg-a");
+    // Build through with_packs — the same constructor the production MCP binary
+    // uses, so the full wiring chain (RuntimeConfig → builder → registry →
+    // dispatch → mint) is exercised.
+    let server = KhiveMcpServer::with_packs(rt.clone(), &["kg".to_string()])
+        .expect("server builds with non-local actor config");
 
-    // Build the server through with_packs so the visible set flows through the
-    // full wiring chain: RuntimeConfig → with_packs → builder.with_visible_namespaces
-    // → VerbRegistry.visible_namespaces → dispatch → mint_with_visibility.
-    let server = KhiveMcpServer::with_packs(rt, &["kg".to_string()])
-        .expect("server builds with visible_namespaces set");
-
-    // ── (a) READ: get the vcfg-b entity via registry dispatch ────────────────
-    //
-    // dispatch_request_local mints a token with primary=vcfg-a + visible=[vcfg-b].
-    // The `get` handler calls resolve() (visible-aware) — must find the entity.
-    let get_out = server
+    // ── (a) CREATE: entity must land in "local", not the actor namespace ──────
+    let create_out = server
         .dispatch_request_local(RequestParams {
-            ops: format!(r#"get(id="{}")"#, entity_in_b.id),
+            ops: r#"create(kind="concept", name="MintProbe")"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
         })
         .await
-        .expect("dispatch get must not error at the MCP level");
+        .expect("dispatch create must not error at the MCP level");
 
-    let get_body: Value = serde_json::from_str(&get_out).expect("get response must be valid JSON");
-    let get_result = &get_body["results"][0];
+    let create_body: Value =
+        serde_json::from_str(&create_out).expect("create response must be valid JSON");
+    let create_result = &create_body["results"][0];
     assert_eq!(
-        get_result["ok"],
+        create_result["ok"],
         json!(true),
-        "get(id=<vcfg-b entity>) via config-derived dispatch token must return ok:true; \
-         visible_namespaces in RuntimeConfig must flow through with_packs to the dispatch token; \
-         got: {get_result}"
+        "create via non-local actor config must succeed; got: {create_result}"
     );
+    let entity_id = create_result["result"]["id"]
+        .as_str()
+        .expect("create result must carry 'id'");
     assert_eq!(
-        get_result["result"]["id"].as_str().unwrap_or(""),
-        entity_in_b.id.as_hyphenated().to_string(),
-        "returned entity id must match the vcfg-b entity"
+        create_result["result"]["namespace"].as_str().unwrap_or(""),
+        "local",
+        "entity must land in 'local' even when default_namespace='lambda:leo'; \
+         actor identity must not silently become the storage namespace (ADR-007 Rule 0); \
+         got: {create_result}"
     );
 
-    // ── (b) MUTATION: link targeting vcfg-b entity must return NotFound ───────
-    //
-    // dispatch_request_local mints a token with primary=vcfg-a + visible=[vcfg-b].
-    // link calls resolve_primary() on both endpoints; vcfg-b entity is NotFound
-    // in the primary namespace → link must fail (ADR-007:215-219).
-    let link_out = server
+    // ── (b) LIST: same MCP path must see the entity from "local" ─────────────
+    let list_out = server
         .dispatch_request_local(RequestParams {
-            ops: format!(
-                r#"link(source_id="{}", target_id="{}", relation="extends")"#,
-                entity_in_a.id, entity_in_b.id,
-            ),
+            ops: r#"list(kind="entity")"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
         })
         .await
-        .expect("dispatch link must not error at the MCP level");
+        .expect("dispatch list must not error at the MCP level");
 
-    let link_body: Value =
-        serde_json::from_str(&link_out).expect("link response must be valid JSON");
-    let link_result = &link_body["results"][0];
+    let list_body: Value =
+        serde_json::from_str(&list_out).expect("list response must be valid JSON");
+    let list_result = &list_body["results"][0];
     assert_eq!(
-        link_result["ok"],
-        json!(false),
-        "link(target_id=<vcfg-b entity>) via config-derived dispatch token must return ok:false; \
-         visible-only record must not be a mutation endpoint; got: {link_result}"
+        list_result["ok"],
+        json!(true),
+        "list via non-local actor config must succeed; got: {list_result}"
     );
-    let err_msg = link_result["error"].to_string().to_lowercase();
+    let ids_in_list: Vec<&str> = match list_result["result"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect(),
+        None => match list_result["result"].as_object() {
+            Some(obj) => obj
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => {
+                panic!("list result must be a JSON array or object with items; got: {list_result}")
+            }
+        },
+    };
     assert!(
-        err_msg.contains("not found") || err_msg.contains("notfound"),
-        "link error must be NotFound (not Forbidden, per ADR-007:215-219); got: {link_result}"
+        ids_in_list.contains(&entity_id),
+        "entity created via non-local actor registry must be readable from 'local' list \
+         through MCP dispatch; got ids: {ids_in_list:?}"
+    );
+
+    // ── (c) DIRECT NON-LOCAL TOKEN: must see an empty store ──────────────────
+    // This is NOT via dispatch — it uses a token pinned to "lambda:leo" directly.
+    // Together with (a) and (b) it proves storage was never routed to that namespace.
+    let pack = KgPack::new(rt.clone());
+    // We need a VerbRegistry to call pack.dispatch; build a minimal one.
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let probe_registry = builder.build().expect("probe registry builds");
+    let actor_token = rt
+        .authorize(actor_ns.clone())
+        .expect("authorize lambda:leo token");
+    let actor_list = pack
+        .dispatch(
+            "list",
+            json!({ "kind": "entity" }),
+            &probe_registry,
+            &actor_token,
+        )
+        .await
+        .expect("direct pack list via actor-ns token must succeed");
+    let ids_in_actor_ns: Vec<&str> = match &actor_list {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect(),
+        other => panic!("list must return a JSON array; got: {other:?}"),
+    };
+    assert!(
+        !ids_in_actor_ns.contains(&entity_id),
+        "storage must not have been routed to 'lambda:leo'; \
+         entity must NOT appear when listing directly under that namespace \
+         (ADR-007 Rule 0/3, PR-B); got ids: {ids_in_actor_ns:?}"
     );
 }

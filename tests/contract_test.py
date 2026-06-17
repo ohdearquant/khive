@@ -253,33 +253,44 @@ def _run_test(name: str, fn) -> None:
 # ---------------------------------------------------------------------------
 
 def test_namespace_isolation(proc: subprocess.Popen) -> None:
-    """All substrates (entities, notes) are namespace-isolated per ADR-050."""
-    # ADR-050 supersedes ADR-007 §"Namespace-by-Layer Rule": KG entity and edge
-    # verbs now honor the NamespaceToken from VerbRegistry::dispatch.  Entities,
-    # edges, and notes are all scoped to the caller's namespace.
+    """By-ID ops are namespace-blind; multi-record list/search stay namespace-filtered.
 
-    # ---- entities: namespace-isolated ----
+    ADR-007 rule 2 (shipped in #148): get/update/delete resolve a globally-unique
+    UUID and apply NO ``namespace ==`` check, so a by-ID read returns the record
+    regardless of the caller's namespace token.  The token's namespace is for write
+    attribution plus multi-record list/search filtering only; cross-namespace read
+    authorization is the gate's job (allow-all in OSS), never an inline by-ID storage
+    check.  This test is the regression guard: re-introducing by-ID namespace
+    filtering flips the cross-namespace get assertions below back to failures.
+    """
+
+    # ---- entities: by-ID blind, list filtered ----
     entity = _tool(proc, "create", {
         "kind": "entity",
         "entity_kind": "concept",
         "name": "AlphaEntity",
-        "description": "Only visible in ns-alpha",
+        "description": "Written in ns-alpha",
         "namespace": "ns-alpha",
     })
     full_id = entity["id"]
 
-    # get from ns-alpha MUST succeed (own namespace)
+    # get from ns-alpha (the write namespace) MUST succeed
     fetched_alpha = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
     assert fetched_alpha["kind"] == "concept", f"Expected kind=concept, got {fetched_alpha['kind']}"
     assert fetched_alpha["name"] == "AlphaEntity"
 
-    # get from ns-beta MUST fail (cross-namespace, ADR-050)
-    err_text = _expect_rpc_error(proc, "get", {"id": full_id, "namespace": "ns-beta"})
-    assert "not found" in err_text.lower(), (
-        f"Expected entity not found from ns-beta (ADR-050), got: {err_text!r}"
+    # get from ns-beta MUST ALSO succeed — by-ID is namespace-blind (ADR-007 rule 2, #148).
+    # Re-adding an inline ``namespace ==`` filter here is what this guard catches.
+    fetched_beta = _tool(proc, "get", {"id": full_id, "namespace": "ns-beta"})
+    assert fetched_beta["kind"] == "concept", (
+        f"by-ID get must be namespace-blind (ADR-007 rule 2): {fetched_beta!r}"
+    )
+    assert fetched_beta["name"] == "AlphaEntity", (
+        f"cross-namespace by-ID get must return the same record: {fetched_beta!r}"
     )
 
-    # list from ns-beta MUST NOT find the entity
+    # list from ns-beta MUST NOT find the entity — multi-record listing stays
+    # namespace-filtered (the part of ADR-007 that by-ID blindness does NOT relax).
     entities_beta = _tool(proc, "list", {
         "kind": "entity",
         "entity_kind": "concept",
@@ -287,7 +298,7 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     })
     ids_beta = [e["id"] for e in entities_beta]
     assert full_id not in ids_beta, (
-        f"AlphaEntity must NOT be visible in ns-beta list (ADR-050): {ids_beta}"
+        f"AlphaEntity must NOT be visible in ns-beta list (ADR-007 list filtering): {ids_beta}"
     )
 
     # same-namespace link MUST succeed
@@ -307,7 +318,7 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
         f"Same-namespace link must succeed: {link_result}"
     )
 
-    # ---- notes: namespace-isolated (unchanged from ADR-007) ----
+    # ---- notes: same by-ID-blind contract ----
     note = _tool(proc, "create", {
         "kind": "note",
         "note_kind": "observation",
@@ -316,13 +327,13 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     })
     note_id = note["id"]
 
-    # get note from ns-beta must NOT find it
-    err_text = _expect_rpc_error(proc, "get", {"id": note_id, "namespace": "ns-beta"})
-    assert "not found" in err_text.lower(), (
-        f"Expected note not found from ns-beta, got: {err_text!r}"
+    # get note from ns-beta MUST succeed — by-ID blindness applies to notes too.
+    fetched_note_beta = _tool(proc, "get", {"id": note_id, "namespace": "ns-beta"})
+    assert fetched_note_beta["kind"] == "observation", (
+        f"by-ID note get must be namespace-blind (ADR-007 rule 2): {fetched_note_beta!r}"
     )
 
-    # get note from ns-alpha MUST succeed
+    # get note from ns-alpha (the write namespace) MUST succeed
     fetched_note = _tool(proc, "get", {"id": note_id, "namespace": "ns-alpha"})
     assert fetched_note["kind"] == "observation"
 

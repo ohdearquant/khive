@@ -4,12 +4,15 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
-use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::pack::{PackByIdResolver, PackRuntime};
+use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::{HandlerDef, Pack};
 
+use crate::knowledge::util::{atom_from_row, atom_to_json, domain_from_row, domain_to_json};
 use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
 use crate::vocab::KNOWLEDGE_HANDLERS;
@@ -61,6 +64,13 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(KnowledgePack::new(runtime))
+    }
+
+    fn create_resolver(
+        &self,
+        runtime: KhiveRuntime,
+    ) -> Option<Box<dyn khive_runtime::PackByIdResolver>> {
+        Some(Box::new(KnowledgePack::new(runtime)))
     }
 }
 
@@ -151,5 +161,289 @@ impl PackRuntime for KnowledgePack {
                 "knowledge pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl PackByIdResolver for KnowledgePack {
+    /// Resolve a live knowledge record by UUID.
+    ///
+    /// Queries `knowledge_domains` first (canonical record), then
+    /// `knowledge_atoms`. The domain mirror atom shares the domain's UUID
+    /// (crud.rs:279/300) so domains must win over the mirror.
+    async fn resolve_by_id(&self, id: Uuid) -> Result<Option<Resolved>, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("knowledge resolve_by_id reader: {e}")))?;
+
+        // 1. Check knowledge_domains first (canonical over the mirror atom).
+        let domain_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, description, tags, members, \
+                      created_at, updated_at, deleted_at \
+                      FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str.clone())],
+                label: Some("knowledge.resolve_by_id.domain".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("knowledge resolve_by_id domain query: {e}"))
+            })?;
+
+        if let Some(row) = domain_row {
+            if let Some(domain) = domain_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "domain".into(),
+                    data: domain_to_json(&domain),
+                }));
+            }
+        }
+
+        // 2. Check knowledge_atoms.
+        let atom_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
+                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
+                      FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str)],
+                label: Some("knowledge.resolve_by_id.atom".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("knowledge resolve_by_id atom query: {e}"))
+            })?;
+
+        if let Some(row) = atom_row {
+            if let Some(atom) = atom_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "atom".into(),
+                    data: atom_to_json(&atom),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve a knowledge record including already-soft-deleted records.
+    ///
+    /// Used by the hard-delete path to locate tombstoned records.
+    async fn resolve_by_id_including_deleted(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Resolved>, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        let mut reader = sql.reader().await.map_err(|e| {
+            RuntimeError::Internal(format!(
+                "knowledge resolve_by_id_including_deleted reader: {e}"
+            ))
+        })?;
+
+        let domain_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, description, tags, members, \
+                      created_at, updated_at, deleted_at \
+                      FROM knowledge_domains WHERE id = ?1 LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str.clone())],
+                label: Some("knowledge.resolve_by_id_incl_deleted.domain".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!(
+                    "knowledge resolve_by_id_including_deleted domain query: {e}"
+                ))
+            })?;
+
+        if let Some(row) = domain_row {
+            if let Some(domain) = domain_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "domain".into(),
+                    data: domain_to_json(&domain),
+                }));
+            }
+        }
+
+        let atom_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
+                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
+                      FROM knowledge_atoms WHERE id = ?1 LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(id_str)],
+                label: Some("knowledge.resolve_by_id_incl_deleted.atom".into()),
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!(
+                    "knowledge resolve_by_id_including_deleted atom query: {e}"
+                ))
+            })?;
+
+        if let Some(row) = atom_row {
+            if let Some(atom) = atom_from_row(&row) {
+                return Ok(Some(Resolved::PackRecord {
+                    pack: "knowledge".into(),
+                    kind: "atom".into(),
+                    data: atom_to_json(&atom),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Delete a knowledge domain or atom by UUID.
+    ///
+    /// Soft-delete by default (`hard=false`): sets `deleted_at = now()`.
+    /// For domains, also tombstones the mirror atom in `knowledge_atoms`.
+    /// Hard-delete (`hard=true`): permanently removes rows from the table(s).
+    async fn delete_by_id(&self, id: Uuid, hard: bool) -> Result<serde_json::Value, RuntimeError> {
+        let sql = self.runtime.sql();
+        let id_str = id.to_string();
+
+        // First determine the kind (including deleted rows so hard-delete can find tombstones).
+        let kind = match self.resolve_by_id_including_deleted(id).await? {
+            Some(Resolved::PackRecord { kind, .. }) => kind,
+            _ => {
+                return Err(RuntimeError::NotFound(format!(
+                    "knowledge record not found: {id}"
+                )));
+            }
+        };
+
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+
+        let mut writer = sql
+            .writer()
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("knowledge delete_by_id writer: {e}")))?;
+
+        match kind.as_str() {
+            "domain" => {
+                if hard {
+                    // Hard-delete: sections → mirror atom → domain (all in one transaction).
+                    // knowledge_sections has a FK to knowledge_atoms(id) without ON DELETE
+                    // CASCADE, so sections must go before the atom row.
+                    writer
+                        .execute_batch(vec![
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some(
+                                    "knowledge.delete_by_id.domain_mirror_sections.hard".into(),
+                                ),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.domain.hard".into()),
+                            },
+                        ])
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain hard: {e}"
+                            ))
+                        })?;
+                } else {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_domains SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain soft: {e}"
+                            ))
+                        })?;
+                    // Tombstone the mirror atom so FTS no longer surfaces it.
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.domain_mirror.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "knowledge delete_by_id domain mirror soft: {e}"
+                            ))
+                        })?;
+                }
+            }
+            "atom" => {
+                if hard {
+                    // Hard-delete: sections first (FK constraint), then the atom row.
+                    writer
+                        .execute_batch(vec![
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
+                            },
+                            SqlStatement {
+                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                params: vec![SqlValue::Text(id_str.clone())],
+                                label: Some("knowledge.delete_by_id.atom.hard".into()),
+                            },
+                        ])
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!("knowledge delete_by_id atom hard: {e}"))
+                        })?;
+                } else {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
+                                  WHERE id = ?2 AND deleted_at IS NULL"
+                                .into(),
+                            params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
+                            label: Some("knowledge.delete_by_id.atom.soft".into()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!("knowledge delete_by_id atom soft: {e}"))
+                        })?;
+                }
+            }
+            other => {
+                return Err(RuntimeError::Internal(format!(
+                    "knowledge delete_by_id: unexpected kind {other:?}"
+                )));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "deleted": true,
+            "id": id_str,
+            "kind": kind,
+            "hard": hard,
+        }))
     }
 }

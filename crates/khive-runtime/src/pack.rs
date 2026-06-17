@@ -259,15 +259,71 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     ) -> Result<(), RuntimeError>;
 }
 
+/// Optional sub-trait for packs that own private SQL tables and issue UUIDs
+/// that must be reachable through the generic `get(id)` and `delete(id)` verbs.
+///
+/// Implementing both methods is required — the sub-trait bundles them atomically
+/// so partial implementation is a compile-time error, not a runtime surprise.
+/// Packs whose records live in the shared entity/note substrate (gtd, memory)
+/// do not implement this sub-trait.
+#[async_trait]
+pub trait PackByIdResolver: Send + Sync {
+    /// Attempt to resolve a live (non-deleted) UUID owned by this pack's private tables.
+    ///
+    /// Returns `Some(Resolved::PackRecord { ... })` if this pack owns the UUID,
+    /// `None` if it does not (the caller continues to the next resolver),
+    /// or `Err(...)` on a storage error.
+    ///
+    /// Must query domain-authoritative tables before mirror tables.
+    /// Must NOT filter by namespace. UUID v4 is globally unique; by-ID
+    /// resolution is namespace-blind per ADR-007.
+    async fn resolve_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::Resolved>, crate::RuntimeError>;
+
+    /// Attempt to resolve a UUID including already-soft-deleted records.
+    ///
+    /// Used by the hard-delete path. Default delegates to `resolve_by_id`;
+    /// packs with `deleted_at` columns override this to query without the filter.
+    async fn resolve_by_id_including_deleted(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::Resolved>, crate::RuntimeError> {
+        self.resolve_by_id(id).await
+    }
+
+    /// Delete a record owned by this pack's private tables.
+    ///
+    /// `hard` mirrors the `delete` verb's `hard?` argument.
+    /// Default behavior for packs with a `deleted_at` column MUST be soft-delete;
+    /// `hard=true` performs permanent removal.
+    ///
+    /// Returns `Ok(Value)` with a `{ deleted: true, id, kind, hard }` body on success.
+    /// Returns `Err(RuntimeError::NotFound(...))` if the record does not exist.
+    async fn delete_by_id(
+        &self,
+        id: uuid::Uuid,
+        hard: bool,
+    ) -> Result<serde_json::Value, crate::RuntimeError>;
+}
+
 /// Builder for constructing a `VerbRegistry`.
 ///
 /// Packs are registered here; once `.build()` is called the registry is
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces threaded into dispatch tokens.
+    /// Retained for future cloud-gate policy wiring only.
+    ///
+    /// After ADR-007 Rev 2 (PR-B), `VerbRegistry::dispatch` always mints the
+    /// storage token with `Namespace::local()` and an empty extra-visible set.
+    /// This field is NOT a read-scope-widening mechanism and is ignored by the
+    /// OSS dispatch path.  A cloud gate implementation may consult it as a
+    /// policy input, but it does not flow into the storage token.
     visible_namespaces: Vec<Namespace>,
     /// Optional audit event sink.
     ///
@@ -289,6 +345,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            resolvers: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
@@ -297,10 +354,14 @@ impl VerbRegistryBuilder {
         }
     }
 
-    /// Set the extra readable namespaces threaded into dispatch tokens.
+    /// Store extra namespaces for future cloud-gate policy wiring.
     ///
-    /// These are the namespaces from `actor.visible_namespaces` in `khive.toml`.
-    /// The primary namespace is always readable and need not appear here.
+    /// After ADR-007 Rev 2 (PR-B), these namespaces are **not** threaded into
+    /// dispatch tokens and do **not** widen read scope.  The OSS dispatch path
+    /// always mints `Namespace::local()` with an empty extra-visible set
+    /// regardless of what is supplied here.  This setter is retained so that a
+    /// cloud gate implementation can read the value as policy input without
+    /// requiring a builder API change.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
         self
@@ -321,6 +382,19 @@ impl VerbRegistryBuilder {
     /// contract is satisfied upstream at the [`PackFactory::create`] site.
     pub(crate) fn register_boxed(&mut self, pack: Box<dyn PackRuntime>) -> &mut Self {
         self.packs.push(pack);
+        self
+    }
+
+    /// Register a by-ID resolver for a pack that owns private SQL tables.
+    ///
+    /// Packs that implement `PackByIdResolver` call this during their boot path
+    /// so that `get(id)` and `delete(id)` can reach their records.
+    pub fn register_resolver(
+        &mut self,
+        name: impl Into<String>,
+        resolver: Box<dyn PackByIdResolver>,
+    ) -> &mut Self {
+        self.resolvers.push((name.into(), resolver));
         self
     }
 
@@ -459,9 +533,9 @@ impl VerbRegistryBuilder {
 
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
+            resolvers: Arc::new(self.resolvers),
             gate: self.gate,
             default_namespace: self.default_namespace,
-            visible_namespaces: self.visible_namespaces,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -587,10 +661,10 @@ impl Default for VerbRegistryBuilder {
 #[derive(Clone)]
 pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    /// Pack-level by-ID resolvers, in registration order.
+    resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     gate: GateRef,
     default_namespace: String,
-    /// Extra readable namespaces for dispatch tokens (from `actor.visible_namespaces`).
-    visible_namespaces: Vec<Namespace>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -761,14 +835,19 @@ impl VerbRegistry {
         }
 
         // Mint the authorized namespace token at the dispatch boundary.
-        // ns_str was already validated above when building the gate request.
-        let primary = Namespace::parse(&ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = NamespaceToken::mint_with_visibility(
-            primary,
-            self.visible_namespaces.clone(),
-            ActorRef::anonymous(),
-        );
+        //
+        // ADR-007 Rev 2, Rule 0 + Rule 3 (PR-B): the OSS dispatch path pins the storage
+        // token's primary to `local`. Actor identity, CLI `--actor`, and config `[actor] id`
+        // are gate/attribution inputs only — they never route storage. The request/default
+        // namespace (`ns_str`) reaches the gate via `gate_req` for policy evaluation, but
+        // the token handed to packs always has primary = local, so all packs write and read
+        // the shared "local" store regardless of which actor is configured.
+        // `actor.visible_namespaces` is dissolved; per-actor distinctions are view-layer tag
+        // filters (assignee, actor_id, from/to), not namespace partitions.
+        // `with_visible_namespaces()` is retained on the builder for future cloud-gate policy
+        // input but no longer widens this dispatch token's read scope.
+        let token =
+            NamespaceToken::mint_with_visibility(Namespace::local(), vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
@@ -850,6 +929,15 @@ impl VerbRegistry {
             "unknown verb {verb:?}; available: {}",
             available.join(", ")
         )))
+    }
+
+    /// Registered pack-level by-ID resolvers, in registration order.
+    ///
+    /// Each element is `(pack_name, resolver)`. The kg `get` and `delete` handlers
+    /// iterate this slice to probe pack-private tables when the standard KG
+    /// substrates (entity/note/edge/event) return `None` for a given UUID.
+    pub fn resolvers(&self) -> &[(String, Box<dyn PackByIdResolver>)] {
+        &self.resolvers
     }
 
     /// Find a kind hook among the registered packs.
@@ -1128,6 +1216,15 @@ pub trait PackFactory: Send + Sync + 'static {
 
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
+
+    /// Optionally create a `PackByIdResolver` for this pack.
+    ///
+    /// Packs that own private SQL tables implement this to hook into
+    /// `get(id)` and `delete(id)`. Defaults to `None` so existing packs
+    /// compile without changes.
+    fn create_resolver(&self, _runtime: KhiveRuntime) -> Option<Box<dyn PackByIdResolver>> {
+        None
+    }
 }
 
 /// Newtype wrapper collected by `inventory` so pack crates can submit
@@ -1232,6 +1329,9 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             builder.register_boxed(factory.create(runtime.clone()));
+            if let Some(resolver) = factory.create_resolver(runtime.clone()) {
+                builder.register_resolver(name.clone(), resolver);
+            }
         }
 
         Ok(())

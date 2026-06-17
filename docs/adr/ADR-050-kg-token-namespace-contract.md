@@ -1,9 +1,15 @@
 # ADR-050: KG Token Namespace Contract
 
+> **Partially superseded by ADR-007 Rev 2 (2026-06-16).** The §"Decision" clause (removal of
+> the KG-pack namespace override) is absorbed and confirmed by ADR-007 Rev 2 Rule 2 and Rule 3.
+> The by-ID namespace check aspects are superseded by ADR-007 Rev 2 Rule 2 (SHIPPED, PR-A1).
+> The §"Context" and §"Rationale / Why not token rebinding" sections remain authoritative
+> historical background for why the override was introduced and why it was removed.
+
 **Status**: Proposed — pending Ocean review
 **Date**: 2026-06-03
 **Supersedes**: ADR-007 §"Namespace-by-Layer Rule" (KG pack rebinding only)
-**References**: ADR-007, ADR-028, ADR-029
+**References**: ADR-007 (Rev 2), ADR-028, ADR-029
 
 ---
 
