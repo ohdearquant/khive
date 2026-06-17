@@ -1075,12 +1075,14 @@ mod tests {
         );
     }
 
-    // Namespace resolution parity with `kkernel mcp`: when --namespace is omitted,
-    // the config file `[actor] id` must set the effective namespace — same as the
-    // MCP path. When --namespace is explicit, it must override the config tier.
+    // Namespace resolution parity with `kkernel mcp` under ADR-007 Rev 2 Rule 0:
+    // when --namespace is omitted, the config file `[actor] id` is attribution only
+    // and does NOT set the effective namespace — it stays `local`, same as the MCP
+    // path. When --namespace is explicit, it routes storage (Rule 1 / reindex's
+    // explicit namespace channel) and overrides the local default.
     #[test]
     #[serial]
-    fn namespace_absent_honors_config_actor_id() {
+    fn namespace_absent_defers_to_local_not_config_actor_id() {
         use std::io::Write;
         std::env::remove_var("KHIVE_NAMESPACE");
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
@@ -1092,7 +1094,8 @@ mod tests {
         f.write_all(b"[actor]\nid = \"lambda:prod\"\n")
             .expect("write config");
 
-        // No --namespace: must pick up [actor] id from config file.
+        // No --namespace: config [actor] id is attribution only (Rule 0), so the
+        // effective namespace stays `local` — it must NOT become lambda:prod.
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
             config: Some(&config_path),
@@ -1105,8 +1108,9 @@ mod tests {
         .expect("resolve config");
         assert_eq!(
             resolved.default_namespace.as_str(),
-            "lambda:prod",
-            "omitted --namespace must defer to config [actor] id"
+            "local",
+            "omitted --namespace must stay local; config [actor] id is attribution \
+             only (ADR-007 Rev 2 Rule 0)"
         );
 
         // Explicit --namespace must override [actor] id.

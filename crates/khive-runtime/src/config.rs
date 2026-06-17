@@ -391,27 +391,12 @@ pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
     base: RuntimeConfig,
 ) -> RuntimeConfig {
-    // Apply actor.id as default_namespace when present and valid.
-    // KhiveConfig::validate() guarantees that actor.id, when present, is a
-    // structurally valid Namespace — so the Err arm here is unreachable for
-    // any config that passed load(). A panic here signals a caller contract
-    // violation (passing an unvalidated config).
-    let default_namespace = match khive_cfg.actor.id.as_deref() {
-        Some(id) if !id.is_empty() => match Namespace::parse(id) {
-            Ok(ns) => {
-                tracing::debug!(actor_id = id, "actor.id from config sets default_namespace");
-                ns
-            }
-            Err(e) => {
-                panic!(
-                    "actor.id {id:?} passed validation but Namespace::parse failed: {e}; \
-                     this is a bug — KhiveConfig must be validated before calling \
-                     runtime_config_from_khive_config"
-                );
-            }
-        },
-        _ => base.default_namespace.clone(),
-    };
+    // ADR-007 Rev 2 Rule 0: `[actor] id` is attribution only and never becomes the
+    // storage namespace. `default_namespace` is whatever the caller resolved into
+    // `base` (explicit `--namespace` / `KHIVE_NAMESPACE`, else `local`). A caller
+    // targets a named namespace per request (`create(namespace=...)`), not by virtue
+    // of which actor is configured — actor identity must not silently route storage.
+    let default_namespace = base.default_namespace.clone();
 
     // base.brain_profile must carry ONLY the explicit CLI tier — never an env
     // value (env sits BELOW toml per ADR-035; the MCP resolver applies it after).

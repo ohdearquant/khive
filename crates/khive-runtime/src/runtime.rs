@@ -887,7 +887,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_from_khive_config_applies_actor_id_as_default_namespace() {
+    fn runtime_config_from_khive_config_actor_id_does_not_override_default_namespace() {
+        // ADR-007 Rev 2 Rule 0: `[actor] id` is attribution only and never becomes
+        // the storage namespace. A configured actor must NOT silently route storage —
+        // default_namespace stays whatever `base` carried (here, `local`).
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
@@ -902,7 +905,11 @@ mod tests {
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
-        assert_eq!(result.default_namespace.as_str(), "lambda:khive");
+        assert_eq!(
+            result.default_namespace.as_str(),
+            "local",
+            "actor.id must not become the storage namespace (ADR-007 Rev 2 Rule 0)"
+        );
     }
 
     #[test]
@@ -989,7 +996,12 @@ mod tests {
             runtime: RuntimeSectionConfig::default(),
         };
         let result = runtime_config_from_khive_config(&cfg, base);
-        assert_eq!(result.default_namespace.as_str(), "lambda:test");
+        assert_eq!(
+            result.default_namespace.as_str(),
+            "local",
+            "actor.id is attribution only and must not override default_namespace \
+             (ADR-007 Rev 2 Rule 0); engine config is still applied"
+        );
         assert!(result.embedding_model.is_some());
     }
 
