@@ -2396,9 +2396,13 @@ fn actor_precedence_default_local_with_no_config() {
     );
 }
 
-/// Tier 3 (config file): no CLI, config has actor.id → config actor applied.
+/// Tier 3 (config file): no CLI, config has actor.id. Under ADR-007 Rev 2 Rule 0
+/// the config `[actor] id` is attribution only and must NOT route the storage
+/// namespace — `default_namespace` stays at the `local` hard default. (Actor
+/// attribution threading is deferred to ADR-053; `[actor] id` is inert in OSS
+/// until then.)
 #[test]
-fn actor_precedence_config_actor_applied_when_no_cli() {
+fn actor_precedence_config_actor_id_does_not_route_namespace() {
     use khive_runtime::{runtime_config_from_khive_config, KhiveConfig, Namespace, RuntimeConfig};
     use std::io::Write;
 
@@ -2415,13 +2419,14 @@ fn actor_precedence_config_actor_applied_when_no_cli() {
         .expect("file found");
     assert_eq!(khive_cfg.actor.id.as_deref(), Some("lambda:from-config"));
 
-    // Simulate: no CLI actor → base stays at "local" default.
+    // No CLI actor → base stays at "local" default; config actor.id must not move it.
     let base = RuntimeConfig::default();
     let resolved = runtime_config_from_khive_config(&khive_cfg, base);
     assert_eq!(
         resolved.default_namespace,
-        Namespace::parse("lambda:from-config").unwrap(),
-        "config actor.id must override the hard default when no CLI actor is set"
+        Namespace::parse("local").unwrap(),
+        "config actor.id is attribution only and must NOT become default_namespace \
+         (ADR-007 Rev 2 Rule 0); the local hard default must be preserved"
     );
 }
 
@@ -3971,179 +3976,142 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
 }
 
 // =============================================================================
-// ADR-007 Rev 2 Rule 0/3 (PR-B): non-local actor/default namespace must not
-// route storage — all packs write and read the shared "local" store.
+// ADR-007 Rev 2: dispatch honors the resolved namespace — an explicit `namespace=`
+// request param when supplied, else `default_namespace` (`local` for OSS). Actor
+// identity never silently routes storage (Rule 0, enforced at the config layer:
+// see runtime.rs `..._actor_id_does_not_override_default_namespace`).
 // =============================================================================
 
-/// Proves ADR-007 Rev 2 Rule 0/3 at the real MCP server boundary.
+/// Proves the dispatch-side namespace contract at the real MCP server boundary.
 ///
-/// A server built with `KhiveMcpServer::with_packs` whose `RuntimeConfig`
-/// carries a non-local `default_namespace` ("lambda:leo") and non-empty
-/// `visible_namespaces` must still route all storage through `"local"`.
+/// All ops go through `dispatch_request_local`, so a regression at the
+/// `VerbRegistry::dispatch` mint site (`pack.rs`) is caught here:
 ///
-/// Three assertions, all dispatched through `dispatch_request_local` so a
-/// regression at the `VerbRegistry::dispatch` mint site (`pack.rs:772`) would
-/// be caught here — not by a direct runtime helper call:
+///   (a) with `default_namespace = local`, a plain `create` lands in `"local"`.
 ///
-///   (a) `create` returns an entity whose `namespace` field is `"local"`, not
-///       `"lambda:leo"`.  This fails if `dispatch` regresses to using the
-///       default_namespace as the token primary.
+///   (b) an explicit `create(namespace="lambda:leo")` lands in `"lambda:leo"` —
+///       the caller deliberately targeting a namespace (Rule 1).  This is exactly
+///       what #159's unconditional `Namespace::local()` hard-pin wrongly collapsed
+///       to `"local"`.
 ///
-///   (b) `list(kind=entity)` via the same server (same mint path) includes the
-///       entity id, proving that MCP reads also operate on `"local"`.  This
-///       fails if list were scoped to the non-local namespace.
+///   (c) a default `list` (local) sees the local entity but NOT the lambda:leo one,
+///       and `list(namespace="lambda:leo")` sees the lambda:leo entity but NOT the
+///       local one — multi-record reads filter by the supplied namespace.
 ///
-///   (c) A `NamespaceToken` pinned directly to `"lambda:leo"` (bypassing
-///       dispatch) sees an empty list, confirming nothing was written to the
-///       actor namespace.  This assertion would NOT catch a mint regression on
-///       its own, but together with (a) and (b) it forms a complete sandwich
-///       proof that storage is exclusively in `"local"`.
-///
-/// Regression sensitivity: if `pack.rs:772` reverts to
-/// `NamespaceToken::mint_with_visibility(primary, ...)` where `primary` comes
-/// from `default_namespace`, assertion (a) fails because the entity's namespace
-/// field would be `"lambda:leo"`, and assertion (b) fails because
-/// `list(kind=entity)` via the minted token would scope reads to `"lambda:leo"`
-/// where the store is empty.
+/// Regression sensitivity: if dispatch reverts to pinning `Namespace::local()`,
+/// assertion (b) fails (the entity namespace would be `"local"`) and the scoped
+/// list in (c) would be empty.
 #[tokio::test]
-async fn non_local_actor_config_routes_storage_to_local_adr007_prb() {
+async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     use khive_mcp::tools::request::RequestParams;
-    use khive_pack_kg::KgPack;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 
     disable_daemon();
 
-    let actor_ns = Namespace::parse("lambda:leo").unwrap();
-
-    // Build a RuntimeConfig equivalent to:
-    //   [actor]
-    //   id          = "lambda:leo"
-    //   visible_namespaces = ["lambda:extra"]
-    // This is the scenario where a non-local actor identity would historically
-    // route storage — PR-B must suppress that.
-    let extra_ns = Namespace::parse("lambda:extra").unwrap();
+    // OSS default: default_namespace = local; actor identity is attribution only.
     let cfg = RuntimeConfig {
         db_path: None,
-        default_namespace: actor_ns.clone(),
+        default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string()],
-        visible_namespaces: vec![extra_ns.clone()],
         ..RuntimeConfig::default()
     };
 
     let rt = KhiveRuntime::new(cfg).expect("in-memory runtime");
+    let server =
+        KhiveMcpServer::with_packs(rt.clone(), &["kg".to_string()]).expect("server builds");
 
-    // Build through with_packs — the same constructor the production MCP binary
-    // uses, so the full wiring chain (RuntimeConfig → builder → registry →
-    // dispatch → mint) is exercised.
-    let server = KhiveMcpServer::with_packs(rt.clone(), &["kg".to_string()])
-        .expect("server builds with non-local actor config");
+    // Dispatch one `create`/`list` op and return the parsed `results[0]` body.
+    async fn dispatch_op(server: &KhiveMcpServer, ops: &str) -> Value {
+        let out = server
+            .dispatch_request_local(RequestParams {
+                ops: ops.to_string(),
+                presentation: Some("verbose".to_string()),
+                presentation_per_op: None,
+            })
+            .await
+            .expect("dispatch must not error at the MCP level");
+        let body: Value = serde_json::from_str(&out).expect("response must be valid JSON");
+        body["results"][0].clone()
+    }
 
-    // ── (a) CREATE: entity must land in "local", not the actor namespace ──────
-    let create_out = server
-        .dispatch_request_local(RequestParams {
-            ops: r#"create(kind="concept", name="MintProbe")"#.to_string(),
-            presentation: Some("verbose".to_string()),
-            presentation_per_op: None,
-        })
-        .await
-        .expect("dispatch create must not error at the MCP level");
+    fn list_ids(result: &Value) -> Vec<String> {
+        match result["result"].as_array() {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect(),
+            None => match result["result"]["items"].as_array() {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect(),
+                None => {
+                    panic!("list result must be a JSON array or object with items; got: {result}")
+                }
+            },
+        }
+    }
 
-    let create_body: Value =
-        serde_json::from_str(&create_out).expect("create response must be valid JSON");
-    let create_result = &create_body["results"][0];
+    // ── (a) DEFAULT CREATE: lands in "local" ─────────────────────────────────
+    let default_res = dispatch_op(&server, r#"create(kind="concept", name="DefaultProbe")"#).await;
     assert_eq!(
-        create_result["ok"],
+        default_res["ok"],
         json!(true),
-        "create via non-local actor config must succeed; got: {create_result}"
+        "default create must succeed; got: {default_res}"
     );
-    let entity_id = create_result["result"]["id"]
-        .as_str()
-        .expect("create result must carry 'id'");
     assert_eq!(
-        create_result["result"]["namespace"].as_str().unwrap_or(""),
+        default_res["result"]["namespace"].as_str().unwrap_or(""),
         "local",
-        "entity must land in 'local' even when default_namespace='lambda:leo'; \
-         actor identity must not silently become the storage namespace (ADR-007 Rule 0); \
-         got: {create_result}"
+        "a create with no explicit namespace must land in 'local'; got: {default_res}"
     );
+    let default_id = default_res["result"]["id"]
+        .as_str()
+        .expect("create result must carry 'id'")
+        .to_string();
 
-    // ── (b) LIST: same MCP path must see the entity from "local" ─────────────
-    let list_out = server
-        .dispatch_request_local(RequestParams {
-            ops: r#"list(kind="entity")"#.to_string(),
-            presentation: Some("verbose".to_string()),
-            presentation_per_op: None,
-        })
-        .await
-        .expect("dispatch list must not error at the MCP level");
-
-    let list_body: Value =
-        serde_json::from_str(&list_out).expect("list response must be valid JSON");
-    let list_result = &list_body["results"][0];
+    // ── (b) EXPLICIT CREATE: namespace="lambda:leo" is honored ───────────────
+    let named_res = dispatch_op(
+        &server,
+        r#"create(kind="concept", name="NamedProbe", namespace="lambda:leo")"#,
+    )
+    .await;
     assert_eq!(
-        list_result["ok"],
+        named_res["ok"],
         json!(true),
-        "list via non-local actor config must succeed; got: {list_result}"
+        "explicit-namespace create must succeed; got: {named_res}"
     );
-    let ids_in_list: Vec<&str> = match list_result["result"].as_array() {
-        Some(arr) => arr
-            .iter()
-            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-            .collect(),
-        None => match list_result["result"].as_object() {
-            Some(obj) => obj
-                .get("items")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            None => {
-                panic!("list result must be a JSON array or object with items; got: {list_result}")
-            }
-        },
-    };
+    assert_eq!(
+        named_res["result"]["namespace"].as_str().unwrap_or(""),
+        "lambda:leo",
+        "create(namespace=\"lambda:leo\") must land in 'lambda:leo', not be collapsed to \
+         'local' (ADR-007 Rev 2 Rule 1 — explicit namespace is honored); got: {named_res}"
+    );
+    let named_id = named_res["result"]["id"]
+        .as_str()
+        .expect("create result must carry 'id'")
+        .to_string();
+
+    // ── (c) LIST scoping: default(local) vs explicit(lambda:leo) ─────────────
+    let local_ids = list_ids(&dispatch_op(&server, r#"list(kind="entity")"#).await);
     assert!(
-        ids_in_list.contains(&entity_id),
-        "entity created via non-local actor registry must be readable from 'local' list \
-         through MCP dispatch; got ids: {ids_in_list:?}"
+        local_ids.contains(&default_id),
+        "default list must see the local entity; got: {local_ids:?}"
+    );
+    assert!(
+        !local_ids.contains(&named_id),
+        "default(local) list must NOT see the lambda:leo entity; got: {local_ids:?}"
     );
 
-    // ── (c) DIRECT NON-LOCAL TOKEN: must see an empty store ──────────────────
-    // This is NOT via dispatch — it uses a token pinned to "lambda:leo" directly.
-    // Together with (a) and (b) it proves storage was never routed to that namespace.
-    let pack = KgPack::new(rt.clone());
-    // We need a VerbRegistry to call pack.dispatch; build a minimal one.
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    let probe_registry = builder.build().expect("probe registry builds");
-    let actor_token = rt
-        .authorize(actor_ns.clone())
-        .expect("authorize lambda:leo token");
-    let actor_list = pack
-        .dispatch(
-            "list",
-            json!({ "kind": "entity" }),
-            &probe_registry,
-            &actor_token,
-        )
-        .await
-        .expect("direct pack list via actor-ns token must succeed");
-    let ids_in_actor_ns: Vec<&str> = match &actor_list {
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-            .collect(),
-        other => panic!("list must return a JSON array; got: {other:?}"),
-    };
+    let leo_ids =
+        list_ids(&dispatch_op(&server, r#"list(kind="entity", namespace="lambda:leo")"#).await);
     assert!(
-        !ids_in_actor_ns.contains(&entity_id),
-        "storage must not have been routed to 'lambda:leo'; \
-         entity must NOT appear when listing directly under that namespace \
-         (ADR-007 Rule 0/3, PR-B); got ids: {ids_in_actor_ns:?}"
+        leo_ids.contains(&named_id),
+        "list(namespace=lambda:leo) must see the lambda:leo entity; got: {leo_ids:?}"
+    );
+    assert!(
+        !leo_ids.contains(&default_id),
+        "list(namespace=lambda:leo) must NOT see the local entity; got: {leo_ids:?}"
     );
 }

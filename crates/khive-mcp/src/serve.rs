@@ -133,7 +133,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         };
         resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)?
     } else {
-        resolve_config(inputs.config, base_config, inputs.namespace_explicit)?
+        resolve_config(inputs.config, base_config)?
     };
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
@@ -154,12 +154,15 @@ fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
     cfg
 }
 
-/// Resolve the full config (embedding engines + actor namespace) from file or env.
+/// Resolve the full config (embedding engines + namespace) from file or env.
 ///
-/// Precedence for actor/namespace (highest to lowest):
-/// 1. CLI `--actor` / `--namespace` (cli_namespace_explicit=true skips config tier)
-/// 2. Config file `[actor] id` (applied here when !cli_namespace_explicit)
-/// 3. Default "local" from RuntimeConfig
+/// Precedence for the storage namespace (highest to lowest):
+/// 1. CLI `--actor` / `--namespace` (carried in `base.default_namespace`)
+/// 2. Default "local" from RuntimeConfig
+///
+/// Config file `[actor] id` is attribution only and does NOT route the storage
+/// namespace (ADR-007 Rev 2 Rule 0); `runtime_config_from_khive_config` preserves
+/// `base.default_namespace` regardless of the configured actor.
 ///
 /// Precedence for embedding engines:
 /// 1. Config file `[[engines]]`
@@ -167,7 +170,6 @@ fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
 fn resolve_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
-    cli_namespace_explicit: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
@@ -182,15 +184,7 @@ fn resolve_config(
                 );
             }
 
-            let effective_cfg = if cli_namespace_explicit {
-                let mut c = khive_cfg;
-                c.actor.id = None;
-                c
-            } else {
-                khive_cfg
-            };
-
-            Ok(runtime_config_from_khive_config(&effective_cfg, base))
+            Ok(runtime_config_from_khive_config(&khive_cfg, base))
         }
         None => {
             let env_cfg = config_from_env();

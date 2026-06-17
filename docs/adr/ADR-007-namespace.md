@@ -46,6 +46,14 @@ Actor identity (lambda:khive, lambda:leo, agent:*, user:ocean) is attribution on
 write records and gate-request context, available for logging, filtering, and cloud policy
 input. It never silently becomes the storage namespace and never gates by-ID access.
 
+Config-layer realization: the `[actor] id` config key is attribution only and does not set
+`default_namespace`. `runtime_config_from_khive_config` preserves whatever the caller resolved
+into the base config (an explicit `--namespace` / `KHIVE_NAMESPACE`, else `local`), regardless
+of which actor is configured. Threading actor identity onto write records is deferred to
+ADR-053; until that lands, `[actor] id` is inert at the storage layer in OSS. This is the
+distinction Rule 0 turns on: a caller may target a named namespace per request, but the actor a
+deployment is configured as must not route storage on its own.
+
 Source: CLAUDE.md "The local system is a single shared brain: one namespace (`local`), and
 every lambda / agent / subagent reads and writes it."
 
@@ -85,19 +93,34 @@ while routing KG and knowledge to "local". Gemini REFUTE Finding 2 correctly ide
 as a contradiction of Rule 0: framing per-pack actor routing as "explicit pack policy"
 re-introduces the exact actor-as-namespace isolation coupling Ocean ordered removed. Finding 1
 added that memory is live-audited as bulk "local" and that cross-lambda learning via
-memory.recall over one pool depends on the shared store. The lambda synthesis confirms: there
-is no actor-namespace routing rule. ALL packs store in "local". The per-pack distinction is
-dissolved.
+memory.recall over one pool depends on the shared store. The lambda synthesis rejected
+_blanket_ per-pack routing (every pack keyed by actor namespace), and Ocean (2026-06-17) confirms
+kg, knowledge, gtd, and brain are no-carry. What stays open is a _narrow_ carry for the genuinely
+per-actor packs: comm (Ocean leans yes — messages are inherently addressed) and memory
+(undecided). The current release ships the uniform no-carry default for ALL packs; narrow
+per-pack carry is deferred to Rev 3 (see the per-pack note below).
 
 Under this ADR: list, search, recall, neighbors, traverse, and query for ALL packs pass
-WHERE namespace = 'local' (or the configured default_namespace, which is "local" for OSS).
+WHERE namespace = 'local' by default. The single exception is an explicit `namespace=` request
+parameter (Rule 1 — a caller may deliberately read a named set, e.g.
+`list(namespace="lambda:khive")` or `create(namespace="ns-beta")`), which routes that one
+operation to the named set. There is no per-pack actor routing, and `default_namespace` (the
+actor/config identity) does NOT route storage: it reaches the gate as policy context, but the
+storage token stays "local" unless the caller named a namespace explicitly.
+
+The dispatch boundary (VerbRegistry::dispatch, pack.rs) mints the storage token with primary =
+the explicit `namespace=` parameter when present, else `Namespace::local()`. The "local" pin is
+the default; the explicit parameter is the only escape.
 
 Per-actor distinctions for operational packs are view-layer filters, not namespace partitions:
 
 - GTD: filter by the "assignee" column (tag or field), not by namespace.
-- Comm: filter by "from" and "to" addressing fields, not by namespace.
+- Comm: in the current release, filters by "from"/"to" addressing fields over the shared
+  "local" store. Open (Rev 3): Ocean (2026-06-17) leans toward comm _carrying_ the caller's
+  namespace into storage by default, since messages are inherently per-actor.
 - Memory: filter by actor_id attribution column when an owner-scoped view is needed; the
-  underlying pool is shared and cross-lambda recall operates over it.
+  underlying pool is shared and cross-lambda recall operates over it. Whether memory should
+  carry the caller's namespace by default is undecided (Rev 3).
 - Brain: profile resolution is its own scoping mechanism (brain.resolve, profile bindings),
   independent of namespace.
 - Schedule: attribution columns carry the scheduling actor; namespace is "local".
@@ -105,7 +128,12 @@ Per-actor distinctions for operational packs are view-layer filters, not namespa
 This dissolves the Rule 0 vs Rule 3 contradiction present in the draft (gemini Finding 2) and
 resolves the memory-pack scoping incoherence (gemini Finding 1).
 
-Status: PR-B, not yet built.
+Status: implemented. VerbRegistry::dispatch mints the storage token with primary = the explicit
+`namespace=` parameter when present, else `Namespace::local()`; `default_namespace` feeds only
+the gate request, never the storage token. `runtime_config_from_khive_config` treats `[actor] id`
+as attribution only. The earlier pin of `Namespace::local()` at the dispatch mint site (PR #159)
+applied _unconditionally_ — collapsing even an explicit parameter and so breaking namespace
+isolation between caller-named sets — and is superseded by this explicit-parameter escape.
 
 ### Rule 4 — Authorization enforced at one seam: the Gate
 
@@ -209,13 +237,13 @@ collision.
 
 ## Alternatives Considered
 
-| Alternative                                                  | Pros                                                           | Cons                                                                                                                 | Disposition                                                         |
-| ------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Keep ADR-007 v1 NamespaceToken as by-ID guard                | Type-safe isolation proof                                      | Incompatible with dumb-storage contract; removed by PR-A1                                                            | Rejected, SHIPPED removal                                           |
-| Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Rejected (gemini Finding 1, Finding 2; lambda synthesis)            |
-| ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Superseded by this ADR                                              |
-| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                            |
-| Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not |
+| Alternative                                                  | Pros                                                           | Cons                                                                                                                 | Disposition                                                                                                                             |
+| ------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Keep ADR-007 v1 NamespaceToken as by-ID guard                | Type-safe isolation proof                                      | Incompatible with dumb-storage contract; removed by PR-A1                                                            | Rejected, SHIPPED removal                                                                                                               |
+| Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Blanket form rejected; kg/knowledge/gtd/brain confirmed no-carry (Ocean 2026-06-17); narrow comm-only (±memory) carry deferred to Rev 3 |
+| ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Superseded by this ADR                                                                                                                  |
+| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                                                                                                |
+| Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not                                                                     |
 
 ---
 
