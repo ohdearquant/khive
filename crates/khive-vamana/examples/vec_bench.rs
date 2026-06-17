@@ -663,7 +663,8 @@ fn evaluate_check(spec: &CheckSpec, rows: &[RowResult], fits: &FitsResult) -> (V
         }
         "max_n" => {
             let v = rows
-                .last()
+                .iter()
+                .max_by_key(|r| r.n)
                 .map(|r| get_row_metric(&spec.metric, r))
                 .unwrap_or(f64::NAN);
             let pass = compare(v, &spec.operator, effective_threshold);

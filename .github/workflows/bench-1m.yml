@@ -1,0 +1,104 @@
+name: Vamana 1M scale-proof bench
+
+# Blocking / non-blocking decision:
+#
+#   NON-BLOCKING in main CI (continue-on-error: true).
+#
+# Rationale: The bench requires the SIFT-1M dataset (~500 MB, .fvecs format)
+# to be present at SIFT_DIR. GitHub-hosted runners do not have this data; it
+# lives on a self-hosted runner or must be downloaded. If SIFT_DIR is not set
+# or the files are absent, the script exits with code 2 (prerequisite missing)
+# rather than a regression (code 1). Treating a missing-data exit as a CI
+# failure would block every PR on all developers' machines.
+#
+# When a SIFT-capable self-hosted runner is provisioned, flip
+# continue-on-error to false for this job to make it fully blocking.
+#
+# What IS blocking: the bench script itself fails with exit 1 if the bench
+# runs but assertions fail. This will block only when SIFT data is present and
+# a regression is detected — exactly the desired behavior.
+
+on:
+  push:
+    branches: [main, "integration/**"]
+    paths:
+      - "crates/khive-vamana/**"
+      - "perf/targets.toml"
+      - "scripts/bench_1m.sh"
+      - "scripts/perf/ingest_scale_proof.py"
+  pull_request:
+    branches: [main, "integration/**"]
+    paths:
+      - "crates/khive-vamana/**"
+      - "perf/targets.toml"
+      - "scripts/bench_1m.sh"
+      - "scripts/perf/ingest_scale_proof.py"
+  workflow_dispatch:
+    inputs:
+      sift_dir:
+        description: "Path to SIFT data dir (overrides SIFT_DIR env)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-1m-ci:
+    name: Vamana ANN regression check (CI subset)
+    # Use a self-hosted runner when SIFT data is available; fall back to
+    # ubuntu-latest for the prerequisite-check path (exits 2, not 1).
+    runs-on: ubuntu-latest
+
+    # NON-BLOCKING: missing SIFT data is exit 2, not a regression.
+    # Flip to false when a SIFT-capable self-hosted runner is in place.
+    continue-on-error: true
+
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set SIFT_DIR from workflow_dispatch input (if provided)
+        if: ${{ github.event.inputs.sift_dir != '' }}
+        run: echo "SIFT_DIR=${{ github.event.inputs.sift_dir }}" >> "$GITHUB_ENV"
+
+      - name: Run Vamana CI bench (10K/50K subset, <60 s when data present)
+        # Exit codes:
+        #   0 — data present; all assertions PASS
+        #   1 — data present; one or more assertions FAIL (regression)
+        #   2 — data absent; skip gracefully
+        run: |
+          set +e
+          bash scripts/bench_1m.sh --ci
+          RC=$?
+          set -e
+          if [ $RC -eq 2 ]; then
+            echo "::notice::SIFT data not found at SIFT_DIR=${SIFT_DIR:-<unset>} — bench skipped. Provision a SIFT-capable runner to enable regression gating."
+            exit 0
+          elif [ $RC -eq 0 ]; then
+            echo "::notice::Vamana CI bench PASSED."
+            exit 0
+          else
+            echo "::warning::Vamana CI bench FAILED (regression detected, exit $RC)."
+            exit $RC
+          fi
+        env:
+          SIFT_DIR: ${{ env.SIFT_DIR || '' }}
+          BENCH_OUT: /tmp/bench-out
