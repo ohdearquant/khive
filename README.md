@@ -30,7 +30,7 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 | **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                               |
 | **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                        |
 | **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                               |
-| **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                                                    |
+| **Namespace attribution**   | Every record stamped with a namespace; one shared store in OSS, tenant isolation enforced at the Gate in cloud           |
 
 ---
 

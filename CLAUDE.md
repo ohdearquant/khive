@@ -272,11 +272,18 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   `request`. **Per-verb validation failure** (unknown kind, bad UUID, etc.) returns a per-op
   `{ok: false, error: "..."}` entry — the batch does not abort.
 
-### Namespace isolation
+### Namespace (attribution-only — ADR-007 Rev 3, 2026-06-17)
 
-- **Enforced at the runtime layer.** Every ID-based operation (get, delete, update, merge)
-  must verify `record.namespace == caller_namespace` after fetching by UUID.
-- Storage stores are ID-only. The runtime is the trust boundary.
+- **Namespace is attribution, not isolation.** It is a write-stamp on records, queryable and
+  filterable, available to the Gate as policy input. It is never a storage boundary.
+- **By-ID ops are namespace-agnostic** (get, update, delete, merge). No `record.namespace ==
+  caller_namespace` check exists at the store, runtime, or handler layer. This was the
+  prior v1 behavior; it was removed by PR-A1 (commit 2607e263) and is no longer correct.
+  Do not add such checks.
+- **Authorization lives at one seam: the Gate** (ADR-018). Storage stores are ID-only. The
+  Gate is the trust boundary.
+- **Multi-record ops default to `WHERE namespace='local'`**; the only escape is an explicit
+  `namespace=` parameter from the caller.
 
 ### Edge cascade
 
@@ -379,8 +386,10 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
   language, call the MCP server — don't rewrite the storage logic.
 - **Don't silently coerce invalid input.** Invalid entity kinds, note kinds, and edge relations
   must return errors with the valid values listed. Never `unwrap_or_default()`.
-- **Don't bypass namespace isolation.** Every ID-based runtime method checks namespace.
-  Storage is ID-only by design — the runtime enforces access control.
+- **Don't add namespace checks to by-ID ops.** By-ID methods (get, update, delete, merge)
+  are namespace-agnostic by design (ADR-007 Rev 3). Authorization is at the Gate. Adding
+  `record.namespace == caller_namespace` post-fetch checks is the prior v1 bug pattern; it
+  was removed by PR-A1 and must not return.
 - **Don't edit V1 migrations.** Append a new version. V1 is immutable on existing databases.
 - **Don't store research findings only as notes.** Notes are for context; entities + edges
   are for structure. If a concept is worth naming, it's an entity.

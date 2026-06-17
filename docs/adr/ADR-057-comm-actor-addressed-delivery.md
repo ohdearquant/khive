@@ -44,13 +44,16 @@ scope reads and writes by actor. That is the correct long-term model. However, #
 changes to the dispatch layer, gate stack, and several packs. Gating comm actor-addressed
 delivery on #75 would leave agent-to-agent messaging broken for an extended period.
 
-### Namespace isolation is a security boundary
+### Namespace is attribution, not isolation (ADR-007 Rev 3)
 
-ADR-007 specifies that namespace isolation is a data-breach boundary in hosted deployments.
-The local shared-namespace deployment intentionally places all lambdas in `"local"` so that
-memory and KG records are cross-visible. Per-lambda namespaces would orphan the existing
-corpus from every lambda's view. Actor identity and data visibility are orthogonal axes;
-conflating them by creating per-lambda namespaces is the wrong fix.
+ADR-007 Rev 3 (2026-06-17, Accepted/Ratified) establishes that namespace is attribution-only:
+a write-stamp on records, queryable and filterable, available to the Gate as policy input, but
+not a storage boundary. Isolation is enforced at one seam — the Gate (ADR-018, ADR-053) — not
+in storage partitions or by-ID namespace checks. The local shared-namespace deployment
+intentionally places all lambdas in `"local"` so that memory and KG records are cross-visible.
+Per-lambda namespaces would orphan the existing corpus from every lambda's view. Actor identity
+and data visibility are orthogonal axes; conflating them by creating per-lambda namespaces is
+the wrong fix.
 
 ## Decision
 
@@ -209,13 +212,14 @@ No changes to thread resolution or read-marking logic. Thread queries filter by
 `properties.thread_id`, which is namespace-scoped and independent of actor labels. Read
 marking is a per-message operation gated on namespace membership, which is unchanged.
 
-### Interaction with ADR-007 (namespace isolation)
+### Interaction with ADR-007 Rev 3 (namespace as attribution)
 
 Option A writes both copies to the caller's namespace. No `NamespaceToken::with_namespace`
-is called. No cross-namespace write is attempted. Namespace isolation as defined in ADR-007
-is fully preserved. The safety argument: actor-addressed delivery is a routing abstraction
-implemented within a single namespace; it changes the actor label on message properties, not
-the namespace of stored records.
+is called. No cross-namespace write is attempted. ADR-007 Rev 3 is fully satisfied: namespace
+is attribution, storage is dumb, and the Gate is the single enforcement seam. The safety
+argument: actor-addressed delivery is a routing abstraction implemented within a single
+namespace; it changes the actor label on message properties (`from_actor`, `to_actor`), not
+the namespace of stored records. Comm is NO-CARRY per ADR-007 Rev 3 Rule 3.
 
 ### Interaction with ADR-040 cross-namespace allowlist
 
