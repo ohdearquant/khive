@@ -141,20 +141,68 @@ Repair is local (the deleted node's 2-hop neighborhood), so per-delete cost is b
 not corpus size. Because repair happens at delete time, **recall stays bounded between
 consolidations** -- consolidation is then a pure compaction, not a recall-recovery step.
 
-**`insert(vector)` -- incremental.** Recycle a `free_slots` ordinal if available, else append.
-Greedy-search for an entry neighborhood, `RobustPrune` to select the new node's out-edges, add
-back-edges with `RobustPrune` on each affected neighbor, update `reverse_adj`, increment
-`ops_since_consolidation`.
+**`insert(vector) -> Result<u32>` -- incremental.** Preflight checks (dimension, finite,
+capacity) run before any state mutation; a rejected insert never touches the Mmap store.
+`ensure_owned()` then promotes `VectorStorage::Mmap` to `VectorStorage::Owned` (one-time
+copy; subsequent inserts pay no promotion cost). Recycles a `free_slots` ordinal if
+available (LIFO; double-use guard: slot must be tombstoned before popping), else appends.
+Greedy-search finds an entry neighborhood; `RobustPrune` selects the new node's out-edges.
 
-**`consolidate()` -- compaction with ordinal remapping**, triggered when
+**Never-drop back-edge rule.** For each selected out-neighbor `j`, the back-edge `j→ordinal`
+is added ONLY IF `j` has a free slot (`|adj(j)| < max_degree`). If `j` is full, the
+back-edge is skipped entirely -- `RobustPrune` is NOT called on `j` and none of `j`'s
+existing edges are removed. Correctness invariant: insert() never removes any existing
+node's inbound edge, so every node reachable before the insert remains reachable after it.
+
+**Medoid-pin eager repair (insert-time analog of Wolverine for delete).** If, after the
+back-edge loop, the inserted node has zero inbound edges (all selected neighbors were full),
+it is pinned by adding the edge `medoid→ordinal`. The medoid is the search entry point and
+is always reachable; it is the designated overflow node (the same role it plays in DiskANN).
+The medoid is permitted to exceed `max_degree` in the live in-memory index (by one edge per
+orphan-pinned insert; K consecutive inserts into a saturated graph can accumulate K overflow
+edges). No existing medoid edge is removed, so the never-drop invariant is preserved.
+
+**Save/load + snapshot round-trip invariant.** `save()` and `to_snapshot()` cap the medoid's
+adjacency to `max_degree` before writing. Any overflow edges beyond `max_degree` are dropped
+at serialization time. The result is a written graph
+that satisfies all v1 loader degree constraints (`degree ≤ max_degree` everywhere). After
+load, recently inserted nodes whose overflow edges were dropped may lack medoid in-edges
+and may not be immediately searchable. Today's `consolidate()` handles tombstone compaction
+only (renumbering live nodes); it does not redistribute forward edges or re-run RobustPrune
+for under-connected nodes. A future redistribution pass (separate issue) will address
+post-load reachability recovery; until then, serialization truncation of overflow edges is
+a permanent quality reduction for affected nodes absent a full index rebuild. Tests
+verify that the post-insert `save()`/`load()` and `to_snapshot()`/`from_snapshot()` round-trips
+succeed without degree-violation errors, and that existing nodes remain findable.
+
+**Quality trade-off.** Skipping back-edges on saturated neighbors lowers incremental-insert
+graph quality on heavily-saturated corpora (ordinal becomes less well-connected via
+back-edges, increasing reliance on the medoid hub for routing). This is a quality trade-off,
+not a correctness issue (recall is bounded and ADR-052-acceptable). A future
+consolidate-side redistribution pass (separate issue + ADR-052 amendment) will repair the
+degree imbalance if bench measurements show it is material.
+
+**Ordinal stability invariant:** ordinals returned by `insert()` are stable until the next
+`consolidate()` call. After consolidation the ordinal space is renumbered; callers that
+maintain external id→ordinal tables **must** apply the returned remap (see below).
+
+**`consolidate() -> Result<Vec<u32>>` -- compaction with ordinal remapping**, triggered when
 `ops_since_consolidation >= tau` (default `tau = 40_000`):
 
+0. Fast-path: if `tombstone_count == 0`, reset `ops_since_consolidation` and return
+   `Ok(Vec::new())`. An empty return signals "ordinals unchanged; no remap needed."
 1. Build `old -> new` ordinal remap assigning live nodes contiguous ordinals `0..M`.
 2. Allocate a fresh vector store of size `M`; copy live vectors to new ordinals.
 3. Rewrite every adjacency list through the remap, dropping any tombstoned targets.
 4. Rebuild `reverse_adj` from the compacted forward graph.
 5. Remap the medoid.
 6. Clear `tombstones`, `free_slots`; reset `tombstone_count` and `ops_since_consolidation`.
+7. Return `Ok(new_to_old)` where `new_to_old[new_ordinal] = old_ordinal`.
+
+Callers that maintain external id→ordinal mappings (e.g. the knowledge pack's ANN bridge)
+must invert the returned `new_to_old` slice to rebuild their table; a non-empty return is
+an epoch boundary. `ensure_owned()` is called at the top of `consolidate()` for the same
+Mmap-promotion reason as `insert()`.
 
 Consolidation does **not** re-run graph construction -- the Wolverine repairs already kept the
 graph navigable. It reclaims space and restores dense ordinals. (FreshDiskANN / SPFresh use the
@@ -208,6 +256,10 @@ the claim is made load-bearing.
    recall parity by probe.
 3. Add the five lifecycle fields + `tombstone`/`insert`/`consolidate` to khive-vamana with
    isomorphic tests (delete-then-search recall, churn-then-consolidate identity, insert recall).
+   `insert` returns the assigned `u32` ordinal; `consolidate` returns `Result<Vec<u32>>`
+   (the `new_to_old` remap, or an empty `Vec` when no-op). `ensure_owned()` is called at
+   the top of both mutating functions to promote Mmap storage before any write. Ordinals
+   are NOT stable across a non-no-op `consolidate`. (Implemented: PR3.)
 4. Add the v2 format + `save_atomic` + `load_or_build`; verify crash-consistency by a
    kill-during-save probe and restore-correctness by a fingerprint-match probe.
 5. Add `build_batch_sq8`/`search_layer_sq8` to khive-hnsw as an opt-in path; enable per-corpus

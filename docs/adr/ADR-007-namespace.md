@@ -1,511 +1,266 @@
-# ADR-007: Namespace
+# ADR-007 Rev 2: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate
 
-**Status**: accepted\
-**Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Status**: Proposed (pending Ocean ratification of C1 and C3 in Part C of the synthesis)
+**Date**: 2026-06-16
+**Authors**: lambda:khive, alpha:architect
+**Amends**: ADR-007-namespace.md (replaces v1 base text and both 2026-05 amendments in full)
+**Supersedes (partial)**: ADR-050 §"Decision"; ADR-059 §"Decision" and §"Visibility tiers"
+**Superseded-by-none**: ADR-053 (ActorStore, SessionStore, cloud-tier actor threading) survives in full
+**ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
+| ADR-002 (edge cascade, no dangling refs)
+
+---
 
 ## Context
 
-Namespace is khive's logical isolation primitive. Every entity, note, event, and edge record
-carries a namespace. Queries are namespace-scoped. In a hosted deployment, namespace isolation
-failure is a data breach.
+khive accumulated four namespace documents in the v1 series that disagree on what namespace is
+for. ADR-007 v1 base text treated namespace as a type-level authorization proof
+(NamespaceToken, NamespaceView, by-ID post-fetch checks). The 2026-05-25 amendment introduced
+AllowAllGate as the OSS default. The 2026-05-27 Namespace-by-Layer amendment split packs into
+two routing groups. ADR-050 proposed removing the KG-pack token rebinding introduced by that
+split. ADR-059 drafted a three-tier visibility model.
 
-The isolation model must satisfy:
+Ocean's ruling (CLAUDE.md "Authorization — the gate is a seam, by design" and "Namespace and
+authorization") resolves the divergence: namespace is attribution, not isolation. Storage is
+dumb. The Gate is the one enforcement seam.
 
-1. **OSS simplicity.** Single-user local deployment should work with zero configuration. No
-   tenant IDs, no auth tokens, no isolation layers to understand.
-2. **Cloud correctness.** In hosted multi-tenant deployment, one tenant's data must be
-   unreachable from another tenant's context. Accidental namespace fallback must be impossible
-   to express.
-3. **Federation safety.** A single verb may fan out to multiple backends (ADR-029, Substrate Coordinator).
-   Namespace enforcement must propagate through every backend call, not just the entry point.
-4. **Type-level enforcement.** Convention fails; types hold. The design should make isolation
-   breaks impossible to express in Rust, not merely documented as forbidden.
-5. **Wire compatibility.** Namespace is stored as a TEXT column in SQLite. Changes to the
-   `Namespace` representation must not require database migrations for existing deployments.
+PR-A1 (commit 2607e263, merged 2026-06-16) shipped the by-ID half: all ensure_namespace /
+ensure_namespace_visible post-fetch checks removed from get_entity, get_note, delete_entity,
+delete_note, update_entity, update_note, update_edge, delete_edge. The multi-record half
+(list, search, recall, neighbors, traverse, query) still filters by visible_namespaces. This
+ADR specifies collapsing that to the single shared "local" set (PR-B).
+
+This ADR does not specify cloud multi-tenant isolation. That is behind the Gate trait. This ADR
+specifies the OSS contract and the seam that cloud plugs into.
+
+---
 
 ## Decision
 
-### Opaque newtype with validated factories
-
-`Namespace` is a string-backed newtype with no public unchecked constructor. Callers
-construct namespaces through validated factories.
-
-```rust
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct Namespace(String);
-
-impl Namespace {
-    pub const LOCAL: &'static str = "local";
-
-    pub fn parse(value: &str) -> Result<Self, NamespaceError> {
-        validate_namespace(value)?;
-        Ok(Self(String::from(value)))
-    }
-
-    pub fn local() -> Self {
-        Self(String::from(Self::LOCAL))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl TryFrom<String> for Namespace { /* validates through Namespace::parse */ }
-impl TryFrom<&str> for Namespace { /* validates through Namespace::parse */ }
-```
-
-`Namespace` is a string-backed newtype with no public unchecked constructor. The
-shipped public construction surface is `Namespace::parse(&str)`, `Namespace::local()`,
-`TryFrom<String>`, and `TryFrom<&str>`. Earlier `project(slug)`, `tenant(id)`,
-`system(name)`, and `from_trusted_unchecked` examples are deferred sketches, not
-accepted API. Hosted deployments derive namespace strings from authenticated
-context, parse them, and mint `NamespaceToken` through runtime/gate dispatch;
-caller input never receives an unchecked namespace factory.
-
-### No `Default`
-
-`Namespace` does not implement `Default`.
-
-Single-user OSS deployments obtain `Namespace::local()` from runtime configuration, not
-from the namespace type itself:
-
-```rust
-pub struct RuntimeConfig {
-    pub default_namespace: Namespace,
-}
-
-impl RuntimeConfig {
-    pub fn local_dev() -> Self {
-        Self {
-            default_namespace: Namespace::local(),
-        }
-    }
-}
-```
-
-Hosted deployments must mint namespaces from authenticated tenant context before verb
-dispatch. If `Default` existed, a misconfigured cloud tenant could accidentally fall into
-`"local"` and access other `"local"`-namespaced data.
-
-### Structural validation
-
-Structural invariants are enforced at `Namespace` construction time. A valid `Namespace`
-value is definitionally well-formed.
-
-```text
-Structural validation (at construction):
-- non-empty
-- length-bounded (max 256 characters)
-- valid character set (alphanumeric, '-', '_', ':', '.')
-- no trailing separator
-- no empty path segments ("local::project" is invalid)
-- tenant namespace contains valid UUID
-- reserved prefixes ("system:", "tenant:") controlled by factories
-```
-
-### `NamespaceToken`: type-level authorization proof
-
-`NamespaceToken` is a non-forgeable proof that structural validation and semantic
-authorization have both occurred. It is minted only by the auth/runtime layer.
-
-```rust
-pub struct NamespaceToken {
-    namespace: Namespace,
-    principal: PrincipalId,
-    grants: NamespaceGrants,
-    _sealed: private::Sealed,
-}
-
-mod private {
-    pub struct Sealed;
-}
-
-impl NamespaceToken {
-    pub(crate) fn mint(
-        auth: &AuthContext,
-        namespace: Namespace,
-        requested: NamespaceAccess,
-    ) -> Result<Self, AuthError> {
-        auth.authorize_namespace(&namespace, requested)?;
-        Ok(Self {
-            namespace,
-            principal: auth.principal_id(),
-            grants: auth.grants_for(&namespace),
-            _sealed: private::Sealed,
-        })
-    }
-
-    pub fn namespace(&self) -> &Namespace {
-        &self.namespace
-    }
-}
-```
-
-Semantic authorization (at token minting):
-
-```text
-- namespace exists in tenant registry (cloud) or is well-formed (OSS)
-- principal owns or has been granted access to namespace
-- requested access mode (read / write / admin) is permitted
-- cross-namespace access grant exists (if requesting foreign namespace)
-```
-
-A `Namespace` value proves structural well-formedness. A `NamespaceToken` proves
-authorization for a principal and access mode.
-
-### Runtime enforcement via `NamespaceView`
-
-Agent/user code never receives the raw coordinator or raw storage. It receives a
-`NamespaceView`, created from a `NamespaceToken`:
-
-```rust
-pub struct NamespaceView<'a> {
-    coordinator: &'a SubstrateCoordinator,
-    token: NamespaceToken,
-}
-
-impl<'a> NamespaceView<'a> {
-    pub async fn search(&self, req: SearchRequest) -> Result<SearchResult, RuntimeError> {
-        self.coordinator.search(&self.token, req).await
-    }
-
-    pub async fn get_entity(&self, id: Uuid) -> Result<Entity, RuntimeError> {
-        self.coordinator.get_entity(&self.token, id).await
-    }
-}
-```
-
-All runtime methods that read/write namespace-scoped records require `NamespaceToken`.
-In the shipped runtime, `VerbRegistry::dispatch` resolves and validates the operation
-namespace, consults the gate, mints `NamespaceToken` at the dispatch boundary, strips
-the transport `namespace` field before ordinary pack handlers, and passes
-`&NamespaceToken` into pack code. Single-record ID operations still require token
-verification after fetching by UUID.
-
-First-party packs may apply documented namespace policy by rebinding a token with
-`NamespaceToken::with_namespace`, for example KG graph verbs using the shared default
-namespace under the Namespace-by-Layer rule. This is trusted pack policy, not a
-caller-visible namespace factory.
-
-The enforcement pattern:
-
-```rust
-// Write path
-if entity.namespace != *token.namespace() {
-    return Err(RuntimeError::NamespaceMismatch);
-}
-
-// Read-by-ID path
-let record = storage.get(id).await?;
-if record.namespace != *token.namespace() {
-    return Err(RuntimeError::NamespaceDenied);
-}
-```
-
-Physical stores remain unscoped persistence connections. They execute what they are told.
-Enforcement happens in the runtime/coordinator layer, not at the storage level.
-
-**Timing oracle mitigation**: Error responses for "UUID exists but wrong namespace" and
-"UUID does not exist" MUST be identical in type, message, and observable timing. Both
-return `RuntimeError::NotFound` with the message "not found in this namespace" — no
-indication of whether the record exists in another namespace. This prevents UUID
-enumeration attacks against foreign namespaces.
-
-### Namespace vs backend: independent axes
-
-Namespace and backend are independent isolation dimensions.
-
-```text
-Namespace answers: "Which principal may access this record?"
-Backend answers: "Where is this record physically stored and what operational policy applies?"
-```
-
-A namespace may span multiple backends. A backend may contain multiple namespaces.
-
-Authorization is always evaluated against namespace, not backend name. The coordinator
-composes both axes during fan-out: it routes to the correct backends AND enforces namespace
-filtering on every backend call.
-
-Neither dimension subsumes the other. Namespace isolation is necessary but not sufficient
-for full isolation — a record in the correct namespace on the wrong backend is a routing
-bug. A record on the correct backend in the wrong namespace is a security bug.
-
-### Hierarchy helper: naming utility, not authorization
-
-The shipped namespace module exposes `has_segment_prefix(child, parent)` as a public
-helper for naming-convention checks. It is not a semantic guarantee and MUST NOT be
-used for authorization. Authorization decisions use `NamespaceToken` and gate policy.
-
-```rust
-// khive-types/src/namespace.rs — naming-convention helper, NOT authorization
-pub fn has_segment_prefix(child: &Namespace, parent: &Namespace) -> bool {
-    let c = child.as_str();
-    let p = parent.as_str();
-    c.len() > p.len()
-        && c.starts_with(p)
-        && c.as_bytes().get(p.len()) == Some(&b':')
-}
-```
-
-Authorization decisions use `NamespaceToken`, not string-prefix checks.
-
-### Pack namespace policy: out of scope
-
-ADR-007 defines the namespace primitive and enforcement model. Pack-specific namespace
-behavior (memory pack scoped to agent namespace, lore pack as global read-only) belongs
-in ADR-017 (Pack Standard) or a future pack capability ADR.
-
-Any pack namespace policy must compile down to `NamespaceToken` / `NamespaceView`
-permissions. Packs must not bypass namespace enforcement or construct namespaces from
-raw strings.
-
-## Rationale
-
-### Why no public constructor?
-
-`Namespace::new(arbitrary_string)` allows typos (`""`, `"local:"`, `"tenant:not-a-uuid"`)
-and namespace guessing attacks in hosted deployments. Factories enforce invariants at
-construction time. Every call site that currently passes an arbitrary string must go through
-validation — this is good breakage because it identifies every unvalidated namespace entry
-point.
-
-### Why no Default?
-
-`Default` produces `Namespace::local()`. In a cloud deployment, any code path that reaches
-`Default::default()` without going through auth falls into the `"local"` namespace. A
-misconfigured cloud tenant reading `"local"` data is a data breach. Moving the default to
-runtime configuration makes the OSS path explicit (`RuntimeConfig::local_dev()`) and the
-cloud path impossible to accidentally bypass.
-
-### Why NamespaceToken (not just ingress validation)?
-
-Ingress validation (option A from the question file) is a single chokepoint at verb
-dispatch. Any code path that skips verb dispatch — internal maintenance, background tasks,
-admin operations, future hot paths — can access any namespace without validation. A
-token makes bypass impossible to express in the type system: if you don't have a
-`NamespaceToken`, you cannot call namespace-scoped operations.
-
-### Why independent axes (not namespace-primary)?
-
-Backend is not merely an implementation detail once federation exists. A namespace can span
-`main.db` and `archive.db`. A backend can hold namespaces from different tenants. The
-coordinator must compose both: route to the right backends AND filter by namespace. Treating
-backend as "just an implementation detail" encourages developers to assume backend placement
-is irrelevant to isolation — but placing tenant A's data on tenant B's dedicated backend is
-a placement bug even if namespace filtering would prevent reads.
-
-### Why remove hierarchy from core type?
-
-`is_child_of` performs a string-prefix check. It has no semantic relationship to
-authorization. In cloud deployments, tenant namespaces are UUIDs — there is no hierarchy.
-The method would be dead code on half the deployment surface and a security footgun on the
-other half.
-
-### Why read-by-ID still requires token?
-
-UUID is globally unique, but namespace-scoped. Storage fetches by UUID without namespace
-filtering (the UUID is sufficient for the lookup). But the runtime must verify the result
-belongs to the caller's namespace before returning it. Without this check, an attacker who
-guesses or observes a UUID from another namespace can read that record.
+### Rule 0 — One shared brain, one namespace
+
+khive's local (OSS) deployment is a single shared brain: one SQLite file, one namespace
+("local"), all lambdas and agents reading and writing together.
+
+Actor identity (lambda:khive, lambda:leo, agent:*, user:ocean) is attribution only: stamped on
+write records and gate-request context, available for logging, filtering, and cloud policy
+input. It never silently becomes the storage namespace and never gates by-ID access.
+
+Source: CLAUDE.md "The local system is a single shared brain: one namespace (`local`), and
+every lambda / agent / subagent reads and writes it."
+
+### Rule 1 — Storage is dumb
+
+Stores (khive-db, khive-storage traits) are unscoped database connections. Namespace is a
+column on every record, written as-is from the record struct. Stores execute what they are
+told.
+
+- Multi-record methods (list, search, FTS, vector search, neighbors, traverse, query) accept
+  namespace as a caller-supplied parameter used in the SQL WHERE clause.
+- By-ID methods (get, update, delete, upsert) use WHERE id = ? only. No namespace equality
+  check in the store or in the runtime above it.
+
+Source: v0 archive ADR-007-namespace-as-open-string.md (2026-05-15) rules 1-4 ("stores are
+unscoped database connections"), re-affirmed for v1.
+
+No inline namespace == checks in handlers or stores are permitted. No per-namespace storage
+partitioning. These make the Gate redundant — the exact regression this seam exists to prevent.
+
+### Rule 2 — By-ID ops are namespace-agnostic (SHIPPED, PR-A1)
+
+get, update, delete by UUID resolve a globally-unique UUID with no namespace check at any
+layer: not in the store SQL, not in the runtime post-fetch check, not in the pack handler.
+
+Status: SHIPPED in commit 2607e263. Covered by regression tests added in that PR.
+
+Affected functions confirmed clean post-PR-A1 (operations.rs): get_entity,
+get_entity_including_deleted, get_note_including_deleted, delete_entity, delete_note,
+update_entity, update_note, update_edge, delete_edge.
+
+### Rule 3 — Multi-record ops scope to the single shared "local" set (PR-B, pending)
+
+CHANGE FROM ADR-007 v1: The 2026-05-27 Namespace-by-Layer amendment routed memory, gtd, comm,
+brain, and schedule multi-record ops by actor namespace ("WHERE namespace = <actor_namespace>"),
+while routing KG and knowledge to "local". Gemini REFUTE Finding 2 correctly identified this
+as a contradiction of Rule 0: framing per-pack actor routing as "explicit pack policy"
+re-introduces the exact actor-as-namespace isolation coupling Ocean ordered removed. Finding 1
+added that memory is live-audited as bulk "local" and that cross-lambda learning via
+memory.recall over one pool depends on the shared store. The lambda synthesis confirms: there
+is no actor-namespace routing rule. ALL packs store in "local". The per-pack distinction is
+dissolved.
+
+Under this ADR: list, search, recall, neighbors, traverse, and query for ALL packs pass
+WHERE namespace = 'local' (or the configured default_namespace, which is "local" for OSS).
+
+Per-actor distinctions for operational packs are view-layer filters, not namespace partitions:
+
+- GTD: filter by the "assignee" column (tag or field), not by namespace.
+- Comm: filter by "from" and "to" addressing fields, not by namespace.
+- Memory: filter by actor_id attribution column when an owner-scoped view is needed; the
+  underlying pool is shared and cross-lambda recall operates over it.
+- Brain: profile resolution is its own scoping mechanism (brain.resolve, profile bindings),
+  independent of namespace.
+- Schedule: attribution columns carry the scheduling actor; namespace is "local".
+
+This dissolves the Rule 0 vs Rule 3 contradiction present in the draft (gemini Finding 2) and
+resolves the memory-pack scoping incoherence (gemini Finding 1).
+
+Status: PR-B, not yet built.
+
+### Rule 4 — Authorization enforced at one seam: the Gate
+
+VerbRegistry::dispatch (crates/khive-runtime/src/pack.rs) calls self.gate.check(&gate_req)
+before every verb invocation. This is the single enforcement point.
+
+- OSS default: AllowAllGate — every request passes. Zero embedded cost.
+- Cloud: a TenantGate (non-OSS, separate crate behind the Gate trait) validates the caller's
+  authenticated identity and enforces per-tenant namespace access.
+- No policy DSL ships in khive. khive-gate-rego is a dev-dep only; cloud policy lives behind
+  the Gate trait, outside this repository.
+
+The gate call is live code, not dead code. It is the seam that makes OSS single-tenant and
+cloud multi-tenant share the same binary without structural change.
+
+**Cloud-tier clarification.** Namespace is attribution and a gate policy-input — never a
+storage boundary, at either tier. The invariant that holds in OSS holds unchanged in cloud:
+storage is never partitioned by namespace, and by-ID ops resolve a globally-unique UUID with
+no namespace check. The only OSS/cloud difference is which Gate is installed. The gate receives
+the acting actor, the request namespace, and the target records' attribution as policy input,
+and returns allow/deny:
+
+- OSS AllowAllGate ignores all of it and returns allow.
+- A cloud TenantGate MAY key per-tenant isolation on the namespace string (or any attribution
+  field). That is the gate reading namespace as policy input — not storage partitioning on it.
+
+How a cloud gate maps authenticated tenants to allow/deny is cloud policy, behind the trait,
+out of this repository's scope. This ADR specifies only the gate's input contract and the
+storage-dumb / by-ID-global invariant that both tiers preserve. "Namespace never becomes the
+storage namespace" is absolute. "Namespace may be a cloud gate's policy key" is consistent
+with it: a policy input is not a storage boundary.
+
+Source: CLAUDE.md "The `Gate` is a replaceable trait. The runtime holds an `Arc<dyn Gate>` and
+consults it on every verb dispatch — one authorization boundary."
+
+### Rule 5 — Merge semantics: same-namespace guard survives as substrate check, not isolation
+
+CHANGE FROM ADR-007 v1: The v1 base text and Namespace-by-Layer amendment defended the
+merge_entity same-namespace guard on the grounds that it prevents merging a "local KG entity
+with an actor-scoped operational note." Gemini Finding 4 correctly refuted this: entities and
+notes are different substrates merged by different verbs (merge_entity vs merge_note), so the
+cross-substrate scenario is structurally impossible regardless of namespace values. In an
+all-"local" world the guard is circular ("local" == "local") and is dead code with respect to
+isolation.
+
+This ADR retains the guard as merge semantics (ADR-014 curation), specifically as a
+same-substrate deduplication quality gate, not as an isolation mechanism. It does not prevent
+anything in the current deployment. It is dead-but-harmless and may be cleaned up in a future
+PR. It must not be defended as isolation.
+
+Source: curation.rs line 2908-2910 ("a merge-semantic constraint, not tenant isolation"),
+gemini Finding 4.
+
+### Rule 6 — Namespace type: open string with validated factory
+
+Namespace is a string-backed newtype. The validated factory Namespace::parse(s) is the
+construction surface (non-empty, length <= 256, character set [a-zA-Z0-9\-_:.], no trailing
+separator, no empty segments). Namespace::local() returns the "local" singleton.
+
+Structural validation from ADR-007 v1 is retained. It is not isolation machinery; it prevents
+accidental garbage in the namespace column.
+
+Removed from scope vs ADR-007 v1:
+
+- NamespaceToken as a proof-of-authorization for by-ID access (superseded by Rule 2).
+- NamespaceView wrapper that gates coordinator access (superseded by Rule 2).
+- Timing oracle mitigation (returning identical errors for "wrong namespace" vs "not found")
+  because by-ID ops no longer do namespace checks.
+- NamespaceGrants, AuthContext, PrincipalId types from the base text — cloud types, behind
+  the Gate trait, outside this repository.
+- Read-by-ID namespace post-fetch verification. SHIPPED removed by PR-A1.
+
+NamespaceToken may be retained as the attribution carrier passed into pack handlers (it carries
+actor, namespace, visible-set metadata), but it is no longer a by-ID access guard.
+
+### Rule 7 — Attribution stamping
+
+Writes stamp namespace, actor_id, and actor_kind on records from the dispatch context.
+Attribution is informational: queryable, filterable, loggable, and available to the gate as
+policy input. It does not route storage.
+
+---
+
+## Supersession Map
+
+| Document                                          | Status                      | Superseded clauses                                                                                                                                                                          | Surviving clauses                                                                                                                                                                                                                 |
+| ------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ADR-007 v1 base text (this file, prior revision)  | Superseded (Rev 2 replaces) | NamespaceToken as by-ID guard; NamespaceView; Read-by-ID namespace check; Timing oracle mitigation; NamespaceGrants / AuthContext / PrincipalId                                             | Namespace::parse structural validation; "No Default"; Namespace vs backend independent axes; Hierarchy helper naming utility                                                                                                      |
+| ADR-007 2026-05-25 amendment                      | Partially superseded        | OSS vs Cloud two-model framing (collapsed: OSS IS the model; cloud plugs in via Gate)                                                                                                       | AllowAllGate as OSS default; [actor] id as attribution config; 4-tier config search path; display_name advisory-only                                                                                                              |
+| ADR-007 2026-05-27 amendment (Namespace-by-Layer) | Superseded                  | KG-pack namespace override via token.with_namespace(); per-pack actor namespace routing for memory/gtd/comm — this ADR replaces routing with view-layer tag filters                         | None; the routing intent is now stated correctly in Rule 3                                                                                                                                                                        |
+| ADR-050                                           | Partially superseded        | Decision: removal of KG-pack override (this ADR absorbs and confirms)                                                                                                                       | Context: documents the override as a historical bug; Rationale "Why not token rebinding"                                                                                                                                          |
+| ADR-053                                           | Survives in full            | No conflict                                                                                                                                                                                 | All: ActorStore, SessionStore, DispatchRequest, cloud-tier actor threading. Attribution threading is orthogonal to namespace isolation.                                                                                           |
+| ADR-059 (draft)                                   | Substantially superseded    | Decision: visibility tiers (shared + private + proposal-only); visibility filter checking all three namespace columns; subagents submit proposals; legacy "local" maps to private namespace | Context: multi-lambda cooperation description (retained as background); Gemini-mirror corrections on edge namespace storage (edge carries its own namespace column, not derived from endpoints) — a storage schema fact, retained |
+
+Note on ADR-058: PR #143 proposes a new ADR-058 for the brain posterior read-path. That
+number is orthogonal to the namespace work. The supersession map above does not reference
+ADR-058 because this ADR does not touch the brain read-path. PR #143 may proceed without
+collision.
+
+---
+
+## Alternatives Considered
+
+| Alternative                                                  | Pros                                                           | Cons                                                                                                                 | Disposition                                                         |
+| ------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Keep ADR-007 v1 NamespaceToken as by-ID guard                | Type-safe isolation proof                                      | Incompatible with dumb-storage contract; removed by PR-A1                                                            | Rejected, SHIPPED removal                                           |
+| Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Rejected (gemini Finding 1, Finding 2; lambda synthesis)            |
+| ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Superseded by this ADR                                              |
+| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                            |
+| Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not |
+
+---
 
 ## Consequences
 
 ### Positive
 
-- Namespace isolation enforced by the Rust type system, not convention.
-- Cloud deployment cannot accidentally fall into `"local"`.
-- Every namespace-scoped code path requires an authorized token.
-- Read-by-ID verifies namespace after fetch — no UUID-guessing bypass.
-- Hierarchy helpers cannot be confused with authorization.
-- Pack namespace policy deferred to the right layer (ADR-017, Pack Standard).
+- By-ID ops are namespace-agnostic (SHIPPED). Agents can reach any record they know the UUID of.
+- Storage is dumb: no authorization logic at the store or runtime-post-fetch layer.
+- Gate is the single enforcement seam: cloud isolation is one Gate implementation swap.
+- "local" as the universal namespace means cross-project KG edges and cross-lambda memory.recall
+  work without gymnastics.
+- Memory pool is shared: lambdas learn from each other's recalled experience.
+- Removes the KG-pack token rebinding bug (ADR-050 context) that caused cross-tenant bleed.
+- Removes the Rule 0/Rule 3 contradiction present in the prior amendment.
 
 ### Negative
 
-- Removing `Default` and the public constructor breaks existing call sites.
-  Mitigated: these are the call sites that need audit — the breakage is diagnostic.
-- `NamespaceToken` adds a parameter to every runtime/coordinator method.
-  Mitigated: the parameter is the authorization proof — omitting it would be the bug.
-- Two-layer validation (structural + semantic) is more complex than single-layer.
-  Mitigated: each layer is simple and independently testable.
+- PR-A2/PR-F require a full reindex, not just a WHERE-clause change: FTS5 is physically
+  per-namespace and ANN snapshots are per-namespace graph blobs, both regenerated from the
+  relabeled base rows. Vector base data needs no movement (vec_* tables are per-model,
+  namespace-agnostic — live-DB verified). Higher-cost than the prior amendment implied, but a
+  single reindex pass is the mechanism.
+- PR-F is a live-data mutation with no automatic rollback. Requires snapshot discipline.
+- Until PR-B lands, KG list/search may include stranded non-"local" records or miss them
+  depending on current visible-set config. This is the current state post-PR-A1.
 
 ### Neutral
 
-- SQLite TEXT column unchanged. Namespace strings stored the same way.
-- `Namespace::local()` still works for OSS. The factory is the same; the default is
-  moved to config.
-- Wire format unchanged — namespaces are strings in JSON/MCP.
-
-## Implementation
-
-- `khive-types/src/namespace.rs`: `Namespace` struct with factories, `TryFrom<String>`,
-  `NamespaceError`. No `Default`. No `new(String)`. No `is_child_of`.
-- `khive-runtime/src/runtime.rs`: `NamespaceToken` with sealed constructor,
-  `NamespaceView` wrapper. Token minting via `VerbRegistry::dispatch`.
-- `khive-types/src/namespace.rs`: `has_segment_prefix` utility for OSS hierarchical
-  naming convention (lives with the `Namespace` type, not in the runtime).
-- Runtime methods: all namespace-scoped operations take `&NamespaceToken`. Read-by-ID
-  methods verify `record.namespace == token.namespace()` after fetch.
+- Namespace::parse structural validation survives.
+- merge_entity / merge_note same-namespace guard survives as dead-but-harmless merge semantics.
+- ADR-053 (ActorStore, DispatchRequest) survives in full.
+- Wire format unchanged: namespace is a string in JSON/MCP.
 
 ---
 
-## Amendment: OSS vs Cloud Namespace Models (2026-05-25)
+## References
 
-**Authors**: lambda:khive (Wave 4 — k-actor-config)
-
-### Two products, two models
-
-The original ADR describes the complete enforcement model that will apply in cloud (hosted,
-multi-tenant) deployments. OSS single-binary deployments use a deliberately lighter model.
-These are different products and the distinction is intentional.
-
-```text
-OSS model:   config-default actor + per-op override + no enforcement
-Cloud model: NamespaceToken from authenticated session + full enforcement
-```
-
-OSS never enforces namespace isolation — it is a single-user local tool. The namespace
-field exists to give agents logical grouping and to prevent accidental cross-session
-contamination, not to provide security.
-
-### OSS namespace resolution (priority order)
-
-When `khive-mcp` starts, it resolves the default namespace for the session in the
-following priority order (highest wins):
-
-1. `--actor <id>` CLI flag (or `KHIVE_ACTOR` env var)
-2. `--namespace <id>` CLI flag (or `KHIVE_NAMESPACE` env var) — legacy alias for `--actor`
-3. `[actor] id` in the config file (`--config` / `KHIVE_CONFIG` / `khive.toml` /
-   `.khive/config.toml` / `~/.khive/config.toml`)
-4. Hard default: `"local"`
-
-Every verb that does not supply an explicit `namespace` argument inherits the session
-default. Verbs that supply `namespace` explicitly use that value unconditionally — the gate
-is still consulted (as required by ADR-018), but the OSS default `AllowAllGate` allows all
-requests, so there is no denying enforcement. Cloud deployments swap in `TenantGate`, which
-rejects namespace requests that do not match the authenticated session JWT.
-
-### TOML config format
-
-```toml
-[actor]
-id = "lambda:myproject"           # sets default_namespace for this session
-display_name = "My Project Agent" # optional, advisory only
-```
-
-`display_name` is stored in the config struct and available for display/logging; it has no
-effect on namespace routing or enforcement.
-
-### Why no enforcement in OSS
-
-1. **Single-user deployment.** There is no second principal to protect against. The user
-   who sets `--actor lambda:foo` is the same user who could set `--actor lambda:bar`. An
-   enforcement layer would only add friction with zero security benefit.
-2. **AllowAllGate.** The OSS binary uses `AllowAllGate` — every verb dispatch succeeds
-   authorization. `NamespaceToken` is still minted (structural validation still fires), but
-   the gate never rejects. Cloud swaps in `TenantGate` which verifies the session JWT and
-   enforces that the requested namespace matches the authenticated tenant.
-3. **Contamination prevention, not isolation.** The main value of `--actor` in OSS is
-   preventing accidental cross-session contamination: two agents sharing a single `khive-mcp`
-   instance with the same `"local"` default will interleave their tasks. Giving each agent
-   its own actor ID (`lambda:agent-a`, `lambda:agent-b`) keeps their records separate without
-   any security boundary.
-
-### Cloud enforcement (future)
-
-Cloud deployments replace the `AllowAllGate` with a real gate that:
-
-- Receives the session JWT from the incoming connection context
-- Extracts the tenant namespace from the token claims
-- Rejects any verb that requests a namespace not permitted by the JWT
-
-The `NamespaceToken` minting in `VerbRegistry::dispatch` is unchanged — only the gate
-implementation differs. OSS and cloud share the same type system; enforcement is a
-deployment-time configuration, not a code change.
-
-### Consequences of this amendment
-
-- `RuntimeConfig::default_namespace` is the single place where the OSS actor default
-  is stored. All config-loading code sets it; the runtime never reads `[actor]` directly.
-- `khive-runtime/src/engine_config.rs` gains `ActorConfig { id, display_name }` as a
-  `[actor]` section in `KhiveConfig`.
-- `runtime_config_from_khive_config` applies `actor.id` to `default_namespace` when present.
-- `khive-mcp` binary gains `--actor` / `KHIVE_ACTOR` as the preferred namespace override,
-  with `--namespace` retained as a legacy alias.
-- `KhiveConfig::load_with_home_fallback` implements the 4-tier config search path.
-
----
-
-## Amendment: Namespace-by-Layer Rule (2026-05-27)
-
-**Authors**: Ocean, lambda:khive
-
-### Problem
-
-When different projects (lionagi, khive, lattice) each run MCP with `--actor lambda:{project}`,
-their KG entities land in separate namespaces. This makes shared concepts invisible across
-projects, creates duplicates, and prevents cross-project edges — defeating the purpose of a
-shared knowledge graph.
-
-### Rule: KG uses shared namespace, scoped packs use actor namespace
-
-| Pack layer                      | Namespace                 | Rationale                                             |
-| ------------------------------- | ------------------------- | ----------------------------------------------------- |
-| **KG** (entities, edges, notes) | `local` (default, shared) | One "LoRA" entity — all projects link to it via edges |
-| **Memory** (remember/recall)    | `lambda:{project}`        | Scoped episodic/semantic memory per agent             |
-| **GTD** (assign/next/complete)  | `lambda:{project}`        | Scoped task queues per orchestrator                   |
-| **Comm** (send/inbox)           | `lambda:{project}`        | Scoped messaging between agents                       |
-| **Brain** (profiles/feedback)   | `lambda:{project}`        | Scoped priors per agent context                       |
-| **Schedule** (agenda/remind)    | `lambda:{project}`        | Scoped schedules per agent                            |
-| **Knowledge** (learn/cite)      | `local` (shared)          | Extends KG — same shared namespace                    |
-
-**Invariant**: `create`, `link`, `search`, `list`, `get`, `neighbors`, `traverse`, `query`,
-`knowledge.learn`, `knowledge.cite` MUST use the default shared namespace. Agents MUST NOT
-override the namespace for KG operations with `lambda:*` actor namespaces.
-
-### Why not one namespace for everything?
-
-Memory recall under `lambda:lionagi` returns only lionagi's working memories. If all memory
-went to `local`, every agent would recall every other agent's episodic notes — noise that
-degrades recall precision. The separation is correct for scoped operational data and wrong
-for shared structural knowledge.
-
-### Cross-project connection model
-
-Projects connect through the edge ontology, not through namespace sharing:
-
-```text
-Entity: "LoRA" (concept, namespace=local)
-  ←implements— "lattice-lora" (project, namespace=local)
-  ←depends_on— "lionagi-finetune" (project, namespace=local)
-  ←introduced_by— "Hu et al. 2021" (concept, namespace=local)
-```
-
-Each project's `project` entity lives in the shared graph. The `implements`, `depends_on`,
-`competes_with` edges ARE the cross-project synergy layer.
-
-### Implementation
-
-1. **MCP server**: KG pack verbs always use `RuntimeConfig::default_namespace` (already
-   `Namespace::local()` by default). The `--actor` flag affects memory/gtd/comm/brain
-   namespace selection but NOT KG verbs.
-2. **Pack dispatch**: Each pack determines its own namespace policy. KG pack ignores actor
-   override for entity/edge/note operations. Memory/GTD/Comm packs use actor namespace.
-3. **Plugin skills**: All KG plugin skills (digest, expand, polish, gap, explore, etc.)
-   document that they operate in the shared namespace.
-4. **Agent instructions**: Agents using `--actor lambda:{project}` must understand that KG
-   operations are cross-project by design.
-
-### Consequences
-
-- No duplicate entities across projects — one canonical concept per name.
-- Cross-project edges work without namespace gymnastics.
-- Memory/task isolation preserved — agents don't pollute each other's working state.
-- Requires pack-level namespace routing (KG pack → shared, memory pack → actor) rather than
-  a single session-wide namespace.
+- CLAUDE.md "Authorization — the gate is a seam, by design" — Ocean's ratified design.
+- CLAUDE.md "Namespace and authorization" — coding standards.
+- v0 archive: khive-old/docs/_archive/adr_v0/ADR-007-namespace-as-open-string.md — original
+  dumb-storage rules 1-4.
+- Commit 2607e263 — PR-A1 implementation, by-ID contract SHIPPED.
+- gemini_refute_adr007.md (resume 44078a77) — REFUTE findings 1-6, authoritative corrections.
+- ADR-014 — curation operations, merge semantics.
+- ADR-018 — Gate trait, single dispatch site, AllowAllGate.
+- ADR-002 — edge cascade, no dangling refs.
+- ADR-053 — ActorStore, SessionStore, cloud-tier actor threading (survives).

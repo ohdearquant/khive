@@ -16,6 +16,26 @@ use khive_storage::types::{
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
+// Fault-injection point for backfill reader errors. When set, the next
+// `backfill_missing_embeddings` call substitutes a `StorageError::Pool` for the
+// result of `sql.reader().await`, then resets to false. Available in test builds
+// and the `fault-injection` feature for integration testing.
+#[cfg(any(test, feature = "fault-injection"))]
+std::thread_local! {
+    static BACKFILL_READER_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm the backfill reader fault injection. When set, the next call to
+/// `backfill_missing_embeddings` will substitute a `StorageError::Pool` for the
+/// result of `sql.reader().await`, then reset the flag. The injected error
+/// passes through `map_err(RuntimeError::Storage)?` — the same path as a real
+/// reader failure — so it exercises the fail-closed guard rather than bypassing it.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_backfill_reader_fail() {
+    BACKFILL_READER_FAIL.with(|c| c.set(true));
+}
+
 /// A unified search result combining vector and text signals.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
@@ -562,10 +582,22 @@ impl KhiveRuntime {
 
                 let entity_rows: Vec<SqlRow> = {
                     let sql = self.sql();
-                    match sql.reader().await {
-                        Ok(mut reader) => reader.query_all(entity_sql).await.unwrap_or_default(),
-                        Err(_) => vec![],
-                    }
+                    let reader_result = sql.reader().await;
+                    #[cfg(any(test, feature = "fault-injection"))]
+                    let reader_result = if BACKFILL_READER_FAIL.with(|c| c.get()) {
+                        BACKFILL_READER_FAIL.with(|c| c.set(false));
+                        Err(khive_storage::StorageError::Pool {
+                            operation: "reader".into(),
+                            message: "injected failure".into(),
+                        })
+                    } else {
+                        reader_result
+                    };
+                    let mut reader = reader_result.map_err(RuntimeError::Storage)?;
+                    reader
+                        .query_all(entity_sql)
+                        .await
+                        .map_err(RuntimeError::Storage)?
                 };
 
                 let batch_len = entity_rows.len();
@@ -666,10 +698,22 @@ impl KhiveRuntime {
 
                 let note_rows: Vec<SqlRow> = {
                     let sql = self.sql();
-                    match sql.reader().await {
-                        Ok(mut reader) => reader.query_all(note_sql).await.unwrap_or_default(),
-                        Err(_) => vec![],
-                    }
+                    let reader_result = sql.reader().await;
+                    #[cfg(any(test, feature = "fault-injection"))]
+                    let reader_result = if BACKFILL_READER_FAIL.with(|c| c.get()) {
+                        BACKFILL_READER_FAIL.with(|c| c.set(false));
+                        Err(khive_storage::StorageError::Pool {
+                            operation: "reader".into(),
+                            message: "injected failure".into(),
+                        })
+                    } else {
+                        reader_result
+                    };
+                    let mut reader = reader_result.map_err(RuntimeError::Storage)?;
+                    reader
+                        .query_all(note_sql)
+                        .await
+                        .map_err(RuntimeError::Storage)?
                 };
 
                 let batch_len = note_rows.len();
@@ -1284,6 +1328,84 @@ mod tests {
             doc_emb, query_emb,
             "multilingual-e5-small uses asymmetric prefixes: document ('passage: ') \
              and query ('query: ') embeds of the same text must differ"
+        );
+    }
+
+    // ---- M-07 regression: backfill reader error must be propagated, not swallowed ----
+
+    use crate::embedder_registry::EmbedderProvider;
+    use lattice_embed::EmbeddingService;
+
+    /// A stub embedder that never actually loads weights — used to satisfy the
+    /// `registered_embedding_model_names` check inside `backfill_missing_embeddings`
+    /// without triggering a real model load. The test fault-injects a reader error
+    /// before any embedding call is made, so `embed()` is never reached.
+    struct StubEmbedderProvider;
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for StubEmbedderProvider {
+        fn name(&self) -> &str {
+            "stub-model-m07"
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            struct StubSvc;
+            #[async_trait::async_trait]
+            impl EmbeddingService for StubSvc {
+                async fn embed(
+                    &self,
+                    _texts: &[String],
+                    _model: lattice_embed::EmbeddingModel,
+                ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+                    Ok(vec![])
+                }
+
+                fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+                    true
+                }
+
+                fn name(&self) -> &'static str {
+                    "stub-svc-m07"
+                }
+            }
+            Ok(std::sync::Arc::new(StubSvc))
+        }
+    }
+
+    /// Regression test for M-07: `backfill_missing_embeddings` must propagate a
+    /// reader error rather than treating it as "zero rows to embed" (silent swallow).
+    ///
+    /// Before the fix: `Err(_) => vec![]` caused the caller to receive `Ok(0)`,
+    /// silently skipping all embeddings. After the fix: the error is returned via `?`.
+    ///
+    /// The fault injection substitutes a `StorageError::Pool` for the result of
+    /// `sql.reader().await` (i.e., the error originates AT the reader boundary, not
+    /// before it), so the test exercises the exact `map_err(RuntimeError::Storage)?`
+    /// lines that the fix introduced. Reverting those lines to `unwrap_or_default()`
+    /// would swallow the injected error and cause this test to fail.
+    #[tokio::test]
+    async fn backfill_reader_error_is_propagated_not_swallowed() {
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_embedder(StubEmbedderProvider);
+        let tok = NamespaceToken::local();
+
+        // Arm the fault injection: the next backfill call will substitute a
+        // StorageError at the sql.reader().await boundary, then reset.
+        super::arm_backfill_reader_fail();
+
+        let result = rt.backfill_missing_embeddings(&tok).await;
+        assert!(
+            result.is_err(),
+            "backfill_missing_embeddings must propagate the reader error (got Ok instead)"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected failure"),
+            "error must originate from the injected reader failure, got: {err_msg}"
         );
     }
 }

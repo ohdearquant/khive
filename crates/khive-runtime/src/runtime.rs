@@ -168,10 +168,11 @@ impl KhiveRuntime {
         &self.config.backend_id
     }
 
-    /// Return the extra-visible namespaces from config (beyond the primary).
+    /// Return the extra-visible namespaces from config.
     ///
-    /// Used by pack dispatch to mint tokens that can read across namespaces
-    /// configured in `actor.visible_namespaces` in `khive.toml`.
+    /// Retained for configuration identity and future cloud-gate policy. OSS
+    /// dispatch does NOT use these to mint read tokens — storage is always
+    /// local-only (ADR-007 Rev 2).
     pub fn visible_namespaces(&self) -> &[Namespace] {
         &self.config.visible_namespaces
     }

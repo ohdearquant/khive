@@ -199,8 +199,6 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
 
-        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
-
         let mut text_changed = false;
         let mut changed_fields: Vec<&'static str> = Vec::new();
 
@@ -535,8 +533,6 @@ impl KhiveRuntime {
             .get_note(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
-
-        Self::ensure_namespace(&note.namespace, token.namespace().as_str())?;
 
         let mut text_changed = false;
 
@@ -2867,11 +2863,10 @@ mod tests {
         );
     }
 
-    // ── #hardening Item 5: cross-namespace entity update/merge must be denied ──
+    // ADR-007 PR-A1: cross-namespace update now succeeds (shared-brain model).
 
     #[tokio::test]
-    async fn update_entity_cross_namespace_returns_not_found_and_preserves_source() {
-        use crate::error::RuntimeError;
+    async fn update_entity_cross_namespace_succeeds() {
         use crate::Namespace;
 
         let rt = rt();
@@ -2891,33 +2886,30 @@ mod tests {
             .await
             .unwrap();
 
-        let err = rt
+        // ADR-007 PR-A1: update from ns_b token must now succeed on an ns_a entity.
+        let result = rt
             .update_entity(
                 &ns_b,
                 entity.id,
                 EntityPatch {
-                    name: Some("Compromised".into()),
+                    name: Some("Updated".into()),
                     ..Default::default()
                 },
             )
             .await;
 
         assert!(
-            matches!(err, Err(RuntimeError::NotFound(_))),
-            "cross-namespace update must return opaque NotFound, got {err:?}"
+            result.is_ok(),
+            "cross-namespace update must succeed in shared-brain OSS; got {result:?}"
         );
-
-        let after = rt.get_entity(&ns_a, entity.id).await.unwrap();
-        assert_eq!(
-            after.name, "Alpha",
-            "foreign update must not mutate source row"
-        );
-        assert_eq!(after.description.as_deref(), Some("original"));
+        assert_eq!(result.unwrap().name, "Updated");
     }
 
+    // merge_entity still requires both entities to be in the same namespace as
+    // the token's write namespace (enforced at the SQL transaction layer, not the
+    // runtime layer).  This is a merge-semantic constraint, not tenant isolation.
     #[tokio::test]
-    async fn merge_entity_cross_namespace_either_id_returns_not_found() {
-        use crate::error::RuntimeError;
+    async fn merge_entity_cross_namespace_ids_fail_at_sql_layer() {
         use crate::Namespace;
 
         let rt = rt();
@@ -2937,7 +2929,7 @@ mod tests {
             .await
             .unwrap();
 
-        // foreign into_id: foreign_b belongs to ns_b, caller token is ns_a
+        // foreign into_id: SQL read_merge_entity checks ns matches token namespace.
         let foreign_into = rt
             .merge_entity(
                 &ns_a,
@@ -2948,11 +2940,11 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(foreign_into, Err(RuntimeError::NotFound(_))),
-            "foreign into_id must be denied before merge, got {foreign_into:?}"
+            foreign_into.is_err(),
+            "cross-namespace into_id must still fail at SQL layer; got {foreign_into:?}"
         );
 
-        // foreign from_id: foreign_b belongs to ns_b, caller token is ns_a
+        // foreign from_id: same SQL constraint.
         let foreign_from = rt
             .merge_entity(
                 &ns_a,
@@ -2963,8 +2955,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(foreign_from, Err(RuntimeError::NotFound(_))),
-            "foreign from_id must be denied before merge, got {foreign_from:?}"
+            foreign_from.is_err(),
+            "cross-namespace from_id must still fail at SQL layer; got {foreign_from:?}"
         );
 
         // All three entities survive the failed merges.

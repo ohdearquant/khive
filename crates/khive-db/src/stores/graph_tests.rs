@@ -548,3 +548,72 @@ async fn upsert_edge_non_symmetric_relation_preserves_direction() {
         "non-symmetric edge direction must be preserved"
     );
 }
+
+// ADR-007 PR-A1 regression: upsert must accept edges whose namespace differs
+// from the store's construction-time namespace.  Before the fix, `upsert_edge`
+// rejected this with InvalidInput; after, it stores the edge with whatever
+// namespace the edge carries and get_edge finds it by UUID alone.
+#[tokio::test]
+async fn upsert_edge_cross_namespace_accepted() {
+    // Store is constructed with "local" as its default multi-record query namespace.
+    let store = setup_memory_store(); // uses "default" as construction namespace
+
+    let src = Uuid::new_v4();
+    let tgt = Uuid::new_v4();
+    let now = Utc::now();
+
+    // Edge carries "lambda:leo" — different from store's "default".
+    let edge = Edge {
+        id: Uuid::new_v4().into(),
+        namespace: "lambda:leo".to_string(),
+        source_id: src,
+        target_id: tgt,
+        relation: EdgeRelation::Extends,
+        weight: 0.9,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+        metadata: None,
+        target_backend: None,
+    };
+    let edge_id = edge.id;
+
+    // Must not error (V1 violation removed).
+    store.upsert_edge(edge).await.unwrap();
+
+    // get_edge by UUID must find it regardless of namespace.
+    let stored = store.get_edge(edge_id).await.unwrap();
+    assert!(
+        stored.is_some(),
+        "cross-namespace edge must be retrievable by UUID"
+    );
+    let stored = stored.unwrap();
+    assert_eq!(
+        stored.namespace, "lambda:leo",
+        "namespace column must be preserved as stored"
+    );
+}
+
+// ADR-007 PR-A1 regression: namespace column is preserved on the record even
+// after upsert — not silently overwritten with the store's construction namespace.
+#[tokio::test]
+async fn upsert_edge_namespace_stored_on_record() {
+    let store = setup_memory_store();
+
+    let edge = make_edge(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        EdgeRelation::Implements,
+        1.0,
+    );
+    let edge_id = edge.id;
+    let ns = edge.namespace.clone();
+
+    store.upsert_edge(edge).await.unwrap();
+
+    let stored = store.get_edge(edge_id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.namespace, ns,
+        "namespace column must survive the write/read roundtrip"
+    );
+}

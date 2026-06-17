@@ -251,6 +251,10 @@ async fn resolve_context_entity_id(
         Some(Resolved::Event(_)) => Err(RuntimeError::InvalidInput(format!(
             "context_entity_id {uuid} must reference a KG entity; got event"
         ))),
+        Some(Resolved::PackRecord { pack, kind, .. }) => Err(RuntimeError::InvalidInput(format!(
+            "context_entity_id {uuid} must reference a KG entity; got pack-private record \
+             (pack={pack:?}, kind={kind:?})"
+        ))),
         None => Err(RuntimeError::NotFound(format!(
             "context_entity_id {uuid} not found in namespace"
         ))),

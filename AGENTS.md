@@ -64,12 +64,13 @@ or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` f
 
 `gtd.assign` accepts `context_entity_id` to anchor a task to a KG entity.
 
-### Memory pack — 2 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
+### Memory pack — 3 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                           | When to use                                |
-| ----------------- | ------------------------------------------------------ | ------------------------------------------ |
-| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state         |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions |
+| Verb              | What it does                                           | When to use                                 |
+| ----------------- | ------------------------------------------------------ | ------------------------------------------- |
+| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state          |
+| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions  |
+| `memory.feedback` | Emit explicit feedback on a recalled memory            | Signal useful/not_useful to tune posteriors |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
@@ -111,7 +112,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `schedule.agenda`   | List upcoming scheduled events   | "What's on the calendar?"                      |
 | `schedule.cancel`   | Cancel a scheduled event         | Remove a pending reminder/action               |
 
-### Knowledge pack — 18 verbs (`knowledge.` prefix)
+### Knowledge pack — 19 verbs (`knowledge.` prefix)
 
 | Verb                       | What it does                                            | When to use                                  |
 | -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
@@ -133,6 +134,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
 | `knowledge.cite`           | Link concept → paper/person (introduced_by edge)        | Attribution                                  |
 | `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
+| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
@@ -494,7 +496,7 @@ structural traces.
 | ------------------------------------------------- | -------------------------------------------------- |
 | Storing findings only as notes, never as entities | Notes are for context; entities are for structure  |
 | Creating duplicate entities                       | Always `search` first — link to existing if found  |
-| Using ad-hoc relations                            | Map to the closed 15-relation set or don't link    |
+| Using ad-hoc relations                            | Map to the closed 17-relation set or don't link    |
 | Reversed `introduced_by` direction                | concept → paper (the paper introduces the concept) |
 | One-hop neighbor queries when you need lineage    | Use `traverse` with `max_depth` for multi-hop      |
 | Adding `version`/`date` to entity names           | Those are properties, not names                    |

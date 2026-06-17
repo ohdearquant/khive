@@ -2,6 +2,7 @@
 
 use std::{
     fs::{self, File},
+    io::Write,
     path::Path,
 };
 
@@ -19,6 +20,12 @@ use crate::{
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
+
+// v2 commit-record magic written into metadata.bin by save_atomic.
+const V2_COMMIT_MAGIC: &[u8; 8] = b"KHVVAMG2";
+
+// lifecycle.bin magic for v2 persistence.
+const LIFECYCLE_MAGIC: &[u8; 8] = b"KHVVLIF1";
 
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
@@ -393,7 +400,7 @@ impl VamanaIndex {
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         write_metadata(&path.join("metadata.bin"), self)?;
-        write_graph(&path.join("graph.bin"), &self.graph)?;
+        write_graph(&path.join("graph.bin"), &self.graph, self.config.max_degree)?;
         write_vectors(&path.join("vectors.bin"), self.vectors()?)?;
         Ok(())
     }
@@ -448,6 +455,408 @@ impl VamanaIndex {
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
         })
+    }
+
+    /// Crash-safe v2 save. Writes vectors.bin and graph.bin (same formats as v1),
+    /// then lifecycle.bin (tombstones, free_slots, reverse_adj, ops_since_consolidation),
+    /// then atomically renames metadata.bin.tmp → metadata.bin as the commit record.
+    ///
+    /// If a crash interrupts before the rename the previous metadata.bin (v1 or v2) is
+    /// still valid. load_or_build never observes a torn v2 commit.
+    ///
+    /// Segments are staged under `.v2new` suffixes so a crash between segment write and
+    /// metadata rename does not corrupt a live v1-format set of segments.
+    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+
+        // Stage under .v2new so a crash before the metadata rename leaves the previous
+        // segments (v1 or v2) intact and readable.
+        let vectors_new = path.join("vectors.bin.v2new");
+        let graph_new = path.join("graph.bin.v2new");
+        let lifecycle_new = path.join("lifecycle.bin.v2new");
+        let vectors_path = path.join("vectors.bin");
+        let graph_path = path.join("graph.bin");
+        let lifecycle_path = path.join("lifecycle.bin");
+        let metadata_path = path.join("metadata.bin");
+        let metadata_tmp = path.join("metadata.bin.tmp");
+
+        // 1. Write vectors.bin.v2new (identical format to v1).
+        write_vectors(&vectors_new, self.vectors()?)?;
+
+        // 2. Write graph.bin.v2new (identical format to v1, medoid-overflow capped).
+        write_graph(&graph_new, &self.graph, self.config.max_degree)?;
+
+        // 3. Compute the capped reverse adjacency that matches what write_graph wrote.
+        //    The medoid's forward list may exceed max_degree in-memory; write_graph caps it
+        //    before serialization. Build reverse adj from the same capped view so that
+        //    lifecycle.bin stays consistent with graph.bin after restore.
+        let adjacency = self.graph.adjacency();
+        let medoid = self.graph.medoid() as usize;
+        let max_degree = self.config.max_degree;
+        let mut capped_reverse_adj: Vec<Vec<u32>> = vec![Vec::new(); adjacency.len()];
+        for (u, neighbors) in adjacency.iter().enumerate() {
+            let effective: &[u32] = if u == medoid {
+                &neighbors[..max_degree.min(neighbors.len())]
+            } else {
+                neighbors
+            };
+            for &v in effective {
+                capped_reverse_adj[v as usize].push(u as u32);
+            }
+        }
+
+        // 4. Write lifecycle.bin.v2new with the capped reverse adjacency.
+        write_lifecycle(
+            &lifecycle_new,
+            &self.tombstones,
+            &self.free_slots,
+            &capped_reverse_adj,
+            self.ops_since_consolidation,
+        )?;
+
+        // 5. Compute blake3 checksums of the three staged segments.
+        let vectors_data = fs::read(&vectors_new)?;
+        let graph_data = fs::read(&graph_new)?;
+        let lifecycle_data = fs::read(&lifecycle_new)?;
+
+        let vectors_hash = blake3::hash(&vectors_data);
+        let graph_hash = blake3::hash(&graph_data);
+        let lifecycle_hash = blake3::hash(&lifecycle_data);
+
+        // 6. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
+        let content_hash = *vectors_hash.as_bytes();
+        let fp = V2CorpusFingerprint {
+            vector_count: self.num_vectors as u64,
+            dimensions: self.dimensions as u64,
+            content_hash,
+        };
+
+        // 7. Write metadata.bin.tmp then rename atomically (the commit gate).
+        write_v2_commit_full(
+            &metadata_tmp,
+            vectors_hash.as_bytes(),
+            graph_hash.as_bytes(),
+            lifecycle_hash.as_bytes(),
+            &fp,
+            self.num_vectors,
+            self.dimensions,
+            self.config.max_degree,
+            self.config.search_list_size,
+            self.config.alpha,
+        )?;
+        fs::rename(&metadata_tmp, &metadata_path)?;
+
+        // Barrier: make metadata.bin durable before promoting canonical segments.
+        // Commit gate is metadata.bin: after this fsync any post-crash state is either
+        // (old metadata + old segments) or (new KHVVAMG2 metadata + maybe-stale segments).
+        // The new-metadata path is checksum-guarded, so stale/partial segments safe-degrade
+        // to rebuild — never a torn no-checksum read.
+        {
+            let dir_file = File::open(path)?;
+            dir_file.sync_all()?;
+        }
+
+        // 8. Promote staged segments to their final names.
+        fs::rename(&vectors_new, &vectors_path)?;
+        fs::rename(&graph_new, &graph_path)?;
+        fs::rename(&lifecycle_new, &lifecycle_path)?;
+
+        // 9. Sync the directory entry so all renames are durable.
+        let dir_file = File::open(path)?;
+        dir_file.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Fingerprint-gated restore. On a corpus fingerprint match, loads all segments including
+    /// lifecycle state in O(N) without rebuilding reverse_adj. On mismatch or missing v2
+    /// commit, falls back to rebuild using `fallback_config`.
+    ///
+    /// `corpus_vectors` is the raw flat f32 slice from the caller's database layer.
+    /// `fallback_config` is used when no saved config is available (clean first run or total
+    /// corruption).
+    ///
+    /// Decision tree:
+    /// - metadata.bin with KHVVAMG2 magic AND checksums valid AND fingerprint matches → fast path
+    /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild from commit config + save_atomic
+    /// - metadata.bin with KHVVAMM1 (v1) → v1 load + save_atomic upgrade
+    /// - metadata.bin missing or corrupt → rebuild from fallback_config + save_atomic
+    pub fn load_or_build(
+        path: &Path,
+        corpus_vectors: &[f32],
+        fallback_config: VamanaConfig,
+    ) -> Result<Self> {
+        let metadata_path = path.join("metadata.bin");
+
+        let metadata_bytes = match fs::read(&metadata_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Clean first run: no saved state at all. Remove any stale staged segments.
+                for suffix in &[
+                    "vectors.bin.v2new",
+                    "graph.bin.v2new",
+                    "lifecycle.bin.v2new",
+                ] {
+                    let _ = fs::remove_file(path.join(suffix));
+                }
+                let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if metadata_bytes.len() < 8 {
+            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+            index.save_atomic(path)?;
+            return Ok(index);
+        }
+
+        if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
+            let commit = match parse_v2_commit(&metadata_bytes) {
+                Ok(c) => c,
+                Err(_) => {
+                    let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+            };
+
+            // Verify checksums of all three segments.
+            let vectors_data = match fs::read(path.join("vectors.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let graph_data = match fs::read(path.join("graph.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let lifecycle_data = match fs::read(path.join("lifecycle.bin")) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    return Ok(index);
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let vhash = *blake3::hash(&vectors_data).as_bytes();
+            let ghash = *blake3::hash(&graph_data).as_bytes();
+            let lhash = *blake3::hash(&lifecycle_data).as_bytes();
+
+            if vhash != commit.vectors_hash
+                || ghash != commit.graph_hash
+                || lhash != commit.lifecycle_hash
+            {
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+
+            // Verify corpus fingerprint: dimensions, count, and content hash.
+            let dim = commit.index_meta.dimensions;
+            if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+            let live_count = corpus_vectors.len() / dim;
+            let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
+
+            let fp_matches = commit.fingerprint.vector_count == live_count as u64
+                && commit.fingerprint.dimensions == dim as u64
+                && commit.fingerprint.content_hash == live_content_hash;
+
+            if !fp_matches {
+                let config = VamanaConfig {
+                    dimensions: commit.index_meta.dimensions,
+                    max_degree: commit.index_meta.max_degree,
+                    search_list_size: commit.index_meta.search_list_size,
+                    alpha: commit.index_meta.alpha,
+                };
+                let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                index.save_atomic(path)?;
+                return Ok(index);
+            }
+
+            // Fast path: load all segments, restore lifecycle state.
+            // A corrupt-but-checksum-valid lifecycle segment (e.g. reverse_adj not the inverse
+            // of graph.bin) passes the blake3 gate but fails the new bidirectional check inside
+            // load_v2_fast.  Route that InvalidFormat error through the same corrupt-snapshot →
+            // rebuild path used by the unknown-magic and checksum-mismatch cases above.
+            match Self::load_v2_fast(path, &lifecycle_data) {
+                Ok(index) => Ok(index),
+                Err(VamanaError::InvalidFormat { .. }) => {
+                    let config = VamanaConfig {
+                        dimensions: commit.index_meta.dimensions,
+                        max_degree: commit.index_meta.max_degree,
+                        search_list_size: commit.index_meta.search_list_size,
+                        alpha: commit.index_meta.alpha,
+                    };
+                    let index = Self::rebuild_from_corpus(corpus_vectors, config)?;
+                    index.save_atomic(path)?;
+                    Ok(index)
+                }
+                Err(e) => Err(e),
+            }
+        } else if &metadata_bytes[..8] == METADATA_MAGIC {
+            // V1 format: upgrade to v2. Remove any stale staged segments first.
+            for suffix in &[
+                "vectors.bin.v2new",
+                "graph.bin.v2new",
+                "lifecycle.bin.v2new",
+            ] {
+                let _ = fs::remove_file(path.join(suffix));
+            }
+            let mut index = Self::load(path)?;
+            // Release the mmap before save_atomic overwrites the same files.
+            index.ensure_owned()?;
+            index.save_atomic(path)?;
+            Ok(index)
+        } else {
+            // Unknown or garbage magic: treat as corrupt snapshot and rebuild.
+            // VamanaIndex::load (direct v1 callers) remains strict; load_or_build always
+            // recovers because the caller supplies a corpus and fallback config.
+            let index = Self::rebuild_from_corpus(corpus_vectors, fallback_config)?;
+            index.save_atomic(path)?;
+            Ok(index)
+        }
+    }
+
+    /// Load all v2 segments from `path` and restore lifecycle state from `lifecycle_data`.
+    fn load_v2_fast(path: &Path, lifecycle_data: &[u8]) -> Result<Self> {
+        let meta_bytes = fs::read(path.join("metadata.bin"))?;
+        let commit = parse_v2_commit(&meta_bytes)?;
+
+        let config = VamanaConfig {
+            dimensions: commit.index_meta.dimensions,
+            max_degree: commit.index_meta.max_degree,
+            search_list_size: commit.index_meta.search_list_size,
+            alpha: commit.index_meta.alpha,
+        };
+        config.validate()?;
+
+        let num_vectors = commit.index_meta.num_vectors;
+
+        let dimensions = config.dimensions;
+        let max_degree = config.max_degree;
+        let mut graph = read_graph(&path.join("graph.bin"), max_degree, num_vectors)?;
+
+        if graph.node_count() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "graph node count {} != commit num_vectors {}",
+                graph.node_count(),
+                num_vectors
+            )));
+        }
+
+        let expected_len_f32 = num_vectors
+            .checked_mul(dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
+        let storage = mmap_vectors(&path.join("vectors.bin"), expected_len_f32)?;
+
+        // Parse lifecycle.bin and restore state directly (no O(N*R) rebuild).
+        let lifecycle = parse_lifecycle(lifecycle_data, num_vectors, max_degree)?;
+
+        // Validate bidirectional consistency: the persisted reverse_adj must be the exact
+        // inverse of the loaded forward graph. A checksum-valid but writer-bugged lifecycle
+        // segment can pass parse_lifecycle's per-list shape checks (in-range, no dup, no
+        // self-ref) while still being semantically wrong (phantom sources, missing entries).
+        // Wolverine delete-repair relies on the invariant at graph.rs:96-98 that
+        // reverse_adj[v] == { u | v ∈ adjacency[u] }; a false in-neighbor corrupts repair.
+        {
+            let adjacency = graph.adjacency();
+            let rev = &lifecycle.reverse_adj;
+            // Rebuild expected reverse_adj from the forward graph in O(N*R).
+            let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
+            for (u, neighbors) in adjacency.iter().enumerate() {
+                for &v in neighbors {
+                    expected[v as usize].push(u as u32);
+                }
+            }
+            // Sort both sides before comparing (persisted lists may not be sorted).
+            for e in expected.iter_mut() {
+                e.sort_unstable();
+            }
+            for (v, (exp, got)) in expected.iter().zip(rev.iter()).enumerate() {
+                let mut got_sorted = got.clone();
+                got_sorted.sort_unstable();
+                if *exp != got_sorted {
+                    return Err(VamanaError::invalid_format(format!(
+                        "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
+                         forward adjacency: expected {exp:?}, got {got_sorted:?}"
+                    )));
+                }
+            }
+        }
+
+        graph.restore_reverse_adj(lifecycle.reverse_adj);
+
+        let tombstone_count = lifecycle
+            .tombstones
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum();
+
+        Ok(Self {
+            vectors: storage,
+            graph,
+            config,
+            num_vectors,
+            dimensions,
+            tombstones: lifecycle.tombstones,
+            tombstone_count,
+            ops_since_consolidation: lifecycle.ops_since_consolidation,
+            free_slots: lifecycle.free_slots,
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+        })
+    }
+
+    /// Build a fresh VamanaIndex from `corpus_vectors` using the supplied `config`.
+    /// Used when fingerprint mismatches, metadata is corrupt/missing, or on a clean first run.
+    fn rebuild_from_corpus(corpus_vectors: &[f32], config: VamanaConfig) -> Result<Self> {
+        VamanaIndex::build(corpus_vectors, config)
     }
 
     /// Mean recall@k across `queries` vs. exact brute-force. Errors on empty, bad dim, or non-finite.
@@ -517,6 +926,26 @@ impl VamanaIndex {
             .map_err(|_| VamanaError::invalid_format("max_degree overflows u32".into()))?;
         let search_list_size_u32 = u32::try_from(self.config.search_list_size)
             .map_err(|_| VamanaError::invalid_format("search_list_size overflows u32".into()))?;
+        // Cap the medoid's adjacency at max_degree before serializing.
+        // The medoid-pin in insert() may transiently allow the medoid to exceed
+        // max_degree (by one edge per orphan-pinned insert; K consecutive inserts
+        // can accumulate K overflow edges). Capping here ensures the snapshot
+        // satisfies from_snapshot()'s degree constraint.
+        let medoid = self.graph.medoid();
+        let max_degree_usize = self.config.max_degree;
+        let adjacency: Vec<Vec<u32>> = self
+            .graph
+            .adjacency()
+            .iter()
+            .enumerate()
+            .map(|(i, neighbors)| {
+                if i == medoid as usize && neighbors.len() > max_degree_usize {
+                    neighbors[..max_degree_usize].to_vec()
+                } else {
+                    neighbors.clone()
+                }
+            })
+            .collect();
         Ok(VamanaSnapshot {
             format: VAMANA_SNAPSHOT_FORMAT.to_string(),
             version: VAMANA_SNAPSHOT_VERSION,
@@ -529,8 +958,8 @@ impl VamanaIndex {
                 max_degree: max_degree_u32,
                 search_list_size: search_list_size_u32,
                 alpha: self.config.alpha,
-                medoid: self.graph.medoid(),
-                adjacency: self.graph.adjacency().to_vec(),
+                medoid,
+                adjacency,
                 vectors: self.vectors()?.to_vec(),
             },
             external_ids,
@@ -681,9 +1110,351 @@ impl VamanaIndex {
         self.tombstone_count
     }
 
+    /// Count of live (non-tombstoned) nodes.
+    pub fn live_count(&self) -> usize {
+        self.num_vectors - self.tombstone_count
+    }
+
+    /// Cumulative delete+insert churn since the last consolidation.
+    pub fn ops_since_consolidation(&self) -> usize {
+        self.ops_since_consolidation
+    }
+
     /// True when `ops_since_consolidation >= consolidation_tau`.
     pub fn needs_consolidation(&self) -> bool {
         self.ops_since_consolidation >= self.consolidation_tau
+    }
+
+    // ---- PR3: Mmap-to-Owned promotion helper ----
+
+    /// Promote `VectorStorage::Mmap` to `Owned` by copying the mapping into a `Vec<f32>`.
+    ///
+    /// Called as the first statement of both `insert` and `consolidate` so that all
+    /// subsequent vector reads/writes operate on a mutable owned buffer. If already
+    /// `Owned`, this is a no-op. O(N × dim) once per promotion; the next `save`
+    /// creates a fresh mmap at next load.
+    fn ensure_owned(&mut self) -> Result<()> {
+        if let VectorStorage::Mmap { .. } = &self.vectors {
+            let owned: Vec<f32> = self.vectors.as_slice()?.to_vec();
+            self.vectors = VectorStorage::Owned(owned);
+        }
+        Ok(())
+    }
+
+    // ---- PR3: insert and consolidate (ADR-052 §2) ----
+
+    /// Insert a new vector into the index. Returns the ordinal assigned to the new node.
+    ///
+    /// If `free_slots` is non-empty a recycled ordinal is reused; otherwise a new slot
+    /// is appended. Either way, the call runs greedy search from the current medoid,
+    /// selects out-edges via RobustPrune, wires back-edges with reverse_adj update, and
+    /// increments `ops_since_consolidation`.
+    ///
+    /// Mmap-backed indexes are promoted to Owned on the first insert call. Callers that
+    /// held ordinals across a previous consolidate must treat those ordinals as invalid;
+    /// ordinals are NOT stable across consolidate().
+    ///
+    /// Returns `Err` without mutating state if the vector is non-finite, wrong dimension,
+    /// or would push `num_vectors` past `u32::MAX`.
+    pub fn insert(&mut self, vector: &[f32]) -> Result<u32> {
+        // Preflight — validate before ANY state change (including Mmap promotion).
+        if vector.len() != self.dimensions {
+            return Err(VamanaError::DimensionMismatch {
+                expected: self.dimensions,
+                actual: vector.len(),
+            });
+        }
+        require_finite(vector, "insert vector")?;
+        if self.num_vectors >= u32::MAX as usize {
+            return Err(VamanaError::TooManyVectors {
+                count: self.num_vectors,
+            });
+        }
+
+        // GAP-1 resolution: promote Mmap to Owned before any vector mutation.
+        // Only reached when preflight passed — a rejected insert never touches Mmap.
+        self.ensure_owned()?;
+
+        // Slot assignment: recycle or append.
+        let ordinal: u32;
+        if !self.free_slots.is_empty() {
+            // Recycle path: LIFO pop. Guard against corrupted free_slots entry.
+            let candidate = *self.free_slots.last().unwrap();
+            if !is_tombstoned_bit(&self.tombstones, candidate as usize) {
+                return Err(VamanaError::invalid_format(format!(
+                    "insert: free slot {candidate} is not tombstoned"
+                )));
+            }
+            self.free_slots.pop();
+            ordinal = candidate;
+
+            // Clear tombstone bit and decrement count before graph wiring.
+            let word = ordinal as usize / 64;
+            self.tombstones[word] &= !(1u64 << (ordinal as usize % 64));
+            self.tombstone_count -= 1;
+
+            // Write vector into recycled slot in-place.
+            let start = ordinal as usize * self.dimensions;
+            let end = start + self.dimensions;
+            match &mut self.vectors {
+                VectorStorage::Owned(v) => v[start..end].copy_from_slice(vector),
+                VectorStorage::Mmap { .. } => {
+                    return Err(VamanaError::invalid_format(
+                        "insert: unexpected Mmap after ensure_owned".into(),
+                    ))
+                }
+            }
+        } else {
+            // Append path: assign next ordinal and extend storage.
+            ordinal = self.num_vectors as u32;
+            self.num_vectors += 1;
+
+            // Extend graph: adjacency and reverse_adj grow atomically.
+            self.graph.add_node()?;
+
+            // Extend tombstone bitvec if the new ordinal falls in a new word.
+            let word = ordinal as usize / 64;
+            if word >= self.tombstones.len() {
+                self.tombstones.resize(word + 1, 0);
+            }
+
+            // Append vector to Owned storage.
+            match &mut self.vectors {
+                VectorStorage::Owned(v) => v.extend_from_slice(vector),
+                VectorStorage::Mmap { .. } => {
+                    return Err(VamanaError::invalid_format(
+                        "insert: unexpected Mmap after ensure_owned".into(),
+                    ))
+                }
+            }
+        }
+
+        // Graph wiring.
+        let live_before = self.num_vectors - self.tombstone_count - 1; // before this insert contributed
+        if live_before == 0 {
+            // Only one live node (the one just inserted); skip greedy search and set medoid.
+            self.graph.set_medoid(ordinal);
+        } else {
+            let vecs = self.vectors.as_slice()?;
+
+            let tombstones_opt = if self.tombstone_count > 0 {
+                Some(self.tombstones.as_slice())
+            } else {
+                None
+            };
+
+            let mut visited = VisitedSet::new(self.num_vectors);
+            let search_result = self.graph.greedy_search(
+                vecs,
+                self.dimensions,
+                vector,
+                self.config.search_list_size,
+                self.config.search_list_size,
+                &mut visited,
+                tombstones_opt,
+            )?;
+
+            // Candidate pool: expanded ∪ results, excluding ordinal itself, deduped.
+            let mut candidates: Vec<u32> = search_result
+                .expanded
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(search_result.results.iter().map(|(id, _)| *id))
+                .filter(|&id| id != ordinal)
+                .collect();
+            sort_dedup_u32(&mut candidates);
+
+            let vecs = self.vectors.as_slice()?;
+            let new_neighbors = robust_prune_inner(
+                vecs,
+                self.dimensions,
+                ordinal,
+                candidates,
+                self.config.alpha,
+                self.config.max_degree,
+            );
+
+            // Wire new node's forward adjacency and reverse_adj in lockstep.
+            self.graph
+                .replace_adjacency_and_update_reverse(ordinal, new_neighbors.clone());
+
+            // INVARIANT (never-drop insert):
+            // insert() never removes any existing node's inbound edge. Every node
+            // reachable before this insert therefore remains reachable after it.
+            // The inserted node receives at least one inbound edge from an always-
+            // reachable node (a free-slot out-neighbor, or the medoid), so it is
+            // reachable too. No successful insert can make a previously-findable
+            // vector unfindable.
+            //
+            // Back-edge rule (Option E): for each selected out-neighbor j, add the
+            // back-edge j→ordinal ONLY IF j has a free slot (|adj(j)| < max_degree).
+            // If j is already full, SKIP the back-edge entirely — do NOT call
+            // robust_prune_inner(j) and do NOT drop any of j's existing edges.
+            // Pruning j's adjacency to make room is what caused the round-1 and
+            // round-2 orphan/disconnect defects.
+            //
+            // Trade-off: skipping back-edges on saturated neighbors lowers incremental
+            // graph quality on heavily-saturated graphs (ordinal becomes less
+            // well-connected via back-edges, increasing reliance on the medoid hub for
+            // routing). This is a quality trade-off, not a correctness issue — recall
+            // is bounded and ADR-052-acceptable. A future consolidate-side redistri-
+            // bution pass (separate issue + ADR-052 amendment) can repair it.
+            for &j in &new_neighbors {
+                if self.graph.adjacency()[j as usize].len() < self.config.max_degree {
+                    // j has a free slot: add the back-edge without dropping anything.
+                    let mut j_adj: Vec<u32> = self.graph.adjacency()[j as usize]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(ordinal))
+                        .filter(|&x| x != j)
+                        .collect();
+                    sort_dedup_u32(&mut j_adj);
+                    self.graph.replace_adjacency_and_update_reverse(j, j_adj);
+                }
+                // j is full: skip the back-edge to preserve all of j's existing edges.
+            }
+
+            // Medoid-pin eager repair: if no selected out-neighbor had a free slot,
+            // the inserted node has zero inbound edges and is unreachable. Pin it by
+            // adding the edge medoid→ordinal. The medoid is the search entry point and
+            // is always reachable; it is the designated overflow node for this edge.
+            //
+            // The medoid may transiently exceed max_degree due to this pin (by one
+            // edge per orphan-pinned insert; K consecutive inserts can accumulate K
+            // overflow edges). This is resolved at serialization time
+            // (save()/to_snapshot()): the medoid's adjacency is capped to max_degree
+            // so the written graph satisfies all loader degree constraints. See
+            // write_graph() and to_snapshot().
+            //
+            // If overflow edges are dropped at serialization, the affected ordinals
+            // will not be searchable after load — but they ARE searchable in the
+            // live in-memory index. Today's consolidate() handles tombstone
+            // compaction only; a future redistribution pass will recover
+            // post-load reachability for truncation-affected nodes.
+            //
+            // Edge case: if the graph was empty before this insert and ordinal became
+            // the medoid (live_before == 0 branch), no pin is needed — handled by the
+            // `if live_before == 0` branch above this block.
+            debug_assert!(
+                !new_neighbors.is_empty(),
+                "insert: new_neighbors must be non-empty when live_before > 0"
+            );
+            if self.graph.reverse_adjacency()[ordinal as usize].is_empty() {
+                let medoid = self.graph.medoid();
+                debug_assert_ne!(
+                    medoid, ordinal,
+                    "insert: medoid == ordinal in live_before>0 branch — impossible"
+                );
+                let mut medoid_adj: Vec<u32> = self.graph.adjacency()[medoid as usize]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(ordinal))
+                    .filter(|&x| x != medoid)
+                    .collect();
+                sort_dedup_u32(&mut medoid_adj);
+                // Medoid may now exceed max_degree — resolved at serialization time.
+                self.graph
+                    .replace_adjacency_and_update_reverse(medoid, medoid_adj);
+            }
+        }
+
+        self.ops_since_consolidation += 1;
+        Ok(ordinal)
+    }
+
+    /// Compact tombstoned slots: renumber live nodes to contiguous ordinals `0..M`,
+    /// rebuild adjacency and `reverse_adj` over the new ordinals, and reset
+    /// tombstone/free-slot state. Does NOT re-run graph construction.
+    ///
+    /// Returns `new_to_old` where `new_to_old[new_ordinal] == old_ordinal`, allowing
+    /// callers that hold external-id maps (e.g., `AnnBridge`'s ordinal→UUID table) to
+    /// remap their data. An empty `Vec` is returned on the no-op fast path (zero
+    /// tombstones), signaling that ordinals are unchanged and no remap is needed.
+    ///
+    /// **Ordinals are NOT stable across consolidate().** Any external holder of a `u32`
+    /// ordinal must rebuild its mapping using the returned `new_to_old` vector after
+    /// each non-no-op consolidation. This is an invariant break visible to callers.
+    ///
+    /// After return: `tombstone_count == 0`, `free_slots` is empty,
+    /// `ops_since_consolidation == 0`, `num_vectors == prior live_count`.
+    pub fn consolidate(&mut self) -> Result<Vec<u32>> {
+        // No-op fast path: no tombstones — skip Mmap promotion entirely.
+        // A clean index on a Mmap-backed store stays Mmap after a no-op consolidate.
+        if self.tombstone_count == 0 {
+            self.ops_since_consolidation = 0;
+            return Ok(Vec::new());
+        }
+
+        // GAP-1 resolution: promote Mmap to Owned before the compaction rebuild.
+        // Only reached when there are tombstones to compact.
+        self.ensure_owned()?;
+
+        let m = self.num_vectors - self.tombstone_count;
+
+        // Build old→new and new→old remap tables.
+        let mut old_to_new: Vec<u32> = vec![u32::MAX; self.num_vectors];
+        let mut new_to_old: Vec<u32> = Vec::with_capacity(m);
+        let mut new_ord: u32 = 0;
+        for (old, slot) in old_to_new.iter_mut().enumerate() {
+            if !is_tombstoned_bit(&self.tombstones, old) {
+                *slot = new_ord;
+                new_to_old.push(old as u32);
+                new_ord += 1;
+            }
+        }
+        debug_assert_eq!(new_ord as usize, m);
+
+        // Build compacted vector store (always Owned after consolidation).
+        let old_vecs = self.vectors.as_slice()?;
+        let mut new_vecs: Vec<f32> = Vec::with_capacity(m * self.dimensions);
+        for &old in &new_to_old {
+            let src =
+                &old_vecs[old as usize * self.dimensions..(old as usize + 1) * self.dimensions];
+            new_vecs.extend_from_slice(src);
+        }
+
+        // Build compacted adjacency lists with remapped ordinals.
+        let mut new_adj: Vec<Vec<u32>> = vec![Vec::new(); m];
+        for new_u in 0..m {
+            let old_u = new_to_old[new_u] as usize;
+            let remapped: Vec<u32> = self.graph.adjacency()[old_u]
+                .iter()
+                .filter_map(|&old_v| {
+                    let nv = old_to_new[old_v as usize];
+                    if nv == u32::MAX {
+                        None // tombstoned target — drop
+                    } else {
+                        Some(nv)
+                    }
+                })
+                .collect();
+            new_adj[new_u] = remapped;
+        }
+
+        // Remap medoid.
+        let old_medoid = self.graph.medoid() as usize;
+        let new_medoid = old_to_new[old_medoid];
+        debug_assert!(
+            new_medoid != u32::MAX,
+            "consolidate: medoid {old_medoid} is tombstoned — invariant violated"
+        );
+
+        // Swap in new graph state.
+        let mut new_graph = VamanaGraph::new(m, new_medoid)?;
+        for (i, neighbors) in new_adj.into_iter().enumerate() {
+            new_graph.adjacency_mut_for_load()[i] = neighbors;
+        }
+        new_graph.rebuild_reverse_adj_from_adjacency();
+
+        self.graph = new_graph;
+        self.vectors = VectorStorage::Owned(new_vecs);
+        self.num_vectors = m;
+        self.tombstones = tombstone_words_for(m);
+        self.tombstone_count = 0;
+        self.free_slots.clear();
+        self.ops_since_consolidation = 0;
+
+        Ok(new_to_old)
     }
 
     /// Soft-delete the node at `node_id` with eager Wolverine 2-hop repair (ADR-052 §2).
@@ -793,8 +1564,26 @@ impl VamanaIndex {
             ));
         }
 
-        let vecs = self.vectors.as_slice()?;
-        let vecs: Vec<f32> = vecs.to_vec(); // clone to avoid borrow conflict with &mut self
+        // Obtain a read-only slice over the vector store without cloning.
+        // Inline the VectorStorage match rather than calling self.vectors.as_slice()
+        // (a method call) so the borrow checker sees self.vectors and self.graph /
+        // self.tombstones as separate fields and allows the simultaneous &mut borrows
+        // inside the loop.
+        let vecs: &[f32] = match &self.vectors {
+            VectorStorage::Owned(v) => v.as_slice(),
+            VectorStorage::Mmap { mmap, len_f32 } => {
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                    .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
+                if floats.len() != *len_f32 {
+                    return Err(VamanaError::invalid_format(format!(
+                        "mmap f32 length {} != expected {}",
+                        floats.len(),
+                        len_f32
+                    )));
+                }
+                floats
+            }
+        };
 
         let mut medoid_affected = false;
 
@@ -811,7 +1600,7 @@ impl VamanaIndex {
             self.ops_since_consolidation += 1;
 
             wolverine_repair(
-                &vecs,
+                vecs,
                 self.dimensions,
                 &mut self.graph,
                 node_id,
@@ -826,7 +1615,7 @@ impl VamanaIndex {
         // Single medoid re-election after all rewires — O(N*dims) once, not K times.
         if medoid_affected {
             let new_medoid =
-                elect_medoid(&vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
+                elect_medoid(vecs, self.dimensions, self.num_vectors, &self.tombstones)?;
             self.graph.set_medoid(new_medoid);
         }
 
@@ -1077,6 +1866,376 @@ fn exact_search(
     dists
 }
 
+// ---- V2 persistence helpers ----
+
+/// Corpus identity check used by `save_atomic` / `load_or_build`.
+/// Separate from `CorpusFingerprint` (which is part of the snapshot API).
+struct V2CorpusFingerprint {
+    vector_count: u64,
+    dimensions: u64,
+    content_hash: [u8; 32],
+}
+
+/// Parsed content of a KHVVAMG2 commit record (metadata.bin written by save_atomic).
+struct V2Commit {
+    vectors_hash: [u8; 32],
+    graph_hash: [u8; 32],
+    lifecycle_hash: [u8; 32],
+    fingerprint: V2CorpusFingerprint,
+    index_meta: IndexMetadata,
+}
+
+/// Parsed lifecycle.bin content.
+struct ParsedLifecycle {
+    tombstones: Vec<u64>,
+    free_slots: Vec<u32>,
+    reverse_adj: Vec<Vec<u32>>,
+    ops_since_consolidation: usize,
+}
+
+/// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
+#[allow(clippy::too_many_arguments)]
+fn write_v2_commit_full(
+    path: &Path,
+    vectors_hash: &[u8; 32],
+    graph_hash: &[u8; 32],
+    lifecycle_hash: &[u8; 32],
+    fp: &V2CorpusFingerprint,
+    num_vectors: usize,
+    dimensions: usize,
+    max_degree: usize,
+    search_list_size: usize,
+    alpha: f64,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(V2_COMMIT_MAGIC)?;
+    w.write_all(vectors_hash)?;
+    w.write_all(graph_hash)?;
+    w.write_all(lifecycle_hash)?;
+    w.write_all(&fp.vector_count.to_le_bytes())?;
+    w.write_all(&fp.dimensions.to_le_bytes())?;
+    w.write_all(&fp.content_hash)?;
+    // Embedded v1-style index metadata.
+    w.write_all(&(num_vectors as u64).to_le_bytes())?;
+    w.write_all(&(dimensions as u64).to_le_bytes())?;
+    w.write_all(&(max_degree as u64).to_le_bytes())?;
+    w.write_all(&(search_list_size as u64).to_le_bytes())?;
+    w.write_all(&alpha.to_le_bytes())?;
+    let file = w.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Parse a KHVVAMG2 commit record from bytes.
+fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
+    // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
+    // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
+    let expected_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
+    if data.len() < expected_len {
+        return Err(VamanaError::invalid_format(format!(
+            "v2 commit record too short: {} < {expected_len}",
+            data.len()
+        )));
+    }
+    if &data[..8] != V2_COMMIT_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "v2 commit record magic mismatch".into(),
+        ));
+    }
+
+    let mut offset = 8usize;
+
+    let mut vectors_hash = [0u8; 32];
+    vectors_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut graph_hash = [0u8; 32];
+    graph_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut lifecycle_hash = [0u8; 32];
+    lifecycle_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let vector_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let fp_dimensions = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let num_vectors = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit num_vectors overflow".into()))?;
+    offset += 8;
+    let dimensions = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit dimensions overflow".into()))?;
+    offset += 8;
+    let max_degree = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit max_degree overflow".into()))?;
+    offset += 8;
+    let search_list_size = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("v2 commit search_list_size overflow".into()))?;
+    offset += 8;
+    let alpha = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+
+    if num_vectors == 0 {
+        return Err(VamanaError::invalid_format(
+            "v2 commit num_vectors is 0".into(),
+        ));
+    }
+    if dimensions == 0 {
+        return Err(VamanaError::invalid_format(
+            "v2 commit dimensions is 0".into(),
+        ));
+    }
+
+    Ok(V2Commit {
+        vectors_hash,
+        graph_hash,
+        lifecycle_hash,
+        fingerprint: V2CorpusFingerprint {
+            vector_count,
+            dimensions: fp_dimensions,
+            content_hash,
+        },
+        index_meta: IndexMetadata {
+            num_vectors,
+            dimensions,
+            max_degree,
+            search_list_size,
+            alpha,
+        },
+    })
+}
+
+/// Write lifecycle.bin.
+///
+/// Layout (all little-endian):
+///   magic            8 B   "KHVVLIF1"
+///   tombstone_words  8 B   (u64 count of u64 words)
+///   tombstone data   N × 8 B
+///   free_slots_count 8 B   (u64)
+///   free_slots data  M × 4 B (u32)
+///   ops              8 B   (u64)
+///   // reverse_adj: same format as graph.bin adjacency (per-node degree + neighbors)
+///   // num_nodes derived from tombstone_words (context: caller knows num_vectors)
+///   rev_num_nodes    8 B   (u64)
+///   for each node:
+///     degree         4 B   (u32)
+///     neighbors      degree × 4 B (u32 each)
+fn write_lifecycle(
+    path: &Path,
+    tombstones: &[u64],
+    free_slots: &[u32],
+    reverse_adj: &[Vec<u32>],
+    ops_since_consolidation: usize,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(LIFECYCLE_MAGIC)?;
+
+    // Tombstones.
+    let ts_words = tombstones.len() as u64;
+    w.write_all(&ts_words.to_le_bytes())?;
+    for &word in tombstones {
+        w.write_all(&word.to_le_bytes())?;
+    }
+
+    // Free slots.
+    let fs_count = free_slots.len() as u64;
+    w.write_all(&fs_count.to_le_bytes())?;
+    for &slot in free_slots {
+        w.write_all(&slot.to_le_bytes())?;
+    }
+
+    // ops_since_consolidation.
+    w.write_all(&(ops_since_consolidation as u64).to_le_bytes())?;
+
+    // Reverse adjacency (already capped to match the written forward graph).
+    let rev_nodes = reverse_adj.len() as u64;
+    w.write_all(&rev_nodes.to_le_bytes())?;
+    for neighbors in reverse_adj {
+        let degree = neighbors.len() as u32;
+        w.write_all(&degree.to_le_bytes())?;
+        for &nb in neighbors {
+            w.write_all(&nb.to_le_bytes())?;
+        }
+    }
+
+    let file = w.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Parse lifecycle.bin bytes into `ParsedLifecycle`.
+fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Result<ParsedLifecycle> {
+    if data.len() < 8 {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin too short".into(),
+        ));
+    }
+    if &data[..8] != LIFECYCLE_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin magic mismatch".into(),
+        ));
+    }
+
+    let mut offset = 8usize;
+
+    // Tombstones.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at tombstone_words".into(),
+        ));
+    }
+    let ts_words = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    let ts_bytes = ts_words
+        .checked_mul(8)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin ts_words overflows".into()))?;
+    let ts_end = offset
+        .checked_add(ts_bytes)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin ts_end overflows".into()))?;
+    if ts_end > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at tombstone data".into(),
+        ));
+    }
+    let mut tombstones = Vec::with_capacity(ts_words);
+    for _ in 0..ts_words {
+        let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        tombstones.push(word);
+        offset += 8;
+    }
+    // Ensure tombstone bitvec covers all nodes.
+    let needed_words = num_vectors.div_ceil(64);
+    if tombstones.len() < needed_words {
+        tombstones.resize(needed_words, 0);
+    }
+
+    // Free slots.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at free_slots_count".into(),
+        ));
+    }
+    let fs_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    let fs_bytes = fs_count
+        .checked_mul(4)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin fs_count overflows".into()))?;
+    let fs_end = offset
+        .checked_add(fs_bytes)
+        .ok_or_else(|| VamanaError::invalid_format("lifecycle.bin fs_end overflows".into()))?;
+    if fs_end > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at free_slots data".into(),
+        ));
+    }
+    let mut free_slots = Vec::with_capacity(fs_count);
+    for _ in 0..fs_count {
+        let slot = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        free_slots.push(slot);
+        offset += 4;
+    }
+
+    // ops_since_consolidation.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at ops".into(),
+        ));
+    }
+    let ops_since_consolidation =
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+
+    // Reverse adjacency.
+    if offset + 8 > data.len() {
+        return Err(VamanaError::invalid_format(
+            "lifecycle.bin truncated at rev_num_nodes".into(),
+        ));
+    }
+    let rev_num_nodes = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+
+    if rev_num_nodes != num_vectors {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin rev_num_nodes {rev_num_nodes} != num_vectors {num_vectors}"
+        )));
+    }
+
+    let mut reverse_adj: Vec<Vec<u32>> = Vec::with_capacity(rev_num_nodes);
+    for node in 0..rev_num_nodes {
+        if offset + 4 > data.len() {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin truncated at rev degree".into(),
+            ));
+        }
+        let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        // Reverse-adjacency degree is bounded by num_vectors-1 (every other node pointing
+        // here), not by max_degree (which caps forward out-degree only). A hub node in a
+        // legitimate graph can have up to num_vectors-1 inbound edges.
+        if degree > num_vectors.saturating_sub(1) {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin node {node} rev degree {degree} > num_vectors-1"
+            )));
+        }
+        let neighbors_end = offset.checked_add(degree * 4).ok_or_else(|| {
+            VamanaError::invalid_format("lifecycle.bin neighbors_end overflows".into())
+        })?;
+        if neighbors_end > data.len() {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin truncated at rev neighbors".into(),
+            ));
+        }
+        let mut neighbors = Vec::with_capacity(degree);
+        let mut seen = std::collections::HashSet::with_capacity(degree);
+        for _ in 0..degree {
+            let nb = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            if nb as usize >= num_vectors {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin rev neighbor {nb} >= num_vectors {num_vectors}"
+                )));
+            }
+            if nb as usize == node {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin node {node} has self-reference in reverse adjacency"
+                )));
+            }
+            if !seen.insert(nb) {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin node {node} has duplicate rev neighbor {nb}"
+                )));
+            }
+            neighbors.push(nb);
+        }
+        reverse_adj.push(neighbors);
+    }
+
+    Ok(ParsedLifecycle {
+        tombstones,
+        free_slots,
+        reverse_adj,
+        ops_since_consolidation,
+    })
+}
+
 fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(METADATA_MAGIC);
@@ -1129,13 +2288,38 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
     })
 }
 
-fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
+fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()> {
     let num_nodes = u32::try_from(graph.node_count()).map_err(|_| VamanaError::TooManyVectors {
         count: graph.node_count(),
     })?;
     let medoid = graph.medoid();
 
-    let total_edges: usize = graph.adjacency().iter().map(|v| v.len()).sum();
+    // Cap the medoid's adjacency list at max_degree before serialization.
+    // The medoid-pin in insert() may transiently allow the medoid to exceed
+    // max_degree (by one edge per orphan-pinned insert; K consecutive inserts
+    // can accumulate K overflow edges). We drop all overflow entries here so
+    // the written graph satisfies the loader degree constraint.
+    let medoid_adj_capped: Vec<u32>;
+    let adjacency = graph.adjacency();
+    let medoid_neighbors = &adjacency[medoid as usize];
+    let medoid_capped: &[u32] = if medoid_neighbors.len() > max_degree {
+        medoid_adj_capped = medoid_neighbors[..max_degree].to_vec();
+        &medoid_adj_capped
+    } else {
+        medoid_neighbors
+    };
+
+    let total_edges: usize = adjacency
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i == medoid as usize {
+                medoid_capped.len()
+            } else {
+                v.len()
+            }
+        })
+        .sum();
     // magic(8) + num_nodes(4) + medoid(4) + per-node degree(4) + all edges(4 each)
     let capacity = 8 + 4 + 4 + num_nodes as usize * 4 + total_edges * 4;
     let mut buf = Vec::with_capacity(capacity);
@@ -1144,7 +2328,12 @@ fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
     buf.extend_from_slice(&num_nodes.to_le_bytes());
     buf.extend_from_slice(&medoid.to_le_bytes());
 
-    for neighbors in graph.adjacency() {
+    for (i, neighbors) in adjacency.iter().enumerate() {
+        let neighbors: &[u32] = if i == medoid as usize {
+            medoid_capped
+        } else {
+            neighbors
+        };
         let degree = u32::try_from(neighbors.len()).map_err(|_| {
             VamanaError::invalid_format(format!(
                 "neighbor list length {} overflows u32",
@@ -1157,7 +2346,9 @@ fn write_graph(path: &Path, graph: &VamanaGraph) -> Result<()> {
         }
     }
 
-    fs::write(path, &buf)?;
+    let mut f = File::create(path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -1261,7 +2452,9 @@ fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<Vama
 
 fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
     let bytes: &[u8] = cast_slice(vectors);
-    fs::write(path, bytes)?;
+    let mut f = File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -2270,6 +3463,53 @@ mod tests {
                 Err(VamanaError::NonFiniteFloat { .. })
             ),
             "from_snapshot must reject NaN in vectors"
+        );
+    }
+
+    /// Regression test for MEDIUM: rejected insert and no-op consolidate must NOT
+    /// promote a Mmap-backed index to Owned. Verified via the private `VectorStorage`
+    /// variant (only accessible inside `mod tests` due to `use super::*`).
+    #[test]
+    fn mmap_atomicity_rejected_insert_and_noop_consolidate_stay_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let dim = 4usize;
+        let vectors = rand_unit_vectors(8, dim, 0xABC1);
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        idx.save(path).unwrap();
+
+        // Load: vectors are Mmap-backed.
+        let mut loaded = VamanaIndex::load(path).unwrap();
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "loaded index must use Mmap-backed storage"
+        );
+
+        // Rejected insert (wrong dimension) must not promote to Owned.
+        let bad = vec![0.5f32; dim + 1];
+        assert!(
+            loaded.insert(&bad).is_err(),
+            "wrong-dim insert must return Err"
+        );
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "Mmap must stay Mmap after rejected insert"
+        );
+
+        // No-op consolidate (tombstone_count == 0) must not promote to Owned.
+        assert_eq!(loaded.tombstone_count(), 0);
+        let remap = loaded.consolidate().unwrap();
+        assert!(
+            remap.is_empty(),
+            "no-op consolidate must return empty remap"
+        );
+        assert!(
+            matches!(loaded.vectors, VectorStorage::Mmap { .. }),
+            "Mmap must stay Mmap after no-op consolidate"
         );
     }
 }

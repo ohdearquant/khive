@@ -287,6 +287,15 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
+    /// Install a previously serialized in-neighbor list as `reverse_adj`.
+    /// Called by the v2 fast-load path after `load_v2_fast` has already paid the O(N*R)
+    /// cost to validate bidirectional consistency against the forward adjacency; this call
+    /// itself is O(1) (a move). The O(N*R) work is not avoided — it is done by the
+    /// consistency check before this call, not here.
+    pub(crate) fn restore_reverse_adj(&mut self, reverse_adj: Vec<Vec<u32>>) {
+        self.reverse_adj = reverse_adj;
+    }
+
     /// Mutable access to both adjacency and reverse_adj for Wolverine repair.
     pub(crate) fn adjacency_and_reverse_mut(&mut self) -> (&mut Vec<Vec<u32>>, &mut Vec<Vec<u32>>) {
         (&mut self.adjacency, &mut self.reverse_adj)

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{NamespaceToken, Resolved, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::EventKind;
 
@@ -21,6 +21,7 @@ impl KgPack {
         token: &NamespaceToken,
         graph_token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
 
@@ -61,6 +62,8 @@ impl KgPack {
             Err(e) => return Err(e),
         }
 
+        // PR-A1: by-ID get returns the note regardless of namespace (UUID v4 is globally unique).
+        // Visible-set gating removed here; list/search keep their namespace filter (PR-B scope).
         if let Some(note) = self
             .runtime
             .notes(token)?
@@ -68,17 +71,13 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if token
-                .visible_namespace_strs()
-                .contains(&note.namespace.as_str())
-            {
-                let note_val = normalize_entity_timestamps(to_json(&note)?);
-                let remapped = remap_note_status(note_val);
-                return flatten_get_result("note", remapped);
-            }
+            let note_val = normalize_entity_timestamps(to_json(&note)?);
+            let remapped = remap_note_status(note_val);
+            return flatten_get_result("note", remapped);
         }
 
-        if let Some(edge) = self.runtime.get_edge_visible(token, id).await? {
+        // PR-A1: by-ID edge get returns the edge regardless of namespace.
+        if let Some(edge) = self.runtime.get_edge(token, id).await? {
             return flatten_get_result("edge", to_json(&edge)?);
         }
 
@@ -94,6 +93,16 @@ impl KgPack {
                 .contains(&event.namespace.as_str())
             {
                 return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
+            }
+        }
+
+        // Pack-resolver probe: ask each registered resolver for pack-private records
+        // (e.g. knowledge_atoms, knowledge_domains) that the standard substrates cannot see.
+        for (_pack_name, resolver) in registry.resolvers() {
+            if let Some(Resolved::PackRecord { kind, data, .. }) =
+                resolver.resolve_by_id(id).await?
+            {
+                return flatten_get_result(&kind, data);
             }
         }
 
