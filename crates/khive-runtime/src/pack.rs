@@ -834,20 +834,28 @@ impl VerbRegistry {
             });
         }
 
-        // Mint the authorized namespace token at the dispatch boundary.
+        // Mint the authorized storage token at the dispatch boundary.
         //
-        // ADR-007 Rev 2, Rule 0 + Rule 3 (PR-B): the OSS dispatch path pins the storage
-        // token's primary to `local`. Actor identity, CLI `--actor`, and config `[actor] id`
-        // are gate/attribution inputs only — they never route storage. The request/default
-        // namespace (`ns_str`) reaches the gate via `gate_req` for policy evaluation, but
-        // the token handed to packs always has primary = local, so all packs write and read
-        // the shared "local" store regardless of which actor is configured.
-        // `actor.visible_namespaces` is dissolved; per-actor distinctions are view-layer tag
-        // filters (assignee, actor_id, from/to), not namespace partitions.
-        // `with_visible_namespaces()` is retained on the builder for future cloud-gate policy
-        // input but no longer widens this dispatch token's read scope.
-        let token =
-            NamespaceToken::mint_with_visibility(Namespace::local(), vec![], ActorRef::anonymous());
+        // ADR-007 Rev 2 Rule 0/3: storage pins to `local` by default. Actor identity,
+        // CLI `--actor`, and config `[actor] id` (carried in `default_namespace`) are
+        // attribution and gate-context inputs only — they never route storage. The one
+        // escape is an explicit `namespace=` request param (Rule 1): a caller may
+        // deliberately read/write a named set, e.g. `create(namespace="lambda:khive")`
+        // or `list(namespace="ns-beta")`. `default_namespace` reaches the gate via
+        // `gate_req` above for policy evaluation, but the storage token stays `local`
+        // unless the caller named a namespace explicitly.
+        //
+        // #159 pinned `local` *unconditionally*, collapsing even an explicit param and
+        // breaking namespace isolation between caller-named sets; this restores the
+        // Rule 1 escape without reviving actor-as-namespace routing. `visible_namespaces`
+        // stays dissolved (empty extra-visible set); per-actor distinctions are
+        // view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
+        let primary = match params.get("namespace").and_then(Value::as_str) {
+            Some(ns) => Namespace::parse(ns)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?,
+            None => Namespace::local(),
+        };
+        let token = NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
