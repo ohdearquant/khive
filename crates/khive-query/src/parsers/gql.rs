@@ -505,8 +505,29 @@ impl Parser {
 
 /// Parse a GQL query string into a [`GqlQuery`] AST. Errors on invalid syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
+    reject_gql_write(input.trim())?;
     let mut parser = Parser::new(input.trim());
     parser.parse_query()
+}
+
+/// Reject GQL/Cypher-style write forms with an explicit, actionable error.
+///
+/// The GQL parser already requires `MATCH` as the leading keyword, so
+/// `CREATE`, `DELETE`, `SET`, and `MERGE` are parse errors by accident.
+/// This check makes the rejection deliberate ("the query verb is read-only")
+/// rather than relying on the incidental grammar constraint.
+fn reject_gql_write(input: &str) -> Result<(), QueryError> {
+    let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
+    match first.as_str() {
+        "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE" => {
+            Err(QueryError::Unsupported(
+                "the query verb is read-only; \
+                 to mutate the graph use: create, update, link, merge, delete"
+                    .into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -637,6 +658,80 @@ mod tests {
         assert!(
             !nodes[0].properties.contains_key("entity_type"),
             "entity_type must be removed from the properties map after lifting"
+        );
+    }
+
+    // --- Read-only invariant regression tests (#16) ---
+
+    #[test]
+    fn gql_create_rejected_with_readonly_message() {
+        let err = parse("CREATE (n:concept {name: 'X'}) RETURN n").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "GQL CREATE must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only"),
+            "error must mention 'read-only'; got: {msg}"
+        );
+        assert!(
+            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
+            "error must name the mutation verbs; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gql_delete_rejected_with_readonly_message() {
+        let err = parse("DELETE (n) WHERE n.kind = 'concept'").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "GQL DELETE must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "got: {msg}");
+    }
+
+    #[test]
+    fn gql_set_rejected_with_readonly_message() {
+        let err = parse("SET (n:concept) RETURN n").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "GQL SET must return Unsupported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn gql_merge_rejected_with_readonly_message() {
+        let err = parse("MERGE (n:concept {name: 'X'}) RETURN n").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "GQL MERGE must return Unsupported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn gql_match_still_compiles_after_write_guard() {
+        // Positive control: a valid MATCH must still parse correctly.
+        let q = parse("MATCH (a:concept)-[:extends]->(b) RETURN a").unwrap();
+        assert!(!q.pattern.elements.is_empty(), "valid MATCH must parse");
+    }
+
+    #[test]
+    fn gql_detach_delete_rejected() {
+        let err = parse("DETACH DELETE (n)").unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Unsupported(_)),
+            "DETACH DELETE must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only"),
+            "error must mention 'read-only'; got: {msg}"
+        );
+        assert!(
+            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
+            "error must name the mutation verbs; got: {msg}"
         );
     }
 }

@@ -150,6 +150,21 @@ or DDL statements. Mutations go through verb handlers (`create`, `update`, `dele
 The `query` verb handler may share infrastructure with other verbs (e.g., filter parsing),
 but the compilation path produces `SELECT` statements only.
 
+This invariant is enforced at two independent levels:
+
+1. **Parser-level guard.** `parsers::gql::parse` and `parsers::sparql::parse` each check the
+   leading keyword before parsing. SPARQL write operations (`INSERT`, `DELETE`, `LOAD`,
+   `CLEAR`, `DROP`, `ADD`, `MOVE`, `COPY`, `CREATE`) and GQL/Cypher write forms (`CREATE`,
+   `DELETE`, `SET`, `REMOVE`, `MERGE`, `INSERT`, `UPDATE`) are rejected with an explicit
+   `Unsupported` error that names the mutation verbs to use instead:
+   `"the query verb is read-only; to mutate the graph use: create, update, link, merge, delete"`.
+
+2. **Compiler-level guard (`assert_select_only`).** After the SQL string is built, the
+   compiler asserts it starts with `SELECT` or `WITH` (recursive CTE). This is defense-in-depth
+   against a future code path that somehow bypasses the parser check.
+
+Both levels are covered by regression tests in `crates/khive-query/src/` (see `#16`).
+
 ## Rationale
 
 ### Why separate crate from khive-request?

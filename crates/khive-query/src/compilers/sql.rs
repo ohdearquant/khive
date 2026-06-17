@@ -68,7 +68,33 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
         compile_fixed_length(&query, opts)?
     };
     compiled.warnings = warnings;
+
+    // Defense-in-depth: assert the emitted SQL is SELECT-only.
+    // The parsers already reject write-shaped input; this guard ensures a future
+    // code path cannot accidentally emit a non-SELECT statement through the
+    // compiler. Fails closed with an explicit read-only message.
+    assert_select_only(&compiled.sql)?;
+
     Ok(compiled)
+}
+
+/// Assert that the emitted SQL starts with SELECT (or WITH for recursive CTEs).
+///
+/// This is a compiler-level read-only invariant guard. The parsers reject
+/// write-shaped input before AST construction, but this check prevents a
+/// hypothetical future code path from emitting `INSERT`/`UPDATE`/`DELETE`
+/// SQL through the compile path. It is not a security boundary — the SQLite
+/// reader connection already enforces read-only at the driver level.
+fn assert_select_only(sql: &str) -> Result<(), QueryError> {
+    let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
+    if first == "SELECT" || first == "WITH" {
+        return Ok(());
+    }
+    Err(QueryError::Compile(
+        "the query verb is read-only; \
+         to mutate the graph use: create, update, link, merge, delete"
+            .into(),
+    ))
 }
 
 fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryValue>) -> String {
@@ -2130,6 +2156,102 @@ mod tests {
         assert!(
             result.is_err(),
             "edge pattern without suffix '-' must be rejected as a parse error"
+        );
+    }
+
+    // --- Read-only invariant regression tests (#16) ---
+
+    /// assert_select_only accepts SELECT and WITH (recursive CTE).
+    #[test]
+    fn assert_select_only_accepts_select_and_with() {
+        assert!(
+            assert_select_only("SELECT a FROM entities WHERE 1=1").is_ok(),
+            "SELECT must be accepted"
+        );
+        assert!(
+            assert_select_only("WITH RECURSIVE traverse AS (...) SELECT ...").is_ok(),
+            "WITH must be accepted (recursive CTE)"
+        );
+    }
+
+    /// assert_select_only rejects write SQL with the canonical read-only message.
+    #[test]
+    fn assert_select_only_rejects_write_sql_with_readonly_message() {
+        for stmt in &[
+            "INSERT INTO entities VALUES (?)",
+            "UPDATE entities SET name = ?",
+            "DELETE FROM entities WHERE id = ?",
+            "DROP TABLE entities",
+        ] {
+            let err = assert_select_only(stmt).unwrap_err();
+            assert!(
+                matches!(err, QueryError::Compile(_)),
+                "write SQL must return Compile error for '{stmt}'; got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("read-only"),
+                "error must mention 'read-only' for '{stmt}'; got: {msg}"
+            );
+            assert!(
+                msg.contains("create") && msg.contains("delete"),
+                "error must name the mutation verbs for '{stmt}'; got: {msg}"
+            );
+        }
+    }
+
+    /// Regression: compile() for a valid GQL query must still succeed end-to-end.
+    /// This guards against assert_select_only incorrectly rejecting compiler output.
+    #[test]
+    fn readonly_guard_does_not_break_valid_gql_compile() {
+        let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.starts_with("SELECT"),
+            "valid GQL must compile to SELECT; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// Regression: compile() for a variable-length GQL query must still succeed.
+    #[test]
+    fn readonly_guard_does_not_break_valid_cte_compile() {
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.starts_with("WITH RECURSIVE"),
+            "variable-length GQL must compile to WITH RECURSIVE; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// GQL write forms are rejected at the parse layer before reaching the compiler.
+    #[test]
+    fn gql_write_form_rejected_before_compile() {
+        use crate::parsers::gql;
+        let err = gql::parse("CREATE (n:concept) RETURN n").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "GQL CREATE must be Unsupported; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("read-only"),
+            "error must mention read-only; got: {err}"
+        );
+    }
+
+    /// SPARQL write forms are rejected at the parse layer before reaching the compiler.
+    #[test]
+    fn sparql_write_form_rejected_before_compile() {
+        use crate::parsers::sparql;
+        let err = sparql::parse("INSERT DATA { ?a :extends ?b }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "SPARQL INSERT must be Unsupported; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("read-only"),
+            "error must mention read-only; got: {err}"
         );
     }
 
