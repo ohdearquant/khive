@@ -17,7 +17,7 @@ The ADR number 059 is burned — this file is preserved as a record of the withd
 **Withdrawn**: 2026-06-16 (superseded by ADR-007 Rev 2)
 **Depends on**:
 
-- ADR-007 (Namespace contract — data-breach boundary, OSS vs cloud axes)
+- ADR-007 (Namespace contract — attribution-only, OSS vs cloud axes; now Rev 3)
 - ADR-017 (Pack standard — pack-extensible edge endpoints)
 - ADR-018 (Authorization gate — single dispatch-site enforcement)
 - ADR-046 (Event-sourced proposals — the mutation path for subagents)

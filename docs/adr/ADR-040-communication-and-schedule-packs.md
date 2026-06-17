@@ -132,7 +132,14 @@ reconstruct conversation order from `sent_at` on messages sharing a `thread_id`.
 is propagated; otherwise the target message's own UUID becomes the `thread_id` for the new
 message chain.
 
-#### Cross-namespace messaging (OSS policy — specified 2026-06-15)
+#### Cross-namespace messaging (deferred Option B — cloud path)
+
+**Note (2026-06-17, ADR-007 Rev 3)**: The cross-namespace allowlist model described in this
+section is the deferred Option B (cloud/multi-tenant path) from ADR-057. It is NOT the current
+OSS implementation. Under ADR-007 Rev 3, comm is NO-CARRY: all comm messages stay in the
+caller's shared "local" namespace. Actor addressing uses `from_actor`/`to_actor` properties
+on message notes (ADR-057), not namespace partitions. The `allowed_outbound_namespaces`
+mechanism below is preserved for the future cloud path (Option B), but is not active in OSS.
 
 `send` writes the inbound copy into the recipient's namespace. Whether this write is allowed
 depends on the **sender-side outbound allowlist** (`actor.allowed_outbound_namespaces` in the
@@ -146,8 +153,8 @@ The minted token has `namespace = recipient` and `visible = [recipient]`; it is 
 `NamespaceToken` that the comm handler uses in an append-only manner (one `create_note` call,
 never returned to the sender). The enforced boundary is the sender-side allowlist check plus
 the handler's single-create usage — not the token type. A future cloud-path authorization ADR
-(not yet written) will replace this with a type-enforced, append-only capability primitive.
-The denial error is `RuntimeError::PermissionDenied { verb: "comm.send" }`.
+will replace this with a type-enforced, append-only capability primitive. The denial error is
+`RuntimeError::PermissionDenied { verb: "comm.send" }`.
 
 Within-namespace messaging (sender and recipient in the same namespace) proceeds without any
 allowlist check.
