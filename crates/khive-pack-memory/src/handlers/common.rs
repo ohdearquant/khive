@@ -524,7 +524,7 @@ impl MemoryPack {
         &self,
         token: &NamespaceToken,
         query: &str,
-        ns: &str,
+        namespaces: &[String],
         candidate_limit: u32,
         snippet_policy: TextSnippetPolicy,
         cjk_fts_bypass: bool,
@@ -543,7 +543,7 @@ impl MemoryPack {
             crate::text_gather::collect_text_hits(
                 searcher.as_ref(),
                 query,
-                ns,
+                namespaces,
                 candidate_limit,
                 snippet_policy,
                 cjk_fts_bypass,
@@ -557,7 +557,7 @@ impl MemoryPack {
                     query: terms.join(" "),
                     mode: TextQueryMode::AnyTerm,
                     filter: Some(TextFilter {
-                        namespaces: vec![ns.to_string()],
+                        namespaces: namespaces.to_vec(),
                         kinds: vec![SubstrateKind::Note],
                         ..TextFilter::default()
                     }),
@@ -594,94 +594,41 @@ impl MemoryPack {
             fts_gather,
         } = opts;
 
-        // FTS recall fans out across all visible namespaces by iterating each
-        // namespace's own FTS virtual table (fts_notes_{ns}) — there is NO global
-        // FTS table and TextFilter.namespaces does NOT yield cross-namespace hits.
-        // Each namespace is selected by minting a token via token.with_namespace(ns)
-        // (see multi-namespace fanout path below at line 633+).
-        //
-        // Phase-1.5 limitation: vector/ANN recall stays primary-namespace-only.
-        // Each namespace owns a separate ANN index instance; cross-namespace
-        // recall on the vector path requires fanout+fusion across index instances,
-        // which is deferred to a follow-up PR.
-        let visible = token.visible_namespace_strs();
+        // FTS recall uses the single shared fts_notes table. Namespace filtering
+        // is applied via TextFilter.namespaces with the full visible set.
+        // ANN recall uses the single global index per model; namespace filtering
+        // is applied post-search by passing visible_namespaces to the vector path.
+        let visible: Vec<String> = token
+            .visible_namespace_strs()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         let primary_ns = token.namespace().as_str().to_string();
 
-        // For single-namespace (common case) take the fast path.
-        if visible.len() <= 1 {
-            let text_fut = self.collect_recall_text_hits(
-                token,
-                query,
-                &primary_ns,
+        let text_fut = self.collect_recall_text_hits(
+            token,
+            query,
+            &visible,
+            candidate_limit,
+            snippet_policy,
+            cjk_fts_bypass,
+            fts_gather,
+        );
+        let vector_fut = self.collect_recall_vector_hits(
+            token,
+            query,
+            &primary_ns,
+            RecallVectorCandidateParams {
                 candidate_limit,
-                snippet_policy,
-                cjk_fts_bypass,
-                fts_gather,
-            );
-            let vector_fut = self.collect_recall_vector_hits(
-                token,
-                query,
-                &primary_ns,
-                RecallVectorCandidateParams {
-                    candidate_limit,
-                    embedding_model,
-                    use_multilingual,
-                    scoring_cfg,
-                },
-            );
-            let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
-            return Ok(RecallCandidateSet {
-                namespace: primary_ns,
-                text_hits,
-                vector_hits_per_model: vector_result.vector_hits_per_model,
-                multilingual_routed: vector_result.multilingual_routed,
-            });
-        }
-
-        // Multi-namespace: fanout FTS across all visible namespaces.
-        //
-        // Each namespace has its own FTS virtual table (fts_notes_{ns}); we must
-        // select that table by minting a token whose primary namespace matches the
-        // target namespace. `token.with_namespace` creates such a token while
-        // preserving the actor context.
-        let mut all_text_hits = Vec::new();
-        for ns_str in &visible {
-            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
-                Ok(ns) => ns,
-                Err(_) => continue,
-            };
-            let ns_token = token.with_namespace(ns_parsed);
-            let hits = self
-                .collect_recall_text_hits(
-                    &ns_token,
-                    query,
-                    ns_str,
-                    candidate_limit,
-                    snippet_policy,
-                    cjk_fts_bypass,
-                    fts_gather,
-                )
-                .await?;
-            all_text_hits.extend(hits);
-        }
-        // Vector recall stays in primary namespace (single index).
-        let vector_result = self
-            .collect_recall_vector_hits(
-                token,
-                query,
-                &primary_ns,
-                RecallVectorCandidateParams {
-                    candidate_limit,
-                    embedding_model,
-                    use_multilingual,
-                    scoring_cfg,
-                },
-            )
-            .await?;
-
+                embedding_model,
+                use_multilingual,
+                scoring_cfg,
+            },
+        );
+        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
-            text_hits: all_text_hits,
+            text_hits,
             vector_hits_per_model: vector_result.vector_hits_per_model,
             multilingual_routed: vector_result.multilingual_routed,
         })

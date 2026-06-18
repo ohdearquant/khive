@@ -2234,19 +2234,14 @@ async fn create_note_annotates_refuses_target_in_visible_only_namespace() {
 // Finding 5: hybrid_search cross-namespace Option B limitation documented + tested
 // =============================================================================
 
-/// Documents the Phase 1.5 limitation: `hybrid_search` is primary-namespace-only
-/// for both the FTS and vector legs (each namespace owns its own FTS table and
-/// ANN index; cross-namespace fanout is deferred to Phase 1.5).
+/// Verifies that `hybrid_search` with a visible-set token returns entities from
+/// ALL visible namespaces (not just the primary namespace).
 ///
-/// This test verifies the actual current behavior:
-/// - The primary-namespace entity appears in results.
-/// - The extra-namespace entity does NOT appear in results (its FTS data lives
-///   in `fts_entities_{extra-ns}`, a separate table not queried here).
-///
-/// A caller with a visible set can READ the extra-namespace entity directly via
-/// `get_entity`, but `hybrid_search` does not surface it today.
+/// After FTS+ANN consolidation, `fts_entities` is a single shared table with a
+/// `namespace` column. `hybrid_search` passes `visible_ns` as a `TextFilter`
+/// so entities from any visible namespace are surfaced in one query pass.
 #[tokio::test]
-async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
+async fn hybrid_search_surfaces_all_visible_namespaces() {
     let rt = rt();
 
     let ns_primary = Namespace::parse("hs-primary-ns").unwrap();
@@ -2289,7 +2284,7 @@ async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
         .unwrap();
 
     // Search: FTS-only (no embedding model in test runtime).
-    // Current behavior: only primary-namespace results surface.
+    // With consolidated fts_entities, both namespace entities should surface.
     let hits = rt
         .hybrid_search(&vis_tok, "stellar", None, 20, None, None)
         .await
@@ -2305,18 +2300,16 @@ async fn hybrid_search_is_primary_namespace_only_phase1_5_limitation() {
         entity_in_primary.id,
     );
 
-    // Extra-namespace entity does NOT surface — Phase 1.5 limitation.
-    // Each namespace has its own FTS table; cross-namespace FTS fanout is deferred.
+    // Extra-namespace entity must also surface (Phase-1.5 limitation lifted).
+    // The consolidated fts_entities table + namespace column filter enables cross-namespace FTS.
     assert!(
-        !hit_ids.contains(&entity_in_extra.id),
-        "hybrid_search must NOT return entity from extra (visible-only) namespace \
-         until Phase 1.5 cross-namespace fanout ships; \
-         entity_id={} unexpectedly appeared in: {hit_ids:?}",
+        hit_ids.contains(&entity_in_extra.id),
+        "hybrid_search must return entity from visible extra namespace; \
+         entity_id={} missing from: {hit_ids:?}",
         entity_in_extra.id,
     );
 
-    // Direct read of the extra-namespace entity via get_entity must still work
-    // (this proves the visible set wiring is correct — only search is primary-scoped).
+    // Direct read of the extra-namespace entity via get_entity must still work.
     let fetched = rt
         .get_entity(&vis_tok, entity_in_extra.id)
         .await

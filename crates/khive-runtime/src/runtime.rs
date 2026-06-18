@@ -292,22 +292,22 @@ impl KhiveRuntime {
         )?)
     }
 
-    /// Get a TextSearch index for the token's namespace entity corpus.
+    /// Get a TextSearch index for the entity corpus (single shared table).
     pub fn text(
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
-        let key = format!("entities_{}", sanitize_key(token.namespace().as_str()));
-        Ok(self.backend.text(&key)?)
+        let _ = token;
+        Ok(self.backend.text("entities")?)
     }
 
-    /// Get a TextSearch index for the token's namespace notes corpus.
+    /// Get a TextSearch index for the notes corpus (single shared table).
     pub fn text_for_notes(
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
-        let key = format!("notes_{}", sanitize_key(token.namespace().as_str()));
-        Ok(self.backend.text(&key)?)
+        let _ = token;
+        Ok(self.backend.text("notes")?)
     }
 
     /// Mint an authorization token for the given namespace.
