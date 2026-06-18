@@ -168,11 +168,12 @@ impl KhiveRuntime {
         &self.config.backend_id
     }
 
-    /// Return the extra-visible namespaces from config.
+    /// Return the extra-visible namespaces assembled at config load.
     ///
-    /// Retained for configuration identity and future cloud-gate policy. OSS
-    /// dispatch does NOT use these to mint read tokens — storage is always
-    /// local-only (ADR-007 Rev 2).
+    /// OSS dispatch uses this set to widen the DEFAULT multi-record read scope
+    /// to `['local'] ∪ visible_namespaces` (ADR-007 Rev 4 Rule 3b). Writes are
+    /// unchanged — always pinned to `'local'`. This set is also available as
+    /// gate/cloud policy input.
     pub fn visible_namespaces(&self) -> &[Namespace] {
         &self.config.visible_namespaces
     }
@@ -888,9 +889,10 @@ mod tests {
 
     #[test]
     fn runtime_config_from_khive_config_actor_id_does_not_override_default_namespace() {
-        // ADR-007 Rev 2 Rule 0: `[actor] id` is attribution only and never becomes
-        // the storage namespace. A configured actor must NOT silently route storage —
-        // default_namespace stays whatever `base` carried (here, `local`).
+        // ADR-007 Rev 4 Rule 0: `[actor] id` must NOT set `default_namespace` —
+        // writes stay pinned to `local`. Note: a non-`'local'` actor.id IS folded
+        // into the default READ visible-set (Rule 3b), but that does not change
+        // default_namespace. This test asserts the write-routing invariant only.
         let base = RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
@@ -908,7 +910,7 @@ mod tests {
         assert_eq!(
             result.default_namespace.as_str(),
             "local",
-            "actor.id must not become the storage namespace (ADR-007 Rev 2 Rule 0)"
+            "actor.id must not become default_namespace (ADR-007 Rev 4 Rule 0); writes pin to local"
         );
     }
 
@@ -999,8 +1001,8 @@ mod tests {
         assert_eq!(
             result.default_namespace.as_str(),
             "local",
-            "actor.id is attribution only and must not override default_namespace \
-             (ADR-007 Rev 2 Rule 0); engine config is still applied"
+            "actor.id must not override default_namespace (ADR-007 Rev 4 Rule 0); \
+             writes pin to local; engine config is still applied"
         );
         assert!(result.embedding_model.is_some());
     }

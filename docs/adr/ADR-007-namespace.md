@@ -12,16 +12,22 @@
 **Rev 4 summary (2026-06-17)**: Generalizes the Rev 3 default read scope. Rev 3 fixed the
 default multi-record read scope at exactly `['local']`, with an explicit `namespace=` request
 parameter as the only escape. Rev 4 widens the default read scope to `['local'] ∪
-visible_namespaces`, where `visible_namespaces` is an operator-configured list in `khive.toml`
-(`[actor] visible_namespaces`). `'local'` is always included. With `visible_namespaces` unset
-(the default), behavior is identical to Rev 3 — fully backward-compatible. Writes are unchanged
-(still pin `'local'` by default, explicit `namespace=` escape unchanged), by-ID ops are
-unchanged (namespace-agnostic, Rule 2), and the Gate remains the single enforcement seam. The
-new config field is an explicit, additive, read-only view filter; it is NOT derived from actor
-identity and does NOT route writes, so it does not re-introduce the actor-as-namespace coupling
-Rev 3 rejected (Rule 0). Rev 4 obviates the Rev-3-pending PR-A2/PR-F relabel backfill: legacy
-non-`'local'` rows become visible by configuring `visible_namespaces`, without mutating stored
-attribution. See Rule 3b.
+visible_namespaces`, where `visible_namespaces` is assembled at config load from two sources:
+the operator-configured `[actor] visible_namespaces` list in `khive.toml`, and the configured
+`[actor] id` when it is non-`'local'` (folded in, deduplicated). `'local'` is always included.
+With neither configured (the default), behavior is identical to Rev 3 — fully
+backward-compatible. Writes are unchanged (still pin `'local'` by default, explicit
+`namespace=` escape unchanged), by-ID ops are unchanged (namespace-agnostic, Rule 2), and the
+Gate remains the single enforcement seam. Rev 4 deliberately AMENDS the Rev 3
+"attribution-only" reading of `[actor] id` (Rule 0): a non-`'local'` actor identity now
+contributes to the DEFAULT READ visible-set. It still never routes writes and never sets
+`default_namespace`. This is read-augmentation, not the actor-as-namespace isolation Rev 3
+rejected: it only ever ADDS namespaces to what a default read sees — it never hides records,
+never silos, and never breaks by-ID resolution (the failure modes of the rejected model, which
+hid data behind per-actor partitions for both reads and writes). Rev 4 obviates the
+Rev-3-pending PR-A2/PR-F relabel backfill: legacy non-`'local'` rows become visible by
+configuring `[actor] id` or `visible_namespaces`, without mutating stored attribution. See
+Rule 3b.
 
 **Rev 3 summary (2026-06-17)**: Promoted from Proposed to Accepted/Ratified. Closes the two
 Rev-2-deferred per-pack carry questions as NO-CARRY: comm = no-carry (reverses the Rev-2 "leans
@@ -182,11 +188,14 @@ parameter is supplied) is:
 ['local'] ∪ visible_namespaces
 ```
 
-where `visible_namespaces` is the operator-configured `[actor] visible_namespaces` list in
-`khive.toml`. `'local'` is always a member, whether or not it appears in the configured list.
-When `visible_namespaces` is unset or empty, the default read scope is exactly `['local']`,
-identical to Rev 3. The widening is therefore opt-in: a deployment that configures nothing keeps
-Rev 3 behavior verbatim.
+where `visible_namespaces` is assembled at config load from two sources: the
+operator-configured `[actor] visible_namespaces` list in `khive.toml`, and the configured
+`[actor] id` when it is non-`'local'` (folded in, deduplicated; an actor.id of `'local'` adds
+nothing since `'local'` is always present). `'local'` is always a member, whether or not it
+appears in either source. When neither source contributes a non-`'local'` namespace, the
+default read scope is exactly `['local']`, identical to Rev 3. The widening is therefore
+opt-in: a deployment that configures neither `[actor] id` nor `[actor] visible_namespaces`
+keeps Rev 3 behavior verbatim.
 
 The scope applies to all multi-record reads for all packs: list, search, recall, neighbors,
 traverse, query. The runtime supplies the set to the store as a `WHERE namespace IN (...)`
@@ -198,7 +207,8 @@ What Rev 4 does NOT change:
 - Writes. The write namespace is `'local'` by default, or the explicit `namespace=` parameter
   when present. `visible_namespaces` does NOT widen the write namespace. Rule 0 holds: actor
   identity never becomes the storage namespace, and a non-`'local'` `[actor] id` does not route
-  writes.
+  writes. (A non-`'local'` `[actor] id` does, however, contribute to the default READ
+  visible-set — see the Rev 4 amendment to Rule 0 above and Rule 3b.)
 - The explicit `namespace=X` escape (Rule 3). An explicit request parameter scopes that one
   operation to exactly `[X]` for both read and write. It is the precise-targeting escape and is
   NOT widened by `visible_namespaces`: `list(namespace="ns-beta")` returns only `ns-beta`,
@@ -211,13 +221,16 @@ What Rev 4 does NOT change:
   field.
 
 Why this is not the rejected actor-routing (Rev 3 Rule 0, ADR-059): the rejected model derived
-the storage namespace from actor IDENTITY (writes and reads both followed `[actor] id`),
-coupling identity to storage and breaking the shared brain. `visible_namespaces` is an explicit
-operator config list that is read-only (never routes writes), additive (always includes
-`'local'`), and attribution-preserving (records keep their stored namespace; nothing is
-relabeled). It does not derive from actor identity and does not partition storage. It is a
-caller-supplied generalization of the Rule 1 multi-record namespace parameter from a single
-value to a set, applied to the default read path.
+the storage namespace from actor IDENTITY for BOTH writes and reads — writes followed `[actor]
+id` into a per-actor partition and reads were confined to it, coupling identity to storage,
+hiding records behind partitions, and breaking by-ID resolution and the shared brain. Rev 4
+lets `[actor] id` contribute ONLY to the default READ visible-set, and only ever additively:
+writes still pin `'local'` (never an actor partition), `'local'` is always included, by-ID ops
+stay namespace-agnostic, and records keep their stored namespace (nothing is relabeled).
+Read-augmentation cannot reproduce the rejected model's failures because it only ever shows
+MORE, never hides, silos, or reroutes. The visible-set is a caller/config-supplied
+generalization of the Rule 1 multi-record namespace parameter from a single value to a set,
+applied to the default read path.
 
 Relation to the Rev 3 data backfill: Rev 3 §Consequences flagged a pending PR-A2/PR-F relabel
 of stranded non-`'local'` base rows to `'local'` (a live data mutation with no automatic

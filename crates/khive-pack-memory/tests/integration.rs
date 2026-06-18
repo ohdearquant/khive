@@ -3452,3 +3452,76 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_both_legs() {
          even with a lexically-disjoint query (no FTS match possible); got: {ids_5b:?}"
     );
 }
+
+/// (a2) ADR-007 Rev 4: FTS-leg isolation — with the vector leg disabled (no embedder),
+/// default recall surfaces a lambda:khive note via the FTS fanout alone.
+///
+/// Builds a `KhiveRuntime` with `embedding_model: None` and registers NO embedder,
+/// so the vector leg is dead. Asserts `registered_embedding_model_names()` is empty
+/// (self-documenting premise). Dispatches `memory.remember` with
+/// `namespace="lambda:khive"` (explicit-param write into that namespace), then
+/// `memory.recall` with a lexically matching query and no `namespace=` param.
+/// The note id must appear — with the vector leg dead, the ONLY path that can
+/// surface it is the FTS fanout (`with_namespace` selecting `fts_notes_lambda:khive`).
+#[tokio::test]
+async fn adr007_rev4_default_recall_surfaces_actor_ns_via_fts_leg() {
+    // Build a runtime with visible_namespaces = ["lambda:khive"] and NO embedder,
+    // so the vector leg is dead.
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        visible_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory runtime");
+
+    // Assert the vector leg is dead — no embedder registered.
+    // This makes the test premise self-documenting: if an embedder were registered,
+    // the vector leg could carry the result without FTS, and the test would prove nothing.
+    assert!(
+        rt.registered_embedding_model_names().is_empty(),
+        "FTS-leg isolation premise: no embedder must be registered (vector leg must be dead)"
+    );
+
+    // Build the registry with with_visible_namespaces mirroring tests (b)/(d).
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    // Write the note into lambda:khive via the Rule-3 explicit-namespace escape.
+    let result = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "alpha beta gamma delta",
+                "salience": 0.8,
+                "namespace": "lambda:khive"
+            }),
+        )
+        .await
+        .expect("memory.remember with explicit namespace must succeed");
+    let note_id = result["id"].as_str().expect("note id present").to_owned();
+    assert!(!note_id.is_empty());
+
+    // Default recall with a lexically matching query and no namespace= param.
+    // With the vector leg dead, the ONLY path that can surface the note is the
+    // FTS fanout (with_namespace selecting fts_notes_lambda:khive). This isolates
+    // the FTS leg as the sole return path.
+    let recall = registry
+        .dispatch("memory.recall", json!({ "query": "alpha beta" }))
+        .await
+        .expect("memory.recall must succeed");
+    let hits = recall.as_array().expect("recall returns array");
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["id"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        ids.contains(&note_id.as_str()),
+        "FTS-leg: default recall must surface the lambda:khive note via FTS fanout alone \
+         (vector leg is dead — no embedder registered); got: {ids:?}"
+    );
+}

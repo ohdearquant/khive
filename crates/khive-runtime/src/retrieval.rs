@@ -351,15 +351,21 @@ impl KhiveRuntime {
     /// that right-kind hits ranked below `limit` in the raw fusion still surface when
     /// higher-ranked candidates are wrong-kind or soft-deleted.
     ///
-    /// # Cross-namespace visibility (Phase 1.5 limitation — primary namespace only)
+    /// # Cross-namespace visibility (entity search — primary namespace only; deferred)
     ///
-    /// Both the **FTS leg** and the **vector/ANN leg** are currently restricted to
-    /// the **primary namespace only** for search.
+    /// Both the **FTS leg** and the **vector/ANN leg** of entity search (`hybrid_search`)
+    /// are restricted to the **primary namespace only**.
     ///
     /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
-    /// and a separate ANN index instance. Cross-namespace fanout requires iterating
-    /// over every visible namespace's store, issuing parallel search requests, and
-    /// fusing the results — this is deferred to Phase 1.5.
+    /// and a separate ANN index instance. Cross-namespace entity-search fanout
+    /// requires iterating over every visible namespace's store, issuing parallel
+    /// search requests, and fusing the results — this is deferred (entity-search
+    /// cross-namespace fanout is the outstanding follow-up).
+    ///
+    /// Note: this is distinct from memory recall's cross-namespace fanout, which
+    /// ships in ADR-007 Rev 4 (`memory.recall` iterates `visible_namespaces` across
+    /// both the FTS and vector legs). Entity search fanout is the remaining deferred
+    /// piece; memory recall fanout is not deferred.
     ///
     /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
     /// which limits results to those namespaces within the primary store. Because
@@ -368,7 +374,7 @@ impl KhiveRuntime {
     ///
     /// Callers with a multi-namespace visible set can READ cross-namespace entities
     /// directly via `get_entity` / `resolve`, but `hybrid_search` returns only
-    /// primary-namespace hits until Phase 1.5 cross-namespace fanout ships.
+    /// primary-namespace hits until entity-search cross-namespace fanout ships.
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,

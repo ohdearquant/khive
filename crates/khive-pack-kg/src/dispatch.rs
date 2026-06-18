@@ -587,7 +587,7 @@ mod tests {
         );
     }
 
-    /// ADR-007 Rev 2, Rule 0 regression: non-local actor config does NOT route storage.
+    /// ADR-007 Rev 4, Rule 0 regression: non-local actor config does NOT route WRITE storage.
     ///
     /// Builds a VerbRegistry whose `default_namespace` is `"lambda:leo"` (simulating
     /// `[actor] id = "lambda:leo"` or `--actor lambda:leo`).  Dispatches `create` and

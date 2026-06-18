@@ -1075,11 +1075,12 @@ mod tests {
         );
     }
 
-    // Namespace resolution parity with `kkernel mcp` under ADR-007 Rev 2 Rule 0:
-    // when --namespace is omitted, the config file `[actor] id` is attribution only
-    // and does NOT set the effective namespace — it stays `local`, same as the MCP
-    // path. When --namespace is explicit, it routes storage (Rule 1 / reindex's
-    // explicit namespace channel) and overrides the local default.
+    // Namespace resolution parity with `kkernel mcp` under ADR-007 Rev 4 Rule 0:
+    // when --namespace is omitted, the config file `[actor] id` does NOT set
+    // default_namespace — it stays `local` (writes pin to local). A non-`'local'`
+    // actor.id IS folded into the default READ visible-set (Rule 3b), but that
+    // does not affect default_namespace. When --namespace is explicit, it routes
+    // storage (Rule 1 / reindex's explicit namespace channel) and overrides local.
     #[test]
     #[serial]
     fn namespace_absent_defers_to_local_not_config_actor_id() {
@@ -1109,8 +1110,8 @@ mod tests {
         assert_eq!(
             resolved.default_namespace.as_str(),
             "local",
-            "omitted --namespace must stay local; config [actor] id is attribution \
-             only (ADR-007 Rev 2 Rule 0)"
+            "omitted --namespace must stay local; config [actor] id does NOT set \
+             default_namespace (ADR-007 Rev 4 Rule 0)"
         );
 
         // Explicit --namespace must override [actor] id.

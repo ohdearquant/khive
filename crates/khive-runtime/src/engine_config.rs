@@ -156,9 +156,10 @@ pub struct KhiveConfig {
     /// Default actor identity for this khive instance.
     ///
     /// When present, `actor.id` feeds configuration identity and gate/attribution
-    /// policy input.  OSS dispatch pins storage to the shared `local` namespace
-    /// regardless of this setting (ADR-007 Rev 2).  Cloud model derives actor
-    /// identity from an authenticated token.
+    /// policy input.  A non-`'local'` `actor.id` is folded into the default READ
+    /// visible-set at config load (ADR-007 Rev 4 Rule 3b) — it widens what default
+    /// multi-record reads return, but never routes writes or sets `default_namespace`.
+    /// Cloud model derives actor identity from an authenticated token.
     #[serde(default)]
     pub actor: ActorConfig,
 
@@ -843,10 +844,10 @@ id = "lambda:"
         );
     }
 
-    // 18. ADR-007 Rev 2 Rule 0: actor.id is attribution only and must NOT become
-    //     default_namespace. Storage namespace stays whatever `base` carried (local
-    //     by default for OSS); a caller targets a named namespace per request, not
-    //     by virtue of which actor is configured.
+    // 18. ADR-007 Rev 4 Rule 0: actor.id must NOT become default_namespace — writes
+    //     stay pinned to `local`. A non-`'local'` actor.id IS folded into the
+    //     default READ visible-set (ADR-007 Rev 4 Rule 3b), but that does not affect
+    //     default_namespace. This test asserts the write-routing invariant only.
     #[test]
     fn test_runtime_config_actor_id_does_not_override_namespace() {
         use crate::runtime::runtime_config_from_khive_config;
@@ -869,8 +870,8 @@ id = "lambda:"
         assert_eq!(
             result.default_namespace,
             Namespace::local(),
-            "actor.id must NOT become default_namespace (ADR-007 Rev 2 Rule 0); \
-             base local namespace must be preserved"
+            "actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
+             writes stay pinned to local"
         );
     }
 

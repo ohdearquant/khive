@@ -2396,11 +2396,11 @@ fn actor_precedence_default_local_with_no_config() {
     );
 }
 
-/// Tier 3 (config file): no CLI, config has actor.id. Under ADR-007 Rev 2 Rule 0
-/// the config `[actor] id` is attribution only and must NOT route the storage
-/// namespace — `default_namespace` stays at the `local` hard default. (Actor
-/// attribution threading is deferred to ADR-053; `[actor] id` is inert in OSS
-/// until then.)
+/// Tier 3 (config file): no CLI, config has actor.id. Under ADR-007 Rev 4 Rule 0
+/// the config `[actor] id` must NOT route the storage `default_namespace` — writes
+/// stay pinned to `local`. Note: a non-`'local'` `actor.id` IS folded into the
+/// default READ visible-set (ADR-007 Rev 4 Rule 3b), but that does not change
+/// `default_namespace`. This test asserts only the write-routing invariant.
 #[test]
 fn actor_precedence_config_actor_id_does_not_route_namespace() {
     use khive_runtime::{runtime_config_from_khive_config, KhiveConfig, Namespace, RuntimeConfig};
@@ -2425,8 +2425,9 @@ fn actor_precedence_config_actor_id_does_not_route_namespace() {
     assert_eq!(
         resolved.default_namespace,
         Namespace::parse("local").unwrap(),
-        "config actor.id is attribution only and must NOT become default_namespace \
-         (ADR-007 Rev 2 Rule 0); the local hard default must be preserved"
+        "config actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
+         writes stay pinned to local (actor.id does contribute to READ visible-set per Rule 3b, \
+         but that does not affect default_namespace)"
     );
 }
 
