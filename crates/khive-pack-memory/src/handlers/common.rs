@@ -40,6 +40,16 @@ pub(super) fn recall_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok())
 }
 
+pub(super) fn ann_overfetch_max_rounds() -> usize {
+    static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    })
+}
+
 #[inline(always)]
 pub(super) fn plog(call_id: u64, stage: &str, us: u128) {
     eprintln!(r#"{{"c":{},"s":"{}","us":{}}}"#, call_id, stage, us);
@@ -776,12 +786,9 @@ impl MemoryPack {
             // Maximum rounds for the ANN over-fetch retry loop. Round 1 is the initial
             // over-fetch; rounds 2–N double the fetch window until the corpus is
             // exhausted or enough visible-namespace candidates are found.
-            // Can be overridden via ANN_OVERFETCH_MAX_ROUNDS env var (tests use 1 to
-            // verify the gate fires correctly, i.e. that round 1 alone is insufficient).
-            let ann_overfetch_max_rounds: usize = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3);
+            // Resolved once per process via OnceLock (see ann_overfetch_max_rounds());
+            // tests must set ANN_OVERFETCH_MAX_ROUNDS before process start.
+            let ann_overfetch_max_rounds = ann_overfetch_max_rounds();
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
