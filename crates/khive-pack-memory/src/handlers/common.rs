@@ -594,16 +594,13 @@ impl MemoryPack {
             fts_gather,
         } = opts;
 
-        // FTS recall fans out across all visible namespaces by iterating each
-        // namespace's own FTS virtual table (fts_notes_{ns}) — there is NO global
-        // FTS table and TextFilter.namespaces does NOT yield cross-namespace hits.
-        // Each namespace is selected by minting a token via token.with_namespace(ns)
-        // (see multi-namespace fanout path below at line 633+).
-        //
-        // Phase-1.5 limitation: vector/ANN recall stays primary-namespace-only.
-        // Each namespace owns a separate ANN index instance; cross-namespace
-        // recall on the vector path requires fanout+fusion across index instances,
-        // which is deferred to a follow-up PR.
+        // FTS and vector recall both fan out across all visible namespaces (ADR-007
+        // Rev 4 Phase 1.5). FTS: each namespace has its own FTS virtual table
+        // (fts_notes_{ns}); token.with_namespace(ns) selects it. Vector: each
+        // namespace has its own ANN index keyed by (namespace, model); tokens are
+        // minted via self.runtime.authorize(ns) (same pattern as warm_existing_memory_indexes
+        // in ann.rs:318) so that token.namespace().as_str() inside ensure_ann_for_model
+        // (ann.rs:344) resolves to the target namespace.
         let visible = token.visible_namespace_strs();
         let primary_ns = token.namespace().as_str().to_string();
 
@@ -664,26 +661,61 @@ impl MemoryPack {
                 .await?;
             all_text_hits.extend(hits);
         }
-        // Vector recall stays in primary namespace (single index).
-        let vector_result = self
-            .collect_recall_vector_hits(
-                token,
-                query,
-                &primary_ns,
-                RecallVectorCandidateParams {
-                    candidate_limit,
-                    embedding_model,
-                    use_multilingual,
-                    scoring_cfg,
-                },
-            )
-            .await?;
+        // Vector recall fans out across all visible namespaces (ADR-007 Rev 4 Phase 1.5).
+        // Each per-namespace token is minted via self.runtime.authorize(ns) so that
+        // token.namespace().as_str() inside ensure_ann_for_model (ann.rs:344) reads the
+        // target namespace, producing the correct AnnKey. token.with_namespace would
+        // preserve the primary namespace in the ANN key lookup, missing the legacy index.
+        //
+        // Each call receives the full candidate_limit. With N visible namespaces the total
+        // candidate pool before RRF fusion can reach N * candidate_limit — this improves
+        // recall quality and is intentional (RRF then reduces to the configured result limit).
+        let mut all_vector_per_model: Vec<(String, Vec<VectorSearchHit>)> = Vec::new();
+        let mut final_multilingual_routed = false;
+        for ns_str in &visible {
+            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
+                Ok(ns) => ns,
+                Err(_) => continue,
+            };
+            let ns_token = match self.runtime.authorize(ns_parsed) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(ns = %ns_str, error = %e,
+                        "memory vector fanout: authorize failed; skipping namespace");
+                    continue;
+                }
+            };
+            let result = self
+                .collect_recall_vector_hits(
+                    &ns_token,
+                    query,
+                    ns_str,
+                    RecallVectorCandidateParams {
+                        candidate_limit,
+                        embedding_model,
+                        use_multilingual,
+                        scoring_cfg,
+                    },
+                )
+                .await?;
+            final_multilingual_routed |= result.multilingual_routed;
+            for (model_name, hits) in result.vector_hits_per_model {
+                if let Some(entry) = all_vector_per_model
+                    .iter_mut()
+                    .find(|(m, _)| m == &model_name)
+                {
+                    entry.1.extend(hits);
+                } else {
+                    all_vector_per_model.push((model_name, hits));
+                }
+            }
+        }
 
         Ok(RecallCandidateSet {
             namespace: primary_ns,
             text_hits: all_text_hits,
-            vector_hits_per_model: vector_result.vector_hits_per_model,
-            multilingual_routed: vector_result.multilingual_routed,
+            vector_hits_per_model: all_vector_per_model,
+            multilingual_routed: final_multilingual_routed,
         })
     }
 

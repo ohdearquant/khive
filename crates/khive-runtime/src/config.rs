@@ -242,9 +242,13 @@ pub struct RuntimeConfig {
     /// 2. Namespace-bound profile resolved via `brain.resolve` at feedback time
     /// 3. Pack-local global tuning prior (default fallback)
     pub brain_profile: Option<String>,
-    /// Extra namespaces retained for configuration identity; NOT consumed by
-    /// OSS dispatch (storage token is always pinned to `local`, ADR-007 Rev 2).
-    /// Populated from `actor.visible_namespaces` in `khive.toml`.
+    /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
+    ///
+    /// OSS dispatch widens the DEFAULT multi-record read scope to
+    /// `['local'] ∪ visible_namespaces`. Writes remain pinned to `'local'`.
+    /// An explicit `namespace=` request param is a precise single-namespace
+    /// escape and is not widened. Populated from `actor.visible_namespaces`
+    /// in `khive.toml`.
     pub visible_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
@@ -391,11 +395,10 @@ pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
     base: RuntimeConfig,
 ) -> RuntimeConfig {
-    // ADR-007 Rev 2 Rule 0: `[actor] id` is attribution only and never becomes the
-    // storage namespace. `default_namespace` is whatever the caller resolved into
-    // `base` (explicit `--namespace` / `KHIVE_NAMESPACE`, else `local`). A caller
-    // targets a named namespace per request (`create(namespace=...)`), not by virtue
-    // of which actor is configured — actor identity must not silently route storage.
+    // ADR-007 Rev 4 Rule 0: `[actor] id` does NOT become the storage namespace
+    // (writes always pin to `local`). `default_namespace` is whatever the caller
+    // resolved into `base` (explicit `--namespace` / `KHIVE_NAMESPACE`, else `local`).
+    // `actor.id` contributes to the read visible-set only (see fold-in below).
     let default_namespace = base.default_namespace.clone();
 
     // base.brain_profile must carry ONLY the explicit CLI tier — never an env
@@ -422,6 +425,26 @@ pub fn runtime_config_from_khive_config(
             }
         })
         .collect();
+
+    // ADR-007 Rev 4: fold actor.id's namespace into visible_namespaces so that
+    // default reads widen to {local} ∪ {actor namespace}. Skipped when actor.id
+    // parses to `local` (mint already includes primary=local on the default path,
+    // adding it here would create a duplicate). Also skipped when it is already
+    // present from actor.visible_namespaces above.
+    let visible_namespaces = if let Some(id) = khive_cfg.actor.id.as_deref() {
+        match Namespace::parse(id) {
+            Ok(actor_ns) if actor_ns != Namespace::local() => {
+                let mut v = visible_namespaces;
+                if !v.contains(&actor_ns) {
+                    v.push(actor_ns);
+                }
+                v
+            }
+            _ => visible_namespaces,
+        }
+    } else {
+        visible_namespaces
+    };
 
     // KhiveConfig::validate() guarantees every entry in allowed_outbound_namespaces is a
     // structurally valid Namespace string, so Namespace::parse failures here are unreachable

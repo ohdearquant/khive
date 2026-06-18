@@ -160,9 +160,10 @@ fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
 /// 1. CLI `--actor` / `--namespace` (carried in `base.default_namespace`)
 /// 2. Default "local" from RuntimeConfig
 ///
-/// Config file `[actor] id` is attribution only and does NOT route the storage
-/// namespace (ADR-007 Rev 2 Rule 0); `runtime_config_from_khive_config` preserves
-/// `base.default_namespace` regardless of the configured actor.
+/// Config file `[actor] id` does NOT set `default_namespace` — writes stay
+/// pinned to `local` (ADR-007 Rev 4 Rule 0). A non-`'local'` `actor.id` IS
+/// folded into the default READ visible-set (Rule 3b), but `runtime_config_from_khive_config`
+/// preserves `base.default_namespace` regardless of the configured actor.
 ///
 /// Precedence for embedding engines:
 /// 1. Config file `[[engines]]`

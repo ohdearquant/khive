@@ -276,22 +276,20 @@ mod tests {
             .expect("Beta must be retrievable via local token");
     }
 
-    /// ADR-007 Rev 2, Rule 3 (PR-B): shared-brain visible-set regression.
+    /// ADR-007 Rev 4, Rule 3b: default read scope honors configured visible set.
     ///
-    /// The dispatch token minted by VerbRegistry must always have visible = [primary_namespace]
-    /// regardless of what `actor.visible_namespaces` was configured on the registry. All
-    /// multi-record ops (list) scope to the single shared "local" set.
+    /// The dispatch token minted by VerbRegistry on the default (no explicit `namespace=`)
+    /// path widens the read scope to `['local'] ∪ visible_namespaces`. Both the 'local'
+    /// entity AND the entity written to a configured extra namespace must appear in a
+    /// registry-dispatched list without any explicit `namespace=` parameter.
     ///
-    /// This test verifies two invariants:
+    /// This test verifies:
     ///
-    /// 1. Records written to "local" (the OSS default namespace) are visible in a list
-    ///    dispatched via the registry — the shared-brain property.
-    /// 2. A record written to a non-"local" namespace (stranded record, written via a
-    ///    directly-minted token) does NOT appear in the "local" list even when that
-    ///    extra namespace appears in the registry's visible_namespaces config — proving
-    ///    the visible set is collapsed to [primary] and not widened by the config field.
+    /// 1. Records written to "local" are visible in the list — the shared-brain property.
+    /// 2. A record written to a configured visible namespace (via a directly-minted token)
+    ///    ALSO appears in the registry-dispatched list — the Rev 4 read-scope widening.
     #[tokio::test]
-    async fn dispatch_list_scopes_to_primary_namespace_only_adr007_prb() {
+    async fn dispatch_list_honors_configured_visible_namespaces_adr007_rev4() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
         let extra_ns = Namespace::parse("alpha-test-ns").expect("valid namespace");
@@ -331,7 +329,7 @@ mod tests {
         let entity_in_extra = pack
             .dispatch(
                 "create",
-                json!({ "kind": "concept", "name": "StrandedConcept" }),
+                json!({ "kind": "concept", "name": "ConfiguredVisibleConcept" }),
                 &registry,
                 &extra_token,
             )
@@ -370,13 +368,226 @@ mod tests {
             "shared-brain: 'local' entity must appear in list; got ids: {ids:?}"
         );
         assert!(
-            !ids.contains(&extra_id),
-            "visible-set collapse: 'alpha-test-ns' entity must NOT appear in list \
-             even though that namespace was in registry.visible_namespaces; got ids: {ids:?}"
+            ids.contains(&extra_id),
+            "Rev 4 read-scope widening: 'alpha-test-ns' entity MUST appear in list \
+             because that namespace is in registry.visible_namespaces; got ids: {ids:?}"
         );
     }
 
-    /// ADR-007 Rev 2, Rule 0 regression: non-local actor config does NOT route storage.
+    /// ADR-007 Rev 4: backward-compat — with visible_namespaces UNSET, default read scope = ['local'] only.
+    ///
+    /// A registry with no `visible_namespaces` configured has the same behavior as Rev 3:
+    /// list returns only records in 'local'. A record written to a different namespace via
+    /// a directly-minted token does NOT appear in the registry list.
+    #[tokio::test]
+    async fn dispatch_list_empty_visible_namespaces_scopes_to_local_only_adr007_rev4() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        // Registry with NO visible_namespaces — backward-compat with Rev 3.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        // Intentionally NOT calling with_visible_namespaces — default is empty.
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+        let other_token = rt
+            .authorize(Namespace::parse("other-ns").expect("valid"))
+            .expect("authorize other-ns");
+
+        let entity_in_local = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "LocalConcept" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create in local must succeed");
+        let local_id = entity_in_local
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+
+        let entity_in_other = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "OtherNsConcept" }),
+                &registry,
+                &other_token,
+            )
+            .await
+            .expect("create in other-ns must succeed");
+        let other_id = entity_in_other
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id");
+
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity" }))
+            .await
+            .expect("list must succeed");
+        let items: Vec<serde_json::Value> = match list_result {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            ids.contains(&local_id),
+            "backward-compat: 'local' entity must appear in list; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&other_id),
+            "backward-compat: 'other-ns' entity must NOT appear when visible_namespaces is unset; \
+             got ids: {ids:?}"
+        );
+    }
+
+    /// ADR-007 Rev 4: 'local' is always included in the default read scope,
+    /// even when visible_namespaces does not explicitly list it.
+    ///
+    /// Configuring visible_namespaces = ["other-ns"] (without "local") must still
+    /// return records from BOTH 'local' and 'other-ns' in the registry list.
+    #[tokio::test]
+    async fn dispatch_list_local_always_included_when_visible_ns_set_adr007_rev4() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let other_ns = Namespace::parse("other-ns").expect("valid namespace");
+
+        // Registry with visible_namespaces = ["other-ns"] — does NOT contain "local".
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_visible_namespaces(vec![other_ns.clone()]);
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+        let other_token = rt.authorize(other_ns.clone()).expect("authorize other-ns");
+
+        let entity_local = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "LocalEntity" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create in local must succeed");
+        let local_id = entity_local.get("id").and_then(|v| v.as_str()).expect("id");
+
+        let entity_other = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "OtherEntity" }),
+                &registry,
+                &other_token,
+            )
+            .await
+            .expect("create in other-ns must succeed");
+        let other_id = entity_other.get("id").and_then(|v| v.as_str()).expect("id");
+
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity" }))
+            .await
+            .expect("list must succeed");
+        let items: Vec<serde_json::Value> = match list_result {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            ids.contains(&local_id),
+            "'local' must always appear in list even when not in visible_namespaces config; \
+             got ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&other_id),
+            "'other-ns' must appear because it is in visible_namespaces; got ids: {ids:?}"
+        );
+    }
+
+    /// ADR-007 Rev 4: explicit namespace= param is a precise single-namespace escape, NOT widened.
+    ///
+    /// With visible_namespaces=["other-ns"] configured, a list(namespace="other-ns") call
+    /// scopes to EXACTLY ["other-ns"] and does NOT include 'local' or the union set.
+    /// This preserves the ability to read a single named set precisely.
+    #[tokio::test]
+    async fn dispatch_explicit_namespace_param_is_precise_not_widened_adr007_rev4() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let other_ns = Namespace::parse("other-ns").expect("valid namespace");
+
+        // Registry with visible_namespaces = ["other-ns"].
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_visible_namespaces(vec![other_ns.clone()]);
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let pack = KgPack::new(rt.clone());
+        let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+        let other_token = rt.authorize(other_ns.clone()).expect("authorize other-ns");
+
+        // Write one entity in 'local' and one in 'other-ns'.
+        let entity_local = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "LocalPrecise" }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("create in local must succeed");
+        let local_id = entity_local.get("id").and_then(|v| v.as_str()).expect("id");
+
+        let entity_other = pack
+            .dispatch(
+                "create",
+                json!({ "kind": "concept", "name": "OtherPrecise" }),
+                &registry,
+                &other_token,
+            )
+            .await
+            .expect("create in other-ns must succeed");
+        let other_id = entity_other.get("id").and_then(|v| v.as_str()).expect("id");
+
+        // list(namespace="other-ns") — explicit escape: must scope to EXACTLY "other-ns".
+        let list_result = registry
+            .dispatch("list", json!({ "kind": "entity", "namespace": "other-ns" }))
+            .await
+            .expect("list with explicit namespace must succeed");
+        let items: Vec<serde_json::Value> = match list_result {
+            serde_json::Value::Array(arr) => arr,
+            other => panic!("list must return a JSON array; got: {other:?}"),
+        };
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            ids.contains(&other_id),
+            "explicit namespace='other-ns' must return the other-ns entity; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&local_id),
+            "explicit namespace='other-ns' must NOT include 'local' entity — \
+             the explicit param is a precise escape, not widened by visible_namespaces; \
+             got ids: {ids:?}"
+        );
+    }
+
+    /// ADR-007 Rev 4, Rule 0 regression: non-local actor config does NOT route WRITE storage.
     ///
     /// Builds a VerbRegistry whose `default_namespace` is `"lambda:leo"` (simulating
     /// `[actor] id = "lambda:leo"` or `--actor lambda:leo`).  Dispatches `create` and

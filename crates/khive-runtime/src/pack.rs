@@ -317,13 +317,13 @@ pub struct VerbRegistryBuilder {
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     gate: GateRef,
     default_namespace: String,
-    /// Retained for future cloud-gate policy wiring only.
+    /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
     ///
-    /// After ADR-007 Rev 2 (PR-B), `VerbRegistry::dispatch` always mints the
-    /// storage token with `Namespace::local()` and an empty extra-visible set.
-    /// This field is NOT a read-scope-widening mechanism and is ignored by the
-    /// OSS dispatch path.  A cloud gate implementation may consult it as a
-    /// policy input, but it does not flow into the storage token.
+    /// Threads into `VerbRegistry::visible_namespaces` and is consumed by the
+    /// default dispatch path to widen read scope to `['local'] ∪ visible_namespaces`.
+    /// Writes remain pinned to `'local'`. An explicit `namespace=` request param
+    /// is a precise escape and is not widened by this set. A cloud gate may also
+    /// consult the list as policy input at its own layer.
     visible_namespaces: Vec<Namespace>,
     /// Optional audit event sink.
     ///
@@ -354,14 +354,13 @@ impl VerbRegistryBuilder {
         }
     }
 
-    /// Store extra namespaces for future cloud-gate policy wiring.
+    /// Set the operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
     ///
-    /// After ADR-007 Rev 2 (PR-B), these namespaces are **not** threaded into
-    /// dispatch tokens and do **not** widen read scope.  The OSS dispatch path
-    /// always mints `Namespace::local()` with an empty extra-visible set
-    /// regardless of what is supplied here.  This setter is retained so that a
-    /// cloud gate implementation can read the value as policy input without
-    /// requiring a builder API change.
+    /// On the default (no explicit `namespace=` param) dispatch path, reads fan
+    /// out over `['local'] ∪ ns`. Writes remain pinned to `'local'`. An explicit
+    /// `namespace=` request parameter is a precise single-namespace escape and
+    /// is not widened by this set. A cloud gate may also consult the list as
+    /// policy input at its own layer.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
         self
@@ -536,6 +535,7 @@ impl VerbRegistryBuilder {
             resolvers: Arc::new(self.resolvers),
             gate: self.gate,
             default_namespace: self.default_namespace,
+            visible_namespaces: self.visible_namespaces,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -665,6 +665,13 @@ pub struct VerbRegistry {
     resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     gate: GateRef,
     default_namespace: String,
+    /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
+    ///
+    /// On the default (no explicit `namespace=` param) dispatch path, reads fan
+    /// out over `['local'] ∪ visible_namespaces`. Writes are unaffected — they
+    /// still pin to `'local'`. An explicit `namespace=` request param is a
+    /// precise single-namespace escape and is not widened by this set.
+    visible_namespaces: Vec<Namespace>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -836,26 +843,32 @@ impl VerbRegistry {
 
         // Mint the authorized storage token at the dispatch boundary.
         //
-        // ADR-007 Rev 2 Rule 0/3: storage pins to `local` by default. Actor identity,
-        // CLI `--actor`, and config `[actor] id` (carried in `default_namespace`) are
-        // attribution and gate-context inputs only — they never route storage. The one
-        // escape is an explicit `namespace=` request param (Rule 1): a caller may
-        // deliberately read/write a named set, e.g. `create(namespace="lambda:khive")`
-        // or `list(namespace="ns-beta")`. `default_namespace` reaches the gate via
-        // `gate_req` above for policy evaluation, but the storage token stays `local`
-        // unless the caller named a namespace explicitly.
+        // ADR-007 Rev 4 Rule 0/3/3b: writes pin to `local` by default. Actor
+        // identity and config `[actor] id` are attribution and gate-context inputs
+        // only — they never route storage. The explicit `namespace=` request param
+        // is a precise single-namespace escape (Rule 3): the caller deliberately
+        // reads/writes exactly that one set; it is NOT widened by `visible_namespaces`.
         //
-        // #159 pinned `local` *unconditionally*, collapsing even an explicit param and
-        // breaking namespace isolation between caller-named sets; this restores the
-        // Rule 1 escape without reviving actor-as-namespace routing. `visible_namespaces`
-        // stays dissolved (empty extra-visible set); per-actor distinctions are
-        // view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
-        let primary = match params.get("namespace").and_then(Value::as_str) {
-            Some(ns) => Namespace::parse(ns)
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?,
-            None => Namespace::local(),
+        // Rule 3b (Rev 4): on the default (no explicit `namespace=`) path, the read
+        // scope widens to `['local'] ∪ self.visible_namespaces`. `'local'` is always
+        // included (mint_with_visibility deduplicates). Writes remain pinned to
+        // `'local'`. Per-actor distinctions use view-layer tag filters
+        // (assignee, actor_id, from/to), not namespace partitions.
+        let token = match params.get("namespace").and_then(Value::as_str) {
+            Some(ns) => {
+                // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
+                let primary = Namespace::parse(ns)
+                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+                NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous())
+            }
+            None => {
+                // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
+                let primary = Namespace::local();
+                let mut extra_visible = self.visible_namespaces.clone();
+                extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
+                NamespaceToken::mint_with_visibility(primary, extra_visible, ActorRef::anonymous())
+            }
         };
-        let token = NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous());
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {

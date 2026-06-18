@@ -1,13 +1,33 @@
-# ADR-007 Rev 3: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, All Packs No-Carry
+# ADR-007 Rev 4: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
 
-**Status**: Accepted/Ratified (2026-06-17)
+**Status**: Accepted/Ratified (2026-06-18)
 **Date**: 2026-06-17
 **Authors**: lambda:khive, alpha:architect
-**Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, and Rev 2 in full)
+**Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, Rev 2, and Rev 3 read-scope clause)
 **Supersedes (partial)**: ADR-050 §"Decision"; ADR-059 §"Decision" and §"Visibility tiers"
 **Superseded-by-none**: ADR-053 (ActorStore, SessionStore, cloud-tier actor threading) survives in full
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
 | ADR-002 (edge cascade, no dangling refs)
+
+**Rev 4 summary (2026-06-17)**: Generalizes the Rev 3 default read scope. Rev 3 fixed the
+default multi-record read scope at exactly `['local']`, with an explicit `namespace=` request
+parameter as the only escape. Rev 4 widens the default read scope to `['local'] ∪
+visible_namespaces`, where `visible_namespaces` is assembled at config load from two sources:
+the operator-configured `[actor] visible_namespaces` list in `khive.toml`, and the configured
+`[actor] id` when it is non-`'local'` (folded in, deduplicated). `'local'` is always included.
+With neither configured (the default), behavior is identical to Rev 3 — fully
+backward-compatible. Writes are unchanged (still pin `'local'` by default, explicit
+`namespace=` escape unchanged), by-ID ops are unchanged (namespace-agnostic, Rule 2), and the
+Gate remains the single enforcement seam. Rev 4 deliberately AMENDS the Rev 3
+"attribution-only" reading of `[actor] id` (Rule 0): a non-`'local'` actor identity now
+contributes to the DEFAULT READ visible-set. It still never routes writes and never sets
+`default_namespace`. This is read-augmentation, not the actor-as-namespace isolation Rev 3
+rejected: it only ever ADDS namespaces to what a default read sees — it never hides records,
+never silos, and never breaks by-ID resolution (the failure modes of the rejected model, which
+hid data behind per-actor partitions for both reads and writes). Rev 4 obviates the
+Rev-3-pending PR-A2/PR-F relabel backfill: legacy non-`'local'` rows become visible by
+configuring `[actor] id` or `visible_namespaces`, without mutating stored attribution. See
+Rule 3b.
 
 **Rev 3 summary (2026-06-17)**: Promoted from Proposed to Accepted/Ratified. Closes the two
 Rev-2-deferred per-pack carry questions as NO-CARRY: comm = no-carry (reverses the Rev-2 "leans
@@ -15,6 +35,7 @@ yes"); memory = no-carry (resolves the Rev-2 "undecided"). All seven production 
 the single shared "local" namespace by default. Per-actor distinction is a view-layer tag, never
 a namespace partition. Edge namespace is attribution-only, stamped "local" by default, never an
 isolation mechanism; the ADR-059 three-column filter is rejected. ADR-059 remains withdrawn.
+(Rev 4 retains all Rev 3 rules; it generalizes only the Rule 3 default read scope.)
 
 ---
 
@@ -156,6 +177,77 @@ the gate request, never the storage token. `runtime_config_from_khive_config` tr
 as attribution only. The earlier pin of `Namespace::local()` at the dispatch mint site (PR #159)
 applied unconditionally — collapsing even an explicit parameter and so breaking namespace
 isolation between caller-named sets — and is superseded by this explicit-parameter escape.
+
+### Rule 3b — Default read scope MAY be widened by an operator-configured visible set (Rev 4)
+
+CHANGE FROM Rev 3: Rev 3 fixed the default multi-record read scope at exactly `['local']`. Rev 4
+generalizes it. The default read scope (the scope applied when no explicit `namespace=` request
+parameter is supplied) is:
+
+```
+['local'] ∪ visible_namespaces
+```
+
+where `visible_namespaces` is assembled at config load from two sources: the
+operator-configured `[actor] visible_namespaces` list in `khive.toml`, and the configured
+`[actor] id` when it is non-`'local'` (folded in, deduplicated; an actor.id of `'local'` adds
+nothing since `'local'` is always present). `'local'` is always a member, whether or not it
+appears in either source. When neither source contributes a non-`'local'` namespace, the
+default read scope is exactly `['local']`, identical to Rev 3. The widening is therefore
+opt-in: a deployment that configures neither `[actor] id` nor `[actor] visible_namespaces`
+keeps Rev 3 behavior verbatim.
+
+The scope applies to all multi-record reads for all packs: list, search, recall, neighbors,
+traverse, query. The runtime supplies the set to the store as a `WHERE namespace IN (...)`
+filter. Storage stays dumb (Rule 1): the set is caller/config-supplied, not actor-derived
+routing, and the store executes the filter it is told.
+
+What Rev 4 does NOT change:
+
+- Writes. The write namespace is `'local'` by default, or the explicit `namespace=` parameter
+  when present. `visible_namespaces` does NOT widen the write namespace. Rule 0 holds: actor
+  identity never becomes the storage namespace, and a non-`'local'` `[actor] id` does not route
+  writes. (A non-`'local'` `[actor] id` does, however, contribute to the default READ
+  visible-set — see the Rev 4 amendment to Rule 0 above and Rule 3b.)
+- The explicit `namespace=X` escape (Rule 3). An explicit request parameter scopes that one
+  operation to exactly `[X]` for both read and write. It is the precise-targeting escape and is
+  NOT widened by `visible_namespaces`: `list(namespace="ns-beta")` returns only `ns-beta`,
+  never `ns-beta ∪ local ∪ visible_namespaces`. This preserves the ability to read a single
+  named set precisely.
+- By-ID ops (Rule 2). get, update, delete, merge by UUID remain namespace-agnostic.
+- The Gate (Rule 4). Authorization remains a single seam. `visible_namespaces` is an OSS
+  configuration convenience, not an authorization mechanism. A cloud TenantGate continues to
+  mint the read-visibility set from the authenticated identity, independent of this OSS config
+  field.
+
+Why this is not the rejected actor-routing (Rev 3 Rule 0, ADR-059): the rejected model derived
+the storage namespace from actor IDENTITY for BOTH writes and reads — writes followed `[actor]
+id` into a per-actor partition and reads were confined to it, coupling identity to storage,
+hiding records behind partitions, and breaking by-ID resolution and the shared brain. Rev 4
+lets `[actor] id` contribute ONLY to the default READ visible-set, and only ever additively:
+writes still pin `'local'` (never an actor partition), `'local'` is always included, by-ID ops
+stay namespace-agnostic, and records keep their stored namespace (nothing is relabeled).
+Read-augmentation cannot reproduce the rejected model's failures because it only ever shows
+MORE, never hides, silos, or reroutes. The visible-set is a caller/config-supplied
+generalization of the Rule 1 multi-record namespace parameter from a single value to a set,
+applied to the default read path.
+
+Relation to the Rev 3 data backfill: Rev 3 §Consequences flagged a pending PR-A2/PR-F relabel
+of stranded non-`'local'` base rows to `'local'` (a live data mutation with no automatic
+rollback) so the local-only scope would return them. Rev 4 makes that backfill unnecessary for
+visibility: configuring `visible_namespaces` to include those namespaces makes the legacy rows
+visible without rewriting their stored attribution. Per the "data vs view" principle, the
+invisibility of legacy rows is a read-scope (view) problem; the correct fix is to widen the read
+scope, not to mutate stored attribution. A deployment MAY still consolidate namespaces via
+curation verbs as a deliberate data decision, but it is no longer required to restore
+visibility.
+
+Status: see implementation note in Rule 3 §Status. The visible-set machinery
+(NamespaceToken.visible, operations.rs multi-namespace read fanout over
+token.visible_namespaces(), VerbRegistryBuilder::with_visible_namespaces, server.rs config
+plumbing) was already present from the shared-brain visible-set work; Rev 4 connects it by
+minting the dispatch token with the configured visible set on the default (no-explicit-param)
+read path instead of an empty extra-visible set.
 
 ### Rule 3a — Edge namespace is attribution-only, never isolation
 
@@ -311,10 +403,34 @@ collision.
   namespace-agnostic — live-DB verified). Higher-cost than the prior amendment implied, but a
   single reindex pass is the mechanism.
 - PR-F is a live-data mutation with no automatic rollback. Requires snapshot discipline.
-- The dispatch routing is shipped (local-only scope, empty visible set). Until the PR-A2/PR-F
-  data backfill lands, KG list/search will MISS the stranded non-"local" base rows (they sit
-  under lambda:* namespaces that the default local scope no longer returns) until those rows
-  are relabeled to "local". This is a data-state gap, not a routing gap.
+- The dispatch routing shipped local-only (empty visible set). Rev 3 closed the resulting
+  data-state gap (KG list/search/recall MISS stranded non-"local" base rows) by a pending
+  PR-A2/PR-F relabel of those rows to "local". Rev 4 closes it differently: configuring
+  `visible_namespaces` to include the stranded namespaces makes the rows visible without
+  relabeling. The relabel backfill is therefore no longer required for visibility (Rule 3b).
+
+### Rev 4 deltas
+
+Positive:
+
+- Legacy non-"local" rows (e.g. v1-era lambda:* writes) become visible by configuration, with
+  no live data mutation and no FTS/ANN reindex. The Rev 3 PR-A2/PR-F relabel — a no-rollback
+  live mutation — is no longer required to restore visibility.
+- Stored attribution is preserved: a record written under lambda:leo keeps namespace=lambda:leo
+  and is readable, rather than being flattened to "local". This honors the "data vs view"
+  principle: read scope is a view decision, attribution is data.
+- Cross-actor read sharing (a configured set of namespaces visible to one deployment) without
+  granting write access to those namespaces — reads widen, writes stay pinned to "local".
+
+Negative:
+
+- A misconfigured `visible_namespaces` widens reads beyond intent. In OSS single-tenant this is
+  low-risk (one operator, one brain) but the field must be validated (non-empty entries,
+  Namespace::parse) and is logged. It is not an authorization control; a cloud TenantGate must
+  not rely on it.
+- Two read-scope mechanisms now coexist: the default widened set (Rule 3b) and the explicit
+  `namespace=` precise escape (Rule 3). The distinction (set-union default vs single-namespace
+  override) must be documented at the call site to avoid surprise.
 
 ### Neutral
 
