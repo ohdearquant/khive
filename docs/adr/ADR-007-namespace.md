@@ -1,6 +1,6 @@
 # ADR-007 Rev 4: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
 
-**Status**: Accepted/Ratified (2026-06-17)
+**Status**: Proposed (pending HC-7 review, 2026-06-18)
 **Date**: 2026-06-17
 **Authors**: lambda:khive, alpha:architect
 **Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, Rev 2, and Rev 3 read-scope clause)
