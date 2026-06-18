@@ -1,0 +1,73 @@
+name: Pipeline Regression Gate
+
+# Runs on any PR that touches the retrieval/fusion/memory stack.
+# Builds kkernel with the bench-embedder feature (deterministic FNV-1a hash,
+# no model download) then drives the full daemon path end-to-end.
+
+on:
+  pull_request:
+    paths:
+      - "crates/khive-pack-memory/**"
+      - "crates/khive-runtime/**"
+      - "crates/khive-db/**"
+      - "crates/khive-retrieval/**"
+      - "crates/khive-fusion/**"
+      - "crates/khive-bm25/**"
+      - "crates/khive-vamana/**"
+      - "crates/khive-hnsw/**"
+      - "crates/khive-score/**"
+      - "crates/khive-mcp/**"
+      - "crates/kkernel/**"
+      - "scripts/perf/bench_pipeline_daemon.py"
+      - ".github/workflows/bench-pipeline.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pipeline-gate:
+    name: Pipeline Regression Gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      # Build the bench binary (bench-embedder injects FNV-1a, no lattice model download)
+      - name: Build kkernel (bench-embedder feature)
+        run: |
+          set -euo pipefail
+          cargo build --release -p kkernel --features bench-embedder
+          cp target/release/kkernel target/release/kkernel-bench
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run pipeline regression gate
+        working-directory: .
+        env:
+          KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
+        run: |
+          set -euo pipefail
+          uv run python scripts/perf/bench_pipeline_daemon.py
+
+      - name: Upload pipeline ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-ledger
+          path: perf/pipeline-ledger.csv
+          if-no-files-found: ignore

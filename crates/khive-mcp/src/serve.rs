@@ -62,6 +62,8 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     })?;
 
     let runtime = KhiveRuntime::new(config)?;
+    #[cfg(feature = "bench-embedder")]
+    runtime.register_embedder(crate::bench_embedder::FeatureHashProvider);
     KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
 }
 

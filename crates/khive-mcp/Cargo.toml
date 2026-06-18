@@ -32,6 +32,12 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
+lattice-embed = { workspace = true, optional = true }
+
+[features]
+# bench-embedder: inject deterministic FNV-1a hash embedder into the serve path.
+# Bench-only — never enabled in release/publish builds.
+bench-embedder = ["lattice-embed"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
