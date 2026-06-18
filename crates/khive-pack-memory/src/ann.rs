@@ -37,6 +37,10 @@ impl AnnKey {
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Distinct namespaces present in the indexed corpus.
+    /// Used by the recall retry gate to short-circuit when the global index
+    /// contains no vectors outside the caller's visible namespace set.
+    pub(crate) namespace_set: HashSet<String>,
 }
 
 /// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
@@ -78,6 +82,7 @@ impl AnnBridge {
         mut vectors: Vec<f32>,
         dim: usize,
         id_map: Vec<Uuid>,
+        namespace_set: HashSet<String>,
     ) -> Result<Self, RuntimeError> {
         if dim == 0 {
             return Err(RuntimeError::Internal("dimension must be > 0".into()));
@@ -101,7 +106,11 @@ impl AnnBridge {
         let cfg = VamanaConfig::with_dimensions(dim);
         let index =
             VamanaIndex::build(&vectors, cfg).map_err(|e| RuntimeError::Internal(e.to_string()))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            namespace_set,
+        })
     }
 
     pub(crate) fn search(&self, query: &[f32], k: usize) -> Result<Vec<(Uuid, f32)>, RuntimeError> {
@@ -145,7 +154,19 @@ impl AnnBridge {
             .collect::<Result<_, _>>()?;
         let index = VamanaIndex::from_snapshot(&snapshot)
             .map_err(|e| RuntimeError::Internal(format!("snapshot restore: {e}")))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            // Namespace set is populated after restore via `populate_namespace_set`.
+            // Until then it is left empty, which causes the retry gate to be
+            // conservative (assume the index may contain non-visible namespaces).
+            namespace_set: HashSet::new(),
+        })
+    }
+
+    /// Populate `namespace_set` from an already-queried set of namespace strings.
+    pub(crate) fn set_namespace_set(&mut self, ns_set: HashSet<String>) {
+        self.namespace_set = ns_set;
     }
 }
 
@@ -205,6 +226,16 @@ pub(crate) async fn search_loaded(
             bridge.search(query, k).map(Some)
         }
     }
+}
+
+/// Return the namespace set for the loaded index, or `None` on cache miss.
+///
+/// An empty set (returned for snapshot-restored indexes before their set is
+/// populated) must be treated conservatively by the caller — i.e. assume the
+/// index may contain non-visible namespaces and proceed with the retry loop.
+pub(crate) async fn index_namespace_set(ann: &SharedAnn, key: &AnnKey) -> Option<HashSet<String>> {
+    let guard = ann.indexes.read().await;
+    guard.get(key).map(|b| b.namespace_set.clone())
 }
 
 /// Remove a single in-memory ANN slot and its warming guard entry.
@@ -317,7 +348,13 @@ pub(crate) async fn ensure_ann_for_model(
         if let Some(fp) = current_fp {
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_snapshot(snapshot) {
-                    Ok(bridge) => {
+                    Ok(mut bridge) => {
+                        // Populate namespace set from a cheap DISTINCT query so the
+                        // retry gate in recall can short-circuit when appropriate.
+                        let ns_set = query_distinct_namespaces(rt, token, model)
+                            .await
+                            .unwrap_or_default();
+                        bridge.set_namespace_set(ns_set);
                         ann.indexes.write().await.entry(key).or_insert(bridge);
                         tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
                         return Ok(AnnEnsureStatus::LoadedSnapshot);
@@ -374,6 +411,46 @@ pub(crate) async fn ensure_ann_for_model(
 }
 
 // ── corpus loading ────────────────────────────────────────────────────────────
+
+/// Query the set of distinct `namespace` values present in the vector corpus for `model`.
+/// Used after snapshot restore to populate the in-memory namespace set.
+async fn query_distinct_namespaces(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+) -> Option<HashSet<String>> {
+    let store = rt.vectors_for_model(token, model).ok()?;
+    let _ = store; // ensure store is accessible; actual query goes to SQL layer
+    let model_key = sanitize_model_key(model);
+    let table_name = format!("vec_{model_key}");
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.ok()?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT DISTINCT n.namespace FROM {table_name} v \
+                 JOIN notes n ON n.id = v.subject_id \
+                 WHERE v.embedding_model = ?1 \
+                   AND v.kind = 'note' AND v.field = 'note.content' \
+                   AND n.deleted_at IS NULL"
+            ),
+            params: vec![SqlValue::Text(model.to_owned())],
+            label: Some("memory_ann_distinct_namespaces".into()),
+        })
+        .await
+        .ok()?;
+    let set: HashSet<String> = rows
+        .into_iter()
+        .filter_map(|row| {
+            if let Some(SqlValue::Text(ns)) = row.get("namespace") {
+                Some(ns.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Some(set)
+}
 
 /// Compute a fingerprint for all non-deleted memory note vectors for `model` (all namespaces).
 async fn compute_memory_fingerprint(
@@ -442,7 +519,7 @@ async fn load_and_build_from_vector_store(
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT v.subject_id, v.embedding FROM {table_name} v \
+                "SELECT v.subject_id, v.embedding, n.namespace FROM {table_name} v \
                  JOIN notes n ON n.id = v.subject_id \
                  WHERE v.embedding_model = ?1 \
                    AND v.kind = 'note' AND v.field = 'note.content' \
@@ -461,6 +538,7 @@ async fn load_and_build_from_vector_store(
 
     let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
+    let mut namespace_set: HashSet<String> = HashSet::new();
 
     for row in &rows {
         let id_str = match row.get("subject_id") {
@@ -482,6 +560,9 @@ async fn load_and_build_from_vector_store(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        if let Some(SqlValue::Text(ns)) = row.get("namespace") {
+            namespace_set.insert(ns.clone());
+        }
         id_map.push(uuid);
         flat.extend_from_slice(&vec);
     }
@@ -490,7 +571,7 @@ async fn load_and_build_from_vector_store(
         return Ok(None);
     }
 
-    AnnBridge::build(flat, dims, id_map).map(Some)
+    AnnBridge::build(flat, dims, id_map, namespace_set).map(Some)
 }
 
 // ── persistence ───────────────────────────────────────────────────────────────
@@ -652,7 +733,8 @@ mod tests {
             0.0, 1.0, 0.0, // id_b
             0.0, 0.0, 1.0, // id_c
         ];
-        let bridge = AnnBridge::build(vectors, 3, vec![id_a, id_b, id_c]).expect("build");
+        let bridge =
+            AnnBridge::build(vectors, 3, vec![id_a, id_b, id_c], HashSet::new()).expect("build");
 
         // query close to id_a
         let hits = bridge.search(&[1.0, 0.0, 0.0], 1).expect("search");
@@ -664,8 +746,8 @@ mod tests {
     #[test]
     fn ann_search_dimension_error_returns_err() {
         let id = Uuid::new_v4();
-        let bridge =
-            AnnBridge::build(vec![1.0f32, 0.0, 0.0], 3, vec![id]).expect("build 3-dim bridge");
+        let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0], 3, vec![id], HashSet::new())
+            .expect("build 3-dim bridge");
         // query with wrong dimension (2 instead of 3)
         let result = bridge.search(&[1.0, 0.0], 1);
         assert!(result.is_err(), "wrong dimension must return Err");
@@ -696,10 +778,10 @@ mod tests {
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
 
-        let bridge_a =
-            AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id_a]).expect("build a");
-        let bridge_b =
-            AnnBridge::build(vec![0.0f32, 1.0, 0.0, 0.0], 4, vec![id_b]).expect("build b");
+        let bridge_a = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id_a], HashSet::new())
+            .expect("build a");
+        let bridge_b = AnnBridge::build(vec![0.0f32, 1.0, 0.0, 0.0], 4, vec![id_b], HashSet::new())
+            .expect("build b");
 
         // Keys are model-only; namespace arg is ignored.
         let key_a = AnnKey::new("any-ns", model_a);

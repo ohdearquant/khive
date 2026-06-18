@@ -776,7 +776,12 @@ impl MemoryPack {
             // Maximum rounds for the ANN over-fetch retry loop. Round 1 is the initial
             // over-fetch; rounds 2–N double the fetch window until the corpus is
             // exhausted or enough visible-namespace candidates are found.
-            const ANN_OVERFETCH_MAX_ROUNDS: usize = 3;
+            // Can be overridden via ANN_OVERFETCH_MAX_ROUNDS env var (tests use 1 to
+            // verify the gate fires correctly, i.e. that round 1 alone is insufficient).
+            let ann_overfetch_max_rounds: usize = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
@@ -830,18 +835,35 @@ impl MemoryPack {
                     let note_store = self.runtime.notes(token)?;
                     let visible_set: std::collections::HashSet<&str> =
                         visible_namespaces.iter().map(String::as_str).collect();
-                    let is_multi_ns = visible_namespaces.len() > 1
-                        || visible_namespaces
-                            .first()
-                            .is_some_and(|ns| ns.as_str() != "local");
+
+                    // Gate: run the retry loop only when the global ANN index contains
+                    // vectors from namespaces outside the caller's visible set.
+                    //
+                    // We query the namespace set stored on the loaded AnnBridge. If the
+                    // set is empty (e.g. freshly snapshot-restored bridge whose set has
+                    // not yet been populated) we treat it conservatively as "may contain
+                    // non-visible namespaces" and proceed with the loop. If the index
+                    // namespace set is a subset of visible_set then all indexed vectors
+                    // pass the post-filter on round 1 — no retry needed.
+                    let index_has_non_visible =
+                        match ann::index_namespace_set(&self.ann, &key).await {
+                            Some(index_ns) if !index_ns.is_empty() => {
+                                !index_ns.iter().all(|ns| visible_set.contains(ns.as_str()))
+                            }
+                            // Empty set (snapshot-restored without population yet) or cache miss:
+                            // be conservative — assume non-visible namespaces may be present.
+                            _ => true,
+                        };
 
                     let mut best_raw = first_raw;
                     let mut current_fetch_limit = ann_fetch_limit;
 
-                    // Only run the retry loop when there are multiple visible namespaces;
-                    // single-namespace stores always get all local candidates on round 1.
-                    if is_multi_ns {
-                        for _round in 1..ANN_OVERFETCH_MAX_ROUNDS {
+                    // Run the retry loop only when the index spans namespaces outside
+                    // the caller's visible set. On a single-namespace store where the
+                    // index only covers the visible namespace, this is skipped entirely
+                    // at zero extra cost (no note-batch fetch, no extra ANN searches).
+                    if index_has_non_visible {
+                        for _round in 1..ann_overfetch_max_rounds {
                             let corpus_exhausted = best_raw.len() < current_fetch_limit;
                             if corpus_exhausted {
                                 break;

@@ -1506,6 +1506,89 @@ mod tests {
         assert_eq!(after, 0, "row must be deleted by drop_vectors_for_subjects");
     }
 
+    // C3 alias regression: drop_vectors_for_subjects via a lattice ALIAS must target
+    // the SAME canonical table as the insert path that used the full canonical name.
+    //
+    // Previously the old hand-sanitized path would diverge on aliases like "paraphrase"
+    // (→ "paraphrase-multilingual-minilm-l12-v2" canonical, table
+    // "vec_paraphrase_multilingual_minilm_l12_v2"). Both the insert path and the drop
+    // path go through rt.vectors_for_model() which resolves the alias to the same
+    // canonical VectorStore — the bug cannot happen with the current implementation.
+    //
+    // This test registers a stub under the canonical name, inserts via the canonical
+    // name, drops via the short alias "paraphrase", and asserts the row is gone.
+    // It FAILS if either path hand-derives the table name from the raw string instead
+    // of routing through vectors_for_model().
+    #[tokio::test]
+    async fn drop_vectors_for_subjects_paraphrase_alias_targets_same_table_as_insert() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+        use khive_types::SubstrateKind;
+        use lattice_embed::EmbeddingModel;
+
+        // "paraphrase" is a short alias for the built-in lattice model.
+        // vectors_for_model resolves both the alias and the canonical name to the
+        // same physical table (key = sanitize_key(CANONICAL), dims = 384).
+        //
+        // We register the model in RuntimeConfig so vectors_for_model(CANONICAL)
+        // can resolve it without an Unknown model error.  We write raw VectorRecords
+        // directly — the embedder is never called — so DIMS must equal the lattice
+        // model's declared output dimension.
+        const CANONICAL: &str = "paraphrase-multilingual-minilm-l12-v2";
+        const ALIAS: &str = "paraphrase";
+        // Must equal EmbeddingModel::ParaphraseMultilingualMiniLmL12V2::dimensions().
+        const DIMS: usize = 384;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        // The paraphrase model is now in the registry under its canonical name.
+        // vectors_for_model("paraphrase") and vectors_for_model(CANONICAL) must
+        // both resolve to the same table — that is what this test verifies.
+
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Insert via the canonical name (same as the normal embed-and-store path).
+        let store_canonical = rt
+            .vectors_for_model(&token, CANONICAL)
+            .expect("canonical store");
+        let subject_id = Uuid::new_v4();
+        store_canonical
+            .insert_batch(vec![VectorRecord {
+                subject_id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "content".to_string(),
+                embedding_model: Some(CANONICAL.to_string()),
+                vectors: vec![vec![0.1_f32; DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch via canonical name");
+
+        let before = store_canonical.count().await.expect("count before");
+        assert_eq!(before, 1, "row must exist before alias-drop");
+
+        // Drop via the ALIAS "paraphrase".  vectors_for_model resolves alias →
+        // EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 → same canonical table.
+        // If the implementation ever diverges (hand-sanitizes the raw alias string),
+        // the delete targets a different table and `after` stays 1 → test fails.
+        drop_vectors_for_subjects(&rt, &token, ALIAS, &[subject_id]).await;
+
+        let after = store_canonical.count().await.expect("count after");
+        assert_eq!(
+            after, 0,
+            "alias-routed drop must delete from the same canonical table as insert; \
+             after={after} (expected 0). \
+             Failure means alias 'paraphrase' resolved to a different table than CANONICAL."
+        );
+    }
+
     #[test]
     fn has_failures_flags_notes_fts_failed() {
         let report = ReindexReport {

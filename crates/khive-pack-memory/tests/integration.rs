@@ -3283,26 +3283,124 @@ async fn test_multi_namespace_recall_overfetch_filter() {
     }
 }
 
-// C1 regression: ANN bounded retry — local memories must be found even when the
-// first over-fetch round is dominated by foreign-namespace hits.
+// ── C1 regression (rewritten) ─────────────────────────────────────────────────
 //
-// Stores N_FOREIGN "foreign" memories followed by N_LOCAL "local" memories in an
-// ANN index that spans both namespaces.  For a wide token (visible = local + foreign),
-// recall@N_LOCAL with `ann_fetch_limit` < total corpus is forced to widen and retry
-// until local candidates accumulate.
+// ANN bounded retry — local memories must be found even when the first over-fetch
+// round is dominated by foreign-namespace vectors that cluster NEAR the query.
 //
-// The retry loop fires when: (a) `is_multi_ns` is true, (b) visible-local survivors
-// from round 1 < candidate_limit, and (c) corpus is not yet exhausted.  Round 2
-// doubles the fetch window; at most ANN_OVERFETCH_MAX_ROUNDS = 3 total rounds.
+// Setup (deterministic, hand-constructed geometry):
+//   - N_FOREIGN=50 "foreign" vectors embedded near the query direction [1,0,0,0].
+//   - N_LOCAL=3  "local"   vectors embedded far from the query direction [0,1,0,0].
+//   - Query text maps to [1,0,0,0] (same cluster as foreign).
+//   - candidate_limit = Some(8) → ann_fetch_limit = max(8×4, 8+32) = 40.
+//   - Round 1: ANN returns 40 nearest → all foreign (locals are far). 0 local survivors.
+//   - The retry gate must fire (index spans "foreign" which is NOT in visible {"local"}).
+//   - Round 2: doubles fetch to 80 > 53 total → exhausts corpus, finds all 3 locals.
 //
-// Correctness assertion: ALL local memory IDs appear in the recall result set,
-// regardless of which round they were found in.
-#[tokio::test]
-async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_cluster() {
-    use khive_runtime::PackRuntime;
+// Correctness:
+//   - Default (ANN_OVERFETCH_MAX_ROUNDS env unset → 3 rounds): all locals FOUND.
+//   - ANN_OVERFETCH_MAX_ROUNDS=1 (single round only): locals MISSING.
+//     Run as: ANN_OVERFETCH_MAX_ROUNDS=1 cargo test -p khive-pack-memory \
+//                test_ann_overfetch_retry_stalls_without_widening
+//
+// Token: uses a DEFAULT local-only token — the production default-recall scenario.
 
-    const MODEL: &str = "c1-retry-enc";
-    const DIMS: usize = 4;
+/// Content-keyed embedding service.
+///
+/// Foreign cluster (query direction):
+///   texts containing "xforeign", or the query "xforeign dominant cluster" → [1,0,0,0]
+///   cosine with query = 1.0 — closest to query, fill top-40 ANN results.
+///
+/// Local cluster (far from query but NOT orthogonal):
+///   texts containing "xlocal" → [0.15, 0.9887, 0.0, 0.0] (pre-normalised unit vector)
+///   cosine with query [1,0,0,0] = 0.15 — above the default min_raw_relevance=0.10 floor,
+///   but cosine < 1.0 so ANN ranks locals behind all 50 foreign vectors.
+///
+/// Geometry guarantee:
+///   ann_fetch_limit=40 < 50 foreign vectors → round 1 returns only foreign hits;
+///   locals are unreachable until the retry widens the window to >53.
+struct ClusteredVecService;
+
+#[async_trait]
+impl EmbeddingService for ClusteredVecService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                if t.contains("xlocal") {
+                    // Far cluster: cosine=0.15 with query direction → above score floor,
+                    // but farther than all 50 foreign vectors (cosine=1.0).
+                    // Pre-normalised: 0.15² + 0.9887² ≈ 0.0225 + 0.9775 = 1.0000.
+                    vec![0.15_f32, 0.9887, 0.0, 0.0]
+                } else {
+                    // "xforeign" content and the query both map to the foreign cluster.
+                    vec![1.0_f32, 0.0, 0.0, 0.0]
+                }
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "clustered-vec"
+    }
+}
+
+struct ClusteredVecProvider {
+    provider_name: String,
+}
+
+impl ClusteredVecProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            provider_name: name.to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbedderProvider for ClusteredVecProvider {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(ClusteredVecService))
+    }
+}
+
+/// Shared setup for the C1 regression tests. Returns `(rt, registry, pack, local_ids)`.
+///
+/// Corpus layout:
+///   - 50 foreign memories with vector [1,0,0,0]        (cosine=1.0, nearest to query)
+///   - 3  local  memories with vector [0.15,0.9887,0,0] (cosine=0.15, farther from query)
+///   - Query "xforeign dominant cluster" → vector [1,0,0,0]
+///   - candidate_limit = Some(8) → ann_fetch_limit = 40 < total 53
+///
+/// With only 40 candidates fetched in round 1, all 40 are foreign (nearest to query).
+/// Locals are ranked 51-53 (behind all 50 foreign) and NOT retrieved until the fetch
+/// window is widened to ≥53 (round 2 doubles to 80, exhausting the corpus).
+///
+/// Local cosine=0.15 is above the default min_raw_relevance=0.10 score floor so locals
+/// survive the final scoring step once the retry loop surfaces them.
+async fn c1_setup() -> (
+    KhiveRuntime,
+    khive_runtime::VerbRegistry,
+    MemoryPack,
+    Vec<String>,
+) {
+    const MODEL: &str = "c1-clustered-enc";
     const N_FOREIGN: usize = 50;
     const N_LOCAL: usize = 3;
 
@@ -3313,17 +3411,18 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
         ..RuntimeConfig::default()
     })
     .expect("runtime");
-    rt.register_embedder(ConstVecProvider::new(MODEL, DIMS, 0.5));
+    rt.register_embedder(ClusteredVecProvider::new(MODEL));
 
     let registry = make_registry(rt.clone());
 
-    // Insert N_FOREIGN memories in the "foreign" namespace.
+    // Insert N_FOREIGN memories in "foreign" namespace. Content contains "xforeign"
+    // so the embedder returns [1,0,0,0] — same direction as the query vector.
     for i in 0..N_FOREIGN {
         registry
             .dispatch(
                 "memory.remember",
                 json!({
-                    "content": format!("foreign memory {i} occupying ann slot"),
+                    "content": format!("xforeign memory slot {i} cluster-a"),
                     "salience": 0.6,
                     "namespace": "foreign"
                 }),
@@ -3332,15 +3431,16 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
             .unwrap_or_else(|e| panic!("foreign remember {i} failed: {e}"));
     }
 
-    // Insert N_LOCAL memories in the "local" namespace AFTER foreign ones,
-    // so in insertion-order ANN they appear at the end.
+    // Insert N_LOCAL memories in "local" namespace. Content contains "xlocal"
+    // so the embedder returns [0.15,0.9887,0,0] — far from query (cosine=0.15),
+    // ranked behind all 50 foreign vectors but above the min_raw_relevance floor.
     let mut local_ids = Vec::new();
     for i in 0..N_LOCAL {
         let r = registry
             .dispatch(
                 "memory.remember",
                 json!({
-                    "content": format!("local memory {i} that must be recalled"),
+                    "content": format!("xlocal memory {i} must be recalled"),
                     "salience": 0.8,
                     "namespace": "local"
                 }),
@@ -3350,34 +3450,45 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
         local_ids.push(r["id"].as_str().expect("note_id").to_string());
     }
 
-    // Warm the ANN so all vectors are indexed.
     let pack = MemoryPack::new(rt.clone());
-    pack.warm().await;
+    {
+        use khive_runtime::PackRuntime;
+        pack.warm().await;
+    }
 
-    // Wide token: visible = [local, foreign].  The global ANN index spans all
-    // N_FOREIGN + N_LOCAL = 53 vectors.  With candidate_limit = N_LOCAL and
-    // ann_fetch_limit = max(N_LOCAL*4, N_LOCAL+32) = 35, the first round fetches
-    // 35 of the 53 total.  If ANN returns foreign-namespace entries first (which is
-    // likely when N_FOREIGN > ann_fetch_limit), visible-local survivors < N_LOCAL
-    // and the retry fires.  Round 2 doubles the limit to 70 > 53, exhausting the
-    // corpus and finding all locals.  The assertion must hold regardless of which
-    // round found them.
-    let wide_token = rt
-        .authorize_with_visibility(
-            Namespace::parse("local").expect("local ns"),
-            vec![Namespace::parse("foreign").expect("foreign ns")],
-        )
-        .expect("wide token");
+    (rt, registry, pack, local_ids)
+}
+
+// C1 main: with default retry rounds, local memories ARE found despite the foreign
+// cluster dominating the first over-fetch round.
+#[tokio::test]
+async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_cluster() {
+    use khive_runtime::PackRuntime;
+
+    let (rt, registry, pack, local_ids) = c1_setup().await;
+
+    // Local-only token: the production default. visible = {"local"}.
+    // The global ANN index spans {"local", "foreign"} — retry gate must fire.
+    let local_token = rt
+        .authorize(Namespace::parse("local").expect("local ns"))
+        .expect("authorize local");
 
     let result = pack
         .dispatch(
             "memory.recall",
-            json!({ "query": "local memory must be recalled", "limit": N_LOCAL }),
+            // candidate_limit=Some(8) → ann_fetch_limit=40. Query maps to [1,0,0,0]
+            // (same as foreign cluster). Round 1 returns 40 foreign hits, 0 local.
+            // Retry widens to 80>53, exhausting corpus and finding all 3 locals.
+            json!({
+                "query": "xforeign dominant cluster",
+                "limit": 3,
+                "config": { "candidate_limit": 8 }
+            }),
             &registry,
-            &wide_token,
+            &local_token,
         )
         .await
-        .expect("wide-token recall");
+        .expect("local-token recall");
 
     let hits: Vec<&str> = result
         .as_array()
@@ -3386,11 +3497,72 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
         .map(|h| h["id"].as_str().unwrap())
         .collect();
 
-    // All N_LOCAL local memories must appear in the result.
     for lid in &local_ids {
         assert!(
             hits.contains(&lid.as_str()),
-            "C1 retry regression: local memory {lid} must be in recall result; got: {hits:?}"
+            "C1 retry regression: local memory {lid} must be in recall result with retry; \
+             got: {hits:?}. If this fails with ANN_OVERFETCH_MAX_ROUNDS=1, that is expected."
+        );
+    }
+}
+
+// C1 stall: with ANN_OVERFETCH_MAX_ROUNDS=1, local memories are NOT found because the
+// retry loop is disabled. This test PASSES only when ANN_OVERFETCH_MAX_ROUNDS=1 is set.
+// It is skipped silently when the env var is absent or != "1".
+//
+// Run to confirm the gate matters:
+//   ANN_OVERFETCH_MAX_ROUNDS=1 cargo test -p khive-pack-memory \
+//       test_ann_overfetch_retry_stalls_without_widening -- --nocapture
+#[tokio::test]
+async fn test_ann_overfetch_retry_stalls_without_widening() {
+    use khive_runtime::PackRuntime;
+
+    // Only meaningful when ANN_OVERFETCH_MAX_ROUNDS=1 is set externally.
+    // When unset, the retry loop runs to default (3 rounds) and locals ARE found —
+    // which would make this test always pass trivially. Skip unless forced to 1.
+    let max_rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
+    if max_rounds != 1 {
+        // Not running with the stall condition — skip.
+        return;
+    }
+
+    let (rt, registry, pack, local_ids) = c1_setup().await;
+
+    let local_token = rt
+        .authorize(Namespace::parse("local").expect("local ns"))
+        .expect("authorize local");
+
+    let result = pack
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "xforeign dominant cluster",
+                "limit": 3,
+                "config": { "candidate_limit": 8 }
+            }),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local-token recall (stall)");
+
+    let hits: Vec<&str> = result
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+
+    // With a single round, round 1 fetches 40 of 53 vectors — all foreign (near query).
+    // No retry fires, so local memories (far from query) are silently dropped.
+    for lid in &local_ids {
+        assert!(
+            !hits.contains(&lid.as_str()),
+            "C1 stall: local memory {lid} must NOT appear in single-round recall; \
+             if it does, the test corpus geometry is wrong. hits: {hits:?}"
         );
     }
 }
