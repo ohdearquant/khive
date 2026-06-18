@@ -578,6 +578,17 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         if let Err(e) = invalidate_vamana_snapshots(&rt, &ns_str).await {
             tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
         }
+
+        // Purge stale per-namespace memory Vamana snapshot rows (legacy key format
+        // `{ns}::memory_vamana::*`). After FTS+ANN consolidation the unified key is
+        // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
+        purge_stale_memory_vamana_snapshots(&rt).await;
+
+        // Drop per-namespace FTS partition tables that survived the V4 migration
+        // (tables created by the runtime before the migration ran, or on databases
+        // that were migrated but not swept). Safe to run on any V4+ database;
+        // a no-op on fresh databases.
+        sweep_stale_fts_partitions(&rt).await;
     } // end if do_graph
 
     // ── knowledge corpus ───────────────────────────────────────────────────────
@@ -724,6 +735,118 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("{e}"))
+            }
+        }
+    }
+}
+
+/// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
+/// After FTS+ANN consolidation the active key is `global::memory_vamana::*`; old per-ns rows
+/// are orphaned. Best-effort — missing table or SQL failure is logged and ignored.
+async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
+    use khive_storage::types::SqlStatement;
+    let sql = rt.sql();
+    let Ok(mut writer) = sql.writer().await else {
+        return;
+    };
+    match writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM retrieval_snapshots \
+                  WHERE index_type = 'memory_vamana' AND namespace != 'global'"
+                .into(),
+            params: vec![],
+            label: Some("purge_stale_memory_vamana_snapshots".into()),
+        })
+        .await
+    {
+        Ok(deleted) => {
+            if deleted > 0 {
+                tracing::info!(deleted, "purged stale per-ns memory Vamana snapshot rows");
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("no such table") {
+                tracing::warn!(error = %e, "failed to purge stale memory Vamana snapshots");
+            }
+        }
+    }
+}
+
+/// Drop per-namespace FTS5 partition tables (`fts_entities_*`, `fts_notes_*`) that
+/// may exist in databases that were not yet migrated or were created before V4.
+/// Canonical tables (`fts_entities`, `fts_notes`, `fts_knowledge`, `fts_sections`)
+/// and their FTS5 shadow tables are never dropped.
+/// Safe to run repeatedly; a no-op on fresh databases.
+async fn sweep_stale_fts_partitions(rt: &KhiveRuntime) {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    // Canonical base names that must never be dropped.
+    let canonical: &[&str] = &["fts_entities", "fts_notes", "fts_knowledge", "fts_sections"];
+
+    // FTS5 shadow table suffixes that must never be dropped (the extension drops
+    // them automatically when the virtual table itself is dropped; we only drop
+    // the virtual table, so these patterns must be excluded from discovery).
+    let shadow_suffixes: &[&str] = &["_data", "_idx", "_docsize", "_config", "_content"];
+
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return;
+    };
+
+    // Find candidate tables: type='table', name starts with `fts_entities_` or `fts_notes_`.
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name FROM sqlite_master \
+                  WHERE type IN ('table', 'shadow') \
+                    AND (name LIKE 'fts_entities_%' OR name LIKE 'fts_notes_%')"
+                .into(),
+            params: vec![],
+            label: Some("sweep_stale_fts_partitions_discover".into()),
+        })
+        .await;
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to discover stale FTS partition tables");
+            return;
+        }
+    };
+
+    let mut to_drop: Vec<String> = Vec::new();
+    for row in &rows {
+        let name = match row.get("name") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => continue,
+        };
+        // Skip canonical tables.
+        if canonical.contains(&name.as_str()) {
+            continue;
+        }
+        // Skip FTS5 shadow tables (they are dropped automatically with the virtual table).
+        if shadow_suffixes.iter().any(|suf| name.ends_with(suf)) {
+            continue;
+        }
+        to_drop.push(name);
+    }
+    drop(reader);
+
+    if to_drop.is_empty() {
+        return;
+    }
+
+    let Ok(mut writer) = sql.writer().await else {
+        return;
+    };
+    for table in &to_drop {
+        let ddl = format!("DROP TABLE IF EXISTS \"{table}\"");
+        match writer.execute_script(ddl).await {
+            Ok(_) => {
+                tracing::info!(table, "dropped stale FTS partition table");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, table, "failed to drop stale FTS partition table");
             }
         }
     }
