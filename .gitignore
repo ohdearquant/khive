@@ -94,3 +94,6 @@ uv.lock
 pyproject.toml
 
 *results.json
+
+# Pipeline ledger — written locally and uploaded as CI artifact; not committed.
+perf/pipeline-ledger.csv

@@ -23,25 +23,32 @@ fn fnv1a_64(data: &[u8]) -> u64 {
     h
 }
 
+/// Feature-hashing embedder: tokenise → per-token (dim, sign) → accumulate → L2-normalise.
+///
+/// Lexically similar texts share tokens and therefore accumulate signal in the
+/// same dimensions with the same sign, producing correlated vectors. This lets
+/// the gate exercise the vector/ANN/fusion legs rather than treating them as
+/// pure noise (as the previous whole-text FNV avalanche did).
 fn hash_embed(text: &str) -> Vec<f32> {
-    let bytes = text.as_bytes();
     let mut v = vec![0.0f32; DIM];
-    for (i, slot) in v.iter_mut().enumerate() {
-        let seed = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let salted: Vec<u8> = seed
-            .to_le_bytes()
-            .iter()
-            .chain(bytes.iter())
-            .copied()
-            .collect();
-        let h = fnv1a_64(&salted);
-        let h2 = fnv1a_64(&h.to_le_bytes());
-        let raw = (h ^ h2.rotate_right(17)) as i64;
-        *slot = raw as f32;
+    for token in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        let h = fnv1a_64(token.as_bytes());
+        let dim = ((h >> 1) as usize) % DIM;
+        let sign = if h & 1 == 0 { 1.0_f32 } else { -1.0_f32 };
+        v[dim] += sign;
     }
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
     v.iter_mut().for_each(|x| *x /= norm);
     v
+}
+
+#[cfg(test)]
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 struct FeatureHashService;
@@ -79,5 +86,28 @@ impl EmbedderProvider for FeatureHashProvider {
 
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         Ok(Arc::new(FeatureHashService))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same-cluster strings (sharing several topic words) must be more similar
+    /// to each other than cross-cluster strings (disjoint vocabularies).
+    /// This locks the clustering property of the feature-hashing embedder.
+    #[test]
+    fn feature_hash_same_cluster_more_similar_than_cross_cluster() {
+        let a = hash_embed("knowledge graph entity edge relation ontology");
+        let b = hash_embed("knowledge graph concept node link schema");
+        let c = hash_embed("Rust cargo clippy fmt workspace crate lint");
+
+        let sim_same = cosine(&a, &b);
+        let sim_cross = cosine(&a, &c);
+
+        assert!(
+            sim_same > sim_cross,
+            "same-cluster cosine ({sim_same:.4}) must be > cross-cluster cosine ({sim_cross:.4})"
+        );
     }
 }

@@ -1,3 +1,0 @@
-git_sha,runner_os,loadavg1,produced_at,precision_at_k,p50_us,p95_us,n_queries,n_corpus
-31c335805f2b0d497f0dc5f98f4ddfbe00f1d5a1,darwin-arm64,4.04,2026-06-18T21:07:07Z,0.9267,4946,5212,15,600
-31c335805f2b0d497f0dc5f98f4ddfbe00f1d5a1,darwin-arm64,10.74,2026-06-18T21:08:31Z,0.9267,5136,5480,15,600
