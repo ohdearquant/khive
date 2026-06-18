@@ -160,4 +160,24 @@ pub trait VectorStore: Send + Sync + 'static {
             message: "this backend does not support batch existence checks".into(),
         })
     }
+
+    /// Delete all rows for the given subject IDs, regardless of their stored namespace.
+    ///
+    /// This is a namespace-agnostic sweep — it removes every vector row whose
+    /// `subject_id` matches, no matter which namespace the row was written under.
+    /// Required when the vec table's PRIMARY KEY is `subject_id` alone (not
+    /// `(subject_id, namespace)`): a row from a prior namespace would collide on
+    /// re-insert after a relabel, so the pre-insert drop must target by subject
+    /// only. Returns the number of rows deleted across all chunks.
+    ///
+    /// Default returns [`StorageError::Unsupported`]; backends that store vectors
+    /// in a per-subject keyed table should override this method.
+    async fn delete_subjects(&self, ids: &[Uuid]) -> StorageResult<u64> {
+        let _ = ids;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "delete_subjects".into(),
+            message: "this backend does not support namespace-agnostic subject deletion".into(),
+        })
+    }
 }

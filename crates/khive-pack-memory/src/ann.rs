@@ -1,4 +1,5 @@
-//! Warm ANN bridge: wraps `VamanaIndex` per `(namespace, model)` to cache memory-note vector search.
+//! Warm ANN bridge: wraps `VamanaIndex` per model to cache memory-note vector search.
+//! One index per model covers all namespaces; namespace filtering is applied at recall time.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -13,29 +14,33 @@ use uuid::Uuid;
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-/// Cache key for a per-`(namespace, model)` ANN slot.
+/// Cache key for a per-model ANN slot (one index per model, all namespaces combined).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AnnKey {
-    pub(crate) namespace: String,
     pub(crate) model: String,
 }
 
 impl AnnKey {
-    pub(crate) fn new(namespace: impl Into<String>, model: impl Into<String>) -> Self {
+    pub(crate) fn new(_namespace: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            namespace: namespace.into(),
             model: model.into(),
         }
     }
 
-    pub(crate) fn from_token(token: &NamespaceToken, model: &str) -> Self {
-        Self::new(token.namespace().as_str(), model)
+    pub(crate) fn from_token(_token: &NamespaceToken, model: &str) -> Self {
+        Self {
+            model: model.to_owned(),
+        }
     }
 }
 
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Distinct namespaces present in the indexed corpus.
+    /// Used by the recall retry gate to short-circuit when the global index
+    /// contains no vectors outside the caller's visible namespace set.
+    pub(crate) namespace_set: HashSet<String>,
 }
 
 /// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
@@ -77,6 +82,7 @@ impl AnnBridge {
         mut vectors: Vec<f32>,
         dim: usize,
         id_map: Vec<Uuid>,
+        namespace_set: HashSet<String>,
     ) -> Result<Self, RuntimeError> {
         if dim == 0 {
             return Err(RuntimeError::Internal("dimension must be > 0".into()));
@@ -100,7 +106,11 @@ impl AnnBridge {
         let cfg = VamanaConfig::with_dimensions(dim);
         let index =
             VamanaIndex::build(&vectors, cfg).map_err(|e| RuntimeError::Internal(e.to_string()))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            namespace_set,
+        })
     }
 
     pub(crate) fn search(&self, query: &[f32], k: usize) -> Result<Vec<(Uuid, f32)>, RuntimeError> {
@@ -144,7 +154,19 @@ impl AnnBridge {
             .collect::<Result<_, _>>()?;
         let index = VamanaIndex::from_snapshot(&snapshot)
             .map_err(|e| RuntimeError::Internal(format!("snapshot restore: {e}")))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            // Namespace set is populated after restore via `populate_namespace_set`.
+            // Until then it is left empty, which causes the retry gate to be
+            // conservative (assume the index may contain non-visible namespaces).
+            namespace_set: HashSet::new(),
+        })
+    }
+
+    /// Populate `namespace_set` from an already-queried set of namespace strings.
+    pub(crate) fn set_namespace_set(&mut self, ns_set: HashSet<String>) {
+        self.namespace_set = ns_set;
     }
 }
 
@@ -166,10 +188,10 @@ pub(crate) fn sanitize_model_key(s: &str) -> String {
         .collect()
 }
 
-/// Snapshot namespace key for memory Vamana — distinct from knowledge's
-/// `{ns}::vamana::{model}` to prevent corpus identity collisions.
-pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
-    format!("{namespace}::memory_vamana::{model}")
+/// Snapshot key for the global memory Vamana index for a model.
+/// Distinct from knowledge's `{ns}::vamana::{model}` to prevent corpus identity collisions.
+pub(crate) fn snapshot_key(_namespace: &str, model: &str) -> String {
+    format!("global::memory_vamana::{model}")
 }
 
 const MEMORY_VAMANA_INDEX_TYPE: &str = "memory_vamana";
@@ -206,31 +228,36 @@ pub(crate) async fn search_loaded(
     }
 }
 
+/// Return the namespace set for the loaded index, or `None` on cache miss.
+///
+/// An empty set (returned for snapshot-restored indexes before their set is
+/// populated) must be treated conservatively by the caller — i.e. assume the
+/// index may contain non-visible namespaces and proceed with the retry loop.
+pub(crate) async fn index_namespace_set(ann: &SharedAnn, key: &AnnKey) -> Option<HashSet<String>> {
+    let guard = ann.indexes.read().await;
+    guard.get(key).map(|b| b.namespace_set.clone())
+}
+
 /// Remove a single in-memory ANN slot and its warming guard entry.
 pub(crate) async fn clear_key(ann: &SharedAnn, key: &AnnKey) {
     ann.indexes.write().await.remove(key);
     ann.warming.lock().await.remove(key);
 }
 
-/// Remove all in-memory ANN slots and warming-guard entries for `namespace`.
-pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
-    ann.indexes
-        .write()
-        .await
-        .retain(|k, _| k.namespace != namespace);
-    ann.warming
-        .lock()
-        .await
-        .retain(|k| k.namespace != namespace);
+/// Remove all in-memory ANN slots and warming-guard entries.
+/// Because the index is global per model, any namespace write invalidates all slots.
+pub(crate) async fn clear_namespace(ann: &SharedAnn, _namespace: &str) {
+    ann.indexes.write().await.clear();
+    ann.warming.lock().await.clear();
 }
 
-/// Clear in-memory cache and delete persisted snapshots for `namespace`.
-pub(crate) async fn invalidate_namespace(rt: &KhiveRuntime, ann: &SharedAnn, namespace: &str) {
-    clear_namespace(ann, namespace).await;
-    invalidate_snapshots(rt, namespace).await;
+/// Clear in-memory cache and delete persisted snapshots.
+pub(crate) async fn invalidate_namespace(rt: &KhiveRuntime, ann: &SharedAnn, _namespace: &str) {
+    clear_namespace(ann, _namespace).await;
+    invalidate_snapshots(rt).await;
 }
 
-/// Fire-once per-key background warm for `model`. Returns `true` if a new task was started.
+/// Fire-once per-model background warm. Returns `true` if a new task was started.
 pub(crate) async fn ensure_ann_background(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -258,10 +285,9 @@ pub(crate) async fn ensure_ann_background(
 
     let rt = rt.clone();
     let ann = ann.clone();
-    let token_ns = token.namespace().clone();
     let model = model.to_owned();
     tokio::spawn(async move {
-        if let Ok(token) = rt.authorize(token_ns) {
+        if let Ok(token) = rt.authorize(Namespace::local()) {
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
@@ -280,58 +306,26 @@ pub(crate) async fn ensure_ann_background(
     true
 }
 
-/// Warm all `(namespace, model)` ANN indexes at startup — skips already-loaded keys.
+/// Warm the global per-model ANN indexes at startup — skips already-loaded keys.
 pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &SharedAnn) {
     let models = rt.registered_embedding_model_names();
     for model in &models {
-        let model_key = sanitize_model_key(model);
-        let table_name = format!("vec_{model_key}");
-        let sql = rt.sql();
-        let mut reader = match sql.reader().await {
-            Ok(r) => r,
+        let token = match rt.authorize(Namespace::local()) {
+            Ok(t) => t,
             Err(_) => continue,
         };
-        let rows = match reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT DISTINCT namespace FROM {table_name} \
-                     WHERE embedding_model = ?1 AND kind = 'note' AND field = 'note.content'"
-                ),
-                params: vec![SqlValue::Text(model.clone())],
-                label: Some("memory_ann_warm_namespaces".into()),
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        for row in &rows {
-            let ns_str = match row.get("namespace") {
-                Some(SqlValue::Text(s)) => s.as_str(),
-                _ => continue,
-            };
-            let ns = match Namespace::parse(ns_str) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            let token = match rt.authorize(ns) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            match ensure_ann_for_model(rt, &token, ann, model).await {
-                Ok(status) => {
-                    tracing::debug!(?status, namespace = %ns_str, model = %model, "memory ANN warm complete");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, namespace = %ns_str, model = %model, "memory ANN warm failed");
-                }
+        match ensure_ann_for_model(rt, &token, ann, model).await {
+            Ok(status) => {
+                tracing::debug!(?status, model = %model, "memory ANN warm complete");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, model = %model, "memory ANN warm failed");
             }
         }
     }
 }
 
-/// Lazy warm-load for a specific `(namespace, model)`: snapshot restore or rebuild with double-fingerprint check.
+/// Lazy warm-load for the global index for `model`: snapshot restore or rebuild with double-fingerprint check.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -341,20 +335,26 @@ pub(crate) async fn ensure_ann_for_model(
     if model.is_empty() {
         return Ok(AnnEnsureStatus::EmptyCorpus);
     }
-    let ns = token.namespace().as_str().to_owned();
-    let key = AnnKey::new(&ns, model);
+    let ns = "global";
+    let key = AnnKey::new(ns, model);
 
     if ann.indexes.read().await.contains_key(&key) {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
     // Try snapshot warm-load.
-    if let Some(snapshot) = try_load_snapshot(rt, &ns, model).await {
+    if let Some(snapshot) = try_load_snapshot(rt, ns, model).await {
         let current_fp = compute_memory_fingerprint(rt, token, model).await;
         if let Some(fp) = current_fp {
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_snapshot(snapshot) {
-                    Ok(bridge) => {
+                    Ok(mut bridge) => {
+                        // Populate namespace set from a cheap DISTINCT query so the
+                        // retry gate in recall can short-circuit when appropriate.
+                        let ns_set = query_distinct_namespaces(rt, token, model)
+                            .await
+                            .unwrap_or_default();
+                        bridge.set_namespace_set(ns_set);
                         ann.indexes.write().await.entry(key).or_insert(bridge);
                         tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
                         return Ok(AnnEnsureStatus::LoadedSnapshot);
@@ -389,7 +389,7 @@ pub(crate) async fn ensure_ann_for_model(
             }
             let vector_count = bridge.id_map.len();
             if let Some(fingerprint) = fp_after {
-                if let Err(e) = persist_snapshot(rt, &ns, model, &bridge, fingerprint).await {
+                if let Err(e) = persist_snapshot(rt, ns, model, &bridge, fingerprint).await {
                     tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
                 }
             }
@@ -412,8 +412,47 @@ pub(crate) async fn ensure_ann_for_model(
 
 // ── corpus loading ────────────────────────────────────────────────────────────
 
-/// Compute a fingerprint scoped strictly to memory note vectors
-/// (`kind='note'`, `field='note.content'`) for `(namespace, model)`.
+/// Query the set of distinct `namespace` values present in the vector corpus for `model`.
+/// Used after snapshot restore to populate the in-memory namespace set.
+async fn query_distinct_namespaces(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+) -> Option<HashSet<String>> {
+    let store = rt.vectors_for_model(token, model).ok()?;
+    let _ = store; // ensure store is accessible; actual query goes to SQL layer
+    let model_key = sanitize_model_key(model);
+    let table_name = format!("vec_{model_key}");
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.ok()?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT DISTINCT n.namespace FROM {table_name} v \
+                 JOIN notes n ON n.id = v.subject_id \
+                 WHERE v.embedding_model = ?1 \
+                   AND v.kind = 'note' AND v.field = 'note.content' \
+                   AND n.deleted_at IS NULL"
+            ),
+            params: vec![SqlValue::Text(model.to_owned())],
+            label: Some("memory_ann_distinct_namespaces".into()),
+        })
+        .await
+        .ok()?;
+    let set: HashSet<String> = rows
+        .into_iter()
+        .filter_map(|row| {
+            if let Some(SqlValue::Text(ns)) = row.get("namespace") {
+                Some(ns.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Some(set)
+}
+
+/// Compute a fingerprint for all non-deleted memory note vectors for `model` (all namespaces).
 async fn compute_memory_fingerprint(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -421,18 +460,19 @@ async fn compute_memory_fingerprint(
 ) -> Option<CorpusFingerprint> {
     let store = rt.vectors_for_model(token, model).ok()?;
     let info = store.info().await.ok()?;
-    let namespace = token.namespace().as_str().to_owned();
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let sql = rt.sql();
     let mut reader = sql.reader().await.ok()?;
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT COUNT(*) AS n FROM {table_name} \
-                 WHERE namespace = ?1 AND embedding_model = ?2 \
-                   AND kind = 'note' AND field = 'note.content'"
+                "SELECT COUNT(*) AS n FROM {table_name} v \
+                 JOIN notes n ON n.id = v.subject_id \
+                 WHERE v.embedding_model = ?1 \
+                   AND v.kind = 'note' AND v.field = 'note.content' \
+                   AND n.deleted_at IS NULL"
             ),
-            params: vec![SqlValue::Text(namespace), SqlValue::Text(model.to_owned())],
+            params: vec![SqlValue::Text(model.to_owned())],
             label: Some("memory_ann_fingerprint".into()),
         })
         .await
@@ -447,7 +487,7 @@ async fn compute_memory_fingerprint(
     })
 }
 
-/// Scan all `note.content` vectors for `(namespace, model)` and build an
+/// Scan all non-deleted `note.content` vectors across all namespaces for `model` and build an
 /// `AnnBridge`. Returns `Ok(None)` when the corpus is empty or inaccessible.
 async fn load_and_build_from_vector_store(
     rt: &KhiveRuntime,
@@ -462,12 +502,11 @@ async fn load_and_build_from_vector_store(
         .info()
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    if info.entry_count == 0 || info.dimensions == 0 {
+    if info.dimensions == 0 {
         return Ok(None);
     }
     let dims = info.dimensions;
 
-    let ns = token.namespace().as_str().to_owned();
     let model_key = sanitize_model_key(model);
     let table_name = format!("vec_{model_key}");
 
@@ -480,12 +519,14 @@ async fn load_and_build_from_vector_store(
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT subject_id, embedding FROM {table_name} \
-                 WHERE namespace = ?1 AND embedding_model = ?2 \
-                   AND kind = 'note' AND field = 'note.content' \
-                 ORDER BY subject_id"
+                "SELECT v.subject_id, v.embedding, n.namespace FROM {table_name} v \
+                 JOIN notes n ON n.id = v.subject_id \
+                 WHERE v.embedding_model = ?1 \
+                   AND v.kind = 'note' AND v.field = 'note.content' \
+                   AND n.deleted_at IS NULL \
+                 ORDER BY v.subject_id"
             ),
-            params: vec![SqlValue::Text(ns), SqlValue::Text(model.to_owned())],
+            params: vec![SqlValue::Text(model.to_owned())],
             label: Some("memory_ann_corpus_scan".into()),
         })
         .await
@@ -497,6 +538,7 @@ async fn load_and_build_from_vector_store(
 
     let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
+    let mut namespace_set: HashSet<String> = HashSet::new();
 
     for row in &rows {
         let id_str = match row.get("subject_id") {
@@ -518,6 +560,9 @@ async fn load_and_build_from_vector_store(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        if let Some(SqlValue::Text(ns)) = row.get("namespace") {
+            namespace_set.insert(ns.clone());
+        }
         id_map.push(uuid);
         flat.extend_from_slice(&vec);
     }
@@ -526,7 +571,7 @@ async fn load_and_build_from_vector_store(
         return Ok(None);
     }
 
-    AnnBridge::build(flat, dims, id_map).map(Some)
+    AnnBridge::build(flat, dims, id_map, namespace_set).map(Some)
 }
 
 // ── persistence ───────────────────────────────────────────────────────────────
@@ -629,10 +674,10 @@ async fn try_load_snapshot(
     }
 }
 
-/// Delete all memory Vamana snapshot rows for `namespace` from
-/// `retrieval_snapshots`. Best-effort — missing table is silently ignored.
-async fn invalidate_snapshots(rt: &KhiveRuntime, namespace: &str) {
-    let pattern = format!("{namespace}::memory_vamana::%");
+/// Delete the global memory Vamana snapshot rows from `retrieval_snapshots`.
+/// Best-effort — missing table is silently ignored.
+async fn invalidate_snapshots(rt: &KhiveRuntime) {
+    let pattern = "global::memory_vamana::%".to_string();
     let sql = rt.sql();
     let mut w = match sql.writer().await {
         Ok(w) => w,
@@ -664,12 +709,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ann_key_includes_namespace_and_model() {
+    fn ann_key_is_model_only() {
+        // After FTS+ANN consolidation AnnKey is model-only; namespace is ignored.
         let k1 = AnnKey::new("ns:a", "model-x");
-        let k2 = AnnKey::new("ns:b", "model-x");
-        let k3 = AnnKey::new("ns:a", "model-x");
-        assert_ne!(k1, k2, "same model, different namespace must differ");
-        assert_eq!(k1, k3, "identical keys must be equal");
+        let k2 = AnnKey::new("ns:b", "model-x"); // same model, different ns → same key
+        let k3 = AnnKey::new("ns:a", "model-y"); // different model → different key
+        assert_eq!(
+            k1, k2,
+            "same model, different namespace must produce the same key"
+        );
+        assert_ne!(k1, k3, "different models must produce different keys");
     }
 
     #[test]
@@ -684,7 +733,8 @@ mod tests {
             0.0, 1.0, 0.0, // id_b
             0.0, 0.0, 1.0, // id_c
         ];
-        let bridge = AnnBridge::build(vectors, 3, vec![id_a, id_b, id_c]).expect("build");
+        let bridge =
+            AnnBridge::build(vectors, 3, vec![id_a, id_b, id_c], HashSet::new()).expect("build");
 
         // query close to id_a
         let hits = bridge.search(&[1.0, 0.0, 0.0], 1).expect("search");
@@ -696,8 +746,8 @@ mod tests {
     #[test]
     fn ann_search_dimension_error_returns_err() {
         let id = Uuid::new_v4();
-        let bridge =
-            AnnBridge::build(vec![1.0f32, 0.0, 0.0], 3, vec![id]).expect("build 3-dim bridge");
+        let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0], 3, vec![id], HashSet::new())
+            .expect("build 3-dim bridge");
         // query with wrong dimension (2 instead of 3)
         let result = bridge.search(&[1.0, 0.0], 1);
         assert!(result.is_err(), "wrong dimension must return Err");
@@ -717,22 +767,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_namespace_clears_indexes_and_warming() {
+    async fn invalidate_namespace_clears_global_index() {
+        // After FTS+ANN consolidation, AnnKey is model-only (namespace is ignored).
+        // invalidate_namespace clears the single global index for all models.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ann = new_shared();
-        let model = "test-model";
+        let model_a = "model-a";
+        let model_b = "model-b";
 
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
 
-        // Insert two keys: one in ns:a, one in ns:b.
-        let bridge_a =
-            AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id_a]).expect("build a");
-        let bridge_b =
-            AnnBridge::build(vec![0.0f32, 1.0, 0.0, 0.0], 4, vec![id_b]).expect("build b");
+        let bridge_a = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id_a], HashSet::new())
+            .expect("build a");
+        let bridge_b = AnnBridge::build(vec![0.0f32, 1.0, 0.0, 0.0], 4, vec![id_b], HashSet::new())
+            .expect("build b");
 
-        let key_a = AnnKey::new("ns:a", model);
-        let key_b = AnnKey::new("ns:b", model);
+        // Keys are model-only; namespace arg is ignored.
+        let key_a = AnnKey::new("any-ns", model_a);
+        let key_b = AnnKey::new("any-ns", model_b);
 
         {
             let mut idxs = ann.indexes.write().await;
@@ -745,24 +798,16 @@ mod tests {
             warming.insert(key_b.clone());
         }
 
-        // Invalidate ns:a only.
-        invalidate_namespace(&rt, &ann, "ns:a").await;
+        // invalidate_namespace evicts ALL in-memory indexes (global index serves all namespaces).
+        invalidate_namespace(&rt, &ann, "any-ns").await;
 
         assert!(
-            !ann.indexes.read().await.contains_key(&key_a),
-            "ns:a index must be removed"
+            ann.indexes.read().await.is_empty(),
+            "all indexes must be cleared after invalidation"
         );
         assert!(
-            ann.indexes.read().await.contains_key(&key_b),
-            "ns:b index must survive"
-        );
-        assert!(
-            !ann.warming.lock().await.contains(&key_a),
-            "ns:a warming guard must be removed"
-        );
-        assert!(
-            ann.warming.lock().await.contains(&key_b),
-            "ns:b warming guard must survive"
+            ann.warming.lock().await.is_empty(),
+            "all warming guards must be cleared after invalidation"
         );
     }
 }

@@ -41,6 +41,8 @@ toml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
+async-trait = { workspace = true }
+lattice-embed = { workspace = true }
 
 [[bin]]
 name = "kkernel"

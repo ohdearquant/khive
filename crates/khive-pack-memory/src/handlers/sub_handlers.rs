@@ -140,8 +140,11 @@ impl MemoryPack {
             .collect();
 
         let all_vector_hits = candidates.all_vector_hits();
+        // Filter to memory_ids: this drops over-fetched hits from outside the
+        // caller's visible namespace set (those were filtered at hydration time).
         let vector_candidates: Vec<Value> = all_vector_hits
             .iter()
+            .filter(|hit| memory_ids.contains(&hit.subject_id))
             .map(|hit| {
                 json!({
                     "id": hit.subject_id.to_string(),

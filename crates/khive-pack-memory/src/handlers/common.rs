@@ -40,6 +40,16 @@ pub(super) fn recall_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok())
 }
 
+pub(super) fn ann_overfetch_max_rounds() -> usize {
+    static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    })
+}
+
 #[inline(always)]
 pub(super) fn plog(call_id: u64, stage: &str, us: u128) {
     eprintln!(r#"{{"c":{},"s":"{}","us":{}}}"#, call_id, stage, us);
@@ -278,10 +288,13 @@ pub(super) fn make_pipeline(cfg: &RecallConfig) -> MemoryRecallPipeline {
 pub(super) struct RecallCandidateSet {
     pub(super) namespace: String,
     pub(super) text_hits: Vec<TextSearchHit>,
-    /// One entry per embedding model: (model_name, hits).
+    /// One entry per embedding model: (model_name, hits). These have already been
+    /// filtered to the caller's visible namespace set via over-fetch + post-filter.
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
     /// True when multilingual dense routing was requested AND a multilingual model was found.
     pub(super) multilingual_routed: bool,
+    /// The caller's full visible namespace set (primary + any explicit extras).
+    pub(super) visible_namespaces: Vec<String>,
 }
 
 impl RecallCandidateSet {
@@ -351,6 +364,9 @@ pub(super) struct RecallVectorCandidateParams<'a> {
     /// Route the dense/vector path to the multilingual model. Keyed on `needs_multilingual`.
     pub(super) use_multilingual: bool,
     pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
+    /// Namespace set the caller is allowed to read. ANN returns global candidates;
+    /// post-filter trims to this set before returning hits.
+    pub(super) visible_namespaces: Vec<String>,
 }
 
 pub(super) struct RecallVectorCandidateResult {
@@ -524,7 +540,7 @@ impl MemoryPack {
         &self,
         token: &NamespaceToken,
         query: &str,
-        ns: &str,
+        namespaces: &[String],
         candidate_limit: u32,
         snippet_policy: TextSnippetPolicy,
         cjk_fts_bypass: bool,
@@ -543,7 +559,7 @@ impl MemoryPack {
             crate::text_gather::collect_text_hits(
                 searcher.as_ref(),
                 query,
-                ns,
+                namespaces,
                 candidate_limit,
                 snippet_policy,
                 cjk_fts_bypass,
@@ -557,7 +573,7 @@ impl MemoryPack {
                     query: terms.join(" "),
                     mode: TextQueryMode::AnyTerm,
                     filter: Some(TextFilter {
-                        namespaces: vec![ns.to_string()],
+                        namespaces: namespaces.to_vec(),
                         kinds: vec![SubstrateKind::Note],
                         ..TextFilter::default()
                     }),
@@ -594,132 +610,63 @@ impl MemoryPack {
             fts_gather,
         } = opts;
 
-        // FTS and vector recall both fan out across all visible namespaces (ADR-007
-        // Rev 4 Phase 1.5). FTS: each namespace has its own FTS virtual table
-        // (fts_notes_{ns}); token.with_namespace(ns) selects it. Vector: each
-        // namespace has its own ANN index keyed by (namespace, model); tokens are
-        // minted via self.runtime.authorize(ns) (same pattern as warm_existing_memory_indexes
-        // in ann.rs:318) so that token.namespace().as_str() inside ensure_ann_for_model
-        // (ann.rs:344) resolves to the target namespace.
-        let visible = token.visible_namespace_strs();
+        // FTS recall uses the single shared fts_notes table (V4 migration). Namespace
+        // filtering is applied via TextFilter.namespaces with the full visible set
+        // (ADR-007 Rev 4 Phase 1.5 — visible includes {local} ∪ {actor.id} ∪
+        // {actor.visible_namespaces} as built by token.visible_namespace_strs()).
+        // ANN recall uses the single global index per model (spans all namespaces).
+        // Namespace scoping is applied post-search: the vector path over-fetches,
+        // then filters candidates to the caller's visible set before returning.
+        let visible: Vec<String> = token
+            .visible_namespace_strs()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         let primary_ns = token.namespace().as_str().to_string();
 
-        // For single-namespace (common case) take the fast path.
-        if visible.len() <= 1 {
-            let text_fut = self.collect_recall_text_hits(
-                token,
-                query,
-                &primary_ns,
+        let text_fut = self.collect_recall_text_hits(
+            token,
+            query,
+            &visible,
+            candidate_limit,
+            snippet_policy,
+            cjk_fts_bypass,
+            fts_gather,
+        );
+        let vector_fut = self.collect_recall_vector_hits(
+            token,
+            query,
+            &primary_ns,
+            RecallVectorCandidateParams {
                 candidate_limit,
-                snippet_policy,
-                cjk_fts_bypass,
-                fts_gather,
-            );
-            let vector_fut = self.collect_recall_vector_hits(
-                token,
-                query,
-                &primary_ns,
-                RecallVectorCandidateParams {
-                    candidate_limit,
-                    embedding_model,
-                    use_multilingual,
-                    scoring_cfg,
-                },
-            );
-            let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
-            return Ok(RecallCandidateSet {
-                namespace: primary_ns,
-                text_hits,
-                vector_hits_per_model: vector_result.vector_hits_per_model,
-                multilingual_routed: vector_result.multilingual_routed,
-            });
-        }
-
-        // Multi-namespace: fanout FTS across all visible namespaces.
-        //
-        // Each namespace has its own FTS virtual table (fts_notes_{ns}); we must
-        // select that table by minting a token whose primary namespace matches the
-        // target namespace. `token.with_namespace` creates such a token while
-        // preserving the actor context.
-        let mut all_text_hits = Vec::new();
-        for ns_str in &visible {
-            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
-                Ok(ns) => ns,
-                Err(_) => continue,
-            };
-            let ns_token = token.with_namespace(ns_parsed);
-            let hits = self
-                .collect_recall_text_hits(
-                    &ns_token,
-                    query,
-                    ns_str,
-                    candidate_limit,
-                    snippet_policy,
-                    cjk_fts_bypass,
-                    fts_gather,
-                )
-                .await?;
-            all_text_hits.extend(hits);
-        }
-        // Vector recall fans out across all visible namespaces (ADR-007 Rev 4 Phase 1.5).
-        // Each per-namespace token is minted via self.runtime.authorize(ns) so that
-        // token.namespace().as_str() inside ensure_ann_for_model (ann.rs:344) reads the
-        // target namespace, producing the correct AnnKey. token.with_namespace would
-        // preserve the primary namespace in the ANN key lookup, missing the legacy index.
-        //
-        // Each call receives the full candidate_limit. With N visible namespaces the total
-        // candidate pool before RRF fusion can reach N * candidate_limit — this improves
-        // recall quality and is intentional (RRF then reduces to the configured result limit).
-        let mut all_vector_per_model: Vec<(String, Vec<VectorSearchHit>)> = Vec::new();
-        let mut final_multilingual_routed = false;
-        for ns_str in &visible {
-            let ns_parsed = match khive_runtime::Namespace::parse(ns_str) {
-                Ok(ns) => ns,
-                Err(_) => continue,
-            };
-            let ns_token = match self.runtime.authorize(ns_parsed) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(ns = %ns_str, error = %e,
-                        "memory vector fanout: authorize failed; skipping namespace");
-                    continue;
-                }
-            };
-            let result = self
-                .collect_recall_vector_hits(
-                    &ns_token,
-                    query,
-                    ns_str,
-                    RecallVectorCandidateParams {
-                        candidate_limit,
-                        embedding_model,
-                        use_multilingual,
-                        scoring_cfg,
-                    },
-                )
-                .await?;
-            final_multilingual_routed |= result.multilingual_routed;
-            for (model_name, hits) in result.vector_hits_per_model {
-                if let Some(entry) = all_vector_per_model
-                    .iter_mut()
-                    .find(|(m, _)| m == &model_name)
-                {
-                    entry.1.extend(hits);
-                } else {
-                    all_vector_per_model.push((model_name, hits));
-                }
-            }
-        }
-
+                embedding_model,
+                use_multilingual,
+                scoring_cfg,
+                visible_namespaces: visible.clone(),
+            },
+        );
+        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
-            text_hits: all_text_hits,
-            vector_hits_per_model: all_vector_per_model,
-            multilingual_routed: final_multilingual_routed,
+            text_hits,
+            vector_hits_per_model: vector_result.vector_hits_per_model,
+            multilingual_routed: vector_result.multilingual_routed,
+            visible_namespaces: visible,
         })
     }
 
     /// Collect vector (ANN / sqlite-vec) recall candidates.
+    ///
+    /// ANN path: the global index spans all namespaces. To respect the caller's
+    /// visible namespace set we over-fetch and then apply a post-filter at note
+    /// hydration time (see `load_memory_candidate_notes`). The over-fetch factor
+    /// is F=4 with a fixed margin M=32: k' = max(k * 4, k + 32). This ensures
+    /// enough candidates survive the namespace filter to fill `k` results on a
+    /// single-namespace store at no extra cost (all candidates pass the filter
+    /// on round 1). On a multi-namespace store the margin absorbs foreign hits.
+    ///
+    /// sqlite-vec fallback: namespace filter is passed directly into the query
+    /// (`namespace = ?`) so no over-fetch is required.
     pub(super) async fn collect_recall_vector_hits(
         &self,
         token: &NamespaceToken,
@@ -732,7 +679,16 @@ impl MemoryPack {
             embedding_model,
             use_multilingual,
             scoring_cfg,
+            visible_namespaces,
         } = opts;
+
+        // Over-fetch factor for the ANN path: F=4, M=32.
+        // k' = max(k * F, k + M) so a 4× wider search compensates for foreign-namespace hits.
+        // On a single-namespace store round-1 always satisfies k (zero foreign hits).
+        const ANN_OVERFETCH_FACTOR: usize = 4;
+        const ANN_OVERFETCH_MARGIN: usize = 32;
+        let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
+            .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
         let prof = recall_profile_enabled();
         let call_id = PROF_CID.with(|c| c.get());
 
@@ -829,92 +785,182 @@ impl MemoryPack {
                 }
             }
 
+            // Maximum rounds for the ANN over-fetch retry loop. Round 1 is the initial
+            // over-fetch; rounds 2–N double the fetch window until the corpus is
+            // exhausted or enough visible-namespace candidates are found.
+            // Resolved once per process via OnceLock (see ann_overfetch_max_rounds());
+            // tests must set ANN_OVERFETCH_MAX_ROUNDS before process start.
+            let ann_overfetch_max_rounds = ann_overfetch_max_rounds();
+
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
             let mut results = Vec::with_capacity(query_vecs.len());
             for (model_name, vec) in query_vecs {
                 let key = AnnKey::new(ns, &model_name);
 
-                match ann::search_loaded(&self.ann, &key, &vec, candidate_limit as usize).await {
-                    Ok(Some(raw_hits)) => {
-                        tracing::debug!(
-                            model = %model_name,
-                            namespace = %ns,
-                            hits = raw_hits.len(),
-                            "memory recall via warm ANN"
-                        );
-                        let hits: Vec<VectorSearchHit> = raw_hits
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, (uuid, score))| VectorSearchHit {
-                                subject_id: uuid,
-                                score: khive_score::DeterministicScore::from_f64(score as f64),
-                                rank: (idx + 1) as u32,
-                            })
-                            .collect();
-                        results.push((model_name, hits));
-                        continue;
-                    }
-                    Ok(None) => {
-                        let status =
-                            ann::ensure_ann_for_model(&self.runtime, token, &self.ann, &model_name)
-                                .await?;
-                        tracing::debug!(
-                            ?status,
-                            model = %model_name,
-                            namespace = %ns,
-                            "memory ANN ensured on recall miss"
-                        );
-                        if let Some(raw_hits) =
-                            ann::search_loaded(&self.ann, &key, &vec, candidate_limit as usize)
-                                .await?
-                        {
+                // ANN path: search the global index with ann_fetch_limit (over-fetch)
+                // plus a bounded widening retry. The index spans all namespaces;
+                // namespace scoping is enforced here by counting how many returned IDs
+                // belong to the caller's visible_namespaces set. If fewer than
+                // candidate_limit candidates survive, we double the fetch window and
+                // retry — up to ANN_OVERFETCH_MAX_ROUNDS total rounds, or until the
+                // index is exhausted (returned hits < requested k). Single-namespace
+                // stores fill on round 1 at zero extra cost.
+                let initial_raw_hits: Option<Vec<(Uuid, f32)>> =
+                    match ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await {
+                        Ok(Some(hits)) => Some(hits),
+                        Ok(None) => {
+                            let status = ann::ensure_ann_for_model(
+                                &self.runtime,
+                                token,
+                                &self.ann,
+                                &model_name,
+                            )
+                            .await?;
+                            tracing::debug!(
+                                ?status,
+                                model = %model_name,
+                                namespace = %ns,
+                                "memory ANN ensured on recall miss"
+                            );
+                            ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                namespace = %ns,
+                                model = %model_name,
+                                "memory ANN search failed; falling back to exact sqlite-vec"
+                            );
+                            ann::clear_key(&self.ann, &key).await;
+                            None
+                        }
+                    };
+
+                if let Some(first_raw) = initial_raw_hits {
+                    // Bounded retry: widen fetch window if visible-namespace survivors
+                    // are short. Termination: enough survivors OR corpus exhausted (returned
+                    // hits < requested k means the index has no more candidates).
+                    let note_store = self.runtime.notes(token)?;
+                    let visible_set: std::collections::HashSet<&str> =
+                        visible_namespaces.iter().map(String::as_str).collect();
+
+                    // Gate: run the retry loop only when the global ANN index contains
+                    // vectors from namespaces outside the caller's visible set.
+                    //
+                    // We query the namespace set stored on the loaded AnnBridge. If the
+                    // set is empty (e.g. freshly snapshot-restored bridge whose set has
+                    // not yet been populated) we treat it conservatively as "may contain
+                    // non-visible namespaces" and proceed with the loop. If the index
+                    // namespace set is a subset of visible_set then all indexed vectors
+                    // pass the post-filter on round 1 — no retry needed.
+                    let index_has_non_visible =
+                        match ann::index_namespace_set(&self.ann, &key).await {
+                            Some(index_ns) if !index_ns.is_empty() => {
+                                !index_ns.iter().all(|ns| visible_set.contains(ns.as_str()))
+                            }
+                            // Empty set (snapshot-restored without population yet) or cache miss:
+                            // be conservative — assume non-visible namespaces may be present.
+                            _ => true,
+                        };
+
+                    let mut best_raw = first_raw;
+                    let mut current_fetch_limit = ann_fetch_limit;
+
+                    // Run the retry loop only when the index spans namespaces outside
+                    // the caller's visible set. On a single-namespace store where the
+                    // index only covers the visible namespace, this is skipped entirely
+                    // at zero extra cost (no note-batch fetch, no extra ANN searches).
+                    if index_has_non_visible {
+                        for _round in 1..ann_overfetch_max_rounds {
+                            let corpus_exhausted = best_raw.len() < current_fetch_limit;
+                            if corpus_exhausted {
+                                break;
+                            }
+                            // Count visible-namespace survivors via a lightweight note batch fetch.
+                            let candidate_ids: Vec<Uuid> =
+                                best_raw.iter().map(|(id, _)| *id).collect();
+                            let notes = note_store.get_notes_batch(&candidate_ids).await?;
+                            let visible_count = notes
+                                .iter()
+                                .filter(|n| {
+                                    n.deleted_at.is_none()
+                                        && n.kind == "memory"
+                                        && visible_set.contains(n.namespace.as_str())
+                                })
+                                .count();
+                            if visible_count >= candidate_limit as usize {
+                                break;
+                            }
+                            // Widen and retry.
+                            current_fetch_limit *= 2;
                             tracing::debug!(
                                 model = %model_name,
                                 namespace = %ns,
-                                hits = raw_hits.len(),
-                                "memory recall via warm ANN (after build)"
+                                visible_count,
+                                candidate_limit,
+                                new_fetch_limit = current_fetch_limit,
+                                "memory ANN: widening over-fetch (visible survivors short)"
                             );
-                            let hits: Vec<VectorSearchHit> = raw_hits
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, (uuid, score))| VectorSearchHit {
-                                    subject_id: uuid,
-                                    score: khive_score::DeterministicScore::from_f64(score as f64),
-                                    rank: (idx + 1) as u32,
-                                })
-                                .collect();
-                            results.push((model_name, hits));
-                            continue;
+                            if let Ok(Some(wider)) =
+                                ann::search_loaded(&self.ann, &key, &vec, current_fetch_limit).await
+                            {
+                                best_raw = wider;
+                            } else {
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            namespace = %ns,
-                            model = %model_name,
-                            "memory ANN search failed; falling back to exact sqlite-vec"
-                        );
-                        ann::clear_key(&self.ann, &key).await;
-                    }
+
+                    tracing::debug!(
+                        model = %model_name,
+                        namespace = %ns,
+                        hits = best_raw.len(),
+                        "memory recall via warm ANN"
+                    );
+                    let hits: Vec<VectorSearchHit> = best_raw
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, (uuid, score))| VectorSearchHit {
+                            subject_id: uuid,
+                            score: khive_score::DeterministicScore::from_f64(score as f64),
+                            rank: (idx + 1) as u32,
+                        })
+                        .collect();
+                    results.push((model_name, hits));
+                    continue;
                 }
 
+                // sqlite-vec fallback: the query includes namespace IN (...) so it
+                // respects the caller's visible set directly without over-fetch.
+                // When visible_namespaces has multiple entries we fan out one search
+                // per namespace and union the results, since VectorSearchRequest
+                // accepts a single namespace string.
                 tracing::debug!(model = %model_name, namespace = %ns, "memory recall via exact sqlite-vec");
                 ann_route = "sqlite_vec";
-                let hits = self
-                    .runtime
-                    .vectors_for_model(token, &model_name)?
-                    .search(VectorSearchRequest {
-                        query_vectors: vec![vec],
-                        top_k: candidate_limit,
-                        namespace: Some(ns.to_string()),
-                        kind: Some(SubstrateKind::Note),
-                        embedding_model: Some(model_name.clone()),
-                        filter: None,
-                        backend_hints: None,
-                    })
-                    .await?;
-                results.push((model_name, hits));
+                let store = self.runtime.vectors_for_model(token, &model_name)?;
+                let mut all_hits: Vec<VectorSearchHit> = Vec::new();
+                for search_ns in &visible_namespaces {
+                    let ns_hits = store
+                        .search(VectorSearchRequest {
+                            query_vectors: vec![vec.clone()],
+                            top_k: candidate_limit,
+                            namespace: Some(search_ns.clone()),
+                            kind: Some(SubstrateKind::Note),
+                            embedding_model: Some(model_name.clone()),
+                            filter: None,
+                            backend_hints: None,
+                        })
+                        .await?;
+                    all_hits.extend(ns_hits);
+                }
+                // Merge + re-rank by score descending.
+                all_hits.sort_by(|a, b| b.score.cmp(&a.score));
+                all_hits.truncate(candidate_limit as usize);
+                for (idx, hit) in all_hits.iter_mut().enumerate() {
+                    hit.rank = (idx + 1) as u32;
+                }
+                results.push((model_name, all_hits));
             }
             if prof {
                 if let Some(t) = t_ann_total {
@@ -963,8 +1009,18 @@ impl MemoryPack {
         let batch = note_store.get_notes_batch(&candidate_ids).await?;
         let mut memory_ids = HashSet::new();
         let mut notes_by_id = HashMap::new();
+        let visible_set: std::collections::HashSet<&str> = candidates
+            .visible_namespaces
+            .iter()
+            .map(String::as_str)
+            .collect();
         for note in batch {
-            if note.deleted_at.is_none() && note.kind == "memory" {
+            // Post-filter: ANN over-fetch may include rows from outside the caller's
+            // visible namespace set. Drop them here where the note row carries its namespace.
+            if note.deleted_at.is_none()
+                && note.kind == "memory"
+                && visible_set.contains(note.namespace.as_str())
+            {
                 memory_ids.insert(note.id);
                 notes_by_id.insert(note.id, note);
             }

@@ -27,14 +27,25 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 3, "latest migration version");
+    assert_eq!(version, 4, "latest migration version");
 
     let recorded: i64 = conn
         .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 3);
+    assert_eq!(recorded, 4);
+}
+
+#[test]
+fn v4_creates_consolidated_fts_tables() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    assert!(
+        table_exists(&conn, "fts_entities"),
+        "V4 must create fts_entities"
+    );
+    assert!(table_exists(&conn, "fts_notes"), "V4 must create fts_notes");
 }
 
 #[test]
@@ -138,7 +149,7 @@ fn run_migrations_twice_is_idempotent() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 3, "no duplicate migration rows on re-run");
+    assert_eq!(recorded, 4, "no duplicate migration rows on re-run");
 }
 
 // ── _embedding_models.dim u32 range tests ───────────────────────────────────

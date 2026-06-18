@@ -84,7 +84,7 @@ pub fn select_terms_by_stats(
 pub async fn collect_text_hits(
     searcher: &dyn TextSearch,
     _query: &str,
-    ns: &str,
+    namespaces: &[String],
     candidate_limit: u32,
     snippet_policy: TextSnippetPolicy,
     cjk_fts_bypass: bool,
@@ -94,7 +94,7 @@ pub async fn collect_text_hits(
     use khive_storage::types::TextQueryMode;
 
     let filter = Some(TextFilter {
-        namespaces: vec![ns.to_string()],
+        namespaces: namespaces.to_vec(),
         kinds: vec![SubstrateKind::Note],
         ..TextFilter::default()
     });
@@ -133,7 +133,7 @@ pub async fn collect_text_hits(
             .term_stats(TextTermStatsRequest {
                 terms: all_terms.to_vec(),
                 filter: Some(TextFilter {
-                    namespaces: vec![ns.to_string()],
+                    namespaces: namespaces.to_vec(),
                     kinds: vec![SubstrateKind::Note],
                     ..TextFilter::default()
                 }),
@@ -350,7 +350,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "quantum_xqzzy_unique signal_phrase_fixture",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -385,7 +385,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "boundary_token_zzq",
-            ns,
+            &[ns.to_string()],
             150,
             TextSnippetPolicy::Omit,
             false,
@@ -412,7 +412,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -476,7 +476,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "common_word_term rare_xqzzy_token",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -523,7 +523,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "common_alpha common_beta common_gamma",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -574,7 +574,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "机器学习",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             true, // cjk_fts_bypass=true
@@ -632,7 +632,7 @@ mod collect_text_hits_tests {
         let baseline_hits = collect_text_hits(
             &*searcher,
             "alpha_tok beta_tok",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -650,7 +650,7 @@ mod collect_text_hits_tests {
         let ranked_hits = collect_text_hits(
             &*searcher,
             "alpha_tok beta_tok",
-            ns,
+            &[ns.to_string()],
             10,
             TextSnippetPolicy::Omit,
             false,
@@ -693,7 +693,7 @@ mod collect_text_hits_tests {
         let hits = collect_text_hits(
             &*searcher,
             "candidate_tok",
-            ns,
+            &[ns.to_string()],
             5,
             TextSnippetPolicy::Omit,
             false,
