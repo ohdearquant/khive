@@ -235,57 +235,36 @@ impl ReindexReport {
     }
 }
 
-/// Drop ALL existing vector rows for `subject_ids` in the given model table,
+/// Drop ALL existing vector rows for `subject_ids` in the model's canonical table,
 /// regardless of their stored namespace. This is required before re-embedding
 /// because the vec table's PRIMARY KEY is `(subject_id)` — not `(subject_id,
 /// namespace)` — so a row written by a different namespace would collide on
 /// re-insert. By deleting on subject_id alone we ensure the subsequent INSERT
 /// lands cleanly with the base row's current namespace.
 ///
-/// Only called when `drop_existing` (i.e. NOT `--keep-existing`). Best-effort:
-/// a deletion failure is logged but does not abort; the subsequent INSERT will
-/// either collide (and be counted as an error) or succeed.
-async fn drop_vectors_for_subjects(rt: &KhiveRuntime, model_name: &str, ids: &[Uuid]) {
-    use khive_storage::types::{SqlStatement, SqlValue};
+/// Resolves the store via `rt.vectors_for_model(token, model_name)` — the SAME
+/// call the insert path uses — so alias resolution (`paraphrase` → canonical table
+/// name) is handled identically in both directions. Best-effort: a failure to
+/// resolve the store or delete is logged but does not abort; the subsequent INSERT
+/// will either collide (counted as an error) or succeed.
+async fn drop_vectors_for_subjects(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    model_name: &str,
+    ids: &[Uuid],
+) {
     if ids.is_empty() {
         return;
     }
-    // Compute the table name the same way SqliteVecStore does.
-    let model_key: String = model_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let table = format!("vec_{model_key}");
-    let sql = rt.sql();
-
-    // Batch into ≤400 IDs per statement to stay within SQLite's variable limit.
-    for chunk in ids.chunks(400) {
-        let placeholders: String = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let statement = format!("DELETE FROM {table} WHERE subject_id IN ({placeholders})");
-        let params: Vec<SqlValue> = chunk
-            .iter()
-            .map(|id| SqlValue::Text(id.to_string()))
-            .collect();
-        let Ok(mut writer) = sql.writer().await else {
-            tracing::warn!(
-                table,
-                "failed to open writer for subject-scoped vector drop"
-            );
+    let store = match rt.vectors_for_model(token, model_name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(model = %model_name, error = %e, "drop_vectors_for_subjects: could not resolve store; skipping delete");
             return;
-        };
-        if let Err(e) = writer
-            .execute(SqlStatement {
-                sql: statement,
-                params,
-                label: Some("drop_vectors_for_subjects".into()),
-            })
-            .await
-        {
-            tracing::warn!(error = %e, table, "subject-scoped vector drop failed (continuing)");
         }
+    };
+    if let Err(e) = store.delete_subjects(ids).await {
+        tracing::warn!(model = %model_name, error = %e, "subject-scoped vector drop failed (continuing)");
     }
 }
 
@@ -325,7 +304,7 @@ async fn embed_and_store_batch(
     if drop_existing && !staged.is_empty() {
         let subject_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
         for model_name in model_names {
-            drop_vectors_for_subjects(rt, model_name, &subject_ids).await;
+            drop_vectors_for_subjects(rt, token, model_name, &subject_ids).await;
         }
     }
 
@@ -1416,6 +1395,115 @@ mod tests {
             args.namespace.is_none(),
             "omitted --namespace must be None (not a String default)"
         );
+    }
+
+    // C3 regression: drop_vectors_for_subjects must target the SAME table as the insert path.
+    //
+    // The old code hand-sanitized model_name to derive the table name, which diverged from
+    // the insert path when the model is registered under a canonical name (e.g.
+    // "all-minilm-l6-v2" → table "vec_all_minilm_l6_v2" but a different sanitization of the
+    // raw env-var alias would yield a different key). The fix routes both drop and insert
+    // through rt.vectors_for_model() — the same Arc<dyn VectorStore> — so the table is
+    // always consistent.
+    //
+    // This test inserts a vector via vectors_for_model, calls drop_vectors_for_subjects with
+    // the same model name, and asserts the row is gone.
+    #[tokio::test]
+    async fn drop_vectors_for_subjects_targets_same_table_as_insert() {
+        use async_trait::async_trait;
+        use khive_runtime::{EmbedderProvider, RuntimeConfig, RuntimeError};
+        use khive_storage::types::VectorRecord;
+        use khive_types::SubstrateKind;
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::Arc;
+
+        struct StubService;
+
+        #[async_trait]
+        impl EmbeddingService for StubService {
+            async fn embed(
+                &self,
+                _texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                panic!("StubService::embed must not be called in this test")
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "stub-c3"
+            }
+        }
+
+        struct StubProvider {
+            model_name: &'static str,
+            dims: usize,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for StubProvider {
+            fn name(&self) -> &str {
+                self.model_name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dims
+            }
+
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Ok(Arc::new(StubService))
+            }
+        }
+
+        const MODEL: &str = "stub-model-c3";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(StubProvider {
+            model_name: MODEL,
+            dims: DIMS,
+        });
+
+        let ns = khive_runtime::Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Obtain the store via the same path as the insert path uses.
+        let store = rt.vectors_for_model(&token, MODEL).expect("store");
+
+        // Insert one vector record.
+        let subject_id = Uuid::new_v4();
+        store
+            .insert_batch(vec![VectorRecord {
+                subject_id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "content".to_string(),
+                embedding_model: Some(MODEL.to_string()),
+                vectors: vec![vec![0.1_f32; DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch");
+
+        // Confirm the row exists.
+        let before = store.count().await.expect("count before");
+        assert_eq!(before, 1, "row must exist before drop");
+
+        // Drop via drop_vectors_for_subjects — uses the same vectors_for_model path.
+        drop_vectors_for_subjects(&rt, &token, MODEL, &[subject_id]).await;
+
+        // Row must be gone.
+        let after = store.count().await.expect("count after");
+        assert_eq!(after, 0, "row must be deleted by drop_vectors_for_subjects");
     }
 
     #[test]

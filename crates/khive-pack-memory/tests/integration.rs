@@ -3282,3 +3282,115 @@ async fn test_multi_namespace_recall_overfetch_filter() {
         );
     }
 }
+
+// C1 regression: ANN bounded retry — local memories must be found even when the
+// first over-fetch round is dominated by foreign-namespace hits.
+//
+// Stores N_FOREIGN "foreign" memories followed by N_LOCAL "local" memories in an
+// ANN index that spans both namespaces.  For a wide token (visible = local + foreign),
+// recall@N_LOCAL with `ann_fetch_limit` < total corpus is forced to widen and retry
+// until local candidates accumulate.
+//
+// The retry loop fires when: (a) `is_multi_ns` is true, (b) visible-local survivors
+// from round 1 < candidate_limit, and (c) corpus is not yet exhausted.  Round 2
+// doubles the fetch window; at most ANN_OVERFETCH_MAX_ROUNDS = 3 total rounds.
+//
+// Correctness assertion: ALL local memory IDs appear in the recall result set,
+// regardless of which round they were found in.
+#[tokio::test]
+async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_cluster() {
+    use khive_runtime::PackRuntime;
+
+    const MODEL: &str = "c1-retry-enc";
+    const DIMS: usize = 4;
+    const N_FOREIGN: usize = 50;
+    const N_LOCAL: usize = 3;
+
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new(MODEL, DIMS, 0.5));
+
+    let registry = make_registry(rt.clone());
+
+    // Insert N_FOREIGN memories in the "foreign" namespace.
+    for i in 0..N_FOREIGN {
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("foreign memory {i} occupying ann slot"),
+                    "salience": 0.6,
+                    "namespace": "foreign"
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("foreign remember {i} failed: {e}"));
+    }
+
+    // Insert N_LOCAL memories in the "local" namespace AFTER foreign ones,
+    // so in insertion-order ANN they appear at the end.
+    let mut local_ids = Vec::new();
+    for i in 0..N_LOCAL {
+        let r = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("local memory {i} that must be recalled"),
+                    "salience": 0.8,
+                    "namespace": "local"
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("local remember {i} failed: {e}"));
+        local_ids.push(r["id"].as_str().expect("note_id").to_string());
+    }
+
+    // Warm the ANN so all vectors are indexed.
+    let pack = MemoryPack::new(rt.clone());
+    pack.warm().await;
+
+    // Wide token: visible = [local, foreign].  The global ANN index spans all
+    // N_FOREIGN + N_LOCAL = 53 vectors.  With candidate_limit = N_LOCAL and
+    // ann_fetch_limit = max(N_LOCAL*4, N_LOCAL+32) = 35, the first round fetches
+    // 35 of the 53 total.  If ANN returns foreign-namespace entries first (which is
+    // likely when N_FOREIGN > ann_fetch_limit), visible-local survivors < N_LOCAL
+    // and the retry fires.  Round 2 doubles the limit to 70 > 53, exhausting the
+    // corpus and finding all locals.  The assertion must hold regardless of which
+    // round found them.
+    let wide_token = rt
+        .authorize_with_visibility(
+            Namespace::parse("local").expect("local ns"),
+            vec![Namespace::parse("foreign").expect("foreign ns")],
+        )
+        .expect("wide token");
+
+    let result = pack
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "local memory must be recalled", "limit": N_LOCAL }),
+            &registry,
+            &wide_token,
+        )
+        .await
+        .expect("wide-token recall");
+
+    let hits: Vec<&str> = result
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+
+    // All N_LOCAL local memories must appear in the result.
+    for lid in &local_ids {
+        assert!(
+            hits.contains(&lid.as_str()),
+            "C1 retry regression: local memory {lid} must be in recall result; got: {hits:?}"
+        );
+    }
+}
