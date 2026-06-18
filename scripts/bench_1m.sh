@@ -6,15 +6,17 @@
 # file and every row is appended to perf/ledger.csv.
 #
 # Usage:
-#   bash scripts/bench_1m.sh [--ns <N1,N2,...>] [--dataset <name>] [--ci]
+#   bash scripts/bench_1m.sh [--ns <N1,N2,...>] [--dataset <name>] [--ci] [--ci-synthetic]
 #
-#   --ns       comma-separated subset sizes (default: 100000,316228,1000000)
-#   --dataset  dataset name tag written into bench JSON (default: SIFT-1M-honest-3pt)
-#   --ci       shorthand for --ns 10000,50000 (fast CI smoke-check)
+#   --ns            comma-separated subset sizes (default: 100000,316228,1000000)
+#   --dataset       dataset name tag written into bench JSON (default: SIFT-1M-honest-3pt)
+#   --ci            shorthand for --ns 10000,50000 (fast CI smoke-check on real SIFT data)
+#   --ci-synthetic  generate hermetic synthetic fixtures and run a structural ANN regression
+#                   gate; no SIFT data required; writes to perf/ci-synthetic-ledger.csv
 #
 # Environment:
 #   SIFT_DIR   directory containing sift_base.fvecs and sift_query.fvecs
-#              (required; no default — script exits 2 if unset or empty)
+#              (required for real-SIFT paths; not needed for --ci-synthetic)
 #   BENCH_OUT  output directory for bench JSON and logs
 #              (default: target/bench-out; gitignored via target/)
 #
@@ -29,8 +31,12 @@
 #   - Cargo is invoked from the crates/ subdirectory (no root Cargo.toml).
 #   - Raw bench JSON is written to BENCH_OUT; that directory is outside the
 #     repo tree by default (target/bench-out) and is gitignored.
-#   - On success, ledger rows are appended to perf/ledger.csv.
-#   - For CI, use --ci (runs 10K/50K; fast; still asserts PASS criteria).
+#   - On success, ledger rows are appended to the appropriate ledger CSV.
+#   - For CI on real SIFT data, use --ci (runs 10K/50K; fast).
+#   - For hermetic per-PR structural regression gate, use --ci-synthetic.
+#     The synthetic gate generates clustered data via gen_synthetic_fvecs.py
+#     (stdlib-only Python), runs vec_bench, and asserts recall@10 >= floor.
+#     It never touches perf/ledger.csv; results go to perf/ci-synthetic-ledger.csv.
 
 set -euo pipefail
 
@@ -45,6 +51,9 @@ BENCH_OUT="${BENCH_OUT:-$REPO_ROOT/target/bench-out}"
 NS="100000,316228,1000000"
 DATASET="SIFT-1M-honest-3pt"
 CI_MODE=0
+CI_SYNTHETIC=0
+TARGET_KEY="khive-vamana/1m-scale-proof/sift-1m"
+LEDGER_CSV="$REPO_ROOT/perf/ledger.csv"
 
 # ── Argument parsing ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -58,8 +67,15 @@ while [[ $# -gt 0 ]]; do
       NS="10000,50000"
       DATASET="SIFT-CI-smoke"
       shift ;;
+    --ci-synthetic)
+      CI_SYNTHETIC=1
+      NS="10000,50000"
+      DATASET="SIFT-CI-synthetic"
+      TARGET_KEY="khive-vamana/ci-synthetic/clustered-128"
+      LEDGER_CSV="$REPO_ROOT/perf/ci-synthetic-ledger.csv"
+      shift ;;
     -h|--help)
-      sed -n '2,40p' "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \?//'
+      sed -n '2,57p' "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \?//'
       exit 0 ;;
     *)
       echo "ERROR: Unknown argument: $1" >&2
@@ -67,12 +83,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ── Synthetic fixture generation (--ci-synthetic only) ──────────────────────
+if [[ $CI_SYNTHETIC -eq 1 ]]; then
+  SYNTH_TMPDIR="$(mktemp -d)"
+  # Generate exactly max(NS) base vectors so vec_bench's `N <= base size`
+  # assertion always holds even if --ci-synthetic's NS is later changed.
+  SYNTH_N="$(echo "$NS" | tr ',' '\n' | sort -n | tail -1)"
+  echo "=== Generating synthetic fvecs fixture ===" >&2
+  python3 "$REPO_ROOT/scripts/perf/gen_synthetic_fvecs.py" \
+    --out "$SYNTH_TMPDIR" \
+    --n "$SYNTH_N" \
+    --queries 1000 \
+    --dim 128 \
+    --clusters 64 \
+    --sigma 0.08 \
+    --seed 42
+  SIFT_DIR="$SYNTH_TMPDIR"
+fi
+
 # ── Derived paths ────────────────────────────────────────────────────────────
 BASE_FILE="$SIFT_DIR/sift_base.fvecs"
 QUERY_FILE="$SIFT_DIR/sift_query.fvecs"
 TARGETS_TOML="$REPO_ROOT/perf/targets.toml"
-LEDGER_CSV="$REPO_ROOT/perf/ledger.csv"
-TARGET_KEY="khive-vamana/1m-scale-proof/sift-1m"
 
 mkdir -p "$BENCH_OUT"
 BENCH_JSON="$BENCH_OUT/${DATASET}.json"
@@ -86,6 +118,9 @@ echo "BENCH_OUT:  $BENCH_OUT" | tee -a "$LOG_FILE"
 echo "ns:         $NS" | tee -a "$LOG_FILE"
 echo "dataset:    $DATASET" | tee -a "$LOG_FILE"
 echo "CI mode:    $CI_MODE" | tee -a "$LOG_FILE"
+echo "CI synthetic: $CI_SYNTHETIC" | tee -a "$LOG_FILE"
+echo "target_key: $TARGET_KEY" | tee -a "$LOG_FILE"
+echo "ledger:     $LEDGER_CSV" | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
@@ -144,7 +179,17 @@ echo "--- vec_bench exit code: $BENCH_EXIT ---" | tee -a "$LOG_FILE"
 
 if [[ $BENCH_EXIT -ne 0 ]]; then
   echo "ERROR: vec_bench exited with code $BENCH_EXIT" >&2
-  echo "=== RESULT: FAIL (bench assertions failed) ===" | tee -a "$LOG_FILE"
+  if [[ -f "$BENCH_JSON" ]] && grep -q '"overall": *"SKIPPED"' "$BENCH_JSON"; then
+    # Assertions did not run — target-key absent from targets.toml or targets
+    # unreadable. The gate still exits non-zero (fails closed), but this is a
+    # CONFIG fault, not a measured recall regression. Surface it distinctly so
+    # a red CI is not misread as a real index regression.
+    echo "::error::Bench assertions were SKIPPED (target-key '$TARGET_KEY' not found in $TARGETS_TOML, or targets unreadable) — the gate self-disabled and is NOT asserting recall. Fix the target-key, not the index." >&2
+    echo "=== RESULT: FAIL (assertions SKIPPED — gate misconfigured, see above) ===" | tee -a "$LOG_FILE"
+  else
+    echo "::error::Vamana bench assertions FAILED — measured regression against target-key '$TARGET_KEY'." >&2
+    echo "=== RESULT: FAIL (bench assertions failed) ===" | tee -a "$LOG_FILE"
+  fi
   exit 1
 fi
 

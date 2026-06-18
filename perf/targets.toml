@@ -142,3 +142,78 @@ name = "khive-vamana/1m-scale-proof/sift-1m"
   operator = "<="
   threshold = 900.0
   tolerance = 0.10
+
+# -------------------------------------------------------------------
+# Target 3: ci-synthetic/clustered-128 — per-PR STRUCTURAL ANN regression gate
+#
+# This is a HERMETIC, DETERMINISTIC gate that runs on every PR touching
+# crates/khive-vamana/**. It uses synthetic clustered vectors generated
+# by scripts/perf/gen_synthetic_fvecs.py (stdlib-only Python, seed=42,
+# no network, no committed binary data) with:
+#   n=50000 base vectors, 1000 queries, dim=128, 64 clusters, sigma=0.08
+#
+# Purpose: structural regression detection — catches index-build or
+# search breakage (e.g. recall collapse, speedup regression). It does
+# NOT prove real-SIFT quality; that is the banked workflow_dispatch job.
+#
+# Because vec_bench computes ground truth by brute-force internally on
+# the same synthetic dataset, recall@10 is ANN-vs-brute-force on self-
+# consistent data. On clusterable (low-intrinsic-dim) data, ANN recall
+# is high; a drop signals structural breakage.
+#
+# Measured baselines (gen_synthetic_fvecs.py --n 50000 --seed 42,
+# vec_bench --ns 10000,50000, 2026-06-18 on macOS arm64):
+#   recall@10:     0.9522 @ N=10000  /  0.9531 @ N=50000
+#   beam:          14 @ N=10000  /  26 @ N=50000
+#   beam exponent: 0.3846 (2-point fit)
+#   speedup:       76x @ N=10000  /  69x @ N=50000
+#   p50:           8 µs @ N=10000  /  46 µs @ N=50000
+#   p95:           10 µs @ N=10000  /  69 µs @ N=50000
+#
+# NOTE: iso_recall_query_exponent_warm is NOT checked here. At small N
+# (10K/50K) query latency is near-linear even for a correct index, so
+# the exponent check would always fail. Sublinear scaling is verified by
+# the banked SIFT-1M job.
+#
+# NOTE: Latency thresholds are NOT checked here. Shared CI runners have
+# high and variable latency; structural breakage shows up in recall, not
+# in µs numbers. p50/p95 are tracked in ci-synthetic-ledger.csv for
+# trend analysis but are not gated.
+# -------------------------------------------------------------------
+
+[[scale-proof.target]]
+name = "khive-vamana/ci-synthetic/clustered-128"
+
+  # Primary structural gate: recall must stay above this floor at all N.
+  # NOTE: reported recall (~0.952) is the recall AT the iso-recall beam, which
+  # vec_bench binary-searches to hit TARGET_RECALL=0.95 — so it sits at ~0.95
+  # by construction, NOT as free headroom. The real margin to the 0.90 floor is
+  # ~0.05. That is sufficient: a genuine structural regression collapses recall
+  # far below 0.90 (empirically ~0.675 at max_degree=4, ~0.01 at degree 3),
+  # well clear of any runner-to-runner clustering variation.
+  [[scale-proof.target.check]]
+  metric = "recall_at_10"
+  scope = "all_rows"
+  operator = ">="
+  threshold = 0.90
+  tolerance = 0.0
+
+  # Beam growth: exponent < 0.6 confirms beam does not explode with N.
+  # Measured: 0.385 (2-point fit). Threshold 0.6 is generous but still
+  # catches a runaway-beam regression that would make CI very slow.
+  [[scale-proof.target.check]]
+  metric = "beam_growth_exponent"
+  scope = "fits"
+  operator = "<="
+  threshold = 0.6
+  tolerance = 0.0
+
+  # ANN must beat brute-force at max_n (N=50000). Measured: 69x.
+  # Threshold 5.0x is a very conservative floor; anything below it
+  # indicates the ANN search itself is broken or degenerate.
+  [[scale-proof.target.check]]
+  metric = "speedup_vs_brute_force"
+  scope = "max_n"
+  operator = ">="
+  threshold = 5.0
+  tolerance = 0.0

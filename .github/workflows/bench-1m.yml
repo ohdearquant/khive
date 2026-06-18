@@ -1,22 +1,34 @@
-name: Vamana 1M scale-proof bench
+name: Vamana ANN Regression Gate
 
-# Blocking / non-blocking decision:
+# Two distinct jobs with different purposes:
 #
-#   NON-BLOCKING in main CI (continue-on-error: true).
+# (1) ann-ci-gate — BLOCKING per-PR structural ANN regression gate.
+#     Runs on ubuntu-latest. Generates hermetic deterministic synthetic
+#     clustered-vector fixtures (no network, no committed binary data,
+#     no SIFT download) via scripts/perf/gen_synthetic_fvecs.py and
+#     drives the existing vec_bench harness. Asserts recall@10 >= floor,
+#     beam growth exponent <= ceiling, and ANN beats brute-force.
+#     Cannot silent-skip: fixture is always generated; prereq-missing
+#     means generator or build failure = hard CI failure. continue-on-error
+#     is false. The gate BLOCKS on regression (exit 1) and on infra
+#     failure (exit 2 or non-zero).
 #
-# Rationale: The bench requires the SIFT-1M dataset (~500 MB, .fvecs format)
-# to be present at SIFT_DIR. GitHub-hosted runners do not have this data; it
-# lives on a self-hosted runner or must be downloaded. If SIFT_DIR is not set
-# or the files are absent, the script exits with code 2 (prerequisite missing)
-# rather than a regression (code 1). Treating a missing-data exit as a CI
-# failure would block every PR on all developers' machines.
+#     What this gate PROVES: the index still builds correctly and
+#     retrieves at high recall on clusterable (low-intrinsic-dim) data.
+#     This catches structural collapse — broken graph build, broken
+#     greedy search, broken pruning. It does NOT prove real-SIFT quality
+#     or sublinear scaling; those are tested by the banked SIFT-1M job
+#     below. At small N (10K/50K), query latency is near-linear even for
+#     a correct index, so latency and query-exponent checks are not gated
+#     here; they are tracked in the artifact ledger for trend analysis.
 #
-# When a SIFT-capable self-hosted runner is provisioned, flip
-# continue-on-error to false for this job to make it fully blocking.
-#
-# What IS blocking: the bench script itself fails with exit 1 if the bench
-# runs but assertions fail. This will block only when SIFT data is present and
-# a regression is detected — exactly the desired behavior.
+# (2) bench-1m-sift — OPTIONAL real SIFT-1M scale-proof (manual only).
+#     Gated to workflow_dispatch; never runs on pull_request or push.
+#     Requires the SIFT-1M dataset (~500 MB) at SIFT_DIR, which is only
+#     available on self-hosted runners or via manual download. Exit 2
+#     (data absent) is handled gracefully (skip notice, not a failure).
+#     This is the banked 3-point (100K/316K/1M) sublinear scaling proof.
+#     continue-on-error: true because data may be absent on manual runs.
 
 on:
   push:
@@ -26,6 +38,8 @@ on:
       - "perf/targets.toml"
       - "scripts/bench_1m.sh"
       - "scripts/perf/ingest_scale_proof.py"
+      - "scripts/perf/gen_synthetic_fvecs.py"
+      - ".github/workflows/bench-1m.yml"
   pull_request:
     branches: [main, "integration/**"]
     paths:
@@ -33,10 +47,12 @@ on:
       - "perf/targets.toml"
       - "scripts/bench_1m.sh"
       - "scripts/perf/ingest_scale_proof.py"
+      - "scripts/perf/gen_synthetic_fvecs.py"
+      - ".github/workflows/bench-1m.yml"
   workflow_dispatch:
     inputs:
       sift_dir:
-        description: "Path to SIFT data dir (overrides SIFT_DIR env)"
+        description: "Path to SIFT data dir for the real SIFT-1M job (overrides SIFT_DIR env)"
         required: false
         default: ""
 
@@ -44,15 +60,75 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  bench-1m-ci:
-    name: Vamana ANN regression check (CI subset)
-    # Use a self-hosted runner when SIFT data is available; fall back to
-    # ubuntu-latest for the prerequisite-check path (exits 2, not 1).
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Blocking per-PR structural ANN regression gate (hermetic synthetic)
+  # ─────────────────────────────────────────────────────────────────────────────
+  ann-ci-gate:
+    name: ANN structural regression gate (synthetic, hermetic)
     runs-on: ubuntu-latest
 
-    # NON-BLOCKING: missing SIFT data is exit 2, not a regression.
-    # Flip to false when a SIFT-capable self-hosted runner is in place.
+    # BLOCKING: this gate must not be bypassed. Structural ANN regression
+    # (recall collapse, broken build) must block the PR. Infra failures
+    # (generator crash, cargo build failure) also block — they signal
+    # something is wrong, not that data is absent.
+    continue-on-error: false
+
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Run synthetic ANN structural regression gate
+        # Generates hermetic clustered-vector fixtures (no network, seed=42),
+        # builds vec_bench, runs at NS=10000,50000, asserts recall@10 >= 0.90.
+        # Exit codes propagate directly:
+        #   0 — all assertions PASS (gate green)
+        #   1 — assertion FAIL (recall regression, beam regression, etc.)
+        #   2 — prereq missing (generator crash or cargo build failure)
+        # All non-zero exits block the PR.
+        run: bash scripts/bench_1m.sh --ci-synthetic
+        env:
+          BENCH_OUT: /tmp/bench-out
+
+      - name: Upload synthetic ledger artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-synthetic-ledger
+          path: perf/ci-synthetic-ledger.csv
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Real SIFT-1M scale-proof (banked, manual/self-hosted only)
+  # ─────────────────────────────────────────────────────────────────────────────
+  bench-1m-sift:
+    name: Vamana SIFT-1M scale-proof (banked, manual)
+    runs-on: ubuntu-latest
+
+    # This job is workflow_dispatch-only (see 'on' triggers above, which do
+    # not include pull_request/push for this job path). It runs gracefully
+    # when SIFT data is absent (exit 2 → skip notice). continue-on-error
+    # remains true because missing data on a manual run is expected.
     continue-on-error: true
+
+    # Only run on manual dispatch, not on push/pull_request.
+    if: github.event_name == 'workflow_dispatch'
 
     defaults:
       run:
@@ -79,24 +155,27 @@ jobs:
         if: ${{ github.event.inputs.sift_dir != '' }}
         run: echo "SIFT_DIR=${{ github.event.inputs.sift_dir }}" >> "$GITHUB_ENV"
 
-      - name: Run Vamana CI bench (10K/50K subset, <60 s when data present)
-        # Exit codes:
+      - name: Run real SIFT-1M bench (3-point 100K/316K/1M)
+        # Runs the full default NS (100000,316228,1000000) — the real banked
+        # scale-proof, not the subset. Requires the full SIFT-1M dataset at
+        # SIFT_DIR (provide via the sift_dir dispatch input or a self-hosted
+        # runner). Exit codes:
         #   0 — data present; all assertions PASS
         #   1 — data present; one or more assertions FAIL (regression)
         #   2 — data absent; skip gracefully
         run: |
           set +e
-          bash scripts/bench_1m.sh --ci
+          bash scripts/bench_1m.sh
           RC=$?
           set -e
           if [ $RC -eq 2 ]; then
-            echo "::notice::SIFT data not found at SIFT_DIR=${SIFT_DIR:-<unset>} — bench skipped. Provision a SIFT-capable runner to enable regression gating."
+            echo "::notice::SIFT data not found at SIFT_DIR=${SIFT_DIR:-<unset>} — bench skipped. Provision a SIFT-capable runner to run the banked scale-proof."
             exit 0
           elif [ $RC -eq 0 ]; then
-            echo "::notice::Vamana CI bench PASSED."
+            echo "::notice::Vamana SIFT-1M bench PASSED."
             exit 0
           else
-            echo "::warning::Vamana CI bench FAILED (regression detected, exit $RC)."
+            echo "::warning::Vamana SIFT-1M bench FAILED (regression detected, exit $RC)."
             exit $RC
           fi
         env:
