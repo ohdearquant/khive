@@ -3810,10 +3810,10 @@ async fn test_propose_pipe_withdraw_chain() -> anyhow::Result<()> {
 /// Two RuntimeConfigs that are identical except for their `visible_namespaces`
 /// must produce different `compute_config_id` fingerprints.
 ///
-/// `visible_namespaces` is retained for configuration identity; OSS dispatch
-/// does NOT use it to widen read scope (ADR-007 Rev 2). The fingerprint still
-/// includes it so configs with different visible sets are treated as distinct
-/// daemon configurations (e.g. for future cloud-gate policy).
+/// `visible_namespaces` widens the default multi-record read scope to
+/// `['local'] ∪ visible_namespaces` on the OSS dispatch path (ADR-007 Rev 4
+/// Rule 3b). The fingerprint includes the visible set so configs with different
+/// read scopes are treated as distinct daemon configurations.
 #[test]
 fn compute_config_id_differs_when_visible_namespaces_differ() {
     use khive_mcp::server::compute_config_id;

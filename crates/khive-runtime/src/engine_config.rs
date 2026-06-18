@@ -85,20 +85,22 @@ pub struct EngineConfig {
 ///
 /// Corresponds to the `[actor]` TOML section. `id` is used as the
 /// `default_namespace` for gate/attribution policy input. OSS dispatch pins
-/// storage to the shared `local` namespace regardless of this value (ADR-007
-/// Rev 2); cloud deployments derive the namespace from an authenticated
+/// writes to the shared `local` namespace regardless of this value (ADR-007
+/// Rev 4 Rule 0); cloud deployments derive the namespace from an authenticated
 /// `NamespaceToken` instead.
 ///
 /// ```toml
 /// [actor]
 /// id = "lambda:leo"                          # attribution identity (required)
 /// display_name = "Leo global orchestrator"   # human label (optional)
-/// visible_namespaces = ["lambda:khive", "local"]  # configuration identity; not consumed by OSS dispatch
+/// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// ```
 ///
-/// `visible_namespaces` is retained for configuration identity and future
-/// cloud-gate policy. OSS dispatch does NOT use it to widen read scope
-/// (storage token is always local-only, ADR-007 Rev 2).
+/// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
+/// multi-record read scope to `['local'] ∪ visible_namespaces` (ADR-007 Rev 4
+/// Rule 3b). Writes remain pinned to `'local'`. An explicit `namespace=` request
+/// param is a precise single-namespace escape and is not widened. A cloud gate
+/// may also consult this list as policy input at its own layer.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ActorConfig {
     /// Namespace identifier used as the default actor for all operations.
@@ -114,10 +116,11 @@ pub struct ActorConfig {
     #[serde(default)]
     pub display_name: Option<String>,
 
-    /// Additional namespaces retained for configuration identity and future
-    /// cloud-gate policy. Each string must be a valid `Namespace`. OSS
-    /// dispatch does NOT consume this list — storage is always pinned to
-    /// `local` regardless (ADR-007 Rev 2).
+    /// Additional namespaces that widen the DEFAULT multi-record read scope
+    /// to `['local'] ∪ visible_namespaces` (ADR-007 Rev 4 Rule 3b). Each string
+    /// must be a valid `Namespace`. Writes remain pinned to `'local'`. An
+    /// explicit `namespace=` request param is a precise escape and is not widened
+    /// by this list. A cloud gate may also consult it as policy input.
     #[serde(default)]
     pub visible_namespaces: Option<Vec<String>>,
 
