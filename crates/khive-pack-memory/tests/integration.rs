@@ -3131,6 +3131,10 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
 async fn adr007_rev4_writes_stamp_local() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
+        // No real embedder: this test exercises namespace scoping, not embedding.
+        // The CI runner has no model files, so loading one would fail (see a/a2).
+        embedding_model: None,
+        additional_embedding_models: vec![],
         visible_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
         ..RuntimeConfig::default()
     })
@@ -3176,6 +3180,9 @@ async fn adr007_rev4_writes_stamp_local() {
 async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
+        // No real embedder: scoping test, FTS recall only (see a/a2). CI has no model files.
+        embedding_model: None,
+        additional_embedding_models: vec![],
         // no visible_namespaces — same as Rev 3 behavior
         visible_namespaces: vec![],
         ..RuntimeConfig::default()
@@ -3233,12 +3240,22 @@ async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
 /// results (the explicit param is not widened by visible_namespaces).
 #[tokio::test]
 async fn adr007_rev4_explicit_namespace_is_strict_reading2() {
+    const MODEL_A: &str = "custom-enc-a";
+    const DIMS: usize = 4;
+
+    // No real model (CI has no model files); a ConstVecProvider drives the vector leg
+    // instead. The constant vector is identical across notes, so the local note WOULD
+    // surface if the explicit namespace= weren't strict — making this a sharp Reading-2
+    // guard rather than relying on FTS lexical luck for the hyphenated marker query.
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
         visible_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
         ..RuntimeConfig::default()
     })
     .expect("in-memory runtime");
+    rt.register_embedder(ConstVecProvider::new(MODEL_A, DIMS, 0.9));
 
     // Write a note to local (default path — no explicit namespace).
     let tok_local = rt.authorize(Namespace::local()).expect("authorize local");
@@ -3325,6 +3342,9 @@ async fn adr007_rev4_explicit_namespace_is_strict_reading2() {
 async fn adr007_rev4_get_byid_is_namespace_agnostic() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
+        // No real embedder: by-ID get needs no embedding (see a/a2). CI has no model files.
+        embedding_model: None,
+        additional_embedding_models: vec![],
         visible_namespaces: vec![],
         ..RuntimeConfig::default()
     })
