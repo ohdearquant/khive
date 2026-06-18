@@ -3117,3 +3117,168 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
          its presence proves the old greedy retain was used instead of the prefix cut"
     );
 }
+
+// ── B2 — multi-namespace recall regression (ADR-062 §2 over-fetch + filter) ────
+
+/// B2: ANN over-fetch + namespace post-filter.
+///
+/// Stores memories in two namespaces (`local` and `other`).  The global ANN index
+/// spans both.  Asserts:
+///  1. Default recall (visible = [`local`]) excludes `other`-namespace memories.
+///  2. A wide token (visible = [`local`, `other`]) includes both namespaces.
+///  3. Recall@k is satisfied when ≥k local candidates exist (over-fetch is enough).
+///
+/// Uses a deterministic custom embedder (no lattice weights required).
+#[tokio::test]
+async fn test_multi_namespace_recall_overfetch_filter() {
+    use khive_runtime::PackRuntime;
+
+    const MODEL: &str = "ns-filter-enc";
+    const DIMS: usize = 8;
+
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new(MODEL, DIMS, 0.42));
+
+    let registry = make_registry(rt.clone());
+
+    // Store 3 memories in `local` namespace.
+    let mut local_ids = Vec::new();
+    for i in 0..3 {
+        let r = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("local memory entry number {i} about graph databases"),
+                    "salience": 0.7,
+                    "namespace": "local"
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("local remember {i} failed: {e}"));
+        local_ids.push(r["id"].as_str().expect("note_id").to_string());
+    }
+
+    // Store 2 memories in `other` namespace.
+    let mut other_ids = Vec::new();
+    for i in 0..2 {
+        let r = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("other namespace memory {i} about graph databases"),
+                    "salience": 0.7,
+                    "namespace": "other"
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("other remember {i} failed: {e}"));
+        other_ids.push(r["id"].as_str().expect("note_id").to_string());
+    }
+
+    // ── Assertion 1: default recall (local-only) excludes `other` memories ────
+    let default_recall = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "graph databases", "limit": 10 }),
+        )
+        .await
+        .expect("default recall");
+    let default_hits: Vec<&str> = default_recall
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+
+    for oid in &other_ids {
+        assert!(
+            !default_hits.contains(&oid.as_str()),
+            "default recall must exclude other-namespace memory {oid}; got: {default_hits:?}"
+        );
+    }
+    for lid in &local_ids {
+        assert!(
+            default_hits.contains(&lid.as_str()),
+            "default recall must include local memory {lid}; got: {default_hits:?}"
+        );
+    }
+
+    // ── Assertion 2: wide token includes both namespaces ──────────────────────
+    let pack = MemoryPack::new(rt.clone());
+    // Warm the ANN so vectors are indexed.
+    pack.warm().await;
+
+    let wide_token = rt
+        .authorize_with_visibility(
+            Namespace::parse("local").expect("local ns"),
+            vec![Namespace::parse("other").expect("other ns")],
+        )
+        .expect("wide token");
+
+    let wide_recall = pack
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "graph databases", "limit": 10 }),
+            &registry,
+            &wide_token,
+        )
+        .await
+        .expect("wide-token recall");
+
+    let wide_hits: Vec<&str> = wide_recall
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+
+    for lid in &local_ids {
+        assert!(
+            wide_hits.contains(&lid.as_str()),
+            "wide-token recall must include local memory {lid}; got: {wide_hits:?}"
+        );
+    }
+    for oid in &other_ids {
+        assert!(
+            wide_hits.contains(&oid.as_str()),
+            "wide-token recall must include other-namespace memory {oid}; got: {wide_hits:?}"
+        );
+    }
+
+    // ── Assertion 3: recall@3 satisfied with 3 local candidates even when ────
+    // the global ANN top results may include foreign-namespace hits.
+    let k3_recall = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "graph databases", "limit": 3 }),
+        )
+        .await
+        .expect("recall@3");
+    let k3_hits: Vec<&str> = k3_recall
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+
+    // All 3 local memories should be present — over-fetch ensures enough
+    // local candidates survive the post-filter even if the global NN top-k
+    // includes foreign-namespace hits.
+    assert_eq!(
+        k3_hits.len(),
+        3,
+        "recall@3 must return exactly 3 results when 3 local candidates exist; got: {k3_hits:?}"
+    );
+    for lid in &local_ids {
+        assert!(
+            k3_hits.contains(&lid.as_str()),
+            "recall@3 must include local memory {lid}; got: {k3_hits:?}"
+        );
+    }
+}

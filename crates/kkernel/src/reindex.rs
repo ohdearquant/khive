@@ -235,14 +235,71 @@ impl ReindexReport {
     }
 }
 
+/// Drop ALL existing vector rows for `subject_ids` in the given model table,
+/// regardless of their stored namespace. This is required before re-embedding
+/// because the vec table's PRIMARY KEY is `(subject_id)` — not `(subject_id,
+/// namespace)` — so a row written by a different namespace would collide on
+/// re-insert. By deleting on subject_id alone we ensure the subsequent INSERT
+/// lands cleanly with the base row's current namespace.
+///
+/// Only called when `drop_existing` (i.e. NOT `--keep-existing`). Best-effort:
+/// a deletion failure is logged but does not abort; the subsequent INSERT will
+/// either collide (and be counted as an error) or succeed.
+async fn drop_vectors_for_subjects(rt: &KhiveRuntime, model_name: &str, ids: &[Uuid]) {
+    use khive_storage::types::{SqlStatement, SqlValue};
+    if ids.is_empty() {
+        return;
+    }
+    // Compute the table name the same way SqliteVecStore does.
+    let model_key: String = model_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let table = format!("vec_{model_key}");
+    let sql = rt.sql();
+
+    // Batch into ≤400 IDs per statement to stay within SQLite's variable limit.
+    for chunk in ids.chunks(400) {
+        let placeholders: String = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!("DELETE FROM {table} WHERE subject_id IN ({placeholders})");
+        let params: Vec<SqlValue> = chunk
+            .iter()
+            .map(|id| SqlValue::Text(id.to_string()))
+            .collect();
+        let Ok(mut writer) = sql.writer().await else {
+            tracing::warn!(
+                table,
+                "failed to open writer for subject-scoped vector drop"
+            );
+            return;
+        };
+        if let Err(e) = writer
+            .execute(SqlStatement {
+                sql: statement,
+                params,
+                label: Some("drop_vectors_for_subjects".into()),
+            })
+            .await
+        {
+            tracing::warn!(error = %e, table, "subject-scoped vector drop failed (continuing)");
+        }
+    }
+}
+
 /// Embed `staged` with every model in `model_names` and store one vector record
 /// per model — mirroring the multi-model write path in the runtime. Returns the
 /// number of vector inserts that failed.
 ///
-/// With `drop_existing`, all staged ids are (re)embedded — existing vectors are
-/// atomically replaced by `SqliteVecStore::insert`'s internal DELETE+INSERT
-/// transaction (no-worse-than-stale on failure). Otherwise (`--keep-existing`),
-/// ids already embedded in a given model are skipped for that model only.
+/// With `drop_existing`, all staged ids are (re)embedded. Before inserting, a
+/// subject-scoped delete removes ANY existing row for each `subject_id` in the
+/// model table, regardless of its stored namespace. This prevents UNIQUE
+/// constraint violations when the database was relabeled and vec rows from a
+/// prior namespace survive. The subsequent INSERT writes the current base-row
+/// namespace. With `--keep-existing`, existing vectors are preserved and ids
+/// already embedded are skipped.
 // REASON: each argument is a distinct embed dimension (runtime, token, models,
 // namespace, batch, substrate kind, field, drop flag); a struct would add
 // indirection without grouping anything cohesive.
@@ -258,6 +315,20 @@ async fn embed_and_store_batch(
     drop_existing: bool,
 ) -> u64 {
     let mut errors: u64 = 0;
+
+    // Subject-scoped drop: remove ANY existing vec rows for these subject_ids
+    // in each model table, regardless of stored namespace. This ensures the
+    // re-insert never hits a UNIQUE collision when vec rows from a prior
+    // namespace survive a relabel operation. Done once per model here; the
+    // SqliteVecStore::insert DELETE is namespace-scoped and would miss rows
+    // stored under a different namespace.
+    if drop_existing && !staged.is_empty() {
+        let subject_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
+        for model_name in model_names {
+            drop_vectors_for_subjects(rt, model_name, &subject_ids).await;
+        }
+    }
+
     for model_name in model_names {
         let vectors = match rt.vectors_for_model(token, model_name) {
             Ok(v) => v,
@@ -586,9 +657,13 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
         // Drop per-namespace FTS partition tables that survived the V4 migration
         // (tables created by the runtime before the migration ran, or on databases
-        // that were migrated but not swept). Safe to run on any V4+ database;
-        // a no-op on fresh databases.
-        sweep_stale_fts_partitions(&rt).await;
+        // that were migrated but not swept). The sweep is guarded: it only runs
+        // when this reindex pass covered every distinct namespace in the base
+        // entities/notes tables. If any namespace is uncovered, sweeping would
+        // orphan those rows (they were dropped from the old partition and never
+        // written to the new unified table). On a single-namespace (post-relabel)
+        // db the guard always passes and the sweep runs normally.
+        sweep_stale_fts_partitions(&rt, &ns_str).await;
     } // end if do_graph
 
     // ── knowledge corpus ───────────────────────────────────────────────────────
@@ -773,13 +848,76 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     }
 }
 
+/// Return the set of distinct namespaces present in base `entities` and `notes`
+/// (non-deleted rows only). Used by the FTS sweep guard.
+async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
+    use khive_storage::types::SqlStatement;
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return HashSet::new();
+    };
+    // Union of entity and note namespaces; soft-deleted rows are excluded so
+    // we only guard against losing rows that are still live in the base table.
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT DISTINCT namespace FROM entities WHERE deleted_at IS NULL \
+                  UNION \
+                  SELECT DISTINCT namespace FROM notes WHERE deleted_at IS NULL"
+                .into(),
+            params: vec![],
+            label: Some("distinct_base_namespaces".into()),
+        })
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            row.get("namespace").and_then(|v| {
+                if let khive_storage::types::SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 /// Drop per-namespace FTS5 partition tables (`fts_entities_*`, `fts_notes_*`) that
 /// may exist in databases that were not yet migrated or were created before V4.
 /// Canonical tables (`fts_entities`, `fts_notes`, `fts_knowledge`, `fts_sections`)
 /// and their FTS5 shadow tables are never dropped.
 /// Safe to run repeatedly; a no-op on fresh databases.
-async fn sweep_stale_fts_partitions(rt: &KhiveRuntime) {
+///
+/// **Sweep guard**: only drops partition tables when every distinct namespace
+/// present in the base `entities`/`notes` tables was covered by this reindex
+/// pass (i.e. the operating namespace `covered_ns` is the only namespace in the
+/// base). If uncovered namespaces exist, the sweep is skipped and a warning is
+/// emitted so operators know a manual or multi-namespace reindex is needed.
+async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
     use khive_storage::types::{SqlStatement, SqlValue};
+
+    // Guard: only sweep when every distinct namespace present in base
+    // entities/notes was covered by this reindex pass. A single-namespace
+    // (post-relabel) db has exactly {covered_ns} and passes immediately. A
+    // multi-namespace db would be partially swept — rows in other namespaces
+    // were dropped from old partitions but never carried to the unified table —
+    // so we skip and warn instead.
+    let base_namespaces = distinct_base_namespaces(rt).await;
+    let uncovered: Vec<&str> = base_namespaces
+        .iter()
+        .filter(|ns| ns.as_str() != covered_ns)
+        .map(String::as_str)
+        .collect();
+    if !uncovered.is_empty() {
+        tracing::warn!(
+            covered = covered_ns,
+            uncovered = ?uncovered,
+            "skipping stale FTS partition sweep: base tables contain namespaces not \
+             covered by this reindex pass; run reindex for each namespace first, \
+             or normalize all rows to one namespace before sweeping"
+        );
+        return;
+    }
 
     // Canonical base names that must never be dropped.
     let canonical: &[&str] = &["fts_entities", "fts_notes", "fts_knowledge", "fts_sections"];

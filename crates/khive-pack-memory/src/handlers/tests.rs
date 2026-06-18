@@ -225,6 +225,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         text_hits: text_hits.clone(),
         vector_hits_per_model: vec![("mock".to_string(), vector_hits.clone())],
         multilingual_routed: false,
+        visible_namespaces: vec!["local".to_string()],
     };
     let cfg_rrf = RecallConfig {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },
@@ -238,6 +239,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         text_hits,
         vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
         multilingual_routed: false,
+        visible_namespaces: vec!["local".to_string()],
     };
     let cfg_weighted = RecallConfig {
         fuse_strategy: FusionStrategy::Weighted {
@@ -578,6 +580,7 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
             ("model-b".to_string(), hits_b),
         ],
         multilingual_routed: false,
+        visible_namespaces: vec!["test".to_string()],
     };
 
     let per_model: Vec<Value> = candidates
