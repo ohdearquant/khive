@@ -106,6 +106,8 @@ const V2_UP: &str = include_str!("../sql/002-narrow-fts-sections-update-trigger.
 
 const V3_UP: &str = include_str!("../sql/003-backfill-domain-mirror-atoms.sql");
 
+const V4_UP: &str = include_str!("../sql/004-fts-consolidation.sql");
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -129,6 +131,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 3,
         name: "backfill_domain_mirror_atoms",
         up: V3_UP,
+    },
+    VersionedMigration {
+        version: 4,
+        name: "fts_consolidation",
+        up: V4_UP,
     },
 ];
 
