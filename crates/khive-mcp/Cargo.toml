@@ -49,3 +49,4 @@ async-trait = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.2.11", path = "../khive-pack-knowledge" }
+rusqlite = { workspace = true, features = ["bundled"] }
