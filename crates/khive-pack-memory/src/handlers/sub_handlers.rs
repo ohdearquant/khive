@@ -104,6 +104,9 @@ impl MemoryPack {
         let effective_fts_gather_cand = crate::config::RecallFtsGatherConfig::from_env()
             .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
             .unwrap_or_else(|| cfg.fts_gather.clone());
+        let ann_overfetch_max_rounds_cand = cfg
+            .ann_overfetch_max_rounds
+            .unwrap_or_else(super::common::ann_overfetch_max_rounds);
 
         let candidates = self
             .collect_recall_candidates(
@@ -119,6 +122,7 @@ impl MemoryPack {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },
                     fts_gather: &effective_fts_gather_cand,
+                    ann_overfetch_max_rounds: ann_overfetch_max_rounds_cand,
                 },
             )
             .await?;
@@ -206,6 +210,9 @@ impl MemoryPack {
         let effective_fts_gather_fuse = crate::config::RecallFtsGatherConfig::from_env()
             .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
             .unwrap_or_else(|| cfg.fts_gather.clone());
+        let ann_overfetch_max_rounds_fuse = cfg
+            .ann_overfetch_max_rounds
+            .unwrap_or_else(super::common::ann_overfetch_max_rounds);
 
         let candidates = self
             .collect_recall_candidates(
@@ -221,6 +228,7 @@ impl MemoryPack {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },
                     fts_gather: &effective_fts_gather_fuse,
+                    ann_overfetch_max_rounds: ann_overfetch_max_rounds_fuse,
                 },
             )
             .await?;

@@ -356,6 +356,10 @@ pub(super) struct RecallCandidateParams<'a> {
     pub(super) scoring_cfg: &'a crate::scoring::ScoringConfig,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
+    /// Maximum rounds for the ANN over-fetch retry loop. Threaded from
+    /// `RecallConfig::ann_overfetch_max_rounds` (with OnceLock env fallback)
+    /// so tests can drive both branches in-process without env mutation.
+    pub(super) ann_overfetch_max_rounds: usize,
 }
 
 pub(super) struct RecallVectorCandidateParams<'a> {
@@ -367,6 +371,13 @@ pub(super) struct RecallVectorCandidateParams<'a> {
     /// Namespace set the caller is allowed to read. ANN returns global candidates;
     /// post-filter trims to this set before returning hits.
     pub(super) visible_namespaces: Vec<String>,
+    /// Maximum rounds for the ANN over-fetch retry loop.
+    ///
+    /// Resolved from `RecallConfig::ann_overfetch_max_rounds` (per-request) with
+    /// fallback to the process-wide `ANN_OVERFETCH_MAX_ROUNDS` env OnceLock.
+    /// Passed explicitly so tests can drive both branches in-process without
+    /// mutating the process-wide env.
+    pub(super) ann_overfetch_max_rounds: usize,
 }
 
 pub(super) struct RecallVectorCandidateResult {
@@ -608,6 +619,7 @@ impl MemoryPack {
             scoring_cfg,
             snippet_policy,
             fts_gather,
+            ann_overfetch_max_rounds,
         } = opts;
 
         // FTS recall uses the single shared fts_notes table (V4 migration). Namespace
@@ -643,6 +655,7 @@ impl MemoryPack {
                 use_multilingual,
                 scoring_cfg,
                 visible_namespaces: visible.clone(),
+                ann_overfetch_max_rounds,
             },
         );
         let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
@@ -680,6 +693,7 @@ impl MemoryPack {
             use_multilingual,
             scoring_cfg,
             visible_namespaces,
+            ann_overfetch_max_rounds,
         } = opts;
 
         // Over-fetch factor for the ANN path: F=4, M=32.
@@ -785,12 +799,10 @@ impl MemoryPack {
                 }
             }
 
-            // Maximum rounds for the ANN over-fetch retry loop. Round 1 is the initial
-            // over-fetch; rounds 2–N double the fetch window until the corpus is
-            // exhausted or enough visible-namespace candidates are found.
-            // Resolved once per process via OnceLock (see ann_overfetch_max_rounds());
-            // tests must set ANN_OVERFETCH_MAX_ROUNDS before process start.
-            let ann_overfetch_max_rounds = ann_overfetch_max_rounds();
+            // ann_overfetch_max_rounds is resolved by the caller (from RecallConfig or
+            // the process-wide OnceLock env fallback) and threaded via
+            // RecallVectorCandidateParams so both branches are exercisable in-process
+            // without env mutation.
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";

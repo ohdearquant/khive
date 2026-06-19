@@ -528,10 +528,10 @@ impl VectorStore for SqliteVecStore {
                     stmt.raw_execute().map(|n| n as u64)
                 })
                 .await
-                .unwrap_or_else(|e| {
+                .map_err(|e| {
                     tracing::warn!(error = %e, table = %table_cl, "delete_subjects chunk failed");
-                    0
-                });
+                    e
+                })?;
             total_deleted += deleted;
         }
         Ok(total_deleted)

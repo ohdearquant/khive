@@ -3887,10 +3887,24 @@ async fn c1_setup() -> (
     (rt, registry, pack, local_ids)
 }
 
-// C1 main: with default retry rounds, local memories ARE found despite the foreign
-// cluster dominating the first over-fetch round.
+// C1 deterministic: asserts BOTH branches of the ANN over-fetch retry loop in a
+// single test with no env mutation. Both branches run every CI invocation.
+//
+// Corpus geometry (see c1_setup):
+//   - 50 foreign vectors [1,0,0,0] closest to query direction
+//   - 3 local  vectors [0.15,0.9887,0,0] farther from query (cosine=0.15)
+//   - candidate_limit=8 → ann_fetch_limit=40 < 53 total
+//
+// Branch (a): ann_overfetch_max_rounds=3 (≥2 rounds needed to widen to 80>53)
+//   → retry fires, corpus exhausted, all 3 locals surface.
+//
+// Branch (b): ann_overfetch_max_rounds=1 (single round only)
+//   → round 1 returns 40 foreign hits; no retry; locals silently absent.
+//
+// Both branches are exercised in-process via RecallConfig.ann_overfetch_max_rounds.
+// No env var mutation; no cross-test interference; no silent skips.
 #[tokio::test]
-async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_cluster() {
+async fn test_ann_overfetch_retry_both_branches_deterministic() {
     use khive_runtime::PackRuntime;
 
     let (rt, registry, pack, local_ids) = c1_setup().await;
@@ -3901,24 +3915,26 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
         .authorize(Namespace::parse("local").expect("local ns"))
         .expect("authorize local");
 
-    let result = pack
+    // Branch (a): with adequate rounds (3), the retry widens to 80>53 and
+    // exhausts the corpus, surfacing all 3 local memories.
+    let result_with_retry = pack
         .dispatch(
             "memory.recall",
-            // candidate_limit=Some(8) → ann_fetch_limit=40. Query maps to [1,0,0,0]
-            // (same as foreign cluster). Round 1 returns 40 foreign hits, 0 local.
-            // Retry widens to 80>53, exhausting corpus and finding all 3 locals.
             json!({
                 "query": "xforeign dominant cluster",
                 "limit": 3,
-                "config": { "candidate_limit": 8 }
+                "config": {
+                    "candidate_limit": 8,
+                    "ann_overfetch_max_rounds": 3
+                }
             }),
             &registry,
             &local_token,
         )
         .await
-        .expect("local-token recall");
+        .expect("recall with retry");
 
-    let hits: Vec<&str> = result
+    let hits_with_retry: Vec<&str> = result_with_retry
         .as_array()
         .expect("array")
         .iter()
@@ -3927,70 +3943,44 @@ async fn test_ann_overfetch_retry_finds_local_memories_in_foreign_dominated_clus
 
     for lid in &local_ids {
         assert!(
-            hits.contains(&lid.as_str()),
-            "C1 retry regression: local memory {lid} must be in recall result with retry; \
-             got: {hits:?}. If this fails with ANN_OVERFETCH_MAX_ROUNDS=1, that is expected."
+            hits_with_retry.contains(&lid.as_str()),
+            "C1 branch-a: local memory {lid} MUST appear when retry rounds=3; \
+             got: {hits_with_retry:?}"
         );
     }
-}
 
-// C1 stall: with ANN_OVERFETCH_MAX_ROUNDS=1, local memories are NOT found because the
-// retry loop is disabled. This test PASSES only when ANN_OVERFETCH_MAX_ROUNDS=1 is set.
-// It is skipped silently when the env var is absent or != "1".
-//
-// Run to confirm the gate matters:
-//   ANN_OVERFETCH_MAX_ROUNDS=1 cargo test -p khive-pack-memory \
-//       test_ann_overfetch_retry_stalls_without_widening -- --nocapture
-#[tokio::test]
-async fn test_ann_overfetch_retry_stalls_without_widening() {
-    use khive_runtime::PackRuntime;
-
-    // Only meaningful when ANN_OVERFETCH_MAX_ROUNDS=1 is set externally.
-    // When unset, the retry loop runs to default (3 rounds) and locals ARE found —
-    // which would make this test always pass trivially. Skip unless forced to 1.
-    let max_rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(3);
-    if max_rounds != 1 {
-        // Not running with the stall condition — skip.
-        return;
-    }
-
-    let (rt, registry, pack, local_ids) = c1_setup().await;
-
-    let local_token = rt
-        .authorize(Namespace::parse("local").expect("local ns"))
-        .expect("authorize local");
-
-    let result = pack
+    // Branch (b): with a single round, round 1 fetches 40 of 53 vectors — all
+    // foreign (nearest to query direction). No retry fires so local memories
+    // (ranked 51-53 behind all 50 foreign) are absent from the result.
+    let result_no_retry = pack
         .dispatch(
             "memory.recall",
             json!({
                 "query": "xforeign dominant cluster",
                 "limit": 3,
-                "config": { "candidate_limit": 8 }
+                "config": {
+                    "candidate_limit": 8,
+                    "ann_overfetch_max_rounds": 1
+                }
             }),
             &registry,
             &local_token,
         )
         .await
-        .expect("local-token recall (stall)");
+        .expect("recall without retry");
 
-    let hits: Vec<&str> = result
+    let hits_no_retry: Vec<&str> = result_no_retry
         .as_array()
         .expect("array")
         .iter()
         .map(|h| h["id"].as_str().unwrap())
         .collect();
 
-    // With a single round, round 1 fetches 40 of 53 vectors — all foreign (near query).
-    // No retry fires, so local memories (far from query) are silently dropped.
     for lid in &local_ids {
         assert!(
-            !hits.contains(&lid.as_str()),
-            "C1 stall: local memory {lid} must NOT appear in single-round recall; \
-             if it does, the test corpus geometry is wrong. hits: {hits:?}"
+            !hits_no_retry.contains(&lid.as_str()),
+            "C1 branch-b: local memory {lid} must NOT appear when retry rounds=1 \
+             (corpus geometry broken if it does); got: {hits_no_retry:?}"
         );
     }
 }
