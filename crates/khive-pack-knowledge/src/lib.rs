@@ -73,7 +73,10 @@ pub async fn reindex_knowledge(
     let mut sections_indexed = 0u64;
     let mut sections_failed = 0u64;
     if opts.sections {
-        let batch = opts.batch_size.unwrap_or(500) as usize;
+        let batch = opts
+            .batch_size
+            .map(|b| b as usize)
+            .unwrap_or(knowledge::util::DEFAULT_EMBED_BATCH);
         let (indexed, _skipped, sec_failed) = knowledge::sections_index::embed_sections(
             runtime,
             token,

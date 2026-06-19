@@ -8,7 +8,7 @@
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::util::{now_us, row_str, sql_err, EMBED_BATCH, MAX_EMBED_BYTES};
+use super::util::{now_us, row_str, sql_err, MAX_EMBED_BYTES};
 
 fn unit_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -109,56 +109,45 @@ pub(crate) async fn embed_sections(
     let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    let mut offset = 0i64;
+    let mut last_id: Option<String> = None;
 
     loop {
-        let skipped_before = skipped;
-        let failed_before = failed;
-        // When keeping existing vectors we filter on `embedding IS NULL`. Embedded
-        // rows leave the set; rows that fail or are skipped stay NULL, so we must
-        // advance the offset past THEM each pass (see the offset update below) —
-        // otherwise a full page of persistent failures would re-select forever.
-        // A full re-embed has a stable result set, so we paginate by row count.
+        // Keyset pagination on the `id` PRIMARY KEY: each page selects rows with
+        // `id > last_id` in id order, then advances `last_id` to the page's max id.
+        // Cost is O(N) total (one forward walk of the id B-tree) instead of the
+        // O(N^2) deep-OFFSET re-scan. Works for both modes: a full re-embed walks
+        // every row once; keep-existing walks once and the `embedding IS NULL`
+        // filter skips already-embedded rows inline. Advancing past EVERY page row
+        // (embedded, skipped, or failed) guarantees each row is attempted at most
+        // once and the loop terminates.
         let null_filter = if drop_existing {
             ""
         } else {
             " AND s.embedding IS NULL"
         };
-        // atom_filter uses ?2 when present; pagination params follow at ?2/?3 or ?3/?4.
-        let (query, page_params) = if let Some(id) = atom_id {
-            (
-                format!(
-                    "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
-                            a.name AS atom_name \
-                     FROM knowledge_sections s \
-                     JOIN knowledge_atoms a ON a.id = s.atom_id \
-                     WHERE s.namespace = ?1 AND s.atom_id = ?2{null_filter} \
-                     ORDER BY s.id LIMIT ?3 OFFSET ?4"
-                ),
-                vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Text(id.to_owned()),
-                    SqlValue::Integer(page),
-                    SqlValue::Integer(offset),
-                ],
-            )
+        let mut page_params = vec![SqlValue::Text(ns.clone())];
+        let atom_clause = if let Some(id) = atom_id {
+            page_params.push(SqlValue::Text(id.to_owned()));
+            format!(" AND s.atom_id = ?{}", page_params.len())
         } else {
-            (
-                format!(
-                    "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
-                            a.name AS atom_name \
-                     FROM knowledge_sections s \
-                     JOIN knowledge_atoms a ON a.id = s.atom_id \
-                     WHERE s.namespace = ?1{null_filter} \
-                     ORDER BY s.id LIMIT ?2 OFFSET ?3"
-                ),
-                vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Integer(page),
-                    SqlValue::Integer(offset),
-                ],
-            )
+            String::new()
         };
+        let keyset_clause = if let Some(ref last) = last_id {
+            page_params.push(SqlValue::Text(last.clone()));
+            format!(" AND s.id > ?{}", page_params.len())
+        } else {
+            String::new()
+        };
+        page_params.push(SqlValue::Integer(page));
+        let limit_pos = page_params.len();
+        let query = format!(
+            "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
+                    a.name AS atom_name \
+             FROM knowledge_sections s \
+             JOIN knowledge_atoms a ON a.id = s.atom_id \
+             WHERE s.namespace = ?1{atom_clause}{null_filter}{keyset_clause} \
+             ORDER BY s.id LIMIT ?{limit_pos}"
+        );
         let mut reader = sql
             .reader()
             .await
@@ -192,49 +181,52 @@ pub(crate) async fn embed_sections(
             staged.push((id, text));
         }
 
-        for chunk in staged.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = chunk.iter().map(|(_, t)| truncate_bytes(t)).collect();
-            let embeddings = match runtime.embed_document_batch(&texts).await {
-                Ok(e) if e.len() == chunk.len() => e,
+        // One embed call per page: the page (LIMIT = batch_size) IS the embed
+        // batch, so there is no inner re-chunk. `staged` holds the non-empty rows
+        // of this page (≤ batch_size).
+        if !staged.is_empty() {
+            let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_bytes(t)).collect();
+            match runtime.embed_document_batch(&texts).await {
+                Ok(embeddings) if embeddings.len() == staged.len() => {
+                    let mut writer = sql
+                        .writer()
+                        .await
+                        .map_err(|e| sql_err("section index writer", e))?;
+                    let now = now_us();
+                    for ((id, _), mut emb) in staged.iter().zip(embeddings.into_iter()) {
+                        unit_normalize(&mut emb);
+                        if let Err(e) = writer
+                            .execute(SqlStatement {
+                                sql:
+                                    "UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 \
+                                      WHERE id = ?3"
+                                        .into(),
+                                params: vec![
+                                    SqlValue::Blob(f32_to_le_bytes(&emb)),
+                                    SqlValue::Integer(now),
+                                    SqlValue::Text(id.clone()),
+                                ],
+                                label: None,
+                            })
+                            .await
+                        {
+                            tracing::warn!(id = %id, error = %e, "section embedding UPDATE failed; counting as failed");
+                            failed += 1;
+                        } else {
+                            indexed += 1;
+                        }
+                    }
+                }
                 Ok(_) => {
                     tracing::warn!(
-                        batch = chunk.len(),
+                        batch = staged.len(),
                         "section embed_batch returned wrong vector count; counting as failed"
                     );
-                    failed += chunk.len();
-                    continue;
+                    failed += staged.len();
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, batch = chunk.len(), "section embed_batch failed; counting as failed");
-                    failed += chunk.len();
-                    continue;
-                }
-            };
-            let mut writer = sql
-                .writer()
-                .await
-                .map_err(|e| sql_err("section index writer", e))?;
-            let now = now_us();
-            for ((id, _), mut emb) in chunk.iter().zip(embeddings.into_iter()) {
-                unit_normalize(&mut emb);
-                if let Err(e) = writer
-                    .execute(SqlStatement {
-                        sql: "UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 \
-                              WHERE id = ?3"
-                            .into(),
-                        params: vec![
-                            SqlValue::Blob(f32_to_le_bytes(&emb)),
-                            SqlValue::Integer(now),
-                            SqlValue::Text(id.clone()),
-                        ],
-                        label: None,
-                    })
-                    .await
-                {
-                    tracing::warn!(id = %id, error = %e, "section embedding UPDATE failed; counting as failed");
-                    failed += 1;
-                } else {
-                    indexed += 1;
+                    tracing::warn!(error = %e, batch = staged.len(), "section embed_batch failed; counting as failed");
+                    failed += staged.len();
                 }
             }
         }
@@ -246,16 +238,13 @@ pub(crate) async fn embed_sections(
         if n < page as usize {
             break;
         }
-        // drop_existing: stable result set → paginate by full page.
-        // keep-existing: embedded rows leave the `embedding IS NULL` set, so only
-        // the rows still NULL after this pass (failed + skipped) need to be
-        // stepped over; advancing by exactly that count attempts each row once
-        // and guarantees termination.
-        offset += if drop_existing {
-            n as i64
-        } else {
-            (skipped - skipped_before + failed - failed_before) as i64
-        };
+        // Advance the cursor past the whole page. Rows are id-ordered, so the last
+        // row holds the page's max id; this steps over embedded, skipped, and
+        // failed rows alike so none is re-selected and the loop terminates.
+        match rows.last().and_then(|r| row_str(r, "id")) {
+            Some(id) => last_id = Some(id),
+            None => break,
+        }
     }
 
     Ok((indexed, skipped, failed))

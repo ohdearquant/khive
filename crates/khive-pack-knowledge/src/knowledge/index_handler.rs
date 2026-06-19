@@ -7,7 +7,9 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::SubstrateKind;
 
 use super::schema::{Atom, IndexParams};
-use super::util::{atom_embed_text, atom_from_row, deser, sql_err, EMBED_BATCH, MAX_EMBED_BYTES};
+use super::util::{
+    atom_embed_text, atom_from_row, deser, sql_err, DEFAULT_EMBED_BATCH, MAX_EMBED_BYTES,
+};
 use super::vamana;
 use super::KnowledgeHandlers;
 
@@ -30,7 +32,7 @@ impl KnowledgeHandlers {
         }
 
         let sql = runtime.sql();
-        let batch_size = p.batch_size.unwrap_or(500).clamp(1, 1000);
+        let batch_size = p.batch_size.unwrap_or(DEFAULT_EMBED_BATCH).clamp(1, 1000);
         // insert_only is accepted for API compatibility but no longer drives a
         // pre-delete loop: SqliteVecStore::insert atomically replaces via its own
         // transacted DELETE+INSERT regardless of this flag.
@@ -98,7 +100,7 @@ impl KnowledgeHandlers {
         let mut ann_ids: Vec<uuid::Uuid> = Vec::new();
         let mut ann_dim: usize = 0;
 
-        for chunk in atoms.chunks(EMBED_BATCH) {
+        for chunk in atoms.chunks(batch_size) {
             let mut staged: Vec<(uuid::Uuid, String)> = Vec::with_capacity(chunk.len());
             for atom in chunk {
                 let text = atom_embed_text(atom);
