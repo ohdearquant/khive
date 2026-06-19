@@ -1,13 +1,33 @@
-# ADR-007 Rev 4: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
+# ADR-007 Rev 6: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility, Per-Actor Episodic Memory
 
-**Status**: Accepted/Ratified (2026-06-18)
-**Date**: 2026-06-17
+**Status**: Accepted/Ratified (2026-06-19)
+**Date**: 2026-06-19
 **Authors**: lambda:khive, alpha:architect
-**Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, Rev 2, and Rev 3 read-scope clause)
+**Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, Rev 2, Rev 3 read-scope clause; Rev 6 amends the Rev 4 Rule 0 write-default for episodic memory)
 **Supersedes (partial)**: ADR-050 §"Decision"; ADR-059 §"Decision" and §"Visibility tiers"
 **Superseded-by-none**: ADR-053 (ActorStore, SessionStore, cloud-tier actor threading) survives in full
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
-| ADR-002 (edge cascade, no dangling refs)
+| ADR-002 (edge cascade, no dangling refs) | ADR-021 (memory pack, episodic vs semantic routing)
+
+**Rev 6 summary (2026-06-19)**: Carves one exception out of the Rule 0 write default. Through
+Rev 4, every write pinned `namespace = 'local'` by default (the actor identity contributed only
+to the read visible-set, never to the write namespace). Rev 6 amends that default for a single
+write path: an episodic memory write (`memory.remember` with `memory_type = episodic`) stamps
+`namespace = the caller's actor id` (`token.actor().id`) by default, rather than the shared
+`'local'` pool. Semantic memory writes are unchanged: they continue to stamp `token.namespace()`
+(the shared pool, `'local'` by default). An explicit `namespace=` request parameter continues to
+override the write namespace for both memory types, exactly as in Rule 3. This carve-out is
+attribution plus view-layer visibility, not a storage boundary: the store performs no
+`record.namespace == caller_namespace` check (the prior-v1 pattern PR-A1 removed, which must not
+return), by-ID ops stay namespace-agnostic (Rule 2), and the actor-stamped episodic memory
+becomes visible purely through the existing Rev-4 read visible-set fanout
+(`{local} ∪ {actor.id} ∪ {actor.visible_namespaces}`). It is backward-compatible: an anonymous
+actor has id `'local'` (`ActorRef::anonymous`), so with no `[actor]` configured the episodic
+write namespace resolves to `'local'`, byte-identical to pre-Rev-6 behavior. The carve-out takes
+effect only once a real actor is configured and threaded into `token.actor()`. Recall needs no
+change: the Rev-4 fanout already returns actor.id-stamped memories on both the FTS path and the
+ANN post-filter path. The Gate (ADR-018) remains the single trust seam. All other Rev 4 / Rev 3
+rules are retained verbatim. See the Rev 6 amendment to Rule 0 below and Rule 3 (memory routing).
 
 **Rev 4 summary (2026-06-17)**: Generalizes the Rev 3 default read scope. Rev 3 fixed the
 default multi-record read scope at exactly `['local']`, with an explicit `namespace=` request
@@ -88,6 +108,52 @@ deployment is configured as must not route storage on its own.
 Source: CLAUDE.md "The local system is a single shared brain: one namespace (`local`), and
 every lambda / agent / subagent reads and writes it."
 
+**Rev 6 amendment to Rule 0 (episodic memory writes stamp the actor id by default).** Rule 0
+continues to hold for every write path EXCEPT one: an episodic memory write
+(`memory.remember` with `memory_type = episodic`, or the equivalent
+`create(kind="memory", properties={"memory_type": "episodic"})`) stamps
+`namespace = token.actor().id` by default, rather than the shared `'local'` pool. This is the
+single carve-out from the prior "writes always pin `'local'`" default. It is bounded as follows:
+
+- Scope is episodic memory only. Semantic memory writes (`memory_type = semantic`) are
+  unchanged: they stamp `token.namespace()` (the shared pool, `'local'` by default). All
+  non-memory writes (KG entities, edges, notes, tasks, comm, schedule, brain) are unchanged and
+  continue to pin `'local'` by default per the unamended Rule 0.
+- An explicit `namespace=` request parameter overrides the write namespace for both memory
+  types, identical to the Rule 3 escape. `memory.remember(..., namespace="ns-x")` writes to
+  exactly `ns-x` regardless of `memory_type`. The actor-id default applies only when no explicit
+  `namespace=` is supplied.
+- This is attribution plus view-layer visibility, not a storage boundary. The store performs no
+  `record.namespace == caller_namespace` check at any layer (the prior-v1 pattern PR-A1 removed
+  must not return). By-ID ops remain namespace-agnostic (Rule 2): an episodic memory written
+  under `lambda:leo` is fetchable, updatable, and deletable by UUID with no namespace check. The
+  actor-stamped episodic memory becomes _visible_ to a default recall purely through the existing
+  Rev-4 read visible-set fanout (`{local} ∪ {actor.id} ∪ {actor.visible_namespaces}`, Rule 3b),
+  not through any storage partition.
+- Backward-compatible. An anonymous actor has id `'local'` (`ActorRef::anonymous` returns
+  `kind = "anonymous"`, `id = "local"`). With no `[actor]` configured, the caller is the
+  anonymous actor, so the episodic write namespace resolves to `'local'`, byte-identical to
+  pre-Rev-6 behavior. The carve-out takes effect only once a real actor id is configured and
+  threaded onto the request token via `token.actor()` (the actor-identity threading from
+  ADR-053). Until a non-`'local'` actor is configured, this amendment is inert.
+
+Rationale: an episodic memory is a specific actor's lived experience. Attributing it to that
+actor, and keeping it private to that actor's default recall view, matches what episodic memory
+is. A semantic memory is distilled, shareable knowledge and belongs in the common pool. Per-actor
+episodic plus shared semantic is the intended model. The prior Rule 0 text ("writes always pin
+`'local'`") predates this episodic/semantic distinction; it stamped both memory types into the
+shared pool, which conflated one actor's experience with the common knowledge base. Rev 6 closes
+that gap for the episodic path while leaving the semantic path, and every other write path,
+unchanged.
+
+This is not the actor-as-namespace isolation Rev 3 rejected. The rejected model derived the
+storage namespace from actor identity for ALL writes and confined ALL reads to a per-actor
+partition, coupling identity to storage, hiding records, and breaking the shared brain and by-ID
+resolution. Rev 6 changes only the episodic-memory write default, leaves every other write path
+on `'local'`, never confines a read to a partition, never hides records behind a namespace check,
+and keeps by-ID ops global. Visibility is restored additively by the Rule 3b read fanout, which
+only ever shows MORE, never less.
+
 ### Rule 1 — Storage is dumb
 
 Stores (khive-db, khive-storage traits) are unscoped database connections. Namespace is a
@@ -157,10 +223,15 @@ partitions:
 - Comm: actor addressing uses `from_actor`/`to_actor` in message `properties` (ADR-057,
   implemented). Both copies of a comm.send stay in the caller's namespace ("local"). Actor
   label is attribution only; namespace carry is NO.
-- Memory: filter by `actor_id` attribution column when an owner-scoped view is needed; the
-  underlying pool is shared and cross-lambda recall operates over it. Namespace carry is NO.
-  The `actor_id` attribution column is deferred to ADR-053; interim attribution is via
-  `properties`.
+- Memory: recall reads operate over the caller's read visible-set
+  (`{local} ∪ {actor.id} ∪ {actor.visible_namespaces}`, Rule 3b); cross-lambda recall over the
+  shared pool is the intended behavior for the namespaces in that set. Per-actor read distinction
+  is also available as a view-layer filter on the `actor_id` attribution column when an
+  owner-scoped view is needed. The `actor_id` attribution column is deferred to ADR-053; interim
+  attribution is via `properties`. Write routing is per-`memory_type` (Rev 6): a semantic write
+  stamps `'local'` (namespace carry is NO, unchanged), while an episodic write stamps the
+  caller's actor id by default (the single Rev 6 carve-out from the Rule 0 write default). An
+  explicit `namespace=` overrides both. See the Rev 6 amendment to Rule 0 and ADR-021 §10.
 - Brain: profile resolution is its own scoping mechanism (brain.resolve, profile bindings),
   independent of namespace. Namespace carry is NO.
 - Schedule: attribution columns carry the scheduling actor; namespace is "local". Namespace
@@ -432,6 +503,35 @@ Negative:
   `namespace=` precise escape (Rule 3). The distinction (set-union default vs single-namespace
   override) must be documented at the call site to avoid surprise.
 
+### Rev 6 deltas
+
+Positive:
+
+- Episodic memory is attributed to the actor that lived it and is private to that actor's
+  default recall view, while semantic memory stays in the shared pool. This realizes the
+  per-actor-episodic plus shared-semantic model that the prior "all memory pins `'local'`"
+  default prevented.
+- The change is confined to one write default. By-ID ops, the read fanout, the Gate seam, and
+  every non-episodic write path are untouched. No `record.namespace == caller_namespace` check is
+  introduced; visibility is restored by the existing Rule 3b read fanout, not by a storage
+  partition.
+- Backward-compatible with zero behavior change for unconfigured deployments: the anonymous actor
+  id is `'local'`, so episodic writes resolve to `'local'` until a real actor is configured.
+- Recall requires no code change. The Rev-4 visible-set fanout already returns actor.id-stamped
+  memories on both the FTS and ANN paths.
+
+Negative:
+
+- Episodic and semantic writes now resolve to different default namespaces. A caller that wants
+  an episodic memory in the shared pool must pass `namespace="local"` explicitly. The
+  `memory_type`-conditioned default must be documented at the `memory.remember` call site (done
+  in ADR-021 §10) to avoid surprise.
+- Once a real actor is configured, episodic memories written by one actor are not in another
+  actor's default recall view unless that actor's `visible_namespaces` includes the writer's id
+  (Rule 3b). This is the intended privacy boundary, but it is a behavior change for multi-actor
+  deployments relative to the all-`'local'` default. It is a view-scope effect, not a storage
+  partition: the records remain reachable by UUID and by an explicit `namespace=` read.
+
 ### Neutral
 
 - Namespace::parse structural validation survives.
@@ -453,3 +553,7 @@ Negative:
 - ADR-018 — Gate trait, single dispatch site, AllowAllGate.
 - ADR-002 — edge cascade, no dangling refs.
 - ADR-053 — ActorStore, SessionStore, cloud-tier actor threading (survives).
+- ADR-021 §10, memory pack `memory_type` to namespace routing and the `namespace=` override
+  (the consumer-side statement of the Rev 6 carve-out).
+- `ActorRef::anonymous`, the anonymous caller (`kind = "anonymous"`, `id = "local"`) that makes
+  the Rev 6 carve-out a no-op for unconfigured deployments.
