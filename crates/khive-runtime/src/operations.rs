@@ -1129,6 +1129,21 @@ impl KhiveRuntime {
         Ok(())
     }
 
+    /// Public delegator for cross-backend link validation (ADR-029 D3).
+    ///
+    /// Exposes `validate_edge_relation_endpoints` for the `SubstrateCoordinator`
+    /// so it can validate the relation before writing the edge on the source backend.
+    pub async fn validate_link_endpoints(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<()> {
+        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+            .await
+    }
+
     /// Create a directed edge between two substrates.
     ///
     /// Enforces the three-case relation contract via
@@ -1196,6 +1211,64 @@ impl KhiveRuntime {
         // generated UUID that was displaced by an ON CONFLICT DO UPDATE.
         // Under parallel calls for the same triple, every caller now returns
         // the same persisted edge ID — the winner's insert or the updated row.
+        let persisted = self
+            .list_edges(
+                token,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(source_id),
+                    target_id: Some(target_id),
+                    relations: vec![relation],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                crate::RuntimeError::Internal(format!(
+                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
+                ))
+            })?;
+        Ok(persisted)
+    }
+
+    /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
+    ///
+    /// Called by the `SubstrateCoordinator` when source and target are on
+    /// different backends. The coordinator validates endpoints before calling
+    /// this method via [`validate_link_endpoints`], so endpoint validation is
+    /// skipped here. The edge is written on the source backend only.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_with_target_backend(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        target_backend: Option<String>,
+    ) -> RuntimeResult<Edge> {
+        validate_edge_weight(weight)?;
+        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        validate_edge_metadata(relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
+        let ns = token.namespace().as_str();
+        let edge = Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: ns.to_string(),
+            source_id,
+            target_id,
+            relation,
+            weight,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend,
+        };
+        self.graph(token)?.upsert_edge(edge).await?;
         let persisted = self
             .list_edges(
                 token,

@@ -12,6 +12,7 @@ description = "khive MCP server library — served via the kkernel binary"
 
 [dependencies]
 khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
+khive-storage = { version = "0.2.11", path = "../khive-storage" }
 khive-request = { version = "0.2.11", path = "../khive-request" }
 khive-pack-kg = { version = "0.2.11", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.2.11", path = "../khive-pack-gtd" }
@@ -20,6 +21,7 @@ khive-pack-brain = { version = "0.2.11", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.2.11", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.2.11", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.2.11", path = "../khive-pack-knowledge" }
+uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }
 tokio = { workspace = true }

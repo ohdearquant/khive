@@ -11,6 +11,8 @@
 // as a unit. The module is the authoritative implementation of request
 // dispatch and is intentionally co-located.
 
+use std::sync::Arc;
+
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
@@ -24,6 +26,7 @@ use khive_runtime::{
     RuntimeError, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 
+use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
 
 /// Fingerprint the dispatch-affecting parts of a resolved [`RuntimeConfig`].
@@ -185,6 +188,10 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     config_id: String,
+    /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
+    /// deployments. `None` in single-backend mode — all dispatch goes through the
+    /// `VerbRegistry` unchanged (zero-change invariant).
+    coordinator: Option<Arc<dyn CoordinatorService>>,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -306,6 +313,7 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.as_str().to_string(),
             config_id,
+            coordinator: None,
         })
     }
 
@@ -323,6 +331,7 @@ impl KhiveMcpServer {
             // sentinel that matches no real daemon so such servers always
             // dispatch locally rather than forward.
             config_id: "registry-only".to_string(),
+            coordinator: None,
         }
     }
 
@@ -330,7 +339,7 @@ impl KhiveMcpServer {
     ///
     /// Used by the multi-backend boot path in `serve.rs` where the registry is
     /// assembled externally before constructing the server.
-    pub(crate) fn from_registry_with_meta(
+    pub fn from_registry_with_meta(
         registry: VerbRegistry,
         default_namespace: &str,
         config_id: &str,
@@ -339,7 +348,18 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
+            coordinator: None,
         }
+    }
+
+    /// Attach a cross-backend coordinator (ADR-029 Phase 2).
+    ///
+    /// Only multi-backend servers need a coordinator. Single-backend servers
+    /// leave `coordinator` as `None` (zero-change invariant: all dispatch goes
+    /// through `VerbRegistry` unchanged).
+    pub fn with_coordinator(mut self, coordinator: Arc<dyn CoordinatorService>) -> Self {
+        self.coordinator = Some(coordinator);
+        self
     }
 
     /// Namespace this server's registry was built for.
