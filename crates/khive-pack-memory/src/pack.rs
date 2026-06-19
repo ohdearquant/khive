@@ -127,6 +127,12 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
                 required: false,
                 description: "Tag values to filter by. Matched against properties.tags on stored memories.",
             },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Write namespace override. When absent: episodic memories land in the actor's namespace; semantic memories land in \"local\". When present, overrides both routing rules.",
+            },
         ],
     },
     // Commissive: explicit feedback on a recalled memory — updates recall-domain posteriors

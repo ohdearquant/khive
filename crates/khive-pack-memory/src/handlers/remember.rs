@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 
@@ -30,6 +30,31 @@ impl MemoryPack {
 
         let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
         validate_memory_type(memory_type)?;
+
+        // Resolve the write namespace (ADR-007 Rev 6 carve-out):
+        //   1. Explicit override (`namespace=` param) → use that.
+        //   2. Episodic memory → stamp with the caller's actor id.
+        //      ActorRef::anonymous() has id="local", so unconfigured actors produce no change.
+        //   3. Semantic memory → unchanged (shared "local" pool).
+        // Defense-in-depth for direct (non-dispatch) callers; dispatch pre-mints override ns via Rule-3 escape (pack.rs:~886).
+        let write_token_owned: Option<NamespaceToken> = if let Some(ns_str) = p.namespace.as_deref()
+        {
+            let ns = Namespace::parse(ns_str).map_err(|e| {
+                RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+            })?;
+            Some(token.with_namespace(ns))
+        } else if memory_type == "episodic" {
+            let actor_id = token.actor().id.as_str();
+            let ns = Namespace::parse(actor_id).map_err(|e| {
+                RuntimeError::InvalidInput(format!(
+                    "actor id {actor_id:?} is not a valid namespace: {e}"
+                ))
+            })?;
+            Some(token.with_namespace(ns))
+        } else {
+            None
+        };
+        let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
 
         let salience = match p.salience {
             Some(v) if !(0.0..=1.0).contains(&v) => {
@@ -98,7 +123,7 @@ impl MemoryPack {
         let note = self
             .runtime
             .create_note_with_decay_for_embedding_model(
-                token,
+                write_token,
                 "memory",
                 None,
                 &p.content,
@@ -111,14 +136,14 @@ impl MemoryPack {
             .await?;
 
         {
-            let ns = token.namespace().as_str().to_owned();
+            let ns = write_token.namespace().as_str().to_owned();
             ann::invalidate_namespace(&self.runtime, &self.ann, &ns).await;
             let affected_models: Vec<String> = match p.embedding_model.as_deref() {
                 Some(model) => vec![model.to_owned()],
                 None => self.runtime.registered_embedding_model_names(),
             };
             for model in affected_models {
-                ann::ensure_ann_background(&self.runtime, token, &self.ann, &model).await;
+                ann::ensure_ann_background(&self.runtime, write_token, &self.ann, &model).await;
             }
         }
 

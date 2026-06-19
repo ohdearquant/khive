@@ -33,7 +33,18 @@ use crate::tools::request::RequestParams;
 /// daemon compares this against each forwarded request's `config_id` and rejects
 /// mismatches so a restricted client (e.g. `--pack kg`, `--db :memory:`) cannot
 /// execute through the broader default daemon. Namespace is carried separately.
-pub fn compute_config_id(config: &RuntimeConfig) -> String {
+///
+/// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
+/// declaration, the backend topology (sorted backend list and pack→backend
+/// assignments) is folded into the fingerprint so that two configs differing
+/// only in pack routing produce different ids (ADR-049 / B-SHOULD-FIX-4).
+///
+/// When `khive_cfg` is `None` or its `backends` list is empty, the fingerprint
+/// is byte-identical to what it would have been before this parameter was added.
+pub fn compute_config_id(
+    config: &RuntimeConfig,
+    khive_cfg: Option<&khive_runtime::KhiveConfig>,
+) -> String {
     let mut packs = config.packs.clone();
     packs.sort();
     let db = config
@@ -66,7 +77,8 @@ pub fn compute_config_id(config: &RuntimeConfig) -> String {
         .collect();
     outbound.sort();
     outbound.dedup();
-    format!(
+
+    let base = format!(
         "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}];outbound=[{}]",
         packs.join(","),
         db,
@@ -75,7 +87,45 @@ pub fn compute_config_id(config: &RuntimeConfig) -> String {
         config.backend_id,
         visible.join(","),
         outbound.join(","),
-    )
+    );
+
+    // Fold backend topology when non-empty so two configs differing only in
+    // pack→backend routing produce different config_ids (ADR-049).
+    // When backends is empty this branch is skipped, preserving byte-identity
+    // with the pre-change fingerprint.
+    let topology = khive_cfg
+        .filter(|cfg| !cfg.backends.is_empty())
+        .map(|cfg| {
+            let mut backend_entries: Vec<String> = cfg
+                .backends
+                .iter()
+                .map(|b| {
+                    let path = b
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| ":memory:".to_string());
+                    format!("{}:{:?}:{}", b.name, b.kind, path)
+                })
+                .collect();
+            backend_entries.sort();
+
+            let mut pack_entries: Vec<String> = cfg
+                .packs
+                .iter()
+                .map(|(pack, pc)| format!("{}={}", pack, pc.backend))
+                .collect();
+            pack_entries.sort();
+
+            format!(
+                ";backends=[{}];pack_backends=[{}]",
+                backend_entries.join(","),
+                pack_entries.join(","),
+            )
+        })
+        .unwrap_or_default();
+
+    format!("{base}{topology}")
 }
 
 /// Build a sorted, human-readable verb catalog from `(pack_name, verb_name, description)` triples.
@@ -213,12 +263,14 @@ impl KhiveMcpServer {
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
-        let config_id = compute_config_id(runtime.config());
+        let config_id = compute_config_id(runtime.config(), None);
         let visible_namespaces = runtime.config().visible_namespaces.clone();
+        let actor_id = runtime.config().actor_id.clone();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         builder.with_visible_namespaces(visible_namespaces);
+        builder.with_actor_id(actor_id);
         // Wire the EventStore into the registry for audit persistence.
         if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
             if let Ok(event_store) = runtime.events(&tok) {
@@ -271,6 +323,22 @@ impl KhiveMcpServer {
             // sentinel that matches no real daemon so such servers always
             // dispatch locally rather than forward.
             config_id: "registry-only".to_string(),
+        }
+    }
+
+    /// Build a server from a pre-built registry with explicit namespace and config_id.
+    ///
+    /// Used by the multi-backend boot path in `serve.rs` where the registry is
+    /// assembled externally before constructing the server.
+    pub(crate) fn from_registry_with_meta(
+        registry: VerbRegistry,
+        default_namespace: &str,
+        config_id: &str,
+    ) -> Self {
+        Self {
+            registry,
+            default_namespace: default_namespace.to_string(),
+            config_id: config_id.to_string(),
         }
     }
 

@@ -41,6 +41,25 @@ pub enum ConfigError {
 
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
+
+    #[error("duplicate backend name: {name:?}")]
+    DuplicateBackendName { name: String },
+
+    #[error(
+        "[packs.{pack}].backend = {backend:?} references an unknown backend; \
+         defined backends: {defined}"
+    )]
+    UnknownPackBackend {
+        pack: String,
+        backend: String,
+        defined: String,
+    },
+
+    #[error(
+        "[[backends]] entry {name:?}: field `{field}` is not yet supported; \
+         remove it from the config or wait for a future release that implements it"
+    )]
+    UnsupportedBackendField { name: String, field: &'static str },
 }
 
 // ---- Config structs ----
@@ -139,12 +158,77 @@ pub struct ActorConfig {
     pub allowed_outbound_namespaces: Vec<String>,
 }
 
+// ---- Per-pack backend config (ADR-028) ----
+
+/// Storage backend kind.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    /// SQLite file-backed database (default).
+    #[default]
+    Sqlite,
+    /// In-memory database — for testing only; state is lost on restart.
+    Memory,
+}
+
+/// Configuration for a named storage backend.
+///
+/// Corresponds to a `[[backends]]` entry in `khive.toml`.
+/// When no `[[backends]]` section is present, a single implicit `main` backend
+/// is synthesised from the existing `--db` / `KHIVE_DB` / default-path resolution.
+/// All packs fall back to `main` when their name is absent from `[packs]`.
+///
+/// ```toml
+/// [[backends]]
+/// name = "knowledge"
+/// kind = "sqlite"
+/// path = "~/.khive/knowledge.db"
+/// cache_mb = 128
+/// journal_mode = "wal"
+/// read_only = false
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendConfig {
+    /// Unique backend name. Referenced by `[packs.<name>].backend`.
+    pub name: String,
+    /// Storage backend kind. Defaults to `sqlite`.
+    #[serde(default)]
+    pub kind: BackendKind,
+    /// Filesystem path for `sqlite` kind. Tilde is expanded to `$HOME`.
+    /// `None` for `memory` kind (path is ignored when present).
+    pub path: Option<std::path::PathBuf>,
+    /// SQLite page-cache size in MiB.
+    pub cache_mb: Option<u32>,
+    /// SQLite journal mode (e.g. `"wal"`).
+    pub journal_mode: Option<String>,
+    /// Open the backend read-only. Defaults to `false`.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Per-pack backend assignment.
+///
+/// Corresponds to a `[packs.<pack-name>]` entry in `khive.toml`.
+/// Packs whose name is absent from `[packs]` fall back to the `main` backend.
+///
+/// ```toml
+/// [packs.knowledge]
+/// backend = "knowledge"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackConfig {
+    /// Backend name this pack is assigned to. Must match a `[[backends]].name`.
+    pub backend: String,
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[runtime]`: runtime knobs (namespace, brain_profile)
+/// - `[[backends]]`: storage backend declarations (ADR-028)
+/// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 ///
 /// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -166,6 +250,21 @@ pub struct KhiveConfig {
     /// Runtime knobs: namespace overrides, brain profile, etc.
     #[serde(default)]
     pub runtime: RuntimeSectionConfig,
+
+    /// Named storage backends (ADR-028).
+    ///
+    /// When absent or empty, a single implicit `main` backend is used and all
+    /// packs share it — identical to pre-ADR-028 behavior.
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+
+    /// Per-pack backend assignments (ADR-028).
+    ///
+    /// Maps pack name to backend name. Packs absent from this map fall back to
+    /// the `main` backend. Validated at load time: every referenced backend name
+    /// must appear in `backends`.
+    #[serde(default)]
+    pub packs: std::collections::HashMap<String, PackConfig>,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -331,6 +430,46 @@ impl KhiveConfig {
             })?;
         }
 
+        // Validate [[backends]]: unique names (ADR-028).
+        if !self.backends.is_empty() {
+            let mut seen_backends = std::collections::HashSet::new();
+            for backend in &self.backends {
+                if !seen_backends.insert(backend.name.clone()) {
+                    return Err(ConfigError::DuplicateBackendName {
+                        name: backend.name.clone(),
+                    });
+                }
+
+                // Reject fields that are parsed but not yet supported (ADR-028 §1).
+                // An operator setting cache_mb or journal_mode would get silently
+                // ignored — reject loudly so misconfiguration is caught at startup.
+                if backend.cache_mb.is_some() {
+                    return Err(ConfigError::UnsupportedBackendField {
+                        name: backend.name.clone(),
+                        field: "cache_mb",
+                    });
+                }
+                if backend.journal_mode.is_some() {
+                    return Err(ConfigError::UnsupportedBackendField {
+                        name: backend.name.clone(),
+                        field: "journal_mode",
+                    });
+                }
+            }
+
+            // Validate [packs.<name>].backend references (ADR-028).
+            let defined: Vec<&str> = self.backends.iter().map(|b| b.name.as_str()).collect();
+            for (pack_name, pack_cfg) in &self.packs {
+                if !defined.contains(&pack_cfg.backend.as_str()) {
+                    return Err(ConfigError::UnknownPackBackend {
+                        pack: pack_name.clone(),
+                        backend: pack_cfg.backend.clone(),
+                        defined: defined.join(", "),
+                    });
+                }
+            }
+        }
+
         if self.engines.is_empty() {
             return Ok(());
         }
@@ -435,8 +574,7 @@ pub fn config_from_env() -> KhiveConfig {
 
     KhiveConfig {
         engines,
-        actor: ActorConfig::default(),
-        runtime: RuntimeSectionConfig::default(),
+        ..KhiveConfig::default()
     }
 }
 
@@ -596,8 +734,7 @@ fusion_weight = 0.0
         }
         let cfg = KhiveConfig {
             engines,
-            actor: ActorConfig::default(),
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         };
         cfg.validate().expect("env-derived config should be valid");
         assert_eq!(cfg.engines.len(), 2);
@@ -861,7 +998,7 @@ id = "lambda:"
                 display_name: None,
                 ..Default::default()
             },
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         };
         cfg.validate().expect("valid config");
 
@@ -872,6 +1009,17 @@ id = "lambda:"
             Namespace::local(),
             "actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
              writes stay pinned to local"
+        );
+        // Also assert the fold-in: actor.id MUST appear in visible_namespaces so that
+        // default reads widen to {local} ∪ {actor namespace} (ADR-007 Rev 4 Rule 3b,
+        // config.rs:~444). This is the load-bearing side-effect of the actor id config.
+        assert!(
+            result
+                .visible_namespaces
+                .contains(&Namespace::parse("lambda:test-actor").unwrap()),
+            "actor.id must be folded into visible_namespaces (ADR-007 Rev 4 Rule 3b fold-in); \
+             got: {:?}",
+            result.visible_namespaces
         );
     }
 
@@ -889,7 +1037,7 @@ id = "lambda:"
                 display_name: None,
                 ..Default::default()
             },
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         };
         cfg.validate().expect("valid config");
 
@@ -1011,6 +1159,204 @@ id = "lambda:"
             cfg.actor.id.as_deref(),
             Some("lambda:project-wins"),
             "project .khive/config.toml (tier 3) must win over ~/.khive/config.toml (tier 4)"
+        );
+    }
+
+    // ── ADR-028 backend / pack config tests ─────────────────────────────────
+
+    // 22. No [[backends]] → empty vecs, no validation error.
+    #[test]
+    fn test_no_backends_section_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[engines]]
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert!(cfg.backends.is_empty());
+        assert!(cfg.packs.is_empty());
+    }
+
+    // 23. Single Sqlite backend deserializes correctly.
+    #[test]
+    fn test_single_sqlite_backend_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "knowledge"
+kind = "sqlite"
+path = "/tmp/knowledge.db"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.backends.len(), 1);
+        let b = &cfg.backends[0];
+        assert_eq!(b.name, "knowledge");
+        assert!(matches!(b.kind, BackendKind::Sqlite));
+        assert_eq!(
+            b.path.as_ref().and_then(|p| p.to_str()),
+            Some("/tmp/knowledge.db")
+        );
+    }
+
+    // 24. Memory backend parses correctly.
+    #[test]
+    fn test_memory_backend_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "ephemeral"
+kind = "memory"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.backends.len(), 1);
+        assert!(matches!(cfg.backends[0].kind, BackendKind::Memory));
+    }
+
+    // 25. Pack config backend assignment parses correctly.
+    #[test]
+    fn test_pack_backend_assignment_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "knowledge"
+kind = "memory"
+
+[packs.knowledge]
+backend = "knowledge"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.packs.len(), 1);
+        let pc = cfg.packs.get("knowledge").expect("knowledge pack present");
+        assert_eq!(pc.backend, "knowledge");
+    }
+
+    // 26. Duplicate backend names → DuplicateBackendName error.
+    #[test]
+    fn test_duplicate_backend_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "dup"
+kind = "memory"
+
+[[backends]]
+name = "dup"
+kind = "memory"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("should fail with duplicate name");
+        assert!(
+            matches!(err, ConfigError::DuplicateBackendName { ref name } if name == "dup"),
+            "expected DuplicateBackendName {{ name: \"dup\" }}, got {err:?}"
+        );
+    }
+
+    // 27. Pack referencing undefined backend → UnknownPackBackend error.
+    #[test]
+    fn test_pack_referencing_undefined_backend_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "knowledge"
+kind = "memory"
+
+[packs.kg]
+backend = "nonexistent"
+"#,
+        );
+        let err =
+            KhiveConfig::load(Some(&path)).expect_err("should fail with unknown backend reference");
+        assert!(
+            matches!(err, ConfigError::UnknownPackBackend { ref pack, ref backend, .. }
+                if pack == "kg" && backend == "nonexistent"),
+            "expected UnknownPackBackend for kg→nonexistent, got {err:?}"
+        );
+    }
+
+    // 28. Pack config with no [[backends]] → packs section validated only when backends present.
+    #[test]
+    fn test_pack_config_without_backends_section_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Per the spec: when [[backends]] is absent/empty, packs are not validated
+        // (all packs fall through to the implicit main backend).
+        let path = write_toml(
+            &dir,
+            r#"
+[packs.kg]
+backend = "main"
+"#,
+        );
+        // This should succeed: no backends declared → no validation of packs.
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error expected")
+            .expect("file found");
+        assert_eq!(cfg.backends.len(), 0);
+        assert_eq!(cfg.packs.len(), 1);
+    }
+
+    // B-SHOULD-FIX-1: cache_mb in [[backends]] must be rejected at validate() with a clear error.
+    #[test]
+    fn test_backend_cache_mb_rejected_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+cache_mb = 128
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("cache_mb must be rejected");
+        assert!(
+            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "cache_mb" } if name == "main"),
+            "expected UnsupportedBackendField {{ name: \"main\", field: \"cache_mb\" }}, got {err:?}"
+        );
+    }
+
+    // B-SHOULD-FIX-1: journal_mode in [[backends]] must be rejected at validate() with a clear error.
+    #[test]
+    fn test_backend_journal_mode_rejected_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+journal_mode = "wal"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("journal_mode must be rejected");
+        assert!(
+            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "journal_mode" } if name == "main"),
+            "expected UnsupportedBackendField {{ name: \"main\", field: \"journal_mode\" }}, got {err:?}"
         );
     }
 }
