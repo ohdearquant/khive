@@ -3558,4 +3558,112 @@ mod ann_type_filter_regression {
             "suggest must find the matching domain: {names:?}"
         );
     }
+
+    /// Regression: `knowledge.search` must accept `kind=` as an alias for `type=`.
+    ///
+    /// RED logic (before the `alias = "kind"` annotation): `"kind"` is not a
+    /// recognised serde field on `SearchParams`, so it deserialises to `None`.
+    /// With `SearchParams.kind == None` no type filter is applied, atom hits
+    /// appear in the results, and the `assert_eq!(kind, "domain")` loop below
+    /// fails because atom results have `kind == "atom"`, not `"domain"`.
+    ///
+    /// GREEN (with alias): `kind="domain"` routes into `SearchParams.kind` and
+    /// the type filter fires identically to passing `type="domain"`.
+    ///
+    /// Also asserts that the legacy `type=` key still works (additive, non-breaking).
+    #[tokio::test]
+    async fn search_kind_param_alias_filters_domain() {
+        let f = pack(rt_with_embedder());
+
+        // Seed atoms (they will crowd the ANN results without a type filter).
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "alias-atom-1", "name": "Alias Atom 1", "content": "embedding retrieval vector search index unique aliaskind1 dense sparse corpus benchmark latency gradient descent transformer attention nearest neighbor ranking fusion pipeline rerank cosine similarity", "finalized": true },
+                    { "slug": "alias-atom-2", "name": "Alias Atom 2", "content": "embedding retrieval vector search index unique aliaskind1 dense sparse corpus benchmark latency gradient descent transformer attention nearest neighbor ranking fusion pipeline rerank cosine similarity", "finalized": true },
+                    { "slug": "alias-atom-3", "name": "Alias Atom 3", "content": "embedding retrieval vector search index unique aliaskind1 dense sparse corpus benchmark latency gradient descent transformer attention nearest neighbor ranking fusion pipeline rerank cosine similarity", "finalized": true },
+                ]
+            }),
+        )
+        .await
+        .expect("seed atoms");
+
+        // Seed a domain with identical content so the ANN index holds both kinds.
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "alias-domain",
+                    "name": "Alias Domain",
+                    "description": "embedding retrieval vector search index unique aliaskind1 dense sparse corpus benchmark latency gradient descent transformer attention nearest neighbor ranking fusion pipeline rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("seed domain");
+
+        // Index with rebuild_ann=true so the ANN holds both atoms and the domain.
+        let idx = f
+            .dispatch("knowledge.index", json!({ "rebuild_ann": true }))
+            .await
+            .expect("index ok");
+        assert!(
+            idx["indexed"].as_u64().unwrap_or(0) >= 3,
+            "atoms must be indexed for the ANN to hold them: {idx:?}"
+        );
+
+        // -- GREEN path: kind= alias must filter identically to type= ----------------
+        // Using "kind": "domain" (the khive-wide canonical key).
+        let resp_kind = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "embedding retrieval vector search unique aliaskind1",
+                    "kind": "domain",
+                    "rerank": false
+                }),
+            )
+            .await
+            .expect("search kind=domain ok");
+
+        let results_kind = resp_kind["results"].as_array().expect("results");
+        assert!(
+            !results_kind.is_empty(),
+            "search with kind=domain alias must return the domain: {resp_kind:?}"
+        );
+        for r in results_kind {
+            let kind = r["kind"].as_str().unwrap_or("");
+            assert_eq!(
+                kind, "domain",
+                "search kind=domain alias: all results must have kind=domain, got: {r:?}"
+            );
+        }
+
+        // -- Additive check: legacy type= key must still work ------------------------
+        let resp_type = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "embedding retrieval vector search unique aliaskind1",
+                    "type": "domain",
+                    "rerank": false
+                }),
+            )
+            .await
+            .expect("search type=domain ok");
+
+        let results_type = resp_type["results"].as_array().expect("results");
+        assert!(
+            !results_type.is_empty(),
+            "legacy type=domain must still filter correctly: {resp_type:?}"
+        );
+        for r in results_type {
+            let kind = r["kind"].as_str().unwrap_or("");
+            assert_eq!(
+                kind, "domain",
+                "type=domain (legacy): all results must have kind=domain, got: {r:?}"
+            );
+        }
+    }
 }
