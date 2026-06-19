@@ -1726,6 +1726,126 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
     assert_eq!(count, 2);
 }
 
+// ── compose slim output (explain flag) ───────────────────────────────────────
+
+#[tokio::test]
+async fn compose_default_omits_sections_and_score_annotations() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "slim-atom-a",
+                    "name": "Slim Atom A",
+                    "content": "retrieval augmented generation dense sparse corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["slim-atom-a"],
+                "query": "retrieval augmented generation"
+            }),
+        )
+        .await
+        .expect("compose default ok");
+
+    let data = &resp["data"];
+    assert!(
+        data.get("sections").is_none(),
+        "sections must be absent in default mode"
+    );
+    assert!(
+        data.get("section_count").is_none(),
+        "section_count must be absent in default mode"
+    );
+
+    let md = data["markdown"].as_str().expect("markdown");
+    assert!(
+        !md.contains("(score:"),
+        "markdown must not contain (score: in default mode"
+    );
+    assert!(
+        !md.contains("Score:"),
+        "markdown must not contain Score: in default mode"
+    );
+
+    let atoms = data["atoms"].as_array().expect("atoms array");
+    assert!(!atoms.is_empty(), "atoms must be present");
+    let score_val = atoms[0]["score"].as_f64().expect("score is a number");
+    let rendered = format!("{}", atoms[0]["score"]);
+    let decimal_len = rendered
+        .find('.')
+        .map(|dot| rendered.len() - dot - 1)
+        .unwrap_or(0);
+    assert!(
+        decimal_len <= 4,
+        "atom score must serialize with at most 4 decimal places, got: {rendered}"
+    );
+    let _ = score_val;
+}
+
+#[tokio::test]
+async fn compose_explain_true_atom_path_includes_score_in_markdown() {
+    // This test uses a no-embedder runtime (rt()). Without an embedder,
+    // embed_query() returns None, so section_results is always empty and
+    // compose falls through to the atom-path markdown branch. The sole
+    // assertion here is that explain=true causes "Score:" to appear in the
+    // atom-path output. The section path (sections[] + breakdown + section_count
+    // + "(score:") is exercised by the embedder-backed test in fixes.rs:
+    // compose_explain_sections::compose_explain_true_section_path_is_exercised.
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "explain-atom-b",
+                    "name": "Explain Atom B",
+                    "content": "retrieval augmented generation combines dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["explain-atom-b"],
+                "query": "retrieval augmented generation dense sparse",
+                "explain": true
+            }),
+        )
+        .await
+        .expect("compose explain ok");
+
+    let data = &resp["data"];
+    let md = data["markdown"].as_str().expect("markdown");
+
+    // Without an embedder, sections are never emitted — the atom-path branch
+    // runs and renders "Score: X.XXXX" per atom when explain=true.
+    assert!(
+        data.get("sections").is_none(),
+        "no-embedder runtime must not emit sections key"
+    );
+    assert!(
+        md.contains("Score:"),
+        "atom-path markdown must contain 'Score:' when explain=true, got: {md}"
+    );
+}
+
 // ── KPK-002: DomainInput deny_unknown_fields + domain-mirror content-word minimum ──
 
 #[tokio::test]
