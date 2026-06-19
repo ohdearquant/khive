@@ -834,6 +834,7 @@ fn format_section_compose_markdown(
     domains: &[Domain],
     atoms: &[Atom],
     sections: &[super::compose::ComposeSectionResult],
+    explain: bool,
 ) -> String {
     let mut out = String::from("# Knowledge Briefing\n\n");
     out.push_str(&format!("Query: {query}\n"));
@@ -849,7 +850,11 @@ fn format_section_compose_markdown(
             out.push_str(&format!("\n## {}\n\n", atom.name));
             out.push_str(&format!("Source: {}\n", atom.slug));
             for s in secs {
-                out.push_str(&format!("\n### {} (score: {:.4})\n\n", s.heading, s.score));
+                if explain {
+                    out.push_str(&format!("\n### {} (score: {:.4})\n\n", s.heading, s.score));
+                } else {
+                    out.push_str(&format!("\n### {}\n\n", s.heading));
+                }
                 if !s.content.is_empty() {
                     out.push_str(&s.content);
                     out.push('\n');
@@ -866,13 +871,20 @@ fn format_section_compose_markdown(
     out
 }
 
-fn format_compose_markdown(query: &str, domains: &[Domain], atoms: &[(&Atom, f32)]) -> String {
+fn format_compose_markdown(
+    query: &str,
+    domains: &[Domain],
+    atoms: &[(&Atom, f32)],
+    explain: bool,
+) -> String {
     let mut out = String::from("# Knowledge Briefing\n\n");
     out.push_str(&format!("Query: {query}\n"));
     for (atom, score) in atoms {
         out.push_str(&format!("\n## {}\n\n", atom.name));
         out.push_str(&format!("Source: {}\n", atom.slug));
-        out.push_str(&format!("Score: {:.4}\n", score));
+        if explain {
+            out.push_str(&format!("Score: {:.4}\n", score));
+        }
         if !atom.content.is_empty() {
             out.push('\n');
             out.push_str(&atom.content);
@@ -1150,6 +1162,7 @@ impl KnowledgeHandlers {
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
+        let explain = p.explain.unwrap_or(false);
 
         let mut domain_ids: Vec<String> = p
             .domain_ids
@@ -1369,26 +1382,31 @@ impl KnowledgeHandlers {
                 &resolved_domains,
                 &ordered_atoms,
                 &section_results,
+                explain,
             );
-            let sj: Vec<Value> = section_results
-                .iter()
-                .map(|s| {
-                    json!({
-                        "section_id": s.section_id,
-                        "atom_id": s.atom_id,
-                        "section_type": s.section_type,
-                        "heading": s.heading,
-                        "score": (s.score * 10000.0).round() / 10000.0,
-                        "breakdown": {
-                            "section_cosine": (s.score_breakdown.section_cosine * 10000.0).round() / 10000.0,
-                            "section_bm25": (s.score_breakdown.section_bm25 * 10000.0).round() / 10000.0,
-                            "atom_cosine": (s.score_breakdown.atom_cosine * 10000.0).round() / 10000.0,
-                            "domain_score": (s.score_breakdown.domain_score * 10000.0).round() / 10000.0,
-                            "type_weight": (s.score_breakdown.type_weight * 10000.0).round() / 10000.0,
-                        },
+            let sj: Vec<Value> = if explain {
+                section_results
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "section_id": s.section_id,
+                            "atom_id": s.atom_id,
+                            "section_type": s.section_type,
+                            "heading": s.heading,
+                            "score": (s.score * 10000.0).round() / 10000.0,
+                            "breakdown": {
+                                "section_cosine": (s.score_breakdown.section_cosine * 10000.0).round() / 10000.0,
+                                "section_bm25": (s.score_breakdown.section_bm25 * 10000.0).round() / 10000.0,
+                                "atom_cosine": (s.score_breakdown.atom_cosine * 10000.0).round() / 10000.0,
+                                "domain_score": (s.score_breakdown.domain_score * 10000.0).round() / 10000.0,
+                                "type_weight": (s.score_breakdown.type_weight * 10000.0).round() / 10000.0,
+                            },
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (md, sj)
         } else {
             let mut used = 0usize;
@@ -1410,7 +1428,7 @@ impl KnowledgeHandlers {
                 })
                 .collect();
             (
-                format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms),
+                format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms, explain),
                 Vec::new(),
             )
         };
@@ -1422,7 +1440,7 @@ impl KnowledgeHandlers {
                     "id": item.id,
                     "slug": item.slug,
                     "name": item.name,
-                    "score": item.score,
+                    "score": (item.score * 10000.0).round() / 10000.0,
                 })
             })
             .collect();
@@ -1441,7 +1459,7 @@ impl KnowledgeHandlers {
             "atoms": atom_json,
             "count": count,
         });
-        if !section_json.is_empty() {
+        if explain && !section_json.is_empty() {
             data["sections"] = json!(section_json);
             data["section_count"] = json!(section_json.len());
         }

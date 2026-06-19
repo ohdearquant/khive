@@ -1726,6 +1726,149 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
     assert_eq!(count, 2);
 }
 
+// ── compose slim output (explain flag) ───────────────────────────────────────
+
+#[tokio::test]
+async fn compose_default_omits_sections_and_score_annotations() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "slim-atom-a",
+                    "name": "Slim Atom A",
+                    "content": "retrieval augmented generation dense sparse corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["slim-atom-a"],
+                "query": "retrieval augmented generation"
+            }),
+        )
+        .await
+        .expect("compose default ok");
+
+    let data = &resp["data"];
+    assert!(
+        data.get("sections").is_none(),
+        "sections must be absent in default mode"
+    );
+    assert!(
+        data.get("section_count").is_none(),
+        "section_count must be absent in default mode"
+    );
+
+    let md = data["markdown"].as_str().expect("markdown");
+    assert!(
+        !md.contains("(score:"),
+        "markdown must not contain (score: in default mode"
+    );
+    assert!(
+        !md.contains("Score:"),
+        "markdown must not contain Score: in default mode"
+    );
+
+    let atoms = data["atoms"].as_array().expect("atoms array");
+    assert!(!atoms.is_empty(), "atoms must be present");
+    let score_val = atoms[0]["score"].as_f64().expect("score is a number");
+    let rendered = format!("{}", atoms[0]["score"]);
+    let decimal_len = rendered
+        .find('.')
+        .map(|dot| rendered.len() - dot - 1)
+        .unwrap_or(0);
+    assert!(
+        decimal_len <= 4,
+        "atom score must serialize with at most 4 decimal places, got: {rendered}"
+    );
+    let _ = score_val;
+}
+
+#[tokio::test]
+async fn compose_explain_true_includes_sections_and_score_annotations() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "explain-atom-b",
+                    "name": "Explain Atom B",
+                    "content": "retrieval augmented generation combines dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+                    "body": [
+                        {
+                            "section_type": "summary",
+                            "content": "retrieval augmented generation combines dense and sparse retrieval with generative models for grounded output synthesis"
+                        }
+                    ]
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom with sections");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["explain-atom-b"],
+                "query": "retrieval augmented generation dense sparse",
+                "explain": true
+            }),
+        )
+        .await
+        .expect("compose explain ok");
+
+    let data = &resp["data"];
+    let md = data["markdown"].as_str().expect("markdown");
+
+    if data.get("sections").is_some() {
+        let sections = data["sections"].as_array().expect("sections array");
+        assert!(
+            !sections.is_empty(),
+            "sections array must not be empty when present"
+        );
+        let sec = &sections[0];
+        assert!(
+            sec.get("breakdown").is_some(),
+            "section must have breakdown in explain mode"
+        );
+        let bd = &sec["breakdown"];
+        assert!(
+            bd.get("section_cosine").is_some(),
+            "breakdown.section_cosine"
+        );
+        assert!(bd.get("section_bm25").is_some(), "breakdown.section_bm25");
+        assert!(bd.get("atom_cosine").is_some(), "breakdown.atom_cosine");
+        assert!(bd.get("domain_score").is_some(), "breakdown.domain_score");
+        assert!(bd.get("type_weight").is_some(), "breakdown.type_weight");
+        assert!(
+            data.get("section_count").is_some(),
+            "section_count must be present in explain mode"
+        );
+        assert!(
+            md.contains("(score:"),
+            "markdown must contain (score: in explain mode"
+        );
+    } else {
+        assert!(
+            md.contains("Score:"),
+            "atom-path markdown must contain Score: in explain mode when no sections"
+        );
+    }
+}
+
 // ── KPK-002: DomainInput deny_unknown_fields + domain-mirror content-word minimum ──
 
 #[tokio::test]
