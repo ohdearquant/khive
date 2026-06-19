@@ -172,6 +172,11 @@ fn build_server_multi_backend(
     builder.with_gate(gate);
     builder.with_default_namespace(default_namespace.as_str());
     builder.with_visible_namespaces(visible_namespaces);
+    // Thread authenticated actor identity (issue #75) into the multi-backend
+    // registry exactly as the single-backend path does (server.rs). Without
+    // this, dispatch mints ActorRef::anonymous() and comm.inbox reverts to
+    // party-line, silently disabling actor-addressed delivery (ADR-057).
+    builder.with_actor_id(default_runtime.config().actor_id.clone());
 
     // Wire EventStore from the default (main) runtime.
     if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
@@ -598,5 +603,241 @@ brain_profile = "project-profile"
             Some("cli-profile"),
             "CLI --brain-profile must win over both TOML and KHIVE_BRAIN_PROFILE env var"
         );
+    }
+
+    // --- multi-backend boot path (ADR-028) ---
+
+    /// Build a `RuntimeConfig` suitable for multi-backend tests: in-memory db,
+    /// AllowAllGate, "local" namespace, no embedder, both kg and comm packs.
+    fn base_runtime_config_for_multi_backend() -> RuntimeConfig {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace};
+        RuntimeConfig {
+            db_path: None,
+            gate: std::sync::Arc::new(AllowAllGate),
+            default_namespace: Namespace::parse("local").expect("ns"),
+            embedding_model: None,
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    /// Two in-memory backends — `main` plus a second named `secondary`.
+    /// The `comm` pack is pinned to `secondary`; `kg` defaults to `main`.
+    /// Positive test: `build_server_multi_backend` must return `Ok` and both
+    /// packs must be functional.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boots_ok_with_two_memory_backends() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let server = build_server_multi_backend(base_cfg, &khive_cfg)
+            .expect("multi-backend boot must succeed");
+
+        // kg round-trip: create an entity on the main backend.
+        let kg_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="concept", name="MultiBackendTestEntity")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+            })
+            .await
+            .expect("kg dispatch must not error");
+
+        let kg_json: serde_json::Value =
+            serde_json::from_str(&kg_resp).expect("kg response is valid JSON");
+        // Response shape: {"results": [{ok, tool, result}], "summary": {...}}
+        let first_ok = kg_json["results"][0]["ok"].as_bool();
+        assert_eq!(
+            first_ok,
+            Some(true),
+            "kg create must succeed; response: {kg_resp}"
+        );
+
+        // comm round-trip: send a message on the secondary backend.
+        let comm_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="multi-backend-test")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+            })
+            .await
+            .expect("comm dispatch must not error");
+
+        let comm_json: serde_json::Value =
+            serde_json::from_str(&comm_resp).expect("comm response is valid JSON");
+        let first_comm_ok = comm_json["results"][0]["ok"].as_bool();
+        assert_eq!(
+            first_comm_ok,
+            Some(true),
+            "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// Regression for B-BLOCKER-1 (HC-7 critic): the multi-backend boot path
+    /// MUST thread the configured actor identity (issue #75) into the registry,
+    /// exactly as the single-backend path does. If `with_actor_id` is dropped,
+    /// dispatch mints `ActorRef::anonymous()` and `comm.inbox` reverts to
+    /// party-line — silently re-opening the cross-actor leak #75 fixed. With a
+    /// configured actor `"actor-b"`, a message addressed to `"actor-a"` must NOT
+    /// appear in `actor-b`'s inbox, while one addressed to `"actor-b"` must.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_preserves_actor_filtering() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        // Configured actor — the value #75 threads end-to-end.
+        let base_cfg = RuntimeConfig {
+            actor_id: Some("actor-b".to_string()),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let server = build_server_multi_backend(base_cfg, &khive_cfg)
+            .expect("multi-backend boot must succeed");
+
+        let dispatch = |ops: String| {
+            let server = &server;
+            async move {
+                let resp = server
+                    .dispatch_request_local(RequestParams {
+                        ops,
+                        presentation: None,
+                        presentation_per_op: None,
+                    })
+                    .await
+                    .expect("dispatch must not error");
+                serde_json::from_str::<serde_json::Value>(&resp).expect("valid JSON")
+            }
+        };
+
+        // One message to a different actor, one to ourselves.
+        let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
+        assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
+        let to_b = dispatch(r#"comm.send(to="actor-b", content="for-b")"#.to_string()).await;
+        assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
+
+        // Inbox for the configured actor (actor-b) must be filtered by to_actor.
+        let inbox = dispatch(r#"comm.inbox()"#.to_string()).await;
+        let result = &inbox["results"][0]["result"];
+        let messages = result["messages"]
+            .as_array()
+            .expect("inbox returns a messages array");
+
+        let contents: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            contents.contains(&"for-b"),
+            "actor-b must see the message addressed to it; got {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"for-a"),
+            "actor-b must NOT see the message addressed to actor-a (leak #75 / B-BLOCKER-1); \
+             got {contents:?} — actor identity was not threaded into the multi-backend registry"
+        );
+    }
+
+    /// Negative test: `[[backends]]` is declared but there is no entry named
+    /// `"main"`. `build_server_multi_backend` must return an error whose
+    /// message mentions `"main"` so operators know what to fix.
+    #[test]
+    fn multi_backend_missing_main_returns_error_mentioning_main() {
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "secondary".to_string(), // intentionally NOT "main"
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::new(),
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_server_multi_backend(base_cfg, &khive_cfg);
+        assert!(
+            result.is_err(),
+            "missing main backend must produce an error"
+        );
+        // Neither unwrap_err nor expect_err work because KhiveMcpServer is not Debug.
+        // Extract the error via match instead.
+        if let Err(err) = result {
+            assert!(
+                err.to_string().contains("main"),
+                "error message must mention \"main\"; got: {err}"
+            );
+        }
     }
 }
