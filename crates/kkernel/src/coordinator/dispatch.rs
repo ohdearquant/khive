@@ -1,4 +1,4 @@
-//! SubstrateCoordinator — cross-backend dispatch (D1-D6).
+//! SubstrateCoordinator — cross-backend dispatch (D2-D4).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,14 +7,15 @@ use std::time::Duration;
 use tokio::task::JoinError;
 use uuid::Uuid;
 
-use khive_runtime::{BackendId, KhiveRuntime, SearchHit};
+use khive_runtime::{BackendId, KhiveRuntime, NoteSearchHit, SearchHit};
 use khive_score::DeterministicScore;
+use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
 
-/// Result of a single backend's contribution to a fan-out search.
+/// Result of a single backend's entity-search contribution to a fan-out.
 ///
 /// `hits` may be empty when the backend returned no results.
 /// `error` carries the backend-specific failure message on error.
@@ -22,13 +23,15 @@ use super::registry::BackendRegistry;
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub hits: Vec<SearchHit>,
+    pub note_hits: Vec<NoteSearchHit>,
     pub error: Option<String>,
 }
 
 /// Cross-backend dispatch layer.
 ///
-/// Owns node-to-backend location (D2), cross-backend search fan-out with RRF (D3),
-/// traversal (D5), and partition tolerance (D6).
+/// Owns node-to-backend location (D2), cross-backend link stamping (D3),
+/// fan-out entity/note search with RRF (D4), traversal (D5, future),
+/// and partition tolerance (D6, future).
 pub struct SubstrateCoordinator {
     registry: BackendRegistry,
     locator: Arc<LocatorCache>,
@@ -110,6 +113,10 @@ impl SubstrateCoordinator {
 
     /// Resolve which backend owns the substrate node identified by `id`.
     ///
+    /// Namespace-agnostic per ADR-007 Rev 3: presence of the record on a backend
+    /// is sufficient — the stored namespace is NOT compared to the caller namespace.
+    /// The `namespace` parameter is used only for `runtime.authorize()` capability checks.
+    ///
     /// Checks the locator cache first; on a miss, scans all backends concurrently.
     /// Probes both entity and note substrates.
     pub async fn locate(&self, id: Uuid, namespace: &Namespace) -> Option<BackendId> {
@@ -136,17 +143,10 @@ impl SubstrateCoordinator {
                     return None;
                 }
             };
-            let ns_str = namespace.as_str().to_string();
-
-            let entity_ns = ns_str.clone();
+            // ADR-007 Rev 3: presence on this backend is sufficient.
+            // Do NOT filter by stored record namespace.
             let entity_owned = match runtime.entities(&token) {
-                Ok(store) => store
-                    .get_entity(id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|e| e.namespace == entity_ns)
-                    .unwrap_or(false),
+                Ok(store) => store.get_entity(id).await.ok().flatten().is_some(),
                 Err(_) => false,
             };
             if entity_owned {
@@ -154,13 +154,7 @@ impl SubstrateCoordinator {
                 return Some(backend_id.clone());
             }
             let note_owned = match runtime.notes(&token) {
-                Ok(store) => store
-                    .get_note(id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|n| n.namespace == ns_str)
-                    .unwrap_or(false),
+                Ok(store) => store.get_note(id).await.ok().flatten().is_some(),
                 Err(_) => false,
             };
             if note_owned {
@@ -185,22 +179,18 @@ impl SubstrateCoordinator {
                         return None;
                     }
                 };
-                let ns_str = ns.as_str().to_string();
-
+                // ADR-007 Rev 3: presence on this backend is sufficient.
+                // Do NOT filter by stored record namespace.
                 if let Ok(store) = runtime.entities(&token) {
-                    if let Ok(Some(entity)) = store.get_entity(id).await {
-                        if entity.namespace == ns_str {
-                            locator.insert(id, backend_id.clone());
-                            return Some(backend_id);
-                        }
+                    if let Ok(Some(_)) = store.get_entity(id).await {
+                        locator.insert(id, backend_id.clone());
+                        return Some(backend_id);
                     }
                 }
                 if let Ok(store) = runtime.notes(&token) {
-                    if let Ok(Some(note)) = store.get_note(id).await {
-                        if note.namespace == ns_str {
-                            locator.insert(id, backend_id.clone());
-                            return Some(backend_id);
-                        }
+                    if let Ok(Some(_)) = store.get_note(id).await {
+                        locator.insert(id, backend_id.clone());
+                        return Some(backend_id);
                     }
                 }
                 None
@@ -218,14 +208,132 @@ impl SubstrateCoordinator {
         None
     }
 
+    /// Prewarm the locator cache after a successful create.
+    ///
+    /// Called by the `SubstrateCoordinatorService` so that the first `locate()`
+    /// for a newly-created record is a cache hit rather than a backend scan.
+    pub fn record_created(&self, id: Uuid, backend_id: BackendId) {
+        self.locator.insert(id, backend_id);
+    }
+
     /// Invalidate the locator cache entry for `id`.
     pub fn invalidate(&self, id: Uuid) {
         self.locator.remove(id);
     }
 
-    // ---- D3: Fan-out search ----
+    // ---- D3: Cross-backend link ----
+
+    /// Create an edge whose endpoints may be on different backends (ADR-029 D3).
+    ///
+    /// Locates both `source_id` and `target_id`. When they are on different backends,
+    /// the edge is written on the source backend with `target_backend` stamped to the
+    /// target backend id. When both endpoints are on the same backend, delegates to
+    /// the normal `link` path (no `target_backend` stamp).
+    ///
+    /// The coordinator validates endpoints via `validate_link_endpoints` on the source
+    /// backend's runtime before writing the edge.
+    pub async fn link_cross_backend(
+        &self,
+        namespace: &Namespace,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<khive_storage::Edge, String> {
+        let src_backend = self
+            .locate(source_id, namespace)
+            .await
+            .ok_or_else(|| format!("node {source_id} not found on any backend"))?;
+        let tgt_backend = self
+            .locate(target_id, namespace)
+            .await
+            .ok_or_else(|| format!("node {target_id} not found on any backend"))?;
+
+        let src_runtime = self
+            .registry
+            .get(&src_backend)
+            .map(|e| Arc::clone(&e.runtime))
+            .ok_or_else(|| format!("backend {src_backend} not registered"))?;
+
+        let token = src_runtime
+            .authorize(namespace.clone())
+            .map_err(|e: khive_runtime::RuntimeError| e.to_string())?;
+
+        let cross_backend = src_backend.as_str() != tgt_backend.as_str();
+
+        if !cross_backend {
+            // Same-backend: full endpoint validation including existence and kind checks.
+            src_runtime
+                .validate_link_endpoints(&token, source_id, target_id, relation)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            // Cross-backend: the target entity lives on a different backend so the source
+            // runtime cannot resolve it via its own DB. Fetch each endpoint from its
+            // respective backend and validate the ADR-002 kind-pairing rules using the
+            // pre-fetched records (no cross-backend DB lookup required).
+            let tgt_runtime = self
+                .registry
+                .get(&tgt_backend)
+                .map(|e| Arc::clone(&e.runtime))
+                .ok_or_else(|| format!("backend {tgt_backend} not registered"))?;
+            let tgt_token = tgt_runtime
+                .authorize(namespace.clone())
+                .map_err(|e: khive_runtime::RuntimeError| e.to_string())?;
+            let src_resolved = src_runtime
+                .resolve_primary(&token, source_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let tgt_resolved = tgt_runtime
+                .resolve_primary(&tgt_token, target_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            src_runtime
+                .validate_link_endpoints_by_resolved(
+                    source_id,
+                    target_id,
+                    relation,
+                    src_resolved.as_ref(),
+                    tgt_resolved.as_ref(),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        let target_backend_stamp = if cross_backend {
+            Some(tgt_backend.as_str().to_string())
+        } else {
+            None
+        };
+
+        let edge = src_runtime
+            .link_with_target_backend(
+                &token,
+                source_id,
+                target_id,
+                relation,
+                weight,
+                metadata,
+                target_backend_stamp,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(edge)
+    }
+
+    // ---- D4: Fan-out search ----
 
     /// Broadcast `query` to all registered backends in parallel and merge results via RRF (k=60).
+    ///
+    /// `search_notes` controls which substrate to search:
+    /// - `false` → entity fan-out via `hybrid_search`
+    /// - `true`  → note fan-out via `search_notes`
+    ///
+    /// `kind_filter` is passed as the storage-level kind filter:
+    /// - entity substrate: `entity_kind` parameter of `hybrid_search`
+    /// - note substrate: `note_kind` parameter of `search_notes`
+    ///
+    /// Pass `None` for substrate-level searches (`kind="entity"` or `kind="note"`).
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
@@ -234,7 +342,9 @@ impl SubstrateCoordinator {
         query: &str,
         namespace: &Namespace,
         limit: u32,
-    ) -> (Vec<SearchHit>, Vec<BackendSearchResult>) {
+        search_notes: bool,
+        kind_filter: Option<&str>,
+    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
             .iter()
@@ -242,7 +352,7 @@ impl SubstrateCoordinator {
             .collect();
 
         if entries.is_empty() {
-            return (vec![], vec![]);
+            return (vec![], vec![], vec![]);
         }
 
         if entries.len() == 1 {
@@ -254,36 +364,66 @@ impl SubstrateCoordinator {
                     let backend_result = BackendSearchResult {
                         backend_id: backend_id.clone(),
                         hits: vec![],
+                        note_hits: vec![],
                         error: Some(e.to_string()),
                     };
-                    return (vec![], vec![backend_result]);
+                    return (vec![], vec![], vec![backend_result]);
                 }
             };
-            match runtime
-                .hybrid_search(&token, query, None, limit, None, None)
-                .await
-            {
-                Ok(hits) => {
-                    let backend_result = BackendSearchResult {
-                        backend_id: backend_id.clone(),
-                        hits: hits.clone(),
-                        error: None,
-                    };
-                    return (hits, vec![backend_result]);
+            if search_notes {
+                match runtime
+                    .search_notes(&token, query, None, limit, kind_filter, false)
+                    .await
+                {
+                    Ok(note_hits) => {
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: note_hits.clone(),
+                            error: None,
+                        };
+                        return (vec![], note_hits, vec![backend_result]);
+                    }
+                    Err(e) => {
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(e.to_string()),
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
                 }
-                Err(e) => {
-                    let backend_result = BackendSearchResult {
-                        backend_id: backend_id.clone(),
-                        hits: vec![],
-                        error: Some(e.to_string()),
-                    };
-                    return (vec![], vec![backend_result]);
+            } else {
+                match runtime
+                    .hybrid_search(&token, query, None, limit, kind_filter, None)
+                    .await
+                {
+                    Ok(hits) => {
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: hits.clone(),
+                            note_hits: vec![],
+                            error: None,
+                        };
+                        return (hits, vec![], vec![backend_result]);
+                    }
+                    Err(e) => {
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(e.to_string()),
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
                 }
             }
         }
 
         let query = query.to_string();
         let ns = namespace.clone();
+        let kind_filter_owned: Option<String> = kind_filter.map(|s| s.to_string());
 
         #[cfg(test)]
         let fail_id: Option<String> = self.fail_backend_id.clone();
@@ -294,6 +434,7 @@ impl SubstrateCoordinator {
         for (backend_id, runtime) in entries {
             let q = query.clone();
             let ns = ns.clone();
+            let kf = kind_filter_owned.clone();
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -305,47 +446,71 @@ impl SubstrateCoordinator {
                         Err(khive_runtime::RuntimeError::Internal(
                             "injected failure".to_string(),
                         )),
+                        None::<Vec<NoteSearchHit>>,
                     );
                 }
                 let token = match runtime.authorize(ns) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
-                        return (backend_id, Err(e));
+                        return (backend_id, Err(e), None);
                     }
                 };
-                let result = runtime
-                    .hybrid_search(&token, &q, None, limit, None, None)
-                    .await;
-                (backend_id, result)
+                if search_notes {
+                    let result = runtime
+                        .search_notes(&token, &q, None, limit, kf.as_deref(), false)
+                        .await;
+                    match result {
+                        Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
+                        Err(e) => (backend_id, Err(e), None),
+                    }
+                } else {
+                    let result = runtime
+                        .hybrid_search(&token, &q, None, limit, kf.as_deref(), None)
+                        .await;
+                    match result {
+                        Ok(hits) => (backend_id, Ok(hits), None),
+                        Err(e) => (backend_id, Err(e), None),
+                    }
+                }
             });
             handles.push(handle);
         }
 
-        type BackendSearchOutcome = (
+        type BackendOutcome = (
             BackendId,
             Result<Vec<SearchHit>, khive_runtime::RuntimeError>,
+            Option<Vec<NoteSearchHit>>,
         );
-        let join_results: Vec<Result<BackendSearchOutcome, JoinError>> =
+        let join_results: Vec<Result<BackendOutcome, JoinError>> =
             futures_util::future::join_all(handles).await;
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
-        let mut ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
+        let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
+        let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
 
         for join_result in join_results {
             match join_result {
-                Ok((backend_id, Ok(hits))) => {
-                    ranked_lists.push(hits.clone());
+                Ok((backend_id, Ok(hits), note_hits_opt)) => {
+                    let note_hits = note_hits_opt.unwrap_or_default();
+                    if !hits.is_empty() {
+                        entity_ranked_lists.push(hits.clone());
+                    }
+                    if !note_hits.is_empty() {
+                        note_ranked_lists.push(note_hits.clone());
+                    }
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits,
+                        note_hits,
                         error: None,
                     });
                 }
-                Ok((backend_id, Err(e))) => {
+                Ok((backend_id, Err(e), _)) => {
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits: vec![],
+                        note_hits: vec![],
                         error: Some(e.to_string()),
                     });
                 }
@@ -355,15 +520,16 @@ impl SubstrateCoordinator {
             }
         }
 
-        let merged = rrf_merge_hits(ranked_lists, limit as usize);
-        (merged, per_backend)
+        let merged_entities = rrf_merge_entity_hits(entity_ranked_lists, limit as usize);
+        let merged_notes = rrf_merge_note_hits(note_ranked_lists, limit as usize);
+        (merged_entities, merged_notes, per_backend)
     }
 }
 
 // ---- RRF merge ----
 
-/// Merge multiple ranked hit lists via Reciprocal Rank Fusion (k=60).
-fn rrf_merge_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+/// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     const K: f64 = 60.0;
 
     let mut scores: HashMap<Uuid, (f64, Option<String>, Option<String>)> = HashMap::new();
@@ -398,6 +564,45 @@ fn rrf_merge_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
         .collect();
 
     merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
+    merged.truncate(limit);
+    merged
+}
+
+/// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
+fn rrf_merge_note_hits(lists: Vec<Vec<NoteSearchHit>>, limit: usize) -> Vec<NoteSearchHit> {
+    const K: f64 = 60.0;
+
+    let mut scores: HashMap<Uuid, (f64, Option<String>, Option<String>)> = HashMap::new();
+
+    for list in &lists {
+        for (i, hit) in list.iter().enumerate() {
+            let rank = (i + 1) as f64;
+            let rrf = 1.0 / (K + rank);
+            let entry = scores.entry(hit.note_id).or_insert((0.0, None, None));
+            entry.0 += rrf;
+            if entry.1.is_none() {
+                entry.1 = hit.title.clone();
+            }
+            if entry.2.is_none() {
+                entry.2 = hit.snippet.clone();
+            }
+        }
+    }
+
+    let mut merged: Vec<NoteSearchHit> = scores
+        .into_iter()
+        .map(|(id, (score, title, snippet))| {
+            let det_score = DeterministicScore::from_f64(score);
+            NoteSearchHit {
+                note_id: id,
+                score: det_score,
+                title,
+                snippet,
+            }
+        })
+        .collect();
+
+    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
     merged.truncate(limit);
     merged
 }

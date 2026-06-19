@@ -1129,6 +1129,170 @@ impl KhiveRuntime {
         Ok(())
     }
 
+    /// Public delegator for cross-backend link validation (ADR-029 D3).
+    ///
+    /// Exposes `validate_edge_relation_endpoints` for the `SubstrateCoordinator`
+    /// so it can validate the relation before writing the edge on the source backend.
+    pub async fn validate_link_endpoints(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    ) -> RuntimeResult<()> {
+        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+            .await
+    }
+
+    /// Validate an edge relation using pre-fetched endpoint records (ADR-029 D3).
+    ///
+    /// For cross-backend links the source and target live on different backends —
+    /// the source runtime cannot resolve the target. The coordinator fetches each
+    /// endpoint from its own backend, then calls this method to enforce ADR-002
+    /// kind-pairing rules without a second DB round-trip.
+    ///
+    /// `src` and `tgt` are the `resolve_primary` results from each backend. The
+    /// `token` supplies the pack edge rules installed on this (source) runtime;
+    /// no DB access is performed.
+    pub fn validate_link_endpoints_by_resolved(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        src: Option<&Resolved>,
+        tgt: Option<&Resolved>,
+    ) -> RuntimeResult<()> {
+        if source_id == target_id {
+            return Err(RuntimeError::InvalidInput(
+                "self-loop edges are not allowed: source_id and target_id must be different".into(),
+            ));
+        }
+
+        if relation == EdgeRelation::Annotates {
+            match src {
+                Some(Resolved::Note(_)) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "annotates source {source_id} must be a note"
+                    )));
+                }
+                None => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "link source {source_id} not found"
+                    )));
+                }
+            }
+            if tgt.is_none() {
+                return Err(RuntimeError::NotFound(format!(
+                    "link target {target_id} not found"
+                )));
+            }
+            return Ok(());
+        }
+
+        if matches!(
+            relation,
+            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
+        ) {
+            let rel_name = relation.as_str();
+            let src = src.ok_or_else(|| {
+                RuntimeError::NotFound(format!("link source {source_id} not found"))
+            })?;
+            let tgt = tgt.ok_or_else(|| {
+                RuntimeError::NotFound(format!("link target {target_id} not found"))
+            })?;
+            match (src, tgt) {
+                (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
+                    if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
+                        let rule_hint = match relation {
+                            EdgeRelation::Supports | EdgeRelation::Refutes => {
+                                "requires concept|document|dataset|artifact -> concept \
+                                 (or same-substrate note -> note)"
+                            }
+                            _ => "requires same-kind entity endpoints",
+                        };
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
+                             allowlist; {rel_name} {rule_hint}",
+                            src_e.kind, tgt_e.kind
+                        )));
+                    }
+                }
+                (Resolved::Note(_), Resolved::Note(_)) => {}
+                (Resolved::Entity(_), Resolved::Note(_)) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be the same substrate \
+                         (note→note or entity→entity); got source={source_id} (entity) \
+                         target={target_id} (note)"
+                    )));
+                }
+                (Resolved::Note(_), Resolved::Entity(_)) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be the same substrate \
+                         (note→note or entity→entity); got source={source_id} (note) \
+                         target={target_id} (entity)"
+                    )));
+                }
+                (Resolved::PackRecord { .. }, _) | (_, Resolved::PackRecord { .. }) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "pack-private record is not a valid edge endpoint for {rel_name}"
+                    )));
+                }
+                _ => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be notes or entities (not events)"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        // All remaining base relations: entity→entity with kind-level restrictions.
+        // Consult pack rules installed on this (source) runtime first.
+        if pack_rule_allows(&self.pack_edge_rules(), relation, src, tgt) {
+            return Ok(());
+        }
+
+        let src_kind = match src {
+            Some(Resolved::Entity(e)) => &e.kind,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "link source {source_id} must be an entity for relation {relation:?} \
+                     (only `annotates` crosses substrates)"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "link source {source_id} not found"
+                )));
+            }
+        };
+        let tgt_kind = match tgt {
+            Some(Resolved::Entity(e)) => &e.kind,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "link target {target_id} must be an entity for relation {relation:?} \
+                     (only `annotates` crosses substrates)"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "link target {target_id} not found"
+                )));
+            }
+        };
+
+        if !base_entity_rule_allows(src_kind, relation, tgt_kind) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
+                 allowlist; use pack EDGE_RULES to extend the allowlist",
+                relation.as_str()
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Create a directed edge between two substrates.
     ///
     /// Enforces the three-case relation contract via
@@ -1196,6 +1360,64 @@ impl KhiveRuntime {
         // generated UUID that was displaced by an ON CONFLICT DO UPDATE.
         // Under parallel calls for the same triple, every caller now returns
         // the same persisted edge ID — the winner's insert or the updated row.
+        let persisted = self
+            .list_edges(
+                token,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(source_id),
+                    target_id: Some(target_id),
+                    relations: vec![relation],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                crate::RuntimeError::Internal(format!(
+                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
+                ))
+            })?;
+        Ok(persisted)
+    }
+
+    /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
+    ///
+    /// Called by the `SubstrateCoordinator` when source and target are on
+    /// different backends. The coordinator validates endpoints before calling
+    /// this method via [`validate_link_endpoints`], so endpoint validation is
+    /// skipped here. The edge is written on the source backend only.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_with_target_backend(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        target_backend: Option<String>,
+    ) -> RuntimeResult<Edge> {
+        validate_edge_weight(weight)?;
+        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        validate_edge_metadata(relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
+        let ns = token.namespace().as_str();
+        let edge = Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: ns.to_string(),
+            source_id,
+            target_id,
+            relation,
+            weight,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend,
+        };
+        self.graph(token)?.upsert_edge(edge).await?;
         let persisted = self
             .list_edges(
                 token,

@@ -20,13 +20,15 @@
 //! Pass `--human` to switch to a readable table where supported.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig};
+use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 use kkernel::{
-    coordinator::BackendRegistry, engine, exec, kg, pack_introspect, reindex, sync, vector,
+    coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
+    engine, exec, kg, pack_introspect, reindex, sync, vector,
 };
 
 #[derive(Parser, Debug)]
@@ -208,8 +210,68 @@ async fn main() -> Result<()> {
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::Exec(e) => exec::run_exec(e).await,
         Command::Mcp(a) => {
-            khive_mcp::serve::run(a, &khive_mcp::transport::TransportRegistry::with_builtins())
-                .await
+            let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
+
+            // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
+            let khive_cfg = KhiveConfig::load_with_home_fallback(a.config.as_deref())
+                .unwrap_or_default()
+                .unwrap_or_default();
+
+            if khive_cfg.backends.len() <= 1 {
+                // Single-backend: zero-change path — no coordinator.
+                khive_mcp::serve::run(a, &transport_registry).await
+            } else {
+                // Multi-backend: build registry, inject SubstrateCoordinator.
+                let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                let base_cfg = khive_mcp::serve::resolve_runtime_config(
+                    khive_mcp::serve::RuntimeConfigInputs {
+                        db: a.db.as_deref(),
+                        config: a.config.as_deref(),
+                        namespace: cli_ns,
+                        namespace_explicit: cli_ns_explicit,
+                        no_embed: a.no_embed,
+                        packs: if a.pack.is_empty() {
+                            None
+                        } else {
+                            Some(a.pack.clone())
+                        },
+                        brain_profile: a.brain_profile.clone(),
+                    },
+                )?;
+
+                let multi =
+                    khive_mcp::serve::build_registry_for_multi_backend(base_cfg, &khive_cfg)?;
+
+                // Build BackendRegistry: one entry per unique backend (deduplicated
+                // by backend_name so packs sharing a backend share one runtime).
+                let mut backend_reg = BackendRegistry::new();
+                for (pack_name, rt) in &multi.per_pack_runtimes {
+                    let backend_name = khive_cfg
+                        .packs
+                        .get(pack_name.as_str())
+                        .map(|pc| pc.backend.as_str())
+                        .unwrap_or(BackendId::MAIN);
+                    let backend_id = BackendId::new(backend_name);
+                    // `BackendRegistry::register` is idempotent by backend_id —
+                    // the second registration for the same id is a no-op.
+                    backend_reg.register(backend_id, Arc::clone(rt));
+                }
+
+                let coord =
+                    SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+                let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+                    multi.registry,
+                    &multi.default_namespace,
+                    &multi.config_id,
+                )
+                .with_coordinator(
+                    Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>
+                );
+
+                khive_mcp::serve::serve_server(server, &a, &transport_registry).await
+            }
         }
         Command::Backend(b) => cmd_backend(b),
     }

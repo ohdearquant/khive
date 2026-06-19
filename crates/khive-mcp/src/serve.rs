@@ -17,6 +17,22 @@ use crate::args::{resolve_cli_namespace, Args};
 use crate::server::KhiveMcpServer;
 use crate::transport::{ServeOptions, TransportRegistry};
 
+/// Output of [`build_registry_for_multi_backend`] — carries the registry and
+/// the per-pack runtimes so `kkernel` can build a `BackendRegistry` for the
+/// coordinator (ADR-029 Phase 2).
+pub struct MultiBackendRegistry {
+    /// The assembled [`VerbRegistry`] ready to be passed to a server.
+    pub registry: khive_runtime::VerbRegistry,
+    /// Namespace the registry was built for.
+    pub default_namespace: String,
+    /// Config fingerprint (for daemon matching).
+    pub config_id: String,
+    /// Pack-name → `Arc<KhiveRuntime>`, one entry per declared pack.
+    pub per_pack_runtimes: HashMap<String, Arc<KhiveRuntime>>,
+    /// The `main` backend (needed by the coordinator to build the BackendRegistry).
+    pub main_backend: Arc<StorageBackend>,
+}
+
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
     let server = build_server(&args)?;
@@ -44,6 +60,190 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         bind: args.bind.clone(),
     };
     transport.serve(server, &opts).await
+}
+
+/// Serve a pre-built server (ADR-029 Phase 2 boot path).
+///
+/// Extracted from `run()` so that `kkernel`'s `Command::Mcp` arm can build a
+/// coordinator-equipped server and then call this to drive the
+/// daemon/transport dispatch. The `Args` object is still needed for `--daemon`,
+/// `--transport`, and `--bind` flags.
+pub async fn serve_server(
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if args.daemon {
+        khive_runtime::daemon::run_daemon(server).await?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    if args.daemon {
+        anyhow::bail!(
+            "--daemon mode requires Unix (macOS/Linux). On Windows, use the stdio transport."
+        );
+    }
+
+    let transport_name = args.transport.as_deref().unwrap_or("stdio");
+    let transport = registry.get(transport_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown transport {transport_name:?}; registered: {}",
+            registry.names().join(", ")
+        )
+    })?;
+    let opts = ServeOptions {
+        bind: args.bind.clone(),
+    };
+    transport.serve(server, &opts).await
+}
+
+/// Build the VerbRegistry and per-pack runtimes for a multi-backend deployment
+/// (ADR-028 + ADR-029 Phase 2).
+///
+/// Returns a [`MultiBackendRegistry`] that `kkernel` uses to both:
+/// 1. Construct the `KhiveMcpServer` (via `from_registry_with_meta`), and
+/// 2. Build the `BackendRegistry` for the `SubstrateCoordinator`.
+///
+/// This is a refactor-extraction of the registry-building logic from
+/// `build_server_multi_backend`, keeping the existing tests intact.
+pub fn build_registry_for_multi_backend(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+) -> anyhow::Result<MultiBackendRegistry> {
+    // Open and migrate each declared backend, deduplicating SQLite backends by
+    // canonical path (ADR-028 §8).
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
+    for backend_cfg in &khive_cfg.backends {
+        let canonical = canonical_backend_path(backend_cfg)?;
+        if let Some(ref canon) = canonical {
+            if let Some(existing) = path_to_backend.get(canon) {
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+        let backend = open_backend(backend_cfg)?;
+        {
+            let mut writer = backend.pool().try_writer().map_err(|e| {
+                anyhow::anyhow!("backend {}: migration writer: {e}", backend_cfg.name)
+            })?;
+            run_migrations(writer.conn_mut())
+                .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
+        }
+        let arc = Arc::new(backend);
+        if let Some(canon) = canonical {
+            path_to_backend.insert(canon, arc.clone());
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
+    }
+
+    let main_backend = backends
+        .get(BackendId::MAIN)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "[[backends]] is declared but no backend named \"main\" was found; \
+             add a [[backends]] entry with name = \"main\""
+            )
+        })?
+        .clone();
+
+    let pack_names = &base_config.packs;
+    let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
+    for pack_name in pack_names {
+        let backend_name = khive_cfg
+            .packs
+            .get(pack_name.as_str())
+            .map(|pc| pc.backend.as_str())
+            .unwrap_or(BackendId::MAIN);
+        let backend = backends
+            .get(backend_name)
+            .cloned()
+            .unwrap_or_else(|| main_backend.clone());
+        let mut rt_config = base_config.clone();
+        rt_config.backend_id = BackendId::new(backend_name);
+        per_pack_runtimes_local.insert(
+            pack_name.clone(),
+            KhiveRuntime::from_backend(backend, rt_config),
+        );
+    }
+
+    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
+        let mut cfg = base_config.clone();
+        cfg.backend_id = BackendId::main();
+        cfg
+    });
+
+    #[cfg(feature = "bench-embedder")]
+    {
+        for rt in per_pack_runtimes_local.values() {
+            for name in rt.registered_embedding_model_names() {
+                rt.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+            }
+        }
+        for name in default_runtime.registered_embedding_model_names() {
+            default_runtime
+                .register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+        }
+    }
+
+    let gate = default_runtime.config().gate.clone();
+    let default_namespace = default_runtime.config().default_namespace.clone();
+    let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
+    let visible_namespaces = default_runtime.config().visible_namespaces.clone();
+
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.with_gate(gate);
+    builder.with_default_namespace(default_namespace.as_str());
+    builder.with_visible_namespaces(visible_namespaces);
+    builder.with_actor_id(default_runtime.config().actor_id.clone());
+
+    if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
+        if let Ok(event_store) = default_runtime.events(&tok) {
+            builder.with_event_store(event_store);
+        }
+    }
+
+    khive_runtime::PackRegistry::register_packs_with_runtimes(
+        pack_names,
+        &per_pack_runtimes_local,
+        &default_runtime,
+        &mut builder,
+    )
+    .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
+
+    let registry = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
+
+    default_runtime.install_edge_rules(registry.all_edge_rules());
+    for rt in per_pack_runtimes_local.values() {
+        rt.install_edge_rules(registry.all_edge_rules());
+    }
+    registry.call_register_embedders(&default_runtime);
+
+    let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
+        .iter()
+        .map(|(name, rt)| (name.as_str(), rt.backend()))
+        .collect();
+    let main_ref: &StorageBackend = main_backend.as_ref();
+    registry
+        .apply_schema_plans_with_map(&backend_for_pack, main_ref)
+        .map_err(|e| anyhow::anyhow!("pack schema boot failure: {e}"))?;
+
+    // Wrap runtimes in Arc for the coordinator's BackendRegistry.
+    let per_pack_runtimes_arc: HashMap<String, Arc<KhiveRuntime>> = per_pack_runtimes_local
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v)))
+        .collect();
+
+    Ok(MultiBackendRegistry {
+        registry,
+        default_namespace: default_namespace.as_str().to_string(),
+        config_id,
+        per_pack_runtimes: per_pack_runtimes_arc,
+        main_backend,
+    })
 }
 
 /// Build a fully-configured server from parsed args (without serving).

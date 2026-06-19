@@ -4,6 +4,7 @@
 //! The binary frontend is `kkernel mcp`; this crate ships no binary of its own.
 
 pub mod args;
+pub mod coordinator;
 #[cfg(unix)]
 pub mod daemon;
 pub mod pack;
