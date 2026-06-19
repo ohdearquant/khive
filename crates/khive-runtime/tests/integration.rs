@@ -572,6 +572,7 @@ async fn file_backed_runtime_persists() {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -593,6 +594,7 @@ async fn file_backed_runtime_persists() {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -1082,6 +1084,7 @@ mod embedder_registry_tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
         .expect("in-memory runtime")
     }
@@ -1142,6 +1145,7 @@ mod embedder_registry_tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
         .expect("runtime with two models");
 

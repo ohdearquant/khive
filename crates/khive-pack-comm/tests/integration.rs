@@ -2310,6 +2310,7 @@ fn build_crossns_registry(
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: allowed_outbound,
+        actor_id: None,
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -3391,6 +3392,179 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     assert_eq!(
         alive, 0,
         "T14: no stranded note after vector failure (create_note_inner must compensate); got {alive}"
+    );
+}
+
+// ── Issue #75 regression: actor-identity filter (ADR-057) ────────────────────
+//
+// Root cause: handle_inbox read caller_actor from token.namespace() (always
+// "local") instead of token.actor().id. The to_actor guard was permanently
+// dormant. After the fix, when RuntimeConfig.actor_id is set, authorize() mints
+// a token carrying that actor label, activating the filter.
+
+/// Build a comm registry backed by a shared in-memory StorageBackend with a
+/// configured actor identity. The minted token's actor.id will equal `actor_id`,
+/// activating the to_actor filter in handle_inbox.
+fn build_actor_registry(
+    backend: Arc<khive_db::StorageBackend>,
+    actor_id: &str,
+) -> (VerbRegistry, KhiveRuntime) {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: Some(actor_id.to_string()),
+    };
+    let rt = KhiveRuntime::from_backend(backend, config);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_actor_id(Some(actor_id.to_string()));
+    let registry = builder.build().expect("actor registry builds");
+    (registry, rt)
+}
+
+/// Actor A sends to actor B. B's inbox should see the message; A's inbox should not.
+#[tokio::test]
+async fn t_actor_inbox_filters_to_actor() {
+    let backend = shared_backend();
+
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    // A sends to B.
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello B from A" }),
+        )
+        .await
+        .expect("send succeeds");
+    assert!(
+        send_result.get("id").is_some(),
+        "send must return id: {send_result}"
+    );
+
+    // B's inbox (status=all) should contain exactly one message addressed to lambda:b.
+    // Note: comm.inbox already filters for direction=inbound; all returned messages are inbound.
+    let b_inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("B inbox succeeds");
+    let b_count = b_inbox["count"].as_u64().unwrap_or(0);
+    let b_messages = b_inbox["messages"].as_array().expect("messages array");
+    assert_eq!(
+        b_count,
+        1,
+        "B must see exactly 1 message (addressed to lambda:b); count={b_count}, messages: {b_messages:?}"
+    );
+    // Verify the message is addressed to lambda:b (via the properties.to_actor field).
+    let b_to_actor = b_messages[0]["properties"]["to_actor"].as_str();
+    assert_eq!(
+        b_to_actor,
+        Some("lambda:b"),
+        "message must be addressed to lambda:b; got {b_to_actor:?}"
+    );
+
+    // A's inbox should NOT contain the message (it was addressed to lambda:b, not lambda:a).
+    let a_inbox = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("A inbox succeeds");
+    let a_count = a_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        a_count, 0,
+        "A must see 0 messages (message was addressed to B, not A); got {a_count}"
+    );
+}
+
+/// When no actor_id is configured (anonymous/local), inbox falls back to party-line
+/// behavior — all inbound messages are visible regardless of to_actor.
+#[tokio::test]
+async fn t_anonymous_actor_inbox_party_line_unchanged() {
+    let (registry, _rt) = build_registry();
+
+    // Send two messages from the same anonymous session.
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:x", "content": "msg 1" }),
+        )
+        .await
+        .expect("send 1");
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:y", "content": "msg 2" }),
+        )
+        .await
+        .expect("send 2");
+
+    // Anonymous inbox must see all inbound messages (no to_actor filter applied).
+    // Note: comm.inbox already filters for direction=inbound; all returned messages are inbound.
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let count = inbox["count"].as_u64().unwrap_or(0);
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(
+        count, 2,
+        "anonymous inbox must show all 2 inbound messages (party-line fallback); got {messages:?}"
+    );
+}
+
+/// TOML wiring: actor.id in khive.toml flows into RuntimeConfig.actor_id.
+#[test]
+fn t_actor_id_wires_from_toml_into_runtime_config() {
+    use khive_runtime::{runtime_config_from_khive_config, RuntimeConfig};
+
+    let toml_src = r#"
+[actor]
+id = "lambda:khive"
+"#;
+    let khive_cfg: khive_runtime::KhiveConfig = toml::from_str(toml_src).expect("TOML must parse");
+    let base = RuntimeConfig::default();
+    let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+    assert_eq!(
+        resolved.actor_id.as_deref(),
+        Some("lambda:khive"),
+        "actor.id must flow through to RuntimeConfig.actor_id"
+    );
+}
+
+/// TOML wiring: absent actor.id leaves RuntimeConfig.actor_id as None.
+#[test]
+fn t_absent_actor_id_leaves_runtime_config_actor_id_none() {
+    use khive_runtime::{runtime_config_from_khive_config, RuntimeConfig};
+
+    let toml_src = r#"
+[actor]
+allowed_outbound_namespaces = ["lambda:other"]
+"#;
+    let khive_cfg: khive_runtime::KhiveConfig = toml::from_str(toml_src).expect("TOML must parse");
+    let base = RuntimeConfig::default();
+    let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+    assert!(
+        resolved.actor_id.is_none(),
+        "absent actor.id must leave actor_id as None; got {:?}",
+        resolved.actor_id
     );
 }
 

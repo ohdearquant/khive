@@ -1374,6 +1374,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
+        actor_id: None,
     })
     .expect("runtime with default embedder")
 }
@@ -2044,6 +2045,7 @@ mod embed_failure_tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
         .expect("runtime");
         // Override the lattice provider with our fake — same key, last-writer wins.
@@ -2405,6 +2407,7 @@ mod ann_bypass_regression {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -2999,6 +3002,7 @@ mod edit_inline_reembed {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
         .expect("runtime");
         rt.register_embedder(EmbedProvider);
