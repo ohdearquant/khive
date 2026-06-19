@@ -325,6 +325,9 @@ pub struct VerbRegistryBuilder {
     /// is a precise escape and is not widened by this set. A cloud gate may also
     /// consult the list as policy input at its own layer.
     visible_namespaces: Vec<Namespace>,
+    /// Configured actor identity label (ADR-057). When set, dispatch mints tokens
+    /// carrying this actor so that `comm.inbox` filters by `to_actor`.
+    actor_id: Option<String>,
     /// Optional audit event sink.
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
@@ -349,6 +352,7 @@ impl VerbRegistryBuilder {
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
+            actor_id: None,
             event_store: None,
             dispatch_hook: None,
         }
@@ -363,6 +367,17 @@ impl VerbRegistryBuilder {
     /// policy input at its own layer.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
+        self
+    }
+
+    /// Set the configured actor identity label (ADR-057).
+    ///
+    /// When set, the dispatch path mints tokens carrying this actor so that
+    /// `comm.inbox` applies the `to_actor` filter for directed delivery.
+    /// When `None` (default), tokens carry `ActorRef::anonymous()` and inbox
+    /// falls back to party-line behavior.
+    pub fn with_actor_id(&mut self, actor_id: Option<String>) -> &mut Self {
+        self.actor_id = actor_id;
         self
     }
 
@@ -536,6 +551,7 @@ impl VerbRegistryBuilder {
             gate: self.gate,
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
+            actor_id: self.actor_id,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
         })
@@ -672,6 +688,10 @@ pub struct VerbRegistry {
     /// still pin to `'local'`. An explicit `namespace=` request param is a
     /// precise single-namespace escape and is not widened by this set.
     visible_namespaces: Vec<Namespace>,
+    /// Configured actor identity label (ADR-057). When `Some`, dispatch mints
+    /// tokens carrying this actor so that `comm.inbox` applies the `to_actor`
+    /// filter. When `None`, tokens carry `ActorRef::anonymous()` (party-line).
+    actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
@@ -849,6 +869,14 @@ impl VerbRegistry {
         // is a precise single-namespace escape (Rule 3): the caller deliberately
         // reads/writes exactly that one set; it is NOT widened by `visible_namespaces`.
         //
+        // When actor_id is configured (ADR-057), mint a token carrying that actor
+        // label so that comm.inbox applies the to_actor filter for directed delivery.
+        // Otherwise, use ActorRef::anonymous() and inbox falls back to party-line.
+        let configured_actor = match self.actor_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+            _ => ActorRef::anonymous(),
+        };
+
         // Rule 3b (Rev 4): on the default (no explicit `namespace=`) path, the read
         // scope widens to `['local'] ∪ self.visible_namespaces`. `'local'` is always
         // included (mint_with_visibility deduplicates). Writes remain pinned to
@@ -859,14 +887,14 @@ impl VerbRegistry {
                 // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
                 let primary = Namespace::parse(ns)
                     .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-                NamespaceToken::mint_with_visibility(primary, vec![], ActorRef::anonymous())
+                NamespaceToken::mint_with_visibility(primary, vec![], configured_actor)
             }
             None => {
                 // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
                 let primary = Namespace::local();
                 let mut extra_visible = self.visible_namespaces.clone();
                 extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
-                NamespaceToken::mint_with_visibility(primary, extra_visible, ActorRef::anonymous())
+                NamespaceToken::mint_with_visibility(primary, extra_visible, configured_actor)
             }
         };
 

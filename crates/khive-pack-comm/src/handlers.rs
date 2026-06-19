@@ -70,7 +70,7 @@ pub(crate) async fn handle_send(
     }
 
     let caller_ns = token.namespace().as_str().to_string();
-    let from_actor = caller_ns.clone();
+    let from_actor = token.actor().id.clone();
     let to_actor = p.to.trim().to_string();
     let sent_at = Utc::now().to_rfc3339();
 
@@ -128,7 +128,7 @@ pub(crate) async fn handle_inbox(
         }
     };
 
-    let caller_actor = token.namespace().as_str().to_string();
+    let caller_actor = token.actor().id.clone();
 
     // Push direction + read-status filters into SQL so idx_comm_message_direction is usable.
     // Read filter uses json_type to match the old as_bool().unwrap_or(false) semantics:
@@ -329,14 +329,15 @@ pub(crate) async fn handle_reply(
         format!("Re: {original_subject}")
     };
 
-    let from = token.namespace().as_str().to_string();
+    let caller_ns = token.namespace().as_str().to_string();
+    let from_actor_label = token.actor().id.clone();
     let sent_at = Utc::now().to_rfc3339();
 
     // UE6-H1: route reply to the "other party" — not always to the original sender.
     // If the reply caller is the original sender (from_actor or from), route to the
     // original recipient. If the reply caller is the original recipient, route back
     // to the original sender.
-    let reply_to = if from == original_from {
+    let reply_to = if from_actor_label == original_from {
         original_to.clone()
     } else {
         original_from.clone()
@@ -348,7 +349,7 @@ pub(crate) async fn handle_reply(
     // original's actor fields when present, else from the legacy from/to strings treated
     // as labels. No legacy code path can cause dual_write_message to mint a token in a
     // foreign namespace.
-    let reply_from_actor = from.clone();
+    let reply_from_actor = from_actor_label.clone();
     let reply_to_actor = reply_to.clone();
 
     let reply_subject_opt = if reply_subject.is_empty() {
@@ -363,8 +364,8 @@ pub(crate) async fn handle_reply(
     let reply_note = dual_write_message(
         runtime,
         token,
-        &from,
-        &from,
+        &caller_ns,
+        &caller_ns,
         reply_subject_opt,
         &p.content,
         Some(&thread_id),
@@ -378,7 +379,7 @@ pub(crate) async fn handle_reply(
         "id": short_id(reply_note.id),
         "full_id": reply_note.id.as_hyphenated().to_string(),
         "thread_id": thread_id,
-        "from": from,
+        "from": from_actor_label,
         "to": reply_to,
         "subject": reply_subject,
         "sent_at": sent_at,

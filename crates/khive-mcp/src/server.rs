@@ -215,10 +215,12 @@ impl KhiveMcpServer {
         let default_namespace = runtime.config().default_namespace.clone();
         let config_id = compute_config_id(runtime.config());
         let visible_namespaces = runtime.config().visible_namespaces.clone();
+        let actor_id = runtime.config().actor_id.clone();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         builder.with_visible_namespaces(visible_namespaces);
+        builder.with_actor_id(actor_id);
         // Wire the EventStore into the registry for audit persistence.
         if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
             if let Ok(event_store) = runtime.events(&tok) {

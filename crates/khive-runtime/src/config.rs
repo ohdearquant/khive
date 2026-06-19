@@ -259,6 +259,12 @@ pub struct RuntimeConfig {
     /// `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for
     /// a future cloud-path authorization ADR (not yet written).
     pub allowed_outbound_namespaces: Vec<Namespace>,
+    /// Configured actor identity label (ADR-057). Populated from `[actor] id` in
+    /// `khive.toml`. When `Some`, `authorize()` mints tokens carrying this actor
+    /// label so that `comm.inbox` filters by `to_actor` instead of falling back to
+    /// the party-line "local" behavior. When `None` (default), tokens carry
+    /// `ActorRef::anonymous()` and inbox shows all inbound messages.
+    pub actor_id: Option<String>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -306,6 +312,9 @@ impl Default for RuntimeConfig {
         let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        let actor_id = std::env::var("KHIVE_ACTOR")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         Self {
             db_path,
             default_namespace: Namespace::local(),
@@ -317,6 +326,7 @@ impl Default for RuntimeConfig {
             brain_profile,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id,
         }
     }
 }
@@ -462,12 +472,18 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
+    // ADR-057: store actor.id as actor_id for token minting. The validated id is
+    // already confirmed to be a valid Namespace string by KhiveConfig::validate().
+    // None when [actor] id is absent — tokens then carry ActorRef::anonymous().
+    let actor_id = khive_cfg.actor.id.clone().filter(|s| !s.trim().is_empty());
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
             brain_profile,
             visible_namespaces,
             allowed_outbound_namespaces,
+            actor_id,
             ..base
         };
     }
@@ -501,6 +517,7 @@ pub fn runtime_config_from_khive_config(
         brain_profile,
         visible_namespaces,
         allowed_outbound_namespaces,
+        actor_id,
         ..base
     }
 }

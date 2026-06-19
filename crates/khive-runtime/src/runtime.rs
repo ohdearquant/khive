@@ -157,6 +157,7 @@ impl KhiveRuntime {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         })
     }
 
@@ -321,8 +322,16 @@ impl KhiveRuntime {
     /// The returned token's read visibility set defaults to `[ns]` — identical
     /// to the pre-visibility-set behaviour. Use [`authorize_with_visibility`]
     /// to mint a token that can read additional namespaces.
+    ///
+    /// When `actor_id` is configured in `RuntimeConfig`, the token carries that
+    /// actor label so that `comm.inbox` filters by `to_actor` (ADR-057). When
+    /// unconfigured, the token carries `ActorRef::anonymous()` and inbox falls
+    /// back to party-line behavior.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
-        let actor = ActorRef::anonymous();
+        let actor = match self.config.actor_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+            _ => ActorRef::anonymous(),
+        };
         let req = GateRequest::new(
             actor.clone(),
             ns.clone(),
@@ -375,7 +384,10 @@ impl KhiveRuntime {
         primary: Namespace,
         extra_visible: Vec<Namespace>,
     ) -> RuntimeResult<NamespaceToken> {
-        let actor = ActorRef::anonymous();
+        let actor = match self.config.actor_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+            _ => ActorRef::anonymous(),
+        };
         let req = GateRequest::new(
             actor.clone(),
             primary.clone(),
@@ -734,6 +746,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -754,6 +767,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -904,6 +918,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -927,6 +942,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -958,6 +974,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -981,6 +998,7 @@ mod tests {
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
+            actor_id: None,
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
