@@ -33,10 +33,13 @@ pub use daemon::{
     PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
-pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};
+pub use engine_config::{
+    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
+};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
+pub use khive_db::{run_migrations, StorageBackend};
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
@@ -54,9 +57,9 @@ pub use operations::{arm_fts_fail, arm_vector_fail, arm_vector_fail_after};
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,
-    PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime, PackSchemaPlan,
-    ParamDef, SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
-    Visibility,
+    PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime,
+    PackSchemaCollisionError, PackSchemaPlan, ParamDef, SchemaPlan, VerbCategory,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{micros_to_iso, present, PresentationMode};

@@ -3834,8 +3834,8 @@ fn compute_config_id_differs_when_visible_namespaces_differ() {
         ..base.clone()
     };
 
-    let id_no_vis = compute_config_id(&base);
-    let id_with_vis = compute_config_id(&with_visible);
+    let id_no_vis = compute_config_id(&base, None);
+    let id_with_vis = compute_config_id(&with_visible, None);
 
     assert_ne!(
         id_no_vis, id_with_vis,
@@ -3876,8 +3876,8 @@ fn compute_config_id_is_stable_under_visible_namespace_reorder() {
     };
 
     assert_eq!(
-        compute_config_id(&cfg_ab),
-        compute_config_id(&cfg_ba),
+        compute_config_id(&cfg_ab, None),
+        compute_config_id(&cfg_ba, None),
         "compute_config_id must be stable under reordering of visible_namespaces"
     );
 }
@@ -3915,8 +3915,8 @@ fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
         ..base.clone()
     };
 
-    let id_empty = compute_config_id(&base);
-    let id_with_outbound = compute_config_id(&with_outbound);
+    let id_empty = compute_config_id(&base, None);
+    let id_with_outbound = compute_config_id(&with_outbound, None);
 
     assert_ne!(
         id_empty, id_with_outbound,
@@ -3965,13 +3965,13 @@ fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
     };
 
     assert_eq!(
-        compute_config_id(&cfg_ab),
-        compute_config_id(&cfg_ba),
+        compute_config_id(&cfg_ab, None),
+        compute_config_id(&cfg_ba, None),
         "compute_config_id must be stable under reordering of allowed_outbound_namespaces"
     );
     assert_eq!(
-        compute_config_id(&cfg_ab),
-        compute_config_id(&cfg_dup),
+        compute_config_id(&cfg_ab, None),
+        compute_config_id(&cfg_dup, None),
         "compute_config_id must be stable under duplication of allowed_outbound_namespaces"
     );
 }

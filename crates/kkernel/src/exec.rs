@@ -73,7 +73,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             presentation: args.presentation.clone(),
             presentation_per_op: None,
             namespace: cfg.default_namespace.as_str().to_string(),
-            config_id: compute_config_id(&cfg),
+            config_id: compute_config_id(&cfg, None),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
         };
