@@ -146,7 +146,7 @@ pub(crate) struct GetParams {
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ListParams {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", alias = "kind", default)]
     pub kind: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
@@ -218,7 +218,7 @@ pub(crate) struct FoldCandidate {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SearchParams {
     pub query: String,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", alias = "kind", default)]
     pub kind: Option<String>,
     #[serde(default)]
     pub status: Option<Value>,

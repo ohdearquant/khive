@@ -138,6 +138,8 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
+Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
+alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 
 ### How to call a verb
 

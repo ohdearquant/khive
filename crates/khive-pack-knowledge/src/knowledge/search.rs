@@ -114,6 +114,33 @@ fn filter_by_excluded_statuses(hits: &mut Vec<ScoredHit>, exclude_statuses: &[&s
     });
 }
 
+// ─── type filtering (post-hydration) ─────────────────────────────────────────
+
+/// Remove hits that do not match `type_filter` after hydration.
+///
+/// Mirrors the FTS/SQL path in `fetch_fts_candidates` (the full-scan fallback):
+///
+/// - `Some("domain")` keeps only domain hits (`hit.is_domain == true`).
+/// - `Some(other)` where other is non-empty keeps only non-domain hits.
+/// - `None` or `Some("")` is a no-op.
+///
+/// Applied after ANN fusion + hydration so that ANN-sourced hits go through
+/// the same kind gate as SQL-sourced candidates.
+fn filter_hits_by_type(hits: &mut Vec<ScoredHit>, type_filter: Option<&str>) {
+    let filt = match type_filter {
+        Some(f) if !f.is_empty() => f,
+        _ => return,
+    };
+    let want_domain = filt == "domain";
+    hits.retain(|hit| {
+        if want_domain {
+            hit.is_domain
+        } else {
+            !hit.is_domain
+        }
+    });
+}
+
 // ─── status scoring ───────────────────────────────────────────────────────────
 
 fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprecated: bool) {
@@ -1002,6 +1029,11 @@ impl KnowledgeHandlers {
                 }
             }
         }
+        // Apply the kind gate unconditionally — both FTS-sourced and ANN-sourced
+        // hits must pass the type filter regardless of whether ANN ran.
+        // Previously this was inside the ANN block, so FTS atom hits were never
+        // filtered when ANN was warming or returned no results.
+        filter_hits_by_type(&mut hits, type_filter);
 
         if do_rerank && !hits.is_empty() {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
@@ -1073,7 +1105,11 @@ impl KnowledgeHandlers {
 
         vamana::ensure_ann_background(runtime, token, ann);
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
-            let ann_k = (limit * 3).max(20);
+            // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
+            // limit*3 would return mostly atoms that all get dropped after type filtering.
+            // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
+            // top ANN neighbors before the type gate discards atom hits.
+            let ann_k = (limit * 50).max(200);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
             if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
                 if !ann_hits.is_empty() {
@@ -1081,12 +1117,16 @@ impl KnowledgeHandlers {
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
                     // Apply the same status exclusion to ANN-sourced domain hits.
                     filter_by_excluded_statuses(&mut hits, SUGGEST_EXCLUDE);
+                    // Drop non-domain ANN hits before rerank/truncate so atom hits do
+                    // not crowd out domain hits in the final ranking.
+                    filter_hits_by_type(&mut hits, Some("domain"));
                 }
             }
         }
 
         rerank_with_embeddings(runtime, &raw_query, &mut hits, 0.7).await?;
 
+        // Safety net: retain only domain hits in case any non-domain survived above.
         hits.retain(|h| h.is_domain);
         hits.truncate(limit);
 
