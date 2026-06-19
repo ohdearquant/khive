@@ -294,11 +294,7 @@ impl KhiveRuntime {
             }
         }
         let ns = token.namespace().as_str().to_owned();
-        let sanitized_ns: String = ns
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let fts_table = format!("fts_entities_{}", sanitized_ns);
+        let fts_table = "fts_entities".to_string();
         let vec_tables: Vec<String> = self
             .registered_embedding_model_names()
             .iter()
@@ -612,11 +608,7 @@ impl KhiveRuntime {
             ));
         }
         let ns = token.namespace().as_str().to_string();
-        let sanitized_ns: String = ns
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let fts_table = format!("fts_notes_{}", sanitized_ns);
+        let fts_table = "fts_notes".to_string();
         let vec_tables: Vec<String> = self
             .registered_embedding_model_names()
             .iter()

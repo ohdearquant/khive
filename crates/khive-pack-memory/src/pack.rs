@@ -330,6 +330,7 @@ impl PackRuntime for MemoryPack {
 
     async fn warm(&self) {
         crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+        fts_population_guard(&self.runtime).await;
     }
 
     async fn dispatch(
@@ -351,6 +352,77 @@ impl PackRuntime for MemoryPack {
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),
+        }
+    }
+}
+
+/// Check that the unified FTS tables are adequately populated relative to the
+/// base `notes` and `entities` tables. Called at daemon warm time (after
+/// `kkernel mcp` starts) to detect the V3→V4 migration footgun where the
+/// empty unified tables silently strand FTS recall at ~1% until a manual
+/// `kkernel reindex` is run.
+///
+/// Threshold: warns when `base_count > 100 AND fts_count < base_count / 2`.
+/// A legitimately fresh or empty database (base_count ≤ 100) never warns.
+/// Does NOT hard-fail — boot must succeed even on empty databases.
+async fn fts_population_guard(rt: &KhiveRuntime) {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let sql = rt.sql();
+
+    let Ok(mut reader) = sql.reader().await else {
+        tracing::warn!("fts_population_guard: could not open SQL reader — skipping check");
+        return;
+    };
+
+    for (base_table, fts_table) in [("notes", "fts_notes"), ("entities", "fts_entities")] {
+        let base_row = reader
+            .query_row(SqlStatement {
+                sql: format!("SELECT COUNT(*) AS cnt FROM {base_table} WHERE deleted_at IS NULL"),
+                params: vec![],
+                label: None,
+            })
+            .await;
+
+        let base_count: u64 = match base_row {
+            Ok(Some(r)) => match r.get("cnt") {
+                Some(SqlValue::Integer(n)) => *n as u64,
+                _ => 0,
+            },
+            _ => 0,
+        };
+
+        if base_count <= 100 {
+            continue;
+        }
+
+        let fts_row = reader
+            .query_row(SqlStatement {
+                sql: format!("SELECT COUNT(*) AS cnt FROM {fts_table}"),
+                params: vec![],
+                label: None,
+            })
+            .await;
+
+        let fts_count: u64 = match fts_row {
+            Ok(Some(r)) => match r.get("cnt") {
+                Some(SqlValue::Integer(n)) => *n as u64,
+                _ => 0,
+            },
+            _ => 0,
+        };
+
+        if fts_count < base_count / 2 {
+            tracing::warn!(
+                base_table,
+                fts_table,
+                base_count,
+                fts_count,
+                "FTS table is severely under-populated relative to base rows. \
+                 FTS recall will return near-nothing. This is typically caused by \
+                 a V3→V4 schema migration that did not run `kkernel reindex`. \
+                 Fix: run `kkernel reindex --no-knowledge` to repopulate {fts_table}."
+            );
         }
     }
 }

@@ -273,10 +273,11 @@ async fn production_search(
     cfg: &RecallFtsGatherConfig,
     terms: &[String],
 ) -> Vec<TextSearchHit> {
+    let ns_vec = vec![NS.to_string()];
     collect_text_hits(
         searcher,
         "",
-        NS,
+        &ns_vec,
         CANDIDATE_LIMIT,
         TextSnippetPolicy::Omit,
         false,

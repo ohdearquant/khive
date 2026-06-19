@@ -85,6 +85,15 @@ pub struct RecallConfig {
     // --- FTS candidate-gather optimization ---
     /// Controls the two-stage FTS gather path (default: disabled, existing behavior).
     pub fts_gather: RecallFtsGatherConfig,
+
+    // --- ANN over-fetch retry ---
+    /// Maximum rounds for the ANN namespace over-fetch retry loop.
+    ///
+    /// Round 1 is the initial over-fetch; rounds 2–N double the fetch window
+    /// until enough visible-namespace candidates are found or the corpus is
+    /// exhausted. When `None`, falls back to the `ANN_OVERFETCH_MAX_ROUNDS`
+    /// env var (default 3). Pass `Some(1)` to disable widening entirely.
+    pub ann_overfetch_max_rounds: Option<usize>,
 }
 
 /// Brain-profile hint for score boosting during recall.
@@ -384,6 +393,7 @@ impl Default for RecallConfig {
             scoring: None,
             brain_profile: None,
             fts_gather: RecallFtsGatherConfig::default(),
+            ann_overfetch_max_rounds: None,
         }
     }
 }

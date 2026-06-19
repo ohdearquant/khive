@@ -235,14 +235,50 @@ impl ReindexReport {
     }
 }
 
+/// Drop ALL existing vector rows for `subject_ids` in the model's canonical table,
+/// regardless of their stored namespace. This is required before re-embedding
+/// because the vec table's PRIMARY KEY is `(subject_id)` — not `(subject_id,
+/// namespace)` — so a row written by a different namespace would collide on
+/// re-insert. By deleting on subject_id alone we ensure the subsequent INSERT
+/// lands cleanly with the base row's current namespace.
+///
+/// Resolves the store via `rt.vectors_for_model(token, model_name)` — the SAME
+/// call the insert path uses — so alias resolution (`paraphrase` → canonical table
+/// name) is handled identically in both directions. Best-effort: a failure to
+/// resolve the store or delete is logged but does not abort; the subsequent INSERT
+/// will either collide (counted as an error) or succeed.
+async fn drop_vectors_for_subjects(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    model_name: &str,
+    ids: &[Uuid],
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let store = match rt.vectors_for_model(token, model_name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(model = %model_name, error = %e, "drop_vectors_for_subjects: could not resolve store; skipping delete");
+            return;
+        }
+    };
+    if let Err(e) = store.delete_subjects(ids).await {
+        tracing::warn!(model = %model_name, error = %e, "subject-scoped vector drop failed (continuing)");
+    }
+}
+
 /// Embed `staged` with every model in `model_names` and store one vector record
 /// per model — mirroring the multi-model write path in the runtime. Returns the
 /// number of vector inserts that failed.
 ///
-/// With `drop_existing`, all staged ids are (re)embedded — existing vectors are
-/// atomically replaced by `SqliteVecStore::insert`'s internal DELETE+INSERT
-/// transaction (no-worse-than-stale on failure). Otherwise (`--keep-existing`),
-/// ids already embedded in a given model are skipped for that model only.
+/// With `drop_existing`, all staged ids are (re)embedded. Before inserting, a
+/// subject-scoped delete removes ANY existing row for each `subject_id` in the
+/// model table, regardless of its stored namespace. This prevents UNIQUE
+/// constraint violations when the database was relabeled and vec rows from a
+/// prior namespace survive. The subsequent INSERT writes the current base-row
+/// namespace. With `--keep-existing`, existing vectors are preserved and ids
+/// already embedded are skipped.
 // REASON: each argument is a distinct embed dimension (runtime, token, models,
 // namespace, batch, substrate kind, field, drop flag); a struct would add
 // indirection without grouping anything cohesive.
@@ -258,6 +294,20 @@ async fn embed_and_store_batch(
     drop_existing: bool,
 ) -> u64 {
     let mut errors: u64 = 0;
+
+    // Subject-scoped drop: remove ANY existing vec rows for these subject_ids
+    // in each model table, regardless of stored namespace. This ensures the
+    // re-insert never hits a UNIQUE collision when vec rows from a prior
+    // namespace survive a relabel operation. Done once per model here; the
+    // SqliteVecStore::insert DELETE is namespace-scoped and would miss rows
+    // stored under a different namespace.
+    if drop_existing && !staged.is_empty() {
+        let subject_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
+        for model_name in model_names {
+            drop_vectors_for_subjects(rt, token, model_name, &subject_ids).await;
+        }
+    }
+
     for model_name in model_names {
         let vectors = match rt.vectors_for_model(token, model_name) {
             Ok(v) => v,
@@ -578,6 +628,21 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         if let Err(e) = invalidate_vamana_snapshots(&rt, &ns_str).await {
             tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
         }
+
+        // Purge stale per-namespace memory Vamana snapshot rows (legacy key format
+        // `{ns}::memory_vamana::*`). After FTS+ANN consolidation the unified key is
+        // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
+        purge_stale_memory_vamana_snapshots(&rt).await;
+
+        // Drop per-namespace FTS partition tables that survived the V4 migration
+        // (tables created by the runtime before the migration ran, or on databases
+        // that were migrated but not swept). The sweep is guarded: it only runs
+        // when this reindex pass covered every distinct namespace in the base
+        // entities/notes tables. If any namespace is uncovered, sweeping would
+        // orphan those rows (they were dropped from the old partition and never
+        // written to the new unified table). On a single-namespace (post-relabel)
+        // db the guard always passes and the sweep runs normally.
+        sweep_stale_fts_partitions(&rt, &ns_str).await;
     } // end if do_graph
 
     // ── knowledge corpus ───────────────────────────────────────────────────────
@@ -724,6 +789,181 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("{e}"))
+            }
+        }
+    }
+}
+
+/// Remove per-namespace memory Vamana snapshot rows (legacy `{ns}::memory_vamana::*` format).
+/// After FTS+ANN consolidation the active key is `global::memory_vamana::*`; old per-ns rows
+/// are orphaned. Best-effort — missing table or SQL failure is logged and ignored.
+async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
+    use khive_storage::types::SqlStatement;
+    let sql = rt.sql();
+    let Ok(mut writer) = sql.writer().await else {
+        return;
+    };
+    match writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM retrieval_snapshots \
+                  WHERE index_type = 'memory_vamana' AND namespace != 'global'"
+                .into(),
+            params: vec![],
+            label: Some("purge_stale_memory_vamana_snapshots".into()),
+        })
+        .await
+    {
+        Ok(deleted) => {
+            if deleted > 0 {
+                tracing::info!(deleted, "purged stale per-ns memory Vamana snapshot rows");
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("no such table") {
+                tracing::warn!(error = %e, "failed to purge stale memory Vamana snapshots");
+            }
+        }
+    }
+}
+
+/// Return the set of distinct namespaces present in base `entities` and `notes`
+/// (non-deleted rows only). Used by the FTS sweep guard.
+async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
+    use khive_storage::types::SqlStatement;
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return HashSet::new();
+    };
+    // Union of entity and note namespaces; soft-deleted rows are excluded so
+    // we only guard against losing rows that are still live in the base table.
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT DISTINCT namespace FROM entities WHERE deleted_at IS NULL \
+                  UNION \
+                  SELECT DISTINCT namespace FROM notes WHERE deleted_at IS NULL"
+                .into(),
+            params: vec![],
+            label: Some("distinct_base_namespaces".into()),
+        })
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            row.get("namespace").and_then(|v| {
+                if let khive_storage::types::SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+/// Drop per-namespace FTS5 partition tables (`fts_entities_*`, `fts_notes_*`) that
+/// may exist in databases that were not yet migrated or were created before V4.
+/// Canonical tables (`fts_entities`, `fts_notes`, `fts_knowledge`, `fts_sections`)
+/// and their FTS5 shadow tables are never dropped.
+/// Safe to run repeatedly; a no-op on fresh databases.
+///
+/// **Sweep guard**: only drops partition tables when every distinct namespace
+/// present in the base `entities`/`notes` tables was covered by this reindex
+/// pass (i.e. the operating namespace `covered_ns` is the only namespace in the
+/// base). If uncovered namespaces exist, the sweep is skipped and a warning is
+/// emitted so operators know a manual or multi-namespace reindex is needed.
+async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    // Guard: only sweep when every distinct namespace present in base
+    // entities/notes was covered by this reindex pass. A single-namespace
+    // (post-relabel) db has exactly {covered_ns} and passes immediately. A
+    // multi-namespace db would be partially swept — rows in other namespaces
+    // were dropped from old partitions but never carried to the unified table —
+    // so we skip and warn instead.
+    let base_namespaces = distinct_base_namespaces(rt).await;
+    let uncovered: Vec<&str> = base_namespaces
+        .iter()
+        .filter(|ns| ns.as_str() != covered_ns)
+        .map(String::as_str)
+        .collect();
+    if !uncovered.is_empty() {
+        tracing::warn!(
+            covered = covered_ns,
+            uncovered = ?uncovered,
+            "skipping stale FTS partition sweep: base tables contain namespaces not \
+             covered by this reindex pass; run reindex for each namespace first, \
+             or normalize all rows to one namespace before sweeping"
+        );
+        return;
+    }
+
+    // Canonical base names that must never be dropped.
+    let canonical: &[&str] = &["fts_entities", "fts_notes", "fts_knowledge", "fts_sections"];
+
+    // FTS5 shadow table suffixes that must never be dropped (the extension drops
+    // them automatically when the virtual table itself is dropped; we only drop
+    // the virtual table, so these patterns must be excluded from discovery).
+    let shadow_suffixes: &[&str] = &["_data", "_idx", "_docsize", "_config", "_content"];
+
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return;
+    };
+
+    // Find candidate tables: type='table', name starts with `fts_entities_` or `fts_notes_`.
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name FROM sqlite_master \
+                  WHERE type IN ('table', 'shadow') \
+                    AND (name LIKE 'fts_entities_%' OR name LIKE 'fts_notes_%')"
+                .into(),
+            params: vec![],
+            label: Some("sweep_stale_fts_partitions_discover".into()),
+        })
+        .await;
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to discover stale FTS partition tables");
+            return;
+        }
+    };
+
+    let mut to_drop: Vec<String> = Vec::new();
+    for row in &rows {
+        let name = match row.get("name") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => continue,
+        };
+        // Skip canonical tables.
+        if canonical.contains(&name.as_str()) {
+            continue;
+        }
+        // Skip FTS5 shadow tables (they are dropped automatically with the virtual table).
+        if shadow_suffixes.iter().any(|suf| name.ends_with(suf)) {
+            continue;
+        }
+        to_drop.push(name);
+    }
+    drop(reader);
+
+    if to_drop.is_empty() {
+        return;
+    }
+
+    let Ok(mut writer) = sql.writer().await else {
+        return;
+    };
+    for table in &to_drop {
+        let ddl = format!("DROP TABLE IF EXISTS \"{table}\"");
+        match writer.execute_script(ddl).await {
+            Ok(_) => {
+                tracing::info!(table, "dropped stale FTS partition table");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, table, "failed to drop stale FTS partition table");
             }
         }
     }
@@ -1155,6 +1395,198 @@ mod tests {
         assert!(
             args.namespace.is_none(),
             "omitted --namespace must be None (not a String default)"
+        );
+    }
+
+    // C3 regression: drop_vectors_for_subjects must target the SAME table as the insert path.
+    //
+    // The old code hand-sanitized model_name to derive the table name, which diverged from
+    // the insert path when the model is registered under a canonical name (e.g.
+    // "all-minilm-l6-v2" → table "vec_all_minilm_l6_v2" but a different sanitization of the
+    // raw env-var alias would yield a different key). The fix routes both drop and insert
+    // through rt.vectors_for_model() — the same Arc<dyn VectorStore> — so the table is
+    // always consistent.
+    //
+    // This test inserts a vector via vectors_for_model, calls drop_vectors_for_subjects with
+    // the same model name, and asserts the row is gone.
+    #[tokio::test]
+    async fn drop_vectors_for_subjects_targets_same_table_as_insert() {
+        use async_trait::async_trait;
+        use khive_runtime::{EmbedderProvider, RuntimeConfig, RuntimeError};
+        use khive_storage::types::VectorRecord;
+        use khive_types::SubstrateKind;
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::Arc;
+
+        struct StubService;
+
+        #[async_trait]
+        impl EmbeddingService for StubService {
+            async fn embed(
+                &self,
+                _texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                panic!("StubService::embed must not be called in this test")
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "stub-c3"
+            }
+        }
+
+        struct StubProvider {
+            model_name: &'static str,
+            dims: usize,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for StubProvider {
+            fn name(&self) -> &str {
+                self.model_name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dims
+            }
+
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Ok(Arc::new(StubService))
+            }
+        }
+
+        const MODEL: &str = "stub-model-c3";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(StubProvider {
+            model_name: MODEL,
+            dims: DIMS,
+        });
+
+        let ns = khive_runtime::Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Obtain the store via the same path as the insert path uses.
+        let store = rt.vectors_for_model(&token, MODEL).expect("store");
+
+        // Insert one vector record.
+        let subject_id = Uuid::new_v4();
+        store
+            .insert_batch(vec![VectorRecord {
+                subject_id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "content".to_string(),
+                embedding_model: Some(MODEL.to_string()),
+                vectors: vec![vec![0.1_f32; DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch");
+
+        // Confirm the row exists.
+        let before = store.count().await.expect("count before");
+        assert_eq!(before, 1, "row must exist before drop");
+
+        // Drop via drop_vectors_for_subjects — uses the same vectors_for_model path.
+        drop_vectors_for_subjects(&rt, &token, MODEL, &[subject_id]).await;
+
+        // Row must be gone.
+        let after = store.count().await.expect("count after");
+        assert_eq!(after, 0, "row must be deleted by drop_vectors_for_subjects");
+    }
+
+    // C3 alias regression: drop_vectors_for_subjects via a lattice ALIAS must target
+    // the SAME canonical table as the insert path that used the full canonical name.
+    //
+    // Previously the old hand-sanitized path would diverge on aliases like "paraphrase"
+    // (→ "paraphrase-multilingual-minilm-l12-v2" canonical, table
+    // "vec_paraphrase_multilingual_minilm_l12_v2"). Both the insert path and the drop
+    // path go through rt.vectors_for_model() which resolves the alias to the same
+    // canonical VectorStore — the bug cannot happen with the current implementation.
+    //
+    // This test registers a stub under the canonical name, inserts via the canonical
+    // name, drops via the short alias "paraphrase", and asserts the row is gone.
+    // It FAILS if either path hand-derives the table name from the raw string instead
+    // of routing through vectors_for_model().
+    #[tokio::test]
+    async fn drop_vectors_for_subjects_paraphrase_alias_targets_same_table_as_insert() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::VectorRecord;
+        use khive_types::SubstrateKind;
+        use lattice_embed::EmbeddingModel;
+
+        // "paraphrase" is a short alias for the built-in lattice model.
+        // vectors_for_model resolves both the alias and the canonical name to the
+        // same physical table (key = sanitize_key(CANONICAL), dims = 384).
+        //
+        // We register the model in RuntimeConfig so vectors_for_model(CANONICAL)
+        // can resolve it without an Unknown model error.  We write raw VectorRecords
+        // directly — the embedder is never called — so DIMS must equal the lattice
+        // model's declared output dimension.
+        const CANONICAL: &str = "paraphrase-multilingual-minilm-l12-v2";
+        const ALIAS: &str = "paraphrase";
+        // Must equal EmbeddingModel::ParaphraseMultilingualMiniLmL12V2::dimensions().
+        const DIMS: usize = 384;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        // The paraphrase model is now in the registry under its canonical name.
+        // vectors_for_model("paraphrase") and vectors_for_model(CANONICAL) must
+        // both resolve to the same table — that is what this test verifies.
+
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Insert via the canonical name (same as the normal embed-and-store path).
+        let store_canonical = rt
+            .vectors_for_model(&token, CANONICAL)
+            .expect("canonical store");
+        let subject_id = Uuid::new_v4();
+        store_canonical
+            .insert_batch(vec![VectorRecord {
+                subject_id,
+                kind: SubstrateKind::Note,
+                namespace: "local".to_string(),
+                field: "content".to_string(),
+                embedding_model: Some(CANONICAL.to_string()),
+                vectors: vec![vec![0.1_f32; DIMS]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch via canonical name");
+
+        let before = store_canonical.count().await.expect("count before");
+        assert_eq!(before, 1, "row must exist before alias-drop");
+
+        // Drop via the ALIAS "paraphrase".  vectors_for_model resolves alias →
+        // EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 → same canonical table.
+        // If the implementation ever diverges (hand-sanitizes the raw alias string),
+        // the delete targets a different table and `after` stays 1 → test fails.
+        drop_vectors_for_subjects(&rt, &token, ALIAS, &[subject_id]).await;
+
+        let after = store_canonical.count().await.expect("count after");
+        assert_eq!(
+            after, 0,
+            "alias-routed drop must delete from the same canonical table as insert; \
+             after={after} (expected 0). \
+             Failure means alias 'paraphrase' resolved to a different table than CANONICAL."
         );
     }
 

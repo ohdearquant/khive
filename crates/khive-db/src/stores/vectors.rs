@@ -502,6 +502,41 @@ impl VectorStore for SqliteVecStore {
         self.info().await
     }
 
+    async fn delete_subjects(&self, ids: &[Uuid]) -> Result<u64, StorageError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let table = self.table_name.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let mut total_deleted: u64 = 0;
+
+        // Batch in ≤400 IDs per statement to stay within SQLite's variable limit.
+        for chunk in id_strings.chunks(400) {
+            let placeholders: String = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("DELETE FROM {table} WHERE subject_id IN ({placeholders})");
+            let chunk_owned = chunk.to_vec();
+            let table_cl = table.clone();
+            let deleted = self
+                .with_writer("vec_delete_subjects", move |conn| {
+                    let mut stmt = conn.prepare(&sql)?;
+                    for (i, id_str) in chunk_owned.iter().enumerate() {
+                        stmt.raw_bind_parameter(i + 1, id_str.as_str())?;
+                    }
+                    stmt.raw_execute().map(|n| n as u64)
+                })
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, table = %table_cl, "delete_subjects chunk failed");
+                    e
+                })?;
+            total_deleted += deleted;
+        }
+        Ok(total_deleted)
+    }
+
     async fn batch_exists(
         &self,
         ids: &[Uuid],

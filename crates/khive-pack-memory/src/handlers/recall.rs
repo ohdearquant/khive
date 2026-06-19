@@ -127,6 +127,12 @@ impl MemoryPack {
             .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
             .unwrap_or_else(|| cfg.fts_gather.clone());
 
+        // Prefer the per-request config param; fall back to the process-wide OnceLock
+        // env so production callers without an explicit config field get the default (3).
+        let ann_overfetch_max_rounds = cfg
+            .ann_overfetch_max_rounds
+            .unwrap_or_else(super::common::ann_overfetch_max_rounds);
+
         let candidates = self
             .collect_recall_candidates(
                 query_trimmed,
@@ -139,6 +145,7 @@ impl MemoryPack {
                     scoring_cfg: &scoring_cfg,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
+                    ann_overfetch_max_rounds,
                 },
             )
             .await?;
