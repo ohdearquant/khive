@@ -177,10 +177,12 @@ The guarantee: each pack's substrate writes are confined to its assigned
 backend file. This is enforced structurally because `build_server_multi_backend`
 constructs one `KhiveRuntime` per pack, each wrapping its own
 `Arc<StorageBackend>`. The billing pack's runtime holds only the billing
-backend; it has no handle to `agent.db`. The isolation test in the test suite
-(`multi_backend_boots_ok_with_two_memory_backends`) verifies that a pack
-assigned to a secondary backend writes to and reads from that backend, with no
-data crossing to the other backend.
+backend; it has no handle to `agent.db`. The isolation test
+(`multi_backend_isolates_pack_data_to_separate_files` in
+`crates/khive-mcp/src/serve.rs`) verifies this directly: it pins the `comm` pack
+to a second on-disk backend, writes through both packs, then opens each SQLite
+file independently and asserts that each file holds only its own pack's rows and
+none of the other's.
 
 ### Namespace is not isolation
 
