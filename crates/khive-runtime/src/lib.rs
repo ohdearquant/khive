@@ -57,9 +57,9 @@ pub use operations::{arm_fts_fail, arm_vector_fail, arm_vector_fail_after};
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,
-    PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime, PackSchemaPlan,
-    ParamDef, SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
-    Visibility,
+    PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime,
+    PackSchemaCollisionError, PackSchemaPlan, ParamDef, SchemaPlan, VerbCategory,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{micros_to_iso, present, PresentationMode};

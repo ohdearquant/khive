@@ -39,6 +39,38 @@ impl StorageBackend {
         })
     }
 
+    /// File-backed SQLite database opened read-only.
+    ///
+    /// Opens the database at `path` and sets `PRAGMA query_only = ON` on the
+    /// writer connection so that any write attempt (INSERT/UPDATE/DELETE) returns
+    /// an error. Reader connections are opened with `SQLITE_OPEN_READ_ONLY` by the
+    /// pool; this PRAGMA extends that protection to the writer slot.
+    ///
+    /// The database file must already exist — unlike `sqlite()` this constructor
+    /// does not create a new file.
+    pub fn sqlite_read_only(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
+        let config = PoolConfig {
+            path: Some(path.as_ref().to_path_buf()),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(config)?;
+        // Set PRAGMA query_only = ON on the writer connection so that any write
+        // attempt is rejected at the SQLite level regardless of which code path
+        // reaches the writer.
+        {
+            let writer = pool.try_writer()?;
+            writer
+                .conn()
+                .pragma_update(None, "query_only", "ON")
+                .map_err(SqliteError::Rusqlite)?;
+        }
+        Ok(Self {
+            pool: Arc::new(pool),
+            is_file_backed: true,
+        })
+    }
+
     /// In-memory SQLite database (for tests).
     ///
     /// All data is lost when the backend is dropped. The pool degrades to

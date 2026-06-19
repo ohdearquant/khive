@@ -54,6 +54,12 @@ pub enum ConfigError {
         backend: String,
         defined: String,
     },
+
+    #[error(
+        "[[backends]] entry {name:?}: field `{field}` is not yet supported; \
+         remove it from the config or wait for a future release that implements it"
+    )]
+    UnsupportedBackendField { name: String, field: &'static str },
 }
 
 // ---- Config structs ----
@@ -431,6 +437,22 @@ impl KhiveConfig {
                 if !seen_backends.insert(backend.name.clone()) {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
+                    });
+                }
+
+                // Reject fields that are parsed but not yet supported (ADR-028 §1).
+                // An operator setting cache_mb or journal_mode would get silently
+                // ignored — reject loudly so misconfiguration is caught at startup.
+                if backend.cache_mb.is_some() {
+                    return Err(ConfigError::UnsupportedBackendField {
+                        name: backend.name.clone(),
+                        field: "cache_mb",
+                    });
+                }
+                if backend.journal_mode.is_some() {
+                    return Err(ConfigError::UnsupportedBackendField {
+                        name: backend.name.clone(),
+                        field: "journal_mode",
                     });
                 }
             }
@@ -1285,5 +1307,45 @@ backend = "main"
             .expect("file found");
         assert_eq!(cfg.backends.len(), 0);
         assert_eq!(cfg.packs.len(), 1);
+    }
+
+    // B-SHOULD-FIX-1: cache_mb in [[backends]] must be rejected at validate() with a clear error.
+    #[test]
+    fn test_backend_cache_mb_rejected_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+cache_mb = 128
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("cache_mb must be rejected");
+        assert!(
+            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "cache_mb" } if name == "main"),
+            "expected UnsupportedBackendField {{ name: \"main\", field: \"cache_mb\" }}, got {err:?}"
+        );
+    }
+
+    // B-SHOULD-FIX-1: journal_mode in [[backends]] must be rejected at validate() with a clear error.
+    #[test]
+    fn test_backend_journal_mode_rejected_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+journal_mode = "wal"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("journal_mode must be rejected");
+        assert!(
+            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "journal_mode" } if name == "main"),
+            "expected UnsupportedBackendField {{ name: \"main\", field: \"journal_mode\" }}, got {err:?}"
+        );
     }
 }

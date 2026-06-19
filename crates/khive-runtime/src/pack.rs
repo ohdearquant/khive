@@ -698,6 +698,71 @@ pub struct VerbRegistry {
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
 }
 
+/// Error returned by [`VerbRegistry::apply_schema_plans_with_map`] when two
+/// packs on the same backend declare the same auxiliary table (ADR-028 §7).
+#[derive(Debug)]
+pub struct PackSchemaCollisionError {
+    /// First pack to declare the table.
+    pub pack_a: &'static str,
+    /// Second pack that collides with `pack_a`.
+    pub pack_b: &'static str,
+    /// Table name or DDL error description.
+    pub table: String,
+}
+
+impl std::fmt::Display for PackSchemaCollisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.pack_a == self.pack_b {
+            write!(
+                f,
+                "pack schema boot failure for pack {:?}: {}",
+                self.pack_a, self.table
+            )
+        } else {
+            write!(
+                f,
+                "pack schema collision: packs {:?} and {:?} both declare table {:?} \
+                 on the same backend — move one pack to a separate backend or rename the table",
+                self.pack_a, self.pack_b, self.table
+            )
+        }
+    }
+}
+
+impl std::error::Error for PackSchemaCollisionError {}
+
+/// Extract table names from a single DDL statement.
+///
+/// Handles `CREATE TABLE IF NOT EXISTS`, `CREATE TABLE`, and
+/// `CREATE VIRTUAL TABLE IF NOT EXISTS`, `CREATE VIRTUAL TABLE`.
+/// Returns an empty Vec when no table name is found (e.g. index DDL).
+fn extract_table_names(stmt: &str) -> Vec<String> {
+    let normalized = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let upper = normalized.to_ascii_uppercase();
+    let table_name = if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE IF NOT EXISTS ") {
+        rest.split_whitespace().next()
+    } else if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE ") {
+        rest.split_whitespace().next()
+    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+        rest.split_whitespace().next()
+    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE ") {
+        rest.split_whitespace().next()
+    } else {
+        None
+    };
+    match table_name {
+        Some(name) => {
+            let clean = name.trim_matches(|c: char| c == '(' || c == ';');
+            if clean.is_empty() {
+                vec![]
+            } else {
+                vec![clean.to_ascii_lowercase()]
+            }
+        }
+        None => vec![],
+    }
+}
+
 impl VerbRegistry {
     /// Return the help schema envelope for a verb (issue #287).
     ///
@@ -1260,13 +1325,21 @@ impl VerbRegistry {
     /// applies the plan to `backend_for_pack[pack_name]` when present,
     /// falling back to `default_backend` for any pack not in the map.
     ///
+    /// Returns an error when two packs on the same backend declare the same
+    /// auxiliary table (ADR-028 §7 collision policy: boot failure naming both
+    /// packs and the conflicting table).
+    ///
     /// This is the multi-backend boot path (ADR-028). Single-backend callers
     /// should continue using [`apply_schema_plans`].
     pub fn apply_schema_plans_with_map(
         &self,
         backend_for_pack: &HashMap<&str, &khive_db::StorageBackend>,
         default_backend: &khive_db::StorageBackend,
-    ) {
+    ) -> Result<(), crate::PackSchemaCollisionError> {
+        // Track which pack first claimed each table on each backend.
+        // Backend identity is the raw pointer of the underlying connection pool Arc.
+        let mut claimed: HashMap<(*const (), String), &'static str> = HashMap::new();
+
         for (pack_name, plan) in self.all_schema_plans_named() {
             if plan.is_empty() {
                 continue;
@@ -1275,14 +1348,37 @@ impl VerbRegistry {
                 .get(pack_name)
                 .copied()
                 .unwrap_or(default_backend);
-            if let Err(e) = backend.apply_pack_ddl_statements(plan.statements) {
-                tracing::warn!(
-                    pack = pack_name,
-                    error = %e,
-                    "failed to apply pack schema plan at startup (non-fatal)"
-                );
+            let backend_ptr = std::sync::Arc::as_ptr(&backend.pool_arc()) as *const ();
+
+            // Pre-scan DDL for table names and detect collisions before applying.
+            for stmt in plan.statements {
+                for table_name in extract_table_names(stmt) {
+                    let key = (backend_ptr, table_name.clone());
+                    match claimed.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(pack_name);
+                        }
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            let prior_pack = *e.get();
+                            return Err(crate::PackSchemaCollisionError {
+                                pack_a: prior_pack,
+                                pack_b: pack_name,
+                                table: table_name,
+                            });
+                        }
+                    }
+                }
             }
+
+            backend
+                .apply_pack_ddl_statements(plan.statements)
+                .map_err(|e| crate::PackSchemaCollisionError {
+                    pack_a: pack_name,
+                    pack_b: pack_name,
+                    table: format!("DDL error: {e}"),
+                })?;
         }
+        Ok(())
     }
 }
 
@@ -4175,7 +4271,8 @@ mod help_tests {
         let mut backend_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
         backend_map.insert("routed", &pack_backend);
 
-        reg.apply_schema_plans_with_map(&backend_map, &default_backend);
+        reg.apply_schema_plans_with_map(&backend_map, &default_backend)
+            .expect("schema application must not collide");
 
         // On pack_backend: INSERT must succeed (table exists).
         let mut writer = pack_backend.sql().writer().await.expect("writer");
@@ -4222,7 +4319,8 @@ mod help_tests {
         let reg = builder.build().expect("registry builds");
 
         let backend_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
-        reg.apply_schema_plans_with_map(&backend_map, &default_backend);
+        reg.apply_schema_plans_with_map(&backend_map, &default_backend)
+            .expect("schema application must not collide");
 
         // On default_backend: INSERT must succeed (table fell back here).
         let mut writer = default_backend.sql().writer().await.expect("writer");
@@ -4236,6 +4334,47 @@ mod help_tests {
         assert!(
             result.is_ok(),
             "t_unmapped must exist on default_backend for unmapped pack: {result:?}"
+        );
+    }
+
+    // ADR-028 B-SHOULD-FIX-3: two packs declaring the same auxiliary table on
+    // the same backend must cause apply_schema_plans_with_map to return an
+    // error that names both packs and the table — it is a boot-time failure,
+    // not a silent DDL race.
+    #[test]
+    fn apply_schema_plans_with_map_collision_is_an_error() {
+        let backend = khive_db::StorageBackend::memory().expect("memory backend");
+        let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        let registry = builder.build().expect("registry builds");
+
+        let result = registry.apply_schema_plans_with_map(&empty_map, &backend);
+        assert!(
+            result.is_err(),
+            "two packs declaring the same table on the same backend must produce a collision error"
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack_alpha"),
+            "collision error must name first pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("pack_beta"),
+            "collision error must name second pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("collision_table"),
+            "collision error must name the table; got: {msg}"
         );
     }
 }

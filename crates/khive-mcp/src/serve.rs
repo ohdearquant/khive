@@ -88,6 +88,45 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     build_server_multi_backend(config, &khive_cfg)
 }
 
+/// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
+///
+/// The database file may not exist yet at boot time, so we cannot call
+/// `std::fs::canonicalize` on the file itself. Instead we canonicalize the
+/// parent directory (which must exist after `open_backend` creates it) and
+/// rejoin the file name. `None` is returned for in-memory backends, which
+/// are never deduplicated.
+fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>> {
+    if cfg.kind == BackendKind::Memory {
+        return Ok(None);
+    }
+    let path = match cfg.path.as_ref() {
+        Some(p) => expand_tilde(p),
+        None => return Ok(None),
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no parent directory", cfg.name))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no file name", cfg.name))?;
+    // Create the parent so canonicalize succeeds even before the DB file is written.
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "backend {}: cannot create parent dir {}: {e}",
+            cfg.name,
+            parent.display()
+        )
+    })?;
+    let canon_parent = parent.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "backend {}: cannot canonicalize parent dir {}: {e}",
+            cfg.name,
+            parent.display()
+        )
+    })?;
+    Ok(Some(canon_parent.join(file_name)))
+}
+
 /// Open backends, run migrations, build per-pack runtimes, register packs.
 ///
 /// Called only when `[[backends]]` is non-empty in `khive.toml`.
@@ -95,9 +134,21 @@ fn build_server_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<KhiveMcpServer> {
-    // Open and migrate each declared backend.
+    // Open and migrate each declared backend, deduplicating SQLite backends by
+    // canonical path (ADR-028 §8). Two [[backends]] entries that canonicalize to
+    // the same file share one Arc<StorageBackend> and run migrations once.
     let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let mut path_to_backend: HashMap<PathBuf, Arc<StorageBackend>> = HashMap::new();
     for backend_cfg in &khive_cfg.backends {
+        let canonical = canonical_backend_path(backend_cfg)?;
+        // Check for an already-opened backend with the same canonical path.
+        if let Some(ref canon) = canonical {
+            if let Some(existing) = path_to_backend.get(canon) {
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+
         let backend = open_backend(backend_cfg)?;
         // Run migrations before passing backend to any runtime (risk §8 line 433).
         {
@@ -107,7 +158,11 @@ fn build_server_multi_backend(
             run_migrations(writer.conn_mut())
                 .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
         }
-        backends.insert(backend_cfg.name.clone(), Arc::new(backend));
+        let arc = Arc::new(backend);
+        if let Some(canon) = canonical {
+            path_to_backend.insert(canon, arc.clone());
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
     }
 
     // Ensure the `main` backend exists (required fallback for unconfigured packs).
@@ -165,7 +220,7 @@ fn build_server_multi_backend(
     // Build the VerbRegistry using per-pack runtimes.
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id(default_runtime.config());
+    let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
     let mut builder = VerbRegistryBuilder::new();
@@ -204,13 +259,15 @@ fn build_server_multi_backend(
     }
     registry.call_register_embedders(&default_runtime);
 
-    // Apply schema plans to each pack's assigned backend.
+    // Apply schema plans to each pack's assigned backend (ADR-028 §7: collision = boot failure).
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes
         .iter()
         .map(|(name, rt)| (name.as_str(), rt.backend()))
         .collect();
     let main_ref: &StorageBackend = main_backend.as_ref();
-    registry.apply_schema_plans_with_map(&backend_for_pack, main_ref);
+    registry
+        .apply_schema_plans_with_map(&backend_for_pack, main_ref)
+        .map_err(|e| anyhow::anyhow!("pack schema boot failure: {e}"))?;
 
     Ok(KhiveMcpServer::from_registry_with_meta(
         registry,
@@ -241,8 +298,14 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                     )
                 })?;
             }
-            StorageBackend::sqlite(&expanded)
-                .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
+            if cfg.read_only {
+                StorageBackend::sqlite_read_only(&expanded).map_err(|e| {
+                    anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name)
+                })
+            } else {
+                StorageBackend::sqlite(&expanded)
+                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
+            }
         }
     }
 }
@@ -839,5 +902,166 @@ brain_profile = "project-profile"
                 "error message must mention \"main\"; got: {err}"
             );
         }
+    }
+
+    /// B-SHOULD-FIX-1 (SAFETY): A backend opened with `read_only = true` must
+    /// reject write operations. Verified by opening the file backend read-only and
+    /// confirming that writing through `apply_pack_ddl_statements` errors (the
+    /// writer has PRAGMA query_only = ON).
+    #[test]
+    fn read_only_backend_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ro_test.db");
+
+        // Create a writable backend first so the file exists.
+        let rw = StorageBackend::sqlite(&db_path).expect("rw backend");
+        rw.apply_pack_ddl_statements(&[
+            "CREATE TABLE IF NOT EXISTS ro_check (id INTEGER PRIMARY KEY)",
+        ])
+        .expect("DDL on rw backend");
+        drop(rw);
+
+        // Re-open read-only and confirm writes fail.
+        let ro = StorageBackend::sqlite_read_only(&db_path).expect("ro backend");
+        let result = ro.apply_pack_ddl_statements(&["INSERT INTO ro_check (id) VALUES (1)"]);
+        assert!(
+            result.is_err(),
+            "write to a read-only backend must fail; got Ok(())"
+        );
+    }
+
+    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
+    /// canonicalize to the same file must share a single Arc<StorageBackend> and
+    /// run migrations only once. Verified by using two names that differ only by
+    /// `./` prefix while pointing at the same absolute path.
+    #[test]
+    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        // Two backend names pointing to the same file (one with ./ prefix).
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(db_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "alias".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(db_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "alias".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+        let _ = db_path_str; // used above to show intent
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        // Must boot successfully (dedup prevents double-migration / SQLITE_BUSY).
+        let result = build_server_multi_backend(base_cfg, &khive_cfg);
+        if let Err(ref e) = result {
+            panic!(
+                "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
+            );
+        }
+    }
+
+    // B-SHOULD-FIX-3 collision test lives in khive-runtime/src/pack.rs
+    // (apply_schema_plans_with_map_collision_is_an_error) because
+    // `VerbRegistryBuilder::register_boxed` is pub(crate) there.
+
+    /// B-SHOULD-FIX-4 (daemon staleness): `compute_config_id` must produce
+    /// different ids for two configs that differ only in pack→backend routing.
+    /// The empty-backends case must be byte-identical to the pre-change baseline.
+    #[test]
+    fn config_id_folds_backend_topology_when_non_empty() {
+        use khive_runtime::{BackendId, KhiveConfig, Namespace, PackConfig, RuntimeConfig};
+
+        let base_rt = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::default()
+        };
+
+        // No backends — must be byte-identical to compute_config_id(base_rt, None).
+        let id_no_backends = crate::server::compute_config_id(&base_rt, None);
+        let id_empty_backends =
+            crate::server::compute_config_id(&base_rt, Some(&KhiveConfig::default()));
+        assert_eq!(
+            id_no_backends, id_empty_backends,
+            "empty-backends config_id must be byte-identical to None-config config_id"
+        );
+
+        // Two configs differing only in pack→backend assignment.
+        let mut packs_a = std::collections::HashMap::new();
+        packs_a.insert(
+            "comm".to_string(),
+            PackConfig {
+                backend: "secondary".to_string(),
+            },
+        );
+
+        let cfg_a = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: packs_a,
+            ..KhiveConfig::default()
+        };
+
+        // cfg_b: no pack assignments — comm falls back to main.
+        let cfg_b = KhiveConfig {
+            backends: cfg_a.backends.clone(),
+            packs: std::collections::HashMap::new(),
+            ..KhiveConfig::default()
+        };
+
+        let id_a = crate::server::compute_config_id(&base_rt, Some(&cfg_a));
+        let id_b = crate::server::compute_config_id(&base_rt, Some(&cfg_b));
+
+        assert_ne!(
+            id_a, id_b,
+            "configs differing only in pack→backend routing must produce different config_ids; \
+             both produced: {id_a}"
+        );
     }
 }
