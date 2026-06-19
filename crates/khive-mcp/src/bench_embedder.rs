@@ -72,12 +72,28 @@ impl EmbeddingService for FeatureHashService {
     }
 }
 
-pub(crate) struct FeatureHashProvider;
+pub(crate) struct FeatureHashProvider {
+    model_name: String,
+}
+
+impl FeatureHashProvider {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            model_name: name.into(),
+        }
+    }
+}
+
+impl Default for FeatureHashProvider {
+    fn default() -> Self {
+        Self::new(MODEL_NAME)
+    }
+}
 
 #[async_trait]
 impl EmbedderProvider for FeatureHashProvider {
     fn name(&self) -> &str {
-        MODEL_NAME
+        &self.model_name
     }
 
     fn dimensions(&self) -> usize {

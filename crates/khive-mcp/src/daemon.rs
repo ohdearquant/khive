@@ -258,7 +258,7 @@ fn argv_is_khive_daemon(args: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if basename != "kkernel" {
+    if basename != "kkernel" && basename != "kkernel-bench" {
         return false;
     }
     let rest: Vec<&str> = tokens.collect();
@@ -1324,6 +1324,16 @@ mod tests {
     fn argv_daemon_true_with_surrounding_and_inner_whitespace() {
         assert!(argv_is_khive_daemon(
             "  /Users/x/.cargo/bin/kkernel   mcp    --daemon  "
+        ));
+    }
+
+    #[test]
+    fn argv_daemon_true_kkernel_bench_basename() {
+        // bench binary copy is named "kkernel-bench"; pid management must treat it
+        // as a valid daemon so stale bench daemons are SIGTERM'd on respawn.
+        assert!(argv_is_khive_daemon("kkernel-bench mcp --daemon"));
+        assert!(argv_is_khive_daemon(
+            "/Users/x/.cargo/bin/kkernel-bench mcp --daemon"
         ));
     }
 
