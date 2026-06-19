@@ -22,9 +22,11 @@ use serde_json::{json, Value};
 
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, KhiveRuntime, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
+    present, KhiveRuntime, Namespace, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
     RuntimeError, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
+
+use khive_storage::EdgeRelation;
 
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
@@ -362,6 +364,31 @@ impl KhiveMcpServer {
         self
     }
 
+    /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
+    ///
+    /// Returns `Some(result)` when the coordinator handled the op (caller should skip
+    /// `registry.dispatch`). Returns `None` (fall-through) when:
+    /// - no coordinator is attached (`coordinator == None`)
+    /// - the coordinator reports a single backend (`is_single_backend()`)
+    /// - the verb is not `link` or `search`
+    /// - args cannot be extracted for coordinator dispatch (e.g. non-UUID source/target)
+    ///
+    /// Result semantics mirror the per-op envelope from the registry:
+    /// `Ok(Value)` → success payload (caller wraps in `{ok:true, tool, result}`).
+    /// `Err((tool, error_value))` → error payload (caller wraps in `{ok:false, tool, error}`).
+    async fn dispatch_via_coordinator(
+        &self,
+        tool: &str,
+        args_value: &Value,
+    ) -> Option<Result<Value, (String, Value)>> {
+        let coord = self.coordinator.as_ref()?;
+        if coord.is_single_backend() {
+            return None;
+        }
+        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, &self.default_namespace)
+            .await
+    }
+
     /// Namespace this server's registry was built for.
     pub fn default_namespace(&self) -> &str {
         &self.default_namespace
@@ -518,6 +545,13 @@ impl KhiveMcpServer {
             ));
         }
 
+        // Multi-backend interception: route link/search through the coordinator (ADR-029 D3/D4).
+        // Single-backend and non-link/search verbs fall through to the registry unchanged.
+        if let Some(coord_result) = self.dispatch_via_coordinator(&tool, &args_value).await {
+            return coord_result
+                .map(|result| json!({ "ok": true, "tool": tool, "result": result }));
+        }
+
         match self.registry.dispatch(&tool, args_value).await {
             Ok(result) => Ok(json!({ "ok": true, "tool": tool, "result": result })),
             Err(RuntimeError::Khive(k)) => {
@@ -596,6 +630,10 @@ impl KhiveMcpServer {
                     bad
                 };
 
+                // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
+                let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
+                let default_namespace = self.default_namespace.clone();
+
                 // Independent dispatch — run all concurrently, results in input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
                     let conflict_with: Option<String> = if conflict_indices.contains(&i) {
@@ -608,6 +646,8 @@ impl KhiveMcpServer {
                     };
 
                     let registry = self.registry.clone();
+                    let coord = coordinator.clone();
+                    let ns_str = default_namespace.clone();
                     let op_mode = mode_for_op(i);
                     async move {
                         let tool = op.tool.clone();
@@ -668,6 +708,33 @@ impl KhiveMcpServer {
                                      request surface"
                                 )
                             });
+                        }
+
+                        // Multi-backend interception: route link/search through the coordinator
+                        // (ADR-029 D3/D4). Falls through to registry for single-backend and
+                        // non-link/search verbs.
+                        if let Some(active_coord) = coord.as_ref() {
+                            if !active_coord.is_single_backend() {
+                                if let Some(coord_result) = dispatch_via_coordinator_inner(
+                                    active_coord.as_ref(),
+                                    &tool,
+                                    &args_value,
+                                    &ns_str,
+                                )
+                                .await
+                                {
+                                    return match coord_result {
+                                        Ok(result) => {
+                                            let presented =
+                                                present(result, effective_mode, now_unix);
+                                            json!({ "ok": true, "tool": tool, "result": presented })
+                                        }
+                                        Err((_, error_payload)) => {
+                                            json!({ "ok": false, "tool": tool, "error": error_payload })
+                                        }
+                                    };
+                                }
+                            }
                         }
 
                         match registry.dispatch(&tool, args_value).await {
@@ -755,6 +822,140 @@ impl KhiveMcpServer {
                 })
             }
         }
+    }
+}
+
+/// Route a `link` or `search` verb through `coord` when in multi-backend mode.
+///
+/// This is the shared logic behind both dispatch sites (`dispatch_op` chain mode
+/// and the parallel/single closure in `run_parsed`). Extracted as a free async
+/// function so closures that don't have access to `&self` can call it.
+///
+/// Returns `Some(Ok(Value))` when the coordinator handled the op successfully.
+/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error.
+/// Returns `None` to indicate fall-through (caller should dispatch through the registry).
+async fn dispatch_via_coordinator_inner(
+    coord: &dyn CoordinatorService,
+    tool: &str,
+    args_value: &Value,
+    namespace_str: &str,
+) -> Option<Result<Value, (String, Value)>> {
+    let namespace = Namespace::parse(namespace_str).unwrap_or_else(|_| Namespace::local());
+
+    match tool {
+        "link" => {
+            // Only intercept single-link form (not bulk `links` array).
+            // Bulk link falls through to the registry for now.
+            if args_value.get("links").is_some() {
+                return None;
+            }
+            let source_str = args_value.get("source_id")?.as_str()?;
+            let target_str = args_value.get("target_id")?.as_str()?;
+            let relation_str = args_value.get("relation")?.as_str()?;
+
+            // Only intercept when both endpoints are parseable UUIDs.
+            // Name/prefix resolution requires single-backend context — fall through.
+            let source_id: uuid::Uuid = source_str.parse().ok()?;
+            let target_id: uuid::Uuid = target_str.parse().ok()?;
+            let relation: EdgeRelation = relation_str.parse().ok()?;
+
+            let weight = args_value
+                .get("weight")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            let metadata = args_value.get("metadata").cloned();
+
+            let result = coord
+                .link(&namespace, source_id, target_id, relation, weight, metadata)
+                .await;
+
+            let tool_name = tool.to_string();
+            Some(match result {
+                Ok(coord_result) => {
+                    // Serialize the edge using serde_json — matches `to_json(&edge)` in the kg
+                    // handler, which is what `format_edge_output` receives (identity fn).
+                    let edge_val = serde_json::to_value(&coord_result.edge)
+                        .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
+                    // Preserve symmetric-relation source/target override that the kg handler
+                    // applies: if the edge was written with swapped endpoints, inject the
+                    // canonical source/target so callers get what they requested.
+                    let mut raw = edge_val;
+                    if relation.is_symmetric() {
+                        if let Some(obj) = raw.as_object_mut() {
+                            obj.insert("source_id".to_string(), json!(source_id.to_string()));
+                            obj.insert("target_id".to_string(), json!(target_id.to_string()));
+                        }
+                    }
+                    Ok(raw)
+                }
+                Err(e) => {
+                    let re: RuntimeError = e.into();
+                    match re {
+                        RuntimeError::Khive(k) => {
+                            let error_payload = serde_json::to_value(&k).unwrap_or_else(
+                                |_| json!({"kind": "internal", "message": k.to_string()}),
+                            );
+                            Err((tool_name, error_payload))
+                        }
+                        other => Err((tool_name, json!(other.to_string()))),
+                    }
+                }
+            })
+        }
+        "search" => {
+            let kind = args_value.get("kind")?.as_str()?;
+            let query = args_value.get("query")?.as_str()?;
+            let limit = args_value
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(10)
+                .min(100);
+
+            let coord_result = coord.fan_out_search(kind, query, &namespace, limit).await;
+
+            // Shape result to match kg search handler's output field-for-field.
+            // Entity hits: [{id, entity_kind, score, title, snippet}]
+            // Note hits:   [{id, note_kind, score, title, snippet}]
+            let result_val = if !coord_result.note_hits.is_empty()
+                || (coord_result.entity_hits.is_empty() && coord_result.note_hits.is_empty())
+            {
+                // Note substrate or empty — return note-shaped result.
+                let items: Vec<Value> = coord_result
+                    .note_hits
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "id": h.note_id.to_string(),
+                            "note_kind": null,
+                            "score": h.score.to_f64(),
+                            "title": h.title,
+                            "snippet": h.snippet,
+                        })
+                    })
+                    .collect();
+                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+            } else {
+                // Entity substrate — return entity-shaped result.
+                let items: Vec<Value> = coord_result
+                    .entity_hits
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "id": h.entity_id.to_string(),
+                            "entity_kind": null,
+                            "score": h.score.to_f64(),
+                            "title": h.title,
+                            "snippet": h.snippet,
+                        })
+                    })
+                    .collect();
+                serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+            };
+
+            Some(Ok(result_val))
+        }
+        _ => None,
     }
 }
 

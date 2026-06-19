@@ -142,14 +142,12 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     /// Minimal mock for server-routing tests (T6 in the test plan).
-    #[allow(dead_code)]
     pub struct MockCoordinator {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
     }
 
-    #[allow(dead_code)]
     impl MockCoordinator {
         pub fn multi_backend() -> Arc<Self> {
             Arc::new(Self {
@@ -214,5 +212,138 @@ pub(crate) mod tests {
         fn is_single_backend(&self) -> bool {
             self.single_backend
         }
+    }
+
+    // ── T6: server-level coordinator routing ─────────────────────────────────
+
+    use crate::server::KhiveMcpServer;
+    use crate::tools::request::RequestParams;
+    use khive_runtime::{KhiveRuntime, Namespace as RuntimeNamespace, RuntimeConfig};
+
+    fn make_registry() -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: RuntimeNamespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let gate = runtime.config().gate.clone();
+        let default_ns = runtime.config().default_namespace.clone();
+        let actor_id = runtime.config().actor_id.clone();
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_gate(gate);
+        builder.with_default_namespace(default_ns.as_str());
+        builder.with_actor_id(actor_id);
+        khive_runtime::PackRegistry::register_packs(
+            &["kg".to_string()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .expect("register kg");
+        let registry = builder.build().expect("build registry");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        (registry, runtime)
+    }
+
+    /// T6a: A multi-backend server MUST route `link` through the coordinator.
+    ///
+    /// This test must FAIL before BLOCKER-1 is wired (coordinator never called)
+    /// and PASS after wiring.
+    #[tokio::test]
+    async fn t6a_multi_backend_server_routes_link_through_coordinator() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let ops = format!(
+            r#"link(source_id="{}", target_id="{}", relation="implements")"#,
+            src_id, tgt_id
+        );
+        let _result = server
+            .dispatch_request_local(RequestParams {
+                ops,
+                presentation: None,
+                presentation_per_op: None,
+            })
+            .await;
+
+        assert!(
+            coord
+                .link_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6a: coordinator.link must be called when a link op is dispatched through a multi-backend server"
+        );
+    }
+
+    /// T6b: A multi-backend server MUST route `search` through the coordinator.
+    ///
+    /// This test must FAIL before BLOCKER-1 is wired and PASS after wiring.
+    #[tokio::test]
+    async fn t6b_multi_backend_server_routes_search_through_coordinator() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let _result = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="anything")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+            })
+            .await;
+
+        assert!(
+            coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6b: coordinator.fan_out_search must be called when a search op is dispatched through a multi-backend server"
+        );
+    }
+
+    /// T6c: A single-backend server must NOT route through the coordinator.
+    ///
+    /// When the coordinator reports `is_single_backend() == true`, the zero-change
+    /// invariant requires the registry path (unchanged from pre-coordinator code).
+    #[tokio::test]
+    async fn t6c_single_backend_server_bypasses_coordinator() {
+        let (registry, runtime) = make_registry();
+        let coord = MockCoordinator::single_backend_instance();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        // Create a real entity so the search op succeeds via registry.
+        let ns = RuntimeNamespace::local();
+        let token = runtime.authorize(ns).expect("authorize");
+        let entity = runtime
+            .create_entity(&token, "concept", None, "T6cEntity", None, None, vec![])
+            .await
+            .expect("create entity");
+        let _ = entity;
+
+        let _result = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="T6cEntity")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+            })
+            .await;
+
+        assert!(
+            !coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6c: coordinator.fan_out_search must NOT be called for a single-backend server"
+        );
+        assert!(
+            !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+            "T6c: coordinator.link must NOT be called for a single-backend server"
+        );
     }
 }

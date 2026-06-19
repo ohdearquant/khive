@@ -269,16 +269,35 @@ impl SubstrateCoordinator {
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
-            // Cross-backend: the target entity lives on a different backend so the
-            // source runtime cannot resolve it. Existence was already confirmed by the
-            // two `locate()` calls above. Only enforce the self-loop invariant here;
-            // kind-level ADR-002 rules are best-effort (the Gate is the trust boundary).
-            if source_id == target_id {
-                return Err(
-                    "self-loop edges are not allowed: source_id and target_id must be different"
-                        .to_string(),
-                );
-            }
+            // Cross-backend: the target entity lives on a different backend so the source
+            // runtime cannot resolve it via its own DB. Fetch each endpoint from its
+            // respective backend and validate the ADR-002 kind-pairing rules using the
+            // pre-fetched records (no cross-backend DB lookup required).
+            let tgt_runtime = self
+                .registry
+                .get(&tgt_backend)
+                .map(|e| Arc::clone(&e.runtime))
+                .ok_or_else(|| format!("backend {tgt_backend} not registered"))?;
+            let tgt_token = tgt_runtime
+                .authorize(namespace.clone())
+                .map_err(|e: khive_runtime::RuntimeError| e.to_string())?;
+            let src_resolved = src_runtime
+                .resolve_primary(&token, source_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let tgt_resolved = tgt_runtime
+                .resolve_primary(&tgt_token, target_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            src_runtime
+                .validate_link_endpoints_by_resolved(
+                    source_id,
+                    target_id,
+                    relation,
+                    src_resolved.as_ref(),
+                    tgt_resolved.as_ref(),
+                )
+                .map_err(|e| e.to_string())?;
         }
         let target_backend_stamp = if cross_backend {
             Some(tgt_backend.as_str().to_string())

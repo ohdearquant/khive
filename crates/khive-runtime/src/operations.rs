@@ -1144,6 +1144,155 @@ impl KhiveRuntime {
             .await
     }
 
+    /// Validate an edge relation using pre-fetched endpoint records (ADR-029 D3).
+    ///
+    /// For cross-backend links the source and target live on different backends —
+    /// the source runtime cannot resolve the target. The coordinator fetches each
+    /// endpoint from its own backend, then calls this method to enforce ADR-002
+    /// kind-pairing rules without a second DB round-trip.
+    ///
+    /// `src` and `tgt` are the `resolve_primary` results from each backend. The
+    /// `token` supplies the pack edge rules installed on this (source) runtime;
+    /// no DB access is performed.
+    pub fn validate_link_endpoints_by_resolved(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        src: Option<&Resolved>,
+        tgt: Option<&Resolved>,
+    ) -> RuntimeResult<()> {
+        if source_id == target_id {
+            return Err(RuntimeError::InvalidInput(
+                "self-loop edges are not allowed: source_id and target_id must be different".into(),
+            ));
+        }
+
+        if relation == EdgeRelation::Annotates {
+            match src {
+                Some(Resolved::Note(_)) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "annotates source {source_id} must be a note"
+                    )));
+                }
+                None => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "link source {source_id} not found"
+                    )));
+                }
+            }
+            if tgt.is_none() {
+                return Err(RuntimeError::NotFound(format!(
+                    "link target {target_id} not found"
+                )));
+            }
+            return Ok(());
+        }
+
+        if matches!(
+            relation,
+            EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
+        ) {
+            let rel_name = relation.as_str();
+            let src = src.ok_or_else(|| {
+                RuntimeError::NotFound(format!("link source {source_id} not found"))
+            })?;
+            let tgt = tgt.ok_or_else(|| {
+                RuntimeError::NotFound(format!("link target {target_id} not found"))
+            })?;
+            match (src, tgt) {
+                (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
+                    if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
+                        let rule_hint = match relation {
+                            EdgeRelation::Supports | EdgeRelation::Refutes => {
+                                "requires concept|document|dataset|artifact -> concept \
+                                 (or same-substrate note -> note)"
+                            }
+                            _ => "requires same-kind entity endpoints",
+                        };
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
+                             allowlist; {rel_name} {rule_hint}",
+                            src_e.kind, tgt_e.kind
+                        )));
+                    }
+                }
+                (Resolved::Note(_), Resolved::Note(_)) => {}
+                (Resolved::Entity(_), Resolved::Note(_)) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be the same substrate \
+                         (note→note or entity→entity); got source={source_id} (entity) \
+                         target={target_id} (note)"
+                    )));
+                }
+                (Resolved::Note(_), Resolved::Entity(_)) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be the same substrate \
+                         (note→note or entity→entity); got source={source_id} (note) \
+                         target={target_id} (entity)"
+                    )));
+                }
+                (Resolved::PackRecord { .. }, _) | (_, Resolved::PackRecord { .. }) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "pack-private record is not a valid edge endpoint for {rel_name}"
+                    )));
+                }
+                _ => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "{rel_name} endpoints must be notes or entities (not events)"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        // All remaining base relations: entity→entity with kind-level restrictions.
+        // Consult pack rules installed on this (source) runtime first.
+        if pack_rule_allows(&self.pack_edge_rules(), relation, src, tgt) {
+            return Ok(());
+        }
+
+        let src_kind = match src {
+            Some(Resolved::Entity(e)) => &e.kind,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "link source {source_id} must be an entity for relation {relation:?} \
+                     (only `annotates` crosses substrates)"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "link source {source_id} not found"
+                )));
+            }
+        };
+        let tgt_kind = match tgt {
+            Some(Resolved::Entity(e)) => &e.kind,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "link target {target_id} must be an entity for relation {relation:?} \
+                     (only `annotates` crosses substrates)"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "link target {target_id} not found"
+                )));
+            }
+        };
+
+        if !base_entity_rule_allows(src_kind, relation, tgt_kind) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
+                 allowlist; use pack EDGE_RULES to extend the allowlist",
+                relation.as_str()
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Create a directed edge between two substrates.
     ///
     /// Enforces the three-case relation contract via
