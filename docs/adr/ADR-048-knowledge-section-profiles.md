@@ -338,7 +338,9 @@ The full feedback context captured by hooks:
    PostToolUse hook observing subsequent tool calls)
 4. **Outcome signal**: did the task succeed? (from task completion / session summary)
 5. **Section attribution**: which section types were in the returned content? (from the
-   compose response's section manifest)
+   compose response's section manifest — as of ADR-051 / #183 the manifest is **opt-in**: the
+   hook must call `knowledge.compose` with `explain=true` to receive `sections[]` / `breakdown`;
+   the default response omits them)
 
 This gives a complete `(task, query, sections, outcome)` tuple for each compose call.
 The brain feedback reduces this to per-section-type Beta updates scoped to the serving
