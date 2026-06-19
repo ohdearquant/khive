@@ -62,6 +62,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     })?;
 
     let runtime = KhiveRuntime::new(config)?;
+    #[cfg(feature = "bench-embedder")]
+    {
+        // Replace ALL configured embedding models with the deterministic FNV-1a
+        // bench embedder so that CI never attempts to load a lattice model file.
+        // The registry's last-wins semantics ensure every LatticeEmbedderProvider
+        // (primary + additional) is replaced before any embed() call can fire.
+        for name in runtime.registered_embedding_model_names() {
+            runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+        }
+    }
     KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
 }
 

@@ -94,3 +94,9 @@ uv.lock
 pyproject.toml
 
 *results.json
+
+# Pipeline ledger — written locally and uploaded as CI artifact; not committed.
+perf/pipeline-ledger.csv
+
+# Synthetic ANN regression gate ledger — written by --ci-synthetic, uploaded as CI artifact; not committed.
+perf/ci-synthetic-ledger.csv

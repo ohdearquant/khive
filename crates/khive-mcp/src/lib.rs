@@ -11,3 +11,6 @@ pub mod serve;
 pub mod server;
 pub mod tools;
 pub mod transport;
+
+#[cfg(feature = "bench-embedder")]
+pub(crate) mod bench_embedder;

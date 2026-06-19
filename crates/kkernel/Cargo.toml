@@ -42,6 +42,10 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 
+[features]
+# Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
+bench-embedder = ["khive-mcp/bench-embedder"]
+
 [[bin]]
 name = "kkernel"
 path = "src/main.rs"
