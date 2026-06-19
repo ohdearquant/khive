@@ -3262,3 +3262,300 @@ mod edit_inline_reembed {
         );
     }
 }
+
+// ── ANN type-filter regression (kind= and suggest domain crowding) ────────────
+//
+// Bug: the type_filter (kind=) was applied only to FTS/SQL candidates, not to
+// ANN-fused hits. After fusion + hydration the kind gate was never applied, so
+// search(kind="domain") returned atom hits sourced from ANN, and suggest returned
+// empty results when atoms were the nearest ANN neighbors to the query.
+//
+// Fix: filter_hits_by_type is called after hydrate_empty_hits +
+// filter_by_excluded_statuses in both handle_search and suggest.
+// suggest also increases ann_k from (limit*3).max(20) to (limit*50).max(200)
+// so domains are not crowded out of the over-fetch before the type gate fires.
+
+mod ann_type_filter_regression {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+    // Must match AllMiniLmL6V2.native_dimensions() so vector inserts succeed.
+    const DIM: usize = 384;
+
+    /// Returns one unit vector per text so every atom/domain gets indexed.
+    /// Slightly varied by position so ANN results are non-trivial.
+    struct CorrectDimService;
+
+    #[async_trait]
+    impl EmbeddingService for CorrectDimService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let v = (i + 1) as f32;
+                    let norm = (DIM as f32 * v * v).sqrt();
+                    vec![v / norm; DIM]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "correct-dim"
+        }
+    }
+
+    struct CorrectDimProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for CorrectDimProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(CorrectDimService))
+        }
+    }
+
+    fn rt_with_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+        })
+        .expect("runtime");
+        rt.register_embedder(CorrectDimProvider);
+        rt
+    }
+
+    /// search(kind="domain") must return ONLY domain hits even when the warm ANN
+    /// index contains both atom and domain vectors.
+    ///
+    /// Steps:
+    /// 1. Seed several atoms and one domain, index with rebuild_ann=true.
+    /// 2. search(kind="domain") — assert all returned hits have kind=="domain".
+    /// 3. search(kind="atom") — assert no domain hits appear (regression guard).
+    #[tokio::test]
+    async fn ann_search_kind_domain_returns_only_domain_hits() {
+        let f = pack(rt_with_embedder());
+
+        // Seed atoms first (they will be the majority in the ANN index).
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "type-filter-a1", "name": "Type Filter Atom 1", "content": "neural network attention mechanism transformer unique typef1 dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                    { "slug": "type-filter-a2", "name": "Type Filter Atom 2", "content": "neural network attention mechanism transformer unique typef1 dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                    { "slug": "type-filter-a3", "name": "Type Filter Atom 3", "content": "neural network attention mechanism transformer unique typef1 dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                ]
+            }),
+        )
+        .await
+        .expect("seed atoms");
+
+        // Seed a domain — upsert_domains stores a row with type:domain tag.
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "type-filter-domain",
+                    "name": "Type Filter Domain",
+                    "description": "neural network attention mechanism transformer unique typef1 dense sparse retrieval corpus benchmark search latency gradient descent vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("seed domain");
+
+        // Index with rebuild_ann=true: ANN holds both atoms and the domain.
+        let idx = f
+            .dispatch("knowledge.index", json!({ "rebuild_ann": true }))
+            .await
+            .expect("index ok");
+        assert!(
+            idx["indexed"].as_u64().unwrap_or(0) >= 3,
+            "atoms must be indexed for the ANN to hold them: {idx:?}"
+        );
+
+        // search(type="domain") must return ONLY domain hits.
+        // Note: the SearchParams field is `#[serde(rename = "type")]` — the JSON key
+        // is "type", not "kind". See knowledge/schema.rs SearchParams.kind.
+        let resp = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "neural network attention mechanism transformer unique typef1",
+                    "type": "domain",
+                    "rerank": false
+                }),
+            )
+            .await
+            .expect("search type=domain ok");
+
+        let results = resp["results"].as_array().expect("results");
+        assert!(
+            !results.is_empty(),
+            "search kind=domain must find the domain: {resp:?}"
+        );
+        for r in results {
+            assert_eq!(
+                r["kind"].as_str().unwrap_or(""),
+                "domain",
+                "search kind=domain: all results must have kind=domain, got: {r:?}"
+            );
+        }
+
+        // search(type="atom") must not contain the domain (regression guard).
+        let resp_atom = f
+            .dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "neural network attention mechanism transformer unique typef1",
+                    "type": "atom",
+                    "rerank": false
+                }),
+            )
+            .await
+            .expect("search type=atom ok");
+
+        let results_atom = resp_atom["results"].as_array().expect("results");
+        for r in results_atom {
+            assert_ne!(
+                r["kind"].as_str().unwrap_or(""),
+                "domain",
+                "search type=atom: no domain hits must appear, got: {r:?}"
+            );
+        }
+    }
+
+    /// suggest must return relevant domains even when atom hits dominate the
+    /// top ANN neighbors.
+    ///
+    /// Steps:
+    /// 1. Seed many atoms (to dominate ANN top-k) and one domain.
+    /// 2. Index with rebuild_ann=true.
+    /// 3. suggest — assert the domain appears (was blocked by crowding before fix).
+    #[tokio::test]
+    async fn ann_suggest_returns_domain_when_atoms_dominate_ann() {
+        let f = pack(rt_with_embedder());
+
+        // Seed 25 atoms to saturate the ANN top-k (ann_k=(8*3).max(20)=24 without the
+        // fix). The fake embedder produces identical unit vectors for every text, so the
+        // ANN returns items in insertion order. With 25 atoms inserted before the domain
+        // the old ann_k=24 fills up with atoms and the domain is excluded entirely.
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    { "slug": "sug-a1",  "name": "Suggest Atom 1",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a2",  "name": "Suggest Atom 2",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a3",  "name": "Suggest Atom 3",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a4",  "name": "Suggest Atom 4",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a5",  "name": "Suggest Atom 5",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a6",  "name": "Suggest Atom 6",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a7",  "name": "Suggest Atom 7",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a8",  "name": "Suggest Atom 8",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a9",  "name": "Suggest Atom 9",  "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a10", "name": "Suggest Atom 10", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a11", "name": "Suggest Atom 11", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a12", "name": "Suggest Atom 12", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a13", "name": "Suggest Atom 13", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a14", "name": "Suggest Atom 14", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a15", "name": "Suggest Atom 15", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a16", "name": "Suggest Atom 16", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a17", "name": "Suggest Atom 17", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a18", "name": "Suggest Atom 18", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a19", "name": "Suggest Atom 19", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a20", "name": "Suggest Atom 20", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a21", "name": "Suggest Atom 21", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a22", "name": "Suggest Atom 22", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a23", "name": "Suggest Atom 23", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a24", "name": "Suggest Atom 24", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                    { "slug": "sug-a25", "name": "Suggest Atom 25", "content": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "finalized": true },
+                ]
+            }),
+        )
+        .await
+        .expect("seed atoms");
+
+        // Seed a domain that matches the same query terms.
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({
+                "domains": [{
+                    "slug": "sug-domain",
+                    "name": "Suggest Domain",
+                    "description": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail"
+                }]
+            }),
+        )
+        .await
+        .expect("seed domain");
+
+        // Mark atoms as reviewed so they are not excluded by the default status filter.
+        f.sql_exec(
+            "UPDATE knowledge_atoms SET status='reviewed' WHERE slug LIKE 'sug-a%'",
+            vec![],
+        )
+        .await;
+
+        // Index with rebuild_ann=true: ANN holds all 25 atoms and the 1 domain.
+        let idx = f
+            .dispatch("knowledge.index", json!({ "rebuild_ann": true }))
+            .await
+            .expect("index ok");
+        assert!(
+            idx["indexed"].as_u64().unwrap_or(0) >= 25,
+            "all atoms must be indexed: {idx:?}"
+        );
+
+        // suggest must return the domain even though 10 atoms dominate the ANN top-k.
+        let resp = f
+            .dispatch(
+                "knowledge.suggest",
+                json!({
+                    "query": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 techniques"
+                }),
+            )
+            .await
+            .expect("suggest ok");
+
+        let results = resp["results"].as_array().expect("results");
+        assert!(
+            !results.is_empty(),
+            "suggest must return at least one domain even when atoms dominate ANN top-k: {resp:?}"
+        );
+        let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            names.contains(&"Suggest Domain"),
+            "suggest must find the matching domain: {names:?}"
+        );
+    }
+}
