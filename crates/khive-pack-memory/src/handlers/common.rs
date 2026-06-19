@@ -134,6 +134,11 @@ pub(super) struct RememberParams {
     pub(super) tags: Option<Vec<String>>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
+    /// Optional write-namespace override. When absent, episodic memories land in
+    /// the actor's namespace and semantic memories land in "local" (the shared pool).
+    /// When present, overrides both routing rules and stamps the note in this namespace.
+    #[serde(default)]
+    pub(super) namespace: Option<String>,
 }
 
 /// Tag filter mode: `any` = OR, `all` = AND.

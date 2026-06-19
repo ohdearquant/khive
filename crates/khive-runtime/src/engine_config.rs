@@ -873,6 +873,17 @@ id = "lambda:"
             "actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
              writes stay pinned to local"
         );
+        // Also assert the fold-in: actor.id MUST appear in visible_namespaces so that
+        // default reads widen to {local} ∪ {actor namespace} (ADR-007 Rev 4 Rule 3b,
+        // config.rs:~444). This is the load-bearing side-effect of the actor id config.
+        assert!(
+            result
+                .visible_namespaces
+                .contains(&Namespace::parse("lambda:test-actor").unwrap()),
+            "actor.id must be folded into visible_namespaces (ADR-007 Rev 4 Rule 3b fold-in); \
+             got: {:?}",
+            result.visible_namespaces
+        );
     }
 
     // 19. runtime_config_from_khive_config with no actor preserves base namespace.
