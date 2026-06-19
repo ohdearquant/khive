@@ -3,6 +3,10 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: Ocean, lambda:khive
+**Amended**: 2026-06-19, added §10 (`memory_type` to namespace routing) recording the
+[ADR-007](ADR-007-namespace.md) Rev 6 carve-out: episodic memory writes stamp the caller's actor
+id by default, semantic memory writes stamp the shared pool, and an explicit `namespace=`
+overrides both.
 
 ## Context
 
@@ -121,6 +125,11 @@ Semantically equivalent to:
 The handler validates: (a) `content` non-empty, (b) `memory_type ∈ {episodic, semantic}`
 if provided, (c) `salience ∈ [0, 1]`, (d) `decay_factor >= 0`, (e) `source_id` is a
 valid UUID present in the namespace.
+
+The write `namespace` is resolved per `memory_type` (ADR-007 Rev 6, full contract in §10): when
+no explicit `namespace=` argument is supplied, a semantic write stamps `token.namespace()` (the
+shared pool, `'local'` by default) and an episodic write stamps `token.actor().id` (the caller's
+actor id). An explicit `namespace=` argument overrides this for both types.
 
 Agents that prefer explicit CRUD are not blocked:
 `create(kind="memory", salience=0.7, decay_factor=0.01, properties={"memory_type":"semantic"}, ...)`
@@ -255,6 +264,59 @@ runtime:
     memory:
       primary_write_instance: memory-hot
 ```
+
+### 10. `memory_type` → namespace routing (ADR-007 Rev 6)
+
+The write namespace of a memory note is resolved from its `memory_type`, per the Rev 6 carve-out
+in [ADR-007](ADR-007-namespace.md) Rule 0. This is the single place in the system where the write
+namespace depends on the kind of record being written; every other write path pins `'local'` by
+default.
+
+| `memory_type` | Default write namespace (no `namespace=` argument)      | With explicit `namespace=X` |
+| ------------- | ------------------------------------------------------- | --------------------------- |
+| `semantic`    | `token.namespace()` (shared pool, `'local'` by default) | `X`                         |
+| `episodic`    | `token.actor().id` (the caller's actor id)              | `X`                         |
+
+Resolution rules:
+
+- The explicit `namespace=` argument on `memory.remember` (and on the equivalent
+  `create(kind="memory", ...)`) overrides the default for BOTH memory types. It is the precise
+  escape: `memory.remember(content="...", memory_type="episodic", namespace="local")` writes the
+  episodic memory into the shared pool, and `memory.remember(content="...",
+  memory_type="semantic", namespace="ns-x")` writes the semantic memory into `ns-x`.
+- The episodic default uses `token.actor().id`, the actor identity threaded onto the request token
+  (ADR-053). An anonymous caller has actor id `'local'` (`ActorRef::anonymous`), so when no
+  `[actor]` is configured the episodic default resolves to `'local'`, identical to the semantic
+  default and to pre-Rev-6 behavior. The per-actor episodic namespace takes effect only once a
+  real actor is configured.
+- The default `memory_type` is `episodic` (§1). A `memory.remember` call that supplies neither
+  `memory_type` nor `namespace=` therefore writes under the caller's actor id, which is `'local'`
+  for an anonymous caller and the configured actor id otherwise.
+
+Why episodic is per-actor and semantic is shared: an episodic memory is a specific actor's lived
+experience, so it is attributed to that actor and private to that actor's default recall view. A
+semantic memory is distilled, shareable knowledge, so it belongs in the common pool. This is the
+per-actor-episodic plus shared-semantic model. The prior contract stamped both memory types into
+`'local'`, which conflated one actor's experience with the shared knowledge base.
+
+This is attribution plus view-layer visibility, not storage isolation:
+
+- The store performs no `record.namespace == caller_namespace` check (ADR-007 Rule 2). By-ID ops
+  on a memory note (`get`, `update`, `delete`, `merge` by UUID) are namespace-agnostic regardless
+  of which actor wrote the memory. `delete(id=<memory_uuid>)` (§6) works across actors.
+- Recall reads operate over the caller's read visible-set,
+  `{local} ∪ {actor.id} ∪ {actor.visible_namespaces}` (ADR-007 Rule 3b). An actor's own episodic
+  memories are visible to its default recall because the set always includes `{actor.id}`. Another
+  actor sees them only if its configured `visible_namespaces` includes the writer's id. This is
+  the intended privacy boundary, realized as a read-scope (view) decision, not a storage
+  partition.
+- `memory.recall` requires no change for the Rev 6 routing. The visible-set fanout already
+  returns actor-id-stamped memories on both the FTS candidate path and the ANN post-filter path;
+  episodic memories written under the caller's actor id are in scope by construction.
+
+The `memory_type` post-filter on recall (§5) is orthogonal to namespace routing: it filters the
+candidate set by the stored `properties.memory_type` after candidate scoping, independent of
+which namespace a candidate was written to.
 
 ## Rationale
 
@@ -458,6 +520,10 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 
 ## References
 
+- [ADR-007](ADR-007-namespace.md): Namespace as attribution-only. Rev 6 episodic-memory
+  write carve-out (Rule 0 amendment) and the read visible-set fanout (Rule 3b) that makes
+  per-actor episodic memory visible to its own default recall. §10 here is the consumer-side
+  statement of that carve-out.
 - [ADR-002](ADR-002-edge-ontology.md): Edge ontology — `annotates` as the universal note →
   any-substrate relation
 - [ADR-012](ADR-012-retrieval-composition.md): Retrieval composition — RRF hybrid score
