@@ -1210,6 +1210,52 @@ impl VerbRegistry {
             }
         }
     }
+
+    /// Pack-auxiliary schema plans with their owning pack names.
+    ///
+    /// Returns `(pack_name, SchemaPlan)` pairs for every registered pack.
+    /// Used by the multi-backend boot path to apply each plan to the pack's
+    /// assigned backend rather than a single shared backend.
+    pub fn all_schema_plans_named(&self) -> Vec<(&'static str, SchemaPlan)> {
+        self.packs
+            .iter()
+            .map(|p| {
+                let plan = p.schema_plan();
+                (plan.pack, plan)
+            })
+            .collect()
+    }
+
+    /// Apply pack-auxiliary schema plans using a per-pack backend map.
+    ///
+    /// For each `(pack_name, plan)` returned by `all_schema_plans_named()`,
+    /// applies the plan to `backend_for_pack[pack_name]` when present,
+    /// falling back to `default_backend` for any pack not in the map.
+    ///
+    /// This is the multi-backend boot path (ADR-028). Single-backend callers
+    /// should continue using [`apply_schema_plans`].
+    pub fn apply_schema_plans_with_map(
+        &self,
+        backend_for_pack: &HashMap<&str, &khive_db::StorageBackend>,
+        default_backend: &khive_db::StorageBackend,
+    ) {
+        for (pack_name, plan) in self.all_schema_plans_named() {
+            if plan.is_empty() {
+                continue;
+            }
+            let backend = backend_for_pack
+                .get(pack_name)
+                .copied()
+                .unwrap_or(default_backend);
+            if let Err(e) = backend.apply_pack_ddl_statements(plan.statements) {
+                tracing::warn!(
+                    pack = pack_name,
+                    error = %e,
+                    "failed to apply pack schema plan at startup (non-fatal)"
+                );
+            }
+        }
+    }
 }
 
 // ── Inventory-based dynamic pack loading ────────────────────────────────────
@@ -1351,6 +1397,61 @@ impl PackRegistry {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             builder.register_boxed(factory.create(runtime.clone()));
             if let Some(resolver) = factory.create_resolver(runtime.clone()) {
+                builder.register_resolver(name.clone(), resolver);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Register the named packs into `builder`, routing each pack to its own runtime.
+    ///
+    /// `runtimes` maps pack name → `KhiveRuntime` (one per backend assignment).
+    /// `default_runtime` is used for any pack whose name is not in `runtimes`.
+    /// The validation logic (unknown pack, missing dependency) is identical to
+    /// [`register_packs`].
+    ///
+    /// This is the multi-backend boot path (ADR-028). Single-backend callers
+    /// should continue using [`register_packs`].
+    pub fn register_packs_with_runtimes(
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
+        let all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        let factory_for = |name: &str| -> Option<&'static dyn PackFactory> {
+            all.iter().copied().find(|f| f.name() == name)
+        };
+
+        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        for name in names {
+            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
+        }
+
+        for name in names {
+            let factory = factory_for(name.as_str()).unwrap();
+            for &dep in factory.requires() {
+                if !requested.contains(dep) {
+                    return Err(PackLoadError::MissingDependency {
+                        pack: name.clone(),
+                        dep: dep.to_string(),
+                    });
+                }
+            }
+        }
+
+        for name in names {
+            let factory = factory_for(name.as_str()).unwrap();
+            let runtime = runtimes
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_else(|| default_runtime.clone());
+            builder.register_boxed(factory.create(runtime.clone()));
+            if let Some(resolver) = factory.create_resolver(runtime) {
                 builder.register_resolver(name.clone(), resolver);
             }
         }
@@ -3931,6 +4032,182 @@ mod help_tests {
         assert!(
             msg.contains("recall"),
             "dispatch unknown-verb error must still list public verb 'recall': {msg}"
+        );
+    }
+
+    // ── ADR-028 multi-backend schema routing tests ───────────────────────────
+
+    /// A test pack that returns a real SchemaPlan so we can assert routing.
+    struct SchemaPack {
+        pack_name: &'static str,
+        statements: &'static [&'static str],
+    }
+
+    impl Pack for SchemaPack {
+        const NAME: &'static str = "schema-pack";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait]
+    impl PackRuntime for SchemaPack {
+        fn name(&self) -> &str {
+            self.pack_name
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            &[]
+        }
+        fn schema_plan(&self) -> SchemaPlan {
+            SchemaPlan {
+                pack: self.pack_name,
+                statements: self.statements,
+            }
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": self.pack_name, "verb": verb }))
+        }
+    }
+
+    // ADR-028: all_schema_plans_named returns (pack_name, SchemaPlan) pairs
+    // where pack_name comes from SchemaPlan::pack (always &'static str).
+    #[test]
+    fn all_schema_plans_named_returns_correct_pairs() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER PRIMARY KEY)"],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "beta",
+            statements: &[],
+        }));
+        let reg = builder.build().expect("registry builds");
+
+        let named = reg.all_schema_plans_named();
+        assert_eq!(named.len(), 2);
+
+        let alpha_entry = named.iter().find(|(n, _)| *n == "alpha");
+        let beta_entry = named.iter().find(|(n, _)| *n == "beta");
+
+        assert!(alpha_entry.is_some(), "alpha must appear in named plans");
+        assert!(beta_entry.is_some(), "beta must appear in named plans");
+
+        let (_, alpha_plan) = alpha_entry.unwrap();
+        assert_eq!(alpha_plan.statements.len(), 1);
+        assert!(!alpha_plan.is_empty());
+
+        let (_, beta_plan) = beta_entry.unwrap();
+        assert!(beta_plan.is_empty());
+    }
+
+    // ADR-028: apply_schema_plans_with_map routes non-empty plans to the
+    // correct per-pack backend instead of the default.
+    //
+    // Verification: apply DDL to routed backend, then confirm the table is
+    // present on pack_backend and absent on default_backend by attempting to
+    // apply the same DDL again — if the table already exists on pack_backend
+    // the idempotent CREATE IF NOT EXISTS succeeds; applying to default_backend
+    // would only matter if the table were routed there.  We verify isolation
+    // by applying the plan and then running a targeted DDL on each backend
+    // that would fail if the table did not already exist (CREATE without
+    // IF NOT EXISTS on a duplicate raises an error), combined with a no-error
+    // path on the correct backend.
+    //
+    // Simpler approach: confirm the plan applies without error (routing is
+    // correct) and that the opposite backend returns an error when we try to
+    // INSERT into the routed table (table-not-found = SQLITE_ERROR).
+    #[tokio::test]
+    async fn apply_schema_plans_with_map_routes_to_correct_backend() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let default_backend = khive_db::StorageBackend::memory().expect("default memory backend");
+        let pack_backend =
+            khive_db::StorageBackend::memory().expect("pack-specific memory backend");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "routed",
+            statements: &["CREATE TABLE IF NOT EXISTS t_routed (id INTEGER PRIMARY KEY)"],
+        }));
+        let reg = builder.build().expect("registry builds");
+
+        let mut backend_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+        backend_map.insert("routed", &pack_backend);
+
+        reg.apply_schema_plans_with_map(&backend_map, &default_backend);
+
+        // On pack_backend: INSERT must succeed (table exists).
+        let mut writer = pack_backend.sql().writer().await.expect("writer");
+        let result = writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO t_routed (id) VALUES (?1)".into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "t_routed must exist on pack_backend after routing: {result:?}"
+        );
+
+        // On default_backend: INSERT must fail (table not there).
+        let mut default_writer = default_backend.sql().writer().await.expect("writer");
+        let default_result = default_writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO t_routed (id) VALUES (?1)".into(),
+                params: vec![SqlValue::Integer(2)],
+                label: None,
+            })
+            .await;
+        assert!(
+            default_result.is_err(),
+            "t_routed must NOT exist on default_backend (table should not be there)"
+        );
+    }
+
+    // ADR-028: apply_schema_plans_with_map uses default backend for packs
+    // absent from the map.
+    #[tokio::test]
+    async fn apply_schema_plans_with_map_falls_back_to_default_for_unmapped_packs() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let default_backend = khive_db::StorageBackend::memory().expect("default memory backend");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "unmapped",
+            statements: &["CREATE TABLE IF NOT EXISTS t_unmapped (id INTEGER PRIMARY KEY)"],
+        }));
+        let reg = builder.build().expect("registry builds");
+
+        let backend_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+        reg.apply_schema_plans_with_map(&backend_map, &default_backend);
+
+        // On default_backend: INSERT must succeed (table fell back here).
+        let mut writer = default_backend.sql().writer().await.expect("writer");
+        let result = writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO t_unmapped (id) VALUES (?1)".into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "t_unmapped must exist on default_backend for unmapped pack: {result:?}"
         );
     }
 }

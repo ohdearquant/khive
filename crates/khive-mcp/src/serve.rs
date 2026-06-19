@@ -3,10 +3,14 @@
 //! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
 //! initialized by the binary, not here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use khive_runtime::{
-    config_from_env, runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, RuntimeConfig,
+    config_from_env, run_migrations, runtime_config_from_khive_config, BackendConfig, BackendId,
+    BackendKind, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig, StorageBackend,
+    VerbRegistryBuilder,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -61,18 +65,195 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         brain_profile: args.brain_profile.clone(),
     })?;
 
-    let runtime = KhiveRuntime::new(config)?;
+    // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
+    // When no [[backends]] are declared, fall through to the existing single-backend path
+    // to preserve byte-for-byte backward compatibility.
+    let khive_cfg = KhiveConfig::load_with_home_fallback(args.config.as_deref())
+        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+        .unwrap_or_default();
+
+    if khive_cfg.backends.is_empty() {
+        // Single-backend path — identical to pre-ADR-028 behavior.
+        let runtime = KhiveRuntime::new(config)?;
+        #[cfg(feature = "bench-embedder")]
+        {
+            for name in runtime.registered_embedding_model_names() {
+                runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+            }
+        }
+        return KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"));
+    }
+
+    // Multi-backend path (ADR-028).
+    build_server_multi_backend(config, &khive_cfg)
+}
+
+/// Open backends, run migrations, build per-pack runtimes, register packs.
+///
+/// Called only when `[[backends]]` is non-empty in `khive.toml`.
+fn build_server_multi_backend(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+) -> anyhow::Result<KhiveMcpServer> {
+    // Open and migrate each declared backend.
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    for backend_cfg in &khive_cfg.backends {
+        let backend = open_backend(backend_cfg)?;
+        // Run migrations before passing backend to any runtime (risk §8 line 433).
+        {
+            let mut writer = backend.pool().try_writer().map_err(|e| {
+                anyhow::anyhow!("backend {}: migration writer: {e}", backend_cfg.name)
+            })?;
+            run_migrations(writer.conn_mut())
+                .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
+        }
+        backends.insert(backend_cfg.name.clone(), Arc::new(backend));
+    }
+
+    // Ensure the `main` backend exists (required fallback for unconfigured packs).
+    let main_backend = backends
+        .get(BackendId::MAIN)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "[[backends]] is declared but no backend named \"main\" was found; \
+             add a [[backends]] entry with name = \"main\""
+            )
+        })?
+        .clone();
+
+    // Build per-pack runtimes: each pack gets its assigned backend, or `main` as fallback.
+    let pack_names = &base_config.packs;
+    let mut per_pack_runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
+    for pack_name in pack_names {
+        let backend_name = khive_cfg
+            .packs
+            .get(pack_name.as_str())
+            .map(|pc| pc.backend.as_str())
+            .unwrap_or(BackendId::MAIN);
+        let backend = backends
+            .get(backend_name)
+            .cloned()
+            .unwrap_or_else(|| main_backend.clone());
+        let mut rt_config = base_config.clone();
+        rt_config.backend_id = BackendId::new(backend_name);
+        per_pack_runtimes.insert(
+            pack_name.clone(),
+            KhiveRuntime::from_backend(backend, rt_config),
+        );
+    }
+
+    // Build the default runtime (for the main backend) — used for EventStore wiring.
+    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
+        let mut cfg = base_config.clone();
+        cfg.backend_id = BackendId::main();
+        cfg
+    });
+
     #[cfg(feature = "bench-embedder")]
     {
-        // Replace ALL configured embedding models with the deterministic FNV-1a
-        // bench embedder so that CI never attempts to load a lattice model file.
-        // The registry's last-wins semantics ensure every LatticeEmbedderProvider
-        // (primary + additional) is replaced before any embed() call can fire.
-        for name in runtime.registered_embedding_model_names() {
-            runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+        for rt in per_pack_runtimes.values() {
+            for name in rt.registered_embedding_model_names() {
+                rt.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
+            }
+        }
+        for name in default_runtime.registered_embedding_model_names() {
+            default_runtime
+                .register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
         }
     }
-    KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
+
+    // Build the VerbRegistry using per-pack runtimes.
+    let gate = default_runtime.config().gate.clone();
+    let default_namespace = default_runtime.config().default_namespace.clone();
+    let config_id = crate::server::compute_config_id(default_runtime.config());
+    let visible_namespaces = default_runtime.config().visible_namespaces.clone();
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(gate);
+    builder.with_default_namespace(default_namespace.as_str());
+    builder.with_visible_namespaces(visible_namespaces);
+
+    // Wire EventStore from the default (main) runtime.
+    if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
+        if let Ok(event_store) = default_runtime.events(&tok) {
+            builder.with_event_store(event_store);
+        }
+    }
+
+    PackRegistry::register_packs_with_runtimes(
+        pack_names,
+        &per_pack_runtimes,
+        &default_runtime,
+        &mut builder,
+    )
+    .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
+
+    let registry = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
+
+    // Install edge rules and embedders.
+    default_runtime.install_edge_rules(registry.all_edge_rules());
+    for rt in per_pack_runtimes.values() {
+        rt.install_edge_rules(registry.all_edge_rules());
+    }
+    registry.call_register_embedders(&default_runtime);
+
+    // Apply schema plans to each pack's assigned backend.
+    let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes
+        .iter()
+        .map(|(name, rt)| (name.as_str(), rt.backend()))
+        .collect();
+    let main_ref: &StorageBackend = main_backend.as_ref();
+    registry.apply_schema_plans_with_map(&backend_for_pack, main_ref);
+
+    Ok(KhiveMcpServer::from_registry_with_meta(
+        registry,
+        default_namespace.as_str(),
+        &config_id,
+    ))
+}
+
+/// Open a `StorageBackend` from a `BackendConfig`.
+fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
+    match cfg.kind {
+        BackendKind::Memory => StorageBackend::memory()
+            .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
+        BackendKind::Sqlite => {
+            let path = cfg.path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "backend {}: sqlite backend requires a `path` field",
+                    cfg.name
+                )
+            })?;
+            let expanded = expand_tilde(path);
+            if let Some(parent) = expanded.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!(
+                        "backend {}: cannot create parent dir {}: {e}",
+                        cfg.name,
+                        parent.display()
+                    )
+                })?;
+            }
+            StorageBackend::sqlite(&expanded)
+                .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
+        }
+    }
+}
+
+/// Expand a leading `~` to `$HOME` in a path.
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(format!("{home}/{rest}"))
+    } else if s == "~" {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments

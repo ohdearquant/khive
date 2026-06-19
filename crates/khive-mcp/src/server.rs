@@ -274,6 +274,22 @@ impl KhiveMcpServer {
         }
     }
 
+    /// Build a server from a pre-built registry with explicit namespace and config_id.
+    ///
+    /// Used by the multi-backend boot path in `serve.rs` where the registry is
+    /// assembled externally before constructing the server.
+    pub(crate) fn from_registry_with_meta(
+        registry: VerbRegistry,
+        default_namespace: &str,
+        config_id: &str,
+    ) -> Self {
+        Self {
+            registry,
+            default_namespace: default_namespace.to_string(),
+            config_id: config_id.to_string(),
+        }
+    }
+
     /// Namespace this server's registry was built for.
     pub fn default_namespace(&self) -> &str {
         &self.default_namespace

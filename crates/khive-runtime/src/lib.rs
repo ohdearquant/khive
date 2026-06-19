@@ -33,10 +33,13 @@ pub use daemon::{
     PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
-pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};
+pub use engine_config::{
+    config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
+};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
+pub use khive_db::{run_migrations, StorageBackend};
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,

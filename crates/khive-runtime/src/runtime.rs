@@ -873,7 +873,7 @@ mod tests {
 
     // ---- Actor config tests ----
 
-    use crate::engine_config::{ActorConfig, KhiveConfig, RuntimeSectionConfig};
+    use crate::engine_config::{ActorConfig, KhiveConfig};
 
     fn khive_cfg_with_actor(id: &str) -> KhiveConfig {
         KhiveConfig {
@@ -883,7 +883,7 @@ mod tests {
                 display_name: None,
                 ..Default::default()
             },
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         }
     }
 
@@ -935,7 +935,7 @@ mod tests {
                 display_name: None,
                 ..Default::default()
             },
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         };
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
@@ -995,7 +995,7 @@ mod tests {
                 display_name: None,
                 ..Default::default()
             },
-            runtime: RuntimeSectionConfig::default(),
+            ..KhiveConfig::default()
         };
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(
