@@ -22,7 +22,11 @@ pub(super) const D_W_BIGRAM: f32 = 2.0;
 
 pub(super) const CANDIDATE_POOL: usize = 2000;
 pub(super) const MIN_TERM_LEN: usize = 3;
-pub(super) const EMBED_BATCH: usize = 32;
+/// Default embed/write batch when the caller does not pass `batch_size`. This is
+/// the number of records embedded per `embed_document_batch` call (and written
+/// per batch) — NOT a separate DB-pagination unit. The reindex `--batch-size`
+/// flag overrides it; pagination uses the same value.
+pub(crate) const DEFAULT_EMBED_BATCH: usize = 128;
 pub(super) const MAX_EMBED_BYTES: usize = 32_768;
 
 pub(super) static STOP_WORDS: &[&str] = &[
