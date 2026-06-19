@@ -1794,7 +1794,14 @@ async fn compose_default_omits_sections_and_score_annotations() {
 }
 
 #[tokio::test]
-async fn compose_explain_true_includes_sections_and_score_annotations() {
+async fn compose_explain_true_atom_path_includes_score_in_markdown() {
+    // This test uses a no-embedder runtime (rt()). Without an embedder,
+    // embed_query() returns None, so section_results is always empty and
+    // compose falls through to the atom-path markdown branch. The sole
+    // assertion here is that explain=true causes "Score:" to appear in the
+    // atom-path output. The section path (sections[] + breakdown + section_count
+    // + "(score:") is exercised by the embedder-backed test in fixes.rs:
+    // compose_explain_sections::compose_explain_true_section_path_is_exercised.
     let f = pack(rt());
 
     f.dispatch(
@@ -1804,19 +1811,13 @@ async fn compose_explain_true_includes_sections_and_score_annotations() {
                 {
                     "slug": "explain-atom-b",
                     "name": "Explain Atom B",
-                    "content": "retrieval augmented generation combines dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
-                    "body": [
-                        {
-                            "section_type": "summary",
-                            "content": "retrieval augmented generation combines dense and sparse retrieval with generative models for grounded output synthesis"
-                        }
-                    ]
+                    "content": "retrieval augmented generation combines dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 }
             ]
         }),
     )
     .await
-    .expect("upsert atom with sections");
+    .expect("upsert atom");
 
     let resp = f
         .dispatch(
@@ -1833,40 +1834,16 @@ async fn compose_explain_true_includes_sections_and_score_annotations() {
     let data = &resp["data"];
     let md = data["markdown"].as_str().expect("markdown");
 
-    if data.get("sections").is_some() {
-        let sections = data["sections"].as_array().expect("sections array");
-        assert!(
-            !sections.is_empty(),
-            "sections array must not be empty when present"
-        );
-        let sec = &sections[0];
-        assert!(
-            sec.get("breakdown").is_some(),
-            "section must have breakdown in explain mode"
-        );
-        let bd = &sec["breakdown"];
-        assert!(
-            bd.get("section_cosine").is_some(),
-            "breakdown.section_cosine"
-        );
-        assert!(bd.get("section_bm25").is_some(), "breakdown.section_bm25");
-        assert!(bd.get("atom_cosine").is_some(), "breakdown.atom_cosine");
-        assert!(bd.get("domain_score").is_some(), "breakdown.domain_score");
-        assert!(bd.get("type_weight").is_some(), "breakdown.type_weight");
-        assert!(
-            data.get("section_count").is_some(),
-            "section_count must be present in explain mode"
-        );
-        assert!(
-            md.contains("(score:"),
-            "markdown must contain (score: in explain mode"
-        );
-    } else {
-        assert!(
-            md.contains("Score:"),
-            "atom-path markdown must contain Score: in explain mode when no sections"
-        );
-    }
+    // Without an embedder, sections are never emitted — the atom-path branch
+    // runs and renders "Score: X.XXXX" per atom when explain=true.
+    assert!(
+        data.get("sections").is_none(),
+        "no-embedder runtime must not emit sections key"
+    );
+    assert!(
+        md.contains("Score:"),
+        "atom-path markdown must contain 'Score:' when explain=true, got: {md}"
+    );
 }
 
 // ── KPK-002: DomainInput deny_unknown_fields + domain-mirror content-word minimum ──
