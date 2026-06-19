@@ -150,8 +150,9 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Records per embedding batch (default 100, max 500).
-    #[arg(long, default_value = "100")]
+    /// Records embedded per batch — also the DB page and write batch (default
+    /// 128, max 500). One `embed_document_batch` call processes this many records.
+    #[arg(long, default_value = "128")]
     pub batch_size: u32,
 
     /// Keep existing vectors instead of dropping before re-embedding.
