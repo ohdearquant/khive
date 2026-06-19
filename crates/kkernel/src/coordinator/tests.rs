@@ -3,14 +3,31 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use khive_runtime::{BackendId, KhiveRuntime};
+use khive_runtime::Namespace as RuntimeNamespace;
+use khive_runtime::{BackendId, KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
-use super::{BackendRegistry, LocatorCache, SubstrateCoordinator};
+use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+}
+
+/// Build a VerbRegistry with the `kg` pack loaded, using the given runtime.
+fn kg_registry(runtime: Arc<KhiveRuntime>) -> khive_runtime::VerbRegistry {
+    let gate = runtime.config().gate.clone();
+    let default_ns = runtime.config().default_namespace.clone();
+    let actor_id = runtime.config().actor_id.clone();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(gate);
+    builder.with_default_namespace(default_ns.as_str());
+    builder.with_actor_id(actor_id);
+    PackRegistry::register_packs(&["kg".to_string()], (*runtime).clone(), &mut builder)
+        .expect("register kg");
+    let registry = builder.build().expect("build registry");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    registry
 }
 
 // ---- Existing tests (D1 infrastructure) ----
@@ -166,8 +183,9 @@ async fn fan_out_search_single_backend_returns_hits() {
         .await
         .expect("create entity");
 
-    let (hits, _note_hits, per_backend) =
-        coord.fan_out_search("FlashAttention", &ns, 10, false).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search("FlashAttention", &ns, 10, false, None)
+        .await;
 
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
@@ -214,7 +232,8 @@ async fn fan_out_search_two_backends_merged() {
         .expect("create on lore");
 
     // Fan-out search for "LoRA" — both backends should contribute.
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search("LoRA", &ns, 10, false).await;
+    let (merged_hits, _note_hits, per_backend) =
+        coord.fan_out_search("LoRA", &ns, 10, false, None).await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     // Merged set should contain at least one hit from the combined results.
@@ -228,7 +247,8 @@ async fn fan_out_search_two_backends_merged() {
 async fn fan_out_search_empty_registry_returns_empty() {
     let coord = SubstrateCoordinator::new(BackendRegistry::new());
     let ns = Namespace::local();
-    let (hits, note_hits, per_backend) = coord.fan_out_search("anything", &ns, 10, false).await;
+    let (hits, note_hits, per_backend) =
+        coord.fan_out_search("anything", &ns, 10, false, None).await;
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
     assert!(per_backend.is_empty());
@@ -269,7 +289,7 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     let coord = SubstrateCoordinator::new(registry).with_failing_backend("main");
 
     let (merged_hits, _note_hits, per_backend) = coord
-        .fan_out_search("PartialFailureProbe", &ns, 10, false)
+        .fan_out_search("PartialFailureProbe", &ns, 10, false, None)
         .await;
 
     // Both backends must be reported.
@@ -441,7 +461,8 @@ async fn t1_single_backend_zero_change_invariant() {
     );
 
     // fan_out_search returns results equivalent to a single runtime search.
-    let (hits, _note_hits, per_backend) = coord.fan_out_search("T1Entity", &ns, 10, false).await;
+    let (hits, _note_hits, per_backend) =
+        coord.fan_out_search("T1Entity", &ns, 10, false, None).await;
     assert!(
         !hits.is_empty(),
         "T1: fan-out on single backend must return hits"
@@ -561,7 +582,8 @@ async fn t3_fan_out_search_merged_from_two_backends() {
     .expect("T3: create on beta");
 
     // Search "Entity" — should match both AlphaEntity and BetaEntity.
-    let (merged, _note_hits, per_backend) = coord.fan_out_search("Entity", &ns, 20, false).await;
+    let (merged, _note_hits, per_backend) =
+        coord.fan_out_search("Entity", &ns, 20, false, None).await;
 
     assert_eq!(per_backend.len(), 2, "T3: both backends in report");
     assert!(
@@ -692,8 +714,9 @@ async fn fan_out_note_search_two_backends() {
     .expect("create note on lore");
 
     // Note fan-out (search_notes=true).
-    let (_entity_hits, note_hits, per_backend) =
-        coord.fan_out_search("observation", &ns, 10, true).await;
+    let (_entity_hits, note_hits, per_backend) = coord
+        .fan_out_search("observation", &ns, 10, true, None)
+        .await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(per_backend.iter().all(|r| r.error.is_none()), "no errors");
@@ -701,5 +724,250 @@ async fn fan_out_note_search_two_backends() {
     assert!(
         !note_hits.is_empty(),
         "note fan-out must return hits, got 0"
+    );
+}
+
+// ---- T7: ADR-029 multi-backend search parity (kind filter, min_score, real kinds) ----
+//
+// Verifies that the multi-backend coordinator search path through KhiveMcpServer
+// produces the same output SHAPE as the single-backend kg handler:
+//   - entity_kind / note_kind fields are the REAL kind string, never null
+//   - kind filter is honoured (off-kind entities are excluded)
+//   - min_score floor is applied
+//
+// This test MUST fail on HEAD before this fix (null entity_kind / no kind filter)
+// and PASS after.
+
+/// Helper: build a two-backend server with the given runtimes.
+///
+/// Returns the server and a reference to both runtimes (for seeding data before
+/// calling the server).
+fn two_backend_server(
+    rt_a: Arc<KhiveRuntime>,
+    rt_b: Arc<KhiveRuntime>,
+) -> khive_mcp::server::KhiveMcpServer {
+    // Build the VerbRegistry from rt_a (single runtime, kg pack).
+    let registry = kg_registry(Arc::clone(&rt_a));
+
+    // Build a two-backend coordinator.
+    let mut backend_reg = BackendRegistry::new();
+    backend_reg.register(BackendId::new("alpha"), Arc::clone(&rt_a));
+    backend_reg.register(BackendId::new("beta"), Arc::clone(&rt_b));
+    let coordinator = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+
+    khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        registry,
+        "local",
+        "test-two-backend",
+    )
+    .with_coordinator(Arc::new(coordinator) as Arc<dyn khive_mcp::coordinator::CoordinatorService>)
+}
+
+/// T7a: `entity_kind` is populated (not null) in multi-backend search results.
+///
+/// RED before fix: entity_kind was hardcoded null.
+/// GREEN after fix: entity_kind matches the entity's actual kind string.
+#[tokio::test]
+async fn t7a_multi_backend_search_populates_real_entity_kind() {
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    let ns = RuntimeNamespace::local();
+
+    // Seed one concept on each backend.
+    let tok_a = rt_a.authorize(ns.clone()).unwrap();
+    rt_a.create_entity(
+        &tok_a,
+        "concept",
+        None,
+        "T7aConceptAlpha",
+        Some("concept on alpha backend"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7a: create concept on alpha");
+
+    let tok_b = rt_b.authorize(ns.clone()).unwrap();
+    rt_b.create_entity(
+        &tok_b,
+        "concept",
+        None,
+        "T7aConceptBeta",
+        Some("concept on beta backend"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7a: create concept on beta");
+
+    let server = two_backend_server(Arc::clone(&rt_a), Arc::clone(&rt_b));
+
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="concept", query="T7aConcept")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+        })
+        .await
+        .expect("T7a: dispatch");
+
+    let response: serde_json::Value =
+        serde_json::from_str(&result_str).expect("T7a: parse response JSON");
+    let results = response["results"].as_array().expect("T7a: results array");
+    assert!(
+        !results.is_empty(),
+        "T7a: should have at least one result op"
+    );
+
+    let op = &results[0];
+    assert!(
+        op["ok"].as_bool() == Some(true),
+        "T7a: search op must succeed, got: {op}"
+    );
+    let hits = op["result"].as_array().expect("T7a: result must be array");
+    assert!(!hits.is_empty(), "T7a: must find at least one concept hit");
+
+    for hit in hits {
+        let entity_kind = hit.get("entity_kind");
+        assert!(
+            entity_kind.is_some(),
+            "T7a: entity_kind field must be present in hit: {hit}"
+        );
+        assert!(
+            entity_kind.and_then(|v| v.as_str()).is_some(),
+            "T7a: entity_kind must be a non-null string, got: {hit}"
+        );
+        assert_eq!(
+            entity_kind.and_then(|v| v.as_str()),
+            Some("concept"),
+            "T7a: entity_kind must be 'concept', got: {hit}"
+        );
+    }
+}
+
+/// T7b: Granular kind filter excludes off-kind entities.
+///
+/// Seeds a concept AND a document on the same backend. Searching with
+/// `kind="concept"` must return only the concept, not the document.
+///
+/// RED before fix: both kinds returned (kind filter was discarded).
+/// GREEN after fix: only concept returned.
+#[tokio::test]
+async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    let ns = RuntimeNamespace::local();
+
+    // Create a concept AND a document on rt_a with overlapping names.
+    let tok_a = rt_a.authorize(ns.clone()).unwrap();
+    rt_a.create_entity(
+        &tok_a,
+        "concept",
+        None,
+        "T7bTargetConcept",
+        Some("the concept we want"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7b: create concept on alpha");
+
+    rt_a.create_entity(
+        &tok_a,
+        "document",
+        None,
+        "T7bTargetDocument",
+        Some("a document that must be excluded"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7b: create document on alpha");
+
+    // rt_b is empty — all results come from rt_a.
+    let _ = rt_b.authorize(ns.clone()).unwrap();
+
+    let server = two_backend_server(Arc::clone(&rt_a), Arc::clone(&rt_b));
+
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="concept", query="T7bTarget")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+        })
+        .await
+        .expect("T7b: dispatch");
+
+    let response: serde_json::Value = serde_json::from_str(&result_str).expect("T7b: parse");
+    let results = response["results"].as_array().expect("T7b: results array");
+    let op = &results[0];
+    assert!(
+        op["ok"].as_bool() == Some(true),
+        "T7b: search op must succeed"
+    );
+    let hits = op["result"].as_array().expect("T7b: result array");
+
+    for hit in hits {
+        let kind = hit["entity_kind"].as_str().unwrap_or("null");
+        assert_eq!(
+            kind, "concept",
+            "T7b: only concept hits expected, got entity_kind={kind:?} in: {hit}"
+        );
+    }
+}
+
+/// T7c: `min_score` floor filters out low-scoring hits.
+///
+/// Seeds one entity, searches with an impossibly high min_score (1.0), and asserts
+/// the result list is empty (all hits fall below the floor).
+///
+/// RED before fix: min_score was ignored, all hits returned.
+/// GREEN after fix: no hits returned when all scores < floor.
+#[tokio::test]
+async fn t7c_multi_backend_search_min_score_applied() {
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    let ns = RuntimeNamespace::local();
+
+    let tok_a = rt_a.authorize(ns.clone()).unwrap();
+    rt_a.create_entity(
+        &tok_a,
+        "concept",
+        None,
+        "T7cMinScoreProbe",
+        Some("entity for min_score test"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7c: create entity");
+
+    let _ = rt_b.authorize(ns.clone()).unwrap();
+
+    let server = two_backend_server(Arc::clone(&rt_a), Arc::clone(&rt_b));
+
+    // RRF scores are always ≤ ~0.016 for a single-backend hit (1/(60+1)).
+    // min_score=1.0 is always above any real RRF score → result must be empty.
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="concept", query="T7cMinScoreProbe", min_score=1.0)"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+        })
+        .await
+        .expect("T7c: dispatch");
+
+    let response: serde_json::Value = serde_json::from_str(&result_str).expect("T7c: parse");
+    let results = response["results"].as_array().expect("T7c: results");
+    let op = &results[0];
+    assert!(
+        op["ok"].as_bool() == Some(true),
+        "T7c: search op must succeed"
+    );
+    let hits = op["result"].as_array().expect("T7c: result array");
+    assert!(
+        hits.is_empty(),
+        "T7c: min_score=1.0 must filter all hits, got {} hit(s)",
+        hits.len()
     );
 }

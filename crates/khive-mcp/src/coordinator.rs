@@ -80,6 +80,13 @@ pub struct CoordSearchResult {
     pub per_backend: Vec<BackendSearchResult>,
     /// True when at least one backend errored (results may be incomplete).
     pub partial: bool,
+    /// Kind string for each entity hit, keyed by entity UUID.
+    /// Populated by the coordinator after the RRF merge. Missing entries mean
+    /// the kind could not be resolved (e.g. the owning backend errored).
+    pub entity_kinds: std::collections::HashMap<uuid::Uuid, String>,
+    /// Kind string for each note hit, keyed by note UUID.
+    /// Populated by the coordinator after the RRF merge.
+    pub note_kinds: std::collections::HashMap<uuid::Uuid, String>,
 }
 
 /// Cross-backend coordinator seam visible to `khive-mcp`.
@@ -122,6 +129,10 @@ pub trait CoordinatorService: Send + Sync {
     /// - `"entity"` or any granular entity kind → entity fan-out via `hybrid_search`
     /// - `"note"` or any granular note kind → note fan-out via `search_notes`
     ///
+    /// `kind_filter` is the granular kind to pass as a storage-level filter
+    /// (`entity_kind` for entity substrate, `note_kind` for note substrate).
+    /// Pass `None` for substrate-level (`kind="entity"` or `kind="note"`) searches.
+    ///
     /// Granular kinds that cannot be resolved to a substrate fall through to the
     /// registry (single-backend path); the coordinator does not silently drop results.
     async fn fan_out_search(
@@ -130,6 +141,7 @@ pub trait CoordinatorService: Send + Sync {
         query: &str,
         namespace: &Namespace,
         limit: u32,
+        kind_filter: Option<&str>,
     ) -> CoordSearchResult;
 
     /// True when only one backend is registered (zero-change invariant check).
@@ -198,6 +210,7 @@ pub(crate) mod tests {
             _query: &str,
             _namespace: &Namespace,
             _limit: u32,
+            _kind_filter: Option<&str>,
         ) -> CoordSearchResult {
             self.search_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -206,6 +219,8 @@ pub(crate) mod tests {
                 note_hits: vec![],
                 per_backend: vec![],
                 partial: false,
+                entity_kinds: std::collections::HashMap::new(),
+                note_kinds: std::collections::HashMap::new(),
             }
         }
 

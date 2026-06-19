@@ -2,6 +2,8 @@
 //! trait defined in `khive-mcp`. Wraps `SubstrateCoordinator` and adapts its types
 //! to the trait interface used by `KhiveMcpServer`.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -95,14 +97,60 @@ impl CoordinatorService for SubstrateCoordinatorService {
         query: &str,
         namespace: &Namespace,
         limit: u32,
+        kind_filter: Option<&str>,
     ) -> CoordSearchResult {
         let search_notes = is_note_substrate(kind);
         let (entity_hits, note_hits, per_backend) = self
             .inner
-            .fan_out_search(query, namespace, limit, search_notes)
+            .fan_out_search(query, namespace, limit, search_notes, kind_filter)
             .await;
 
         let partial = per_backend.iter().any(|r| r.error.is_some());
+
+        // Batch-fetch entity kinds for each merged entity hit.
+        // We locate each hit's owning backend and call get_entity on it.
+        let entity_kinds: HashMap<Uuid, String> = if entity_hits.is_empty() {
+            HashMap::new()
+        } else {
+            let mut map = HashMap::new();
+            for hit in &entity_hits {
+                let backend_id = self.inner.locate(hit.entity_id, namespace).await;
+                if let Some(bid) = backend_id {
+                    if let Some(entry) = self.inner.registry().get(&bid) {
+                        let rt = &entry.runtime;
+                        if let Ok(token) = rt.authorize(namespace.clone()) {
+                            if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
+                                map.insert(hit.entity_id, entity.kind);
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        };
+
+        // Batch-fetch note kinds for each merged note hit.
+        let note_kinds: HashMap<Uuid, String> = if note_hits.is_empty() {
+            HashMap::new()
+        } else {
+            let mut map = HashMap::new();
+            for hit in &note_hits {
+                let backend_id = self.inner.locate(hit.note_id, namespace).await;
+                if let Some(bid) = backend_id {
+                    if let Some(entry) = self.inner.registry().get(&bid) {
+                        let rt = &entry.runtime;
+                        if let Ok(token) = rt.authorize(namespace.clone()) {
+                            if let Ok(store) = rt.notes(&token) {
+                                if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                                    map.insert(hit.note_id, note.kind);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        };
 
         let coord_per_backend: Vec<CoordBackendResult> = per_backend
             .into_iter()
@@ -119,6 +167,8 @@ impl CoordinatorService for SubstrateCoordinatorService {
             note_hits,
             per_backend: coord_per_backend,
             partial,
+            entity_kinds,
+            note_kinds,
         }
     }
 

@@ -329,6 +329,12 @@ impl SubstrateCoordinator {
     /// - `false` → entity fan-out via `hybrid_search`
     /// - `true`  → note fan-out via `search_notes`
     ///
+    /// `kind_filter` is passed as the storage-level kind filter:
+    /// - entity substrate: `entity_kind` parameter of `hybrid_search`
+    /// - note substrate: `note_kind` parameter of `search_notes`
+    ///
+    /// Pass `None` for substrate-level searches (`kind="entity"` or `kind="note"`).
+    ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
     pub async fn fan_out_search(
@@ -337,6 +343,7 @@ impl SubstrateCoordinator {
         namespace: &Namespace,
         limit: u32,
         search_notes: bool,
+        kind_filter: Option<&str>,
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
@@ -365,7 +372,7 @@ impl SubstrateCoordinator {
             };
             if search_notes {
                 match runtime
-                    .search_notes(&token, query, None, limit, None, false)
+                    .search_notes(&token, query, None, limit, kind_filter, false)
                     .await
                 {
                     Ok(note_hits) => {
@@ -389,7 +396,7 @@ impl SubstrateCoordinator {
                 }
             } else {
                 match runtime
-                    .hybrid_search(&token, query, None, limit, None, None)
+                    .hybrid_search(&token, query, None, limit, kind_filter, None)
                     .await
                 {
                     Ok(hits) => {
@@ -416,6 +423,7 @@ impl SubstrateCoordinator {
 
         let query = query.to_string();
         let ns = namespace.clone();
+        let kind_filter_owned: Option<String> = kind_filter.map(|s| s.to_string());
 
         #[cfg(test)]
         let fail_id: Option<String> = self.fail_backend_id.clone();
@@ -426,6 +434,7 @@ impl SubstrateCoordinator {
         for (backend_id, runtime) in entries {
             let q = query.clone();
             let ns = ns.clone();
+            let kf = kind_filter_owned.clone();
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -449,7 +458,7 @@ impl SubstrateCoordinator {
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(&token, &q, None, limit, None, false)
+                        .search_notes(&token, &q, None, limit, kf.as_deref(), false)
                         .await;
                     match result {
                         Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
@@ -457,7 +466,7 @@ impl SubstrateCoordinator {
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(&token, &q, None, limit, None, None)
+                        .hybrid_search(&token, &q, None, limit, kf.as_deref(), None)
                         .await;
                     match result {
                         Ok(hits) => (backend_id, Ok(hits), None),

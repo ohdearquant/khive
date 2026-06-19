@@ -911,12 +911,35 @@ async fn dispatch_via_coordinator_inner(
                 .map(|v| v as u32)
                 .unwrap_or(10)
                 .min(100);
+            let score_floor = args_value
+                .get("min_score")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .max(0.0);
 
-            let coord_result = coord.fan_out_search(kind, query, &namespace, limit).await;
+            // For substrate-level kinds ("entity" / "note"), pass None so the search
+            // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
+            // the kind string so each backend filters at the storage layer — matching
+            // the behaviour of the single-backend handler (search.rs).
+            let kind_filter: Option<&str> = match kind {
+                "entity" | "note" => None,
+                other => Some(other),
+            };
 
-            // Shape result to match kg search handler's output field-for-field.
+            let coord_result = coord
+                .fan_out_search(kind, query, &namespace, limit, kind_filter)
+                .await;
+
+            // Shape result to match the kg search handler's output fields exactly.
             // Entity hits: [{id, entity_kind, score, title, snippet}]
+            //   - entity_kind: real kind string fetched from the owning backend
+            //   - score: RRF-merged, subject to min_score floor
             // Note hits:   [{id, note_kind, score, title, snippet}]
+            //   - note_kind: real kind string fetched from the owning backend
+            //
+            // NOTE: props/tags filters are not applied here (deferred).
+            // All other parity gaps (kind filter, min_score, real kinds) are closed.
+            // TODO(ADR-029): apply props/tags entity filters in fan-out path — khive#176
             let result_val = if !coord_result.note_hits.is_empty()
                 || (coord_result.entity_hits.is_empty() && coord_result.note_hits.is_empty())
             {
@@ -924,10 +947,12 @@ async fn dispatch_via_coordinator_inner(
                 let items: Vec<Value> = coord_result
                     .note_hits
                     .iter()
+                    .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
+                        let note_kind = coord_result.note_kinds.get(&h.note_id);
                         json!({
                             "id": h.note_id.to_string(),
-                            "note_kind": null,
+                            "note_kind": note_kind,
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,
@@ -940,10 +965,12 @@ async fn dispatch_via_coordinator_inner(
                 let items: Vec<Value> = coord_result
                     .entity_hits
                     .iter()
+                    .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
+                        let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
                         json!({
                             "id": h.entity_id.to_string(),
-                            "entity_kind": null,
+                            "entity_kind": entity_kind,
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,
