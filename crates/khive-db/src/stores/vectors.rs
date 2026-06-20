@@ -19,6 +19,69 @@ use khive_types::SubstrateKind;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 
+// ---------------------------------------------------------------------------
+// Test-only failpoint: force an error between DELETE and INSERT to exercise
+// the SAVEPOINT ROLLBACK TO path in insert_batch and the transaction rollback
+// in update.  Zero impact on release builds — the entire block is cfg(test).
+//
+// Uses Arc<AtomicBool> rather than thread_local! because the actual DB work
+// runs inside tokio::task::spawn_blocking on a worker thread different from
+// the test thread.  The Arc is cloned into the closure so both sides share
+// the same flag without a thread boundary problem.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod failpoint {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Per-test handle to the shared AtomicBool.  Each test that needs
+        /// the failpoint calls `arm()` to create a fresh Arc and store it here;
+        /// the `FailpointGuard` clears it on drop.
+        pub(super) static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    /// Create a fresh `Arc<AtomicBool>` set to `true` and register it in the
+    /// thread-local so the write closure can capture it before spawn_blocking.
+    pub(super) fn arm() {
+        let flag = Arc::new(AtomicBool::new(true));
+        CURRENT.with(|c| *c.borrow_mut() = Some(flag));
+    }
+
+    /// Disarm: clear the thread-local (the Arc may live on in the closure
+    /// a moment longer, but the flag is already spent after one `take()`).
+    pub(super) fn disarm() {
+        CURRENT.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// Called from inside the write closure (worker thread).
+    /// Atomically swaps `true` → `false` and returns whether it fired.
+    pub(super) fn take(flag: &Arc<AtomicBool>) -> bool {
+        flag.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// RAII guard: arms the failpoint on construction and disarms on drop.
+    /// The Arc is stored in the thread-local and captured by the write closure
+    /// directly; the guard's only job is to ensure `disarm()` runs on drop.
+    pub(super) struct FailpointGuard;
+
+    impl FailpointGuard {
+        pub(super) fn new() -> Self {
+            arm();
+            Self
+        }
+    }
+
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            disarm();
+        }
+    }
+}
+
 /// Cast a `&[f32]` slice to `&[u8]` for sqlite-vec blob binding.
 ///
 /// # Safety
@@ -259,6 +322,11 @@ impl VectorStore for SqliteVecStore {
         let attempted = records.len() as u64;
         let store_embedding_model = self.embedding_model.clone();
 
+        // Capture the failpoint Arc (if any) from the thread-local on the
+        // calling thread before handing the closure to spawn_blocking.
+        #[cfg(test)]
+        let _failpoint_flag = failpoint::CURRENT.with(|c| c.borrow().clone());
+
         self.with_writer("vec_insert_batch", move |conn| {
             let del_sql = format!(
                 "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
@@ -298,6 +366,17 @@ impl VectorStore for SqliteVecStore {
                 conn.execute_batch("SAVEPOINT vec_batch_record")?;
                 let result = (|| {
                     conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace])?;
+                    // Failpoint: fires only in cfg(test) when the guard is active.
+                    // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing,
+                    // the deleted row is lost permanently.
+                    #[cfg(test)]
+                    if let Some(ref fp) = _failpoint_flag {
+                        if failpoint::take(fp) {
+                            return Err(rusqlite::Error::InvalidParameterName(
+                                "__test_failpoint_after_delete__".into(),
+                            ));
+                        }
+                    }
                     conn.execute(
                         &ins_sql,
                         rusqlite::params![
@@ -366,6 +445,11 @@ impl VectorStore for SqliteVecStore {
             }
         }
 
+        // Capture the failpoint Arc (if any) from the thread-local on the
+        // calling thread before handing the closure to spawn_blocking.
+        #[cfg(test)]
+        let _failpoint_flag = failpoint::CURRENT.with(|c| c.borrow().clone());
+
         self.with_writer("vec_update", move |conn| {
             if embedding.len() != dims {
                 return Err(rusqlite::Error::InvalidParameterCount(
@@ -386,6 +470,18 @@ impl VectorStore for SqliteVecStore {
                 &del_sql,
                 rusqlite::params![subject_id.to_string(), &namespace],
             )?;
+
+            // Failpoint: fires only in cfg(test) when the guard is active.
+            // DELETE has already run; if the transaction rollback is missing,
+            // the deleted row is lost permanently.
+            #[cfg(test)]
+            if let Some(ref fp) = _failpoint_flag {
+                if failpoint::take(fp) {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "__test_failpoint_after_delete__".into(),
+                    ));
+                }
+            }
 
             let ins_sql = format!(
                 "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
@@ -1329,10 +1425,12 @@ mod atomic_replace_tests {
     /// occupies it (from the ns:a stale row).  The UNIQUE constraint fires — INSERT
     /// fails — ROLLBACK TO SAVEPOINT executes — stale row in ns:a survives intact.
     ///
-    /// Sentinel: removing `ROLLBACK TO SAVEPOINT` would not change the outcome here
-    /// (DELETE was a no-op), but any partial shadow-table write between the SAVEPOINT
-    /// and the INSERT error would be left uncommitted, potentially corrupting the
-    /// stale row's embedding bytes.  The similarity assertion (>0.999) detects that.
+    /// NOTE: removing `ROLLBACK TO SAVEPOINT` would NOT change the outcome for this
+    /// specific test, because the DELETE was a no-op (different namespace).  This test
+    /// is NOT the rollback sentinel — it covers the PK-conflict path and verifies
+    /// that the outer COMMIT succeeds.  For the true sentinel (DELETE succeeds then
+    /// INSERT is injected to fail), see
+    /// `insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
     ///
     /// Additionally: insert_batch must count the record as `failed` and must not
     /// abort the outer `BEGIN IMMEDIATE` transaction (the COMMIT must succeed).
@@ -1446,6 +1544,10 @@ mod atomic_replace_tests {
     ///
     /// Final state: (id_X, ns:a, new_vec).  The search with new_vec yields ~1.0,
     /// confirming Record A's rolled-back SAVEPOINT did not corrupt what Record B wrote.
+    ///
+    /// NOTE: Record A's DELETE is a no-op (different namespace), so removing
+    /// `ROLLBACK TO SAVEPOINT` would NOT change this test's outcome.  The true
+    /// sentinel is `insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
     #[tokio::test]
     async fn insert_batch_rollback_does_not_corrupt_subsequent_record() {
         let pool = make_vec_pool();
@@ -1548,6 +1650,10 @@ mod atomic_replace_tests {
     ///   - INSERT (id_X, ns:b) hits vec0 PK constraint (id_X in _rowids held by ns:a).
     ///   - `unchecked_transaction()` rolls back.
     ///   - Stale row in ns:a survives intact.
+    ///
+    /// NOTE: the DELETE is a no-op (different namespace), so removing the transaction
+    /// rollback would NOT change this test's outcome.  The true sentinel is
+    /// `update_rollback_restores_deleted_stale_after_post_delete_insert_failure`.
     #[tokio::test]
     async fn update_pk_conflict_rolls_back_transaction_preserves_stale() {
         let pool = make_vec_pool();
@@ -1631,6 +1737,256 @@ mod atomic_replace_tests {
             sim > 0.999,
             "cosine similarity of stale_vec to itself must be ~1.0 (got {sim:.6}); \
              transaction rollback must leave embedding bytes unchanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // True ROLLBACK TO SAVEPOINT sentinels (failpoint-driven)
+    //
+    // The PK-conflict tests above exercise the SAVEPOINT path, but the DELETE
+    // is a no-op in those tests (different namespace).  Removing the
+    // `ROLLBACK TO SAVEPOINT vec_batch_record` line from insert_batch, or the
+    // transaction rollback from update, would NOT make those tests fail.
+    //
+    // The two tests below use a cfg(test) failpoint that fires AFTER a
+    // successful same-namespace DELETE and BEFORE the INSERT.  This means:
+    //   - The stale row is genuinely gone from the DB when the error fires.
+    //   - Only a correct ROLLBACK TO SAVEPOINT (or tx.rollback) restores it.
+    //   - Removing those rollback lines WILL make these tests fail.
+    //
+    // Value-level failures (dim/finite/count) are rejected before the
+    // SAVEPOINT opens, so there is no natural same-namespace path to reach
+    // a post-DELETE INSERT failure through the public API.  The failpoint is
+    // the only way to produce this condition in a unit test without modifying
+    // production logic.
+    // -----------------------------------------------------------------------
+
+    /// SENTINEL — insert_batch: stale row is restored when DELETE succeeds but
+    /// INSERT is forced to fail via the cfg(test) failpoint.
+    ///
+    /// Setup: insert stale `(id_X, ns:a, vec1)`.
+    /// Failpoint: `FAIL_AFTER_DELETE` is armed before the batch call.
+    /// Batch: one record `(id_X, ns:a, vec2)` — same namespace, correct dims,
+    ///        all finite — so the production DELETE genuinely removes the stale
+    ///        row, then the failpoint fires before INSERT.
+    /// Expected: `ROLLBACK TO SAVEPOINT vec_batch_record` restores the stale row.
+    ///   - `batch_exists` finds id_X in ns:a.
+    ///   - Search with vec1 returns similarity > 0.999 (not vec2).
+    ///   - BatchWriteSummary: attempted=1, affected=0, failed=1.
+    ///
+    /// FAILURE MODE: delete line 320 (`ROLLBACK TO SAVEPOINT vec_batch_record`)
+    /// from insert_batch and this test fails — the stale row is gone.
+    #[tokio::test]
+    async fn insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
+        let pool = make_vec_pool();
+        let model_key = "sentinel_batch_rb";
+        let dims = 4;
+        let ns = "ns:sentinel_batch";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_x = Uuid::new_v4();
+        let vec1 = vec![0.1f32, 0.2, 0.3, 0.4];
+        let vec2 = vec![0.9f32, 0.0, 0.0, 0.0];
+
+        // Insert the stale row that must survive.
+        store
+            .insert(id_x, SubstrateKind::Entity, ns, "body", vec![vec1.clone()])
+            .await
+            .expect("stale insert");
+
+        // Arm the failpoint under an RAII guard so it always clears on exit.
+        // The guard is dropped AFTER the batch call returns, but `take()` is
+        // one-shot — it clears the flag the moment the failpoint fires.
+        let _guard = failpoint::FailpointGuard::new();
+
+        // Same namespace, correct dims, finite — DELETE will run, then failpoint fires.
+        let summary = store
+            .insert_batch(vec![VectorRecord {
+                subject_id: id_x,
+                kind: SubstrateKind::Entity,
+                namespace: ns.to_string(),
+                field: "body".to_string(),
+                embedding_model: None,
+                vectors: vec![vec2.clone()],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch must complete (outer tx must commit regardless)");
+
+        drop(_guard); // explicit drop for clarity; flag already cleared by take()
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(
+            summary.affected, 0,
+            "failpoint must prevent INSERT from succeeding"
+        );
+        assert_eq!(
+            summary.failed, 1,
+            "failed counter must increment after injected failure"
+        );
+
+        // ROLLBACK TO SAVEPOINT must have restored the deleted stale row.
+        let present = store
+            .batch_exists(&[id_x], ns)
+            .await
+            .expect("batch_exists after failpoint");
+        assert!(
+            present.contains(&id_x),
+            "ROLLBACK TO SAVEPOINT must restore the stale row after DELETE + injected failure"
+        );
+
+        // Self-similarity with vec1 (not vec2) confirms the original bytes are restored.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec1.clone()],
+                top_k: 1,
+                namespace: Some(ns.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search after failpoint");
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "stale vector must be searchable after rollback"
+        );
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "similarity to vec1 must be ~1.0 (got {sim:.6}); \
+             a lower value means the stale embedding was not restored — ROLLBACK TO SAVEPOINT failed"
+        );
+
+        // Cross-check: vec2 must NOT be the stored embedding.
+        let hits2 = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec2.clone()],
+                top_k: 1,
+                namespace: Some(ns.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search vec2 after failpoint");
+        let sim2 = hits2.first().map(|h| h.score.to_f64()).unwrap_or(0.0);
+        assert!(
+            sim2 < 0.99,
+            "similarity to vec2 must be < 0.99 (got {sim2:.6}); \
+             vec2 must not be the stored embedding after a rolled-back INSERT"
+        );
+    }
+
+    /// SENTINEL — update: stale row is restored when DELETE succeeds but INSERT
+    /// is forced to fail via the cfg(test) failpoint.
+    ///
+    /// Setup: insert stale `(id_X, ns:a, vec1)`.
+    /// Failpoint: `FAIL_AFTER_DELETE` is armed before the update call.
+    /// Call: `update(id_X, ns:a, vec2)` — same namespace, correct dims, finite.
+    ///       DELETE removes the stale row, then the failpoint fires before INSERT.
+    /// Expected: `unchecked_transaction` rolls back, restoring the stale row.
+    ///   - `batch_exists` finds id_X in ns:a.
+    ///   - Search with vec1 returns similarity > 0.999 (not vec2).
+    ///   - `update` returns Err (the injected error propagates out).
+    ///
+    /// FAILURE MODE: remove the transaction's DROP/rollback from update and
+    /// this test fails — the stale row is gone.
+    #[tokio::test]
+    async fn update_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
+        let pool = make_vec_pool();
+        let model_key = "sentinel_upd_rb";
+        let dims = 4;
+        let ns = "ns:sentinel_upd";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_x = Uuid::new_v4();
+        let vec1 = vec![0.1f32, 0.2, 0.3, 0.4];
+        let vec2 = vec![0.9f32, 0.0, 0.0, 0.0];
+
+        // Insert the stale row that must survive.
+        store
+            .insert(id_x, SubstrateKind::Entity, ns, "body", vec![vec1.clone()])
+            .await
+            .expect("stale insert");
+
+        // Arm the failpoint under a RAII guard.
+        let _guard = failpoint::FailpointGuard::new();
+
+        // Same namespace, correct dims, finite — DELETE will run, then failpoint fires.
+        let result = store
+            .update(id_x, SubstrateKind::Entity, ns, "body", vec![vec2.clone()])
+            .await;
+
+        drop(_guard);
+
+        assert!(
+            result.is_err(),
+            "update must propagate the injected error back to the caller"
+        );
+
+        // Transaction rollback must have restored the deleted stale row.
+        let present = store
+            .batch_exists(&[id_x], ns)
+            .await
+            .expect("batch_exists after failpoint");
+        assert!(
+            present.contains(&id_x),
+            "transaction rollback must restore the stale row after DELETE + injected failure"
+        );
+
+        // Self-similarity with vec1 confirms the original bytes are intact.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec1.clone()],
+                top_k: 1,
+                namespace: Some(ns.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search after failpoint");
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "stale vector must be searchable after rollback"
+        );
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "similarity to vec1 must be ~1.0 (got {sim:.6}); \
+             a lower value means the stale embedding was not restored — transaction rollback failed"
         );
     }
 }
