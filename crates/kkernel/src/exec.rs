@@ -49,6 +49,10 @@ pub struct ExecArgs {
     /// checksum}`) is printed to stdout instead of the raw results.  Parent
     /// directories are created if absent.
     ///
+    /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
+    /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
+    /// hit a cold or warming index on the first call after a daemon restart.
+    ///
     /// Example:
     ///   kkernel exec 'list(kind="entity")' --save-file /tmp/entities.jsonl
     #[arg(long)]

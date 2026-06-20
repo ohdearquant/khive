@@ -110,12 +110,13 @@ fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     }
 
     // Try tmp+rename for atomicity.
-    let tmp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    // Build the tmp extension without a leading dot so extensionless paths
+    // (e.g. `/tmp/outfile`) don't produce a double-dot (`outfile..tmp`).
+    let tmp_ext = match path.extension() {
+        Some(e) => format!("{}.tmp", e.to_string_lossy()),
+        None => "tmp".to_string(),
+    };
+    let tmp_path = path.with_extension(tmp_ext);
     if std::fs::write(&tmp_path, data).is_ok() {
         if std::fs::rename(&tmp_path, path).is_ok() {
             return Ok(());
@@ -225,6 +226,25 @@ mod tests {
         let m2 = write_and_manifest(&envelope, &path).unwrap();
         assert_eq!(m1["checksum"], m2["checksum"]);
         assert_eq!(m1["schema_fingerprint"], m2["schema_fingerprint"]);
+    }
+
+    #[test]
+    fn extensionless_target_produces_clean_tmp_path() {
+        let tmp = TempDir::new().unwrap();
+        // A target with no extension must not produce a `..tmp` double-dot path.
+        let path = tmp.path().join("outfile");
+        let envelope = make_envelope(vec![
+            json!({ "ok": true, "tool": "stats", "result": { "n": 1 } }),
+        ]);
+        // write_and_manifest must succeed (it uses write_atomic internally).
+        write_and_manifest(&envelope, &path).unwrap();
+        assert!(path.exists());
+        // No double-dot artefact left behind.
+        let double_dot = tmp.path().join("outfile..tmp");
+        assert!(
+            !double_dot.exists(),
+            "double-dot tmp path must not be created"
+        );
     }
 
     #[test]

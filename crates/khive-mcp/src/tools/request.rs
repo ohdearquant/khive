@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Input for `request` — a DSL string (function-call or JSON form) plus
 /// optional presentation controls (`presentation` and `presentation_per_op`).
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RequestParams {
     /// One or more operations as a function-call DSL or JSON-form string.
     ///
