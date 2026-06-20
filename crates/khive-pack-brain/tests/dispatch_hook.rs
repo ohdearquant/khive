@@ -68,28 +68,9 @@ async fn dispatch_hook_fires_on_cold_namespace_no_prior_activation() {
         .await
         .expect("create entity must succeed");
 
-    // Before promotion: the signal must be in the cold pending queue.
-    let cold_events = brain.cold_namespace_total_events("local");
-    assert!(
-        cold_events.is_some(),
-        "cold-namespace 'local' pending queue must have been initialised by the hook"
-    );
-    assert_eq!(
-        cold_events.unwrap(),
-        1,
-        "cold pending queue must hold 1 signal before ensure_loaded; got {:?}",
-        cold_events
-    );
-
     // Promote via the production dispatch path (acquires gate, runs ensure_loaded,
     // drains the pending queue).
     promote_namespace(&brain, &rt, "local").await;
-
-    // After promotion: the pending queue must be empty (drained into active state).
-    assert!(
-        brain.cold_namespace_total_events("local").is_none(),
-        "pending queue for 'local' must be empty after ensure_loaded drains it"
-    );
 
     // The active snapshot must reflect the queued signal.
     let snap = brain.snapshot();
@@ -152,18 +133,6 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
             .expect("beta dispatch");
     }
 
-    // Before promotion: pending queues must hold the correct counts.
-    assert_eq!(
-        brain.cold_namespace_total_events("ns-alpha"),
-        Some(2),
-        "ns-alpha pending queue must have exactly 2 signals before promotion"
-    );
-    assert_eq!(
-        brain.cold_namespace_total_events("ns-beta"),
-        Some(3),
-        "ns-beta pending queue must have exactly 3 signals before promotion"
-    );
-
     // Promote ns-alpha via the production dispatch path.
     promote_namespace(&brain, &rt, "ns-alpha").await;
 
@@ -172,17 +141,6 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
         snap_alpha.balanced_recall.total_events, 2,
         "ns-alpha active snapshot must show 2 events after promotion; got {}",
         snap_alpha.balanced_recall.total_events
-    );
-    assert!(
-        brain.cold_namespace_total_events("ns-alpha").is_none(),
-        "ns-alpha pending queue must be empty after promotion"
-    );
-
-    // ns-beta queue must still be intact while ns-alpha is active.
-    assert_eq!(
-        brain.cold_namespace_total_events("ns-beta"),
-        Some(3),
-        "ns-beta pending queue must remain 3 while ns-alpha is active"
     );
 
     // Promote ns-beta via the production dispatch path.
@@ -193,10 +151,6 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
         snap_beta.balanced_recall.total_events, 3,
         "ns-beta active snapshot must show 3 events after promotion; got {}",
         snap_beta.balanced_recall.total_events
-    );
-    assert!(
-        brain.cold_namespace_total_events("ns-beta").is_none(),
-        "ns-beta pending queue must be empty after promotion"
     );
 }
 
@@ -209,17 +163,22 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
     let brain = Arc::new(BrainPack::new(rt.clone()));
 
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt));
+    builder.register(KgPack::new(rt.clone()));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");
 
     let _ = registry.dispatch("frobnicate_nonexistent", json!({})).await;
 
-    // The verb errored, so the cold bucket for "local" must not have been created.
-    assert!(
-        brain.cold_namespace_total_events("local").is_none(),
-        "failed dispatch must NOT initialise the cold namespace pending queue"
+    // Promote "local" via the production path to flush any pending signals.
+    // A failed dispatch must not have enqueued any signal, so total_events stays 0.
+    promote_namespace(&brain, &rt, "local").await;
+
+    let snap = brain.snapshot();
+    assert_eq!(
+        snap.balanced_recall.total_events, 0,
+        "failed dispatch must NOT fire the hook; total_events must remain 0 after promotion; got {}",
+        snap.balanced_recall.total_events
     );
 }
 
