@@ -2,6 +2,7 @@
 
 mod common;
 mod feedback;
+mod prune;
 mod recall;
 mod remember;
 mod sub_handlers;
