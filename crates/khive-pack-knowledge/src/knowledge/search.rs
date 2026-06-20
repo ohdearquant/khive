@@ -1031,7 +1031,38 @@ impl KnowledgeHandlers {
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             let ann_k = fetch_limit.max(20);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
-            if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
+
+            // If the ANN slot is absent but a background warm is in flight, wait a
+            // bounded time before continuing with FTS-only results.  This avoids a
+            // cold-start race where the ANN is loading and the first query silently
+            // returns ok:true,total:0 when FTS also finds nothing.
+            let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
+            if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
+                const WARM_TIMEOUT_MS: u64 = 3_000;
+                const WARM_POLL_MS: u64 = 50;
+                if vamana::wait_for_ann(ann, &key, WARM_TIMEOUT_MS, WARM_POLL_MS).await {
+                    ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
+                } else {
+                    // Still not ready: if FTS already found results, those are
+                    // valid partial hits — return them.  Only surface the warming
+                    // error when FTS is also empty and the corpus is non-empty.
+                    if hits.is_empty() {
+                        let model = runtime.default_embedder_name();
+                        let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
+                            .await
+                            .map(|fp| fp.vector_count > 0)
+                            .unwrap_or(false);
+                        if corpus_non_empty {
+                            return Err(RuntimeError::Internal(
+                                "ANN index is warming after daemon restart — retry in a few seconds"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let Some(ann_hits) = ann_hits_opt {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, min_score);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
@@ -1123,7 +1154,36 @@ impl KnowledgeHandlers {
             // top ANN neighbors before the type gate discards atom hits.
             let ann_k = (limit * 50).max(200);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
-            if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
+
+            // If the ANN index is not yet loaded but is actively warming (background
+            // task in flight), wait a bounded time before falling through.  This
+            // prevents a race between the daemon warm-start and the first incoming
+            // query from producing a silent ok:true,total:0 result.
+            let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
+            if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
+                const WARM_TIMEOUT_MS: u64 = 3_000;
+                const WARM_POLL_MS: u64 = 50;
+                if vamana::wait_for_ann(ann, &key, WARM_TIMEOUT_MS, WARM_POLL_MS).await {
+                    ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
+                } else {
+                    // Still not ready after the wait.  Check whether the vector
+                    // corpus is non-empty: if so, the index is genuinely warming
+                    // and an empty result would be misleading.
+                    let model = runtime.default_embedder_name();
+                    let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
+                        .await
+                        .map(|fp| fp.vector_count > 0)
+                        .unwrap_or(false);
+                    if corpus_non_empty {
+                        return Err(RuntimeError::Internal(
+                            "ANN index is warming after daemon restart — retry in a few seconds"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(ann_hits) = ann_hits_opt {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, 0.0);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;

@@ -103,6 +103,47 @@ pub(crate) async fn search_loaded(
     guard.get(key).map(|bridge| bridge.search(query, k))
 }
 
+/// Returns `true` when `key` is registered in the warming set but its index has
+/// not yet been inserted — i.e. a background load is in flight right now.
+///
+/// `false` means either (a) the index is already loaded, or (b) no warm has
+/// been triggered for this key at all (e.g. the corpus is empty).
+pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
+    let in_warming = ann.warming.lock().expect("warming lock").contains(key);
+    if !in_warming {
+        return false;
+    }
+    // Sync check: if index is present, warming finished already.
+    // `try_read()` avoids blocking — if the write lock is held we conservatively
+    // report warming=true (the write lock is held during insert, so the index is
+    // about to appear; treating it as "still warming" is safe).
+    match ann.indexes.try_read() {
+        Ok(guard) => !guard.contains_key(key),
+        Err(_) => true,
+    }
+}
+
+/// Poll `ann` until `key` appears in the loaded index set or `timeout_ms` elapses.
+///
+/// Returns `true` if the index became available within the timeout.
+pub(crate) async fn wait_for_ann(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    timeout_ms: u64,
+    poll_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if ann.indexes.read().await.contains_key(key) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+    }
+}
+
 impl AnnBridge {
     pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         if dim == 0 {
@@ -586,6 +627,14 @@ pub(crate) async fn ensure_ann_for_model(
     }
 }
 
+/// Simulate an in-flight warm by inserting `key` into the warming set without
+/// populating the index.  Call this in tests to construct the "warming but not
+/// yet loaded" state that triggers the cold-start guard in `suggest`/`search`.
+#[cfg(test)]
+pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
+    ann.warming.lock().expect("warming lock").insert(key);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +766,88 @@ mod tests {
             hits_b[0].0, id_b,
             "namespace B query must not return namespace A neighbour"
         );
+    }
+
+    // ── is_warming_not_loaded ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_warming_false_when_neither_warming_nor_loaded() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        assert!(
+            !is_warming_not_loaded(&ann, &key),
+            "key absent from both sets must return false"
+        );
+    }
+
+    #[test]
+    fn is_warming_true_when_in_warming_but_not_indexes() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        simulate_warming_in_flight(&ann, key.clone());
+        assert!(
+            is_warming_not_loaded(&ann, &key),
+            "key in warming but not indexes must return true"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_warming_false_when_both_warming_and_loaded() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        // Mark as warming.
+        simulate_warming_in_flight(&ann, key.clone());
+        // Now insert the index (simulates background warm completing).
+        let bridge =
+            AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()]).expect("build");
+        insert_ann_if_absent(&ann, key.clone(), bridge).await;
+        assert!(
+            !is_warming_not_loaded(&ann, &key),
+            "key in both warming and indexes must return false (warm is done)"
+        );
+    }
+
+    // ── wait_for_ann ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_for_ann_returns_true_immediately_when_already_loaded() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        let bridge =
+            AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()]).expect("build");
+        insert_ann_if_absent(&ann, key.clone(), bridge).await;
+        // Already loaded — should return true without sleeping.
+        let ready = wait_for_ann(&ann, &key, 100, 10).await;
+        assert!(ready, "must return true when index is already in the map");
+    }
+
+    #[tokio::test]
+    async fn wait_for_ann_returns_false_on_timeout_when_never_loaded() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        // Nothing inserted — should time out and return false.
+        let ready = wait_for_ann(&ann, &key, 60, 10).await;
+        assert!(
+            !ready,
+            "must return false when index never appears within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ann_returns_true_when_index_appears_mid_poll() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        let ann2 = ann.clone();
+        let key2 = key.clone();
+        // Spawn a task that inserts the bridge after a short delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+                .expect("build");
+            insert_ann_if_absent(&ann2, key2, bridge).await;
+        });
+        // Poll with a 500ms timeout; the insert happens at ~40ms so it should succeed.
+        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        assert!(ready, "must return true when index appears before timeout");
     }
 }
