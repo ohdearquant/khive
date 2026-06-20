@@ -282,8 +282,18 @@ To avoid this, use one of:
 
 The daemon caches a `config_id` fingerprint that folds in the backend topology.
 Two configs that differ only in pack-to-backend routing produce different
-`config_id` values, so a topology change causes the daemon to restart with the
-new config rather than serving the old one.
+`config_id` values. A client whose `config_id` does not match the running
+daemon's does not use, kill, or restart that daemon. It silently falls back to
+local in-process dispatch (cold, without the daemon's warm ANN indexes), while
+the daemon keeps serving its original config to clients that still match it.
+
+This matters operationally. After you change `[[backends]]` or `[packs.*]`
+routing, kill the running daemon so the next client spawns a fresh one on the
+new topology. `make local` does this as part of install; otherwise stop it
+manually (for example `pkill -f "kkernel mcp --daemon"`). Until the daemon is
+replaced, clients on the new config run cold via local dispatch. The daemon is
+killed and respawned automatically only for a stale binary or a
+protocol-version mismatch, never for config-id drift.
 
 ---
 
@@ -305,8 +315,9 @@ backends are never deduplicated (each gets its own in-process database).
 
 ### Read-only backends
 
-Setting `read_only = true` on a backend opens it with `PRAGMA query_only = ON`.
-Any write attempt (DDL or DML) through that backend returns an error. The
+Setting `read_only = true` opens reader connections with
+`SQLITE_OPEN_READ_ONLY` and applies `PRAGMA query_only = ON` to the writer slot,
+so any write attempt (DDL or DML) through that backend returns an error. The
 regression test `read_only_backend_rejects_writes` in
 `crates/khive-mcp/src/serve.rs` verifies this behavior.
 
