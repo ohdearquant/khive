@@ -89,7 +89,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the entity, note, edge, event, or proposal to fetch.",
+                description: "UUID of the entity, note, edge, event, or proposal to fetch. \
+                               Short hex prefix accepted (minimum 8 hex characters); \
+                               shorter prefixes are not resolved and will be treated as a name lookup.",
             },
             ParamDef {
                 name: "include_deleted",
@@ -340,7 +342,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
     // Declaration: declares two entities identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities",
+        description: "Deduplicate two entities. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
+                       chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -544,7 +547,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits a proposal to the namespace event log
     HandlerDef {
         name: "propose",
-        description: "Create an event-sourced change proposal",
+        description: "Create an event-sourced change proposal. Returns {id, status, proposer, title}; \
+                       chain with $prev.id (not $prev.proposal_id). \
+                       Note: the changeset field contains nested objects and cannot be expressed in \
+                       function-call DSL form — use JSON form instead: \
+                       request(ops=\"[{\\\"tool\\\":\\\"propose\\\",\\\"args\\\":{...}}]\").",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

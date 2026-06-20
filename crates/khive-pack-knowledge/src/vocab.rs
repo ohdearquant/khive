@@ -123,7 +123,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "insert_only",
                 param_type: "boolean",
                 required: false,
-                description: "Skip delete-then-insert (faster for fresh corpus backfill)",
+                description: "Deprecated no-op. Accepted for API compatibility but no longer drives any pre-delete behavior; SqliteVecStore::insert atomically replaces regardless of this flag.",
             },
             ParamDef {
                 name: "rebuild_ann",
@@ -326,7 +326,9 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "sections",
                 param_type: "array<object>",
                 required: true,
-                description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]",
+                description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]. \
+                    section_type is a closed enum — valid values: overview | core_model | boundary_conditions | formalism | operational_guidance | examples | failure_modes | expert_lens | references | other. \
+                    content must be ≥80 characters.",
             },
         ],
     },
