@@ -165,14 +165,7 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        // L2: skip the second pass when alpha == 1.0 — both passes would be identical.
-        let passes: &[f64] = if (config.alpha - 1.0f64).abs() < 1e-9 {
-            &[1.0f64]
-        } else {
-            &[1.0f64, config.alpha]
-        };
-
-        for &pass_alpha in passes {
+        for &pass_alpha in &[1.0f64, config.alpha] {
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
@@ -1319,35 +1312,6 @@ mod tests {
             matches!(err, Err(VamanaError::InvalidFormat { .. })),
             "expected InvalidFormat, got {err:?}"
         );
-    }
-
-    /// L2 regression: build with alpha=1.0 produces the same graph as build with alpha=1.2
-    /// followed by a second pass at 1.0 would if both passes were identical. More concretely:
-    /// the single-pass (alpha=1.0) result must be deterministic across two calls, and its
-    /// recall and degree bounds must hold — same invariants as the two-pass path.
-    #[test]
-    fn build_alpha_one_single_pass_is_deterministic_and_bounded() {
-        use rand::SeedableRng;
-        let mut rng = StdRng::seed_from_u64(0xA1FA_1A1F);
-        let n = 40usize;
-        let dim = 4usize;
-        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-
-        let cfg = VamanaConfig::with_dimensions(dim)
-            .with_max_degree(8)
-            .with_search_list_size(16)
-            .with_alpha(1.0);
-
-        let g1 = VamanaGraph::build(&raw, &cfg).unwrap();
-        let g2 = VamanaGraph::build(&raw, &cfg).unwrap();
-
-        assert_eq!(g1, g2, "alpha=1.0 build must be deterministic");
-        for list in g1.adjacency() {
-            assert!(
-                list.len() <= 8,
-                "degree bound violated after alpha=1.0 build"
-            );
-        }
     }
 
     /// KHIVE_BUILD_BATCH env knob: the runtime batch-size resolver clamps to at least 1
