@@ -151,12 +151,23 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             // it — making `map_response` accept the stale response when
             // `served_config_id` happens to match. Detect this here so the
             // caller can route it through the same kill/respawn path.
-            if frame.daemon_protocol_version != PROTOCOL_VERSION && !frame.version_mismatch {
+            //
+            // Also catch the explicit-mismatch / auto-upgrade case (#156): when a
+            // warm OLD daemon receives a request from a NEWER client it responds
+            // with `version_mismatch=true` and its own (lower) version number.
+            // `daemon_protocol_version < PROTOCOL_VERSION` means the daemon is
+            // stale — route through kill+respawn exactly like the implicit case
+            // above.  If `daemon_protocol_version > PROTOCOL_VERSION` the client
+            // binary is behind; kill+respawn cannot fix that, so let map_response
+            // return a hard error.
+            let is_stale_daemon = frame.daemon_protocol_version != PROTOCOL_VERSION
+                && (!frame.version_mismatch || frame.daemon_protocol_version < PROTOCOL_VERSION);
+            if is_stale_daemon {
                 tracing::warn!(
                     daemon_version = frame.daemon_protocol_version,
                     expected = PROTOCOL_VERSION,
-                    "daemon protocol version mismatch (old daemon, no version_mismatch flag) \
-                     — treating as stale",
+                    explicit_mismatch = frame.version_mismatch,
+                    "daemon protocol version mismatch (stale daemon) — treating as stale",
                 );
                 return ForwardOutcome::ProtocolMismatch;
             }
@@ -1877,5 +1888,261 @@ mod tests {
         reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── dispatch error propagates to client as non-empty message (#91) ─────────
+    //
+    // Regression for #91: when the daemon's dispatcher returns Err(msg), the
+    // client-side `map_response` must surface that message through
+    // `forward_or_spawn` as `Some(Err(McpError { message, .. }))` with a
+    // non-empty `message`.  Before the #91 fix, some failure paths swallowed the
+    // message and the client saw only "daemon returned an error without a message".
+    //
+    // This test uses a real run_daemon + FailDispatch (always returns Err("forced
+    // dispatch error: <detail>")) and drives the full forward_or_spawn path so we
+    // exercise both the daemon's response serialization AND the client's
+    // map_response deserialization in one round trip.
+
+    #[derive(Clone)]
+    struct FailDispatch {
+        namespace: String,
+        config_id: String,
+    }
+
+    #[async_trait]
+    impl daemon::DaemonDispatch for FailDispatch {
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+        ) -> Result<String, String> {
+            Err("forced dispatch error: verb returned an error for testing".to_string())
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            &self.namespace
+        }
+
+        fn config_id(&self) -> &str {
+            &self.config_id
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dispatch_error_propagates_as_non_empty_client_message() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+        let dispatcher = FailDispatch {
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(dispatcher).await;
+        });
+
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+
+        match result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    !message.is_empty(),
+                    "error message forwarded to client must not be empty"
+                );
+                assert!(
+                    message.contains("forced dispatch error"),
+                    "client must receive the daemon's error message verbatim; got: {message}"
+                );
+            }
+            Some(Ok(v)) => panic!("FailDispatch always errs; got Ok({v:?})"),
+            None => panic!(
+                "forward_or_spawn returned None (local fallback) instead of \
+                 propagating the daemon's error — the error message was swallowed"
+            ),
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── explicit version_mismatch from stale daemon routes to recovery (#156) ──
+    //
+    // Regression for #156: when a NEWER client connects to an OLD warm daemon,
+    // the old daemon responds with `version_mismatch=true` and its own (lower)
+    // `daemon_protocol_version`. Before the fix, this went to the generic
+    // `Response` arm → `map_response` → hard MCP error, leaving the stale daemon
+    // alive instead of triggering kill+respawn.
+    //
+    // After the fix, `try_forward_inner` detects `version_mismatch=true` &&
+    // `daemon_protocol_version < PROTOCOL_VERSION` and returns
+    // `ForwardOutcome::ProtocolMismatch`, routing it through kill_and_respawn
+    // exactly like the implicit (no version_mismatch flag) old-daemon case.
+    //
+    // This test serves one connection returning an explicit-mismatch frame
+    // (version_mismatch=true, daemon_protocol_version=0) and asserts that
+    // try_forward_inner classifies it as ProtocolMismatch (not Response).
+
+    fn explicit_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "daemon protocol mismatch: client={} daemon=0 — \
+                 rebuild/update the client binary (make local)",
+                PROTOCOL_VERSION
+            )),
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: true,
+            daemon_protocol_version: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn try_forward_inner_routes_explicit_version_mismatch_to_protocol_mismatch() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind explicit-mismatch socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        let mismatch_resp = explicit_version_mismatch_response(config_id);
+        let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+        };
+
+        let outcome = try_forward_inner(&frame).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        assert!(
+            matches!(outcome, ForwardOutcome::ProtocolMismatch),
+            "explicit version_mismatch=true with daemon_protocol_version < PROTOCOL_VERSION \
+             must classify as ProtocolMismatch (triggers kill+respawn), not Response \
+             (which would surface a hard error and leave the stale daemon alive)"
+        );
+
+        clear_daemon_env();
+    }
+
+    // ── explicit version_mismatch from NEWER daemon is NOT routed to recovery ──
+    //
+    // Complementary to the test above: when a stale CLIENT talks to a NEWER
+    // daemon, the daemon responds with `version_mismatch=true` and a
+    // `daemon_protocol_version > PROTOCOL_VERSION`. Kill+respawn cannot fix this
+    // (it would just spawn the same newer daemon again); the client must receive
+    // a hard error telling the operator to upgrade the client binary.
+    //
+    // This test asserts try_forward_inner returns ForwardOutcome::Response
+    // (not ProtocolMismatch) so map_response produces the hard error.
+
+    fn newer_daemon_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "daemon protocol mismatch: client={} daemon={} — \
+                 rebuild/update the client binary (make local)",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            )),
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: true,
+            daemon_protocol_version: PROTOCOL_VERSION + 1,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn try_forward_inner_newer_daemon_mismatch_yields_response_not_recovery() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind newer-daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
+        let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+        };
+
+        let outcome = try_forward_inner(&frame).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        assert!(
+            matches!(outcome, ForwardOutcome::Response(_)),
+            "version_mismatch=true with daemon_protocol_version > PROTOCOL_VERSION \
+             must yield Response (hard error via map_response), not ProtocolMismatch \
+             (kill+respawn cannot fix a stale client binary)"
+        );
+
+        clear_daemon_env();
     }
 }
