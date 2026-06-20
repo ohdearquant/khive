@@ -1036,6 +1036,14 @@ impl KnowledgeHandlers {
             // bounded time before continuing with FTS-only results.  This avoids a
             // cold-start race where the ANN is loading and the first query silently
             // returns ok:true,total:0 when FTS also finds nothing.
+            //
+            // Test coverage note: the warming-Err branch here is exercised by the
+            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
+            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
+            // test is not feasible from the external tests/ directory because
+            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
+            // requires internal access.  The integration tests in tests/fixes.rs
+            // cover the non-warming hot-path and the empty-corpus guard instead.
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
                 const WARM_TIMEOUT_MS: u64 = 3_000;
@@ -1159,6 +1167,14 @@ impl KnowledgeHandlers {
             // task in flight), wait a bounded time before falling through.  This
             // prevents a race between the daemon warm-start and the first incoming
             // query from producing a silent ok:true,total:0 result.
+            //
+            // Test coverage note: the warming-Err branch here is exercised by the
+            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
+            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
+            // test is not feasible from the external tests/ directory because
+            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
+            // requires internal access.  The integration tests in tests/fixes.rs
+            // cover the non-warming hot-path and the empty-corpus guard instead.
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
                 const WARM_TIMEOUT_MS: u64 = 3_000;
@@ -1166,19 +1182,23 @@ impl KnowledgeHandlers {
                 if vamana::wait_for_ann(ann, &key, WARM_TIMEOUT_MS, WARM_POLL_MS).await {
                     ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
                 } else {
-                    // Still not ready after the wait.  Check whether the vector
-                    // corpus is non-empty: if so, the index is genuinely warming
-                    // and an empty result would be misleading.
-                    let model = runtime.default_embedder_name();
-                    let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
-                        .await
-                        .map(|fp| fp.vector_count > 0)
-                        .unwrap_or(false);
-                    if corpus_non_empty {
-                        return Err(RuntimeError::Internal(
-                            "ANN index is warming after daemon restart — retry in a few seconds"
-                                .into(),
-                        ));
+                    // Still not ready after the wait.  If FTS already collected
+                    // non-empty hits, return those partial results rather than
+                    // erroring — mirrors the same guard in `search`.  Only surface
+                    // the warming error when FTS is also empty and the corpus is
+                    // non-empty (a genuinely misleading silent-zero case).
+                    if hits.is_empty() {
+                        let model = runtime.default_embedder_name();
+                        let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
+                            .await
+                            .map(|fp| fp.vector_count > 0)
+                            .unwrap_or(false);
+                        if corpus_non_empty {
+                            return Err(RuntimeError::Internal(
+                                "ANN index is warming after daemon restart — retry in a few seconds"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
             }
