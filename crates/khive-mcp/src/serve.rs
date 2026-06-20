@@ -1276,6 +1276,12 @@ brain_profile = "project-profile"
     ///   entities table — column `name` holds the entity name (entities-ddl.sql)
     ///   notes table    — column `content` holds the message body; `kind` = "message"
     ///                    for comm.send output (notes-ddl.sql + comm handlers.rs)
+    ///
+    /// Relies on `base_runtime_config_for_multi_backend` leaving `embedding_model`
+    /// unset: no embedder means no `vec0` virtual table is created, so the plain
+    /// `rusqlite::Connection::open` below (which does not load the vec0 extension)
+    /// can read both files. If an embedder is ever added to that helper, this test
+    /// must load the extension or query through a runtime instead.
     #[tokio::test]
     #[serial]
     async fn multi_backend_isolates_pack_data_to_separate_files() {
