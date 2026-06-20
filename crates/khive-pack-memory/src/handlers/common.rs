@@ -1031,12 +1031,16 @@ impl MemoryPack {
             .iter()
             .map(String::as_str)
             .collect();
+        let now_micros = chrono::Utc::now().timestamp_micros();
         for note in batch {
             // Post-filter: ANN over-fetch may include rows from outside the caller's
             // visible namespace set. Drop them here where the note row carries its namespace.
+            // Also exclude memories whose expires_at is in the past (view-layer expiry).
+            let expired = note.expires_at.map(|e| e <= now_micros).unwrap_or(false);
             if note.deleted_at.is_none()
                 && note.kind == "memory"
                 && visible_set.contains(note.namespace.as_str())
+                && !expired
             {
                 memory_ids.insert(note.id);
                 notes_by_id.insert(note.id, note);
