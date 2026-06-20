@@ -8,6 +8,7 @@ pub mod coordinator;
 #[cfg(unix)]
 pub mod daemon;
 pub mod pack;
+pub mod save_sink;
 pub mod serve;
 pub mod server;
 pub mod tools;

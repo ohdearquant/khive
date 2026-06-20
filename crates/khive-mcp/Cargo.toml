@@ -34,6 +34,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
+sha2 = { workspace = true }
 lattice-embed = { workspace = true, optional = true }
 
 [features]

@@ -1079,6 +1079,7 @@ impl KhiveMcpServer {
     /// only as a fallback; the daemon calls it directly (never through the tool
     /// wrapper), so there is no risk of a daemon forwarding to itself.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
+        let save_to = p.save_to.clone();
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode.
@@ -1105,6 +1106,15 @@ impl KhiveMcpServer {
         let result = self
             .run_parsed(parsed.ops, parsed.mode, presentation, presentation_per_op)
             .await;
+
+        if let Some(path_str) = save_to {
+            let path = std::path::Path::new(&path_str);
+            let manifest = crate::save_sink::write_and_manifest(&result, path)
+                .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
+            return serde_json::to_string_pretty(&manifest)
+                .map_err(|e| McpError::internal_error(format!("serialize manifest: {e}"), None));
+        }
+
         serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))
     }
