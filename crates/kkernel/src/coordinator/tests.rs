@@ -807,6 +807,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
             ops: r#"search(kind="concept", query="T7aConcept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         })
         .await
         .expect("T7a: dispatch");
@@ -894,6 +895,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
             ops: r#"search(kind="concept", query="T7bTarget")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         })
         .await
         .expect("T7b: dispatch");
@@ -953,6 +955,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
             ops: r#"search(kind="concept", query="T7cMinScoreProbe", min_score=1.0)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         })
         .await
         .expect("T7c: dispatch");

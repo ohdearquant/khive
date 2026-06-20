@@ -42,6 +42,21 @@ pub struct ExecArgs {
     /// Presentation mode: `agent` (default), `verbose`, or `human`.
     #[arg(long)]
     pub presentation: Option<String>,
+
+    /// Write results as JSONL to this path and print a self-describing manifest.
+    ///
+    /// The manifest (`{path, rows, per_column_null_counts, schema_fingerprint,
+    /// checksum}`) is printed to stdout instead of the raw results.  Parent
+    /// directories are created if absent.
+    ///
+    /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
+    /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
+    /// hit a cold or warming index on the first call after a daemon restart.
+    ///
+    /// Example:
+    ///   kkernel exec 'list(kind="entity")' --save-file /tmp/entities.jsonl
+    #[arg(long)]
+    pub save_file: Option<String>,
 }
 
 /// Execute the DSL expression, routing through the warm daemon when available.
@@ -65,9 +80,14 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     cfg.default_namespace =
         Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let save_file = args.save_file.clone();
+
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
+    // The daemon path does not support --save-file (the daemon returns a string;
+    // we would need to parse it back to apply the sink).  Skip daemon forwarding
+    // when --save-file is set so the in-process path handles everything.
     #[cfg(unix)]
-    {
+    if save_file.is_none() {
         let frame = DaemonRequestFrame {
             ops: args.ops.clone(),
             presentation: args.presentation.clone(),
@@ -92,6 +112,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         ops: args.ops,
         presentation: args.presentation,
         presentation_per_op: None,
+        save_to: save_file.clone(),
     };
 
     let output = server

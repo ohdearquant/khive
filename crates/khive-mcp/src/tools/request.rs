@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Input for `request` — a DSL string (function-call or JSON form) plus
 /// optional presentation controls (`presentation` and `presentation_per_op`).
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RequestParams {
     /// One or more operations as a function-call DSL or JSON-form string.
     ///
@@ -43,4 +43,21 @@ pub struct RequestParams {
     #[serde(default)]
     #[schemars(description = "Per-op presentation mode override (optional)")]
     pub presentation_per_op: Option<Vec<Option<String>>>,
+
+    /// File path for result sink.
+    ///
+    /// When set, the full results are written as JSONL to this path and the
+    /// caller receives a self-describing manifest instead of the raw results:
+    /// `{path, rows, per_column_null_counts, schema_fingerprint, checksum}`.
+    ///
+    /// The manifest lets agents detect bulk-export corruption (e.g. 10 000 null
+    /// rows) in one call rather than after a downstream judgment fleet has graded
+    /// blind. Parent directories are created if absent.
+    ///
+    /// When omitted, results are returned inline (default behaviour).
+    #[serde(default)]
+    #[schemars(
+        description = "File path to sink results as JSONL (returns manifest, not raw results)"
+    )]
+    pub save_to: Option<String>,
 }

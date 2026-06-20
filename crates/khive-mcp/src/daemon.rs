@@ -74,6 +74,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             ops,
             presentation,
             presentation_per_op,
+            save_to: None,
         };
         self.dispatch_request_local(params)
             .await
@@ -992,6 +993,7 @@ mod tests {
                 ops: "stats()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
+                save_to: None,
             })
             .await
             .expect("local dispatch of stats() must succeed");
