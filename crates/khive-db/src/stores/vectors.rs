@@ -1313,4 +1313,324 @@ mod atomic_replace_tests {
             "prior vector must survive a failed update"
         );
     }
+
+    /// insert_batch: SAVEPOINT/ROLLBACK path — INSERT failure inside the savepoint.
+    ///
+    /// The existing wrong-dimension tests (`insert_batch_failed_record_preserves_prior_vector`)
+    /// hit the pre-savepoint `continue` guard and never reach the SAVEPOINT/ROLLBACK
+    /// sequence.  This test forces a genuine INSERT failure inside the savepoint by
+    /// exploiting vec0's single-column PRIMARY KEY (`subject_id TEXT PRIMARY KEY`,
+    /// NOT scoped to namespace).
+    ///
+    /// Mechanism: store a stale row for `(id_X, ns:a)`.  Submit a batch with one
+    /// record for `(id_X, ns:b)`.  The DELETE step targets `WHERE namespace = 'ns:b'`
+    /// and finds nothing (stale is in ns:a), so nothing is removed.  The INSERT then
+    /// tries to write `id_X` into vec0's `_rowids` shadow table, but `id_X` already
+    /// occupies it (from the ns:a stale row).  The UNIQUE constraint fires — INSERT
+    /// fails — ROLLBACK TO SAVEPOINT executes — stale row in ns:a survives intact.
+    ///
+    /// Sentinel: removing `ROLLBACK TO SAVEPOINT` would not change the outcome here
+    /// (DELETE was a no-op), but any partial shadow-table write between the SAVEPOINT
+    /// and the INSERT error would be left uncommitted, potentially corrupting the
+    /// stale row's embedding bytes.  The similarity assertion (>0.999) detects that.
+    ///
+    /// Additionally: insert_batch must count the record as `failed` and must not
+    /// abort the outer `BEGIN IMMEDIATE` transaction (the COMMIT must succeed).
+    #[tokio::test]
+    async fn insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale() {
+        let pool = make_vec_pool();
+        let model_key = "atomic_pk_batch";
+        let dims = 4;
+        let ns_a = "ns:pk_a";
+        let ns_b = "ns:pk_b";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns_a.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_x = Uuid::new_v4();
+        let stale_vec = vec![0.1f32, 0.2, 0.3, 0.4];
+
+        // Store stale row in ns:a — this occupies id_X in the vec0 PK.
+        store
+            .insert(
+                id_x,
+                SubstrateKind::Entity,
+                ns_a,
+                "body",
+                vec![stale_vec.clone()],
+            )
+            .await
+            .expect("stale insert");
+
+        // Batch: one record for (id_X, ns:b) — correct dims, all finite.
+        // DELETE WHERE ns=ns:b finds nothing.  INSERT hits PK constraint.
+        // Code path: SAVEPOINT → DELETE(noop) → INSERT(PK fail) →
+        //            ROLLBACK TO SAVEPOINT → RELEASE → outer COMMIT.
+        let summary = store
+            .insert_batch(vec![VectorRecord {
+                subject_id: id_x,
+                kind: SubstrateKind::Entity,
+                namespace: ns_b.to_string(),
+                field: "body".to_string(),
+                embedding_model: None,
+                vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("insert_batch must complete (outer tx must commit)");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.affected, 0, "PK conflict must count as failed");
+        assert_eq!(
+            summary.failed, 1,
+            "failed counter must increment after ROLLBACK TO SAVEPOINT"
+        );
+
+        // Stale row must survive — no partial state must have leaked.
+        let post = store
+            .batch_exists(&[id_x], ns_a)
+            .await
+            .expect("batch_exists ns:a");
+        assert!(
+            post.contains(&id_x),
+            "stale row in ns:a must survive after SAVEPOINT + INSERT failure"
+        );
+
+        // Verify embedding bytes via self-similarity — any shadow-table corruption
+        // would produce a score below 1.0.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![stale_vec.clone()],
+                top_k: 1,
+                namespace: Some(ns_a.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search ns:a after batch");
+
+        assert_eq!(hits.len(), 1, "stale vector must be searchable");
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "cosine similarity of stale_vec to itself must be ~1.0 (got {sim:.6}); \
+             a lower value means the SAVEPOINT/ROLLBACK left partial writes visible"
+        );
+    }
+
+    /// insert_batch: two-record batch where the first record's SAVEPOINT rolls back
+    /// (PK conflict) and the second record succeeds, proving the rollback on record 1
+    /// does not corrupt the state seen by record 2.
+    ///
+    /// Scenario:
+    ///   stale = (id_X, ns:a, stale_vec) in DB.
+    ///
+    ///   Record A — (id_X, ns:b): SAVEPOINT; DELETE WHERE ns=ns:b (nothing);
+    ///     INSERT id_X → PK conflict (stale holds it) → ROLLBACK TO SAVEPOINT.
+    ///     failed=1.  Stale untouched.
+    ///
+    ///   Record B — (id_X, ns:a, new_vec): SAVEPOINT; DELETE WHERE ns=ns:a removes
+    ///     stale (PK freed); INSERT id_X succeeds. RELEASE. affected=1.
+    ///
+    /// Final state: (id_X, ns:a, new_vec).  The search with new_vec yields ~1.0,
+    /// confirming Record A's rolled-back SAVEPOINT did not corrupt what Record B wrote.
+    #[tokio::test]
+    async fn insert_batch_rollback_does_not_corrupt_subsequent_record() {
+        let pool = make_vec_pool();
+        let model_key = "atomic_sib_batch";
+        let dims = 4;
+        let ns_a = "ns:sib_a";
+        let ns_b = "ns:sib_b";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns_a.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_x = Uuid::new_v4();
+        let stale_vec = vec![0.1f32, 0.2, 0.3, 0.4];
+        let new_vec = vec![0.9f32, 0.1, 0.1, 0.1];
+
+        // Stale row occupies id_X in ns:a.
+        store
+            .insert(
+                id_x,
+                SubstrateKind::Entity,
+                ns_a,
+                "body",
+                vec![stale_vec.clone()],
+            )
+            .await
+            .expect("stale insert");
+
+        // Record A (ns:b) fails — PK conflict; Record B (ns:a) succeeds — replaces stale.
+        let summary = store
+            .insert_batch(vec![
+                VectorRecord {
+                    subject_id: id_x,
+                    kind: SubstrateKind::Entity,
+                    namespace: ns_b.to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                    updated_at: chrono::Utc::now(),
+                },
+                VectorRecord {
+                    subject_id: id_x,
+                    kind: SubstrateKind::Entity,
+                    namespace: ns_a.to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![new_vec.clone()],
+                    updated_at: chrono::Utc::now(),
+                },
+            ])
+            .await
+            .expect("insert_batch");
+
+        assert_eq!(summary.attempted, 2);
+        // Record A (ns:b) hits the PK constraint → failed.
+        // Record B (ns:a) DELETEs the stale (freeing PK) then INSERTs → affected.
+        assert_eq!(summary.affected, 1, "Record B must succeed");
+        assert_eq!(summary.failed, 1, "Record A must fail (PK conflict)");
+
+        // Record B's new_vec must be in the DB with correct embedding bytes.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![new_vec.clone()],
+                top_k: 1,
+                namespace: Some(ns_a.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search after batch");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "new_vec similarity to itself must be ~1.0 (got {sim:.6}); \
+             Record A's ROLLBACK must not corrupt Record B's write"
+        );
+    }
+
+    /// update: the single-record path wraps DELETE+INSERT in `unchecked_transaction`.
+    /// Wrong-dim tests fail in the outer Rust guard, before the transaction opens.
+    /// This test forces an INSERT failure inside the transaction on a correctly-
+    /// dimensioned finite vector by calling `update` with a namespace that does NOT
+    /// match the stored row.
+    ///
+    /// Mechanism: stale row is `(id_X, ns:a)`.  Call `update(id_X, ns:b, ...)`.
+    ///   - DELETE WHERE ns=ns:b finds nothing.
+    ///   - INSERT (id_X, ns:b) hits vec0 PK constraint (id_X in _rowids held by ns:a).
+    ///   - `unchecked_transaction()` rolls back.
+    ///   - Stale row in ns:a survives intact.
+    #[tokio::test]
+    async fn update_pk_conflict_rolls_back_transaction_preserves_stale() {
+        let pool = make_vec_pool();
+        let model_key = "atomic_upd_pk";
+        let dims = 4;
+        let ns_a = "ns:upk_a";
+        let ns_b = "ns:upk_b";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns_a.to_string(),
+        )
+        .expect("store");
+
+        let id_x = Uuid::new_v4();
+        let stale_vec = vec![0.1f32, 0.2, 0.3, 0.4];
+
+        // Store stale row in ns:a.
+        store
+            .insert(
+                id_x,
+                SubstrateKind::Entity,
+                ns_a,
+                "body",
+                vec![stale_vec.clone()],
+            )
+            .await
+            .expect("stale insert");
+
+        // update() with ns:b — correct dims, finite values, but different namespace.
+        // DELETE WHERE ns=ns:b finds nothing; INSERT id_X hits PK → transaction rolls back.
+        let result = store
+            .update(
+                id_x,
+                SubstrateKind::Entity,
+                ns_b,
+                "body",
+                vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "update must fail when INSERT hits the vec0 PK constraint"
+        );
+
+        // Stale row in ns:a must be intact.
+        let post = store
+            .batch_exists(&[id_x], ns_a)
+            .await
+            .expect("batch_exists after failed update");
+        assert!(
+            post.contains(&id_x),
+            "stale row in ns:a must survive after update transaction rollback"
+        );
+
+        // Self-similarity check proves the embedding bytes are unchanged.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![stale_vec.clone()],
+                top_k: 1,
+                namespace: Some(ns_a.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search after failed update");
+
+        assert_eq!(hits.len(), 1, "stale vector must be searchable");
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "cosine similarity of stale_vec to itself must be ~1.0 (got {sim:.6}); \
+             transaction rollback must leave embedding bytes unchanged"
+        );
+    }
 }
