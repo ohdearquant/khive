@@ -374,6 +374,7 @@ async fn dispatch_action(
             ops: ops_str,
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;

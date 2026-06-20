@@ -77,7 +77,7 @@ impl Pack for MemoryPack {
 // Illocutionary classification (Searle 1976):
 //   Commissive — commits caller to a persistent change
 //   Assertive  — retrieves/presents state of affairs
-static MEMORY_HANDLERS: [HandlerDef; 8] = [
+static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "memory.remember",
@@ -290,6 +290,47 @@ static MEMORY_HANDLERS: [HandlerDef; 8] = [
         category: VerbCategory::Assertive,
         params: &[],
     },
+    // Commissive: curation prune of low-salience or expired memories
+    HandlerDef {
+        name: "memory.prune",
+        description: "Soft-delete memories below a salience threshold and/or past expires_at. Curation-layer operation per ADR-014.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "min_salience",
+                param_type: "number",
+                required: false,
+                description: "Soft-delete memories with salience strictly below this value.",
+            },
+            ParamDef {
+                name: "before",
+                param_type: "integer",
+                required: false,
+                description: "Soft-delete memories expired at or before this Unix microsecond timestamp. Defaults to now. Pass 0 to skip expiry filter.",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Namespace to prune. Defaults to \"local\".",
+            },
+            ParamDef {
+                name: "dry_run",
+                param_type: "boolean",
+                required: false,
+                description: "When true, count candidates without deleting. Default false.",
+            },
+        ],
+    },
+    // Commissive: reclaim disk space freed by soft-deleted rows
+    HandlerDef {
+        name: "memory.vacuum",
+        description: "Run SQLite VACUUM to reclaim space freed by soft-deleted rows.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[],
+    },
 ];
 
 // ── Inventory self-registration ───────────────────────────────────────────────
@@ -355,6 +396,8 @@ impl PackRuntime for MemoryPack {
             "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
             "memory.recall_rerank" => self.handle_recall_rerank(params).await,
             "memory.recall_score" => self.handle_recall_score(params).await,
+            "memory.prune" => self.handle_prune(token, params).await,
+            "memory.vacuum" => self.handle_vacuum(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),
