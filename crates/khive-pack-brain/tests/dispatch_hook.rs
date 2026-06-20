@@ -186,36 +186,46 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
 /// from prior `brain.feedback` calls, `ensure_loaded` must restore from the
 /// persisted snapshot AND then apply any queued hook signals on top.
 ///
+/// This test exercises the TRUE DB cold path: a second `BrainPack` instance is
+/// constructed over the same `KhiveRuntime` (same SQLite DB) with no in-memory
+/// state.  The queued signal is enqueued while the namespace is genuinely unknown
+/// to the second instance (goes to `pending_hook_signals`, not `saved_states`).
+/// On first access the second instance must reload from the persisted DB snapshot
+/// and drain the pending queue on top.
+///
 /// Sequence:
-///   1. Create a real entity (needed for brain.feedback's C4 target validation).
-///   2. Build a full registry (kg + brain) on the brain instance under test and
-///      dispatch 5 `brain.feedback` calls — enough to cross the snapshot batch
-///      threshold (DEFAULT_SNAPSHOT_BATCH_SIZE = 5) and force `upsert_snapshot`.
-///      Record the persisted total (= 5).
-///   3. Displace "local" from the active slot by loading a second namespace.
-///   4. While "local" is saved off (is_loaded=true, not active), fire one KG
-///      hook signal — it routes via the saved-state path in `route_signal`.
-///   5. Reload "local" via `brain.dispatch("brain.profiles", …)`.
-///   6. Assert active snapshot total == persisted_total + 1 queued signal.
+///   1. Create a real entity for brain.feedback target validation.
+///   2. Using brain_a, dispatch 5 brain.feedback calls — enough to cross
+///      DEFAULT_SNAPSHOT_BATCH_SIZE (5) and force upsert_snapshot into the
+///      shared DB.  Record persisted_total == 5.
+///   3. Construct brain_b = BrainPack::new(rt.clone()), a fresh instance over
+///      the same runtime/DB with empty in-memory state.  brain_a is no longer
+///      used; its in-memory state is not accessible to brain_b.
+///   4. Fire one KG hook signal through brain_b for the "local" namespace.
+///      Because brain_b has never loaded "local", route_signal enqueues it in
+///      pending_hook_signals (true cold pending path).
+///   5. Promote "local" in brain_b via the production dispatch path
+///      (brain_b.dispatch("brain.profiles", …)).  ensure_loaded must:
+///        a. load the DB snapshot (5 events)
+///        b. drain the 1 pending hook signal on top
+///        → total_events = 6
+///   6. Assert brain_b.snapshot().balanced_recall.total_events == persisted_total + 1.
 #[tokio::test]
 async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     use khive_runtime::Namespace;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let brain = Arc::new(BrainPack::new(rt.clone()));
 
     // --- Step 1: create a real entity for feedback target validation ---
-    // We need both kg and brain packs to (a) create entities and (b) dispatch
-    // brain.feedback on the SAME brain instance we are testing.
-    let full_registry = {
+    // A separate brain/kg registry creates the entity; the entity UUID is used
+    // by brain_a for brain.feedback target validation.
+    let setup_registry = {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        builder.build().expect("full registry for step 1")
+        builder.build().expect("setup registry")
     };
-
-    // Create an entity through the full registry to get a valid target_id UUID.
-    let entity_result = full_registry
+    let entity_result = setup_registry
         .dispatch(
             "create",
             json!({
@@ -231,24 +241,23 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
         .expect("created entity must have id")
         .to_string();
 
-    // --- Step 2: dispatch 5 brain.feedback calls to cross the snapshot threshold ---
-    // DEFAULT_SNAPSHOT_BATCH_SIZE = 5; the 5th feedback call triggers upsert_snapshot.
-    // We use brain.dispatch directly so the feedback accumulates on the brain
-    // instance under test (not the full_registry's separate BrainPack instance).
+    // --- Step 2: dispatch 5 brain.feedback calls via brain_a ---
+    // DEFAULT_SNAPSHOT_BATCH_SIZE = 5; the 5th call triggers upsert_snapshot,
+    // writing the "local" namespace snapshot into the shared DB.
+    let brain_a = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new()
         .build()
         .expect("minimal registry");
     let local_ns = Namespace::parse("local").expect("local namespace");
     let local_token = rt.authorize(local_ns).expect("local token");
 
-    // First promote the namespace so feedback does not start from a cold state.
-    brain
+    brain_a
         .dispatch("brain.profiles", json!({}), &empty_registry, &local_token)
         .await
-        .expect("promote local namespace before feedback");
+        .expect("promote local namespace in brain_a before feedback");
 
     for _ in 0..5u32 {
-        brain
+        brain_a
             .dispatch(
                 "brain.feedback",
                 json!({ "target_id": target_id, "signal": "useful" }),
@@ -259,49 +268,54 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
             .expect("brain.feedback must succeed");
     }
 
-    // Record the persisted total before displacing the namespace.
-    let persisted_total = brain.snapshot().balanced_recall.total_events;
+    let persisted_total = brain_a.snapshot().balanced_recall.total_events;
     assert_eq!(
         persisted_total, 5,
-        "after 5 feedback calls the active snapshot must show 5 total_events; got {persisted_total}"
+        "after 5 feedback calls brain_a snapshot must show 5 total_events; got {persisted_total}"
     );
 
-    // --- Step 3: displace "local" by loading a different namespace ---
-    promote_namespace(&brain, &rt, "ns-other").await;
+    // --- Step 3: construct brain_b — fresh instance, empty in-memory state ---
+    // brain_a is dropped after this point; brain_b shares the same SQLite DB
+    // via rt.clone() but starts with a completely empty PersistenceTracker and
+    // BrainState.  This is the true DB cold-start scenario.
+    drop(brain_a);
+    let brain_b = Arc::new(BrainPack::new(rt.clone()));
 
-    // "local" is now in saved_states (is_loaded=true, not active).
-
-    // --- Step 4: fire a KG hook signal while "local" is saved off ---
-    // The hook routes via the saved-state path in route_signal (not the
-    // pending queue, because is_loaded=true for "local").
+    // --- Step 4: fire one KG hook signal through brain_b ---
+    // brain_b has never seen "local"; route_signal must enqueue the signal in
+    // pending_hook_signals (cold pending path, not the saved_states path).
     let mut hook_builder = VerbRegistryBuilder::new();
     hook_builder.register(KgPack::new(rt.clone()));
     hook_builder.with_default_namespace("local".to_string());
-    let hook_arc: Arc<dyn DispatchHook> = brain.clone();
+    let hook_arc: Arc<dyn DispatchHook> = brain_b.clone();
     hook_builder.with_dispatch_hook(hook_arc);
-    let hook_registry = hook_builder.build().expect("hook registry");
+    let hook_registry = hook_builder.build().expect("hook registry for brain_b");
 
     hook_registry
         .dispatch(
             "create",
-            json!({"kind":"entity","name":"SavedPathProbe","entity_kind":"concept"}),
+            json!({"kind":"entity","name":"ColdReplayProbe","entity_kind":"concept"}),
         )
         .await
-        .expect("kg dispatch must succeed");
+        .expect("kg dispatch through brain_b hook must succeed");
 
-    // --- Step 5: reload "local" via the production dispatch path ---
-    brain
+    // --- Step 5: promote "local" in brain_b via the production dispatch path ---
+    // ensure_loaded must:
+    //   a. load the persisted DB snapshot (total_events = 5 from brain_a's writes)
+    //   b. drain the 1 pending hook signal enqueued in step 4
+    // If either sub-step is broken the final count will not equal 6.
+    brain_b
         .dispatch("brain.profiles", json!({}), &empty_registry, &local_token)
         .await
-        .expect("reload local via production path");
+        .expect("promote local namespace in brain_b via cold DB load");
 
-    // --- Step 6: assert total = persisted (5) + saved-state signal (1) ---
-    let snap = brain.snapshot();
+    // --- Step 6: assert total = persisted (5) + cold pending signal (1) ---
+    let snap = brain_b.snapshot();
     assert_eq!(
         snap.balanced_recall.total_events,
         persisted_total + 1,
-        "active snapshot for 'local' must equal persisted total ({persisted_total}) + \
-         1 saved-state signal; got {}",
+        "brain_b cold-reload must yield persisted total ({persisted_total}) + \
+         1 queued signal; got {}",
         snap.balanced_recall.total_events
     );
 }
