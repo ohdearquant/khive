@@ -285,6 +285,7 @@ pub(crate) mod tests {
                 ops,
                 presentation: None,
                 presentation_per_op: None,
+                save_to: None,
             })
             .await;
 
@@ -311,6 +312,7 @@ pub(crate) mod tests {
                 ops: r#"search(kind="entity", query="anything")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
+                save_to: None,
             })
             .await;
 
@@ -347,6 +349,7 @@ pub(crate) mod tests {
                 ops: r#"search(kind="entity", query="T6cEntity")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
+                save_to: None,
             })
             .await;
 

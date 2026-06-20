@@ -143,6 +143,7 @@ impl PersistenceTracker {
     ///
     /// Note: does NOT return the counter for the active namespace, which lives in
     /// the shared `BrainState` slot, not in `saved_states`.
+    #[cfg(test)]
     pub(crate) fn total_events_for(&self, namespace: &str) -> Option<u64> {
         if let Some(s) = self.saved_states.get(namespace) {
             return Some(s.balanced_recall.total_events);

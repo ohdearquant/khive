@@ -71,6 +71,21 @@ pub struct ExecArgs {
     #[arg(long)]
     pub presentation: Option<String>,
 
+    /// Write results as JSONL to this path and print a self-describing manifest.
+    ///
+    /// The manifest (`{path, rows, per_column_null_counts, schema_fingerprint,
+    /// checksum}`) is printed to stdout instead of the raw results.  Parent
+    /// directories are created if absent.
+    ///
+    /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
+    /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
+    /// hit a cold or warming index on the first call after a daemon restart.
+    ///
+    /// Example:
+    ///   kkernel exec 'list(kind="entity")' --save-file /tmp/entities.jsonl
+    #[arg(long)]
+    pub save_file: Option<String>,
+
     /// JSONL file of ops to apply in bulk.
     ///
     /// Each non-blank line must be a JSON object `{"tool":"verb","args":{...}}`
@@ -190,6 +205,7 @@ async fn apply_ops_file(
             ops: batch_json,
             presentation: presentation.clone(),
             presentation_per_op: None,
+            save_to: None,
         };
 
         let raw = server
@@ -265,7 +281,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     match mode {
-        ExecMode::Inline(ops) => run_exec_inline(ops, cfg, args.presentation).await,
+        ExecMode::Inline(ops) => run_exec_inline(ops, cfg, args.presentation, args.save_file).await,
         ExecMode::OpsFile(path) => {
             run_exec_ops_file(path, cfg, args.presentation, args.dry_run).await
         }
@@ -281,10 +297,14 @@ async fn run_exec_inline(
     ops: String,
     cfg: RuntimeConfig,
     presentation: Option<String>,
+    save_file: Option<String>,
 ) -> Result<()> {
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
+    // The daemon path does not support --save-file (the daemon returns a string;
+    // we would need to parse it back to apply the sink).  Skip daemon forwarding
+    // when --save-file is set so the in-process path handles everything.
     #[cfg(unix)]
-    {
+    if save_file.is_none() {
         let frame = DaemonRequestFrame {
             ops: ops.clone(),
             presentation: presentation.clone(),
@@ -309,6 +329,7 @@ async fn run_exec_inline(
         ops,
         presentation,
         presentation_per_op: None,
+        save_to: save_file,
     };
 
     let output = server
@@ -476,6 +497,7 @@ mod tests {
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -522,6 +544,7 @@ mod tests {
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -563,6 +586,7 @@ mod tests {
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
+            save_to: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();

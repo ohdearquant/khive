@@ -113,6 +113,7 @@ impl BrainPack {
     ///
     /// Intended for test verification only.  Production code should access state
     /// via `ensure_loaded` + `snapshot()`.
+    #[cfg(test)]
     pub fn cold_namespace_total_events(&self, namespace: &str) -> Option<u64> {
         self.persistence.lock().unwrap().total_events_for(namespace)
     }
