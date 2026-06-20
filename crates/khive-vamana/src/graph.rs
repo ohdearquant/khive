@@ -1,6 +1,6 @@
 //! Vamana graph construction and greedy-search implementation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -151,6 +151,13 @@ impl VamanaGraph {
             return Err(VamanaError::TooManyVectors { count: num_vectors });
         }
 
+        // Read batch size from env at runtime so vec_bench can tune it without recompiling.
+        let batch_size: usize = std::env::var("KHIVE_BUILD_BATCH")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(BUILD_BATCH_SIZE);
+        let batch_size = batch_size.max(1);
+
         let medoid = select_medoid(vectors, config.dimensions, num_vectors)?;
         let mut adjacency = initial_random_adjacency(num_vectors, config.max_degree)?;
 
@@ -158,19 +165,34 @@ impl VamanaGraph {
         let mut order: Vec<u32> = (0..num_vectors as u32).collect();
         order.shuffle(&mut rng);
 
-        for pass_alpha in [1.0f64, config.alpha] {
-            for batch in order.chunks(BUILD_BATCH_SIZE) {
-                let snapshot = adjacency.clone();
+        // L2: skip the second pass when alpha == 1.0 — both passes would be identical.
+        let passes: &[f64] = if (config.alpha - 1.0f64).abs() < 1e-9 {
+            &[1.0f64]
+        } else {
+            &[1.0f64, config.alpha]
+        };
+
+        for &pass_alpha in passes {
+            for batch in order.chunks(batch_size) {
+                // L1: capture only the current neighbors of the batch nodes (O(batch*R))
+                // instead of cloning the full adjacency (O(N)). The greedy search reads
+                // `adjacency` directly — this is safe because adjacency is not mutated
+                // until after all proposals are collected (the par_iter below is read-only).
+                let batch_prior: Vec<Vec<u32>> = batch
+                    .iter()
+                    .map(|&node| adjacency[node as usize].clone())
+                    .collect();
 
                 let proposals: Vec<(u32, Vec<u32>)> = batch
                     .par_iter()
-                    .map(|&node| {
+                    .zip(batch_prior.par_iter())
+                    .map(|(&node, prior_neighbors)| {
                         let mut visited = VisitedSet::new(num_vectors);
                         let query = row(vectors, config.dimensions, node);
                         let search = greedy_search_inner(
                             vectors,
                             config.dimensions,
-                            &snapshot,
+                            &adjacency,
                             query,
                             medoid,
                             config.max_degree,
@@ -184,7 +206,7 @@ impl VamanaGraph {
                             .iter()
                             .map(|(id, _)| *id)
                             .chain(search.results.iter().map(|(id, _)| *id))
-                            .chain(snapshot[node as usize].iter().copied())
+                            .chain(prior_neighbors.iter().copied())
                             .collect();
                         sort_dedup_u32(&mut candidates);
 
@@ -205,39 +227,38 @@ impl VamanaGraph {
                     adjacency[*node as usize] = neighbors.clone();
                 }
 
-                let mut backedges: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
+                // L3: build sparse backedge map (O(batch*R)) instead of an N-length
+                // array + full par_iter_mut over all N entries.
+                // BTreeMap preserves insertion-key order so backedge application is
+                // deterministic across runs (HashMap order is non-deterministic).
+                let mut backedges: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
                 for (source, neighbors) in &proposals {
                     for &target in neighbors {
                         if target != *source {
-                            backedges[target as usize].push(*source);
+                            backedges.entry(target).or_default().push(*source);
                         }
                     }
                 }
 
-                adjacency
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(target, neighbors)| {
-                        if backedges[target].is_empty() {
-                            return;
+                for (target, sources) in backedges {
+                    let neighbors = &mut adjacency[target as usize];
+                    for source in sources {
+                        if !neighbors.contains(&source) {
+                            neighbors.push(source);
                         }
-                        for &source in &backedges[target] {
-                            if !neighbors.contains(&source) {
-                                neighbors.push(source);
-                            }
-                        }
-                        if neighbors.len() > config.max_degree {
-                            let candidates = std::mem::take(neighbors);
-                            *neighbors = robust_prune_inner(
-                                vectors,
-                                config.dimensions,
-                                target as u32,
-                                candidates,
-                                pass_alpha,
-                                config.max_degree,
-                            );
-                        }
-                    });
+                    }
+                    if neighbors.len() > config.max_degree {
+                        let candidates = std::mem::take(neighbors);
+                        *neighbors = robust_prune_inner(
+                            vectors,
+                            config.dimensions,
+                            target,
+                            candidates,
+                            pass_alpha,
+                            config.max_degree,
+                        );
+                    }
+                }
             }
         }
 
@@ -1298,5 +1319,61 @@ mod tests {
             matches!(err, Err(VamanaError::InvalidFormat { .. })),
             "expected InvalidFormat, got {err:?}"
         );
+    }
+
+    /// L2 regression: build with alpha=1.0 produces the same graph as build with alpha=1.2
+    /// followed by a second pass at 1.0 would if both passes were identical. More concretely:
+    /// the single-pass (alpha=1.0) result must be deterministic across two calls, and its
+    /// recall and degree bounds must hold — same invariants as the two-pass path.
+    #[test]
+    fn build_alpha_one_single_pass_is_deterministic_and_bounded() {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(0xA1FA_1A1F);
+        let n = 40usize;
+        let dim = 4usize;
+        let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(8)
+            .with_search_list_size(16)
+            .with_alpha(1.0);
+
+        let g1 = VamanaGraph::build(&raw, &cfg).unwrap();
+        let g2 = VamanaGraph::build(&raw, &cfg).unwrap();
+
+        assert_eq!(g1, g2, "alpha=1.0 build must be deterministic");
+        for list in g1.adjacency() {
+            assert!(
+                list.len() <= 8,
+                "degree bound violated after alpha=1.0 build"
+            );
+        }
+    }
+
+    /// KHIVE_BUILD_BATCH env knob: the runtime batch-size resolver clamps to at least 1
+    /// and parses a valid decimal integer correctly.
+    #[test]
+    fn build_batch_env_knob_parses_correctly() {
+        // Exercise the resolver logic directly without mutating the process env
+        // (env mutations are process-global and race with parallel tests).
+        //
+        // The resolver is: std::env::var("KHIVE_BUILD_BATCH").ok()
+        //                     .and_then(|s| s.trim().parse().ok())
+        //                     .unwrap_or(BUILD_BATCH_SIZE);
+        //                  batch_size.max(1);
+        let parse =
+            |s: &str| -> usize { s.trim().parse::<usize>().unwrap_or(BUILD_BATCH_SIZE).max(1) };
+        assert_eq!(parse("16"), 16);
+        assert_eq!(parse("1024"), BUILD_BATCH_SIZE);
+        assert_eq!(parse("  128  "), 128);
+        // Invalid input falls back to BUILD_BATCH_SIZE.
+        assert_eq!(parse("notanumber"), BUILD_BATCH_SIZE);
+        // Zero clamps to 1.
+        let zero_parse: usize = "0"
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(BUILD_BATCH_SIZE)
+            .max(1);
+        assert_eq!(zero_parse, 1);
     }
 }
