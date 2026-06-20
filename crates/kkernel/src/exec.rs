@@ -5,6 +5,14 @@
 //! against the daemon's own fingerprint; a mismatch falls back to local
 //! dispatch, keeping behaviour identical to the in-process path.
 //!
+//! ## Modes
+//!
+//! - **DSL mode** (default): `kkernel exec '<dsl>'` — executes a single verb DSL
+//!   expression or batch against the configured database and namespace.
+//! - **Pending-events mode**: `kkernel exec --pending-events` — one-shot drain that
+//!   fires all due `scheduled_event` notes. Mutually exclusive with the positional
+//!   `ops` argument. Cron-friendly: run every minute for minute-granularity delivery.
+//!
 //! # `--ops-file` bulk-apply path
 //!
 //! `kkernel exec --ops-file batch.jsonl` reads a JSONL file where each
@@ -32,6 +40,7 @@ use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 
 use crate::dbpath::resolve_db_override;
+use crate::pending_events;
 
 // `khive-request` is not a direct kkernel dependency.  We use serde_json to
 // parse JSONL lines directly (the format is a strict subset of JSON form)
@@ -55,8 +64,20 @@ pub struct ExecArgs {
     ///   kkernel exec 'knowledge.index(rebuild_ann=true)'
     ///   kkernel exec '[knowledge.list(limit=5), knowledge.stats()]'
     ///
-    /// Mutually exclusive with `--ops-file`.
+    /// Mutually exclusive with `--pending-events` and `--ops-file`.
     pub ops: Option<String>,
+
+    /// One-shot drain: fire all `scheduled_event` notes whose `trigger_at <= now`.
+    ///
+    /// Scans all namespaces, dispatches each event's action in its own namespace,
+    /// marks fired events, and advances repeating events (daily/weekly/monthly).
+    /// Prints a JSON summary of scanned/fired/advanced/failed counts to stdout.
+    ///
+    /// Mutually exclusive with the positional `ops` argument and `--ops-file`.
+    /// Suitable for cron:
+    ///   * * * * *  kkernel exec --pending-events
+    #[arg(long, conflicts_with = "ops", conflicts_with = "ops_file")]
+    pub pending_events: bool,
 
     /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
     /// ephemeral in-memory database, matching `kkernel mcp`.
@@ -70,6 +91,10 @@ pub struct ExecArgs {
     /// Presentation mode: `agent` (default), `verbose`, or `human`.
     #[arg(long)]
     pub presentation: Option<String>,
+
+    /// Verbose output: print per-event progress to stderr.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 
     /// Write results as JSONL to this path and print a self-describing manifest.
     ///
@@ -256,6 +281,15 @@ async fn apply_ops_file(
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    // ── pending-events drain ─────────────────────────────────────────────────
+    if args.pending_events {
+        let summary =
+            pending_events::run_pending_events(args.db.as_deref(), &args.namespace, args.verbose)
+                .await?;
+        pending_events::print_summary(&summary);
+        return Ok(());
+    }
+
     // ── mutual exclusion check ─────────────────────────────────────────────────
     let mode = match (&args.ops, &args.ops_file) {
         (Some(_), Some(_)) => {
@@ -400,6 +434,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_events_flag_sets_mode() {
+        let args = ExecArgs::parse_from(["exec", "--pending-events"]);
+        assert!(args.pending_events);
+        assert!(args.ops.is_none());
+    }
+
+    #[test]
+    fn pending_events_conflicts_with_ops() {
+        let result = ExecArgs::try_parse_from(["exec", "--pending-events", "stats()"]);
+        assert!(
+            result.is_err(),
+            "--pending-events and positional ops must conflict"
+        );
+    }
+
+    #[test]
+    fn pending_events_conflicts_with_ops_file() {
+        let result =
+            ExecArgs::try_parse_from(["exec", "--pending-events", "--ops-file", "/tmp/x.jsonl"]);
+        assert!(
+            result.is_err(),
+            "--pending-events and --ops-file must conflict"
+        );
+    }
+
+    #[test]
     fn ops_positional_is_optional() {
         // With --ops-file, the positional ops should be absent.
         let args = ExecArgs::parse_from(["exec", "--ops-file", "/tmp/batch.jsonl"]);
@@ -408,6 +468,13 @@ mod tests {
             args.ops_file.as_deref(),
             Some(std::path::Path::new("/tmp/batch.jsonl"))
         );
+    }
+
+    #[test]
+    fn ops_positional_works_without_pending_events() {
+        let args = ExecArgs::parse_from(["exec", "stats()"]);
+        assert_eq!(args.ops.as_deref(), Some("stats()"));
+        assert!(!args.pending_events);
     }
 
     #[test]

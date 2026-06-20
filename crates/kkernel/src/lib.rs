@@ -6,6 +6,7 @@ pub mod engine;
 pub mod exec;
 pub mod kg;
 pub mod pack_introspect;
+pub mod pending_events;
 pub mod reindex;
 pub mod sync;
 pub mod vector;
