@@ -291,21 +291,36 @@ impl VectorStore for SqliteVecStore {
                 let blob = f32_slice_as_bytes(embedding);
                 let id_str = record.subject_id.to_string();
                 let kind_str = record.kind.to_string();
-                // Use the record's own namespace — the caller is responsible for namespace.
-                let _ = conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace]);
-                match conn.execute(
-                    &ins_sql,
-                    rusqlite::params![
-                        &id_str,
-                        &record.namespace,
-                        &kind_str,
-                        &record.field,
-                        &store_embedding_model,
-                        blob
-                    ],
-                ) {
-                    Ok(_) => affected += 1,
-                    Err(_) => failed += 1,
+
+                // Wrap each record's DELETE+INSERT in a savepoint so a failed INSERT
+                // rolls back only that record's DELETE, leaving the prior vector intact
+                // (no-worse-than-stale guarantee, same as single-record `insert`).
+                conn.execute_batch("SAVEPOINT vec_batch_record")?;
+                let result = (|| {
+                    conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace])?;
+                    conn.execute(
+                        &ins_sql,
+                        rusqlite::params![
+                            &id_str,
+                            &record.namespace,
+                            &kind_str,
+                            &record.field,
+                            &store_embedding_model,
+                            blob
+                        ],
+                    )?;
+                    Ok::<(), rusqlite::Error>(())
+                })();
+                match result {
+                    Ok(()) => {
+                        conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
+                        affected += 1;
+                    }
+                    Err(_) => {
+                        let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
+                        let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
+                        failed += 1;
+                    }
                 }
             }
 
@@ -317,6 +332,80 @@ impl VectorStore for SqliteVecStore {
                 failed,
                 first_error: String::new(),
             })
+        })
+        .await
+    }
+
+    async fn update(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        if vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_update".into(),
+                message: "sqlite-vec supports exactly one vector per record".into(),
+            });
+        }
+        let embedding = vectors.into_iter().next().expect("len checked");
+
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let namespace = namespace.to_string();
+        let field = field.to_string();
+        let kind_str = kind.to_string();
+        let embedding_model = self.embedding_model.clone();
+
+        if embedding.len() == dims {
+            if let Some(idx) = non_finite_index(&embedding) {
+                return Err(non_finite_vector_error("vec_update", idx, embedding[idx]));
+            }
+        }
+
+        self.with_writer("vec_update", move |conn| {
+            if embedding.len() != dims {
+                return Err(rusqlite::Error::InvalidParameterCount(
+                    embedding.len(),
+                    dims,
+                ));
+            }
+
+            // DELETE then INSERT in one transaction so a failed INSERT rolls back
+            // the DELETE, leaving the previous vector intact (no-worse-than-stale).
+            let tx = conn.unchecked_transaction()?;
+
+            let del_sql = format!(
+                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
+                table
+            );
+            tx.execute(
+                &del_sql,
+                rusqlite::params![subject_id.to_string(), &namespace],
+            )?;
+
+            let ins_sql = format!(
+                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                table
+            );
+            let blob = f32_slice_as_bytes(&embedding);
+            tx.execute(
+                &ins_sql,
+                rusqlite::params![
+                    subject_id.to_string(),
+                    &namespace,
+                    &kind_str,
+                    &field,
+                    &embedding_model,
+                    blob
+                ],
+            )?;
+
+            tx.commit()
         })
         .await
     }
@@ -1040,6 +1129,188 @@ mod capabilities_tests {
         assert_eq!(
             caps1 as *const _, caps2 as *const _,
             "capabilities() must return the same static reference each call"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "vectors"))]
+mod atomic_replace_tests {
+    use std::sync::Arc;
+
+    use khive_storage::types::VectorRecord;
+    use khive_storage::VectorStore;
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn make_vec_pool() -> Arc<crate::pool::ConnectionPool> {
+        use crate::pool::{ConnectionPool, PoolConfig};
+        crate::extension::ensure_extensions_loaded();
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        Arc::new(ConnectionPool::new(config).expect("in-memory pool"))
+    }
+
+    fn create_vec_table(pool: &Arc<crate::pool::ConnectionPool>, model_key: &str, dims: usize) {
+        let writer = pool.try_writer().expect("pool writer");
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+             subject_id TEXT PRIMARY KEY, \
+             namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, \
+             embedding float[{}] distance_metric=cosine)",
+            model_key, dims
+        );
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+    }
+
+    /// insert_batch: a record with wrong dimensions fails its INSERT but must not
+    /// lose the previously stored vector (no-worse-than-stale guarantee for batch).
+    ///
+    /// Setup: insert a good vector for `id_existing` via the single-record path.
+    /// Then call insert_batch with two records: `id_existing` with wrong dimensions
+    /// (forced failure), and `id_new` with correct dimensions.
+    /// Expected: `id_existing`'s old vector survives; `id_new` is inserted;
+    /// BatchWriteSummary reflects 1 affected / 1 failed.
+    #[tokio::test]
+    async fn insert_batch_failed_record_preserves_prior_vector() {
+        let pool = make_vec_pool();
+        let model_key = "atomic_batch_test";
+        let dims = 4;
+        let ns = "ns:atomic";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_existing = Uuid::new_v4();
+        let id_new = Uuid::new_v4();
+        let original_vec = vec![0.1f32, 0.2, 0.3, 0.4];
+
+        store
+            .insert(
+                id_existing,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![original_vec.clone()],
+            )
+            .await
+            .expect("initial insert");
+
+        let summary = store
+            .insert_batch(vec![
+                VectorRecord {
+                    subject_id: id_existing,
+                    kind: SubstrateKind::Entity,
+                    namespace: ns.to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![vec![9.9f32; dims + 1]],
+                    updated_at: chrono::Utc::now(),
+                },
+                VectorRecord {
+                    subject_id: id_new,
+                    kind: SubstrateKind::Entity,
+                    namespace: ns.to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                    updated_at: chrono::Utc::now(),
+                },
+            ])
+            .await
+            .expect("insert_batch");
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(summary.affected, 1, "only id_new should succeed");
+        assert_eq!(summary.failed, 1, "id_existing with wrong dims must fail");
+
+        let existing_still_present = store
+            .batch_exists(&[id_existing], ns)
+            .await
+            .expect("batch_exists");
+        assert!(
+            existing_still_present.contains(&id_existing),
+            "prior vector for id_existing must survive a failed batch replace"
+        );
+
+        let new_present = store
+            .batch_exists(&[id_new], ns)
+            .await
+            .expect("batch_exists for id_new");
+        assert!(
+            new_present.contains(&id_new),
+            "id_new with valid dims must be inserted"
+        );
+    }
+
+    /// update: a vector with wrong dimensions must fail without deleting the prior
+    /// vector (no-worse-than-stale guarantee for the update override).
+    #[tokio::test]
+    async fn update_failed_preserves_prior_vector() {
+        let pool = make_vec_pool();
+        let model_key = "atomic_update_test";
+        let dims = 4;
+        let ns = "ns:atomic_upd";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id = Uuid::new_v4();
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec![0.1f32, 0.2, 0.3, 0.4]],
+            )
+            .await
+            .expect("initial insert");
+
+        let result = store
+            .update(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec![9.9f32; dims + 1]],
+            )
+            .await;
+
+        assert!(result.is_err(), "update with wrong dims must fail");
+
+        let still_present = store
+            .batch_exists(&[id], ns)
+            .await
+            .expect("batch_exists after failed update");
+        assert!(
+            still_present.contains(&id),
+            "prior vector must survive a failed update"
         );
     }
 }
