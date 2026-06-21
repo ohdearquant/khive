@@ -148,6 +148,10 @@ cases). Scores are normalized to [0,1] when `rerank` is active (default).
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 
+`knowledge.compose` accepts `explain=true` to include the section manifest (`sections[]` and
+per-source `breakdown`) in the response; the default omits them and returns only the formatted
+briefing.
+
 ### How to call a verb
 
 Wrap the verb call in `request(ops="…")`:

@@ -42,6 +42,11 @@ section headings into section rows. For a section-only document (an empty or sho
 pre-section body), import synthesizes the atom's `content` from its section bodies so the
 atom satisfies the content minimum and remains searchable at the atom level.
 
+The `knowledge.compose` section manifest is **opt-in**: callers pass `explain=true` to receive
+`sections[]` and per-source `breakdown` in the response; the default compose response returns only
+the formatted briefing and omits them. Consumers that depend on the manifest (for example
+PostToolUse hooks) must set `explain=true` explicitly.
+
 ### Atom and section content constraints
 
 The `knowledge_atoms` table stores atom body text in a single `content` column. There is

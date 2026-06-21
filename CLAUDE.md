@@ -114,7 +114,7 @@ not shipped.
 
 ## Closed taxonomies (DO NOT extend without an ADR)
 
-### 9 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-resource-entity-kind.md))
+### 9 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
 
 `concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service` | `resource`
 
@@ -207,15 +207,17 @@ Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 | `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
 | `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
 
-### Memory pack verbs (3 — ADR-021, optional)
+### Memory pack verbs (5 — ADR-021, optional)
 
 Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
 
-| Verb              | Args                                                                  | What it does                                                              |
-| ----------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
-| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`      | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
-| `memory.feedback` | `target_id`, `signal`                                                 | Emit explicit feedback on a recalled entity; updates recall posteriors    |
+| Verb              | Args                                                                  | What it does                                                                                   |
+| ----------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `memory.remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source                      |
+| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`      | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking                             |
+| `memory.feedback` | `target_id`, `signal`                                                 | Emit explicit feedback on a recalled entity; updates recall posteriors                         |
+| `memory.prune`    | `min_salience?`, `before?`, `namespace?`, `dry_run?`                  | Soft-delete memories below a salience floor and/or past `expires_at` (curation-layer, ADR-014) |
+| `memory.vacuum`   | —                                                                     | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows                                |
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
@@ -272,7 +274,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   `request`. **Per-verb validation failure** (unknown kind, bad UUID, etc.) returns a per-op
   `{ok: false, error: "..."}` entry — the batch does not abort.
 
-### Namespace (attribution-only — ADR-007 Rev 3, 2026-06-17)
+### Namespace (attribution-only — ADR-007 Rev 6, 2026-06-19)
 
 - **Namespace is attribution, not isolation.** It is a write-stamp on records, queryable and
   filterable, available to the Gate as policy input. It is never a storage boundary.
@@ -284,6 +286,9 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   Gate is the trust boundary.
 - **Multi-record ops default to `WHERE namespace='local'`**; the only escape is an explicit
   `namespace=` parameter from the caller.
+- **Episodic memory writes are the Rev 6 write-default exception**: `memory.remember` with
+  `memory_type=episodic` stamps the caller's actor-id namespace by default; semantic and all
+  other writes still default to `'local'`, and an explicit `namespace=` overrides either way.
 
 ### Edge cascade
 
@@ -387,7 +392,7 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 - **Don't silently coerce invalid input.** Invalid entity kinds, note kinds, and edge relations
   must return errors with the valid values listed. Never `unwrap_or_default()`.
 - **Don't add namespace checks to by-ID ops.** By-ID methods (get, update, delete, merge)
-  are namespace-agnostic by design (ADR-007 Rev 3). Authorization is at the Gate. Adding
+  are namespace-agnostic by design (ADR-007 Rev 6). Authorization is at the Gate. Adding
   `record.namespace == caller_namespace` post-fetch checks is the prior v1 bug pattern; it
   was removed by PR-A1 and must not return.
 - **Don't edit V1 migrations.** Append a new version. V1 is immutable on existing databases.
