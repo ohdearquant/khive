@@ -27,7 +27,8 @@ Follow `marketplace/khive/skills/polish/SKILL.md`. This file adds polisher-speci
 - After a schema migration that changed edge semantics
 
 Do not use the polisher for: creating new concepts (`digester` or `expander`), strategic gap
-analysis (`gap-analyst`), or codebase wiring (use a `connect`-skilled agent).
+analysis (`gap-analyst`), or codebase wiring (`implements` edges require reading actual code —
+out of polish scope).
 
 ---
 
@@ -82,10 +83,9 @@ analysis (`gap-analyst`), or codebase wiring (use a `connect`-skilled agent).
 ## What polish CANNOT do autonomously
 
 - Add `competes_with` edges (judgment call — let `expander` propose alternatives)
-- Add `implements` edges (requires reading actual code — let `connect`-style agent handle codebase
-  wiring)
-- Promote concept `status` from `"concept"` to `"implemented"` (only `connect` or human verification
-  of code does that)
+- Add `implements` edges (requires reading actual code — out of scope for autonomous polish)
+- Promote concept `status` from `"concept"` to `"implemented"` (only verification against actual
+  code does that)
 - Delete an entity outright (use `merge` if duplicate; `question` note if questionable)
 
 ---

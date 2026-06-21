@@ -69,8 +69,9 @@ request(ops="memory.recall(query=\"<project name> decisions blockers next steps\
 Use distinctive nouns matching words a memory author would have written. "KG agent
 task queue syntax" finds results; "what happened with agents" does not.
 
-Scores are decay-weighted hybrid (FTS + vector, RRF fusion), bounded to [0,1]. Recent
-notes at normal salience score 0.10-0.25. Start without `min_score`, inspect the
+Scores are decay-weighted hybrid (FTS + vector, weighted fusion `[0.7, 0.3]` by default; RRF
+is available via `fusion_strategy="rrf"`), bounded to [0,1]. Recent notes at normal salience
+score 0.10-0.25. Start without `min_score`, inspect the
 returned scores, then set a threshold just below the last useful hit if needed.
 
 Filter by type when you know what you are looking for:
@@ -91,7 +92,7 @@ request(ops="search(kind=\"note\", query=\"<topic>\", limit=10)")
 After using recall results, emit feedback so the brain pack can tune future ranking:
 
 ```
-request(ops="brain.auto_feedback(results=[{\"id\":\"<uuid>\",\"score\":0.42}], signal=\"useful\")")
+request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], signal=\"useful\")")
 ```
 
 ## Anti-patterns

@@ -63,8 +63,9 @@ request(ops="[schedule.agenda(limit=10), comm.inbox(limit=10), gtd.next(limit=5)
 
 ### 4. Cancel: remove a pending entry
 
-Pass the full UUID from the response (or an unambiguous 8+ hex prefix). The event is soft-deleted
-and stays in storage for audit but vanishes from `agenda`.
+Pass the full UUID from the response (or an unambiguous 8+ hex prefix). The event's `status` is
+set to `cancelled` (with a `cancelled_at` timestamp) — it stays in storage for audit but vanishes
+from `agenda`.
 
 ```
 request(ops="schedule.cancel(id=\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\")")

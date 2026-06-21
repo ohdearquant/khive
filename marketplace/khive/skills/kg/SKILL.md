@@ -71,8 +71,11 @@ When a change should be reviewed before it mutates the graph (a contested edge, 
 `link` / `merge` directly — open a proposal (event-sourced, ADR-046):
 
 ```
-request(ops="propose(title=\"...\", description=\"<cite the evidence>\", changeset={\"kind\":\"add_edge\", ...})")
+request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"...\",\"description\":\"<cite the evidence>\",\"changeset\":{\"kind\":\"add_edge\", ...}}}]")
 ```
+
+`propose` is the one verb that needs the JSON request form, not function-call form — its
+`changeset` holds nested objects the function-call DSL cannot express.
 
 A reviewer reads it and decides — `review(id, decision="approve"|"reject"|"request_changes")` —
 and the runtime applies an approved changeset asynchronously (`approved → applying → applied`).

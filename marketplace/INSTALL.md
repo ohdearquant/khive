@@ -166,8 +166,9 @@ request(ops="delete(kind=\"entity\", id=\"<id-from-create>\")")
 ### GTD pack smoke tests
 
 ```text
-request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\")")
+request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\", status=\"next\")")
 request(ops="gtd.next(limit=3)")
+request(ops="gtd.transition(id=\"<id-from-assign>\", status=\"active\")")
 request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ```
 
