@@ -103,6 +103,13 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `comm.reply`  | Reply to a message (threading linkage) | Respond in-thread                        |
 | `comm.thread` | Retrieve full conversation thread      | Read the whole conversation              |
 
+**Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
+`subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
+chars) — triage without a `get` per message. Delivery is actor-addressed: `comm.send(to="lambda:x")`
+stamps `from_actor` from the server's configured actor and lands in `x`'s inbox, and `comm.inbox`
+returns only messages addressed to you. Set that actor via `--actor` / `KHIVE_ACTOR`; an unset actor
+sends and reads as the shared `"local"` party line.
+
 ### Schedule pack — 4 verbs (`schedule.` prefix)
 
 | Verb                | What it does                     | When to use                                    |

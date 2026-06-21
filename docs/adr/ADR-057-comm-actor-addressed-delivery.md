@@ -149,6 +149,24 @@ Existing messages that lack these fields are treated as if `from_actor == namesp
 `to_actor == "local"` (the single-actor fallback). No database migration is required; these
 are JSON properties, not columns.
 
+### `comm.inbox` response shape
+
+`comm.inbox` surfaces the following top-level convenience fields on each returned message
+object for scannability. The canonical values remain stored in `properties`; these fields are
+extracted at view time and are additive (no existing keys are removed or renamed).
+
+| Field       | Source                                                                             | Default when absent |
+| ----------- | ---------------------------------------------------------------------------------- | ------------------- |
+| `from`      | `properties.from_actor`, fallback to `namespace`                                   | `namespace` value   |
+| `to`        | `properties.to_actor`                                                              | null                |
+| `subject`   | `properties.subject`                                                               | null                |
+| `read`      | `properties.read`                                                                  | false               |
+| `direction` | `properties.direction`                                                             | null                |
+| `preview`   | derived: whitespace-collapsed, truncated to 80 chars with `…` appended when longer | (always present)    |
+
+The `preview` field is computed from `content` in the view layer. Stored content is never
+mutated. When `subject` is null, `preview` provides a fallback scan line for the inbox.
+
 ### `comm.send` behavior change
 
 The `to` parameter is reinterpreted. When `to` does not start with a recognized remote

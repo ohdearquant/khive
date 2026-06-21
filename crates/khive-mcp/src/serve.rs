@@ -187,6 +187,17 @@ pub fn build_registry_for_multi_backend(
         }
     }
 
+    if should_warn_unattributed(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    ) {
+        tracing::warn!(
+            "actor identity resolved to \"local\": comm sends will be stamped from \
+             \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+             Set KHIVE_ACTOR or --actor to this lambda's id."
+        );
+    }
+
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
     let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
@@ -246,6 +257,19 @@ pub fn build_registry_for_multi_backend(
     })
 }
 
+/// Return true when the actor identity will produce unattributed comm sends and
+/// a party-line inbox.
+///
+/// Fires when:
+/// - `actor_id` is `None` (not configured) or `"local"` (the default fallback), AND
+/// - the loaded pack list includes `"comm"`.
+///
+/// Pure predicate — no I/O, no logging. Callers emit the warning.
+pub(crate) fn should_warn_unattributed(actor_id: Option<&str>, loaded_packs: &[String]) -> bool {
+    let is_local = actor_id.map(|id| id == "local").unwrap_or(true);
+    is_local && loaded_packs.iter().any(|p| p == "comm")
+}
+
 /// Build a fully-configured server from parsed args (without serving).
 pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     let (cli_namespace_explicit, cli_namespace) =
@@ -280,6 +304,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
             for name in runtime.registered_embedding_model_names() {
                 runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
             }
+        }
+        if should_warn_unattributed(
+            runtime.config().actor_id.as_deref(),
+            &runtime.config().packs,
+        ) {
+            tracing::warn!(
+                "actor identity resolved to \"local\": comm sends will be stamped from \
+                 \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+                 Set KHIVE_ACTOR or --actor to this lambda's id."
+            );
         }
         return KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"));
     }
@@ -415,6 +449,17 @@ fn build_server_multi_backend(
             default_runtime
                 .register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
         }
+    }
+
+    if should_warn_unattributed(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    ) {
+        tracing::warn!(
+            "actor identity resolved to \"local\": comm sends will be stamped from \
+             \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+             Set KHIVE_ACTOR or --actor to this lambda's id."
+        );
     }
 
     // Build the VerbRegistry using per-pack runtimes.
@@ -593,6 +638,24 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)?
     } else {
         resolve_config(inputs.config, base_config)?
+    };
+
+    // ADR-057: the `--actor` / `--namespace` CLI flag must populate `actor_id`
+    // (token attribution), matching how the `KHIVE_ACTOR` env already does via
+    // RuntimeConfig::default(). Without this, `--actor lambda:x` alone — no env,
+    // no config-file `[actor] id` — leaves actor_id None, so the request token
+    // carries ActorRef::anonymous(): ADR-057 actor-addressed delivery degrades to
+    // the party line and the unattributed-comm startup warning fires despite an
+    // actor having been set. Fill only when still None so the env (base spread) and
+    // a config-file `[actor] id` keep precedence; the `"local"` guard leaves the
+    // default namespace anonymous (consistent with should_warn_unattributed).
+    let resolved = {
+        let mut resolved = resolved;
+        let ns = resolved.default_namespace.as_str().to_string();
+        if resolved.actor_id.is_none() && inputs.namespace_explicit && ns != "local" {
+            resolved.actor_id = Some(ns);
+        }
+        resolved
     };
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
@@ -865,6 +928,63 @@ brain_profile = "project-profile"
             resolved.brain_profile.as_deref(),
             Some("cli-profile"),
             "CLI --brain-profile must win over both TOML and KHIVE_BRAIN_PROFILE env var"
+        );
+    }
+
+    /// Regression for code-review Finding 1 (#203): the `--actor` / `--namespace`
+    /// CLI flag must set `actor_id`, not just `default_namespace`. Before the fix,
+    /// `--actor lambda:x` with no `KHIVE_ACTOR` env and no config-file `[actor] id`
+    /// left actor_id None → anonymous token → degraded ADR-057 comm + false warning.
+    #[test]
+    #[serial]
+    fn cli_actor_flag_populates_actor_id() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("lambda:agent-x").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:agent-x"),
+            "--actor flag must populate actor_id (flag==env parity), not just default_namespace"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "lambda:agent-x",
+            "the flag still sets the write namespace"
+        );
+    }
+
+    /// The `"local"` default namespace must stay anonymous (actor_id None) even when
+    /// passed explicitly, so `should_warn_unattributed` still flags an unset actor.
+    #[test]
+    #[serial]
+    fn cli_actor_flag_local_stays_anonymous() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id, None,
+            "explicit --actor local must remain anonymous (no actor_id) so the \
+             unattributed-comm warning still fires"
         );
     }
 
@@ -1430,5 +1550,42 @@ brain_profile = "project-profile"
             "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
              got count={second_entity_count}"
         );
+    }
+
+    // --- should_warn_unattributed predicate ---
+
+    fn packs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn warn_when_actor_is_none_and_comm_loaded() {
+        assert!(should_warn_unattributed(None, &packs(&["kg", "comm"])));
+    }
+
+    #[test]
+    fn warn_when_actor_is_local_and_comm_loaded() {
+        assert!(should_warn_unattributed(
+            Some("local"),
+            &packs(&["kg", "comm"])
+        ));
+    }
+
+    #[test]
+    fn no_warn_when_actor_is_configured() {
+        assert!(!should_warn_unattributed(
+            Some("lambda:khive"),
+            &packs(&["kg", "comm"])
+        ));
+    }
+
+    #[test]
+    fn no_warn_when_comm_not_loaded() {
+        assert!(!should_warn_unattributed(Some("local"), &packs(&["kg"])));
+    }
+
+    #[test]
+    fn no_warn_when_actor_none_and_no_comm() {
+        assert!(!should_warn_unattributed(None, &packs(&["kg", "memory"])));
     }
 }
