@@ -106,7 +106,7 @@ not shipped.
 | `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
 | `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
 | `docs/adr/`                | Architecture Decision Records (the design contract)                                                                    |
-| `marketplace/`             | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`                                                      |
+| `marketplace/`             | The `khive` umbrella Claude Code plugin (one skill per pack + kg agents) — install via `/plugin install`               |
 | `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
 | `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                    |
 
