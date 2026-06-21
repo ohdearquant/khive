@@ -1,19 +1,16 @@
 # khive Marketplace Plugin Installation
 
-This document covers how to install khive plugins for Claude Code and verify they are wired
+This document covers how to install the khive plugin for Claude Code and verify it is wired
 correctly to a running `kkernel mcp` server.
 
 ## Version compatibility
 
-| Plugin    | Version | kkernel |
-| --------- | ------- | ------- |
-| kg        | 0.2.4   | ≥ 0.2.4 |
-| gtd       | 0.2.4   | ≥ 0.2.4 |
-| memory    | 0.2.4   | ≥ 0.2.4 |
-| brain     | 0.2.4   | ≥ 0.2.4 |
-| comm      | 0.2.4   | ≥ 0.2.4 |
-| schedule  | 0.2.4   | ≥ 0.2.4 |
-| knowledge | 0.2.4   | ≥ 0.2.4 |
+| Plugin | Version | kkernel |
+| ------ | ------- | ------- |
+| khive  | 0.2.8   | ≥ 0.2.4 |
+
+`khive` is a single umbrella plugin — one pattern skill per pack plus the kg stewardship agents,
+all over the one `kkernel mcp` server.
 
 ## Step 1 — Install kkernel
 
@@ -70,7 +67,10 @@ Create or update `.mcp.json` in your project root:
         "schedule",
         "--pack",
         "knowledge"
-      ]
+      ],
+      "env": {
+        "KHIVE_ACTOR": "lambda:your-id"
+      }
     }
   }
 }
@@ -106,29 +106,49 @@ claude mcp add --transport stdio khive -- kkernel mcp \
   --pack comm --pack schedule --pack knowledge
 ```
 
-## Step 3 — Install the plugins
+### Set your actor identity (attribution)
+
+Every record you write — messages, tasks, memories — is stamped with **who you are**
+(`from_actor`). That identity comes from the MCP server's actor config. If it is unset it
+silently defaults to `"local"`, which leaves your messages unattributed and your `comm.inbox`
+unscoped (it returns every `"local"` message, not just yours). Set it once, per agent.
+
+The `env` block in Option A is the simplest place — set `KHIVE_ACTOR` to this agent's id (e.g.
+`lambda:khive`, `lambda:lattice`). For per-session CLI registration, pass the flag instead:
+
+```bash
+claude mcp add --transport stdio khive -- kkernel mcp --actor lambda:your-id --pack kg --pack gtd
+```
+
+Resolution order (highest to lowest):
+
+1. `--actor <id>` flag (or `KHIVE_ACTOR` env) — sets both attribution and the default namespace
+2. `--namespace <id>` / `KHIVE_NAMESPACE` — legacy alias
+3. `[actor] id` in a config file — attribution only (does not move the write namespace)
+4. Default: `"local"`
+
+The config-file form (searched in order `./khive.toml`, `./.khive/config.toml`,
+`~/.khive/config.toml`, or an explicit `--config` / `KHIVE_CONFIG`):
+
+```toml
+[actor]
+id = "lambda:your-id"
+```
+
+When the `comm` pack is loaded and the actor is still `"local"`, the server logs a startup
+warning — that warning means your mail will be unattributed until you set an id.
+
+## Step 3 — Install the plugin
 
 ```bash
 # From the repo root
-claude plugin install marketplace/kg
-claude plugin install marketplace/gtd
-claude plugin install marketplace/memory
-claude plugin install marketplace/brain
-claude plugin install marketplace/comm
-claude plugin install marketplace/schedule
-claude plugin install marketplace/knowledge
+claude plugin install marketplace/khive
 ```
 
-Or manually copy each plugin directory into `~/.claude/plugins/`:
+Or manually copy the plugin directory into `~/.claude/plugins/`:
 
 ```bash
-cp -r marketplace/kg        ~/.claude/plugins/kg
-cp -r marketplace/gtd       ~/.claude/plugins/gtd
-cp -r marketplace/memory    ~/.claude/plugins/memory
-cp -r marketplace/brain     ~/.claude/plugins/brain
-cp -r marketplace/comm      ~/.claude/plugins/comm
-cp -r marketplace/schedule  ~/.claude/plugins/schedule
-cp -r marketplace/knowledge ~/.claude/plugins/knowledge
+cp -r marketplace/khive ~/.claude/plugins/khive
 ```
 
 ## Step 4 — Verify installation
@@ -146,8 +166,9 @@ request(ops="delete(kind=\"entity\", id=\"<id-from-create>\")")
 ### GTD pack smoke tests
 
 ```text
-request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\")")
+request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\", status=\"next\")")
 request(ops="gtd.next(limit=3)")
+request(ops="gtd.transition(id=\"<id-from-assign>\", status=\"active\")")
 request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ```
 

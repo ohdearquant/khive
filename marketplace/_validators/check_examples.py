@@ -33,7 +33,7 @@ MEMORY_VERBS = frozenset({
 BRAIN_VERBS = frozenset({
     "brain.profiles", "brain.profile", "brain.resolve",
     "brain.activate", "brain.deactivate", "brain.archive",
-    "brain.feedback", "brain.reset",
+    "brain.feedback", "brain.auto_feedback", "brain.reset",
     "brain.bind", "brain.unbind", "brain.bindings", "brain.create_profile",
     # internal/subhandler — callable by operators
     "brain.state", "brain.config", "brain.events", "brain.emit",
@@ -49,6 +49,7 @@ SCHEDULE_VERBS = frozenset({
 
 KNOWLEDGE_VERBS = frozenset({
     "knowledge.learn", "knowledge.cite", "knowledge.topic",
+    "knowledge.search", "knowledge.suggest", "knowledge.compose",
 })
 
 ALL_VERBS = KG_VERBS | GTD_VERBS | MEMORY_VERBS | BRAIN_VERBS | COMM_VERBS | SCHEDULE_VERBS | KNOWLEDGE_VERBS
@@ -279,7 +280,7 @@ def main() -> int:
     marketplace_root = here.parent
 
     skill_files = sorted(marketplace_root.glob("*/skills/**/SKILL.md"))
-    agent_files = sorted(marketplace_root.glob("kg/agents/*.md"))
+    agent_files = sorted(marketplace_root.glob("*/agents/*.md"))
     all_files = skill_files + agent_files
 
     if not all_files:
