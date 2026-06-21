@@ -124,8 +124,8 @@ gtd.complete(id="<your-task-id>",
 
 - Chaining modes inside one invocation
 - Skipping the drift check after expansion
-- Promoting a concept to `status: "implemented"` before code lands (only `connect` flips that,
-  against real file references)
+- Promoting a concept to `status: "implemented"` before code lands (flip it only after verifying
+  against real file references, then `update`)
 - Creating speculative entities to pad density
 - Working multiple expander tasks in parallel — drift compounds
 - Finishing without queueing polisher follow-up

@@ -40,7 +40,7 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
   properties={"domain": "...", "type": "...", "year": "..."})
 ```
 
-**8 entity kinds** (closed — pick the best fit, don't invent):
+**9 entity kinds** (closed — pick the best fit, don't invent):
 
 | Kind       | Use for                                                      |
 | ---------- | ------------------------------------------------------------ |
@@ -52,6 +52,7 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
 | `org`      | Labs, companies, institutions                                |
 | `artifact` | Generated files, model artifacts, build outputs              |
 | `service`  | Long-running services, APIs, deployed systems                |
+| `resource` | Knowledge atoms, domains, skills, tools                       |
 
 **Naming**: short canonical name people actually say. `LoRA` not
 `Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.
@@ -64,7 +65,7 @@ For each relationship you identified in the material:
 link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.0>)
 ```
 
-**15 relations** (closed — map to these, don't invent):
+**17 relations** (closed — map to these, don't invent):
 
 | Category       | Relation        | Direction              | When                      |
 | -------------- | --------------- | ---------------------- | ------------------------- |
@@ -83,6 +84,8 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 | Lateral        | `competes_with` | A ↔ B                  | Alternative approaches    |
 | Lateral        | `composed_with` | A ↔ B                  | Used together             |
 | Annotation     | `annotates`     | note → any substrate   | Note observes/comments on |
+| Epistemic      | `supports`      | evidence → claim       | Evidence for a claim      |
+| Epistemic      | `refutes`       | evidence → claim       | Evidence against a claim  |
 
 **Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was
 introduced by the paper). If you get direction wrong, the traversal breaks.
@@ -130,5 +133,5 @@ as `question` notes for follow-up.
 If a tool returns an error, read the message — it lists valid values. Common cases:
 
 - Invalid `entity_kind` or `note_kind` → the error says which values are valid
-- Invalid `relation` → use only the 15 above
+- Invalid `relation` → use only the 17 above
 - ID not found → check the UUID; use `search` to find the correct one

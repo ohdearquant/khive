@@ -100,7 +100,7 @@ resolve. Group by tag / domain to surface patterns.
 ## Taxonomy questions
 
 When gap-analyst queues a `kg:meta + taxonomy` task, the gap requires a relation that doesn't exist
-in the closed 15-relation set. Librarian's job:
+in the closed 17-relation set. Librarian's job:
 
 1. Read the gap analyst's report and the affected entities.
 2. Determine whether the missing relation is genuine or whether the gap can be expressed with

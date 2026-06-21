@@ -226,7 +226,7 @@ State for the record:
    only notes (or one edge if recommendation is strong).
 3. **Every new entity needs a citation.** A description sentence sourced from an existing entity, a
    paper, an ADR, or a code reference. No source = no create. File a question note instead.
-4. **Do not create entities outside the closed taxonomies.** 8 kinds, 15 relations, 5 note kinds. If
+4. **Do not create entities outside the closed taxonomies.** 9 kinds, 17 relations, 5 note kinds. If
    your expansion needs a new kind, that is an ADR, not a skill invocation — stop and surface to a
    human.
 5. **Re-read the source after expansion** to verify you didn't drift. A common failure: the gap

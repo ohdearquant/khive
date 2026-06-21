@@ -40,7 +40,7 @@ request(ops="schedule.schedule(action=\"gtd.assign(title=\\\"weekly review\\\", 
 Any expression accepted by `request` is valid as an action:
 
 ```
-remind(content="check status")
+schedule.remind(content="check status")
 comm.send(to="lambda:leo", content="heartbeat")
 [memory.recall(query="recent work"), comm.inbox()]
 ```
