@@ -640,6 +640,24 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         resolve_config(inputs.config, base_config)?
     };
 
+    // ADR-057: the `--actor` / `--namespace` CLI flag must populate `actor_id`
+    // (token attribution), matching how the `KHIVE_ACTOR` env already does via
+    // RuntimeConfig::default(). Without this, `--actor lambda:x` alone — no env,
+    // no config-file `[actor] id` — leaves actor_id None, so the request token
+    // carries ActorRef::anonymous(): ADR-057 actor-addressed delivery degrades to
+    // the party line and the unattributed-comm startup warning fires despite an
+    // actor having been set. Fill only when still None so the env (base spread) and
+    // a config-file `[actor] id` keep precedence; the `"local"` guard leaves the
+    // default namespace anonymous (consistent with should_warn_unattributed).
+    let resolved = {
+        let mut resolved = resolved;
+        let ns = resolved.default_namespace.as_str().to_string();
+        if resolved.actor_id.is_none() && inputs.namespace_explicit && ns != "local" {
+            resolved.actor_id = Some(ns);
+        }
+        resolved
+    };
+
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
     Ok(apply_env_brain_profile(resolved))
@@ -910,6 +928,63 @@ brain_profile = "project-profile"
             resolved.brain_profile.as_deref(),
             Some("cli-profile"),
             "CLI --brain-profile must win over both TOML and KHIVE_BRAIN_PROFILE env var"
+        );
+    }
+
+    /// Regression for code-review Finding 1 (#203): the `--actor` / `--namespace`
+    /// CLI flag must set `actor_id`, not just `default_namespace`. Before the fix,
+    /// `--actor lambda:x` with no `KHIVE_ACTOR` env and no config-file `[actor] id`
+    /// left actor_id None → anonymous token → degraded ADR-057 comm + false warning.
+    #[test]
+    #[serial]
+    fn cli_actor_flag_populates_actor_id() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("lambda:agent-x").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:agent-x"),
+            "--actor flag must populate actor_id (flag==env parity), not just default_namespace"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "lambda:agent-x",
+            "the flag still sets the write namespace"
+        );
+    }
+
+    /// The `"local"` default namespace must stay anonymous (actor_id None) even when
+    /// passed explicitly, so `should_warn_unattributed` still flags an unset actor.
+    #[test]
+    #[serial]
+    fn cli_actor_flag_local_stays_anonymous() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id, None,
+            "explicit --actor local must remain anonymous (no actor_id) so the \
+             unattributed-comm warning still fires"
         );
     }
 
