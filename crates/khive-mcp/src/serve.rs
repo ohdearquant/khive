@@ -187,6 +187,17 @@ pub fn build_registry_for_multi_backend(
         }
     }
 
+    if should_warn_unattributed(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    ) {
+        tracing::warn!(
+            "actor identity resolved to \"local\": comm sends will be stamped from \
+             \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+             Set KHIVE_ACTOR or --actor to this lambda's id."
+        );
+    }
+
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
     let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
@@ -246,6 +257,19 @@ pub fn build_registry_for_multi_backend(
     })
 }
 
+/// Return true when the actor identity will produce unattributed comm sends and
+/// a party-line inbox.
+///
+/// Fires when:
+/// - `actor_id` is `None` (not configured) or `"local"` (the default fallback), AND
+/// - the loaded pack list includes `"comm"`.
+///
+/// Pure predicate — no I/O, no logging. Callers emit the warning.
+pub(crate) fn should_warn_unattributed(actor_id: Option<&str>, loaded_packs: &[String]) -> bool {
+    let is_local = actor_id.map(|id| id == "local").unwrap_or(true);
+    is_local && loaded_packs.iter().any(|p| p == "comm")
+}
+
 /// Build a fully-configured server from parsed args (without serving).
 pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     let (cli_namespace_explicit, cli_namespace) =
@@ -280,6 +304,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
             for name in runtime.registered_embedding_model_names() {
                 runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
             }
+        }
+        if should_warn_unattributed(
+            runtime.config().actor_id.as_deref(),
+            &runtime.config().packs,
+        ) {
+            tracing::warn!(
+                "actor identity resolved to \"local\": comm sends will be stamped from \
+                 \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+                 Set KHIVE_ACTOR or --actor to this lambda's id."
+            );
         }
         return KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"));
     }
@@ -415,6 +449,17 @@ fn build_server_multi_backend(
             default_runtime
                 .register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
         }
+    }
+
+    if should_warn_unattributed(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    ) {
+        tracing::warn!(
+            "actor identity resolved to \"local\": comm sends will be stamped from \
+             \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
+             Set KHIVE_ACTOR or --actor to this lambda's id."
+        );
     }
 
     // Build the VerbRegistry using per-pack runtimes.
@@ -1430,5 +1475,42 @@ brain_profile = "project-profile"
             "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
              got count={second_entity_count}"
         );
+    }
+
+    // --- should_warn_unattributed predicate ---
+
+    fn packs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn warn_when_actor_is_none_and_comm_loaded() {
+        assert!(should_warn_unattributed(None, &packs(&["kg", "comm"])));
+    }
+
+    #[test]
+    fn warn_when_actor_is_local_and_comm_loaded() {
+        assert!(should_warn_unattributed(
+            Some("local"),
+            &packs(&["kg", "comm"])
+        ));
+    }
+
+    #[test]
+    fn no_warn_when_actor_is_configured() {
+        assert!(!should_warn_unattributed(
+            Some("lambda:khive"),
+            &packs(&["kg", "comm"])
+        ));
+    }
+
+    #[test]
+    fn no_warn_when_comm_not_loaded() {
+        assert!(!should_warn_unattributed(Some("local"), &packs(&["kg"])));
+    }
+
+    #[test]
+    fn no_warn_when_actor_none_and_no_comm() {
+        assert!(!should_warn_unattributed(None, &packs(&["kg", "memory"])));
     }
 }

@@ -37,16 +37,63 @@ pub(crate) async fn resolve_id(
 }
 
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
+    let props = note.properties.as_ref();
+
+    let from = props
+        .and_then(|p| p.get("from_actor"))
+        .and_then(Value::as_str)
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or_else(|| Value::String(note.namespace.clone()));
+
+    let to = props
+        .and_then(|p| p.get("to_actor"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let subject = props
+        .and_then(|p| p.get("subject"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let read = props
+        .and_then(|p| p.get("read"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let direction = props
+        .and_then(|p| p.get("direction"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let preview = build_preview(&note.content);
+
     json!({
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "kind": "message",
+        "from": from,
+        "to": to,
+        "subject": subject,
+        "read": read,
+        "direction": direction,
+        "preview": preview,
         "content": note.content,
         "namespace": note.namespace,
         "properties": note.properties,
         "created_at": micros_to_iso(note.created_at),
         "updated_at": micros_to_iso(note.updated_at),
     })
+}
+
+fn build_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let collapsed: String = content.split_whitespace().collect::<Vec<&str>>().join(" ");
+    if collapsed.chars().count() > MAX_CHARS {
+        let truncated: String = collapsed.chars().take(MAX_CHARS).collect();
+        format!("{truncated}\u{2026}")
+    } else {
+        collapsed
+    }
 }
 
 /// Write an outbound copy (caller namespace) and an inbound copy (recipient namespace),
@@ -235,4 +282,109 @@ pub(crate) async fn dual_write_message(
     }
 
     Ok(outbound_note)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_storage::note::Note;
+    use serde_json::json;
+
+    fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
+        let mut n = Note::new(namespace, "message", content);
+        n.properties = props;
+        n
+    }
+
+    #[test]
+    fn promotes_from_to_subject_when_present() {
+        let note = make_note(
+            "local",
+            "hello",
+            Some(json!({
+                "from_actor": "lambda:khive",
+                "to_actor": "lambda:leo",
+                "subject": "Status update",
+                "direction": "inbound",
+                "read": false,
+            })),
+        );
+        let v = note_to_message_json(&note);
+        assert_eq!(v["from"], json!("lambda:khive"));
+        assert_eq!(v["to"], json!("lambda:leo"));
+        assert_eq!(v["subject"], json!("Status update"));
+        assert_eq!(v["direction"], json!("inbound"));
+        assert_eq!(v["read"], json!(false));
+        assert!(v["content"].is_string());
+        assert!(v["properties"].is_object());
+    }
+
+    #[test]
+    fn from_falls_back_to_namespace_when_from_actor_absent() {
+        let note = make_note(
+            "legacy-ns",
+            "old message",
+            Some(json!({ "to_actor": "lambda:leo" })),
+        );
+        let v = note_to_message_json(&note);
+        assert_eq!(v["from"], json!("legacy-ns"));
+    }
+
+    #[test]
+    fn preview_is_single_line_and_truncated_for_long_content() {
+        let long_body = "word ".repeat(40);
+        let note = make_note("local", long_body.trim(), None);
+        let v = note_to_message_json(&note);
+        let preview = v["preview"].as_str().expect("preview is a string");
+        assert!(!preview.contains('\n'), "preview must be single-line");
+        assert!(
+            preview.ends_with('\u{2026}'),
+            "long preview must end with ellipsis"
+        );
+        let without_ellipsis: &str = &preview[..preview.len() - '\u{2026}'.len_utf8()];
+        assert!(
+            without_ellipsis.chars().count() <= 80,
+            "preview body must not exceed 80 chars before ellipsis"
+        );
+    }
+
+    #[test]
+    fn preview_not_truncated_for_short_content() {
+        let note = make_note("local", "short message", None);
+        let v = note_to_message_json(&note);
+        let preview = v["preview"].as_str().expect("preview is a string");
+        assert_eq!(preview, "short message");
+        assert!(!preview.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_newlines() {
+        let note = make_note("local", "line one\n  line two\n\nline three", None);
+        let v = note_to_message_json(&note);
+        let preview = v["preview"].as_str().expect("preview is a string");
+        assert_eq!(preview, "line one line two line three");
+    }
+
+    #[test]
+    fn properties_and_content_still_present() {
+        let note = make_note(
+            "local",
+            "body text",
+            Some(json!({ "from_actor": "x", "custom": 42 })),
+        );
+        let v = note_to_message_json(&note);
+        assert_eq!(v["content"], json!("body text"));
+        assert_eq!(v["properties"]["custom"], json!(42));
+    }
+
+    #[test]
+    fn null_defaults_when_no_properties() {
+        let note = make_note("local", "no props", None);
+        let v = note_to_message_json(&note);
+        assert_eq!(v["to"], Value::Null);
+        assert_eq!(v["subject"], Value::Null);
+        assert_eq!(v["direction"], Value::Null);
+        assert_eq!(v["read"], json!(false));
+        assert_eq!(v["from"], json!("local"));
+    }
 }
