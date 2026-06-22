@@ -30,6 +30,12 @@
 //!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
+//! - Tokens containing non-ASCII characters (CJK prose, accented text, emoji)
+//!   — not subject to the entropy heuristic.  Real base64/hex/base64url
+//!   credentials are ASCII; multibyte UTF-8 otherwise inflates the byte-wise
+//!   Shannon entropy and false-positives on natural-language non-Latin content.
+//!   The literal-prefix checks still apply (a prefixed secret is caught even
+//!   with a trailing non-ASCII character).
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -374,6 +380,17 @@ const ENTROPY_THRESHOLD: f64 = 4.5;
 /// Window around a trigger word in which a high-entropy token must appear.
 const TRIGGER_WINDOW: usize = 120;
 
+/// Largest index `<= i` that lies on a UTF-8 char boundary of `s`. Stable
+/// replacement for the unstable `str::floor_char_boundary`; used to snap
+/// byte-offset windows that may land inside a multibyte char before slicing.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
     // Tokenize once: collect all whitespace-delimited tokens with their byte offsets.
     let tokens: Vec<(usize, &str)> = text
@@ -391,6 +408,19 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
             continue;
         }
 
+        // The entropy heuristic targets base64/hex/base64url credential runs,
+        // which are ASCII by construction.  A token containing non-ASCII
+        // characters (CJK prose, accented text, emoji) cannot be such a
+        // credential, and `shannon_entropy` runs over UTF-8 bytes — multibyte
+        // codepoints inflate the byte-wise entropy above the threshold, so a
+        // run of natural-language CJK reads as high-entropy.  Skip non-ASCII
+        // tokens to avoid blocking legitimate non-Latin content.  Prefixed
+        // secrets (sk-ant-, AKIA, …) are still caught by the Layer-1 pattern
+        // checks regardless of any trailing non-ASCII char.
+        if !token.is_ascii() {
+            continue;
+        }
+
         // UUID and sha-prefixed base64 content hashes (SRI / npm lockfile) are
         // unconditionally allowlisted: their forms are unambiguous regardless of
         // surrounding context.
@@ -401,8 +431,8 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
         // Compute the trigger window before deciding whether to allowlist hex
         // tokens.  A pure-hex token near a credential trigger word cannot be
         // safely assumed to be a non-secret hash and must be entropy-checked.
-        let window_start = tok_offset.saturating_sub(TRIGGER_WINDOW);
-        let window_end = (tok_offset + raw_token.len() + TRIGGER_WINDOW).min(text.len());
+        let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
+        let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
         let low_window = window.to_ascii_lowercase();
 
@@ -975,6 +1005,49 @@ mod tests {
         // A truly random-looking string should exceed 4.5 bits/char.
         let s = b"X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // 32 mixed base64 chars
         assert!(shannon_entropy(s) > 4.5, "entropy={}", shannon_entropy(s));
+    }
+
+    #[test]
+    fn cjk_prose_near_trigger_is_not_flagged() {
+        // Regression: a multibyte CJK run (~19 chars = 57 bytes) clears the
+        // byte-length floor, and `shannon_entropy` over UTF-8 bytes reads it as
+        // high-entropy — so a Chinese title near the `auth` trigger word used to
+        // false-positive as `high-entropy-token`.  Non-ASCII tokens are now
+        // skipped by the entropy heuristic: real base64/hex credentials are
+        // ASCII, so this cannot hide a secret.
+        let content = "更新 auth 配置数据库连接管理系统核心模块设计文档";
+        assert!(
+            check(content).is_ok(),
+            "CJK prose near a trigger word must not be flagged as a secret"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_near_trigger_still_flagged() {
+        // The non-ASCII skip must NOT weaken detection of genuine ASCII
+        // high-entropy credentials near a trigger word.
+        let content = "api_key X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1";
+        assert!(
+            check(content).is_err(),
+            "ASCII high-entropy token near a trigger word must still be blocked"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_in_cjk_context_does_not_panic_and_is_flagged() {
+        // The ±120-byte trigger window around an ASCII token can land in the
+        // middle of a multibyte CJK character when the token is embedded in
+        // non-Latin prose.  Slicing on a non-char-boundary would panic — the
+        // window bounds are snapped via `floor_char_boundary`.  Detection of
+        // the genuine ASCII secret must still fire.
+        let cjk = "数据库连接管理系统核心模块设计文档".repeat(6); // 17 chars × 6 = 306 bytes
+                                                                  // The leading single-byte `x` breaks 3-byte CJK alignment so the window
+                                                                  // start (token_offset - 120) lands mid-character without the snap.
+        let content = format!("{cjk}x api_key X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1 {cjk}");
+        assert!(
+            check(&content).is_err(),
+            "ASCII secret in CJK context must still be blocked (and must not panic)"
+        );
     }
 
     #[test]
