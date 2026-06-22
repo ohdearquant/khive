@@ -2,12 +2,18 @@
 # Run: cd crates && cargo deny check
 # CI: EmbarkStudios/cargo-deny-action@v2 with manifest-path: crates/Cargo.toml
 #
-# KNOWN LIMITATION (cargo-deny 0.18.x):
-# The advisory database added CVSS 4.0 advisories in 2026 (e.g. RUSTSEC-2026-0073
-# for libcrux-poly1305, which is NOT in khive's dep tree).  cargo-deny 0.18.x
-# cannot parse CVSS 4.0 format and will error on the advisory check.
-# CI uses continue-on-error on the advisories step until cargo-deny is updated.
-# Remove that flag once cargo-deny parses CVSS 4.0 correctly.
+# KNOWN LIMITATION (cargo-deny 0.18.5, verified 2026-06-22):
+# The RustSec advisory DB added CVSS 4.0 advisories in 2026 (e.g. RUSTSEC-2026-0073
+# for libcrux-poly1305, which is NOT in khive's dep tree). cargo-deny 0.18.5 fails to
+# *load* the advisory DB at all: "unsupported CVSS version: 4.0" is a parse-time
+# DB-load error, not a per-advisory match. So `cargo deny check advisories` errors out
+# before checking anything, and the [advisories] ignore list below is DORMANT — it
+# filters matched advisories, which never happens when the DB will not load. (Tested:
+# adding an ignore for RUSTSEC-2026-0073 does NOT suppress the load error.)
+# CI runs the advisories step with continue-on-error so the supply-chain job stays
+# green on the bans/licenses/sources policy, which does not load the advisory DB.
+# Advisory/CVE gating is therefore NOT yet in effect; tracked as a follow-up (evaluate
+# a cargo-deny upgrade or cargo-audit). Drop continue-on-error once the DB loads.
 
 [graph]
 targets = [
