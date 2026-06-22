@@ -17,6 +17,9 @@ cargo fmt --all -- --check
 echo "=== SQL Lint ==="
 sh "$SCRIPT_DIR/lint-sql.sh"
 
+echo "=== No-Stub Guard ==="
+sh "$SCRIPT_DIR/check-no-stubs.sh"
+
 echo "=== Clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
 

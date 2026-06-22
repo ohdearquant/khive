@@ -35,6 +35,26 @@ jobs:
           deno-version: v2.x
       - run: ../scripts/ci.sh
 
+  supply-chain:
+    name: Supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/Cargo.toml
+          command: check bans licenses sources
+      # Advisories run separately with continue-on-error because cargo-deny 0.18.x
+      # cannot parse CVSS 4.0 advisories added to the RustSec DB in 2026
+      # (e.g. RUSTSEC-2026-0073 for libcrux-poly1305, which is not in khive's dep
+      # tree).  Remove continue-on-error once cargo-deny is updated to support
+      # CVSS 4.0, or once the advisory DB no longer carries that format for our deps.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/Cargo.toml
+          command: check advisories
+        continue-on-error: true
+
   data-leak-guard:
     name: JSON/JSONL data-leak guard
     runs-on: ubuntu-latest

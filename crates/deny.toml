@@ -1,0 +1,93 @@
+# cargo-deny supply-chain policy for khive
+# Run: cd crates && cargo deny check
+# CI: EmbarkStudios/cargo-deny-action@v2 with manifest-path: crates/Cargo.toml
+#
+# KNOWN LIMITATION (cargo-deny 0.18.x):
+# The advisory database added CVSS 4.0 advisories in 2026 (e.g. RUSTSEC-2026-0073
+# for libcrux-poly1305, which is NOT in khive's dep tree).  cargo-deny 0.18.x
+# cannot parse CVSS 4.0 format and will error on the advisory check.
+# CI uses continue-on-error on the advisories step until cargo-deny is updated.
+# Remove that flag once cargo-deny parses CVSS 4.0 correctly.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# "workspace" = only unmaintained direct workspace deps are reported.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # FINDING: RUSTSEC-2026-0097 (rand unsound with custom logger + ThreadRng).
+    # All three rand versions in our tree satisfy the patched ranges:
+    #   rand 0.8.6  >= 0.8.6  (patched)
+    #   rand 0.9.4  >= 0.9.3  (patched)
+    #   rand 0.10.1 >= 0.10.1 (patched)
+    # This ignore entry prevents cargo-deny from flagging the advisory when the
+    # advisory DB match logic does not properly account for multi-version patched
+    # ranges in 0.18.x.  Remove once rand < 0.8.6 is no longer in the tree.
+    { id = "RUSTSEC-2026-0097", reason = "all three rand versions (0.8.6/0.9.4/0.10.1) satisfy the patched ranges; all are safe" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    # Standard permissive — OSI approved
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    # MIT-0 — MIT without attribution requirement (borrow-or-share, constant_time_eq)
+    "MIT-0",
+    # BSL-1.0 — Boost Software License, permissive, OSI-approved (ryu@1.0.23)
+    "BSL-1.0",
+    # 0BSD — BSD Zero Clause, maximally permissive (adler2@2.0.1)
+    "0BSD",
+    # CC0-1.0 — Creative Commons Zero / public domain (blake3, constant_time_eq)
+    "CC0-1.0",
+    # Unlicense — public domain equivalent
+    # (aho-corasick, memchr, globset, byteorder-lite)
+    "Unlicense",
+    # MPL-2.0 — Mozilla Public License, weak copyleft (file-level only); used by regorus
+    "MPL-2.0",
+    # CDLA-Permissive-2.0 — Linux Foundation permissive data/software license.
+    # FINDING: not OSI-approved, but widely accepted in the Rust ecosystem for TLS
+    # root certificate crates.  webpki-roots@0.26.11 and webpki-roots@1.0.8 carry
+    # this license; they are pulled in transitively via ureq -> lattice-embed.
+    # The license terms are functionally equivalent to MIT/Apache-2.0 for our usage.
+    # Re-evaluate if policy tightens to OSI-approved-only.
+    "CDLA-Permissive-2.0",
+]
+exceptions = [
+    # FINDING: r-efi carries LGPL-2.1-or-later (copyleft).
+    # It is a Windows/UEFI EFI interface crate pulled in by getrandom for UEFI
+    # random-source support.  Our build targets are Linux, macOS, and Windows x86 —
+    # none of which are EFI targets — so r-efi is never linked into shipped binaries.
+    # If an EFI target is added in future, this exception must be re-evaluated.
+    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+]
+
+[bans]
+multiple-versions = "warn"
+# "warn" rather than "deny": workspace-inherited deps (serde = { workspace = true })
+# may be reported as wildcards by cargo-deny 0.18.x even though they resolve to the
+# pinned workspace version.  Promote to "deny" once that is resolved upstream.
+wildcards = "warn"
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
