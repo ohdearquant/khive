@@ -189,6 +189,13 @@ the design means to hold. The hold is therefore enforced natively:
   GitHub docs do not explicitly state that 0 required approvals composes with code-owner
   enforcement, so rollout step 2 validates it on a throwaway PR before the pipeline depends on
   it.)
+- The proposer and the code owner must be distinct identities. GitHub forbids approving one's own
+  PR, so if the sole code owner authors a Lane-2 PR the code-owner requirement is unsatisfiable and
+  the PR is held indefinitely. Agent-generated PRs (the high-volume majority) must therefore be
+  authored by a bot identity, with the maintainer as the code owner who clears Lane 2; the
+  maintainer's own occasional Lane-2 PRs merge via the admin bypass. Every PR today is authored by
+  the maintainer's account, so giving agent pushes a distinct identity is a precondition for the
+  hold to function, not an optional refinement — validated alongside rollout step 2.
 - Auto-merge is permitted repository-wide (`allow_auto_merge`); squash is the merge method (one
   revertable commit per merge); delete-branch-on-merge is enabled.
 - A lightweight workflow enables auto-merge (`gh pr merge --auto --squash`) on every PR when it
@@ -232,7 +239,9 @@ These are never delegated to automation, in any lane:
    PR. Until this lands, do not require its contexts in branch protection.
 2. Add the `CODEOWNERS` file mapping the Lane-2 paths (§3) to the maintainer. On a throwaway PR,
    verify that 0 required approvals plus "Require review from Code Owners" actually holds a
-   CODEOWNERS-matched PR while letting an unmatched PR through.
+   CODEOWNERS-matched PR while letting an unmatched PR through. Author that PR from the intended
+   bot identity, so the test also confirms the maintainer can clear the hold — a
+   maintainer-authored PR cannot be self-approved, so agent pushes need a distinct identity (§4).
 3. Enable branch protection: require the deterministic gate set (the exact contexts in §1),
    require code-owner review, require branches up to date, dismiss stale approvals, forbid
    force-push. Permit auto-merge, set squash as the merge method, enable delete-branch-on-merge,
