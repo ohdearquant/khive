@@ -43,8 +43,18 @@ mod failpoint {
         pub(super) static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
     }
 
+    // The arming mechanism (`arm`/`disarm`/`FailpointGuard`) is used only by the
+    // SAVEPOINT/ROLLBACK sentinel tests, which need the sqlite-vec store and so
+    // live in the `cfg(all(test, feature = "vectors"))` module below.  Gating
+    // these items on `feature = "vectors"` keeps them out of the no-feature test
+    // build, where they would otherwise have no caller and trip
+    // `clippy --all-targets -D warnings` (which runs without `--features vectors`).
+    // `CURRENT`/`take` stay plain `cfg(test)`: they are read by the failpoint hooks
+    // in `insert_batch`/`update`, which are `cfg(test)` and compile in every test build.
+
     /// Create a fresh `Arc<AtomicBool>` set to `true` and register it in the
     /// thread-local so the write closure can capture it before spawn_blocking.
+    #[cfg(feature = "vectors")]
     pub(super) fn arm() {
         let flag = Arc::new(AtomicBool::new(true));
         CURRENT.with(|c| *c.borrow_mut() = Some(flag));
@@ -52,6 +62,7 @@ mod failpoint {
 
     /// Disarm: clear the thread-local (the Arc may live on in the closure
     /// a moment longer, but the flag is already spent after one `take()`).
+    #[cfg(feature = "vectors")]
     pub(super) fn disarm() {
         CURRENT.with(|c| *c.borrow_mut() = None);
     }
@@ -66,8 +77,10 @@ mod failpoint {
     /// RAII guard: arms the failpoint on construction and disarms on drop.
     /// The Arc is stored in the thread-local and captured by the write closure
     /// directly; the guard's only job is to ensure `disarm()` runs on drop.
+    #[cfg(feature = "vectors")]
     pub(super) struct FailpointGuard;
 
+    #[cfg(feature = "vectors")]
     impl FailpointGuard {
         pub(super) fn new() -> Self {
             arm();
@@ -75,6 +88,7 @@ mod failpoint {
         }
     }
 
+    #[cfg(feature = "vectors")]
     impl Drop for FailpointGuard {
         fn drop(&mut self) {
             disarm();
