@@ -323,8 +323,8 @@ single-writer guarantee lives entirely inside the daemon process. All callers of
 
 ### Issue #195 — decision: dependent follow-up ADR
 
-Cross-op atomicity for `--ops-file` bulk apply is scoped as a follow-up ADR (ADR-068 candidate)
-rather than a section of this ADR, for the following reasons:
+Cross-op atomicity for `--ops-file` bulk apply is scoped as a separate follow-up ADR (number
+assigned when drafted) rather than a section of this ADR, for the following reasons:
 
 1. **Different seam**: #195 requires threading a `SqlTransaction` context from the
    `begin_tx()` seam in `sql_bridge.rs:804` through the verb handler dispatch path. This touches
