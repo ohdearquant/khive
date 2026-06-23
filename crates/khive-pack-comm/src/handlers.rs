@@ -72,6 +72,23 @@ pub(crate) async fn handle_send(
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor = token.actor().id.clone();
     let to_actor = p.to.trim().to_string();
+
+    // #200: addressed sends from an unattributed caller will stamp from_actor="local",
+    // which causes reply-threading collapse when multiple unconfigured actors interact.
+    // This is a known limitation pending issue #75 (actor identity per request).
+    // We surface a visible warning so operators can diagnose mis-attribution; the send
+    // proceeds rather than hard-erroring to preserve backward compatibility with
+    // sessions that set default_namespace but not actor_id.
+    if from_actor == "local" && to_actor != "local" {
+        tracing::warn!(
+            to_actor = %to_actor,
+            "comm.send: unattributed caller (actor.id not configured) sending to a specific \
+             actor label; from_actor will be stamped 'local', corrupting attribution and \
+             reply-thread routing in multi-actor deployments. \
+             Set [actor] id in khive.toml to fix (issue #200)."
+        );
+    }
+
     let sent_at = Utc::now().to_rfc3339();
 
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
@@ -152,18 +169,21 @@ pub(crate) async fn handle_inbox(
         _ => {} // "all" — no read-status filter
     }
 
-    // ADR-057 Q3: when caller has a non-"local" actor label, filter by to_actor.
-    // FilterOp::EqOrMissing matches rows where json_extract(properties, '$.to_actor')
-    // equals the caller's label OR the field is absent/NULL (legacy messages without
-    // a to_actor remain visible). The "local" fallback skips this filter entirely for
-    // backward compatibility.
-    if caller_actor != "local" {
-        property_filters.push(PropertyFilter {
-            json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
-            value: SqlValue::Text(caller_actor.clone()),
-        });
-    }
+    // ADR-057 Q3: filter inbox by to_actor.
+    //
+    // When the caller has a configured actor label (non-"local"), apply an exact
+    // to_actor filter so each actor sees only their own messages. Legacy messages
+    // without a to_actor field (EqOrMissing) remain visible for the configured actor.
+    //
+    // When the caller is anonymous ("local") — the OSS single-tenant case — apply
+    // EqOrMissing("local") so the caller sees only party-line messages (to_actor=
+    // "local" or absent). This closes the #199 multi-actor read leak while preserving
+    // backward-compatible behavior for deployments where everyone is 'local'.
+    property_filters.push(PropertyFilter {
+        json_path: "$.to_actor".to_string(),
+        op: FilterOp::EqOrMissing,
+        value: SqlValue::Text(caller_actor.clone()),
+    });
 
     let filter = NoteFilter {
         kind: Some("message".to_string()),
