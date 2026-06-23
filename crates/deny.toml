@@ -1,0 +1,97 @@
+# cargo-deny supply-chain policy for khive
+# Run: cd crates && cargo deny check   (with cargo-deny 0.19.9+ installed)
+# CI: bans/licenses/sources via EmbarkStudios/cargo-deny-action@v2; advisories
+#     via an explicitly-installed, pinned cargo-deny 0.19.9 (the action image
+#     bakes 0.19.8 and exposes no input to override it — see .github/workflows/ci.yml).
+#
+# CVE / advisory gating: the RustSec DB added CVSS 4.0 advisories in 2026 (e.g.
+# RUSTSEC-2026-0073 for libcrux-poly1305, not in khive's dep tree). cargo-deny 0.18.x
+# failed to *load* the DB on a CVSS 4.0 parse error — a DB-load failure, not a per-
+# advisory match. CI previously masked this with continue-on-error; advisory gating was
+# dormant. Fix (#208): the advisories step now runs a pinned cargo-deny 0.19.9, which
+# parses CVSS 4.0, loads the DB, and gates hard. The [advisories].ignore list below is
+# now ACTIVE. (RUSTSEC-2026-0073 is not in our tree and requires no ignore.)
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# "workspace" = only unmaintained direct workspace deps are reported.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # FINDING: RUSTSEC-2026-0002 (lru 0.12.x IterMut soundness violation).
+    # Fix is lru >= 0.16.3, which is a breaking API change from lru 0.12.
+    # Two paths reach lru 0.12.5 (cargo tree -i lru@0.12.5): khive-pack-memory
+    # (query_cache.rs) and the lattice-embed 0.3.0 dependency. Both use
+    # lru::LruCache via .get()/.put() only — neither calls .iter_mut() on the
+    # cache, so the unsound IterMut is not reachable through any path in our tree
+    # today. Verified against khive-pack-memory source and the lattice-embed
+    # registry source.
+    # Track: upgrade lru to >= 0.16.3 once API compatibility is confirmed.
+    { id = "RUSTSEC-2026-0002", reason = "lru::IterMut is never called on either reachable path (khive-pack-memory, lattice-embed); only .get()/.put() are used. Upgrade to lru >= 0.16.3 tracked separately." },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    # Standard permissive — OSI approved
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    # MIT-0 — MIT without attribution requirement (borrow-or-share, constant_time_eq)
+    "MIT-0",
+    # BSL-1.0 — Boost Software License, permissive, OSI-approved (ryu@1.0.23)
+    "BSL-1.0",
+    # 0BSD — BSD Zero Clause, maximally permissive (adler2@2.0.1)
+    "0BSD",
+    # CC0-1.0 — Creative Commons Zero / public domain (blake3, constant_time_eq)
+    "CC0-1.0",
+    # Unlicense — public domain equivalent
+    # (aho-corasick, memchr, globset, byteorder-lite)
+    "Unlicense",
+    # MPL-2.0 — Mozilla Public License, weak copyleft (file-level only); used by regorus
+    "MPL-2.0",
+    # CDLA-Permissive-2.0 — Linux Foundation permissive data/software license.
+    # FINDING: not OSI-approved, but widely accepted in the Rust ecosystem for TLS
+    # root certificate crates.  webpki-roots@0.26.11 and webpki-roots@1.0.8 carry
+    # this license; they are pulled in transitively via ureq -> lattice-embed.
+    # The license terms are functionally equivalent to MIT/Apache-2.0 for our usage.
+    # Re-evaluate if policy tightens to OSI-approved-only.
+    "CDLA-Permissive-2.0",
+]
+exceptions = [
+    # FINDING: r-efi carries LGPL-2.1-or-later (copyleft).
+    # It is a Windows/UEFI EFI interface crate pulled in by getrandom for UEFI
+    # random-source support.  Our build targets are Linux, macOS, and Windows x86 —
+    # none of which are EFI targets — so r-efi is never linked into shipped binaries.
+    # If an EFI target is added in future, this exception must be re-evaluated.
+    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+]
+
+[bans]
+multiple-versions = "warn"
+# "warn" rather than "deny": workspace-inherited deps (serde = { workspace = true })
+# may be reported as wildcards even though they resolve to the pinned workspace version.
+# Promote to "deny" once the upstream behaviour is confirmed resolved.
+wildcards = "warn"
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
