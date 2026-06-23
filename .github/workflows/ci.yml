@@ -102,15 +102,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check semver (published crates only)
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+      - name: Check semver (all published workspace crates)
+        # Pinned to a commit SHA, not the mutable @v2 tag: under autonomous merge
+        # the required check IS the reviewer, so its implementation must not drift
+        # outside this repo (same rationale as the #215 cargo-deny installer pin).
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           manifest-path: crates/Cargo.toml
-          # khive-mcp is the only crate currently published to crates.io.
-          # All other workspace crates are path-only deps or unpublished libs.
-          # Scoping to khive-mcp avoids "no published baseline" errors on the
-          # rest of the workspace.
-          package: khive-mcp
+          # No `package:` scope — gate the whole publishable workspace. Nearly all
+          # members (khive-types, khive-runtime, khive-pack-kg, …) are live on
+          # crates.io at 0.2.11, and khive-mcp re-exports runtime types, so a break
+          # in a lib crate that does not surface through khive-mcp would otherwise
+          # slip past this required check. cargo-semver-checks compares each member
+          # against its crates.io baseline; every member is published, so there is
+          # no missing-baseline error.
 
   doc-build:
     name: Doc build (-D warnings)
@@ -131,6 +136,11 @@ jobs:
   dependency-review:
     name: Dependency review
     runs-on: ubuntu-latest
+    # Declare the read scope the action needs explicitly so the gate does not
+    # depend on ambient GITHUB_TOKEN defaults (an org policy could tighten them).
+    # No pull-requests:write — comment-summary-in-pr is not enabled.
+    permissions:
+      contents: read
     # This action only works on pull_request events — it diffs the dependency
     # graph between the base and head commits.  Skip on push to main/integration.
     if: github.event_name == 'pull_request'
@@ -170,18 +180,21 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
-      - uses: taiki-e/install-action@v2
+      # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
+      # #215 cargo-deny installer pin): a required gate's tooling must not drift.
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-llvm-cov
       - name: Compute coverage
         working-directory: crates
         run: |
-          cargo llvm-cov --workspace --summary-only 2>&1 \
-            | tee /tmp/cov-summary.txt
-          # Extract the TOTAL line coverage percentage (Lines column, 4th field).
-          CURRENT=$(grep '^TOTAL' /tmp/cov-summary.txt \
-            | awk '{print $4}' \
-            | tr -d '%')
+          # Extract TOTAL *line* coverage from the structured JSON export, not by
+          # column position. In `--summary-only` text the TOTAL row has Regions%
+          # in field 4 and Lines% in field 10, so the prior `awk '{print $4}'`
+          # silently gated on REGION coverage while logs claimed line coverage.
+          # `.data[0].totals.lines.percent` is unambiguous and format-stable.
+          cargo llvm-cov --workspace --summary-only --json > /tmp/cov.json
+          CURRENT=$(jq -r '.data[0].totals.lines.percent' /tmp/cov.json)
           echo "Current line coverage: ${CURRENT}%"
           echo "CURRENT_COVERAGE=${CURRENT}" >> "$GITHUB_ENV"
       - name: Check coverage does not regress
