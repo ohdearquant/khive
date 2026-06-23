@@ -22,8 +22,10 @@
 #       per-PR human review gate stays UP while the wall goes up. This is the
 #       safe direction: adding gates never opens a hole.
 #     - Preflight: every required context must already report on main's HEAD
-#       commit, or it aborts (a required check that never reports locks every
-#       PR forever).
+#       commit OR on a recent PR head, or it aborts (a required check that never
+#       reports locks every PR forever). A PR head is also consulted because
+#       PR-only checks (e.g. "Dependency review", gated on the pull_request
+#       event) never run on a push and so never appear on main's HEAD.
 #
 #   STEP=release-gate
 #     - Creates the 'publish' environment with the running admin (Ocean) as a
@@ -100,29 +102,49 @@ contexts_json() {
     | jq -R . | jq -s 'map({context: .})'
 }
 
-# Names of check-runs that reported on main's HEAD commit.
-main_head_check_names() {
+# Names of check-runs that have reported recently — the union of main's HEAD and
+# the heads of the last few PRs. Required status checks gate PRs, so a PR head is
+# the authoritative source: PR-only checks (e.g. "Dependency review", gated on
+# `if: github.event_name == 'pull_request'`) never appear on a main push, so main
+# HEAD alone would wrongly report them as non-reporting. The per-PR-head calls are
+# best-effort supplements; the connectivity of the API itself is proved separately
+# by the probe in preflight_contexts_report.
+reporting_check_names() {
   gh api --paginate "repos/${REPO}/commits/${BRANCH}/check-runs" \
-    --jq '.check_runs[].name'
+    --jq '.check_runs[].name' 2>/dev/null || true
+  local sha
+  while IFS= read -r sha; do
+    [[ -n "${sha}" ]] || continue
+    gh api --paginate "repos/${REPO}/commits/${sha}/check-runs" \
+      --jq '.check_runs[].name' 2>/dev/null || true
+  done < <(gh pr list --state all --limit 5 --json headRefOid \
+             --jq '.[].headRefOid' 2>/dev/null || true)
 }
 
-# Abort unless every required context reports on main's HEAD. Prevents locking
-# the repo behind a required check that never runs.
+# Abort unless every required context reports on main's HEAD or a recent PR.
+# Prevents locking the repo behind a required check that never runs.
 preflight_contexts_report() {
-  local reported missing=()
-  reported="$(main_head_check_names || true)"
-  local ctx
+  # Distinguish "GitHub API unreachable" from "context genuinely absent": a probe
+  # so a failed verification reports as a failure, not as "merge the gate PRs".
+  if ! gh api "repos/${REPO}" --jq '.full_name' >/dev/null 2>&1; then
+    echo "ABORT: cannot reach the GitHub API for ${REPO} (auth/network/rate-limit?)." >&2
+    echo "Verification could not run; resolve API access and retry." >&2
+    exit 1
+  fi
+
+  local reported missing=() ctx
+  reported="$(reporting_check_names | sort -u)"
   for ctx in "${REQUIRED_CONTEXTS[@]}"; do
     grep -Fxq "${ctx}" <<<"${reported}" || missing+=("${ctx}")
   done
   if (( ${#missing[@]} > 0 )); then
-    echo "ABORT: these required contexts do not report on ${BRANCH} HEAD:" >&2
+    echo "ABORT: these required contexts have not reported on ${BRANCH} HEAD or a recent PR:" >&2
     printf '  - %s\n' "${missing[@]}" >&2
     echo "Merge the PR(s) that add them first (gate wall: #215 then #216)." >&2
     echo "Requiring a check that never reports blocks every PR." >&2
     exit 1
   fi
-  echo "Preflight OK: all ${#REQUIRED_CONTEXTS[@]} required contexts report on ${BRANCH}."
+  echo "Preflight OK: all ${#REQUIRED_CONTEXTS[@]} required contexts report on ${BRANCH} or a recent PR."
 }
 
 # Current ruleset, stripped to the fields the PUT accepts, with mutations
@@ -177,6 +199,18 @@ step_gates() {
 
 step_release_gate() {
   echo "[STEP release-gate] Creating '${ENVIRONMENT}' environment with a required reviewer."
+  # Don't clobber an already-hardened environment. The env 404s before first
+  # activation; if it already exists (a later rerun, a different admin, or manual
+  # hardening), refuse to overwrite its reviewers/branch-policy unless FORCE=true.
+  if gh api "repos/${REPO}/environments/${ENVIRONMENT}" >/dev/null 2>&1; then
+    if [[ "${FORCE:-false}" != "true" ]]; then
+      echo "ABORT: '${ENVIRONMENT}' environment already exists." >&2
+      echo "Re-applying would replace its reviewers and branch policy with this" >&2
+      echo "script's defaults. Set FORCE=true to overwrite intentionally." >&2
+      exit 1
+    fi
+    echo "[release-gate] FORCE=true — overwriting the existing '${ENVIRONMENT}' environment."
+  fi
   local admin_id admin_login body
   admin_id="$(gh api user --jq .id)"
   admin_login="$(gh api user --jq .login)"
