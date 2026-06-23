@@ -1,0 +1,74 @@
+# auto-merge enabler for bot-authored PRs (ADR-066 Lane-2)
+#
+# What this does: when khive-leo[bot] opens a non-draft PR, this workflow
+# calls `gh pr merge --auto --squash`. The --auto flag instructs GitHub to
+# complete the actual merge ONLY once ruleset conditions pass: the full
+# required-status-check battery (the "gate wall" — ADR-066 §1) goes green.
+# In the autonomous-merge model there is no required human approval and no
+# CODEOWNERS gate; the gate wall is the reviewer. This workflow does NOT merge
+# anything itself -- it registers intent and GitHub's ruleset enforces the
+# wall. The ruleset (id 17362266) remains the authoritative safety boundary.
+#
+# Scope note: this is intentionally bot-author-scoped. The autonomous fleet's
+# PRs auto-merge on green; a human's own PR is mergeable on green but still
+# waits for a deliberate merge (or an explicit `gh pr merge --auto`). Humans
+# keep a beat on their own PRs while the fleet runs free.
+#
+# Activation: inert by default. Set the repo variable LEO_AUTOMERGE_ENABLED
+# to the string 'true' to activate. Revert the variable to deactivate with
+# no code change required.
+#
+# Security: uses pull_request_target so the workflow runs from the base-ref
+# definition (not PR-supplied code). No checkout of the PR head. No PR code
+# is executed in this job. The App private key reaches only the pinned
+# token-minter action; the PR number is passed through the environment, never
+# interpolated into a shell command, so no PR-controlled field can reach the
+# shell of this secret-bearing job.
+
+name: Auto-merge (bot PRs)
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# The default GITHUB_TOKEN is unused (the job mints and uses an App token).
+# Grant it read-only so no unused write scope is exposed.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: automerge-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  enable-auto-merge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+
+    # Guard: only bot-authored, non-draft PRs when the variable is set.
+    # Ocean flips LEO_AUTOMERGE_ENABLED to activate; flip back to deactivate.
+    # LEO_AUTOMERGE_ENABLED is a repository variable settable only by an admin,
+    # so no PR author can satisfy this guard on their own.
+    if: >-
+      github.event.pull_request.user.login == 'khive-leo[bot]' &&
+      vars.LEO_AUTOMERGE_ENABLED == 'true' &&
+      github.event.pull_request.draft == false
+
+    steps:
+      - name: Mint App token
+        id: app-token
+        # Pinned to actions/create-github-app-token v3.2.0 by commit SHA.
+        # This action receives the App private key; pin by SHA so a moved tag
+        # cannot redirect the secret to compromised code. Bump deliberately.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.LEO_APP_ID }}
+          private-key: ${{ secrets.LEO_APP_PRIVATE_KEY }}
+
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr merge --auto --squash "$PR_NUMBER"
