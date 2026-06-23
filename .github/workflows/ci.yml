@@ -45,13 +45,19 @@ jobs:
           manifest-path: crates/Cargo.toml
           command: check bans licenses sources
       # Advisory/CVE gate: cargo-deny 0.19.9+ parses CVSS 4.0 entries in the 2026
-      # RustSec DB (0.18.x fails to load the DB entirely).  Pin deny-version so this
-      # step uses a known-good binary and gates hard — no continue-on-error.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # RustSec DB (0.18.x fails to load the DB entirely). cargo-deny-action@v2
+      # bakes 0.19.8 into its image and exposes NO input to override the binary
+      # version (it has no `deny-version` input), so we install the pinned binary
+      # ourselves rather than depend on the image version. The version is logged
+      # before the check runs, so CI proves which binary gated.
+      - name: Install pinned cargo-deny (0.19.9)
+        uses: taiki-e/install-action@v2
         with:
-          manifest-path: crates/Cargo.toml
-          command: check advisories
-          deny-version: "0.19.9"
+          tool: cargo-deny@0.19.9
+      - name: cargo-deny advisories (hard gate)
+        run: |
+          cargo-deny --version
+          cargo deny --manifest-path crates/Cargo.toml check advisories
 
   data-leak-guard:
     name: JSON/JSONL data-leak guard
