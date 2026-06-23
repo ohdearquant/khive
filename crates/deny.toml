@@ -1,19 +1,15 @@
 # cargo-deny supply-chain policy for khive
-# Run: cd crates && cargo deny check
+# Run: cd crates && cargo deny --version 0.19.9 check   (or cargo deny check with 0.19.9 installed)
 # CI: EmbarkStudios/cargo-deny-action@v2 with manifest-path: crates/Cargo.toml
+#     and deny-version: "0.19.9" for the advisories step (see .github/workflows/ci.yml).
 #
-# KNOWN LIMITATION (cargo-deny 0.18.5, verified 2026-06-22):
-# The RustSec advisory DB added CVSS 4.0 advisories in 2026 (e.g. RUSTSEC-2026-0073
-# for libcrux-poly1305, which is NOT in khive's dep tree). cargo-deny 0.18.5 fails to
-# *load* the advisory DB at all: "unsupported CVSS version: 4.0" is a parse-time
-# DB-load error, not a per-advisory match. So `cargo deny check advisories` errors out
-# before checking anything, and the [advisories] ignore list below is DORMANT — it
-# filters matched advisories, which never happens when the DB will not load. (Tested:
-# adding an ignore for RUSTSEC-2026-0073 does NOT suppress the load error.)
-# CI runs the advisories step with continue-on-error so the supply-chain job stays
-# green on the bans/licenses/sources policy, which does not load the advisory DB.
-# Advisory/CVE gating is therefore NOT yet in effect; tracked as a follow-up (evaluate
-# a cargo-deny upgrade or cargo-audit). Drop continue-on-error once the DB loads.
+# CVE / advisory gating: the RustSec DB added CVSS 4.0 advisories in 2026 (e.g.
+# RUSTSEC-2026-0073 for libcrux-poly1305, not in khive's dep tree). cargo-deny 0.18.x
+# failed to *load* the DB on a CVSS 4.0 parse error — a DB-load failure, not a per-
+# advisory match. CI previously masked this with continue-on-error; advisory gating was
+# dormant. Fix (#208): the advisories step now pins deny-version: "0.19.9" in CI,
+# which parses CVSS 4.0, loads the DB, and gates hard. The [advisories].ignore list
+# below is now ACTIVE. (RUSTSEC-2026-0073 is not in our tree and requires no ignore.)
 
 [graph]
 targets = [
@@ -30,15 +26,13 @@ all-features = false
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
-    # FINDING: RUSTSEC-2026-0097 (rand unsound with custom logger + ThreadRng).
-    # All three rand versions in our tree satisfy the patched ranges:
-    #   rand 0.8.6  >= 0.8.6  (patched)
-    #   rand 0.9.4  >= 0.9.3  (patched)
-    #   rand 0.10.1 >= 0.10.1 (patched)
-    # This ignore entry prevents cargo-deny from flagging the advisory when the
-    # advisory DB match logic does not properly account for multi-version patched
-    # ranges in 0.18.x.  Remove once rand < 0.8.6 is no longer in the tree.
-    { id = "RUSTSEC-2026-0097", reason = "all three rand versions (0.8.6/0.9.4/0.10.1) satisfy the patched ranges; all are safe" },
+    # FINDING: RUSTSEC-2026-0002 (lru 0.12.x IterMut soundness violation).
+    # Fix is lru >= 0.16.3, which is a breaking API change from lru 0.12.
+    # khive-pack-memory uses lru::LruCache via .get() and .put() only — it never
+    # calls .iter_mut() on the cache. The soundness issue is therefore not
+    # reachable through any khive code path today.
+    # Track: upgrade lru to >= 0.16.3 once API compatibility is confirmed.
+    { id = "RUSTSEC-2026-0002", reason = "lru::IterMut is never called in khive; only .get()/.put() are used. Upgrade to lru >= 0.16.3 tracked separately." },
 ]
 
 [licenses]
@@ -86,8 +80,8 @@ exceptions = [
 [bans]
 multiple-versions = "warn"
 # "warn" rather than "deny": workspace-inherited deps (serde = { workspace = true })
-# may be reported as wildcards by cargo-deny 0.18.x even though they resolve to the
-# pinned workspace version.  Promote to "deny" once that is resolved upstream.
+# may be reported as wildcards even though they resolve to the pinned workspace version.
+# Promote to "deny" once the upstream behaviour is confirmed resolved.
 wildcards = "warn"
 deny = []
 skip = []
