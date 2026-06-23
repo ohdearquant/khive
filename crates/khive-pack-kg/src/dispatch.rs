@@ -681,4 +681,329 @@ mod tests {
              got ids: {ids_in_actor_ns:?}"
         );
     }
+
+    // ---- Handler-level regression tests for issue #225 (filter-pushdown cliff) ----
+    //
+    // These tests operate at the `pack.dispatch("search", ...)` level and prove the
+    // REAL handler cliff: with `limit=1` the handler sets `search_limit =
+    // (1 * 50).min(500) = 50`, which means only 50 candidates enter the runtime.
+    // To push the target BEYOND the pre-fix cliff we insert 51 non-matching decoys
+    // so that the target sits at rank 52 in the unfiltered FTS ordering.
+    //
+    // Without predicate pushdown into `hybrid_search` / `search_notes` the runtime
+    // received `search_limit = 50` candidates, all decoys, and never saw the target.
+    // With the fix the runtime applies the filter BEFORE truncation over all 200
+    // candidates (50 × CANDIDATE_MULTIPLIER = 4) and surfaces the target.
+    //
+    // BUDGET CONSTANTS (from handlers/search.rs and retrieval.rs):
+    //   handler search_limit = (limit * 50).min(500)  → limit=1 → 50
+    //   runtime candidates   = search_limit * 4       → 200
+    //   old cliff: rank 51 (beyond handler 50-record scan)
+    //   new cliff: rank 201 (beyond runtime 200-candidate budget)
+    //
+    // Corpus: 51 decoys (ranks 1-51 in FTS) + 1 target (rank 52). Target has the
+    // discriminating tag/property; decoys do not. `limit=1`.
+
+    /// Handler-level regression for issue #225, entity branch, tag filter.
+    ///
+    /// 51 decoys rank above the target in FTS but lack the required tag.
+    /// The target carries the required tag and sits at rank 52.
+    /// With predicate pushdown the handler returns the target despite the cliff.
+    #[tokio::test]
+    async fn handler_search_entity_tag_filter_beyond_scan_cliff() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let tok = rt.authorize(Namespace::local()).unwrap();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+        let pack = KgPack::new(rt.clone());
+
+        // 51 decoys: high TF on query words ensures they rank above the target in
+        // FTS regardless of length normalization. No target tag.
+        let decoy_blob = "cliff query ".repeat(20);
+        for i in 0..51usize {
+            pack.dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": format!("{decoy_blob}decoy {i}"),
+                    "description": format!("{decoy_blob}decoy {i} description"),
+                    "tags": ["decoy-tag"]
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("decoy create must succeed");
+        }
+
+        // Target: single occurrence of each query word, carries the required tag.
+        let target_result = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": "cliff query target",
+                    "description": "cliff query target description",
+                    "tags": ["cliff-target-tag"]
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("target create must succeed");
+        let target_id = target_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("target must have id");
+
+        // Search with tag filter and limit=1. The handler widens to search_limit=50
+        // which only covers the 51 decoys without the fix. With the fix, the
+        // predicate is applied before truncation and the target is returned.
+        let result = pack
+            .dispatch(
+                "search",
+                json!({
+                    "kind": "concept",
+                    "query": "cliff query",
+                    "tags": ["cliff-target-tag"],
+                    "limit": 1
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("search must succeed");
+
+        let hits = result.as_array().expect("search must return an array");
+        assert_eq!(hits.len(), 1, "exactly one hit expected; got {hits:?}");
+        assert_eq!(
+            hits[0].get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            target_id,
+            "the tag-filtered entity (rank 52) must be returned despite the handler scan cliff; \
+             got {hits:?}"
+        );
+    }
+
+    /// Handler-level regression for issue #225, entity branch, properties filter.
+    ///
+    /// 51 decoys rank above the target in FTS but have the wrong property value.
+    /// The target has the required property and sits at rank 52.
+    #[tokio::test]
+    async fn handler_search_entity_props_filter_beyond_scan_cliff() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let tok = rt.authorize(Namespace::local()).unwrap();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+        let pack = KgPack::new(rt.clone());
+
+        let decoy_blob = "props cliff signal ".repeat(20);
+        for i in 0..51usize {
+            pack.dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": format!("{decoy_blob}decoy {i}"),
+                    "description": format!("{decoy_blob}decoy {i} description"),
+                    "properties": {"domain": "other"}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("decoy create must succeed");
+        }
+
+        let target_result = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": "props cliff signal target",
+                    "description": "props cliff signal target description",
+                    "properties": {"domain": "props-target"}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("target create must succeed");
+        let target_id = target_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("target must have id");
+
+        let result = pack
+            .dispatch(
+                "search",
+                json!({
+                    "kind": "concept",
+                    "query": "props cliff signal",
+                    "properties": {"domain": "props-target"},
+                    "limit": 1
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("search must succeed");
+
+        let hits = result.as_array().expect("search must return an array");
+        assert_eq!(hits.len(), 1, "exactly one hit expected; got {hits:?}");
+        assert_eq!(
+            hits[0].get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            target_id,
+            "the props-filtered entity (rank 52) must be returned despite the handler scan cliff; \
+             got {hits:?}"
+        );
+    }
+
+    /// Handler-level regression for issue #225, note branch, tag filter.
+    ///
+    /// 51 observation notes rank above the target in FTS but lack the required tag.
+    /// The target carries the required tag and sits at rank 52.
+    #[tokio::test]
+    async fn handler_search_note_tag_filter_beyond_scan_cliff() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let tok = rt.authorize(Namespace::local()).unwrap();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+        let pack = KgPack::new(rt.clone());
+
+        let decoy_blob = "note cliff token ".repeat(20);
+        for i in 0..51usize {
+            pack.dispatch(
+                "create",
+                json!({
+                    "kind": "observation",
+                    "content": format!("{decoy_blob}decoy {i}"),
+                    "properties": {"tags": ["note-decoy-tag"]}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("decoy note create must succeed");
+        }
+
+        let target_result = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "observation",
+                    "content": "note cliff token target",
+                    "properties": {"tags": ["note-cliff-target-tag"]}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("target note create must succeed");
+        let target_id = target_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("target must have id");
+
+        let result = pack
+            .dispatch(
+                "search",
+                json!({
+                    "kind": "note",
+                    "query": "note cliff token",
+                    "tags": ["note-cliff-target-tag"],
+                    "limit": 1
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("search must succeed");
+
+        let hits = result.as_array().expect("search must return an array");
+        assert_eq!(hits.len(), 1, "exactly one hit expected; got {hits:?}");
+        assert_eq!(
+            hits[0].get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            target_id,
+            "the tag-filtered note (rank 52) must be returned despite the handler scan cliff; \
+             got {hits:?}"
+        );
+    }
+
+    /// Handler-level regression for issue #225, note branch, properties filter.
+    ///
+    /// 51 observation notes rank above the target in FTS but have the wrong property.
+    /// The target has the required property value and sits at rank 52.
+    #[tokio::test]
+    async fn handler_search_note_props_filter_beyond_scan_cliff() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let tok = rt.authorize(Namespace::local()).unwrap();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+        let pack = KgPack::new(rt.clone());
+
+        let decoy_blob = "note props wave ".repeat(20);
+        for i in 0..51usize {
+            pack.dispatch(
+                "create",
+                json!({
+                    "kind": "observation",
+                    "content": format!("{decoy_blob}decoy {i}"),
+                    "properties": {"category": "other", "tags": ["note-decoy-tag"]}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("decoy note create must succeed");
+        }
+
+        let target_result = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "observation",
+                    "content": "note props wave target",
+                    "properties": {"category": "note-props-target", "tags": ["note-decoy-tag"]}
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("target note create must succeed");
+        let target_id = target_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("target must have id");
+
+        let result = pack
+            .dispatch(
+                "search",
+                json!({
+                    "kind": "note",
+                    "query": "note props wave",
+                    "properties": {"category": "note-props-target"},
+                    "limit": 1
+                }),
+                &registry,
+                &tok,
+            )
+            .await
+            .expect("search must succeed");
+
+        let hits = result.as_array().expect("search must return an array");
+        assert_eq!(hits.len(), 1, "exactly one hit expected; got {hits:?}");
+        assert_eq!(
+            hits[0].get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            target_id,
+            "the props-filtered note (rank 52) must be returned despite the handler scan cliff; \
+             got {hits:?}"
+        );
+    }
 }
