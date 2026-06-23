@@ -3611,3 +3611,192 @@ allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
         "exactly 2 outbound namespaces expected; got {outbound_strs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cluster-2 isolation tests (branch fix/comm-tenant-isolation-strict)
+// ---------------------------------------------------------------------------
+//
+// These tests were added as part of the pre-cloud-hardening audit (2026-06-23).
+// They cover the decision-independent (no ADR required) half of the isolation
+// story:
+//   - #199 (comm.inbox actor-filter bypass): the to_actor filter must isolate
+//     tenants when actor_id IS configured.
+//   - #13 (gate actor identity gap): the GateRequest.actor must carry the
+//     configured actor identity, not ActorRef::anonymous(), so a cloud TenantGate
+//     can act on it. This assertion FAILS today — see the #[ignore] test below.
+
+/// When two registries share the same storage backend but carry distinct
+/// configured actor identities, `comm.inbox` must isolate each actor's view:
+///
+/// - Actor A sends to B → B's inbox (status=all) shows the message; A's does not.
+/// - Actor B sends to A → A's inbox (status=all) shows the message; B's does not.
+///
+/// This is the end-to-end isolation assertion for #199. It PASSES today when
+/// `actor_id` is properly configured per-registry. The test documents that the
+/// to_actor filter is active and working — the misconfiguration footgun (missing
+/// actor_id → party-line) is addressed separately by the strict-mode startup gate
+/// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`).
+#[tokio::test]
+async fn t_c2_inbox_isolation_cross_actor() {
+    let backend = shared_backend();
+
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:tenant-a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:tenant-b");
+
+    // A sends to B.
+    let send_ab = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:tenant-b", "content": "hello tenant-b from a" }),
+        )
+        .await
+        .expect("A→B send must succeed");
+    assert!(
+        send_ab.get("id").is_some(),
+        "send must return id: {send_ab}"
+    );
+
+    // B sends to A.
+    let send_ba = registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:tenant-a", "content": "hello tenant-a from b" }),
+        )
+        .await
+        .expect("B→A send must succeed");
+    assert!(
+        send_ba.get("id").is_some(),
+        "send must return id: {send_ba}"
+    );
+
+    // B's inbox must contain exactly one message (the one addressed to tenant-b).
+    let b_inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("B inbox must succeed");
+    let b_count = b_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        b_count, 1,
+        "B must see exactly 1 message (the A→B message); got {b_count}. \
+         If this is > 1, the to_actor filter is not applied (party-line leak)."
+    );
+    let b_content = b_inbox["messages"][0]["content"].as_str().unwrap_or("");
+    assert_eq!(
+        b_content, "hello tenant-b from a",
+        "B's inbox message must be the one A sent to B; got {b_content:?}"
+    );
+
+    // A's inbox must contain exactly one message (the one addressed to tenant-a).
+    let a_inbox = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("A inbox must succeed");
+    let a_count = a_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        a_count, 1,
+        "A must see exactly 1 message (the B→A message); got {a_count}. \
+         If this is > 1, the to_actor filter is not applied (party-line leak)."
+    );
+    let a_content = a_inbox["messages"][0]["content"].as_str().unwrap_or("");
+    assert_eq!(
+        a_content, "hello tenant-a from b",
+        "A's inbox message must be the one B sent to A; got {a_content:?}"
+    );
+}
+
+/// Executable spec for issue #13 (Gate actor identity gap).
+///
+/// DESIRED behavior: when `actor_id = "lambda:tenant-x"` is configured on the
+/// registry, `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a
+/// cloud TenantGate can enforce per-actor policies.
+///
+/// CURRENT behavior: `VerbRegistry::dispatch` passes `ActorRef::anonymous()`
+/// (id = "local") to the gate regardless of the configured `actor_id`
+/// (pack.rs:852). The configured actor is used only AFTER the gate consult
+/// to mint the NamespaceToken for storage access — the gate never sees it.
+///
+/// This test is marked `#[ignore]` because it asserts the DESIRED behavior that
+/// is NOT yet implemented. It will become passing once the architectural fix
+/// tracked in issue #13 is implemented (threading authenticated actor identity
+/// into `VerbRegistry::dispatch` before the gate consult).
+///
+/// DO NOT DELETE this test. It is an executable contract spec: when issue #13
+/// is resolved and the `#[ignore]` is removed, the CI gate will verify the fix.
+///
+/// See: https://github.com/ohdearquant/khive/issues/13
+#[tokio::test]
+#[ignore = "issue #13: GateRequest.actor is always ActorRef::anonymous() today; \
+             removing #[ignore] gates the architectural fix (pack.rs:852 must pass \
+             configured actor_id to GateRequest, not ActorRef::anonymous())"]
+async fn t_c2_gate_receives_configured_actor_not_anonymous() {
+    use khive_runtime::{Gate, GateDecision, GateError, GateRef, GateRequest};
+    use std::sync::Mutex;
+
+    // A recording gate that captures every actor ID it sees.
+    #[derive(Debug)]
+    struct RecordingGate {
+        seen_actor_ids: Mutex<Vec<String>>,
+    }
+
+    impl Gate for RecordingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.seen_actor_ids
+                .lock()
+                .unwrap()
+                .push(req.actor.id.clone());
+            Ok(GateDecision::allow())
+        }
+    }
+
+    let gate = Arc::new(RecordingGate {
+        seen_actor_ids: Mutex::new(Vec::new()),
+    });
+
+    let backend = shared_backend();
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate), // runtime gate; registry gate set below
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: Some("lambda:tenant-x".to_string()),
+    };
+    let rt = KhiveRuntime::from_backend(backend, config);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_actor_id(Some("lambda:tenant-x".to_string()));
+    builder.with_gate(gate.clone() as GateRef);
+    let registry = builder.build().expect("registry with recording gate");
+
+    // Dispatch any verb — the gate is consulted before pack dispatch.
+    let _ = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 1 }),
+        )
+        .await
+        .expect("inbox dispatch must not error");
+
+    // DESIRED: gate must have seen "lambda:tenant-x", not "local" (anonymous).
+    // CURRENT: gate sees "local" (ActorRef::anonymous()) — this is the #13 gap.
+    let seen = gate.seen_actor_ids.lock().unwrap();
+    assert!(
+        seen.iter().any(|id| id == "lambda:tenant-x"),
+        "gate must receive configured actor id 'lambda:tenant-x', not 'local' \
+         (anonymous). Saw: {seen:?}. \
+         Fix: pass actor_id into GateRequest at pack.rs:852 instead of \
+         ActorRef::anonymous(). Tracked as issue #13."
+    );
+}
