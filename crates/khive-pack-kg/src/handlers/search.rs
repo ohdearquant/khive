@@ -2,6 +2,16 @@
 
 use std::collections::HashMap;
 
+/// Maximum candidate window used when property/tag post-filters are active.
+///
+/// Both the entity and note branches apply property/tag predicates after the
+/// FTS+vector ranking step (the storage legs have no awareness of these fields).
+/// Using a large-but-bounded scan window reduces the probability of missing a
+/// match that ranked just below the bare `limit`. Matches ranked beyond this
+/// cap may still be silently dropped — the proper fix is to push the predicates
+/// into the storage leg, tracked in GitHub issue #225.
+const FILTERED_SCAN_CAP: u32 = 500;
+
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -52,7 +62,15 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    (limit * 4).min(100)
+                    // Property/tag predicates are applied post-ranking (the storage
+                    // legs have no awareness of entity properties/tags). Widen the
+                    // candidate window so sparse matches ranked below the bare `limit`
+                    // are still visible. The cap of FILTERED_SCAN_CAP is a
+                    // best-effort bound — matches ranked beyond it may still be missed
+                    // (known limitation: both entity and note branches share this
+                    // cliff; pushing predicates into the storage leg is the proper
+                    // fix, tracked in GitHub issue #225).
+                    (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
                 };
@@ -152,7 +170,15 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    (limit * 4).min(100)
+                    // Property/tag predicates are applied post-ranking (notes have no
+                    // dedicated tag column; tags live in `properties["tags"]`). Widen
+                    // the candidate window so sparse matches ranked below the bare
+                    // `limit` are still visible. The cap of FILTERED_SCAN_CAP is a
+                    // best-effort bound — matches ranked beyond it may still be missed
+                    // (known limitation: both entity and note branches share this
+                    // cliff; pushing predicates into the storage leg is the proper
+                    // fix, tracked in GitHub issue #225).
+                    (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
                 };

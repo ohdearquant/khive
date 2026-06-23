@@ -6355,3 +6355,198 @@ async fn search_note_properties_filter_excludes_non_matching_notes() {
         "#176: the matching note must be note_a; got {ids:?}"
     );
 }
+
+/// #223 recall-cliff regression: when more than `limit` notes share high FTS
+/// relevance but only a lower-ranked note carries the target tag, the filter
+/// must still return it within the FILTERED_SCAN_CAP (500) window.
+///
+/// Corpus: 12 notes with identical query text but tag "noise" + 1 note with
+/// the same text and tag "rare". With `limit=10` and the old `limit*4=40` cap
+/// the rare note would be visible (it's within 40). With limit=10 and cap=500
+/// the rare note is always in the window. The test asserts it is returned.
+///
+/// For CASE B (post-filter, bounded scan) this is the correct assertion:
+/// the matching note is returned because the corpus (13 total) fits inside
+/// the FILTERED_SCAN_CAP=500 bound. An anti-regression note: if this ever
+/// starts failing it means the scan cap was lowered below the corpus size.
+#[tokio::test]
+async fn search_note_tag_filter_recall_cliff_bounded_scan() {
+    let pack = pack();
+
+    // Create 12 high-ranking notes with tag "noise".
+    for i in 0..12u32 {
+        pack.dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": format!("cliff regression query text nvk223 item {i}"),
+                "properties": {"tags": ["noise"]}
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create noise note {i} must succeed: {e}"));
+    }
+
+    // Create 1 matching note with tag "rare" — same query text, lower salience
+    // (not set, so default 0.5 same as noise notes; FTS ranking determines order).
+    let rare = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "cliff regression query text nvk223 item rare",
+                "properties": {"tags": ["rare"]}
+            }),
+        )
+        .await
+        .expect("create rare note must succeed");
+    let rare_id = rare.get("id").and_then(Value::as_str).expect("id");
+
+    // Search with limit=10 and tag filter "rare". The 13-note corpus fits
+    // inside FILTERED_SCAN_CAP=500, so the rare note must be returned.
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "cliff regression query text nvk223",
+                "tags": ["rare"],
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("#223: filtered search must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert!(
+        ids.contains(&rare_id),
+        "#223: rare note must be returned within bounded scan window; ids={ids:?}"
+    );
+    assert!(
+        ids.len() <= 10,
+        "#223: result must not exceed limit=10; got {}: ids={ids:?}",
+        ids.len()
+    );
+}
+
+/// #223: search(kind="note", tags=[nonexistent]) where no note matches must return empty.
+#[tokio::test]
+async fn search_note_tag_filter_no_match_returns_empty() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "no match tag filter test nvk223",
+            "properties": {"tags": ["existing"]}
+        }),
+    )
+    .await
+    .expect("create note must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "no match tag filter test nvk223",
+                "tags": ["nonexistent-tag-xyz"],
+            }),
+        )
+        .await
+        .expect("#223: search with no-match tag filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    assert!(
+        arr.is_empty(),
+        "#223: tag filter matching nothing must return empty array; got: {arr:?}"
+    );
+}
+
+/// #223: search(kind="note") with combined property+tag filter must honour both
+/// predicates simultaneously (AND semantics). Notes matching only one predicate
+/// are excluded.
+#[tokio::test]
+async fn search_note_combined_property_and_tag_filter() {
+    let pack = pack();
+
+    // Note A: matches both property AND tag.
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "combined filter test nvk223 alpha",
+                "properties": {"domain": "inference", "tags": ["target"]}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note B: matches tag but NOT property.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "combined filter test nvk223 alpha",
+            "properties": {"domain": "training", "tags": ["target"]}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    // Note C: matches property but NOT tag.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "combined filter test nvk223 alpha",
+            "properties": {"domain": "inference", "tags": ["other"]}
+        }),
+    )
+    .await
+    .expect("create note_c must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "combined filter test nvk223 alpha",
+                "properties": {"domain": "inference"},
+                "tags": ["target"],
+            }),
+        )
+        .await
+        .expect("#223: combined filter search must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#223: combined property+tag filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#223: only note_a matches both predicates; got {ids:?}"
+    );
+}

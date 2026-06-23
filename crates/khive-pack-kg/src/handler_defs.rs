@@ -414,13 +414,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "properties",
                 param_type: "object",
                 required: false,
-                description: "Post-filter search hits to entities whose properties contain all listed key=value pairs (kind=\"entity\" only). Applied after FTS+vector ranking. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}.",
+                description: "Post-filter search hits to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Applied after FTS+vector ranking within a bounded candidate window. For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Note: filtered search is best-effort — matches ranked beyond the candidate scan window may be missed (see GitHub issue #225).",
             },
             ParamDef {
                 name: "tags",
                 param_type: "array",
                 required: false,
-                description: "Post-filter entity search hits to entities with any listed tag (kind=\"entity\" only, OR semantics, case-insensitive). Applied after FTS+vector ranking. E.g. [\"rust\", \"ml\"].",
+                description: "Post-filter search hits to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Applied after FTS+vector ranking within a bounded candidate window. For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Note: filtered search is best-effort — matches ranked beyond the candidate scan window may be missed (see GitHub issue #225).",
             },
             ParamDef {
                 name: "min_score",
