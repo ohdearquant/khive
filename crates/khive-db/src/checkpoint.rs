@@ -108,14 +108,16 @@ impl CheckpointConfig {
 ///
 /// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick. PASSIVE is
 /// the only checkpoint mode used; see the module-level doc for why TRUNCATE is
-/// excluded. When the WAL page count exceeds `config.high_water_pages` a
-/// WARNING is logged to signal sustained WAL pressure.
+/// excluded. A WARNING is emitted once on threshold crossing (wal_pages
+/// transitions from below `high_water_pages` to at/above) rather than on every
+/// tick, preventing log spam when a long-lived reader pins a WAL snapshot.
 ///
 /// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
 /// current tick to be skipped rather than stalling write traffic.
 pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointConfig) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_above_high_water = false;
 
     loop {
         interval.tick().await;
@@ -126,34 +128,39 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             break;
         }
 
-        checkpoint_once(&pool, &config);
+        let wal_pages = checkpoint_once(&pool, &config);
+        let above = wal_pages >= config.high_water_pages;
+        if above && !was_above_high_water {
+            tracing::warn!(
+                wal_pages,
+                high_water = config.high_water_pages,
+                "WAL high-water mark exceeded; sustained WAL pressure — \
+                 a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
+            );
+        }
+        was_above_high_water = above;
     }
 }
 
 /// Issue one checkpoint cycle against the writer connection.
 ///
-/// Returns without error: all failures are logged at warn level and skipped.
-/// This is intentional — a failed checkpoint is non-fatal and will be retried
-/// on the next tick.
+/// Returns the observed WAL page count (0 when the writer mutex was busy and
+/// the tick was skipped, or when the pool is in-memory). All checkpoint errors
+/// are logged at warn level and treated as non-fatal; the next tick retries.
 ///
 /// Uses `try_writer_nowait` so that a busy active writer causes this tick to
 /// be skipped immediately rather than stalling for up to `checkout_timeout`.
-pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) {
+/// The caller (`run_checkpoint_task`) owns threshold-crossing WARN logging so
+/// that high-water warnings fire at most once per crossing, not every tick.
+pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) -> u64 {
     let writer = match pool.try_writer_nowait() {
         Ok(w) => w,
-        Err(_) => return,
+        Err(_) => return 0,
     };
 
     let wal_pages = query_wal_pages(writer.conn());
 
-    if wal_pages >= config.high_water_pages {
-        tracing::warn!(
-            wal_pages,
-            high_water = config.high_water_pages,
-            "WAL high-water mark exceeded; sustained WAL pressure — \
-             a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
-        );
-    } else if wal_pages >= config.warn_pages {
+    if wal_pages >= config.warn_pages && wal_pages < config.high_water_pages {
         tracing::warn!(
             wal_pages,
             warn_threshold = config.warn_pages,
@@ -169,6 +176,8 @@ pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) {
     } else {
         tracing::debug!(wal_pages, "WAL checkpoint issued");
     }
+
+    wal_pages
 }
 
 /// Query the current WAL frame count via `PRAGMA wal_checkpoint`.
@@ -304,20 +313,35 @@ mod tests {
         assert_eq!(cfg.high_water_pages, default.high_water_pages);
     }
 
-    /// Regression: a high-water tick must not block behind an active reader.
+    /// Regression: a high-water tick must NOT block behind an active read transaction.
     ///
-    /// Opens a read connection and holds it for the duration, then triggers a
-    /// `checkpoint_once` with `high_water_pages = 1` so the high-water path
-    /// is taken. Asserts the call returns within 200 ms — proving PASSIVE
-    /// semantics (no reader wait). A TRUNCATE at this point would block for up
-    /// to `PoolConfig::busy_timeout` (30 s default).
+    /// Isomorphism guarantee: this test FAILS if `checkpoint_once` regresses to
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`. Confirmed by reasoning: TRUNCATE inherits
+    /// RESTART semantics and will invoke the busy handler (sleeping up to
+    /// `busy_timeout`) while waiting for the open reader snapshot to release.
+    /// With `busy_timeout = 200ms` a TRUNCATE regression causes the call to take
+    /// ~200ms, blowing the <50ms assertion. PASSIVE returns in <1ms even with an
+    /// open reader, because PASSIVE never waits for readers.
+    ///
+    /// Why `busy_timeout = 200ms`: the test pool uses a small busy_timeout so a
+    /// TRUNCATE regression fails fast (~200ms), not after the 30s production default.
     #[test]
     fn checkpoint_high_water_does_not_block_behind_reader() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("high_water_test.db");
-        let pool = file_pool(&path);
 
-        // Write some data so the WAL is non-trivial.
+        // Use a small busy_timeout so a TRUNCATE regression fails fast (~200ms)
+        // rather than hanging the test suite for the 30s production default.
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path.clone()),
+                busy_timeout: Duration::from_millis(200),
+                ..PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+
+        // Write data so the WAL has frames to checkpoint.
         {
             let writer = pool.try_writer().unwrap();
             writer
@@ -328,11 +352,26 @@ mod tests {
                 .unwrap();
         }
 
-        // Hold an open read connection for the duration of the checkpoint call.
+        // Open a reader and start a real read transaction so it holds a WAL
+        // snapshot. An idle connection (no BEGIN) does NOT pin frames and would
+        // not cause TRUNCATE to wait — the transaction is required for isomorphism.
         let reader = pool.reader().expect("reader");
+        reader
+            .execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
+            .expect("begin read tx");
 
-        // high_water_pages = 1 ensures the high-water branch is taken for any
-        // non-trivial WAL (even after the table write above).
+        // Write another row AFTER the snapshot is established. These new WAL
+        // frames are now pinned by the open reader snapshot — TRUNCATE cannot
+        // reclaim them without waiting; PASSIVE skips them and returns immediately.
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("INSERT INTO t VALUES (2);")
+                .unwrap();
+        }
+
+        // high_water_pages = 1 forces the high-water code path for any non-empty WAL.
         let config = CheckpointConfig {
             high_water_pages: 1,
             ..Default::default()
@@ -342,13 +381,16 @@ mod tests {
         checkpoint_once(&pool, &config);
         let elapsed = start.elapsed();
 
+        // Commit and release the read snapshot only after checkpoint_once returns.
+        reader.execute_batch("COMMIT;").ok();
         drop(reader);
 
-        // PASSIVE returns immediately regardless of readers.
-        // TRUNCATE would block for up to busy_timeout (30 s) here.
+        // PASSIVE returns in <1ms even with an open reader snapshot.
+        // A TRUNCATE regression would block ~busy_timeout (200ms) and fail here.
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "checkpoint_once with active reader took {:?}; expected <200ms (PASSIVE must not block)",
+            elapsed < std::time::Duration::from_millis(50),
+            "checkpoint_once with active reader snapshot took {:?}; \
+             expected <50ms (PASSIVE must not block on readers)",
             elapsed
         );
     }
