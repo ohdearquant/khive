@@ -300,9 +300,24 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// caller is still responsible for emitting the non-fatal `should_warn_unattributed`
 /// warning.
 ///
-/// This is the **single enforcement seam** for the strict-actor contract. Call it
-/// from every server-construction path (serve.rs, kkernel exec, pending_events)
-/// BEFORE constructing [`KhiveMcpServer`] so that no code path can bypass it.
+/// # Scope: dispatch paths only
+///
+/// This function MUST be called from every **SERVING/DISPATCH** construction path —
+/// the paths that will actually route verb calls and read or write comm/tenant data:
+/// - `build_server` and `build_server_multi_backend` in this file (the `kkernel mcp` paths)
+/// - `build_registry_for_multi_backend` in this file (the ADR-029 coordinator path)
+/// - `kkernel exec` (`crates/kkernel/src/exec.rs`) — dispatches arbitrary ops
+/// - `kkernel pending_events` (`crates/kkernel/src/pending_events.rs`) — drains
+///   and dispatches scheduled events
+///
+/// **Pure-introspection registry construction is intentionally EXEMPT** because it
+/// never dispatches verbs or reads comm/tenant data, so it carries no
+/// tenant-isolation risk. Requiring an actor identity there would make
+/// `kkernel pack list` and `kkernel kg validate` fail under strict mode without
+/// any security benefit — an operator must be able to introspect a strict-mode
+/// deployment. Exempt paths: `build_registry` in `crates/kkernel/src/pack_introspect.rs`
+/// and `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`. Each of those
+/// functions carries an inline comment explaining why.
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],

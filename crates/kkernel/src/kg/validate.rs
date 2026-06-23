@@ -22,6 +22,20 @@ struct KgTaxonomy {
 ///
 /// Mirrors the `build_registry()` pattern in `pack_introspect`. No DB is
 /// opened — only pack metadata is needed.
+///
+/// # Strict-actor-mode exemption
+///
+/// This function does NOT call `enforce_strict_actor_mode`. That enforcement
+/// seam protects the **comm dispatch boundary** — it prevents a server from
+/// accepting comm operations without a configured actor identity. `build_taxonomy`
+/// is metadata/introspection-only: it collects the entity-kind and note-kind
+/// sets declared by the loaded packs and never dispatches a verb or reads
+/// comm/tenant data. There is no tenant-isolation risk here, so requiring an
+/// actor identity would make `kkernel kg validate` fail under
+/// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` without any security benefit — an
+/// operator must be able to run taxonomy validation against a strict-mode
+/// deployment. See `enforce_strict_actor_mode` in
+/// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
 fn build_taxonomy() -> Result<KgTaxonomy> {
     let config = RuntimeConfig {
         db_path: None,

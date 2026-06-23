@@ -58,6 +58,20 @@ pub struct PackInfo {
 /// Build an in-memory introspection registry containing every discoverable
 /// pack. Returns `(registry, runtime)` so the caller can hold the runtime
 /// alive for the duration of the introspection call.
+///
+/// # Strict-actor-mode exemption
+///
+/// This function does NOT call `enforce_strict_actor_mode`. That enforcement
+/// seam protects the **comm dispatch boundary** — it prevents a server from
+/// silently accepting comm operations without a configured actor identity.
+/// `build_registry` is metadata/introspection-only: it enumerates verb names,
+/// note kinds, and entity kinds from the registered packs without ever
+/// dispatching a verb or reading comm/tenant data. There is no tenant-isolation
+/// risk here, so requiring an actor identity would make `kkernel pack list`
+/// and `kkernel pack handler` fail under `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`
+/// without any security benefit — an operator must be able to introspect a
+/// strict-mode deployment. See `enforce_strict_actor_mode` in
+/// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
 fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
     let config = RuntimeConfig {
         db_path: None,
@@ -139,6 +153,49 @@ pub fn pack_handler(name: &str) -> Result<Option<PackInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Regression: introspection registry construction MUST succeed under
+    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` with the `comm` pack registered and
+    /// no actor identity configured. `build_registry` is exempt from the
+    /// strict-actor enforcement seam because it is metadata-only and never
+    /// dispatches verbs — requiring an actor would make `kkernel pack list`
+    /// unusable against a strict-mode deployment with zero security benefit.
+    ///
+    /// If this test ever fails it means `enforce_strict_actor_mode` was
+    /// accidentally wired into the introspection path — that is a usability
+    /// regression, not a security improvement.
+    #[test]
+    #[serial]
+    fn introspection_registry_builds_under_strict_mode_without_actor() {
+        let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+
+        let result = build_registry();
+
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "build_registry (introspection-only) must succeed under \
+             KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 + no actor: strict-actor enforcement \
+             applies only to dispatch paths, not introspection. Got: {:?}",
+            result.err()
+        );
+
+        // Confirm the registry is functional: comm pack must appear in the surface
+        // even under strict mode.
+        let (registry, _runtime) = result.unwrap();
+        let pack_names: Vec<&str> = registry.pack_names().into_iter().collect();
+        assert!(
+            pack_names.contains(&"comm"),
+            "comm pack must be present in introspection registry under strict mode; \
+             got: {pack_names:?}"
+        );
+    }
 
     #[test]
     fn list_packs_returns_at_least_kg() {

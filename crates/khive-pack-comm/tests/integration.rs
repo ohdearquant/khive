@@ -3621,7 +3621,7 @@ allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
 // story:
 //   - #199 (comm.inbox actor-filter bypass): the to_actor filter must isolate
 //     tenants when actor_id IS configured.
-//   - #13 (gate actor identity gap): the GateRequest.actor must carry the
+//   - #224 (gate actor identity gap): the GateRequest.actor must carry the
 //     configured actor identity, not ActorRef::anonymous(), so a cloud TenantGate
 //     can act on it. This assertion FAILS today — see the #[ignore] test below.
 
@@ -3790,13 +3790,13 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         .expect("inbox dispatch must not error");
 
     // DESIRED: gate must have seen "lambda:tenant-x", not "local" (anonymous).
-    // CURRENT: gate sees "local" (ActorRef::anonymous()) — this is the #13 gap.
+    // CURRENT: gate sees "local" (ActorRef::anonymous()) — this is the #224 gap.
     let seen = gate.seen_actor_ids.lock().unwrap();
     assert!(
         seen.iter().any(|id| id == "lambda:tenant-x"),
         "gate must receive configured actor id 'lambda:tenant-x', not 'local' \
          (anonymous). Saw: {seen:?}. \
          Fix: pass actor_id into GateRequest at pack.rs:852 instead of \
-         ActorRef::anonymous(). Tracked as issue #13."
+         ActorRef::anonymous(). Tracked as issue #224."
     );
 }
