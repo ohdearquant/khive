@@ -5,7 +5,8 @@
 **Authors**: Ocean, lambda:khive\
 **Depends on**: ADR-007 (Namespace as Attribution), ADR-018 (Authorization Gate), ADR-049
 (khived daemon), ADR-057 (Comm Actor-Addressed Delivery)\
-**Amends (effective now)**: ADR-018 §"AllowAllGate" and §"multi-tenant deployments" — see
+**Amends (effective now)**: ADR-007 Rule 4 (Cloud TenantGate clause); ADR-018
+§"AllowAllGate" and §"Multi-tenant deployments" context bullet — see
 §"Amendment to ADR-007 and ADR-018 for per-tenant-process topology" below\
 **Related issues**: #199 (comm.inbox actor-filter bypass), #200 (from_actor mis-stamp), #13
 (gate actor-identity gap), ADR-053 (ActorStore/SessionStore, cloud-tier actor threading)
@@ -115,10 +116,22 @@ the following invariants before a tenant process begins serving requests:
    set to the tenant's canonical identity string (for example, `tenant:acme-corp`). An empty or
    absent `KHIVE_ACTOR` is a provisioning error; the supervisor rejects the launch.
 2. **Mandatory strict actor attribution**: every tenant process is launched with
-   `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`. This converts the advisory `should_warn_unattributed`
-   check (serve.rs line 190) into a startup error: a process that reaches the communication
-   pack initialization with an unconfigured actor exits non-zero and is not placed in service.
-   The cloud launcher sets this unconditionally on every tenant process; it is not optional.
+   `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`. When this env var is set, a dedicated startup gate
+   (`enforce_strict_actor_mode`, added by PR #220 in `crates/khive-mcp/src/serve.rs`) runs
+   before the server begins serving requests. If the actor is absent or resolves to `"local"`
+   and the `comm` pack is loaded, the gate returns an error and the process exits non-zero; it
+   is never placed in service. This gate is a new parallel check — it does not modify the
+   advisory `should_warn_unattributed` predicate (serve.rs line 268), which remains
+   warning-only for non-strict deployments. The cloud launcher sets
+   `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` unconditionally on every tenant process; it is not
+   optional.
+
+   **Dependency**: this enforcement is provided by PR #220 (branch
+   `fix/comm-tenant-isolation-strict`, commit bd15e595, not yet merged to main at the time
+   of this ADR). The cloud isolation guarantee for issues #199 and #200 holds once PR #220
+   is merged and the cloud launcher sets both `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` and
+   `KHIVE_ACTOR` per this supervisor contract. On plain `main` today (pre-#220) the env var
+   has no effect. PR #220 must land before or concurrently with PR #218 (this ADR's PR).
 3. **Unique actor/path pairs**: the supervisor derives the actor id and the SQLite file path
    atomically from the tenant registry. If a `(KHIVE_ACTOR, KHIVE_DB)` pair already exists in
    the registry for a live process, the new launch is rejected. Duplicate actor or duplicate
@@ -154,7 +167,9 @@ party-line inbox and mis-stamp by refusing to serve a misconfigured process.
 [KHIVE_ACTOR=tenant:acme KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1] khive-mcp process
       |
       v
-KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1: startup aborts if actor is absent or "local"
+KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1: enforce_strict_actor_mode() returns Err
+      (startup fails) if actor is absent or "local" and comm pack is loaded
+      [provided by PR #220; no-op on pre-#220 main]
       |
       v
 RuntimeConfig.actor_id = Some("tenant:acme")          (serve.rs config resolution)
@@ -210,11 +225,14 @@ TenantGate actor-to-gate threading (issue #13) is required only if a future depl
 places multiple tenants in a single process (the multi-tenant single-process extension in the
 future-seam section). For v1 per-tenant-process deployments, #13 is not required.
 
-### Amendment to ADR-018 §"Multi-tenant deployments"
+### Amendment to ADR-018 §"Multi-tenant deployments" context bullet
 
-ADR-018 Context §"Multi-tenant deployments" frames a shared-process model as the cloud path
-and describes TenantGate as the solution. This ADR establishes an alternative: per-process
-physical isolation defers the need for TenantGate to shared-process scale.
+ADR-018 Context §"Multi-tenant deployments" defines multi-tenant deployments as "one khive
+process serving multiple users or agents" and identifies this as a scenario where the absence
+of gating is "a deal-breaker." ADR-007 Rule 4 (verified: ADR-007-namespace.md line 349) is
+where a `TenantGate` (non-OSS, separate crate behind the Gate trait) is named as the cloud
+isolation mechanism for that shared-process model. This ADR establishes an alternative:
+per-process physical isolation defers the need for TenantGate to shared-process scale.
 
 For v1 cloud deployments under this ADR: the authorization seam (ADR-018 Gate trait) is live
 at every verb dispatch, `AllowAllGate` is installed, and audit events fire through tracing per
@@ -257,6 +275,29 @@ cloud migration runbook must include this step.
 The cross-tenant scenario described in the audit requires a shared-process deployment where
 `actor_id` is unconfigured. That deployment shape is not a valid khive-cloud topology under
 this ADR.
+
+#### Amendment: EqOrMissing is the current implemented behavior — corrects ADR-057
+
+ADR-057 §"`comm.inbox` behavior change" (ADR-057-comm-actor-addressed-delivery.md lines
+~201–204) states that actor-scoped callers do not see messages with a missing `to_actor`
+field. The implemented code does not match this description. The actual filter applied when
+`caller_actor != "local"` uses `FilterOp::EqOrMissing` (verified: `crates/khive-pack-comm/src/handlers.rs`
+lines 160–165; `crates/khive-storage/src/note.rs` lines 232–234): this operator matches rows
+where `$.to_actor` equals the caller's label **OR** where the field is absent or NULL. Legacy
+messages without a `to_actor` property are therefore visible to actor-scoped inbox reads.
+
+**This ADR's amendment is authoritative**: the current implemented behavior is
+`EqOrMissing` (missing `to_actor` IS visible). ADR-057's strict-equality description is
+incorrect as implemented. The cloud consequence is that a tenant DB that contains legacy
+messages without `to_actor` will expose those messages to the tenant's actor-scoped inbox
+queries. For fresh cloud deployments this is a no-op (no legacy rows). For migrated or
+imported databases the quarantine rule already stated above — assign or quarantine all messages
+lacking `to_actor` before placing the process in service — is mandatory and sufficient to close
+this gap.
+
+ADR-057 itself is not rewritten in this PR (PR #218 is scoped to ADR-068). ADR-057's text
+requires a follow-up correction to align its description with the implemented
+`EqOrMissing` behavior; that correction is tracked as a follow-up to this ADR.
 
 ### Issue #200 (from_actor mis-stamp) — enforced by mandatory strict-mode startup
 
@@ -322,8 +363,11 @@ the row level.
   (`NoteStore`, `EntityStore`, `GraphStore`, `EventStore`, `VectorStore`, `SparseStore`,
   `TextSearch`, `SqlAccess`), authoring Postgres DDL migrations, and wiring RLS policies is
   full greenfield scope at every layer.
-- Logical isolation is weaker than physical. A misconfigured RLS policy is a data breach. A
-  process boundary cannot be misconfigured.
+- Logical isolation is weaker than physical. A misconfigured RLS policy is a data breach. The
+  process/file boundary removes RLS-policy drift from the isolation path; wrong actor/path
+  provisioning remains a supervisor risk, mitigated by the invariants in the cloud supervisor
+  contract above (mandatory non-empty `KHIVE_ACTOR`, unique actor/path pairs, path from tenant
+  registry only).
 - The ADR-049 daemon model manages warm Vamana ANN indexes in-process. Postgres with pgvector
   eliminates in-process ANN state, removing cold-start concerns, but at the cost of lower peak
   recall (pgvector HNSW is adequate for cloud corpus sizes but does not match Vamana's 0.952
