@@ -21,7 +21,7 @@ use crate::transport::{ServeOptions, TransportRegistry};
 /// the per-pack runtimes so `kkernel` can build a `BackendRegistry` for the
 /// coordinator (ADR-029 Phase 2).
 pub struct MultiBackendRegistry {
-    /// The assembled [`VerbRegistry`] ready to be passed to a server.
+    /// The assembled [`khive_runtime::VerbRegistry`] ready to be passed to a server.
     pub registry: khive_runtime::VerbRegistry,
     /// Namespace the registry was built for.
     pub default_namespace: String,

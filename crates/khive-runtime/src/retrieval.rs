@@ -90,7 +90,7 @@ impl KhiveRuntime {
     /// own a single model implicitly).
     ///
     /// Applies no instruction prefix (generic role). Use
-    /// [`embed_document_with_model`] / [`embed_query_with_model`] for
+    /// [`Self::embed_document_with_model`] / [`Self::embed_query_with_model`] for
     /// instruction-tuned models where the asymmetric prefix matters.
     ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
@@ -109,7 +109,7 @@ impl KhiveRuntime {
     /// Applies `EmbeddingService::embed_passage`, which prepends the model's
     /// `document_instruction()` prefix when defined (e.g. `"passage: "` for
     /// multilingual-e5). For models with no document prefix (MiniLM, BGE) this
-    /// is identical to [`embed_with_model`].
+    /// is identical to [`Self::embed_with_model`].
     ///
     /// Use this for all index/store/backfill paths so that instruction-tuned
     /// models produce passage-side vectors.
@@ -143,7 +143,7 @@ impl KhiveRuntime {
     /// Applies `EmbeddingService::embed_query`, which prepends the model's
     /// `query_instruction()` prefix when defined (e.g. `"query: "` for
     /// multilingual-e5). For models with no query prefix (MiniLM, BGE) this
-    /// is identical to [`embed_with_model`].
+    /// is identical to [`Self::embed_with_model`].
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
@@ -168,7 +168,7 @@ impl KhiveRuntime {
 
     /// Embed a document for indexing using the configured default model.
     ///
-    /// Delegates to [`embed_document_with_model`]. Use for entity/note
+    /// Delegates to [`Self::embed_document_with_model`]. Use for entity/note
     /// create and reindex paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
@@ -182,7 +182,7 @@ impl KhiveRuntime {
 
     /// Embed a query for retrieval using the configured default model.
     ///
-    /// Delegates to [`embed_query_with_model`]. Use for vector search and
+    /// Delegates to [`Self::embed_query_with_model`]. Use for vector search and
     /// hybrid search query paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
@@ -235,7 +235,7 @@ impl KhiveRuntime {
     /// Applies `EmbeddingService::embed_passage`. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
     ///
-    /// **Reindex caveat**: see [`embed_document_with_model`] — the same
+    /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
@@ -255,7 +255,7 @@ impl KhiveRuntime {
 
     /// Embed a batch of documents for indexing using the configured default model.
     ///
-    /// Convenience delegate to [`embed_document_batch_with_model`]. Use for
+    /// Convenience delegate to [`Self::embed_document_batch_with_model`]. Use for
     /// bulk knowledge-atom and section indexing paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.

@@ -1330,7 +1330,7 @@ impl VerbRegistry {
     /// packs and the conflicting table).
     ///
     /// This is the multi-backend boot path (ADR-028). Single-backend callers
-    /// should continue using [`apply_schema_plans`].
+    /// should continue using [`Self::apply_schema_plans`].
     pub fn apply_schema_plans_with_map(
         &self,
         backend_for_pack: &HashMap<&str, &khive_db::StorageBackend>,
@@ -1533,10 +1533,10 @@ impl PackRegistry {
     /// `runtimes` maps pack name → `KhiveRuntime` (one per backend assignment).
     /// `default_runtime` is used for any pack whose name is not in `runtimes`.
     /// The validation logic (unknown pack, missing dependency) is identical to
-    /// [`register_packs`].
+    /// [`PackRegistry::register_packs`].
     ///
     /// This is the multi-backend boot path (ADR-028). Single-backend callers
-    /// should continue using [`register_packs`].
+    /// should continue using [`PackRegistry::register_packs`].
     pub fn register_packs_with_runtimes(
         names: &[String],
         runtimes: &HashMap<String, KhiveRuntime>,

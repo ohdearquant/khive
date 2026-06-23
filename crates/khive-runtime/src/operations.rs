@@ -1386,7 +1386,7 @@ impl KhiveRuntime {
     ///
     /// Called by the `SubstrateCoordinator` when source and target are on
     /// different backends. The coordinator validates endpoints before calling
-    /// this method via [`validate_link_endpoints`], so endpoint validation is
+    /// this method via [`Self::validate_link_endpoints`], so endpoint validation is
     /// skipped here. The edge is written on the source backend only.
     #[allow(clippy::too_many_arguments)]
     pub async fn link_with_target_backend(
@@ -1718,7 +1718,7 @@ impl KhiveRuntime {
         .await
     }
 
-    /// Like [`create_note`] but also sets a non-zero decay factor on the note.
+    /// Like [`Self::create_note`] but also sets a non-zero decay factor on the note.
     // REASON: extends create_note with an additional decay_factor parameter; same
     // rationale — mirrors the MCP surface and reduces an extra builder layer.
     #[allow(clippy::too_many_arguments)]
@@ -1747,7 +1747,7 @@ impl KhiveRuntime {
         .await
     }
 
-    /// Like [`create_note_with_decay`] but targets a specific embedding model.
+    /// Like [`Self::create_note_with_decay`] but targets a specific embedding model.
     // REASON: adds an embedding_model parameter to the decay variant; the full parameter
     // set is required for correct MCP verb routing and cannot be collapsed without
     // introducing a separate config struct that would obscure call sites.
