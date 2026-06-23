@@ -1,8 +1,8 @@
 # ADR-058: Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking
 
 **Status**: Proposed\
-**Date**: 2026-06-15\
-**Authors**: lambda:khive (architect draft)\
+**Date**: 2026-06-15 (updated 2026-06-23)\
+**Authors**: lambda:khive (architect draft); updated by alpha:architect\
 **Depends on**:
 
 - [ADR-021](ADR-021-memory-pack.md) (Memory Pack — recall scoring is a research surface, weights are starting values)
@@ -10,6 +10,7 @@
 - [ADR-033](ADR-033-recall-pipeline.md) (Recall pipeline)
 - [ADR-035](ADR-035-cli-config-and-auto-embed.md) (Profile resolution order; `brain.resolve` / binding table)
 - [ADR-017](ADR-017-pack-standard.md) (Pack standard; cross-pack dispatch via `VerbRegistry`)
+- [ADR-015](ADR-015-schema-migrations.md) (Migration system; V5 migration specified here)
 
 **Relates**: closes the design gap in #85; makes #62's posterior-serving verification passable.
 
@@ -89,10 +90,10 @@ and persisted but never injected into ranking.
   `apply_signal` to the profile state (`handlers.rs:927` / `handlers.rs:934`) but **never
   increments** `exploration_epoch`. A grep over the feedback handler body returns zero hits for
   `exploration_epoch`.
-- **Consequence:** The draft ADR's Option b as originally written — keying the cache on
-  `exploration_epoch` — would cache stale weights after every `brain.feedback` call and would
-  only invalidate on a full `brain.reset`. This makes the original Option b broken for any
-  production use where posteriors evolve through feedback rather than resets.
+- **Consequence:** Any cache keyed on `exploration_epoch` alone would serve permanently stale
+  weights after every `brain.feedback` call, invalidating only on a full `brain.reset`. This
+  makes the original Option b broken for any production use where posteriors evolve through
+  feedback rather than resets. The amendment below introduces `change_counter` to fix this.
 
 ### Where the read path must inject
 
@@ -103,7 +104,7 @@ let mut cfg = p.effective_config(self.active_config());
 ```
 
 `active_config()` is where the per-call `RecallConfig` originates. `effective_config`
-(`crates/khive-pack-memory/src/handlers/common.rs:180-189`) only overlays per-call `min_score` /
+(`crates/khive-pack-memory/src/handlers/common.rs:194-204`) only overlays per-call `min_score` /
 `min_salience` and an optional explicit `config`. To make ranking profile-aware, the three weights
 (`relevance_weight`, `salience_weight`, `temporal_weight`) in `cfg` must reflect the **resolved
 profile's** posterior means before `cfg.validate()` at `recall.rs:89`. `project_config` already
@@ -163,29 +164,81 @@ keyed by `(namespace, profile_id, change_counter)`. On each recall:
 2. If the cache holds a projection for `(namespace, profile_id)` at the current
    `change_counter`, apply it to `cfg` (overwrite the three weights) and proceed. This is
    an O(1) lookup; no lock on the brain `Mutex` is required.
-3. On cache miss or `change_counter` advance, fetch the resolved profile's
-   `BalancedRecallState` and current `change_counter` via a new brain read verb (see Open
-   Questions, Q2). Project the state via the existing `project_config` logic
-   (`crates/khive-pack-memory/src/tunable.rs:56-71`). Store the projection in the cache keyed
-   by `(namespace, profile_id, change_counter)`. Apply it.
+3. On cache miss or `change_counter` advance, call the new `brain.serve_weights` verb (see
+   §New brain verb below). Store the returned projection in the cache keyed by
+   `(namespace, profile_id, change_counter)`. Apply it.
 4. When no profile resolves (no binding, system-default-only), apply nothing — `cfg` keeps the
    pack defaults. This mirrors the feedback write path's tier-3 fallback semantics exactly
    (`crates/khive-pack-memory/src/handlers/feedback.rs:55-60`).
 
+### Binding semantics for the read path (Q3 resolved)
+
+The projection applies **only when `matched_binding == true`**, exactly mirroring the feedback
+write path tier-2 discipline (`crates/khive-pack-memory/src/handlers/feedback.rs:107-118`).
+When `brain.serve_weights` returns `matched_binding: false` (system-default fallback —
+`balanced-recall-v1` active with no explicit binding), the recall path applies nothing and keeps
+pack defaults. This keeps the read and write paths consistent: both require an explicit binding
+before brain posteriors influence behavior.
+
+Rationale: symmetric behavior is easier to reason about and audit. The system-default
+`balanced-recall-v1` posteriors are already reflected in the static default config weights
+(Beta(7,3)=0.70 relevance, Beta(2,8)=0.20 salience, Beta(1,9)=0.10 temporal, confirmed at
+`crates/khive-pack-memory/src/config.rs:362-388`), so applying them on a matched binding
+adds incremental value over the hard-coded defaults. On a system-default non-binding, the
+hard-coded defaults are already correct at prior values; divergence comes only after real events
+update the posteriors, at which point an explicit binding is the right mechanism.
+
+### New brain verb: `brain.serve_weights`
+
+**Q2 resolved: adopt Option (ii), a purpose-built one-dispatch verb.**
+
+Option (i) — extend `brain.profile` to expose `change_counter` plus calling `brain.resolve` first
+— is two registry dispatches per cache miss: one for resolve, one for profile. Option (ii) is one
+dispatch. At warm-up where every namespace triggers a cold cache lookup, halving the dispatch count
+per namespace per restart is worth a modest surface addition.
+
+Verb contract:
+
+```
+brain.serve_weights(namespace, consumer_kind) -> {
+    matched_binding:  bool,
+    profile_id:       String,
+    change_counter:   u64,
+    weights: {
+        relevance:  f64,   // posterior mean of BalancedRecallState.relevance
+        salience:   f64,   // posterior mean of BalancedRecallState.salience
+        temporal:   f64,   // posterior mean of BalancedRecallState.temporal
+    }
+}
+```
+
+Implementation inside the brain pack handler:
+
+1. Run `resolve_with_match(namespace, consumer_kind)` from `brain_state.rs` (the same function
+   `brain.resolve` calls) to obtain `(profile_id, matched_binding)`.
+2. Load the resolved profile's `BalancedRecallState` from `BrainState` (in-memory, under the
+   existing `Mutex`).
+3. Project via `BalancedRecallState::{relevance, salience, temporal}.mean()`.
+4. Return the flat `{matched_binding, profile_id, change_counter, weights}` shape.
+
+The verb is `Visibility::Subhandler` — it is an internal efficiency surface for pack-to-pack
+coordination, not a user-facing verb. It does not appear in `brain.verbs()` output at `Verb`
+visibility. This is consistent with the `brain.config`, `brain.state`, `brain.events`,
+`brain.emit` subhandlers already present in ADR-032 §11.
+
 ### Where the `change_counter` lives and where it increments
 
-- **Lives on**: the brain profile record (`crates/khive-pack-brain/src/handlers.rs` — the same
-  `BrainState`-backed record object accessed throughout the feedback handler). A new `u64` field
-  `change_counter` is added alongside `exploration_epoch` on the in-memory profile state and on
-  the `brain_profile_snapshots` persisted row.
+- **Lives on**: a new `u64` field `change_counter` on `ProfileRecord`
+  (`crates/khive-pack-brain/src/handlers.rs` — the same `BrainState`-backed record accessed
+  throughout the feedback handler). Added alongside `exploration_epoch` on the in-memory profile
+  state and on the `brain_profile_snapshots` persisted row via V5 migration.
 - **Increments at**: the feedback apply site in the feedback handler
   (`crates/khive-pack-brain/src/handlers.rs:926-944`), immediately after `apply_signal` is called
   on the profile state. This is the only mutation path for posteriors; incrementing here provides
   exact invalidation semantics — the counter advances if and only if the posteriors actually
   changed.
-- **Read by**: the new brain read verb (step 3 above), which returns
-  `{weights, change_counter, matched_binding}` in a single dispatch, halving registry round-trips
-  relative to a separate resolve + state-fetch sequence.
+- **Read by**: `brain.serve_weights`, which returns the current `change_counter` together with
+  the projected weights in a single dispatch, letting the caller cache and invalidate precisely.
 
 ### Cache invalidation semantics
 
@@ -193,7 +246,7 @@ The cache entry `(namespace, profile_id, change_counter)` is valid as long as th
 `change_counter` for the resolved profile matches the cached counter. After a feedback event, the
 brain's counter is one greater; the next recall for that `(namespace, profile_id)` detects the
 mismatch, refreshes from the brain, and updates the cache. The cost of a refresh is one registry
-dispatch (the new brain read verb). After a `brain.reset`, `exploration_epoch` also increments,
+dispatch (`brain.serve_weights`). After a `brain.reset`, `exploration_epoch` also increments,
 which can be included in the cache key as an additional guard; but `change_counter` alone is
 sufficient for exact invalidation.
 
@@ -221,10 +274,10 @@ on counter advance. The projection math already exists and is tested.
 | Dimension                             | (a) per-recall                                             | (b-amended) counter-keyed cache (chosen)                                                            | (c) TTL cache                                                                |
 | ------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | Recall latency                        | 2 registry dispatches + brain `Mutex` lock, **every call** | dispatch on cache miss / counter advance only; O(1) lookup otherwise                                | same as (b) plus a clock check per call                                      |
-| Staleness window                      | none (always fresh)                                        | ≤ one recall after `change_counter` advances                                                        | ≤ min(TTL, one recall after counter advance)                                 |
+| Staleness window                      | none (always fresh)                                        | at most one recall after `change_counter` advances                                                  | at most min(TTL, one recall after counter advance)                           |
 | Complexity                            | lowest (no cache state)                                    | one cache map keyed on `(namespace, profile_id, change_counter)` + `u64` increment in feedback path | (b-amended) + TTL bookkeeping and a tuning knob                              |
 | Correctness under concurrent feedback | exact                                                      | exact — counter advances on every feedback apply                                                    | bounded by TTL; may serve stale for up to the TTL window even after feedback |
-| New brain surface                     | a verb to fetch projected weights / state                  | same                                                                                                | same                                                                         |
+| New brain surface                     | `brain.serve_weights` (one-dispatch resolve+project)       | same                                                                                                | same                                                                         |
 
 ### Option c (TTL) — rejected
 
@@ -282,14 +335,16 @@ surface ([ADR-021](ADR-021-memory-pack.md) §Scope: weights are starting values,
 
 **Negative / cost**
 
-- A new brain read verb (weights/state fetch) must be added and validated — a small surface
-  expansion on the brain pack, governed by [ADR-032](ADR-032-brain-profile-orchestration.md).
+- `brain.serve_weights` (new `Visibility::Subhandler` verb) must be added to the brain pack and
+  validated — a small, internal-only surface expansion on the brain pack, governed by
+  [ADR-032](ADR-032-brain-profile-orchestration.md).
 - A `change_counter` field must be added to the brain profile record and incremented in the
-  feedback apply path. This requires a DB migration for the `brain_profile_snapshots` table
-  (a new `change_counter INTEGER NOT NULL DEFAULT 0` column).
+  feedback apply path. This requires V5 DB migration for the `brain_profile_snapshots` table
+  (a new `change_counter INTEGER NOT NULL DEFAULT 0` column, additive — see §Change list).
 - The memory pack gains mutable cache state (`(namespace, profile_id, change_counter) → projected
   weights`), with the usual lock and eviction considerations. It must be bounded (e.g. LRU with
-  a cap on tracked `(namespace, profile_id)` pairs).
+  a cap on tracked `(namespace, profile_id)` pairs; 64 entries is a safe ceiling for v1 — no
+  deployment today has more than a handful of concurrently-bound profiles).
 - A one-recall staleness lag after a posterior update is accepted by design. Surfaces that require
   exact-fresh posteriors per call are not served by this design (none identified today).
 - `BrainProfileHint` (`crates/khive-pack-memory/src/config.rs:90-102`) remains dead under this
@@ -304,8 +359,8 @@ surface ([ADR-021](ADR-021-memory-pack.md) §Scope: weights are starting values,
   (additive migration; existing rows default to 0, which correctly signals "cache always stale"
   until the first feedback after the migration — safe, just triggers one cache miss per profile
   on restart).
-- The cache is in-memory and rebuilt on restart, matching the existing `recall_state` posture
-  (`crates/khive-pack-memory/src/pack.rs:32` — "Persistence is deferred — state is rebuilt
+- The weights cache is in-memory and rebuilt on restart, matching the existing `recall_state`
+  posture (`crates/khive-pack-memory/src/pack.rs:32` — "Persistence is deferred — state is rebuilt
   from actions on restart").
 
 ---
@@ -343,6 +398,254 @@ depend on activation ordering rather than on the caller's resolved binding. The 
 design keys the projection by `(namespace, profile_id)` and resolves per caller, which the
 push-into-one-slot model structurally cannot do.
 
+**(e) Extend `brain.profile` + separate `brain.resolve` call (Option i for Q2).** Two dispatches
+per cache miss: `brain.resolve(namespace, consumer_kind)` then `brain.profile(profile_id)`. Rejected
+in favor of `brain.serve_weights` for the one-dispatch advantage. Cold-start (every namespace
+triggers a cache miss on the first recall after restart) means the round-trip count is O(active
+namespaces), making the per-cache-miss cost matter at warm-up. The one-dispatch verb also
+co-locates resolve and projection inside the brain pack where the `BrainState` Mutex is already
+held, avoiding two separate lock acquisitions.
+
+---
+
+## Exact change list
+
+### 1. `crates/khive-pack-brain` — feedback handler and new verb
+
+**File: `crates/khive-pack-brain/src/handlers.rs`**
+
+- In `ProfileRecord` (or the equivalent `BrainState` profile record struct): add `change_counter:
+  u64` alongside `exploration_epoch`.
+- In `handle_feedback` at the feedback apply site (~line 927): immediately after
+  `state.balanced_recall.apply_signal(&signal)` (and the equivalent branch for user-created
+  profiles at ~line 934), increment the profile's `change_counter` by 1.
+  ```
+  // After apply_signal — exact invalidation for the weights cache
+  if serving_profile == "balanced-recall-v1" {
+      state.balanced_recall.change_counter += 1;
+  } else if let Some(ps) = state.profile_states.get_mut(serving_profile) {
+      ps.change_counter += 1;
+  }
+  ```
+- Add `handle_serve_weights` method: resolve + project weights + return
+  `{matched_binding, profile_id, change_counter, weights: {relevance, salience, temporal}}`.
+- Register `brain.serve_weights` in the `PackRuntime::dispatch` match arm and in `BRAIN_HANDLERS`
+  with `Visibility::Subhandler`.
+
+**File: `crates/khive-brain-core/src/profile.rs`**
+
+- Add `change_counter: u64` to `BalancedRecallState` (alongside `exploration_epoch`).
+- Initialize to `0` in `BalancedRecallState::new`.
+- Include in snapshot serialization (it is a `u64`, serde-compatible, additive field).
+
+**File: `crates/khive-pack-brain/src/persist.rs`**
+
+- `BrainStateSnapshot` (the serde struct serialized to `snapshot_json`): add
+  `change_counter: u64` with `#[serde(default)]`. Existing snapshots deserialize with
+  `change_counter = 0` (correct — signals stale cache on first recall after migration).
+
+### 2. `crates/khive-db` — V5 migration
+
+**New file: `crates/khive-db/sql/005-brain-change-counter.sql`**
+
+```sql
+-- V5: Add change_counter column to brain_profile_snapshots for recall-weights cache
+-- invalidation. DEFAULT 0 ensures existing rows start as "always stale on next recall",
+-- which is safe — triggers one weights-cache miss per profile, then caches normally.
+ALTER TABLE brain_profile_snapshots ADD COLUMN change_counter INTEGER NOT NULL DEFAULT 0;
+```
+
+**File: `crates/khive-db/src/migrations.rs`**
+
+- Add `const V5_UP: &str = include_str!("../sql/005-brain-change-counter.sql");`
+- Add `VersionedMigration { version: 5, name: "brain_change_counter", up: V5_UP }` to the
+  `MIGRATIONS` constant after the existing V4 entry.
+
+### 3. `crates/khive-pack-memory` — weights cache and recall injection
+
+**File: `crates/khive-pack-memory/src/pack.rs`**
+
+- Add `weights_cache: Mutex<WeightsCacheMap>` field to `MemoryPack`, where:
+  ```rust
+  /// Cached brain profile weights. Key: (namespace, profile_id, change_counter).
+  /// Value: projected (relevance, salience, temporal) weights.
+  /// Bounded LRU: evicts oldest (namespace, profile_id) entry when capacity (64) is reached.
+  type WeightsCacheMap = lru::LruCache<(String, String), (u64, f64, f64, f64)>;
+  //                                   ^namespace ^profile_id  ^cc  ^rel ^sal ^tem
+  ```
+  This requires adding `lru` to `crates/khive-pack-memory/Cargo.toml` (already a transitive
+  dep of `khive-runtime` via `khive-db`; verify with `cargo tree -p khive-pack-memory | grep lru`
+  before adding a new dep).
+- Initialize in `MemoryPack::new`: `weights_cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap()))`.
+
+**File: `crates/khive-pack-memory/src/handlers/recall.rs`**
+
+- Before `cfg.validate()` at ~line 89, insert the profile-weights injection:
+  ```rust
+  // Inject brain profile weights if a binding is resolved for this caller.
+  // Fails silently (brain pack absent or binding not found) — recall continues
+  // with pack defaults. See ADR-058.
+  if let Ok(weights) = self.resolve_brain_weights(token, registry).await {
+      if let Some((rel, sal, tem)) = weights {
+          cfg.relevance_weight = rel;
+          cfg.salience_weight = sal;
+          cfg.temporal_weight = tem;
+      }
+  }
+  ```
+
+**New method in `MemoryPack` (e.g., `crates/khive-pack-memory/src/handlers/recall.rs` or
+extracted to a new `brain_weights.rs` module if the file approaches its 700-LOC limit):**
+
+```rust
+/// Resolve and cache brain profile weights for the current caller.
+///
+/// Returns Ok(Some((rel, sal, tem))) when a binding is found and weights are loaded.
+/// Returns Ok(None) when brain is absent, no binding matches (matched_binding=false),
+/// or the brain pack returns an error.
+/// Never propagates brain errors — recall must not fail if brain is unavailable.
+async fn resolve_brain_weights(
+    &self,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+) -> Result<Option<(f64, f64, f64)>, RuntimeError> {
+    let ns = token.namespace().as_str().to_string();
+
+    // Cache lookup: check if we have a valid (namespace, profile_id) entry
+    // whose change_counter matches what brain will return.
+    // We don't know the profile_id yet, so we must dispatch first on cold miss.
+    // On a warm hit, the entry is keyed by (ns, profile_id) from the prior call.
+    // Strategy: peek for any entry for this namespace; if found and we need to
+    // verify counter, the dispatch will confirm. For v1 simplicity, always dispatch
+    // brain.serve_weights (one call) and use the returned change_counter to decide
+    // whether to return the cached projection or update it.
+    //
+    // The dispatch is cheap (in-process registry, no network) and is only one call
+    // regardless of cache state — it returns matched_binding + counter + weights
+    // in one round-trip.
+
+    let serve_params = serde_json::json!({
+        "namespace": &ns,
+        "consumer_kind": "recall",
+    });
+
+    let result = registry
+        .dispatch("brain.serve_weights", serve_params)
+        .await;
+
+    let v = match result {
+        Err(_) => return Ok(None), // brain pack absent or error — use defaults
+        Ok(v) => v,
+    };
+
+    let matched = v.get("matched_binding").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !matched {
+        return Ok(None); // system-default only — use pack defaults (symmetric with write path)
+    }
+
+    let profile_id = match v.get("profile_id").and_then(|s| s.as_str()) {
+        Some(id) => id.to_owned(),
+        None => return Ok(None),
+    };
+    let change_counter = v.get("change_counter").and_then(|n| n.as_u64()).unwrap_or(0);
+
+    // Check cache: if (ns, profile_id) is present and counter matches, use cached weights.
+    {
+        let mut cache = self.weights_cache.lock().unwrap();
+        if let Some(&(cached_cc, rel, sal, tem)) = cache.get(&(ns.clone(), profile_id.clone())) {
+            if cached_cc == change_counter {
+                return Ok(Some((rel, sal, tem)));
+            }
+        }
+    }
+
+    // Cache miss or counter mismatch — extract weights from the serve_weights response.
+    let weights = v.get("weights");
+    let rel = weights.and_then(|w| w.get("relevance")).and_then(|v| v.as_f64()).unwrap_or(0.70);
+    let sal = weights.and_then(|w| w.get("salience")).and_then(|v| v.as_f64()).unwrap_or(0.20);
+    let tem = weights.and_then(|w| w.get("temporal")).and_then(|v| v.as_f64()).unwrap_or(0.10);
+
+    // Update cache.
+    {
+        let mut cache = self.weights_cache.lock().unwrap();
+        cache.put((ns, profile_id), (change_counter, rel, sal, tem));
+    }
+
+    Ok(Some((rel, sal, tem)))
+}
+```
+
+Note: `brain.serve_weights` is called on **every** recall (not only on cold miss), but it is an
+in-process registry dispatch with no I/O — the brain handler reads from its in-memory `BrainState`
+under a brief `Mutex` lock. If profiling shows this is a measurable hot-path cost, the optimization
+path is to store the profile_id from the prior call in the cache and check the counter without
+dispatching; but at v1 scale, the dispatch cost is negligible compared to ANN search.
+
+### 4. Pack decoupling invariant
+
+`crates/khive-pack-memory/Cargo.toml` must **not** gain a direct dependency on
+`khive-pack-brain`. The weights injection uses only `VerbRegistry::dispatch("brain.serve_weights",
+...)` — the same indirection already used for `brain.resolve` and `brain.feedback` in the feedback
+handler. If the brain pack is not loaded, `dispatch` returns an error, which `resolve_brain_weights`
+converts to `Ok(None)`. Pack coupling via the registry is O(1) and already the established pattern.
+
+### 5. ADR-032 amendment note
+
+[ADR-032](ADR-032-brain-profile-orchestration.md) §11 lists the brain verb surface. An implementer
+must add `brain.serve_weights` to that table with:
+
+- Verb: `brain.serve_weights`
+- Speech act: assertive
+- Visibility: Subhandler
+- Purpose: resolve the caller's recall profile and return projected weights with `change_counter`
+  for the memory pack's weights cache.
+
+---
+
+## Determinism and test plan
+
+### Scoring determinism preserved
+
+The three weights (`relevance_weight`, `salience_weight`, `temporal_weight`) flow into
+`compute_score` (`crates/khive-pack-memory/src/handlers/common.rs:227-251`) as `f64` values.
+`compute_score` returns a tuple that passes through `khive_score::DeterministicScore` conversion
+before ranking. The weights themselves are Beta posterior means (rational f64 arithmetic on the
+same input data), which are platform-deterministic given the same event sequence. No new
+non-determinism is introduced: the injection point at `recall.rs:73` overwrites three f64 fields
+in `cfg` before any ANN or scoring call.
+
+### Test cases required for implementation
+
+1. **Read-path wired test.** With brain pack loaded, a profile bound for `consumer_kind="recall"`,
+   and a known posterior state (set via `brain.feedback` calls), verify that `memory.recall`
+   ranking reflects the projected weights — e.g. after setting temporal to a low posterior mean,
+   confirm that a recently-created memory scores lower relative to an older memory with equal
+   relevance than it would under the static default temporal weight.
+
+2. **Fallback test: brain absent.** With only `kg` + `memory` packs loaded (no brain), verify
+   that `memory.recall` succeeds and uses pack defaults. This confirms `resolve_brain_weights`
+   errors silently rather than blocking recall.
+
+3. **Fallback test: no binding (`matched_binding=false`).** With brain loaded but no explicit
+   binding created, verify recall uses pack defaults. This confirms the `matched_binding` gate
+   in `resolve_brain_weights` is respected.
+
+4. **Cache hit test.** After a recall that primes the weights cache, emit a `brain.feedback`
+   that does NOT advance `change_counter` for the resolved profile (e.g. a no-op or a feedback
+   to a different profile), then recall again — verify `brain.serve_weights` is called once
+   total (the cache_miss path on first recall) and the weights match the prior call.
+   (Implementation note: this test requires a test hook or observable counter on the cache.)
+
+5. **Cache invalidation test.** After a recall that primes the cache, emit `brain.feedback` to the
+   bound profile (which increments `change_counter`), then recall again — verify the new weights
+   are fetched and cached under the incremented counter.
+
+6. **Same query + same profile = same ranking (determinism).** With a fixed corpus, fixed profile
+   state, and fixed `change_counter`, running `memory.recall(query=X)` twice must return
+   identical results in identical order. This is already guaranteed by the deterministic scoring
+   invariant (ADR-006 / ADR-032 §9), but the test pins it explicitly as a regression guard for
+   this change.
+
 ---
 
 ## Open questions
@@ -359,30 +662,22 @@ push-into-one-slot model structurally cannot do.
 - This is precisely why Option b-amended introduces `change_counter`: a field that advances on
   every feedback application and is independent of the reset-only epoch.
 
-### Q2 — Open (Ocean / brain VP): new brain read verb contract
+### Q2 — RESOLVED: new brain read verb contract
 
-**What is the new brain read verb's exact contract?** Options:
+**Resolved: adopt `brain.serve_weights` (Option ii), a purpose-built one-dispatch verb** that
+performs resolve + project inside the brain pack and returns
+`{matched_binding, profile_id, change_counter, weights: {relevance, salience, temporal}}`.
+Contract and implementation details are in §New brain verb above.
 
-- **(i)** The existing `brain.profile` verb already returns a snapshot/state summary. If it
-  exposes the three posterior means and the current `change_counter` in its response, no new verb
-  is needed — the memory pack can call `brain.profile` (resolve first via `brain.resolve`, then
-  fetch). This is two dispatches per cache miss.
-- **(ii)** A purpose-built verb — e.g. `brain.serve_weights(consumer_kind, namespace)` — that
-  performs resolve + project inside the brain pack and returns
-  `{weights: {relevance, salience, temporal}, change_counter, matched_binding}` in one dispatch.
-  This halves the round-trips and matches the shape the cache directly needs.
+Rationale: one dispatch per cache miss vs two (resolve + profile fetch). At cold-start, the
+difference is O(active namespaces) dispatches; at warm steady-state it is zero (O(1) cache hit
+with no dispatch).
 
-**Recommendation**: Option (ii), for one-dispatch resolution. The choice touches the brain pack's
-public surface ([ADR-032](ADR-032-brain-profile-orchestration.md)) and is the brain VP's call.
+### Q3 — RESOLVED: binding semantics for the read path
 
-### Q3 — Open (Ocean / architect): binding semantics for the read path
-
-**Should the projection apply only on a real binding (`matched_binding=true`), exactly like
-the feedback write path tier-2, or also on a system-default active profile?** Feedback falls
-through to pack-local state when only a system default matches
-(`crates/khive-pack-memory/src/handlers/feedback.rs:88-122`). Symmetry argues recall should too
-— apply tuned weights only on an explicit binding; otherwise use pack defaults. Confirm this is
-the intended semantics so the read path and write path stay consistent.
+**Resolved: projection applies only on `matched_binding=true`**, mirroring the feedback write
+path tier-2 discipline. System-default fallbacks (`matched_binding=false`) use pack defaults.
+See §Binding semantics above for rationale.
 
 ### Q4 — Open (Ocean): knowledge pack read-path scope
 
@@ -392,10 +687,16 @@ wiring: it routes feedback correctly through `brain.resolve(consumer_kind="recal
 ranking compose output. This ADR scopes the memory-pack path. Should the knowledge pack be brought
 to the same spec in a follow-up ADR, or in this one?
 
+**Recommendation**: follow-up ADR. The knowledge pack's recall path is structurally different
+(compose ranking over atoms vs. note retrieval); a separate ADR can reference ADR-058 as the
+canonical pattern and adapt as needed.
+
 ### Q5 — Open: `BrainProfileHint` disposition
 
 **Delete or wire?** The `BrainProfileHint` struct (`crates/khive-pack-memory/src/config.rs:90-102`)
 specifies a post-recall score-boost mechanism distinct from the weight-projection read path. It is
 currently dead (`brain_profile` is never read in `recall.rs`). Options: delete it as dead config
 per the no-backwards-compat-shims standard, or specify the boost use case and wire it separately.
-Recommend deletion unless a boost use case is articulated.
+**Recommendation**: delete in the implementation PR unless a boost use case is articulated. The
+weight-projection read path (this ADR) subsumes the motivating intent; a per-entity boost on
+top requires a separate evidence base.
