@@ -21,11 +21,14 @@
 #     - LEAVES required_approving_review_count at its current value (1). The
 #       per-PR human review gate stays UP while the wall goes up. This is the
 #       safe direction: adding gates never opens a hole.
-#     - Preflight: every required context must already report on main's HEAD
-#       commit OR on a recent PR head, or it aborts (a required check that never
-#       reports locks every PR forever). A PR head is also consulted because
-#       PR-only checks (e.g. "Dependency review", gated on the pull_request
-#       event) never run on a push and so never appear on main's HEAD.
+#     - Preflight: every required context must already have a recent PASSING run
+#       on main's HEAD OR a recent PR head, or it aborts (a required check that
+#       never reports — or only ever fails — locks every PR forever). A PR head is
+#       also consulted because PR-only checks (e.g. "Dependency review", gated on
+#       the pull_request event) never run on a push and so never appear on main's
+#       HEAD. For determinism, pin the PR that vouches for the PR-only gates with
+#       PR_CONTEXT_SOURCE=<pr> (the #216-after-retarget PR) rather than relying on
+#       an arbitrary recent-PR window.
 #
 #   STEP=release-gate
 #     - Creates the 'publish' environment with the running admin (Ocean) as a
@@ -43,6 +46,20 @@
 #       approvals before the wall is up and the release gate is in place.
 #     - This is the hard-to-reverse, HC-7-gated step. Run it LAST, only on
 #       Ocean's explicit go.
+#
+# BOOTSTRAP ORDER (do this before STEP=gates can pass its preflight):
+#   1. Merge #215 (Supply-chain gate) and #216 (SemVer/Doc/Dependency-review/
+#      Coverage gates) to main. The gate PRs are themselves blocked by the 1-
+#      approval rule, so this first batch is Ocean's HC-7 merge.
+#   2. #216 must target main (or an integration/** branch) for its CI to run at
+#      all: ci.yml triggers on `pull_request: branches: [main, integration/**]`,
+#      so while #216 is stacked on fix/issue-208-cve-gating its four new jobs
+#      never fire (its head shows only "Pipeline Regression Gate"). Retarget it to
+#      main before merge so the new gates actually run.
+#   3. "Dependency review" is pull_request-only — it never appears on a push to
+#      main. After the batch merges, a main-targeted PR must report it once; pin
+#      that PR with PR_CONTEXT_SOURCE=<pr> when running STEP=gates so the preflight
+#      sources it deterministically instead of from an arbitrary recent-PR window.
 #
 # DRY_RUN (default ON): prints the exact mutations and exits 0 without changing
 #   anything. To apply:  DRY_RUN=false STEP=<step> ./scripts/apply-autonomous-merge.sh
@@ -102,49 +119,126 @@ contexts_json() {
     | jq -R . | jq -s 'map({context: .})'
 }
 
-# Names of check-runs that have reported recently — the union of main's HEAD and
-# the heads of the last few PRs. Required status checks gate PRs, so a PR head is
-# the authoritative source: PR-only checks (e.g. "Dependency review", gated on
-# `if: github.event_name == 'pull_request'`) never appear on a main push, so main
-# HEAD alone would wrongly report them as non-reporting. The per-PR-head calls are
-# best-effort supplements; the connectivity of the API itself is proved separately
-# by the probe in preflight_contexts_report.
-reporting_check_names() {
-  gh api --paginate "repos/${REPO}/commits/${BRANCH}/check-runs" \
-    --jq '.check_runs[].name' 2>/dev/null || true
-  local sha
-  while IFS= read -r sha; do
-    [[ -n "${sha}" ]] || continue
-    gh api --paginate "repos/${REPO}/commits/${sha}/check-runs" \
-      --jq '.check_runs[].name' 2>/dev/null || true
-  done < <(gh pr list --state all --limit 5 --json headRefOid \
-             --jq '.[].headRefOid' 2>/dev/null || true)
+# Emit "name<TAB>status<TAB>conclusion" for every check-run on a commit-ish.
+# conclusion is "" while a run is still in flight (jq `// ""`).
+fetch_check_runs() {
+  local ref="$1"
+  gh api --paginate "repos/${REPO}/commits/${ref}/check-runs" \
+    --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv'
 }
 
-# Abort unless every required context reports on main's HEAD or a recent PR.
-# Prevents locking the repo behind a required check that never runs.
+# A required context is "healthy" if ANY recent run concluded with one of these
+# non-failing terminal conclusions — proof the gate is wired and CAN go green.
+# This deliberately does not demand that every recent run passed: one unlucky PR
+# that fails the check must not block activation, but a context that has only ever
+# failed / is still running / never reported must (it would lock every PR once
+# required).
+ACCEPTABLE_CONCLUSIONS="success skipped neutral"
+
+# Abort unless every required context has a recent PASSING run, sourced from:
+#   1. main's HEAD              (MANDATORY — fetch failure aborts verification)
+#   2. recent PR heads          (listing MANDATORY; each per-head fetch best-effort)
+#   3. PR_CONTEXT_SOURCE=<pr>    (OPTIONAL but MANDATORY when set — pins a specific
+#                                 PR so PR-only gates like "Dependency review" are
+#                                 sourced deterministically, not from an arbitrary
+#                                 last-N window. Set this to the #216-after-retarget
+#                                 PR before activation.)
+# PR heads are consulted because PR-only checks (e.g. "Dependency review", gated
+# on `if: github.event_name == 'pull_request'`) never run on a push and so never
+# appear on main's HEAD. Mandatory sources hard-fail rather than silently building
+# a partial picture that could mis-report a context as "not reporting".
 preflight_contexts_report() {
-  # Distinguish "GitHub API unreachable" from "context genuinely absent": a probe
-  # so a failed verification reports as a failure, not as "merge the gate PRs".
+  # Probe API reachability first so a total outage reports as a verification
+  # failure, not as "merge the gate PRs".
   if ! gh api "repos/${REPO}" --jq '.full_name' >/dev/null 2>&1; then
     echo "ABORT: cannot reach the GitHub API for ${REPO} (auth/network/rate-limit?)." >&2
     echo "Verification could not run; resolve API access and retry." >&2
     exit 1
   fi
 
-  local reported missing=() ctx
-  reported="$(reporting_check_names | sort -u)"
+  local runs
+  # MANDATORY source 1: main HEAD.
+  if ! runs="$(fetch_check_runs "${BRANCH}")"; then
+    echo "ABORT: could not fetch check-runs for ${BRANCH} HEAD." >&2
+    echo "Verification data incomplete; resolve API access and retry." >&2
+    exit 1
+  fi
+
+  # MANDATORY source 2: list recent PR heads. The per-head fetches below are
+  # best-effort, but if we cannot even enumerate PRs we cannot vouch for the
+  # PR-only contexts, so abort rather than degrade to a partial union.
+  local pr_shas
+  if ! pr_shas="$(gh pr list --state all --limit 10 --json headRefOid \
+                    --jq '.[].headRefOid')"; then
+    echo "ABORT: could not list recent PRs to source PR-only check contexts." >&2
+    echo "Verification data incomplete; resolve API access and retry." >&2
+    exit 1
+  fi
+
+  # OPTIONAL deterministic source: a pinned PR whose head MUST be reachable.
+  if [[ -n "${PR_CONTEXT_SOURCE:-}" ]]; then
+    local src_sha src_runs
+    if ! src_sha="$(gh pr view "${PR_CONTEXT_SOURCE}" --json headRefOid \
+                      --jq '.headRefOid')"; then
+      echo "ABORT: PR_CONTEXT_SOURCE=#${PR_CONTEXT_SOURCE} not found or unreachable." >&2
+      exit 1
+    fi
+    if ! src_runs="$(fetch_check_runs "${src_sha}")"; then
+      echo "ABORT: could not fetch check-runs for PR #${PR_CONTEXT_SOURCE} head ${src_sha}." >&2
+      exit 1
+    fi
+    runs+=$'\n'"${src_runs}"
+  fi
+
+  # Best-effort: fold in each recent PR head. A dropped fetch here is tolerated
+  # because the mandatory sources above carry the load.
+  local pr_sha pr_runs
+  while IFS= read -r pr_sha; do
+    [[ -n "${pr_sha}" ]] || continue
+    pr_runs="$(fetch_check_runs "${pr_sha}" 2>/dev/null)" || continue
+    runs+=$'\n'"${pr_runs}"
+  done <<<"${pr_shas}"
+
+  # Evaluate health per required context.
+  local ctx missing=() unhealthy=()
   for ctx in "${REQUIRED_CONTEXTS[@]}"; do
-    grep -Fxq "${ctx}" <<<"${reported}" || missing+=("${ctx}")
+    local pairs healthy pair concl
+    # status:conclusion for every run of this context across all sources.
+    pairs="$(awk -F'\t' -v c="${ctx}" \
+      '$1==c {print $2":"(($3=="")?"pending":$3)}' <<<"${runs}")"
+    if [[ -z "${pairs}" ]]; then
+      missing+=("${ctx}")
+      continue
+    fi
+    healthy=false
+    while IFS= read -r pair; do
+      [[ -n "${pair}" ]] || continue
+      concl="${pair##*:}"
+      case " ${ACCEPTABLE_CONCLUSIONS} " in
+        *" ${concl} "*) healthy=true; break ;;
+      esac
+    done <<<"${pairs}"
+    if [[ "${healthy}" != "true" ]]; then
+      unhealthy+=("${ctx} [$(tr '\n' ',' <<<"${pairs}" | sed 's/,$//')]")
+    fi
   done
+
   if (( ${#missing[@]} > 0 )); then
-    echo "ABORT: these required contexts have not reported on ${BRANCH} HEAD or a recent PR:" >&2
+    echo "ABORT: these required contexts have not reported on ${BRANCH} HEAD or any recent PR:" >&2
     printf '  - %s\n' "${missing[@]}" >&2
-    echo "Merge the PR(s) that add them first (gate wall: #215 then #216)." >&2
+    echo "Merge the PR(s) that add them first (gate wall: #215 then #216), and make sure" >&2
+    echo "they run against a main-targeted PR (set PR_CONTEXT_SOURCE=<pr> to pin one)." >&2
     echo "Requiring a check that never reports blocks every PR." >&2
     exit 1
   fi
-  echo "Preflight OK: all ${#REQUIRED_CONTEXTS[@]} required contexts report on ${BRANCH} or a recent PR."
+  if (( ${#unhealthy[@]} > 0 )); then
+    echo "ABORT: these required contexts report but have no recent passing run:" >&2
+    printf '  - %s\n' "${unhealthy[@]}" >&2
+    echo "A context marked required must be able to go green. Fix the failing gate, or" >&2
+    echo "wait for a passing run (set PR_CONTEXT_SOURCE=<pr> to a PR where it passed)." >&2
+    exit 1
+  fi
+  echo "Preflight OK: all ${#REQUIRED_CONTEXTS[@]} required contexts have a recent passing run."
 }
 
 # Current ruleset, stripped to the fields the PUT accepts, with mutations
