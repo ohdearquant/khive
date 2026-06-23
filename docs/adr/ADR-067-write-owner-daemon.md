@@ -142,12 +142,18 @@ requires a non-trivial API change and is scoped below.
 
 ## Decision
 
-Replace all write-path contention with a single write-owner task inside the daemon. All write
-operations — including those currently using standalone connections (graph, text, event, SqlBridge)
-and those using the pool Mutex (entity, note, sparse, vectors, curation, operations, DDL helpers)
-— route their mutations through a bounded async channel to this task. The task is the sole caller
-of `BEGIN IMMEDIATE` and holds the single writer connection for the life of the daemon. Reads
-remain concurrent and do not route through the write-owner task.
+Introduce a single write-owner task (`WriterTask`) inside the daemon. Concurrent write operations
+reaching the daemon accept loop — including those currently using standalone connections (graph,
+text, event, SqlBridge file-backed path) and those using the pool Mutex (entity, note, sparse,
+vectors, curation, operations) — route their mutations through a bounded async channel to this
+task. `WriterTask` is the sole caller of `BEGIN IMMEDIATE` for write traffic processed through
+the accept loop. Reads remain concurrent and do not route through the write-owner task.
+
+**Scope of the guarantee**: two write paths are explicitly excluded from this ADR and continue to
+call `BEGIN IMMEDIATE` independently: (1) `SqlBridge::begin_tx()` (`sql_bridge.rs:834`), deferred
+to the follow-up ADR for issue #195; and (2) startup/bootstrap writes in `backend.rs`
+(`register_embedding_model`, DDL helpers), which run sequentially before the accept loop admits
+any concurrent traffic and require no queuing.
 
 The transport layer (ADR-049 Unix socket framing, `forward_or_spawn`, `DaemonRequestFrame`) is
 unchanged. The redesign is internal to the daemon process and is transparent to all callers.
@@ -161,20 +167,61 @@ unchanged. The redesign is internal to the daemon process and is transparent to 
 A dedicated Tokio task (`WriterTask`) is introduced in `crates/khive-db/src/writer_task.rs`
 (or as a module within `pool.rs` if the scope warrants co-location). This task is the
 exclusive owner of the writer connection. It receives write requests over a bounded
-`tokio::mpsc::channel` and is the only code path that calls `BEGIN IMMEDIATE`.
+`tokio::mpsc::channel` and is the only code path that calls `BEGIN IMMEDIATE` for write traffic
+routed through the daemon accept loop. The two excluded paths — `SqlBridge::begin_tx()` and
+startup/bootstrap writes — are detailed in the Decision section above and in Consequences.
 
 **`WriteRequest` message shape**:
 
-```
-WriteRequest {
-    statements: Vec<SqlStatement>,
-    reply: oneshot::Sender<Result<u64, StorageError>>,
+Store methods that migrate to the channel have heterogeneous return types: `upsert_entities`,
+`upsert_notes`, `upsert_documents`, `append_events`, `upsert_batch`, and `insert_batch` all return
+`BatchWriteSummary` (with `attempted`/`affected`/`failed`/`first_error` fields); `append_event`
+and `upsert_edges` return `()` or `u64`; `SqlBridge::execute_batch` returns `u64`. A flat
+`reply: oneshot::Sender<Result<u64, StorageError>>` cannot carry `BatchWriteSummary` without
+losing the partial-success contract — `affected` and `failed` would be conflated into a single
+rows-affected count, and `first_error` would be dropped. This is a breaking change to the
+`khive-storage` trait surface and must not happen as a side effect of the write-queue migration.
+
+`WriteRequest` therefore carries a typed closure and a type-erased reply channel:
+
+```rust
+type WriteOp = Box<dyn FnOnce(&rusqlite::Connection) -> Box<dyn std::any::Any + Send> + Send>;
+
+struct WriteRequest {
+    /// Closure that executes DML statements against the WriterTask's connection.
+    /// The connection is already inside an outer BEGIN IMMEDIATE when this closure runs.
+    /// The closure must NOT issue BEGIN / COMMIT / ROLLBACK; it may issue named SAVEPOINTs.
+    op: WriteOp,
+    /// Type-erased sender. The closure boxes its result; the store method downcasts it.
+    reply: Box<dyn std::any::Any + Send>,
 }
 ```
 
-The `reply` sender delivers the result (rows affected or error) back to the originating async
-task. Callers `await` the oneshot receiver and propagate the result as if they had called
-`pool.writer()` directly.
+In practice, each store method constructs a concrete `WriteRequest<R>` where `R` is its natural
+return type:
+
+```rust
+struct WriteRequest<R: Send + 'static> {
+    op: Box<dyn FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send>,
+    reply: oneshot::Sender<Result<R, StorageError>>,
+}
+```
+
+The channel is `tokio::mpsc::Sender<Box<dyn AnyWriteRequest + Send>>` where `AnyWriteRequest` is
+a sealed trait whose only method is `execute_and_reply(&rusqlite::Connection)`. This lets the
+`WriterTask` loop drain a homogeneous channel while each request carries its own typed reply.
+
+The caller's side:
+
+```rust
+let (tx, rx) = oneshot::channel::<Result<BatchWriteSummary, StorageError>>();
+channel.send(Box::new(WriteRequest { op: closure, reply: tx })).await?;
+let summary = rx.await.map_err(|_| StorageError::Internal("writer task dropped".into()))??;
+```
+
+The `reply` sender delivers the result back to the originating async task with its full natural
+type. Callers `await` the oneshot receiver and propagate the result as if they had called the
+store method directly. No `BatchWriteSummary` fields are lost.
 
 **Channel capacity and queue-full policy**: The channel is bounded. When the channel is full,
 callers call `channel.send().await`, which applies backpressure: the caller suspends until
@@ -198,36 +245,52 @@ capacity is configurable via `PoolConfig` (recommended default: 256 pending oper
 **Complete write-path migration**: all 14 entries from the write-path inventory above are
 migrated to route through the writer task channel. Specifically:
 
+**Complete `BEGIN IMMEDIATE` site inventory** (verified by `rg -n "BEGIN IMMEDIATE"
+crates/khive-db/src/stores/ crates/khive-db/src/sql_bridge.rs`, excluding test files and
+comments). Each site is dispositioned MIGRATE or EXEMPT with rationale:
+
+| Site                | Function                                                               | Disposition                                                                                                                                                                                                                                                              |
+| ------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `entity.rs:325`     | `upsert_entities` (inside `with_writer` closure)                       | **MIGRATE** — remove bare `BEGIN IMMEDIATE`; closure body becomes DML-only under WriterTask SAVEPOINT                                                                                                                                                                    |
+| `note.rs:348`       | `upsert_notes` (inside `with_writer` closure)                          | **MIGRATE** — same pattern as entity                                                                                                                                                                                                                                     |
+| `graph.rs:390`      | `upsert_edges` (inside `with_writer` closure)                          | **MIGRATE** — same pattern; entry 3 migrates the helper too                                                                                                                                                                                                              |
+| `text.rs:330`       | `upsert_document` (inside `with_writer` closure)                       | **MIGRATE** — single-doc write; closure becomes DML-only                                                                                                                                                                                                                 |
+| `text.rs:395`       | `upsert_documents` (inside `with_writer` closure)                      | **MIGRATE** — batch write with per-doc inner SAVEPOINTs (partial-success); the inner SAVEPOINTs are preserved (SQLite allows nested named SAVEPOINTs); the outer `BEGIN IMMEDIATE` is removed and replaced by the WriterTask's outer transaction + per-request SAVEPOINT |
+| `text.rs:1139`      | `rename_namespace` (inside `with_writer` closure)                      | **EXEMPT** — annotated `#[allow(dead_code)]`, no production callers anywhere in the codebase; forward-deployed infrastructure. Exempt pending a production call site; revisit when wired in                                                                              |
+| `event.rs:652`      | `append_event` (inside `with_writer` closure)                          | **MIGRATE** — single-event write; closure becomes DML-only                                                                                                                                                                                                               |
+| `event.rs:667`      | `append_events` (inside `with_writer` closure)                         | **MIGRATE** — batch write returning `BatchWriteSummary`; same treatment as `upsert_documents` (partial-success via per-record loop, not inner SAVEPOINTs); outer `BEGIN IMMEDIATE` removed                                                                               |
+| `sparse.rs:249`     | `upsert_batch` (inside `with_writer` closure)                          | **MIGRATE** — partial-success loop; outer `BEGIN IMMEDIATE` removed                                                                                                                                                                                                      |
+| `vectors.rs:355`    | `insert_batch` (inside `with_writer` closure)                          | **MIGRATE** — has inner per-record SAVEPOINTs (`vec_batch_record`); the inner SAVEPOINTs are preserved; outer `BEGIN IMMEDIATE` removed                                                                                                                                  |
+| `sql_bridge.rs:322` | `SqliteWriter::execute_batch` (file-backed `SqlBridge::writer()` path) | **MIGRATE** — already Entry 10; `SqlBridge::writer()` and `execute_batch()` send through the channel; the `SqliteWriter` that wraps the standalone connection is retired                                                                                                 |
+| `sql_bridge.rs:699` | `PoolBackedWriter::execute_batch` (in-memory path)                     | **EXEMPT** — `PoolBackedWriter` is produced only when `!is_file_backed` (`sql_bridge.rs:798`); the production daemon always uses `is_file_backed = true` (`backend.rs:29,38`); in-memory path is for tests and is not reachable from the daemon accept loop              |
+| `sql_bridge.rs:834` | `SqlBridge::begin_tx()`                                                | **EXEMPT (deferred)** — entry 9; deferred to the follow-up ADR for issue #195; acknowledged gap in Consequences                                                                                                                                                          |
+
+A bare `BEGIN IMMEDIATE` inside the WriterTask's outer transaction violates SQLite's nested-BEGIN
+rule and will return `SQLITE_ERROR: cannot start a transaction within a transaction`. Each MIGRATE
+site must be rewritten so the closure body contains only DML statements and named SAVEPOINT
+operations managed by the WriterTask wrapper — never a bare `BEGIN IMMEDIATE`. The EXEMPT sites
+are unreachable from the concurrent write path this ADR targets and do not introduce the
+nested-BEGIN hazard.
+
+Migration steps for each Entry in the write-path inventory (§Write-path inventory):
+
 - Entries 1, 2, 6, 7 (`entity`, `note`, `sparse`, `vectors` stores): replace the `with_writer`
-  helper so it sends a `WriteRequest` and awaits the oneshot reply, instead of calling
-  `pool.try_writer()` inside `spawn_blocking`. **Additionally**, seven store methods issue their
-  own `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` calls inside the `with_writer` closure body,
-  independent of the helper entry point. These method-level transaction-control sites are:
-  `entity.rs:325`, `note.rs:348`, `graph.rs:390`, `text.rs:330`, `event.rs:652`, `sparse.rs:249`,
-  and `vectors.rs:355`. Migrating only the `with_writer` helper leaves these sites intact. A
-  `BEGIN IMMEDIATE` issued inside the WriterTask's outer transaction violates SQLite's nested-BEGIN
-  rule and breaks the SAVEPOINT-per-request design. The migration must therefore also rewrite
-  each of these seven sites so the store methods no longer manage their own transaction boundaries:
-  transaction ownership moves entirely to `WriterTask`, which wraps each drained request in a
-  per-request SAVEPOINT (see Component B). After rewriting, the store closure bodies contain only
-  DML statements and SAVEPOINT operations issued by the WriterTask wrapper — never a bare `BEGIN
-  IMMEDIATE`.
+  helper so it sends a typed `WriteRequest` and awaits the oneshot reply (see WriteRequest shape
+  below), instead of calling `pool.try_writer()` inside `spawn_blocking`. Remove the `BEGIN
+  IMMEDIATE` / `COMMIT` / `ROLLBACK` calls from each closure body.
 - Entries 3, 4, 5 (`graph`, `text`, `event` stores): replace the `with_writer` helper so it
-  sends a `WriteRequest` and awaits the reply, instead of calling `open_standalone_writer()`.
-  The `is_file_backed` branch that currently opens a standalone connection is removed; the writer
-  task owns the single writer connection regardless of whether the backend is file-backed or
-  in-memory. The method-level `BEGIN IMMEDIATE` sites in these stores (graph.rs:390, text.rs:330,
-  event.rs:652) are subject to the same rewrite requirement stated above.
-- Entries 8, 9, 10 (`SqlBridge::writer()`, `begin_tx()`, `execute_batch()`): `SqlBridge::writer()`
-  and `execute_batch()` are updated to send through the channel. `begin_tx()` is left with its
-  current standalone-connection behavior until the follow-up ADR for #195 specifies the
-  transaction ownership model; this is an acknowledged gap (see Consequences).
+  sends a typed `WriteRequest` and awaits the reply, instead of calling `open_standalone_writer()`.
+  The `is_file_backed` branch that currently opens a standalone connection is removed. Remove the
+  `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` calls from each closure body. Preserve inner
+  per-record SAVEPOINTs in `text.rs:395` and the per-event loop in `event.rs:667`.
+- Entries 8, 10 (`SqlBridge::writer()`, `SqliteWriter::execute_batch`): `SqlBridge::writer()` and
+  `execute_batch()` are updated to send through the channel; the `SqliteWriter` standalone path
+  is retired.
 - Entries 11, 12, 13 (`curation::merge_entity`, `curation::merge_note`, `operations::link`):
   replace direct `pool.writer()` calls with channel sends.
 - Entry 14 (startup/bootstrap writes in `backend.rs`): these run during sequential daemon startup
-  before the accept loop begins and before concurrent agents connect. They continue to use
-  `pool.try_writer()` directly; they do not route through the writer task channel because no
-  concurrent writes can occur during startup. See also the Minor note on row 14 in the inventory.
+  before the accept loop begins. They continue to use `pool.try_writer()` directly; no channel
+  routing required because no concurrent writes can occur during startup.
 
 After migration, `BEGIN IMMEDIATE` for daemon write traffic is owned solely by `WriterTask`,
 **excluding** `SqlBridge::begin_tx()` (deferred to the #195 follow-up ADR) and the
@@ -259,21 +322,52 @@ instead of paying it N times.
 and per-op failure does not abort siblings; each op produces an independent `ok`/`error` result.
 Cross-request batching inside the writer task must not break this contract.
 
-To preserve per-request isolation, the writer task uses per-request SAVEPOINTs within the
-batch transaction:
+To preserve per-request isolation, the writer task uses a three-level SAVEPOINT hierarchy within
+the batch transaction. SQLite allows nested named SAVEPOINTs, so all three levels are legal
+within one `BEGIN IMMEDIATE`:
 
 ```
-BEGIN IMMEDIATE
-  SAVEPOINT req_0; <statements for request A>; RELEASE SAVEPOINT req_0;
-  SAVEPOINT req_1; <statements for request B>; ROLLBACK TO SAVEPOINT req_1; RELEASE SAVEPOINT req_1;
-  ...
-COMMIT
+BEGIN IMMEDIATE                                        -- WriterTask outer transaction
+  SAVEPOINT req_0                                      -- Level 2: per-request isolation
+    <DML for request A, e.g. single upsert_entity>
+  RELEASE SAVEPOINT req_0                              -- success: promote to outer txn
+  SAVEPOINT req_1                                      -- Level 2: per-request isolation
+    SAVEPOINT inner_rec_0                              -- Level 3: per-record (batch methods)
+      <DML for record 0>
+    RELEASE SAVEPOINT inner_rec_0                      -- record 0 ok
+    SAVEPOINT inner_rec_1
+      <DML for record 1>
+    ROLLBACK TO SAVEPOINT inner_rec_1                  -- record 1 failed (partial success)
+    RELEASE SAVEPOINT inner_rec_1
+    <...>
+    -- reply carries BatchWriteSummary{attempted:2, affected:1, failed:1}
+  RELEASE SAVEPOINT req_1                              -- request-level success (partial ok)
+  SAVEPOINT req_2                                      -- Level 2: per-request isolation
+    <DML for request C>
+  ROLLBACK TO SAVEPOINT req_2                          -- hard StorageError; roll back request C
+  RELEASE SAVEPOINT req_2                              -- releases the savepoint marker
+COMMIT                                                 -- all surviving requests committed
 ```
 
-A failure in request B rolls back only request B's SAVEPOINT. The oneshot reply for request B
-carries a `StorageError` for that op. The oneshot reply for request A carries success. This
-matches the existing server.rs per-op independence guarantee. Callers observe no change in error
-semantics compared to the current standalone-per-op behavior.
+Level 2 (per-request SAVEPOINT): `WriterTask` wraps each drained `WriteRequest` in a named
+SAVEPOINT (e.g. `req_<n>`). On the closure returning `Ok(R)`, the WriterTask RELEASEs the
+SAVEPOINT, promoting that request's writes into the outer transaction. On a hard `Err(StorageError)`,
+the WriterTask issues `ROLLBACK TO SAVEPOINT req_<n>` then `RELEASE SAVEPOINT req_<n>`, leaving
+sibling requests untouched. The typed oneshot reply carries the full `Result<R, StorageError>`.
+
+Level 3 (per-record SAVEPOINT, inside batch closures): batch methods such as `upsert_documents`
+(`text.rs:395`) and `insert_batch` (`vectors.rs:355`) already manage inner named SAVEPOINTs
+(`fts_upsert_doc`, `vec_batch_record`) for per-record partial success. These inner SAVEPOINTs are
+preserved unchanged inside the closure body. The outer `BEGIN IMMEDIATE` those methods currently
+issue is removed; the Level 2 per-request SAVEPOINT from `WriterTask` replaces it as the
+isolation boundary. The `BatchWriteSummary` (with its `affected`/`failed`/`first_error` fields)
+is returned through the typed reply channel unmodified.
+
+A failure in request B's per-request SAVEPOINT rolls back only request B. The typed oneshot reply
+for request B carries `Err(StorageError)`. The typed reply for request A carries its full
+`Ok(BatchWriteSummary{...})`. This matches the existing server.rs per-op independence guarantee.
+Callers observe no change in error semantics or return type compared to current standalone-per-op
+behavior. No `BatchWriteSummary` fields are dropped.
 
 **Atomic single-operation mode**: if a caller requires that its operation commits atomically and
 is not co-batched with any other operation (for example, a migration step), it sets a
@@ -301,66 +395,90 @@ new artifact from this ADR that Component C needs.
 
 ### Component D: Transaction watchdog
 
-The writer task tracks the start time of any in-flight `BEGIN IMMEDIATE`. If the transaction is
-not committed or rolled back within a configurable timeout (`TXN_WATCHDOG_SECS`, default 30 s),
-the watchdog issues `ROLLBACK` and returns `StorageError::WatchdogTimeout` to all senders
-whose requests were in the timed-out batch.
+If a batch does not complete within a configurable timeout (`TXN_WATCHDOG_SECS`, default 30 s),
+the watchdog interrupts the in-flight SQL statement. The blocking closure — which still owns the
+connection — detects the interrupt signal, performs `ROLLBACK` locally, and returns an error. The
+writer task then sends `StorageError::WatchdogTimeout` to every oneshot sender whose requests
+were in the timed-out batch and opens a fresh connection before accepting the next batch. The
+watchdog does not roll back on a foreign connection; the closure always rolls back on the
+connection it owns.
 
-**Execution model**: the writer task is a Tokio async task that dispatches each batch to a
-`spawn_blocking` closure. The `rusqlite::Connection` is moved into that closure for the duration
-of the blocking call; the async task cannot touch the same connection while the blocking closure
-is running. Cancelling the `JoinHandle` does not cancel the running blocking closure. Therefore,
-the writer task cannot issue a `ROLLBACK` on a separate connection to roll back a transaction on
-a different connection — rolling back on a different connection rolls back nothing.
+**Why the watchdog deadline covers lock acquisition and execution together**: the `spawn_blocking`
+closure is dispatched before `BEGIN IMMEDIATE` is issued, so the watchdog timer necessarily
+covers both the `busy_timeout` lock-acquisition wait and the post-BEGIN execution time. The
+`busy_timeout` setting (`pool.rs:29`, 30 s) limits how long `BEGIN IMMEDIATE` will spin waiting
+for the WAL write lock; `TXN_WATCHDOG_SECS` limits the total wall time the blocking closure may
+run. After migration, `WriterTask` holds the single writer connection, so `busy_timeout` applies
+only to that one connection (and the checkpoint connection). Both settings remain configured; they
+are complementary, not redundant.
 
-The implementable watchdog uses `rusqlite`'s interrupt API. **Before** moving the connection
-into `spawn_blocking`, the writer task obtains an interrupt handle:
+**Execution model**: the writer task is a Tokio async task. The `rusqlite::Connection` is moved
+into each `spawn_blocking` closure; the async task cannot touch the same connection while the
+closure runs. Cancelling the `JoinHandle` does not cancel the running closure. To interrupt a
+slow batch, the writer task uses `rusqlite`'s interrupt API.
+
+**Before** moving the connection into `spawn_blocking`, the writer task obtains an interrupt
+handle. On timeout, it calls `interrupt()` and then awaits the handle to observe the
+closure's rolled-back result:
 
 ```rust
+// Obtain interrupt handle BEFORE moving conn into the closure.
 let interrupt_handle = conn.get_interrupt_handle(); // InterruptHandle: Send + Sync
-let handle = tokio::task::spawn_blocking(move || {
-    // conn is moved in here; the async task no longer holds it
+
+// Spawn the blocking batch. conn is moved in; async task no longer holds it.
+let mut handle = tokio::task::spawn_blocking(move || {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    // ... execute batch statements ...
+    // ... execute per-request SAVEPOINTs and DML ...
     conn.execute_batch("COMMIT")?;
-    Ok(conn) // return the connection on success
+    Ok(conn) // return conn on success so it can be reused
 });
-let result = tokio::time::timeout(
-    Duration::from_secs(TXN_WATCHDOG_SECS),
-    handle,
-).await;
-if result.is_err() {
-    // Timeout elapsed — interrupt the in-flight SQL statement inside the closure.
-    interrupt_handle.interrupt();
-    // The closure's next SQLite call returns SQLITE_INTERRUPT
-    // (rusqlite::Error::SqliteFailure with code Interrupt).
-    // The closure — which still owns the connection — performs ROLLBACK locally
-    // and returns the error. Await the (now-completing) JoinHandle to observe the result.
-    ...
+
+// Borrow the handle so it is not consumed by timeout; we need it for the interrupt path.
+match tokio::time::timeout(Duration::from_secs(TXN_WATCHDOG_SECS), &mut handle).await {
+    Ok(join_result) => {
+        // Batch completed within deadline. join_result is Result<Result<conn, rusqlite::Error>, JoinError>.
+        match join_result {
+            Ok(Ok(conn)) => { /* reuse conn for next batch */ }
+            Ok(Err(e))   => { /* SQL error — mark conn poisoned, open fresh */ }
+            Err(_panic)  => { /* spawn_blocking panicked — open fresh conn */ }
+        }
+    }
+    Err(_elapsed) => {
+        // Deadline expired. Signal the in-flight SQL statement to abort.
+        // interrupt() is safe to call from any thread; it sets a flag SQLite checks
+        // between opcodes, causing the next statement to return SQLITE_INTERRUPT.
+        interrupt_handle.interrupt();
+
+        // The closure still owns conn. When it observes SQLITE_INTERRUPT
+        // (rusqlite::Error::SqliteFailure with code ErrorCode::OperationInterrupted),
+        // it executes conn.execute_batch("ROLLBACK") locally and returns Err(...).
+        // Await the now-completing handle (bounded by cleanup time, not a new timeout).
+        let _ = handle.await; // result carries the post-interrupt rollback outcome
+
+        // Send WatchdogTimeout to all senders in this batch, then open a fresh connection.
+        for sender in batch_senders {
+            let _ = sender.send(Err(StorageError::WatchdogTimeout));
+        }
+        conn = open_fresh_writer_connection();
+    }
 }
 ```
 
-Key properties of this mechanism:
+Key properties:
 
-- The watchdog **interrupts** the in-flight SQL statement via `InterruptHandle::interrupt()`.
-  It does **not** roll back on a foreign connection.
-- The blocking closure still owns the connection when the interrupt fires. The closure is
-  responsible for detecting `SqliteFailure { code: ErrorCode::OperationInterrupted }` and
-  executing `ROLLBACK` before returning.
-- `busy_timeout` (30 s, `pool.rs:29`) governs the per-connection SQLite lock-acquisition wait
-  on `BEGIN IMMEDIATE`. The watchdog governs total transaction duration after `BEGIN IMMEDIATE`
-  has been acquired. They address different phases and are not interchangeable. Both remain
-  configured after migration.
-- `InterruptHandle` is `Send + Sync` and safe to hold in the async task while the blocking
-  closure runs. It is obtained via `Connection::get_interrupt_handle()` (rusqlite 0.33 stable
-  API).
+- `interrupt_handle.interrupt()` signals the in-flight statement; it does **not** roll back on a
+  foreign connection.
+- The blocking closure detects `SqliteFailure { code: ErrorCode::OperationInterrupted }` and
+  issues `conn.execute_batch("ROLLBACK")` locally before returning.
+- `InterruptHandle` is `Send + Sync` and safe to hold in the async task concurrent with the
+  blocking closure. Obtained via `Connection::get_interrupt_handle()` (rusqlite 0.33 stable API).
+- The `&mut handle` borrow in `timeout(..., &mut handle)` does not consume the `JoinHandle`, so
+  the elapsed branch can still `.await` it to observe the post-interrupt result.
 
-**ROLLBACK failure handling**: if the `ROLLBACK` inside the closure itself fails (for example,
-if the connection is in an unrecoverable state after interrupt), the closure returns an error.
-The writer task observes this via the now-completing `JoinHandle`, marks the connection
-poisoned, and opens a fresh connection before accepting the next batch. It does not retry the
-original batch. `StorageError::WatchdogTimeout` is sent to every oneshot sender whose requests
-were in the timed-out batch.
+**ROLLBACK failure handling**: if the `ROLLBACK` inside the closure itself fails (the connection
+is unrecoverable after interrupt), the closure returns an error. The writer task observes this via
+the awaited `JoinHandle`, marks the connection poisoned, and opens a fresh connection. It does not
+retry the original batch.
 
 ### Component E: Transport layer (unchanged)
 
