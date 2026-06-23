@@ -21,11 +21,10 @@ belonging to the same tenant share one process and one pool. This ADR solves
 
 ### The WAL-starvation wedge
 
-Under N concurrent agents sharing one daemon process, all writes serialize on a single
-`parking_lot::Mutex<Connection>` held for the full SQLite transaction duration. The chain of
-evidence is as follows.
+Under N concurrent agents sharing one daemon process, writes contend on SQLite's WAL write lock
+through multiple independent code paths. The chain of evidence is as follows.
 
-**Single writer Mutex** (`crates/khive-db/src/pool.rs:60`):
+**Single writer Mutex in the pool** (`crates/khive-db/src/pool.rs:60`):
 
 ```rust
 pub struct ConnectionPool {
@@ -48,7 +47,7 @@ pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
 }
 ```
 
-**BEGIN IMMEDIATE held for the full transaction** (`pool.rs:136`):
+**BEGIN IMMEDIATE held for the full transaction** (`pool.rs:132`):
 
 ```rust
 pub fn transaction<F, R>(&self, f: F) -> Result<R, SqliteError> {
@@ -60,27 +59,41 @@ pub fn transaction<F, R>(&self, f: F) -> Result<R, SqliteError> {
 }
 ```
 
-Every store (`entity.rs:68`, `note.rs:69`, `graph.rs:111`) uses the same `with_writer` pattern:
+#### Write-path inventory
 
-```rust
-async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError> {
-    let pool = Arc::clone(&self.pool);
-    tokio::task::spawn_blocking(move || {
-        let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-        f(guard.conn()).map_err(|e| map_err(e, op))
-    }).await ...
-}
-```
+The pool Mutex is not the only write serialization point. The table below lists every distinct
+write entry point in the current codebase (production / file-backed mode, which is what
+`StorageBackend::sqlite` produces — `backend.rs:29,38` sets `is_file_backed: true`).
 
-Each `spawn_blocking` call submits a task to the Tokio blocking thread pool. Multiple such tasks
-compete for the same Mutex. The first winner calls `BEGIN IMMEDIATE`, which acquires the WAL
-write lock, and holds the Rust Mutex for the entire duration of the SQLite transaction, including
-any I/O within the handler closure.
+| #  | Entry point                                                                                                                                    | File                                                 | file-backed path                                                                 |
+| -- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1  | `SqlEntityStore::with_writer`                                                                                                                  | `stores/entity.rs:68-80`                             | pool Mutex (`pool.try_writer()`)                                                 |
+| 2  | `SqlNoteStore::with_writer`                                                                                                                    | `stores/note.rs:69-81`                               | pool Mutex (`pool.try_writer()`)                                                 |
+| 3  | `SqlGraphStore::with_writer`                                                                                                                   | `stores/graph.rs:111-130`                            | **standalone connection** (`open_standalone_writer`)                             |
+| 4  | `SqlFtsStore::with_writer`                                                                                                                     | `stores/text.rs:130-149`                             | **standalone connection** (`open_standalone_writer`)                             |
+| 5  | `SqlEventStore::with_writer`                                                                                                                   | `stores/event.rs:104-123`                            | **standalone connection** (`open_standalone_writer`)                             |
+| 6  | `SqliteSparseStore::with_writer`                                                                                                               | `stores/sparse.rs:133-145`                           | pool Mutex (`pool.try_writer()`) — no file-backed branch                         |
+| 7  | `SqliteVecStore::with_writer`                                                                                                                  | `stores/vectors.rs:217-229`                          | pool Mutex (`pool.try_writer()`) — no file-backed branch                         |
+| 8  | `SqlBridge::writer()`                                                                                                                          | `sql_bridge.rs:791-801`                              | **standalone connection** (`open_standalone_writer`)                             |
+| 9  | `SqlBridge::begin_tx()`                                                                                                                        | `sql_bridge.rs:804-853`                              | **standalone connection** + `BEGIN IMMEDIATE`                                    |
+| 10 | `SqlBridge::execute_batch()`                                                                                                                   | `sql_bridge.rs:312-338`                              | runs on the connection owned by `SqliteWriter`, which is a standalone connection |
+| 11 | `curation::merge_entity`                                                                                                                       | `curation.rs:316-326`                                | pool Mutex (`pool.writer()`) directly                                            |
+| 12 | `curation::merge_note`                                                                                                                         | `curation.rs:638-645`                                | pool Mutex (`pool.writer()`) directly                                            |
+| 13 | `operations::link`                                                                                                                             | `operations.rs:3061-3073`                            | pool Mutex (`pool.writer()`) directly                                            |
+| 14 | `StorageBackend DDL helpers` (`apply_schema`, `apply_pack_ddl`, `entity_store`, `graph_store`, `note_store`, `event_store`, `vec_store`, etc.) | `backend.rs:108,132,158,185,214,241,302,399,464,534` | pool Mutex (`pool.try_writer()`) directly                                        |
 
-**Contention cascade under load**: while Agent A holds the Mutex, Agents B through N each call
-`pool.try_writer()` and block in `try_lock_for(5s)`. If Agent A's operation spans an embedding
-call, a large FTS rebuild, or a complex merge, B through N time out with the 5-second error
-before acquiring the lock.
+Entries 3, 4, 5, 8, 9, and 10 open a **new standalone connection per operation** in
+file-backed mode, each configured with `busy_timeout` (`sql_bridge.rs:141`,
+`stores/graph.rs:76`, `stores/text.rs:120`, `stores/event.rs:94`). These standalone
+connections compete for the SQLite WAL write lock through `busy_timeout` waits rather than the
+Rust Mutex, but they produce the same contention outcome: concurrent writers stall waiting for
+the lock, and WAL growth exacerbates the wait.
+
+**Contention cascade under load**: two write-contention paths operate concurrently. Entries 1,
+2, 6, 7, 11, 12, 13, and 14 block in `pool.try_lock_for(5s)`. Entries 3, 4, 5, 8, 9, and 10
+open standalone connections and call `BEGIN IMMEDIATE` directly, blocking in `busy_timeout`
+(30 seconds, `pool.rs:29`). Under sustained load from N agents, both paths degrade
+simultaneously.
 
 **WAL growth amplifier** (`pool.rs:15-16`):
 
@@ -91,10 +104,9 @@ const JOURNAL_SIZE_LIMIT_BYTES: &str = "67108864"; // 64 MB journal limit
 
 WAL autocheckpoint requires no active readers. Under concurrent ANN recall, standalone read
 connections (`sql_bridge.rs:101`) hold WAL read snapshots. Checkpoint is deferred. WAL grows
-past 4000 pages. SQLite begins returning `SQLITE_BUSY` to new `BEGIN IMMEDIATE` attempts
-(the per-connection `busy_timeout` is 30 seconds — `pool.rs:29`), feeding additional latency
-back into the write queue. The system appears wedged: writes queue behind busy-timeout cycles
-while long-running reads pin the WAL.
+past 4000 pages. SQLite begins returning `SQLITE_BUSY` to new `BEGIN IMMEDIATE` attempts,
+feeding additional latency back into the write queue. The system appears wedged: writes queue
+behind busy-timeout cycles while long-running reads pin the WAL.
 
 **Degraded mode amplifier** (`pool.rs:211`): when `max_readers == 0` (in-memory or WAL
 unavailable), `pool.reader()` acquires the writer Mutex, creating a deadlock risk if any caller
@@ -103,21 +115,22 @@ holds a `WriterGuard` on the same pool.
 **Daemon accept loop** (`crates/khive-runtime/src/daemon.rs:466`): the daemon accepts N
 connections concurrently via `tokio::spawn` per connection. Each spawned task calls `dispatch()`
 on the shared `KhiveRuntime`, which owns one `Arc<StorageBackend>` and one `ConnectionPool`.
-All N tasks funnel through the single writer Mutex without any application-level queuing.
+All N tasks funnel writes through the paths in the inventory above without any application-level
+queuing.
 
-**Root cause (one sentence)**: under N concurrent agents, all writes serialize on a single
-`parking_lot::Mutex` (`pool.rs:60`) held for the full SQLite transaction duration; long-running
-reads pin WAL readers, starving autocheckpoint, causing WAL growth that feeds `SQLITE_BUSY`
-back into the write queue and can wedge the daemon.
+**Root cause (one sentence)**: under N concurrent agents, writes reach SQLite's WAL write lock
+through multiple independent paths — some blocked on the pool Mutex, others issuing `BEGIN
+IMMEDIATE` on standalone connections — while long-running reads pin WAL readers, starving
+autocheckpoint, causing WAL growth that lengthens `busy_timeout` waits and can wedge the daemon.
 
 ### Issue #195 — cross-op atomicity for `--ops-file` bulk apply
 
 `kkernel exec --ops-file` dispatches ops in chunks of 100 via `dispatch_request_local`
 (`crates/kkernel/src/exec.rs:214`). The daemon fast-path is intentionally bypassed for bulk
 apply (`exec.rs:408`). Each op within a chunk dispatches through its own verb handler, and each
-handler acquires `pool.writer()` and issues a separate `BEGIN IMMEDIATE` / `COMMIT`. There is
-no rollback across ops within a chunk, and no rollback across chunks. A failure in op 47
-of a 100-op chunk leaves ops 1 through 46 committed.
+handler acquires a write path independently and issues a separate `BEGIN IMMEDIATE` / `COMMIT`.
+There is no rollback across ops within a chunk, and no rollback across chunks. A failure in op
+47 of a 100-op chunk leaves ops 1 through 46 committed.
 
 The `SqlAccess` trait (`ADR-005`) exposes a `begin_tx(options: SqlTxOptions)` method
 (`sql_bridge.rs:804`) that opens a standalone connection, issues `BEGIN IMMEDIATE`, and returns
@@ -129,11 +142,12 @@ requires a non-trivial API change and is scoped below.
 
 ## Decision
 
-Replace the implicit per-operation `pool.writer()` Mutex contention model with a single
-write-owner task inside the daemon. All write operations route their mutations through a bounded
-async channel to this task. The task is the sole holder of the writer connection and is
-responsible for batching, commit, rollback, and watchdog enforcement. Reads remain concurrent
-and do not route through the write-owner task.
+Replace all write-path contention with a single write-owner task inside the daemon. All write
+operations — including those currently using standalone connections (graph, text, event, SqlBridge)
+and those using the pool Mutex (entity, note, sparse, vectors, curation, operations, DDL helpers)
+— route their mutations through a bounded async channel to this task. The task is the sole caller
+of `BEGIN IMMEDIATE` and holds the single writer connection for the life of the daemon. Reads
+remain concurrent and do not route through the write-owner task.
 
 The transport layer (ADR-049 Unix socket framing, `forward_or_spawn`, `DaemonRequestFrame`) is
 unchanged. The redesign is internal to the daemon process and is transparent to all callers.
@@ -162,16 +176,48 @@ The `reply` sender delivers the result (rows affected or error) back to the orig
 task. Callers `await` the oneshot receiver and propagate the result as if they had called
 `pool.writer()` directly.
 
-**Channel capacity**: The channel is bounded. Callers block on `channel.send()` when the queue
-is full, providing natural backpressure on write throughput. The default capacity is
-configurable via `PoolConfig` (recommended default: 256 pending operations). A full channel
-returns a `StorageError` with an explicit message; it does not silently discard work.
+**Channel capacity and queue-full policy**: The channel is bounded. When the channel is full,
+callers call `channel.send().await`, which applies backpressure: the caller suspends until
+capacity is available. There is no immediate-error path on a full channel (no `try_send`);
+callers that need a deadline should wrap the `send().await` in a `tokio::time::timeout`.
+A timeout at that boundary returns `StorageError::WriteQueueFull { timeout_ms }`. The default
+capacity is configurable via `PoolConfig` (recommended default: 256 pending operations).
 
-**Store changes**: The `with_writer` helper in `entity.rs`, `note.rs`, `graph.rs`, `text.rs`,
-and `vectors.rs` is updated to send a `WriteRequest` to the channel and await the reply,
-replacing `pool.try_writer()` and `spawn_blocking`. The `SqlBridge` implementations in
-`sql_bridge.rs` that call `pool.writer().execute_batch("BEGIN IMMEDIATE")` are similarly
-updated.
+**Failure mode table**:
+
+| Condition                                      | Behavior                                                                                    |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Channel full                                   | Caller blocks on `channel.send().await` (backpressure)                                      |
+| Send timeout (caller wraps in `time::timeout`) | `StorageError::WriteQueueFull` returned to caller                                           |
+| Writer task panic                              | Receiver drops; subsequent `send()` returns `SendError`; mapped to `StorageError::Internal` |
+| Receiver drop (writer task stopped)            | Same as panic: `send()` returns `SendError`                                                 |
+| `oneshot::Sender` drop before reply            | Caller's `recv()` returns `RecvError`; mapped to `StorageError::Internal`                   |
+| Shutdown                                       | Writer task drains in-flight requests, replies to each, then exits                          |
+| Ordering                                       | FIFO within a batch window; cross-batch order is not guaranteed                             |
+
+**Complete write-path migration**: all 14 entries from the write-path inventory above are
+migrated to route through the writer task channel. Specifically:
+
+- Entries 1, 2, 6, 7 (`entity`, `note`, `sparse`, `vectors` stores): replace the `with_writer`
+  helper so it sends a `WriteRequest` and awaits the oneshot reply, instead of calling
+  `pool.try_writer()` inside `spawn_blocking`.
+- Entries 3, 4, 5 (`graph`, `text`, `event` stores): replace the `with_writer` helper so it
+  sends a `WriteRequest` and awaits the reply, instead of calling `open_standalone_writer()`.
+  The `is_file_backed` branch that currently opens a standalone connection is removed; the writer
+  task owns the single writer connection regardless of whether the backend is file-backed or
+  in-memory.
+- Entries 8, 9, 10 (`SqlBridge::writer()`, `begin_tx()`, `execute_batch()`): `SqlBridge::writer()`
+  and `execute_batch()` are updated to send through the channel. `begin_tx()` is left with its
+  current standalone-connection behavior until the follow-up ADR for #195 specifies the
+  transaction ownership model; this is an acknowledged gap (see Consequences).
+- Entries 11, 12, 13 (`curation::merge_entity`, `curation::merge_note`, `operations::link`):
+  replace direct `pool.writer()` calls with channel sends.
+- Entry 14 (DDL helpers in `backend.rs`): DDL is applied during daemon startup before the
+  accept loop begins and before concurrent agents connect. DDL helpers continue to use
+  `pool.try_writer()` directly during the startup phase; they do not need to route through the
+  writer task channel because no concurrent writes can occur during startup.
+
+After migration, `BEGIN IMMEDIATE` is called in exactly one location: inside `WriterTask`.
 
 **Reads are unaffected**: `with_reader` paths and standalone reader connections
 (`open_standalone_reader` in `sql_bridge.rs:101`) are not routed through the writer task.
@@ -192,13 +238,26 @@ instead of paying it N times.
 | `batch_window_ms` | 5 ms    | Maximum time to collect before committing  |
 | `batch_max_ops`   | 64      | Maximum number of write requests per batch |
 
-**Cross-request batching isolation**: when the writer task collects operations from multiple
-agents into a single transaction, a failure in one operation causes `ROLLBACK` for the entire
-batch. Each originating sender whose operation was in the failed batch receives a
-`StorageError::TransactionRolledBack` response with a retry signal. Callers at the verb handler
-level may retry the operation; the handler is responsible for treating a retry error as a
-retriable failure rather than a permanent error. The ADR mandates that retry errors are surfaced
-distinctly from permanent errors in the `StorageError` enum.
+**Cross-request batching isolation**: the current `request` tool contract — established in
+`crates/khive-mcp/src/server.rs:566-568` — is that Single and Parallel ops run concurrently
+and per-op failure does not abort siblings; each op produces an independent `ok`/`error` result.
+Cross-request batching inside the writer task must not break this contract.
+
+To preserve per-request isolation, the writer task uses per-request SAVEPOINTs within the
+batch transaction:
+
+```
+BEGIN IMMEDIATE
+  SAVEPOINT req_0; <statements for request A>; RELEASE SAVEPOINT req_0;
+  SAVEPOINT req_1; <statements for request B>; ROLLBACK TO SAVEPOINT req_1; RELEASE SAVEPOINT req_1;
+  ...
+COMMIT
+```
+
+A failure in request B rolls back only request B's SAVEPOINT. The oneshot reply for request B
+carries a `StorageError` for that op. The oneshot reply for request A carries success. This
+matches the existing server.rs per-op independence guarantee. Callers observe no change in error
+semantics compared to the current standalone-per-op behavior.
 
 **Atomic single-operation mode**: if a caller requires that its operation commits atomically and
 is not co-batched with any other operation (for example, a migration step), it sets a
@@ -207,38 +266,53 @@ processing a solo request and commits it in isolation.
 
 ### Component C: WAL checkpoint discipline
 
-A periodic checkpoint task runs concurrently with the writer task. It issues
-`PRAGMA wal_checkpoint(PASSIVE)` on a timer when no transaction is active, and escalates to
-`PRAGMA wal_checkpoint(TRUNCATE)` when the WAL page count exceeds a threshold. The checkpoint
-task is started in `run_daemon` after the listener is bound and before the accept loop begins.
+**What has shipped (Slice 1 / PR #221)**: `CheckpointConfig` (interval, warn threshold,
+high-water threshold, all from-env) and `run_checkpoint_task` (a periodic loop spawned in the
+daemon) were implemented as a self-contained, ADR-independent change. That work is complete and
+merged. It is not conditional on this ADR.
 
-**Checkpoint parameters** (configurable via `PoolConfig`, overridable by environment variables):
+**What this ADR adds (Slice 2)**: the writer task coordinates with the checkpoint task by
+exposing a write-activity signal (for example, a shared `AtomicBool` or a tokio watch channel)
+so the checkpoint task can observe its idle window accurately. The checkpoint task parameters
+and table of env overrides are already defined by PR #221 and are not redefined here.
 
-| Constant                     | Default | Env override                       | Meaning                              |
-| ---------------------------- | ------- | ---------------------------------- | ------------------------------------ |
-| `CHECKPOINT_INTERVAL_MS`     | 500 ms  | `KHIVE_CHECKPOINT_INTERVAL_MS`     | Passive checkpoint cadence           |
-| `WAL_WARN_PAGES`             | 2000    | `KHIVE_WAL_WARN_PAGES`             | Log warning threshold                |
-| `WAL_FORCE_CHECKPOINT_PAGES` | 6000    | `KHIVE_WAL_FORCE_CHECKPOINT_PAGES` | Force truncate threshold             |
-| `CHECKPOINT_IDLE_WINDOW_MS`  | 50 ms   | `KHIVE_CHECKPOINT_IDLE_MS`         | Quiet-period guard before checkpoint |
-
-The checkpoint task holds a shared reference to the pool and uses a dedicated checkpoint
-connection (not the writer connection) so it does not contend with the writer task.
-
-This component is also being partially implemented as Slice 1 (WAL config exposure), which
-extracts the hardcoded constants in `pool.rs:15-16` into `PoolConfig` and adds environment
-variable overrides. Slice 1 does not add the periodic task and does not require this ADR to
-be accepted. Slice 2 (this ADR) adds the periodic checkpoint task as a component of the
-write-queue redesign.
+The checkpoint task uses a dedicated checkpoint connection (not the writer connection) so it
+does not contend with the writer task. The coordination signal from Component A is the only
+new artifact from this ADR that Component C needs.
 
 ### Component D: Transaction watchdog
 
 The writer task tracks the start time of any in-flight `BEGIN IMMEDIATE`. If the transaction is
 not committed or rolled back within a configurable timeout (`TXN_WATCHDOG_SECS`, default 30 s),
-the watchdog issues `ROLLBACK` and returns a `StorageError::WatchdogTimeout` to all senders
-whose requests were in the timed-out batch. This replaces the implicit `busy_timeout = 30s` at
-the SQLite connection level, which today fires when `BEGIN IMMEDIATE` fails to acquire the WAL
-write lock. The watchdog fires at the application level when the transaction itself takes too
-long, giving cleaner error attribution.
+the watchdog issues `ROLLBACK` and returns `StorageError::WatchdogTimeout` to all senders
+whose requests were in the timed-out batch.
+
+**Execution model**: the writer task is a Tokio async task that owns a `JoinHandle` for each
+`spawn_blocking` call it issues to run the blocking SQLite statement. The watchdog wraps the
+`JoinHandle` in a `tokio::time::timeout`:
+
+```rust
+let result = tokio::time::timeout(
+    Duration::from_secs(TXN_WATCHDOG_SECS),
+    spawn_blocking_handle,
+).await;
+```
+
+If the timeout fires before the blocking call returns, the writer task issues
+`conn.execute_batch("ROLLBACK")` on a separate blocking call and sends
+`StorageError::WatchdogTimeout` to every oneshot sender in the timed-out batch. The connection
+is then considered poisoned and the writer task opens a fresh connection before accepting the
+next batch.
+
+**Relationship to `busy_timeout`**: `busy_timeout` (30 s, `pool.rs:29`) governs the per-connection
+SQLite lock-acquisition wait on `BEGIN IMMEDIATE`. The watchdog governs the total transaction
+duration after `BEGIN IMMEDIATE` has been acquired. Both remain configured; they address different
+phases. After migration, `busy_timeout` applies only to the writer task's single connection
+(and to the checkpoint connection), not to a pool of competing writers.
+
+**ROLLBACK failure handling**: if `ROLLBACK` itself times out or returns an error (for example,
+because the connection is in an unrecoverable state), the writer task logs the error, closes the
+connection, and opens a fresh connection. It does not retry the original batch.
 
 ### Component E: Transport layer (unchanged)
 
@@ -268,9 +342,8 @@ rather than a section of this ADR, for the following reasons:
 
 The follow-up ADR for #195 must specify: the `begin_tx()` call site in the bulk-apply path;
 how the `SqlTransaction` is threaded through `dispatch_request_local`; the commit and rollback
-points; and the error response shape for a partial-failure rollback. It may depend on
-Component A's `WriteRequest` infrastructure if the writer task is the natural owner of the
-transaction context.
+points; and the error response shape for a partial-failure rollback. It must depend on
+Component A's `WriterTask` being the stable owner of write connections.
 
 ---
 
@@ -282,10 +355,10 @@ Expose `WAL_AUTOCHECKPOINT_PAGES`, `JOURNAL_SIZE_LIMIT_BYTES`, and `busy_timeout
 configurable parameters and add the periodic passive checkpoint task. This reduces wedge
 probability under moderate load by keeping the WAL shorter and checkpointing more aggressively.
 
-Rejected as the sole mitigation because it does not eliminate the root cause: the Mutex is still
-held for the full transaction duration, and under sustained concurrent load the 5-second checkout
-timeout will still fire. Slice 1 is implemented as a prerequisite de-risk measure; it is not a
-substitute for the structural redesign.
+Rejected as the sole mitigation because it does not eliminate the root cause: standalone
+connections (graph, text, event, SqlBridge) still compete via `busy_timeout` waits, and pool
+Mutex holders still contend under load. Slice 1 is implemented as a prerequisite de-risk
+measure (PR #221); it is not a substitute for the structural redesign.
 
 ### Alternative 2: Multiple writer connections (connection-per-request pool)
 
@@ -329,31 +402,34 @@ unnecessary.
 
 ### Positive
 
-- Eliminates the Mutex contention wedge: the write path no longer times out under N concurrent
-  agents because there is no per-request Mutex acquisition with a fixed timeout.
+- Eliminates both contention paths: pool Mutex contention (entries 1, 2, 6, 7, 11, 12, 13, 14)
+  and standalone-connection `BEGIN IMMEDIATE` contention (entries 3, 4, 5, 8, 9, 10). After
+  migration, `BEGIN IMMEDIATE` is called in exactly one place.
 - Batched commits amortize WAL write-lock acquisition, improving write throughput under load.
+- Per-request SAVEPOINTs preserve the existing server.rs per-op independence contract: a failure
+  in one request does not roll back unrelated concurrent requests.
 - The transaction watchdog provides clean application-level attribution for slow writes instead
   of opaque SQLite `SQLITE_BUSY` errors.
 - Backpressure is explicit and measurable (bounded channel depth) instead of implicit (Mutex
   contention visible only as timeouts).
-- Coupling at the pool boundary drops from approximately 0.85 (every store tightly coupled to
-  the single writer Mutex) to approximately 0.3 (every store holds a channel send endpoint and
-  awaits a oneshot reply).
 - Reads remain fully concurrent and are unaffected by writer task load.
 
 ### Negative
 
-- Cross-request batching introduces a new failure mode: a slow operation in one batch can cause
-  a `ROLLBACK` that affects unrelated operations from other agents. The retry signal
-  (`StorageError::TransactionRolledBack`) must be handled at the verb handler level.
-- The `with_writer` helper in five store files must be updated. This is a bounded and mechanical
-  change, but it is a large diff.
-- The `begin_tx()` seam (`sql_bridge.rs:804`) currently opens a standalone connection outside
-  the write-queue. After this ADR, the relationship between `begin_tx()` and the writer task
-  must be clarified in the follow-up ADR for #195. Until that ADR lands, `begin_tx()` retains
-  its current standalone-connection behavior.
-- Backpressure is visible to callers as a blocking `channel.send()` rather than an immediate
-  error. This is intentional, but callers must not hold other resources while blocked.
+- All write-path entry points in the store layer must be migrated. This includes not only the
+  five `with_writer` helpers cited in the original design (`entity`, `note`, `graph`, `text`,
+  `vectors`) but also `event` and `sparse` stores, `SqlBridge::writer()`, `SqlBridge::execute_batch()`,
+  `curation::merge_entity`, `curation::merge_note`, and `operations::link`. The migration is
+  bounded and mechanical but is a large diff across many files.
+- `SqlBridge::begin_tx()` (`sql_bridge.rs:804`) is not migrated by this ADR. It continues to
+  open a standalone connection. This means the writer task does not yet own the transaction
+  context for the `begin_tx` path, and write contention from that path is not eliminated until
+  the follow-up ADR for #195 lands.
+- The `acquire_write_lock` pattern used by DDL helpers during daemon startup continues to use
+  `pool.try_writer()` directly. This is safe because startup is sequential (no concurrent agents),
+  but the asymmetry must be documented for implementers.
+- Backpressure is visible to callers as a blocking `channel.send().await` rather than an
+  immediate error. Callers must not hold other resources while suspended.
 
 ### Neutral
 
@@ -368,27 +444,31 @@ unnecessary.
 
 The recommended landing sequence is:
 
-**Slice 1 (in progress, no ADR required)**: Extract `WAL_AUTOCHECKPOINT_PAGES`,
-`JOURNAL_SIZE_LIMIT_BYTES`, and `busy_timeout` from `pool.rs` constants into `PoolConfig`
-fields with environment variable overrides. Add a passive checkpoint periodic task in
-`run_daemon`. This is a standalone de-risk measure that reduces wedge probability immediately.
-Estimated effort: 2 days. Does not require this ADR to be accepted.
+**Slice 1 (complete, PR #221)**: `CheckpointConfig` with interval, warn threshold, and
+high-water threshold, all overridable by environment variables. `run_checkpoint_task` spawned
+in the daemon. This is a standalone de-risk measure that reduces wedge probability immediately
+and does not require this ADR. Already merged.
 
 **Slice 2 (this ADR): Write-owner task and write queue**. After ADR-067 is accepted:
 
 1. Implement `WriterTask` in `crates/khive-db/src/writer_task.rs`.
-2. Add `WriteRequest` message type and `WriteChannel` wrapper to `pool.rs` or a new module.
-3. Replace `with_writer` in `entity.rs`, `note.rs`, `graph.rs`, `text.rs`, and `vectors.rs`.
-4. Update `SqlBridge::execute_batch` and related pool writer paths in `sql_bridge.rs`.
-5. Start `WriterTask` in `run_daemon` alongside the checkpoint task.
-6. Gate behind `KHIVE_WRITE_QUEUE=1` environment variable for initial rollout; remove the gate
+2. Add `WriteRequest` message type, `WriteChannel` wrapper, and SAVEPOINT-per-request logic.
+3. Migrate `with_writer` in `entity.rs`, `note.rs`, `graph.rs`, `text.rs`, `event.rs`,
+   `sparse.rs`, and `vectors.rs` — all seven stores.
+4. Update `SqlBridge::writer()` and `SqlBridge::execute_batch()` in `sql_bridge.rs`.
+5. Update `curation::merge_entity`, `curation::merge_note`, and `operations::link` to send
+   through the channel.
+6. Leave `SqlBridge::begin_tx()` and the DDL helpers (`backend.rs`) as-is (see Consequences).
+7. Start `WriterTask` in `run_daemon` and wire the write-activity signal to the checkpoint task.
+8. Gate behind `KHIVE_WRITE_QUEUE=1` environment variable for initial rollout; remove the gate
    after integration tests confirm correctness under concurrent load.
-7. Add the transaction watchdog inside `WriterTask`.
+9. Add the transaction watchdog inside `WriterTask`.
    Estimated effort: 2 to 3 weeks including integration test coverage.
 
 **Slice 3 (follow-up ADR): #195 cross-op atomicity**. After Slice 2 is stable: draft the
-follow-up ADR for threading `SqlTransaction` context through `dispatch_request_local`. Depends
-on Slice 2's `WriterTask` being the stable owner of write connections.
+follow-up ADR for threading `SqlTransaction` context through `dispatch_request_local` and
+migrating `begin_tx()` to route through the writer task. Depends on Slice 2's `WriterTask`
+being the stable owner of write connections.
 Estimated effort: 1 to 2 weeks once Slice 2 is stable.
 
 **Slice 4 (deferred, separate ADR): Postgres backend**. Decoupled from Slices 1 through 3 and
@@ -410,6 +490,9 @@ The following are explicitly excluded from this ADR:
   concern and is not routed through the general write-queue unless the follow-up ADR explicitly
   includes it.
 - **ADR-049 transport framing changes**: the Unix socket protocol is unchanged.
+- **`SqlBridge::begin_tx()` migration**: deferred to the follow-up ADR for #195.
+- **DDL helper migration**: DDL runs during sequential startup before concurrent agents connect
+  and continues to use `pool.try_writer()` directly.
 
 ---
 
@@ -419,11 +502,20 @@ The following are explicitly excluded from this ADR:
 - ADR-017: Pack standard — `with_writer` pattern is the current pack write convention
 - ADR-028: Pack-scoped backends — `ConnectionPool` ownership model
 - ADR-049: khived daemon — socket framing and `forward_or_spawn` protocol (unchanged)
-- `crates/khive-db/src/pool.rs` — single writer Mutex, WAL constants, checkout/busy timeouts
-- `crates/khive-db/src/sql_bridge.rs` — `begin_tx` seam, `BEGIN IMMEDIATE` hardcoding
-- `crates/khive-db/src/stores/entity.rs` — `with_writer` pattern (lines 68-80)
-- `crates/khive-db/src/stores/note.rs` — `with_writer` pattern (lines 68-80)
-- `crates/khive-db/src/stores/graph.rs` — `with_writer` pattern (lines 111-130)
-- `crates/khive-runtime/src/daemon.rs` — `run_daemon` accept loop (lines 466-479)
-- `crates/kkernel/src/exec.rs` — `apply_ops_file` and daemon fast-path bypass (lines 205-264, 408)
+- `crates/khive-db/src/pool.rs` — single writer Mutex (`pool.rs:60`), WAL constants (`pool.rs:15-16`), checkout timeout (`pool.rs:263`), busy timeout (`pool.rs:29`)
+- `crates/khive-db/src/backend.rs` — `StorageBackend::sqlite` sets `is_file_backed: true` (`backend.rs:29,38`); DDL helpers use `pool.try_writer()` directly
+- `crates/khive-db/src/sql_bridge.rs` — `open_standalone_writer` (`sql_bridge.rs:126`), `execute_batch` with `BEGIN IMMEDIATE` (`sql_bridge.rs:320-329`), `writer()` standalone path (`sql_bridge.rs:791-801`), `begin_tx()` standalone path (`sql_bridge.rs:804-853`)
+- `crates/khive-db/src/stores/entity.rs` — `with_writer` via pool Mutex (`entity.rs:68-80`)
+- `crates/khive-db/src/stores/note.rs` — `with_writer` via pool Mutex (`note.rs:69-81`)
+- `crates/khive-db/src/stores/graph.rs` — `with_writer` via `open_standalone_writer` in file-backed mode (`graph.rs:111-130`)
+- `crates/khive-db/src/stores/text.rs` — `with_writer` via `open_standalone_writer` in file-backed mode (`text.rs:130-149`)
+- `crates/khive-db/src/stores/event.rs` — `with_writer` via `open_standalone_writer` in file-backed mode (`event.rs:104-123`)
+- `crates/khive-db/src/stores/sparse.rs` — `with_writer` via pool Mutex, no file-backed branch (`sparse.rs:133-145`)
+- `crates/khive-db/src/stores/vectors.rs` — `with_writer` via pool Mutex, no file-backed branch (`vectors.rs:217-229`)
+- `crates/khive-runtime/src/curation.rs` — `merge_entity` and `merge_note` use `pool.writer()` directly (`curation.rs:316-326`, `638-645`)
+- `crates/khive-runtime/src/operations.rs` — `link` uses `pool.writer()` directly (`operations.rs:3061-3073`)
+- `crates/khive-mcp/src/server.rs` — Single/Parallel per-op independence contract (`server.rs:566-568`); per-op result preservation (`server.rs:637,755`)
+- `crates/khive-runtime/src/daemon.rs` — `run_daemon` accept loop (`daemon.rs:466`)
+- `crates/kkernel/src/exec.rs` — `apply_ops_file` and daemon fast-path bypass (`exec.rs:214`, `408`)
+- PR #221 — Slice 1: `CheckpointConfig` and `run_checkpoint_task` (merged, ADR-independent)
 - Issue #195: cross-op atomicity for `--ops-file` bulk apply
