@@ -8,6 +8,9 @@
 **Amends (effective now)**: ADR-007 Rule 4 (Cloud TenantGate clause); ADR-018
 §"AllowAllGate" and §"Multi-tenant deployments" context bullet — see
 §"Amendment to ADR-007 and ADR-018 for per-tenant-process topology" below\
+**Corrects**: ADR-057 §"comm.inbox" legacy `to_actor` visibility — this ADR's EqOrMissing
+amendment is authoritative over ADR-057's strict-equality text (see the EqOrMissing
+amendment that corrects ADR-057 below)\
 **Related issues**: #199 (comm.inbox actor-filter bypass), #200 (from_actor mis-stamp), #13
 (gate actor-identity gap), ADR-053 (ActorStore/SessionStore, cloud-tier actor threading)
 
@@ -257,7 +260,7 @@ always applied.
 
 One precision on the filter: handlers.rs lines 160-164 apply `FilterOp::EqOrMissing` for the
 `$.to_actor` JSON path. This operator matches rows where `to_actor` equals the caller's label
-OR where the field is absent or NULL (see `crates/khive-storage/src/note.rs` line 233 for the
+OR where the field is absent or NULL (see `crates/khive-storage/src/note.rs` lines 232-234 for the
 `EqOrMissing` variant definition). Legacy messages stored without a `to_actor` property are
 therefore visible to an actor-scoped inbox query on a database that contains them.
 
