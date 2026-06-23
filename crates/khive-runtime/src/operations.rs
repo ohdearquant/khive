@@ -393,6 +393,24 @@ fn validate_edge_metadata(
     Ok(())
 }
 
+/// Returns `true` when `note_props` is a superset of all key-value pairs in `filter`.
+///
+/// Mirrors the semantics of `khive_pack_kg::handlers::common::props_match` so that the
+/// storage-leg predicate in `search_notes` is identical to the handler-side post-filter.
+fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json::Value) -> bool {
+    let required = match filter.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return true,
+    };
+    let actual = match note_props.and_then(serde_json::Value::as_object) {
+        Some(obj) => obj,
+        None => return false,
+    };
+    required
+        .iter()
+        .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -1386,7 +1404,7 @@ impl KhiveRuntime {
     ///
     /// Called by the `SubstrateCoordinator` when source and target are on
     /// different backends. The coordinator validates endpoints before calling
-    /// this method via [`validate_link_endpoints`], so endpoint validation is
+    /// this method via [`Self::validate_link_endpoints`], so endpoint validation is
     /// skipped here. The edge is written on the source backend only.
     #[allow(clippy::too_many_arguments)]
     pub async fn link_with_target_backend(
@@ -1718,7 +1736,7 @@ impl KhiveRuntime {
         .await
     }
 
-    /// Like [`create_note`] but also sets a non-zero decay factor on the note.
+    /// Like [`Self::create_note`] but also sets a non-zero decay factor on the note.
     // REASON: extends create_note with an additional decay_factor parameter; same
     // rationale — mirrors the MCP surface and reduces an extra builder layer.
     #[allow(clippy::too_many_arguments)]
@@ -1747,7 +1765,7 @@ impl KhiveRuntime {
         .await
     }
 
-    /// Like [`create_note_with_decay`] but targets a specific embedding model.
+    /// Like [`Self::create_note_with_decay`] but targets a specific embedding model.
     // REASON: adds an embedding_model parameter to the decay variant; the full parameter
     // set is required for correct MCP verb routing and cannot be collapsed without
     // introducing a separate config struct that would obscure call sites.
@@ -2212,8 +2230,19 @@ impl KhiveRuntime {
     /// 2. If embedding model is configured: vector search filtered to `kind="note"`.
     /// 3. RRF fusion (k=60).
     /// 4. Salience-weighted rerank: `score *= (0.5 + 0.5 * note.salience)`.
-    /// 5. Filter soft-deleted notes (`deleted_at IS NOT NULL`).
+    /// 5. Filter soft-deleted notes, apply optional kind / tag / properties predicates.
+    ///    Tags and properties are pushed into the per-note fetch loop BEFORE truncation
+    ///    so that matching notes ranked beyond `limit` in the raw fusion are not silently
+    ///    dropped (fix for issue #225).
     /// 6. Truncate to `limit`.
+    ///
+    /// `tags_any`: when non-empty, only notes that have at least one of these tags
+    /// (stored in `properties["tags"]`, case-insensitive match) are retained. The
+    /// check happens inside the alive-note loop, before `hits.truncate(limit)`.
+    ///
+    /// `properties_filter`: when `Some`, only notes whose `properties` JSON object is
+    /// a superset of the given filter object are retained. Also applied before truncation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_notes(
         &self,
         token: &NamespaceToken,
@@ -2222,6 +2251,8 @@ impl KhiveRuntime {
         limit: u32,
         note_kind: Option<&str>,
         include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
@@ -2286,6 +2317,36 @@ impl KhiveRuntime {
                 }
                 if let Some(want_kind) = note_kind {
                     if note.kind != want_kind {
+                        continue;
+                    }
+                }
+                // Apply tag predicate before adding to alive set: tags on notes live
+                // inside `properties["tags"]` (a JSON array). This pushes the filter
+                // before truncation so matching notes ranked beyond `limit` in the raw
+                // fusion are not silently dropped (fix for issue #225).
+                if !tags_any.is_empty() {
+                    let note_tags: Vec<String> = note
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.get("tags"))
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !note_tags
+                        .iter()
+                        .any(|t| tags_any.iter().any(|w| t.eq_ignore_ascii_case(w)))
+                    {
+                        continue;
+                    }
+                }
+                // Apply properties predicate before truncation (fix for issue #225).
+                if let Some(pf) = properties_filter {
+                    if !note_props_match(note.properties.as_ref(), pf) {
                         continue;
                     }
                 }
@@ -4306,7 +4367,7 @@ mod tests {
         .unwrap();
 
         let results = rt
-            .search_notes(&tok, "GQA KV cache", None, 10, None, false)
+            .search_notes(&tok, "GQA KV cache", None, 10, None, false, &[], None)
             .await
             .unwrap();
 
@@ -4347,13 +4408,162 @@ mod tests {
             .unwrap();
 
         let results = rt
-            .search_notes(&tok, "RoPE rotary positional", None, 10, None, false)
+            .search_notes(
+                &tok,
+                "RoPE rotary positional",
+                None,
+                10,
+                None,
+                false,
+                &[],
+                None,
+            )
             .await
             .unwrap();
 
         assert!(
             results.iter().all(|h| h.note_id != note.id),
             "soft-deleted note should be excluded from search"
+        );
+    }
+
+    // ---- issue #225 regression: predicate pushdown before truncation (note branch) ----
+
+    /// Regression test for issue #225 (note branch, tag filter).
+    ///
+    /// Notes store tags inside `properties["tags"]` — there is no separate tags column.
+    /// Without pushdown, the tag filter is applied after `hits.truncate(limit)`, so a
+    /// tag-matching note ranked beyond `limit` in the raw RRF fusion is silently dropped.
+    ///
+    /// Scenario: `limit=1`, tags_any=["note-target-tag"]. Two notes are inserted:
+    ///   - decoy: high FTS rank (repeats query terms), NO target tag.
+    ///   - target: lower FTS rank, HAS "note-target-tag" in `properties["tags"]`.
+    ///
+    /// Without pushdown: decoy occupies the slot, target is dropped.
+    /// With pushdown: decoy is excluded in the alive-note loop, target survives, returned.
+    ///
+    /// Isomorphism: removing the `tags_any` check from the alive-note loop in
+    /// `search_notes` re-breaks this test.
+    #[tokio::test]
+    async fn search_notes_tag_filter_pushed_before_truncation() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Decoy note: repeats query tokens → higher FTS rank. No target tag.
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "kappa lambda mu note decoy kappa lambda mu note decoy kappa lambda mu",
+            Some(0.5),
+            Some(serde_json::json!({"tags": ["other-note-tag"]})),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Target note: fewer query tokens → lower FTS rank. Has the target tag.
+        let target = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "kappa lambda mu note target",
+                Some(0.5),
+                Some(serde_json::json!({"tags": ["note-target-tag"]})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // With limit=1 and tags_any, the fix must return the target note despite the
+        // decoy ranking higher in raw FTS.
+        let hits = rt
+            .search_notes(
+                &tok,
+                "kappa lambda mu note",
+                None,
+                1,
+                None,
+                false,
+                &["note-target-tag".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one hit expected (tag-matching note)"
+        );
+        assert_eq!(
+            hits[0].note_id, target.id,
+            "tag-filtered note must be returned even when ranked below limit in raw fusion"
+        );
+    }
+
+    /// Regression test for issue #225 (note branch, properties filter).
+    ///
+    /// Without pushdown, the properties filter is applied after truncation; a matching
+    /// note ranked beyond `limit` is silently dropped.
+    ///
+    /// Scenario: `limit=1`, properties_filter={{"source": "target"}}. Two notes:
+    ///   - decoy: high FTS rank, properties {{"source": "other"}}.
+    ///   - target: lower FTS rank, properties {{"source": "target"}}.
+    #[tokio::test]
+    async fn search_notes_props_filter_pushed_before_truncation() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "nu xi omicron note decoy nu xi omicron note decoy nu xi omicron",
+            Some(0.5),
+            Some(serde_json::json!({"source": "other"})),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let target = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "nu xi omicron note target",
+                Some(0.5),
+                Some(serde_json::json!({"source": "target"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let filter = serde_json::json!({"source": "target"});
+        let hits = rt
+            .search_notes(
+                &tok,
+                "nu xi omicron note",
+                None,
+                1,
+                None,
+                false,
+                &[],
+                Some(&filter),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one hit expected (properties-matching note)"
+        );
+        assert_eq!(
+            hits[0].note_id, target.id,
+            "properties-filtered note must be returned even when ranked below limit"
         );
     }
 
@@ -4868,7 +5078,7 @@ mod tests {
 
         // FTS must not contain the content either.
         let search_hits = rt
-            .search_notes(&tok, "should not persist", None, 10, None, false)
+            .search_notes(&tok, "should not persist", None, 10, None, false, &[], None)
             .await
             .unwrap();
         assert!(
@@ -5644,7 +5854,7 @@ mod tests {
             "compensation must remove the note row; got {after_notes:?}"
         );
         let search_hits = rt
-            .search_notes(&tok, "partial note", None, 10, None, false)
+            .search_notes(&tok, "partial note", None, 10, None, false, &[], None)
             .await
             .unwrap();
         assert!(
@@ -6121,7 +6331,7 @@ mod tests {
 
         // FTS must have no hit for the content.
         let hits = rt
-            .search_notes(&tok, "rollback target", None, 10, None, false)
+            .search_notes(&tok, "rollback target", None, 10, None, false, &[], None)
             .await
             .unwrap();
         assert!(
@@ -6340,7 +6550,7 @@ mod tests {
             .unwrap();
 
         let before = rt
-            .search_notes(&tok, "yvwkqz", None, 10, None, false)
+            .search_notes(&tok, "yvwkqz", None, 10, None, false, &[], None)
             .await
             .unwrap();
         assert!(
@@ -6352,7 +6562,7 @@ mod tests {
         assert!(deleted, "soft delete must return true");
 
         let after = rt
-            .search_notes(&tok, "yvwkqz", None, 10, None, false)
+            .search_notes(&tok, "yvwkqz", None, 10, None, false, &[], None)
             .await
             .unwrap();
         assert!(

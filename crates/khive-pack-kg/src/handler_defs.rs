@@ -414,13 +414,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "properties",
                 param_type: "object",
                 required: false,
-                description: "Post-filter search hits to entities whose properties contain all listed key=value pairs (kind=\"entity\" only). Applied after FTS+vector ranking. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}.",
+                description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
             },
             ParamDef {
                 name: "tags",
                 param_type: "array",
                 required: false,
-                description: "Post-filter entity search hits to entities with any listed tag (kind=\"entity\" only, OR semantics, case-insensitive). Applied after FTS+vector ranking. E.g. [\"rust\", \"ml\"].",
+                description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
             },
             ParamDef {
                 name: "min_score",

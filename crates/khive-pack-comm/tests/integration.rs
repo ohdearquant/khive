@@ -513,21 +513,21 @@ async fn test_send_writes_inbound_in_recipient_ns() {
     );
 }
 
-/// inbox() returns the inbound message after a same-namespace send.
+/// inbox() returns the inbound message after a self-send with configured actor identity.
 ///
-/// Cross-namespace delivery is denied (issue #481 fix).
-/// Same-namespace send creates an inbound copy visible in inbox().
+/// A session with actor_id="lambda:khive" sends to itself; the inbound copy has
+/// to_actor="lambda:khive" and is visible to the same registry's inbox (filter matches).
 #[tokio::test]
 async fn test_inbox_returns_inbound_for_recipient() {
-    // Self-send: both copies land in lambda:khive namespace.
-    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+    // Self-send: actor_id configured so inbox filter matches to_actor="lambda:khive".
+    let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:khive");
     registry
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "you have mail" }),
         )
         .await
-        .expect("same-namespace send succeeds");
+        .expect("self-send with actor identity succeeds");
 
     // inbox() on the same registry must surface the inbound copy.
     let inbox = registry
@@ -546,8 +546,11 @@ async fn test_inbox_returns_inbound_for_recipient() {
 
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
     let props = msgs[0].get("properties").unwrap();
-    // ADR-007 Rev 2: token.namespace() is always "local", so from = "local".
-    assert_eq!(props.get("from").and_then(|v| v.as_str()), Some("local"));
+    // from_actor is "lambda:khive" (configured actor_id, not anonymous "local").
+    assert_eq!(
+        props.get("from_actor").and_then(|v| v.as_str()),
+        Some("lambda:khive")
+    );
     assert_eq!(
         props.get("direction").and_then(|v| v.as_str()),
         Some("inbound")
@@ -666,8 +669,10 @@ async fn test_reply_from_sender_routes_to_recipient() {
 /// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_recipient_routes_to_sender() {
-    // Same namespace: lambda:khive sends to lambda:khive, then replies.
-    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+    // lambda:khive (configured actor_id) sends to itself, then replies.
+    // This tests that reply routing works correctly with proper actor attribution.
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
 
     registry
         .dispatch(
@@ -675,9 +680,9 @@ async fn test_reply_from_recipient_routes_to_sender() {
             serde_json::json!({ "to": "lambda:khive", "content": "meeting at 3pm" }),
         )
         .await
-        .expect("same-namespace send succeeds");
+        .expect("self-send with actor identity succeeds");
 
-    // Find the inbound copy.
+    // Find the inbound copy via inbox (actor filter matches to_actor="lambda:khive").
     let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
@@ -701,7 +706,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .await
         .expect("reply succeeds");
 
-    // ADR-007 Rev 2: reply_to = original to_actor = "lambda:khive".
+    // UE6-H1: reply routes to original to_actor = "lambda:khive".
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
@@ -710,14 +715,14 @@ async fn test_reply_from_recipient_routes_to_sender() {
         reply_to, "lambda:khive",
         "UE6-H1: reply routes to original to_actor; got {reply_to}"
     );
-    // ADR-007 Rev 2: from = token.namespace() = "local".
+    // from_actor is the configured actor_id, not anonymous "local".
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
         .expect("reply returns from");
     assert_eq!(
-        reply_from, "local",
-        "reply from must be local (ADR-007 all-local, token.namespace()=local)"
+        reply_from, "lambda:khive",
+        "reply from must be the configured actor_id; got {reply_from}"
     );
 }
 
@@ -1172,8 +1177,10 @@ async fn test_thread_verb_returns_threaded_messages() {
 /// Same-namespace send is used here — both copies land in the caller's namespace.
 #[tokio::test]
 async fn test_reply_delivers_inbound_to_recipient() {
-    // Same-namespace: lambda:khive sends to itself and replies.
-    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+    // lambda:khive (configured actor_id) sends to itself and replies.
+    // With proper actor attribution, inbox filters correctly and reply inbounds are visible.
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
 
     registry
         .dispatch(
@@ -1181,9 +1188,9 @@ async fn test_reply_delivers_inbound_to_recipient() {
             serde_json::json!({ "to": "lambda:khive", "content": "original message" }),
         )
         .await
-        .expect("same-namespace send succeeds");
+        .expect("self-send with actor identity succeeds");
 
-    // Find the inbound copy via inbox().
+    // Find the inbound copy via inbox (actor filter matches to_actor="lambda:khive").
     let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -1202,7 +1209,7 @@ async fn test_reply_delivers_inbound_to_recipient() {
         .expect("reply succeeds");
 
     // After reply, inbox must contain at least 2 inbound messages
-    // (the original inbound + the reply's inbound copy).
+    // (the original inbound + the reply's inbound copy, both with to_actor="lambda:khive").
     let inbox_after = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -2591,26 +2598,22 @@ async fn t4_inbound_note_namespace_is_recipient() {
     );
 }
 
-// T5 — ADR-057 §(c): shared-namespace delivery (single-actor fallback).
+// T5 — ADR-057 §(c): actor-addressed delivery with configured identity.
 //
-// In the production deployment all lambdas run as namespace "local". A send from
-// "local" to any actor label writes both copies into "local". comm.inbox called with
-// namespace "local" skips the to_actor filter (single-actor fallback) and sees all
-// inbound messages. This is the path that makes lambda→lambda messaging functional
-// today, without requiring per-actor namespace isolation (issue #75).
+// A sender with actor_id="lambda:khive" sends to "lambda:leo". Both copies land in
+// the "local" namespace (ADR-007 all-local). The recipient (actor_id="lambda:leo")
+// sees the message in their inbox because the to_actor filter matches.
 //
-// ADR-057 §(c) steps 13-15: send from "local" to "lambda:leo", assert send succeeds,
-// assert the inbound message appears in the "local" inbox.
+// An anonymous caller on the same backend sees 0 messages (inbox leak closed, #199).
 #[tokio::test]
 async fn t5_recipient_inbox_sees_message() {
     let backend = shared_backend();
-    // Both sender and recipient share namespace "local" — the real deployment topology.
-    let (registry_sender, rt_local) = build_crossns_registry(Arc::clone(&backend), "local", vec![]);
-    // A second registry also in "local" simulates the recipient reading their inbox.
-    let (registry_recipient, _rt_local2) =
-        build_crossns_registry(Arc::clone(&backend), "local", vec![]);
+    let (registry_sender, rt_local) = build_actor_registry(Arc::clone(&backend), "lambda:khive");
+    // Recipient configured with actor_id="lambda:leo" to receive messages addressed to them.
+    let (registry_recipient, _rt_recipient) =
+        build_actor_registry(Arc::clone(&backend), "lambda:leo");
 
-    // Send from "local" to actor label "lambda:leo".
+    // Send from lambda:khive to actor label "lambda:leo".
     let send_result = registry_sender
         .dispatch(
             "comm.send",
@@ -2619,7 +2622,7 @@ async fn t5_recipient_inbox_sees_message() {
         .await;
     assert!(
         send_result.is_ok(),
-        "T5: send from 'local' to 'lambda:leo' must succeed; got {send_result:?}"
+        "T5: send from 'lambda:khive' to 'lambda:leo' must succeed; got {send_result:?}"
     );
 
     // The inbound note has to_actor="lambda:leo" and lives in namespace "local".
@@ -2663,8 +2666,7 @@ async fn t5_recipient_inbox_sees_message() {
         "T5: inbound note must have to_actor='lambda:leo'"
     );
 
-    // The recipient inbox (also "local") sees the inbound message via the single-actor
-    // fallback: caller_actor == "local" skips the to_actor filter, returning all inbound.
+    // The configured recipient (actor_id="lambda:leo") sees the message in their inbox.
     let inbox = registry_recipient
         .dispatch("comm.inbox", serde_json::json!({}))
         .await
@@ -2672,11 +2674,10 @@ async fn t5_recipient_inbox_sees_message() {
     let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     assert!(
         count >= 1,
-        "T5: 'local' inbox must see the inbound message (single-actor fallback); got count={count}"
+        "T5: 'lambda:leo' inbox must see the inbound message; got count={count}"
     );
 
-    // Namespace isolation: no notes in any namespace other than "local".
-    // Both outbound + inbound copies are in "local".
+    // Namespace isolation: both outbound + inbound copies are in "local" (ADR-007).
     let local_alive = all_notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
         local_alive, 2,
@@ -2686,21 +2687,20 @@ async fn t5_recipient_inbox_sees_message() {
 
 // T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, codex Critical #2).
 //
-// Reply on a shared-namespace setup proves the fail-closed reply path: after the fix,
+// Reply on a configured-actor setup proves the fail-closed reply path: after the fix,
 // handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
 // and always sets from_actor/to_actor. No path through handle_reply can cause
 // dual_write_message to mint a token in a foreign namespace.
 //
-// This test exercises the "original had no actor labels" branch (legacy message forged
-// via a plain send to "local", so from_actor/to_actor on the original are set by
-// handle_send, not absent). We also verify the reply lands in "local" and the thread
-// links correctly.
+// We use actor_id="lambda:khive" (self-send to "lambda:khive") so that the inbox
+// filter correctly surfaces both the original inbound and the reply inbound, both
+// of which have to_actor="lambda:khive".
 #[tokio::test]
 async fn t5b_reply_always_writes_same_namespace() {
     let backend = shared_backend();
-    let (registry_local, rt_local) = build_crossns_registry(Arc::clone(&backend), "local", vec![]);
+    let (registry_local, rt_local) = build_actor_registry(Arc::clone(&backend), "lambda:khive");
 
-    // Send from "local" to "lambda:khive" — both copies in "local".
+    // Self-send from lambda:khive to lambda:khive — both copies in "local".
     let send_val = registry_local
         .dispatch(
             "comm.send",
@@ -2735,7 +2735,7 @@ async fn t5b_reply_always_writes_same_namespace() {
         .map(|n| n.id.as_hyphenated().to_string())
         .expect("T5b: must find inbound note in 'local'");
 
-    // Reply from the same "local" registry.
+    // Reply from the same registry.
     let reply_result = registry_local
         .dispatch(
             "comm.reply",
@@ -2782,7 +2782,7 @@ async fn t5b_reply_always_writes_same_namespace() {
         );
     }
 
-    // The "local" inbox sees the reply inbound (single-actor fallback, no to_actor filter).
+    // The inbox (actor_id="lambda:khive") sees the inbound messages (to_actor="lambda:khive").
     let inbox_after = registry_local
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -2793,15 +2793,17 @@ async fn t5b_reply_always_writes_same_namespace() {
         .unwrap_or(0);
     assert!(
         inbox_count >= 1,
-        "T5b: 'local' inbox must see at least one inbound message; got {inbox_count}"
+        "T5b: 'lambda:khive' inbox must see at least one inbound message; got {inbox_count}"
     );
 }
 
-// T6 — ADR-007 Rev 2: under all-local model, both outbound and inbound copies land
-// in "local". The inbound copy IS visible in the sender's inbox (they share the same
-// local namespace). The outbound copy is NOT surfaced by inbox (inbox filters direction=inbound).
-// This test verifies inbox surfaces the inbound copy (count >= 1), and that the
-// outbound copy is excluded from the default inbox view.
+// T6 — inbox isolation: sender does NOT see inbound copy addressed to another actor.
+//
+// An anonymous sender (no actor_id) sends from "lambda:leo" namespace to "lambda:khive".
+// The inbound note has to_actor="lambda:khive". The sender's inbox uses EqOrMissing("local")
+// filter (anonymous), so it sees 0 messages. The inbound copy is invisible to the sender.
+//
+// This is the CORRECT post-#199-fix behavior. The old behavior (seeing 1) was the leak.
 #[tokio::test]
 async fn t6_sender_inbox_does_not_see_inbound_copy() {
     let backend = shared_backend();
@@ -2819,26 +2821,16 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
         .await
         .expect("T6: send must succeed");
 
-    // ADR-007 Rev 2: inbound copy is in "local" (same as sender), so inbox sees it.
-    // inbox(status=all) returns inbound messages; verify it returns exactly 1 inbound.
+    // After fix #199: anonymous sender's inbox does NOT see the inbound copy addressed
+    // to "lambda:khive". EqOrMissing("local") filter returns 0 (no matching to_actor).
     let inbox = registry_leo
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
         .expect("T6: sender inbox dispatch must succeed");
     let count = inbox.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     assert_eq!(
-        count, 1,
-        "T6: ADR-007 all-local: inbox must see the inbound copy (both copies in local ns); got {count}"
-    );
-    // Verify the returned message is the inbound copy (not outbound).
-    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(
-        msgs[0]
-            .get("properties")
-            .and_then(|p| p.get("direction"))
-            .and_then(|v| v.as_str()),
-        Some("inbound"),
-        "T6: inbox must only return inbound messages (not outbound)"
+        count, 0,
+        "T6: #199 fix: anonymous sender must NOT see inbound copy addressed to lambda:khive; got {count}"
     );
 }
 
@@ -3491,13 +3483,18 @@ async fn t_actor_inbox_filters_to_actor() {
     );
 }
 
-/// When no actor_id is configured (anonymous/local), inbox falls back to party-line
-/// behavior — all inbound messages are visible regardless of to_actor.
+/// After fix #199, an anonymous caller's inbox is filtered to messages with to_actor="local"
+/// or absent. Messages sent to specific actor labels (e.g. "lambda:x", "lambda:y") are
+/// NOT visible to anonymous callers — this closes the cross-actor inbox read leak.
+///
+/// Prior behavior (pre-fix): all messages were visible to anonymous callers ("party-line
+/// fallback"). That behavior was the bug.
 #[tokio::test]
-async fn t_anonymous_actor_inbox_party_line_unchanged() {
+async fn t_anonymous_actor_inbox_filters_addressed_messages() {
     let (registry, _rt) = build_registry();
 
-    // Send two messages from the same anonymous session.
+    // Send two messages from the same anonymous session to specific actor labels.
+    // These sends emit a tracing::warn! (#200) but proceed.
     registry
         .dispatch(
             "comm.send",
@@ -3513,8 +3510,8 @@ async fn t_anonymous_actor_inbox_party_line_unchanged() {
         .await
         .expect("send 2");
 
-    // Anonymous inbox must see all inbound messages (no to_actor filter applied).
-    // Note: comm.inbox already filters for direction=inbound; all returned messages are inbound.
+    // Anonymous inbox must NOT see messages addressed to specific actors.
+    // Only messages with to_actor="local" or absent are visible (EqOrMissing filter).
     let inbox = registry
         .dispatch(
             "comm.inbox",
@@ -3523,10 +3520,9 @@ async fn t_anonymous_actor_inbox_party_line_unchanged() {
         .await
         .expect("inbox succeeds");
     let count = inbox["count"].as_u64().unwrap_or(0);
-    let messages = inbox["messages"].as_array().expect("messages array");
     assert_eq!(
-        count, 2,
-        "anonymous inbox must show all 2 inbound messages (party-line fallback); got {messages:?}"
+        count, 0,
+        "#199: anonymous inbox must NOT show messages addressed to lambda:x/lambda:y; got {count}"
     );
 }
 
@@ -3609,5 +3605,363 @@ allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
         outbound_strs.len(),
         2,
         "exactly 2 outbound namespaces expected; got {outbound_strs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cluster-2 isolation tests (branch fix/comm-tenant-isolation-strict)
+// ---------------------------------------------------------------------------
+//
+// These tests were added as part of the pre-cloud-hardening audit (2026-06-23).
+// They cover the decision-independent (no ADR required) half of the isolation
+// story:
+//   - #199 (comm.inbox actor-filter bypass): the to_actor filter must isolate
+//     tenants when actor_id IS configured.
+//   - #224 (gate actor identity gap): the GateRequest.actor must carry the
+//     configured actor identity, not ActorRef::anonymous(), so a cloud TenantGate
+//     can act on it. This assertion FAILS today — see the #[ignore] test below.
+
+/// When two registries share the same storage backend but carry distinct
+/// configured actor identities, `comm.inbox` must isolate each actor's view:
+///
+/// - Actor A sends to B → B's inbox (status=all) shows the message; A's does not.
+/// - Actor B sends to A → A's inbox (status=all) shows the message; B's does not.
+///
+/// This is the end-to-end isolation assertion for #199. It PASSES today when
+/// `actor_id` is properly configured per-registry. The test documents that the
+/// to_actor filter is active and working — the misconfiguration footgun (missing
+/// actor_id → party-line) is addressed separately by the strict-mode startup gate
+/// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`).
+#[tokio::test]
+async fn t_c2_inbox_isolation_cross_actor() {
+    let backend = shared_backend();
+
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:tenant-a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:tenant-b");
+
+    // A sends to B.
+    let send_ab = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:tenant-b", "content": "hello tenant-b from a" }),
+        )
+        .await
+        .expect("A→B send must succeed");
+    assert!(
+        send_ab.get("id").is_some(),
+        "send must return id: {send_ab}"
+    );
+
+    // B sends to A.
+    let send_ba = registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:tenant-a", "content": "hello tenant-a from b" }),
+        )
+        .await
+        .expect("B→A send must succeed");
+    assert!(
+        send_ba.get("id").is_some(),
+        "send must return id: {send_ba}"
+    );
+
+    // B's inbox must contain exactly one message (the one addressed to tenant-b).
+    let b_inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("B inbox must succeed");
+    let b_count = b_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        b_count, 1,
+        "B must see exactly 1 message (the A→B message); got {b_count}. \
+         If this is > 1, the to_actor filter is not applied (party-line leak)."
+    );
+    let b_content = b_inbox["messages"][0]["content"].as_str().unwrap_or("");
+    assert_eq!(
+        b_content, "hello tenant-b from a",
+        "B's inbox message must be the one A sent to B; got {b_content:?}"
+    );
+
+    // A's inbox must contain exactly one message (the one addressed to tenant-a).
+    let a_inbox = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("A inbox must succeed");
+    let a_count = a_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        a_count, 1,
+        "A must see exactly 1 message (the B→A message); got {a_count}. \
+         If this is > 1, the to_actor filter is not applied (party-line leak)."
+    );
+    let a_content = a_inbox["messages"][0]["content"].as_str().unwrap_or("");
+    assert_eq!(
+        a_content, "hello tenant-a from b",
+        "A's inbox message must be the one B sent to A; got {a_content:?}"
+    );
+}
+
+/// Executable spec for issue #224 (Gate actor identity gap).
+///
+/// DESIRED behavior: when `actor_id = "lambda:tenant-x"` is configured on the
+/// registry, `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a
+/// cloud TenantGate can enforce per-actor policies.
+///
+/// CURRENT behavior: `VerbRegistry::dispatch` passes `ActorRef::anonymous()`
+/// (id = "local") to the gate regardless of the configured `actor_id`
+/// (pack.rs:852). The configured actor is used only AFTER the gate consult
+/// to mint the NamespaceToken for storage access — the gate never sees it.
+///
+/// This test is marked `#[ignore]` because it asserts the DESIRED behavior that
+/// is NOT yet implemented. It will become passing once the architectural fix
+/// tracked in issue #224 is implemented (threading authenticated actor identity
+/// into `VerbRegistry::dispatch` before the gate consult).
+///
+/// DO NOT DELETE this test. It is an executable contract spec: when issue #224
+/// is resolved and the `#[ignore]` is removed, the CI gate will verify the fix.
+///
+/// See: https://github.com/ohdearquant/khive/issues/224
+#[tokio::test]
+#[ignore = "issue #224: GateRequest.actor is always ActorRef::anonymous() today; \
+             removing #[ignore] gates the architectural fix (pack.rs:852 must pass \
+             configured actor_id to GateRequest, not ActorRef::anonymous())"]
+async fn t_c2_gate_receives_configured_actor_not_anonymous() {
+    use khive_runtime::{Gate, GateDecision, GateError, GateRef, GateRequest};
+    use std::sync::Mutex;
+
+    // A recording gate that captures every actor ID it sees.
+    #[derive(Debug)]
+    struct RecordingGate {
+        seen_actor_ids: Mutex<Vec<String>>,
+    }
+
+    impl Gate for RecordingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.seen_actor_ids
+                .lock()
+                .unwrap()
+                .push(req.actor.id.clone());
+            Ok(GateDecision::allow())
+        }
+    }
+
+    let gate = Arc::new(RecordingGate {
+        seen_actor_ids: Mutex::new(Vec::new()),
+    });
+
+    let backend = shared_backend();
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate), // runtime gate; registry gate set below
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: Some("lambda:tenant-x".to_string()),
+    };
+    let rt = KhiveRuntime::from_backend(backend, config);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_actor_id(Some("lambda:tenant-x".to_string()));
+    builder.with_gate(gate.clone() as GateRef);
+    let registry = builder.build().expect("registry with recording gate");
+
+    // Dispatch any verb — the gate is consulted before pack dispatch.
+    let _ = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 1 }),
+        )
+        .await
+        .expect("inbox dispatch must not error");
+
+    // DESIRED: gate must have seen "lambda:tenant-x", not "local" (anonymous).
+    // CURRENT: gate sees "local" (ActorRef::anonymous()) — this is the #224 gap.
+    let seen = gate.seen_actor_ids.lock().unwrap();
+    assert!(
+        seen.iter().any(|id| id == "lambda:tenant-x"),
+        "gate must receive configured actor id 'lambda:tenant-x', not 'local' \
+         (anonymous). Saw: {seen:?}. \
+         Fix: pass actor_id into GateRequest at pack.rs:852 instead of \
+         ActorRef::anonymous(). Tracked as issue #224."
+    );
+}
+
+// ── Issue #199 / #200 regression: actor attribution and inbox isolation ────────
+//
+// These tests reproduce the two bugs fixed in this PR:
+//
+// #200: from_actor stamped as 'local' when sender has no actor.id configured but
+//       sends to a specific actor label.  Addressed sends from anonymous callers
+//       must be rejected; party-line self-sends (to="local") still work.
+//
+// #199: inbox actor-filter skipped when caller resolves to anonymous/'local'.
+//       An unconfigured caller must NOT see messages addressed to other actors;
+//       they must only see messages whose to_actor is "local" (or absent/NULL).
+
+/// #200 regression: anonymous sender sending to a specific actor label stamps from_actor="local".
+///
+/// The send is NOT rejected (to preserve backward compatibility with sessions that set
+/// default_namespace but not actor_id), but attribution is mis-stamped. A tracing::warn!
+/// is emitted. This is a known limitation pending issue #75 (actor identity per request).
+///
+/// The important invariant: even with the corrupted from_actor, the message is stored and
+/// the #199 inbox fix prevents OTHER anonymous callers from reading messages with
+/// to_actor set to a specific label.
+#[tokio::test]
+async fn i199_200_anonymous_send_to_specific_actor_is_warned() {
+    // build_registry() has no actor_id → token.actor().id = "local".
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:leo", "content": "mis-attributed send" }),
+        )
+        .await;
+
+    // The send proceeds (warn-only), not rejected.
+    assert!(
+        result.is_ok(),
+        "#200: anonymous send to a specific actor must proceed (warn-only); got err: {result:?}"
+    );
+    let resp = result.unwrap();
+    assert!(
+        resp.get("id").is_some(),
+        "#200: response must carry id for the stored message"
+    );
+}
+
+/// #200 / single-tenant: anonymous sender sending to "local" (party-line) still works.
+///
+/// The fix must not break OSS single-tenant deployments where everyone is 'local'.
+#[tokio::test]
+async fn i199_200_anonymous_send_to_local_still_works() {
+    // build_registry() has no actor_id → anonymous caller.
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "party-line message" }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "#200 single-tenant: anonymous send to 'local' must still work; got err: {result:?}"
+    );
+    assert!(
+        result.unwrap().get("id").is_some(),
+        "#200 single-tenant: response must carry id"
+    );
+}
+
+/// #199 regression: anonymous caller must NOT read messages addressed to other actors.
+///
+/// Before the fix, `comm.inbox` with an unconfigured caller (actor="local") returned
+/// ALL inbound messages regardless of `to_actor`, leaking cross-actor inbox content.
+/// After the fix, the anonymous caller only sees messages with to_actor="local" or
+/// to_actor absent/NULL.
+#[tokio::test]
+async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
+    let backend = shared_backend();
+
+    // Actor B (configured) sends a message addressed to itself.  We inject the
+    // inbound note directly to give it to_actor="lambda:b" without going through
+    // the send gate that would now reject an anonymous send.
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "secret for B only" }),
+        )
+        .await
+        .expect("B sends to itself");
+
+    // Confirm B can read its own inbox (1 message).
+    let b_inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("B inbox");
+    let b_count = b_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        b_count, 1,
+        "#199: B must see 1 message addressed to lambda:b"
+    );
+
+    // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
+    let config_anon = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None, // anonymous
+    };
+    let rt_anon = KhiveRuntime::from_backend(backend, config_anon);
+    let mut builder_anon = VerbRegistryBuilder::new();
+    builder_anon.register(khive_pack_kg::KgPack::new(rt_anon.clone()));
+    builder_anon.register(CommPack::new(rt_anon.clone()));
+    // No with_actor_id → anonymous.
+    let registry_anon = builder_anon.build().expect("anon registry");
+
+    let anon_inbox = registry_anon
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("anonymous inbox");
+    let anon_count = anon_inbox["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        anon_count, 0,
+        "#199 regression: anonymous inbox must NOT see messages addressed to lambda:b; \
+         got count={anon_count}, inbox={anon_inbox}"
+    );
+}
+
+/// #199 / single-tenant: anonymous caller still sees messages addressed to "local".
+///
+/// Party-line messages (to_actor="local" or to_actor absent) must remain visible
+/// to anonymous callers — this is the OSS single-tenant case.
+#[tokio::test]
+async fn i199_anonymous_inbox_sees_local_messages() {
+    // build_registry() has no actor_id → anonymous.
+    let (registry, _rt) = build_registry();
+
+    // Send to "local" — this is the single-tenant party-line path.
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "party-line msg" }),
+        )
+        .await
+        .expect("self-send to local");
+
+    let inbox = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("inbox");
+    let count = inbox["count"].as_u64().unwrap_or(0);
+    assert!(
+        count >= 1,
+        "#199 single-tenant: anonymous inbox must see messages addressed to 'local'; \
+         got count={count}"
     );
 }

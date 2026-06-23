@@ -92,6 +92,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
     fn config_id(&self) -> &str {
         crate::server::KhiveMcpServer::config_id(self)
     }
+
+    fn pool_for_checkpoint(&self) -> Option<std::sync::Arc<khive_db::ConnectionPool>> {
+        self.pool()
+    }
 }
 
 // ── client ────────────────────────────────────────────────────────────────────

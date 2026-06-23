@@ -37,6 +37,7 @@ khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"
 uuid = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
+serial_test = { workspace = true }
 
 [[bench]]
 name = "db_hot_path"

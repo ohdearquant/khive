@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use khive_db::{run_checkpoint_task, CheckpointConfig, ConnectionPool};
+
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -244,6 +246,17 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// config differs, so a restricted client cannot dispatch through a broader
     /// daemon.
     fn config_id(&self) -> &str;
+
+    /// Return the pool to use for background WAL checkpointing, if available.
+    ///
+    /// Implementors backed by a file-based SQLite database should return
+    /// `Some(pool_arc)`. In-memory or test dispatchers that have no pool
+    /// return `None` and the checkpoint task is not spawned.
+    ///
+    /// The default implementation returns `None`.
+    fn pool_for_checkpoint(&self) -> Option<Arc<ConnectionPool>> {
+        None
+    }
 }
 
 // ── server ────────────────────────────────────────────────────────────────────
@@ -442,6 +455,12 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
         tokio::spawn(async move {
             warm.warm_all().await;
         });
+    }
+
+    if let Some(pool) = dispatcher.pool_for_checkpoint() {
+        let cfg = CheckpointConfig::from_env();
+        tokio::spawn(run_checkpoint_task(pool, cfg));
+        tracing::info!("WAL checkpoint task started");
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));

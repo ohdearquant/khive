@@ -15,7 +15,7 @@ use crate::error::RuntimeResult;
 ///
 /// The `main` backend is the default single-backend name. Multi-backend deployments
 /// assign each `[[backends]]` entry a distinct `BackendId`. The
-/// [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator) in `kkernel`
+/// `SubstrateCoordinator` in `kkernel`
 /// uses `BackendId` for node-to-backend resolution and cross-backend edge routing.
 ///
 /// A single-backend `KhiveRuntime` always has `BackendId("main")` by default.
@@ -59,7 +59,7 @@ mod private {
 
 /// Authorization proof that a caller is permitted to access a specific namespace.
 ///
-/// Created by [`VerbRegistry::dispatch`] after the gate approves the request.
+/// Created by [`crate::VerbRegistry::dispatch`] after the gate approves the request.
 /// The sealed inner field prevents external code from constructing a token
 /// without going through the authorization path.
 ///
@@ -190,13 +190,13 @@ impl NamespaceToken {
 /// Runtime configuration.
 ///
 /// The `db_path` and `embedding_model` fields are deprecated in favour of
-/// constructing the backend externally and calling [`KhiveRuntime::from_backend`].
+/// constructing the backend externally and calling [`crate::KhiveRuntime::from_backend`].
 /// They remain for backward compatibility with tests and single-binary deployments.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
-    /// Deprecated: use [`KhiveRuntime::from_backend`] instead. The boot path
+    /// Deprecated: use [`crate::KhiveRuntime::from_backend`] instead. The boot path
     /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
     /// `from_backend`. Direct `db_path` usage persists only in tests.
     pub db_path: Option<std::path::PathBuf>,
