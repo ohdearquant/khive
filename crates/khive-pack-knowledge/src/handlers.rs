@@ -222,7 +222,16 @@ impl KnowledgePack {
             // NOT a true corpus count — see doc comment above.
             let hits = self
                 .runtime
-                .hybrid_search(token, query, None, limit * 4, Some("concept"), None)
+                .hybrid_search(
+                    token,
+                    query,
+                    None,
+                    limit * 4,
+                    Some("concept"),
+                    None,
+                    &[],
+                    None,
+                )
                 .await?;
 
             // Always fetch entity records for the search hits so we can emit a

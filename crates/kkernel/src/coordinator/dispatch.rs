@@ -372,7 +372,7 @@ impl SubstrateCoordinator {
             };
             if search_notes {
                 match runtime
-                    .search_notes(&token, query, None, limit, kind_filter, false)
+                    .search_notes(&token, query, None, limit, kind_filter, false, &[], None)
                     .await
                 {
                     Ok(note_hits) => {
@@ -396,7 +396,7 @@ impl SubstrateCoordinator {
                 }
             } else {
                 match runtime
-                    .hybrid_search(&token, query, None, limit, kind_filter, None)
+                    .hybrid_search(&token, query, None, limit, kind_filter, None, &[], None)
                     .await
                 {
                     Ok(hits) => {
@@ -458,7 +458,7 @@ impl SubstrateCoordinator {
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(&token, &q, None, limit, kf.as_deref(), false)
+                        .search_notes(&token, &q, None, limit, kf.as_deref(), false, &[], None)
                         .await;
                     match result {
                         Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
@@ -466,7 +466,7 @@ impl SubstrateCoordinator {
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(&token, &q, None, limit, kf.as_deref(), None)
+                        .hybrid_search(&token, &q, None, limit, kf.as_deref(), None, &[], None)
                         .await;
                     match result {
                         Ok(hits) => (backend_id, Ok(hits), None),

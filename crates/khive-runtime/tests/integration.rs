@@ -396,7 +396,7 @@ async fn create_entity_indexes_into_text_search() {
         .await
         .unwrap();
     let hits = rt
-        .hybrid_search(&tok, "FlashAttention", None, 10, None, None)
+        .hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None)
         .await
         .unwrap();
     assert!(
@@ -451,7 +451,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
 
     // Confirm the entity is visible before deletion.
     let hits_before = rt
-        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None, None)
+        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None, None, &[], None)
         .await
         .unwrap();
     assert!(
@@ -462,7 +462,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
     rt.delete_entity(&tok, entity.id, false).await.unwrap(); // soft delete
 
     let hits_after = rt
-        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None, None)
+        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None, None, &[], None)
         .await
         .unwrap();
     assert!(
@@ -490,7 +490,7 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
         .unwrap();
 
     let hits_before = rt
-        .hybrid_search(&tok, "HardDeleteMe", None, 10, None, None)
+        .hybrid_search(&tok, "HardDeleteMe", None, 10, None, None, &[], None)
         .await
         .unwrap();
     assert!(
@@ -503,7 +503,7 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
     // Hard-deleted rows are gone from the entity store; the FTS/vector indexes may still
     // have stale entries. The soft-delete filter sees no alive entity and drops the hit.
     let hits_after = rt
-        .hybrid_search(&tok, "HardDeleteMe", None, 10, None, None)
+        .hybrid_search(&tok, "HardDeleteMe", None, 10, None, None, &[], None)
         .await
         .unwrap();
     assert!(
@@ -2290,7 +2290,7 @@ async fn hybrid_search_surfaces_all_visible_namespaces() {
     // Search: FTS-only (no embedding model in test runtime).
     // With consolidated fts_entities, both namespace entities should surface.
     let hits = rt
-        .hybrid_search(&vis_tok, "stellar", None, 20, None, None)
+        .hybrid_search(&vis_tok, "stellar", None, 20, None, None, &[], None)
         .await
         .unwrap();
 

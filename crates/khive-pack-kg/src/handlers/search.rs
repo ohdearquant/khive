@@ -83,6 +83,8 @@ impl KgPack {
                         search_limit,
                         kind_filter.as_deref(),
                         validated_et.as_deref(),
+                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        props_filter,
                     )
                     .await?;
 
@@ -191,6 +193,8 @@ impl KgPack {
                         search_limit,
                         kind_filter.as_deref(),
                         p.include_superseded.unwrap_or(false),
+                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        props_filter,
                     )
                     .await?;
 
