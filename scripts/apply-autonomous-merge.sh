@@ -48,8 +48,8 @@
 #       Ocean's explicit go.
 #
 # BOOTSTRAP ORDER (do this before STEP=gates can pass its preflight):
-#   1. Merge #215 (Supply-chain gate) and #216 (SemVer/Doc/Dependency-review/
-#      Coverage gates) to main. The gate PRs are themselves blocked by the 1-
+#   1. Merge #215 (Supply-chain gate) and #216 (Doc/Dependency-review/Coverage
+#      gates) to main. The gate PRs are themselves blocked by the 1-
 #      approval rule, so this first batch is Ocean's HC-7 merge.
 #   2. #216 must target main (or an integration/** branch) for its CI to run at
 #      all: ci.yml triggers on `pull_request: branches: [main, integration/**]`,
@@ -87,8 +87,13 @@ STEP="${STEP:-gates}"
 #                               (gitleaks)", "Docs lint",
 #                               "Marketplace example validator"
 #   ci.yml (lands with #215):   "Supply-chain (cargo-deny)"
-#   ci.yml (lands with #216):   "SemVer checks", "Doc build (-D warnings)",
-#                               "Dependency review", "Coverage ratchet"
+#   ci.yml (lands with #216):   "Doc build (-D warnings)", "Dependency review",
+#                               "Coverage ratchet"
+# RELOCATED (NOT a per-PR gate): "SemVer checks". cargo-semver-checks compares each
+#   crate to its crates.io baseline at the SAME version; mid-cycle on a fixed dev
+#   version it is red on accumulated unreleased breaks (and red on main's own push),
+#   so it can never go green as a per-PR required check. It moves to the crates.io
+#   publish path (publish-time, where the version bumps). See the #216 follow-up.
 # EXCLUDED (intentionally NOT required): the two path-filtered bench gates,
 #   "ANN structural regression gate (synthetic, hermetic)" (bench-1m.yml) and
 #   "Pipeline Regression Gate" (bench-pipeline.yml). They only report when a PR
@@ -103,7 +108,6 @@ REQUIRED_CONTEXTS=(
   "Docs lint"
   "Marketplace example validator"
   "Supply-chain (cargo-deny)"
-  "SemVer checks"
   "Doc build (-D warnings)"
   "Dependency review"
   "Coverage ratchet"
