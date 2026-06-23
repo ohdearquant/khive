@@ -488,8 +488,9 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
 }
 
 /// Returns `true` when `low_window` contains the word `token` as a standalone
-/// word — i.e. surrounded by non-alphanumeric boundaries — but NOT as part of
-/// compound identifiers such as `tokenizer`, `token_count`, or `next_token`.
+/// word — i.e. surrounded by non-ASCII-alphanumeric boundaries (CJK/accented
+/// prose counts as a boundary) — but NOT as part of compound identifiers such
+/// as `tokenizer`, `token_count`, or `next_token`.
 fn has_standalone_token(low_window: &str) -> bool {
     let needle = "token";
     let mut start = 0;
@@ -499,13 +500,13 @@ fn has_standalone_token(low_window: &str) -> bool {
             || low_window[..abs]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         let after_end = abs + needle.len();
         let after_ok = after_end >= low_window.len()
             || low_window[after_end..]
                 .chars()
                 .next()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         if before_ok && after_ok {
             return true;
         }
@@ -535,7 +536,7 @@ fn has_token_assignment(low_window: &str) -> bool {
             || low_window[..abs]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         let after_end = abs + needle.len();
         // Require `=` or `:` immediately after `token` (possibly with surrounding
         // whitespace or quotes stripped by the time we see the lowercased window).
@@ -1138,6 +1139,44 @@ mod tests {
             assert!(
                 check(content).is_err(),
                 "credential URL after CJK must be blocked, not panic: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_glued_token_trigger_is_still_flagged() {
+        // Round-4 regression: `token=`/`token:`/standalone `token` glued directly
+        // after non-ASCII prose was missed because has_standalone_token /
+        // has_token_assignment used is_alphanumeric for the word boundary — CJK,
+        // accented letters, and fullwidth digits all count as alphanumeric in
+        // Rust, so the preceding char was not seen as a boundary and the `token`
+        // trigger was suppressed, leaving the high-entropy value unflagged.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let blocked = [
+            format!("数据token={opaque}"),    // CJK + assignment form, ASCII '='
+            format!("配置token: {opaque}"),   // CJK + assignment form, ASCII ':'
+            format!("密钥token {opaque}"),    // CJK + standalone-word form
+            format!("résumétoken: {opaque}"), // accented letter before `token`
+            format!("１token: {opaque}"),     // fullwidth digit before `token`
+        ];
+        for content in &blocked {
+            assert!(
+                check(content).is_err(),
+                "non-ASCII-glued token trigger must flag the value: {content:?}"
+            );
+        }
+        // Compound identifiers stay excluded — the `_` boundary rule is unchanged
+        // and an ASCII letter before `token` is still a continuation, so these
+        // (including the pure-ASCII `servicetoken:`) must still pass.
+        let allowed = [
+            format!("数据next_token: {opaque}"),
+            format!("数据token_count: {opaque}"),
+            format!("servicetoken: {opaque}"),
+        ];
+        for content in &allowed {
+            assert!(
+                check(content).is_ok(),
+                "compound token identifier must not be flagged: {content:?}"
             );
         }
     }
