@@ -38,8 +38,10 @@
 //!   Treating non-ASCII as a delimiter (rather than skipping any whitespace
 //!   token that merely contains it) keeps CJK prose unflagged while still
 //!   catching an ASCII credential glued to CJK text/punctuation/fullwidth
-//!   whitespace.  The literal-prefix checks (Layer 1) run independently and
-//!   catch a prefixed secret regardless of adjacent non-ASCII characters.
+//!   whitespace.  The literal-prefix checks (Layer 1) treat any
+//!   non-ASCII-alphanumeric char (CJK, accented text, emoji) as a token
+//!   boundary, so a known-prefix secret is caught whether the adjacent
+//!   non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -202,7 +204,7 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
             text[..pos]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric())
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
         if at_boundary {
             let payload_start = pos + 6; // skip "FlyV1 "
@@ -256,10 +258,14 @@ fn find_prefix_token<'a>(text: &'a str, needle: &str, min_len: usize) -> Option<
     while let Some(rel) = text[start..].find(needle) {
         let abs = start + rel;
         // Require that the needle starts at a token boundary (start-of-string
-        // or preceded by whitespace / punctuation that isn't alphanumeric).
+        // or preceded by a non-ASCII-alphanumeric char).  The needles are ASCII,
+        // so only an ASCII alphanumeric can be a real continuation of the same
+        // token; CJK/accented text (which Rust counts as `is_alphanumeric`) must
+        // act as a delimiter, else a secret glued to non-Latin prose (`数据AKIA…`)
+        // is missed.
         let at_boundary = abs == 0 || {
             let prev = text[..abs].chars().next_back().unwrap_or(' ');
-            !prev.is_alphanumeric()
+            !prev.is_ascii_alphanumeric()
         };
         if at_boundary {
             let token = extract_token(&text[abs..]);
@@ -1088,6 +1094,27 @@ mod tests {
             check(&content).is_ok(),
             "high-entropy ASCII run with no trigger word must not be flagged"
         );
+    }
+
+    #[test]
+    fn known_prefix_secret_glued_after_cjk_is_still_flagged() {
+        // Round-2 regression: a Layer-1 known-prefix secret glued directly after
+        // CJK prose (no ASCII whitespace) was missed, because the prefix boundary
+        // check used `is_alphanumeric` — which Rust counts true for CJK — so the
+        // preceding ideograph was not treated as a delimiter.  These credentials
+        // must be caught with no nearby ASCII trigger word, on the left side too.
+        let cases = [
+            "数据AKIAIOSFODNN7EXAMPLE",             // gitleaks:allow
+            "令牌github_pat_11ABCDEFG0HIJKLMNOPQR", // gitleaks:allow
+            "密钥sk-ant-api03-AAAAAAAAAAAAAAAAAA",  // gitleaks:allow
+            "配置FlyV1 fm2_AAAABBBBCCCCDDDD",       // gitleaks:allow
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "known-prefix secret glued after CJK must be blocked: {content:?}"
+            );
+        }
     }
 
     #[test]
