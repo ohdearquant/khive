@@ -6213,3 +6213,386 @@ async fn withdraw_with_old_proposal_id_param_is_rejected() {
         "error must mention 'proposal_id'; got: {msg}"
     );
 }
+
+// ── #176 regression: search(kind="note") must honour `tags` and `properties` filters ──
+
+/// #176 / ADR-029: search(kind="note", tags=["target"]) must exclude notes whose stored
+/// `properties.tags` array does not contain "target".
+///
+/// Both notes share identical query text (so the search engine returns both), but only
+/// one carries `{"tags": ["target"]}` in its properties. After the fix the handler must
+/// return exactly 1 hit; before the fix it returns 2 (filter is silently dropped).
+///
+/// Tags on notes are stored inside `properties["tags"]` (same convention as
+/// `memory.remember`); there is no separate tags column on the notes table.
+/// Notes are created via `pack.dispatch("create", ...)` so FTS indexing occurs.
+#[tokio::test]
+async fn search_note_tag_filter_excludes_non_matching_notes() {
+    let pack = pack();
+
+    // Note 1: shared searchable text + target tag stored in properties["tags"].
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "shared tag search target text alpha nvk176",
+                "properties": {"tags": ["target"]}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note 2: same text, different tag.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "shared tag search target text alpha nvk176",
+            "properties": {"tags": ["other"]}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "shared tag search target text alpha nvk176",
+                "tags": ["target"],
+            }),
+        )
+        .await
+        .expect("#176: search with tags filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#176: tags filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#176: the matching note must be note_a; got {ids:?}"
+    );
+}
+
+/// #176 / ADR-029: search(kind="note", properties={"domain":"inference"}) must exclude
+/// notes whose properties don't match.
+///
+/// Both notes share identical query text; only note_a has `{"domain":"inference"}`.
+/// After the fix the handler returns exactly 1 hit.
+/// Notes are created via `pack.dispatch("create", ...)` so FTS indexing occurs.
+#[tokio::test]
+async fn search_note_properties_filter_excludes_non_matching_notes() {
+    let pack = pack();
+
+    // Note 1: matching property value.
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "shared props search target text beta nvk176",
+                "properties": {"domain": "inference"}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note 2: different property value.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "shared props search target text beta nvk176",
+            "properties": {"domain": "training"}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "shared props search target text beta nvk176",
+                "properties": {"domain": "inference"},
+            }),
+        )
+        .await
+        .expect("#176: search with properties filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#176: properties filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#176: the matching note must be note_a; got {ids:?}"
+    );
+}
+
+/// #223 recall-cliff regression: verifies that a note carrying the target tag
+/// but ranking below position 40 (the old `(limit*4).min(100)=40` handler cap
+/// with limit=10) is still returned when the NEW cap of 500 is in effect.
+///
+/// Design:
+///   - 45 "noise" notes whose content repeats the query term 8× — BM25 ranks
+///     them well above the rare note which uses the term only once.
+///   - 1 "rare" note with the term once — ranks at position 46 in the
+///     unfiltered corpus, safely beyond the old cap of 40 but well within 500.
+///
+/// Two-phase assertion:
+///   1. Unfiltered search (limit=500) confirms the rare note's rank is > 40
+///      and <= 500 — proving the geometry. This assertion FAILS under the old
+///      cap (the rare note would be absent from a limit=40 result set).
+///   2. Filtered search (tags=["rare"], limit=10) asserts the rare note IS
+///      returned — proving the NEW cap of 500 reaches it.
+///
+/// If someone reverts the handler cap to `(limit*4).min(100)`, phase 2 will
+/// fail because search_notes(limit=40) truncates before reaching rank 46.
+#[tokio::test]
+async fn search_note_tag_filter_recall_cliff_bounded_scan() {
+    let pack = pack();
+
+    // 45 noise notes: content repeats the query term 8× so BM25 places them
+    // well above the rare note (1 occurrence). This pushes the rare note to
+    // rank ~46, beyond the old handler cap of (10*4).min(100)=40.
+    for i in 0..45u32 {
+        let repeated = "cliffterm nvk223rc ".repeat(8);
+        pack.dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": format!("{repeated}noise {i}"),
+                "properties": {"tags": ["noise"]}
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create noise note {i} must succeed: {e}"));
+    }
+
+    // The rare note uses the query term only once → ranks below all 45 noise
+    // notes in BM25 order (position ~46).
+    let rare = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "cliffterm nvk223rc rare",
+                "properties": {"tags": ["rare"]}
+            }),
+        )
+        .await
+        .expect("create rare note must succeed");
+    let rare_id = rare.get("id").and_then(Value::as_str).expect("id");
+
+    // Phase 1 — geometry check: unfiltered search with limit=500 must include
+    // the rare note, and its rank must be > 40 (the old cap) and <= 500.
+    // This asserts the rare note sits in the window the NEW cap opens up.
+    let unfiltered = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "cliffterm nvk223rc",
+                "limit": 500,
+            }),
+        )
+        .await
+        .expect("#223: unfiltered search must not error");
+
+    let all_ids: Vec<String> = unfiltered
+        .as_array()
+        .expect("response must be array")
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+
+    let rare_rank = all_ids
+        .iter()
+        .position(|id| id == rare_id)
+        .map(|pos| pos + 1) // 1-based rank
+        .expect("#223[phase1]: rare note must appear in the unfiltered result set");
+
+    assert!(
+        rare_rank > 40,
+        "#223[phase1]: rare note rank must be > 40 (old handler cap) so the cliff is real; got rank={rare_rank}"
+    );
+    assert!(
+        rare_rank <= 500,
+        "#223[phase1]: rare note rank must be <= 500 (new handler cap); got rank={rare_rank}"
+    );
+
+    // Phase 2 — filter check: with tag filter "rare" and limit=10 the new
+    // handler cap of 500 must reach the rare note; the old cap of 40 would not.
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "cliffterm nvk223rc",
+                "tags": ["rare"],
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("#223: filtered search must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let filtered_ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert!(
+        filtered_ids.contains(&rare_id),
+        "#223[phase2]: rare note (rank={rare_rank} > 40) must be returned with new cap=500; ids={filtered_ids:?}"
+    );
+    assert!(
+        filtered_ids.len() <= 10,
+        "#223[phase2]: result must not exceed limit=10; got {}: ids={filtered_ids:?}",
+        filtered_ids.len()
+    );
+}
+
+/// #223: search(kind="note", tags=[nonexistent]) where no note matches must return empty.
+#[tokio::test]
+async fn search_note_tag_filter_no_match_returns_empty() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "no match tag filter test nvk223",
+            "properties": {"tags": ["existing"]}
+        }),
+    )
+    .await
+    .expect("create note must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "no match tag filter test nvk223",
+                "tags": ["nonexistent-tag-xyz"],
+            }),
+        )
+        .await
+        .expect("#223: search with no-match tag filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    assert!(
+        arr.is_empty(),
+        "#223: tag filter matching nothing must return empty array; got: {arr:?}"
+    );
+}
+
+/// #223: search(kind="note") with combined property+tag filter must honour both
+/// predicates simultaneously (AND semantics). Notes matching only one predicate
+/// are excluded.
+#[tokio::test]
+async fn search_note_combined_property_and_tag_filter() {
+    let pack = pack();
+
+    // Note A: matches both property AND tag.
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "combined filter test nvk223 alpha",
+                "properties": {"domain": "inference", "tags": ["target"]}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note B: matches tag but NOT property.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "combined filter test nvk223 alpha",
+            "properties": {"domain": "training", "tags": ["target"]}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    // Note C: matches property but NOT tag.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "combined filter test nvk223 alpha",
+            "properties": {"domain": "inference", "tags": ["other"]}
+        }),
+    )
+    .await
+    .expect("create note_c must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "combined filter test nvk223 alpha",
+                "properties": {"domain": "inference"},
+                "tags": ["target"],
+            }),
+        )
+        .await
+        .expect("#223: combined filter search must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#223: combined property+tag filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#223: only note_a matches both predicates; got {ids:?}"
+    );
+}
