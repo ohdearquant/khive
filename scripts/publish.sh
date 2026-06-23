@@ -28,7 +28,8 @@ set -euo pipefail
 #   wait between each.
 #
 # Prerequisites:
-#   cargo login  (one-time crates.io token setup)
+#   cargo login                                 (one-time crates.io token setup)
+#   cargo install cargo-semver-checks --locked  (SemVer release gate — see below)
 
 LIVE_MODE=false
 if [[ "${1:-}" == "--live" ]]; then

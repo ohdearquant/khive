@@ -36,10 +36,12 @@ Adopt a single-lane autonomous merge pipeline.
 Every PR that passes the full required gate wall (section 1) merges automatically to `main`
 without human review. No pull request requires a human approver before merging to `main`.
 
-The human gate is the release: publishing a versioned artifact (crates.io, npm) requires
-explicit human approval via a GitHub Environment protection rule (section 3). A merge to `main`
-is not a release; it is the unit of continuous delivery into the trunk, which the release gate
-samples when a human decides to publish.
+The human gate is the release: no merge to `main` publishes anything. The npm artifact release
+is held by a GitHub Environment protection rule (section 3); the crates.io library publish is a
+separate maintainer-operated `make publish` step, run by hand from a machine that holds the
+crates.io token. Neither publish path is reachable from autonomous trunk delivery. A merge to
+`main` is not a release; it is the unit of continuous delivery into the trunk, which the release
+gate samples when a human decides to publish.
 
 A non-automatable floor (section 4) is never delegated to automation.
 
@@ -154,9 +156,19 @@ natively, not by workflow logic. Even if `release.yml` is modified in a PR, the 
 does not take effect on `main` until the PR merges and a human cuts a release tag, at which
 point the environment gate intercepts the publish job.
 
-The crates.io token and the npm token are scoped to the `publish` environment's secrets and are
-not accessible to any job that does not run in that environment. This is the authorization
-boundary between autonomous trunk delivery and artifact publication.
+The npm token is scoped to the `publish` environment's secrets and is not accessible to any job
+that does not run in that environment. This is the authorization boundary between autonomous
+trunk delivery and npm publication. The crates.io library publish does not run in CI at all:
+`scripts/publish.sh` (`make publish`) runs on a maintainer's machine using a local `cargo login`
+token, so reaching crates.io already requires a human with publish rights invoking the command by
+hand — no CI path, autonomous or otherwise, holds a crates.io token.
+
+`release.yml` also accepts `workflow_dispatch` for manual releases. To keep the SemVer gate
+unbypassable, the workflow refuses a manual dispatch from any ref other than `main` (the tag-push
+path is unconstrained — a `v*` tag's own checked-out workflow carries the gate), and the `publish`
+environment's deployment-branch policy restricts deployments to `main` and `v*` tags. A manual
+release therefore always runs `main`'s current gate, never an older ref whose workflow predates
+it.
 
 The release path also enforces API-surface stability — the relocation of the former per-PR SemVer
 check. `release.yml` runs a `SemVer gate (release)` job (pinned `cargo-semver-checks`) that
@@ -205,8 +217,9 @@ These properties are enforced at all times and are never relaxed:
   change after a dependent change has landed can break the build. The dependency chain is
   foundation to platform to features. Post-merge monitoring and fast revert discipline are the
   operational backstops.
-- Publishing to crates.io and npm stays human-gated via the `publish` environment (section 3).
-  A published version cannot be unpublished after the registry retains it.
+- Publishing stays human-gated. The npm release is held by the `publish` environment's required
+  reviewer (section 3); the crates.io library publish is a maintainer-run `make publish` with no
+  autonomous CI path. A published version cannot be unpublished after the registry retains it.
 
 ## Activation order
 

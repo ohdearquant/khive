@@ -315,14 +315,27 @@ step_release_gate() {
   local admin_id admin_login body
   admin_id="$(gh api user --jq .id)"
   admin_login="$(gh api user --jq .login)"
+  # Restrict which refs may deploy to the publish environment to `main` and `v*`
+  # release tags. This is the structural half of the workflow_dispatch hole fix:
+  # a manual release dispatched from an arbitrary feature branch cannot deploy
+  # here. (release.yml adds the matching workflow-level guard refusing manual
+  # dispatch from any ref but main.) custom_branch_policies=true means the named
+  # policies POSTed below are the allowlist.
   body="$(jq -n --argjson id "${admin_id}" \
-    '{wait_timer:0, reviewers:[{type:"User", id:$id}], deployment_branch_policy:null}')"
+    '{wait_timer:0, reviewers:[{type:"User", id:$id}], deployment_branch_policy:{protected_branches:false, custom_branch_policies:true}}')"
   if [[ "${DRY_RUN}" != "false" ]]; then
     echo "[DRY RUN] PUT repos/${REPO}/environments/${ENVIRONMENT} (required reviewer: ${admin_login}, id ${admin_id})"
     echo "${body}" | jq .
+    echo "[DRY RUN] POST deployment-branch-policies: tag 'v*', branch 'main'"
   else
     echo "${body}" | gh api --method PUT "repos/${REPO}/environments/${ENVIRONMENT}" --input - >/dev/null
-    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login})."
+    # Define the ref allowlist. POST is idempotent enough for reruns — a duplicate
+    # name returns 422, which we ignore so a re-apply does not abort.
+    gh api --method POST "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" \
+      -f name='v*' -f type='tag' >/dev/null 2>&1 || true
+    gh api --method POST "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" \
+      -f name='main' -f type='branch' >/dev/null 2>&1 || true
+    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main, v* tags)."
   fi
 }
 
