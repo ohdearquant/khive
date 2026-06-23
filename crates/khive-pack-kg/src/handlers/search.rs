@@ -143,39 +143,85 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                let props_filter = p.properties.as_ref().and_then(|v| {
+                    if v.as_object().is_some_and(|m| !m.is_empty()) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+                let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
+                let search_limit = if props_filter.is_some() || tag_filter.is_some() {
+                    (limit * 4).min(100)
+                } else {
+                    limit
+                };
                 let hits = self
                     .runtime
                     .search_notes(
                         token,
                         &p.query,
                         None,
-                        limit,
+                        search_limit,
                         kind_filter.as_deref(),
                         p.include_superseded.unwrap_or(false),
                     )
                     .await?;
 
-                let note_kinds: HashMap<Uuid, String> = if hits.is_empty() {
+                // Fetch each note to capture kind and properties for post-filtering.
+                let note_meta: HashMap<Uuid, (String, Option<Value>)> = if hits.is_empty() {
                     HashMap::new()
                 } else {
                     let note_store = self.runtime.notes(token)?;
                     let mut map = HashMap::new();
                     for h in &hits {
                         if let Ok(Some(n)) = note_store.get_note(h.note_id).await {
-                            map.insert(h.note_id, n.kind);
+                            map.insert(h.note_id, (n.kind, n.properties));
                         }
                     }
                     map
                 };
 
+                let filtered_hits: Vec<_> = if props_filter.is_some() || tag_filter.is_some() {
+                    hits.into_iter()
+                        .filter(|h| {
+                            let Some((_, props)) = note_meta.get(&h.note_id) else {
+                                return false;
+                            };
+                            let props_ok = props_filter
+                                .is_none_or(|pf| props_match(props.as_ref(), pf));
+                            let tags_ok = tag_filter.is_none_or(|wanted| {
+                                let note_tags: Vec<String> = props
+                                    .as_ref()
+                                    .and_then(|p| p.get("tags"))
+                                    .and_then(Value::as_array)
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_owned)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                tags_match_any(&note_tags, wanted)
+                            });
+                            props_ok && tags_ok
+                        })
+                        .take(limit as usize)
+                        .collect()
+                } else {
+                    hits
+                };
+
                 let score_floor = p.min_score.unwrap_or(0.0).max(0.0);
-                let result: Vec<Value> = hits
+                let result: Vec<Value> = filtered_hits
                     .iter()
                     .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
+                        let note_kind =
+                            note_meta.get(&h.note_id).map(|(k, _)| k.as_str());
                         serde_json::json!({
                             "id": h.note_id.to_string(),
-                            "note_kind": note_kinds.get(&h.note_id),
+                            "note_kind": note_kind,
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,

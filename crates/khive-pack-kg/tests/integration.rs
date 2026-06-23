@@ -6213,3 +6213,145 @@ async fn withdraw_with_old_proposal_id_param_is_rejected() {
         "error must mention 'proposal_id'; got: {msg}"
     );
 }
+
+// ── #176 regression: search(kind="note") must honour `tags` and `properties` filters ──
+
+/// #176 / ADR-029: search(kind="note", tags=["target"]) must exclude notes whose stored
+/// `properties.tags` array does not contain "target".
+///
+/// Both notes share identical query text (so the search engine returns both), but only
+/// one carries `{"tags": ["target"]}` in its properties. After the fix the handler must
+/// return exactly 1 hit; before the fix it returns 2 (filter is silently dropped).
+///
+/// Tags on notes are stored inside `properties["tags"]` (same convention as
+/// `memory.remember`); there is no separate tags column on the notes table.
+/// Notes are created via `pack.dispatch("create", ...)` so FTS indexing occurs.
+#[tokio::test]
+async fn search_note_tag_filter_excludes_non_matching_notes() {
+    let pack = pack();
+
+    // Note 1: shared searchable text + target tag stored in properties["tags"].
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "shared tag search target text alpha nvk176",
+                "properties": {"tags": ["target"]}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note 2: same text, different tag.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "shared tag search target text alpha nvk176",
+            "properties": {"tags": ["other"]}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "shared tag search target text alpha nvk176",
+                "tags": ["target"],
+            }),
+        )
+        .await
+        .expect("#176: search with tags filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#176: tags filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#176: the matching note must be note_a; got {ids:?}"
+    );
+}
+
+/// #176 / ADR-029: search(kind="note", properties={"domain":"inference"}) must exclude
+/// notes whose properties don't match.
+///
+/// Both notes share identical query text; only note_a has `{"domain":"inference"}`.
+/// After the fix the handler returns exactly 1 hit.
+/// Notes are created via `pack.dispatch("create", ...)` so FTS indexing occurs.
+#[tokio::test]
+async fn search_note_properties_filter_excludes_non_matching_notes() {
+    let pack = pack();
+
+    // Note 1: matching property value.
+    let note_a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "shared props search target text beta nvk176",
+                "properties": {"domain": "inference"}
+            }),
+        )
+        .await
+        .expect("create note_a must succeed");
+    let note_a_id = note_a.get("id").and_then(Value::as_str).expect("id");
+
+    // Note 2: different property value.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "shared props search target text beta nvk176",
+            "properties": {"domain": "training"}
+        }),
+    )
+    .await
+    .expect("create note_b must succeed");
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "shared props search target text beta nvk176",
+                "properties": {"domain": "inference"},
+            }),
+        )
+        .await
+        .expect("#176: search with properties filter must not error");
+
+    let arr = resp.as_array().expect("response must be array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "#176: properties filter must return exactly 1 hit; got {}: ids={ids:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids[0], note_a_id,
+        "#176: the matching note must be note_a; got {ids:?}"
+    );
+}
