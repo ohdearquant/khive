@@ -92,8 +92,11 @@ STEP="${STEP:-gates}"
 # RELOCATED (NOT a per-PR gate): "SemVer checks". cargo-semver-checks compares each
 #   crate to its crates.io baseline at the SAME version; mid-cycle on a fixed dev
 #   version it is red on accumulated unreleased breaks (and red on main's own push),
-#   so it can never go green as a per-PR required check. It moves to the crates.io
-#   publish path (publish-time, where the version bumps). See the #216 follow-up.
+#   so it can never go green as a per-PR required check. It is enforced at the
+#   publish boundary instead, where the version actually bumps and the check is
+#   green-able: the "SemVer gate (release)" job in release.yml (publish-all depends
+#   on it) and the cargo-semver-checks preflight in scripts/publish.sh. This is a
+#   real gate on the publish path, not a deferred follow-up (ADR-066 §3).
 # EXCLUDED (intentionally NOT required): the two path-filtered bench gates,
 #   "ANN structural regression gate (synthetic, hermetic)" (bench-1m.yml) and
 #   "Pipeline Regression Gate" (bench-pipeline.yml). They only report when a PR

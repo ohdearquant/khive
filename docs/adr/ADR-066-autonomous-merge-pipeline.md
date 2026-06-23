@@ -4,7 +4,7 @@
 **Date**: 2026-06-23 (revised; original 2026-06-22)
 **Supersedes**: ADR-066 draft dated 2026-06-22 (two-lane model with CODEOWNERS hold)
 **Relates to**: CI workflow (`.github/workflows/ci.yml`, `.github/workflows/release.yml`),
-`scripts/apply-branch-protection.sh`, repository ruleset 17362266
+`scripts/apply-autonomous-merge.sh`, repository ruleset 17362266
 
 ---
 
@@ -49,7 +49,7 @@ A non-automatable floor (section 4) is never delegated to automation.
 
 Branch protection on `main` (ruleset 17362266) requires all of the following status contexts.
 Context strings are matched by exact name; the canonical list lives in
-`scripts/apply-branch-protection.sh`, which is the source of truth for the exact strings and
+`scripts/apply-autonomous-merge.sh`, which is the source of truth for the exact strings and
 must be kept in sync with this ADR.
 
 Each gate in the wall replaces a category of defect that a human reviewer would otherwise be
@@ -76,11 +76,14 @@ responsible for catching.
 
 **API stability and documentation (replaces review for interface breakage and doc rot)**
 
-- `SemVer checks` — validates that the public API diff of each modified crate is consistent with
-  the version bump in `Cargo.toml`; a breaking change without a major-version increment blocks
-  merge.
 - `Doc build (-D warnings)` — runs `cargo doc --workspace --no-deps` with `-D warnings` so
   broken intra-doc links and malformed doc comments fail the gate rather than silently rot.
+
+API-surface stability (SemVer) is deliberately **not** a per-PR required check. `cargo-semver-checks`
+compares each crate against its crates.io baseline _at the same version_, so on a workspace that pins
+a fixed dev version mid-cycle and bumps only at release it is permanently red — it can never go green
+as a per-PR gate and would wedge the wall. SemVer is enforced at the boundary where the version
+actually bumps and the check is green-able: the release gate (section 3).
 
 **Quality ratchet (replaces review for regression in coverage and code hygiene)**
 
@@ -102,7 +105,7 @@ responsible for catching.
   in depth.
 
 The full, authoritative context list and the exact strings used in the ruleset are maintained in
-`scripts/apply-branch-protection.sh`. When a new gate is introduced and its context name is
+`scripts/apply-autonomous-merge.sh`. When a new gate is introduced and its context name is
 established, that script is updated first, and this ADR's prose is updated to match.
 
 ### 2. Auto-merge mechanics
@@ -139,7 +142,8 @@ The gate-defining path routing in section 3 documents this risk and the structur
 Merging to `main` is not a release. Publishing is a separate step, gated on human approval.
 
 `release.yml` triggers on a `v*` tag push and on `workflow_dispatch`. It builds platform
-binaries and publishes to crates.io and npm. The publish job (`publish-all`) runs in a GitHub
+binaries and publishes the npm packages; the crates.io library publish is the separate
+`scripts/publish.sh` (`make publish`) path. The npm publish job (`publish-all`) runs in a GitHub
 **Environment** named `publish`. That environment carries a **required reviewer** protection
 rule listing the maintainer. GitHub pauses the workflow at every job targeting `publish` and
 waits for an authorized reviewer to approve the deployment before any publish step executes.
@@ -154,6 +158,16 @@ The crates.io token and the npm token are scoped to the `publish` environment's 
 not accessible to any job that does not run in that environment. This is the authorization
 boundary between autonomous trunk delivery and artifact publication.
 
+The release path also enforces API-surface stability — the relocation of the former per-PR SemVer
+check. `release.yml` runs a `SemVer gate (release)` job (pinned `cargo-semver-checks`) that
+`publish-all` depends on, so a semver-incoherent tag cannot publish. `scripts/publish.sh` runs the
+same check before any `cargo publish` to crates.io, covering the library-publish path that does not
+flow through `release.yml`. cargo-semver-checks validates that the public-API diff is consistent
+with the version bump; at release the version has bumped, so a breaking change shipped under a
+non-breaking bump fails the gate. This is the boundary where the check is both meaningful and
+green-able, unlike the per-PR position (section 1). `khive-quant` (no crates.io baseline yet) is
+excluded until its first publish.
+
 ### 4. Gate-defining files and structural defense
 
 A PR that modifies the gate wall's own scripts or workflows could, if that PR merges
@@ -164,7 +178,7 @@ runs the head's own files.
 The structural mitigation is depth of the wall: no single script or workflow file defines the
 full gate. `CI (ubuntu-latest)` and `CI (macos-latest)` run `scripts/ci.sh`; modifying that
 script changes what those jobs check. But `Supply-chain (cargo-deny)`, `Secret scan
-(gitleaks)`, `Dependency review`, `SemVer checks`, `Doc build (-D warnings)`, and `Coverage
+(gitleaks)`, `Dependency review`, `Doc build (-D warnings)`, and `Coverage
 ratchet` run through independent mechanisms. A PR that weakens `ci.sh` does not disable the
 other contexts. The only PR that could weaken the full wall simultaneously is one that modifies
 every gate in a single diff, which is both impractical and conspicuous.
@@ -201,7 +215,7 @@ required approvals to zero before the full gate wall is enforced opens a window 
 merge over a thinner wall. The order is:
 
 1. Land the companion gate PRs (#215 and the new-gates PR) on `main`. These establish the
-   `Supply-chain (cargo-deny)`, `No-stub guard`, `SemVer checks`, `Doc build (-D warnings)`,
+   `Supply-chain (cargo-deny)`, `No-stub guard`, `Doc build (-D warnings)`,
    `Dependency review`, and `Coverage ratchet` contexts. Until a context's job exists on `main`,
    do not add it to the required set in the ruleset; a required check that never reports
    permanently blocks merge.
