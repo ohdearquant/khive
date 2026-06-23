@@ -163,12 +163,21 @@ trunk delivery and npm publication. The crates.io library publish does not run i
 token, so reaching crates.io already requires a human with publish rights invoking the command by
 hand — no CI path, autonomous or otherwise, holds a crates.io token.
 
-`release.yml` also accepts `workflow_dispatch` for manual releases. To keep the SemVer gate
-unbypassable, the workflow refuses a manual dispatch from any ref other than `main` (the tag-push
-path is unconstrained — a `v*` tag's own checked-out workflow carries the gate), and the `publish`
-environment's deployment-branch policy restricts deployments to `main` and `v*` tags. A manual
-release therefore always runs `main`'s current gate, never an older ref whose workflow predates
-it.
+`release.yml` also accepts `workflow_dispatch` for manual releases. The workflow refuses a manual
+dispatch from any ref other than `main`, so a dispatched release always runs `main`'s current
+SemVer gate. A `v*` tag push runs that tag's own checked-out workflow: a tag cut from a gated
+commit — the normal case, since releases are cut from `main` HEAD — carries the gate, but a tag
+deliberately cut at a pre-gate commit would run an ungated workflow. The `publish` environment's
+deployment-branch policy restricts deployments to `main` and `v*` tags, which blocks dispatch from
+arbitrary branches but does not by itself prove a `v*` tag points at a gated commit.
+
+The universal backstop for every publish path is therefore the `publish` environment's required
+reviewer (above): no npm version reaches the registry without a human approving that specific
+deployment. The SemVer gate is automated defense-in-depth layered on top of that human gate, not a
+replacement for it. The autonomous-merge safety invariant — _nothing publishes without human
+approval_ — holds on every path. Closing the old-tag SemVer gap structurally (making
+`main`-dispatch the only publish trigger) is tracked as a follow-up, not required for the
+invariant.
 
 The release path also enforces API-surface stability — the relocation of the former per-PR SemVer
 check. `release.yml` runs a `SemVer gate (release)` job (pinned `cargo-semver-checks`) that
