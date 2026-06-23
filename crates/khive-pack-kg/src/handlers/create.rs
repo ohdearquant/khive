@@ -235,6 +235,8 @@ impl KgPack {
                     DEDUP_LIMIT + 1,
                     Some(kind.as_str()),
                     None,
+                    &[],
+                    None,
                 )
                 .await
             {

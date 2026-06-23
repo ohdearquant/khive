@@ -345,11 +345,16 @@ impl KhiveRuntime {
     ///   The text/vector candidate pools are unfiltered up front; the kind
     ///   filter applies at the alive-check stage where we already fetch each
     ///   candidate to confirm it isn't soft-deleted.
+    /// - `tags_any`: when non-empty, only entities that have at least one of these
+    ///   tags (case-insensitive) survive the alive-set intersection. Applied BEFORE
+    ///   truncation so matches ranked beyond `limit` in the raw fusion are not lost.
+    /// - `properties_filter`: when `Some`, only entities whose properties are a
+    ///   superset of the given JSON object survive. Applied BEFORE truncation.
     ///
     /// `limit` caps the final returned list; internally pulls `limit * 4` candidates per path.
-    /// The fused candidate set is kept untruncated until after the alive + kind filter so
-    /// that right-kind hits ranked below `limit` in the raw fusion still surface when
-    /// higher-ranked candidates are wrong-kind or soft-deleted.
+    /// The fused candidate set is kept untruncated until after the alive + kind + tag +
+    /// properties filter so that matching hits ranked below `limit` in the raw fusion
+    /// still surface when higher-ranked candidates are excluded by any filter.
     ///
     /// # Cross-namespace visibility (entity search — primary namespace only; deferred)
     ///
@@ -384,6 +389,8 @@ impl KhiveRuntime {
         limit: u32,
         entity_kind: Option<&str>,
         entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -420,12 +427,16 @@ impl KhiveRuntime {
         };
 
         // Fuse without truncating: keep the full candidate pool through the
-        // alive/kind filter so right-kind hits below rank `limit` aren't lost.
+        // alive/kind/tag/property filter so matching hits below rank `limit`
+        // aren't lost when higher-ranked candidates are excluded.
         let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize, query_text);
 
-        // Filter to alive entities (and optionally to a specific kind). A single
-        // query fetches all alive IDs that match the kind constraint from the
-        // fused set; any ID absent has been soft-deleted or doesn't match.
+        // Filter to alive entities (and optionally to a specific kind, tags, or
+        // properties). A single query fetches all alive IDs that match the kind
+        // and tag constraints from the fused set; any ID absent has been
+        // soft-deleted or doesn't match. The SQL-level `tags_any` filter is
+        // pushed into `query_entities`; properties filtering (no SQL column)
+        // is applied at the Rust level using the entity records already fetched.
         if !fused.is_empty() {
             let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
             let alive_page = self
@@ -437,6 +448,7 @@ impl KhiveRuntime {
                         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
                         entity_types: entity_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
                         namespaces: visible_ns,
+                        tags_any: tags_any.to_vec(),
                         ..EntityFilter::default()
                     },
                     PageRequest {
@@ -445,10 +457,18 @@ impl KhiveRuntime {
                     },
                 )
                 .await?;
-            // Keep entity metadata to enrich hits that had no FTS5 title/snippet.
+            // Keep entity metadata to enrich hits that had no FTS5 title/snippet,
+            // and to apply the properties filter before truncation.
             let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
             let mut alive: HashSet<Uuid> = HashSet::new();
             for e in alive_page.items {
+                // Apply properties predicate here — before adding to the alive set —
+                // so that non-matching candidates are dropped before truncation.
+                if let Some(pf) = properties_filter {
+                    if !entity_props_match(e.properties.as_ref(), pf) {
+                        continue;
+                    }
+                }
                 alive.insert(e.id);
                 entity_meta.insert(e.id, (e.name, e.description));
             }
@@ -926,6 +946,27 @@ impl KhiveRuntime {
     }
 }
 
+/// Returns `true` when `entity_props` is a superset of all key-value pairs in `filter`.
+///
+/// Mirrors the semantics of `khive_pack_kg::handlers::common::props_match` so that the
+/// storage-leg predicate is identical to the handler-side post-filter.
+fn entity_props_match(
+    entity_props: Option<&serde_json::Value>,
+    filter: &serde_json::Value,
+) -> bool {
+    let required = match filter.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return true,
+    };
+    let actual = match entity_props.and_then(serde_json::Value::as_object) {
+        Some(obj) => obj,
+        None => return false,
+    };
+    required
+        .iter()
+        .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
+}
+
 /// Score bonus applied when an entity's title is an exact case-insensitive match for
 /// the query. Dominates RRF scores (~0.09–0.18 range with k=10) so that an exact
 /// name match always ranks above any partial or semantic match.
@@ -1252,7 +1293,7 @@ mod tests {
         .unwrap();
 
         let hits = rt
-            .hybrid_search(&tok, "FlashAttention", None, 10, None, None)
+            .hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None)
             .await
             .unwrap();
 
@@ -1262,6 +1303,144 @@ mod tests {
         assert!(
             hit.title.as_deref().unwrap().contains("FlashAttention"),
             "title must contain entity name"
+        );
+    }
+
+    // ---- issue #225 regression: predicate pushdown before truncation ----
+
+    /// Regression test for issue #225 (entity branch).
+    ///
+    /// Scenario: `limit=1`, tag_filter=["target-tag"]. Two entities are inserted:
+    ///   - "decoy_alpha_beta_gamma": many query tokens → ranks 1 in FTS (dominates).
+    ///     Does NOT have "target-tag".
+    ///   - "alpha_beta_gamma target": fewer query tokens → ranks 2 in FTS.
+    ///     HAS "target-tag".
+    ///
+    /// Without predicate pushdown: `fused.truncate(1)` keeps only the decoy. The
+    /// tag-matching entity is invisible. The test asserts the matching entity IS
+    /// returned — this assertion fails on the unfixed code (where tags_any is not
+    /// passed into `query_entities`) and passes after the fix.
+    ///
+    /// Isomorphism: reverting `tags_any: tags_any.to_vec()` in the `EntityFilter`
+    /// inside `hybrid_search` re-breaks this test (the decoy survives `retain` and
+    /// occupies the single slot, dropping the target).
+    #[tokio::test]
+    async fn hybrid_search_tag_filter_pushed_before_truncation() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        // Decoy: high-ranking FTS hit (content repeats query words), no target tag.
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "alpha beta gamma decoy alpha beta gamma",
+            Some("alpha beta gamma decoy description alpha beta gamma"),
+            None,
+            vec!["other-tag".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Target: lower-ranking FTS hit, has the tag we filter on.
+        let target = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "alpha beta gamma target",
+                Some("alpha beta gamma target description"),
+                None,
+                vec!["target-tag".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // With limit=1 and tag_filter, the fix must return the target entity despite
+        // the decoy ranking higher. Without pushdown, the decoy occupies the single
+        // slot and the target is silently dropped.
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                "alpha beta gamma",
+                None,
+                1,
+                None,
+                None,
+                &["target-tag".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one hit expected (the tag-matching entity)"
+        );
+        assert_eq!(
+            hits[0].entity_id, target.id,
+            "the tag-filtered entity must be returned even when ranked below limit in raw fusion"
+        );
+    }
+
+    /// Regression test for issue #225 (entity branch, properties predicate).
+    ///
+    /// Scenario: `limit=1`, properties_filter={{"domain": "target"}}. Two entities:
+    ///   - decoy: high FTS rank, properties {{"domain": "other"}}.
+    ///   - target: lower FTS rank, properties {{"domain": "target"}}.
+    ///
+    /// Without pushdown: decoy fills the slot, target is dropped. With pushdown:
+    /// only the target survives the properties filter before truncation.
+    #[tokio::test]
+    async fn hybrid_search_props_filter_pushed_before_truncation() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "delta epsilon zeta decoy delta epsilon zeta",
+            Some("delta epsilon zeta decoy description delta epsilon zeta"),
+            Some(serde_json::json!({"domain": "other"})),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let target = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "delta epsilon zeta target",
+                Some("delta epsilon zeta target description"),
+                Some(serde_json::json!({"domain": "target"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let filter = serde_json::json!({"domain": "target"});
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                "delta epsilon zeta",
+                None,
+                1,
+                None,
+                None,
+                &[],
+                Some(&filter),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1, "exactly one hit expected (properties match)");
+        assert_eq!(
+            hits[0].entity_id, target.id,
+            "the properties-filtered entity must be returned even when ranked below limit"
         );
     }
 

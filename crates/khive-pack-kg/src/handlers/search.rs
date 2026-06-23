@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 
-/// Maximum candidate window used when property/tag post-filters are active.
+/// Maximum candidate window used when property/tag filters are active.
 ///
-/// Both the entity and note branches apply property/tag predicates after the
-/// FTS+vector ranking step (the storage legs have no awareness of these fields).
-/// Using a large-but-bounded scan window reduces the probability of missing a
-/// match that ranked just below the bare `limit`. Matches ranked beyond this
-/// cap may still be silently dropped — the proper fix is to push the predicates
-/// into the storage leg, tracked in GitHub issue #225.
+/// Predicates are applied BEFORE result truncation inside the runtime's
+/// candidate budget (`search_limit × CANDIDATE_MULTIPLIER`). This constant
+/// widens the handler's initial `search_limit` so that sparse matches ranked
+/// just below the bare `limit` remain within the candidate window.
+/// Matches ranked beyond the overall budget may still be missed — use
+/// specific query text to keep target records near the top of the ranking.
 const FILTERED_SCAN_CAP: u32 = 500;
 
 use serde_json::Value;
@@ -62,14 +62,11 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // Property/tag predicates are applied post-ranking (the storage
-                    // legs have no awareness of entity properties/tags). Widen the
-                    // candidate window so sparse matches ranked below the bare `limit`
-                    // are still visible. The cap of FILTERED_SCAN_CAP is a
-                    // best-effort bound — matches ranked beyond it may still be missed
-                    // (known limitation: both entity and note branches share this
-                    // cliff; pushing predicates into the storage leg is the proper
-                    // fix, tracked in GitHub issue #225).
+                    // Widen the candidate window so sparse matches ranked below the
+                    // bare `limit` remain within the runtime's retrieval budget.
+                    // Predicates are applied BEFORE result truncation (entity tags:
+                    // SQL-level via EntityFilter; properties: Rust-level in alive-set
+                    // loop). The cap bounds worst-case scan cost.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
@@ -83,6 +80,8 @@ impl KgPack {
                         search_limit,
                         kind_filter.as_deref(),
                         validated_et.as_deref(),
+                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        props_filter,
                     )
                     .await?;
 
@@ -170,14 +169,12 @@ impl KgPack {
                 });
                 let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
                 let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // Property/tag predicates are applied post-ranking (notes have no
-                    // dedicated tag column; tags live in `properties["tags"]`). Widen
-                    // the candidate window so sparse matches ranked below the bare
-                    // `limit` are still visible. The cap of FILTERED_SCAN_CAP is a
-                    // best-effort bound — matches ranked beyond it may still be missed
-                    // (known limitation: both entity and note branches share this
-                    // cliff; pushing predicates into the storage leg is the proper
-                    // fix, tracked in GitHub issue #225).
+                    // Widen the candidate window so sparse matches ranked below the
+                    // bare `limit` remain within the runtime's retrieval budget.
+                    // Predicates are applied BEFORE result truncation (note tags and
+                    // properties: Rust-level in the alive-set loop, since notes have
+                    // no dedicated tag column — tags live in `properties["tags"]`).
+                    // The cap bounds worst-case scan cost.
                     (limit * 50).min(FILTERED_SCAN_CAP)
                 } else {
                     limit
@@ -191,6 +188,8 @@ impl KgPack {
                         search_limit,
                         kind_filter.as_deref(),
                         p.include_superseded.unwrap_or(false),
+                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        props_filter,
                     )
                     .await?;
 
