@@ -153,8 +153,14 @@ jobs:
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # needed to push the ratchet commit on main
+    # Read-only gate: fails a PR whose line coverage regresses below the committed
+    # baseline (coverage-baseline.txt). It does NOT push to main — the baseline is
+    # raised only by an explicit PR that edits coverage-baseline.txt, so every
+    # change to main (the floor included) goes through the gate wall. Auto-pushing
+    # a ratchet commit would require a direct-to-main write path that bypasses the
+    # required-checks wall, which the autonomous-merge model (ADR-066) forbids;
+    # under that model the bot is not a ruleset bypass actor, so the push would be
+    # rejected and fail the job on every merge.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -194,24 +200,3 @@ jobs:
               sys.exit(1)
           print(f'OK: {current:.2f}% >= {baseline:.2f}% - {epsilon}% threshold')
           "
-      - name: Ratchet baseline upward (main push only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          BASELINE=$(cat coverage-baseline.txt | tr -d '[:space:]')
-          CURRENT="${CURRENT_COVERAGE}"
-          python3 -c "
-          baseline = float('${BASELINE}')
-          current  = float('${CURRENT}')
-          if current > baseline:
-              open('coverage-baseline.txt', 'w').write(f'{current:.2f}\n')
-              print(f'Ratcheted baseline {baseline:.2f}% -> {current:.2f}%')
-          else:
-              print(f'Baseline unchanged at {baseline:.2f}% (current={current:.2f}%)')
-          "
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet coverage-baseline.txt; then
-            git add coverage-baseline.txt
-            git commit -m "chore(ci): ratchet coverage baseline [skip ci]"
-            git push
-          fi
