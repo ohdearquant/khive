@@ -12,9 +12,10 @@ use crate::error::SqliteError;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
-const WAL_AUTOCHECKPOINT_PAGES: &str = "4000";
-const JOURNAL_SIZE_LIMIT_BYTES: &str = "67108864";
 const DEFAULT_READER_CAP: usize = 8;
+
+const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
+const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -26,9 +27,26 @@ pub struct PoolConfig {
     /// WAL mode (must be true for pooling to work; default: true).
     pub wal_mode: bool,
     /// Busy timeout per connection (default: 30s).
+    ///
+    /// Overridable via `KHIVE_BUSY_TIMEOUT_SECS`.
     pub busy_timeout: Duration,
     /// Time to wait for a reader connection before returning an error (default: 5s).
+    ///
+    /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.
     pub checkout_timeout: Duration,
+    /// Number of WAL pages that triggers an automatic checkpoint.
+    ///
+    /// Maps to `PRAGMA wal_autocheckpoint`. The default (4000 pages, ~16 MiB
+    /// at SQLite's default 4 KiB page size) matches the pre-config behaviour.
+    ///
+    /// Overridable via `KHIVE_WAL_AUTOCHECKPOINT_PAGES`.
+    pub wal_autocheckpoint_pages: u32,
+    /// Maximum WAL journal size in bytes before SQLite resets the WAL.
+    ///
+    /// Maps to `PRAGMA journal_size_limit`. Default: 64 MiB.
+    ///
+    /// Overridable via `KHIVE_JOURNAL_SIZE_LIMIT_BYTES`.
+    pub journal_size_limit_bytes: i64,
 }
 
 impl Default for PoolConfig {
@@ -40,8 +58,26 @@ impl Default for PoolConfig {
                 .unwrap_or(1)
                 .clamp(1, DEFAULT_READER_CAP),
             wal_mode: true,
-            busy_timeout: Duration::from_secs(30),
-            checkout_timeout: Duration::from_secs(5),
+            busy_timeout: Duration::from_secs(
+                std::env::var("KHIVE_BUSY_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30),
+            ),
+            checkout_timeout: Duration::from_secs(
+                std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(5),
+            ),
+            wal_autocheckpoint_pages: std::env::var("KHIVE_WAL_AUTOCHECKPOINT_PAGES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_WAL_AUTOCHECKPOINT_PAGES),
+            journal_size_limit_bytes: std::env::var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
         }
     }
 }
@@ -388,8 +424,8 @@ fn configure_writer_connection(
     let wal_enabled = wants_wal && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
 
     if wal_enabled {
-        conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
-        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)?;
+        conn.pragma_update(None, "wal_autocheckpoint", config.wal_autocheckpoint_pages)?;
+        conn.pragma_update(None, "journal_size_limit", config.journal_size_limit_bytes)?;
     }
 
     Ok(wal_enabled)
@@ -463,4 +499,113 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
         )),
     )
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_config_default_values_match_constants() {
+        // Ensure defaults are not accidentally changed.
+        let cfg = PoolConfig::default();
+        assert_eq!(
+            cfg.wal_autocheckpoint_pages,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
+        );
+        assert_eq!(
+            cfg.journal_size_limit_bytes,
+            DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
+        );
+        assert_eq!(cfg.busy_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.checkout_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn pool_config_env_override_wal_autocheckpoint() {
+        std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "8000");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
+        assert_eq!(cfg.wal_autocheckpoint_pages, 8000);
+    }
+
+    #[test]
+    fn pool_config_env_override_journal_size_limit() {
+        std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "134217728");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES");
+        assert_eq!(cfg.journal_size_limit_bytes, 134_217_728);
+    }
+
+    #[test]
+    fn pool_config_env_override_busy_timeout() {
+        std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "60");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_BUSY_TIMEOUT_SECS");
+        assert_eq!(cfg.busy_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn pool_config_env_override_checkout_timeout() {
+        std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "10");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS");
+        assert_eq!(cfg.checkout_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn pool_config_env_invalid_falls_back_to_default() {
+        std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "not_a_number");
+        std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
+        std::env::remove_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES");
+        assert_eq!(
+            cfg.wal_autocheckpoint_pages,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
+        );
+        assert_eq!(
+            cfg.journal_size_limit_bytes,
+            DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn file_backed_pool_opens_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_pool.db");
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+        assert!(path.exists());
+        assert!(pool.max_readers() > 0);
+    }
+
+    #[test]
+    fn in_memory_pool_degrades_to_single_connection() {
+        let cfg = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("in-memory pool should open");
+        assert_eq!(pool.max_readers(), 0);
+    }
+
+    #[test]
+    fn writer_checkout_and_release_works() {
+        let cfg = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let _writer = pool.writer().expect("writer checkout should succeed");
+        }
+        // After drop, writer should be re-acquirable.
+        let _writer2 = pool
+            .writer()
+            .expect("second writer checkout should succeed");
+    }
 }

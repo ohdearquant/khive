@@ -20,6 +20,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
+use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
     present, KhiveRuntime, Namespace, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
@@ -194,6 +195,9 @@ pub struct KhiveMcpServer {
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
     coordinator: Option<Arc<dyn CoordinatorService>>,
+    /// Pool arc for the WAL checkpoint background task. `None` for in-memory
+    /// or registry-only servers that have no persistent database.
+    pool: Option<Arc<ConnectionPool>>,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -311,11 +315,19 @@ impl KhiveMcpServer {
         // present before any handler runs. Errors are logged but not propagated
         // so a single pack's schema failure cannot abort startup.
         registry.apply_schema_plans(runtime.backend());
+        // Capture the pool arc for the WAL checkpoint task. Only available for
+        // file-backed databases; in-memory backends return None here.
+        let pool = if runtime.backend().is_file_backed() {
+            Some(runtime.backend().pool_arc())
+        } else {
+            None
+        };
         Ok(Self {
             registry,
             default_namespace: default_namespace.as_str().to_string(),
             config_id,
             coordinator: None,
+            pool,
         })
     }
 
@@ -334,6 +346,7 @@ impl KhiveMcpServer {
             // dispatch locally rather than forward.
             config_id: "registry-only".to_string(),
             coordinator: None,
+            pool: None,
         }
     }
 
@@ -351,6 +364,7 @@ impl KhiveMcpServer {
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
             coordinator: None,
+            pool: None,
         }
     }
 
@@ -397,6 +411,13 @@ impl KhiveMcpServer {
     /// Fingerprint of the runtime config this server's registry was built for.
     pub fn config_id(&self) -> &str {
         &self.config_id
+    }
+
+    /// The connection pool to use for background WAL checkpointing, if any.
+    ///
+    /// Returns `None` for in-memory or registry-only servers.
+    pub fn pool(&self) -> Option<Arc<ConnectionPool>> {
+        self.pool.clone()
     }
 
     /// Warm every pack's in-memory state. Called by the daemon in a background
