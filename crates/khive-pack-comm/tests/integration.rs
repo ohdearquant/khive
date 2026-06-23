@@ -3710,7 +3710,7 @@ async fn t_c2_inbox_isolation_cross_actor() {
     );
 }
 
-/// Executable spec for issue #13 (Gate actor identity gap).
+/// Executable spec for issue #224 (Gate actor identity gap).
 ///
 /// DESIRED behavior: when `actor_id = "lambda:tenant-x"` is configured on the
 /// registry, `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a
@@ -3723,15 +3723,15 @@ async fn t_c2_inbox_isolation_cross_actor() {
 ///
 /// This test is marked `#[ignore]` because it asserts the DESIRED behavior that
 /// is NOT yet implemented. It will become passing once the architectural fix
-/// tracked in issue #13 is implemented (threading authenticated actor identity
+/// tracked in issue #224 is implemented (threading authenticated actor identity
 /// into `VerbRegistry::dispatch` before the gate consult).
 ///
-/// DO NOT DELETE this test. It is an executable contract spec: when issue #13
+/// DO NOT DELETE this test. It is an executable contract spec: when issue #224
 /// is resolved and the `#[ignore]` is removed, the CI gate will verify the fix.
 ///
-/// See: https://github.com/ohdearquant/khive/issues/13
+/// See: https://github.com/ohdearquant/khive/issues/224
 #[tokio::test]
-#[ignore = "issue #13: GateRequest.actor is always ActorRef::anonymous() today; \
+#[ignore = "issue #224: GateRequest.actor is always ActorRef::anonymous() today; \
              removing #[ignore] gates the architectural fix (pack.rs:852 must pass \
              configured actor_id to GateRequest, not ActorRef::anonymous())"]
 async fn t_c2_gate_receives_configured_actor_not_anonymous() {

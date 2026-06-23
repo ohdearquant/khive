@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Months, Utc};
 use serde_json::{json, Value};
 
+use khive_mcp::serve::enforce_strict_actor_mode;
 use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
@@ -80,6 +81,7 @@ pub async fn run_pending_events(
     cfg.default_namespace = Namespace::parse(namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
     let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let now = Utc::now();

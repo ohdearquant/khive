@@ -187,18 +187,14 @@ pub fn build_registry_for_multi_backend(
         }
     }
 
+    enforce_strict_actor_mode(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    )?;
     if should_warn_unattributed(
         default_runtime.config().actor_id.as_deref(),
         &default_runtime.config().packs,
     ) {
-        if is_strict_actor_mode() {
-            return Err(anyhow::anyhow!(
-                "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-                 configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
-                 starting in strict mode (comm pack requires an attributed actor to \
-                 prevent party-line inbox exposure)."
-            ));
-        }
         tracing::warn!(
             "actor identity resolved to \"local\": comm sends will be stamped from \
              \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
@@ -294,6 +290,34 @@ pub(crate) fn is_strict_actor_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Enforce the strict-actor mode contract at server construction time.
+///
+/// When `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`:
+///   - If `actor_id` is `None`/`"local"` AND `"comm"` is in the pack list →
+///     return `Err` with a clear message. The server must NOT be constructed.
+///
+/// When strict mode is OFF (default): return `Ok(())` unconditionally — the
+/// caller is still responsible for emitting the non-fatal `should_warn_unattributed`
+/// warning.
+///
+/// This is the **single enforcement seam** for the strict-actor contract. Call it
+/// from every server-construction path (serve.rs, kkernel exec, pending_events)
+/// BEFORE constructing [`KhiveMcpServer`] so that no code path can bypass it.
+pub fn enforce_strict_actor_mode(
+    actor_id: Option<&str>,
+    loaded_packs: &[String],
+) -> anyhow::Result<()> {
+    if is_strict_actor_mode() && should_warn_unattributed(actor_id, loaded_packs) {
+        anyhow::bail!(
+            "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
+             configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
+             starting in strict mode (comm pack requires an attributed actor to \
+             prevent party-line inbox exposure)."
+        );
+    }
+    Ok(())
+}
+
 /// Build a fully-configured server from parsed args (without serving).
 pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     let (cli_namespace_explicit, cli_namespace) =
@@ -329,18 +353,14 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
                 runtime.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
             }
         }
+        enforce_strict_actor_mode(
+            runtime.config().actor_id.as_deref(),
+            &runtime.config().packs,
+        )?;
         if should_warn_unattributed(
             runtime.config().actor_id.as_deref(),
             &runtime.config().packs,
         ) {
-            if is_strict_actor_mode() {
-                return Err(anyhow::anyhow!(
-                    "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-                     configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
-                     starting in strict mode (comm pack requires an attributed actor to \
-                     prevent party-line inbox exposure)."
-                ));
-            }
             tracing::warn!(
                 "actor identity resolved to \"local\": comm sends will be stamped from \
                  \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
@@ -483,18 +503,14 @@ fn build_server_multi_backend(
         }
     }
 
+    enforce_strict_actor_mode(
+        default_runtime.config().actor_id.as_deref(),
+        &default_runtime.config().packs,
+    )?;
     if should_warn_unattributed(
         default_runtime.config().actor_id.as_deref(),
         &default_runtime.config().packs,
     ) {
-        if is_strict_actor_mode() {
-            return Err(anyhow::anyhow!(
-                "KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1 is set but no actor identity is \
-                 configured. Set KHIVE_ACTOR or --actor to this lambda's id before \
-                 starting in strict mode (comm pack requires an attributed actor to \
-                 prevent party-line inbox exposure)."
-            ));
-        }
         tracing::warn!(
             "actor identity resolved to \"local\": comm sends will be stamped from \
              \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
@@ -1630,25 +1646,25 @@ brain_profile = "project-profile"
     }
 
     // --- is_strict_actor_mode predicate ---
+    // All three tests mutate the process-global KHIVE_REQUIRE_ATTRIBUTED_ACTOR;
+    // #[serial] prevents races under parallel test execution.
 
     #[test]
+    #[serial]
     fn strict_mode_off_by_default() {
-        // Ensure the env var is absent for this assertion.
-        // NOTE: env var tests are inherently racy with parallel test runs; this is
-        // a pure predicate test so the env mutation window is kept minimal.
         let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         assert!(
             !is_strict_actor_mode(),
             "strict mode must be OFF when KHIVE_REQUIRE_ATTRIBUTED_ACTOR is unset"
         );
-        // Restore.
         if let Some(v) = prev {
             std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v);
         }
     }
 
     #[test]
+    #[serial]
     fn strict_mode_on_when_env_var_is_1() {
         let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
@@ -1663,6 +1679,7 @@ brain_profile = "project-profile"
     }
 
     #[test]
+    #[serial]
     fn strict_mode_off_when_env_var_is_not_1() {
         let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "0");
@@ -1674,5 +1691,90 @@ brain_profile = "project-profile"
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
             None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
         }
+    }
+
+    // --- enforce_strict_actor_mode: shared seam regression tests ---
+    // These cover the enforcement seam itself (finding 1 regression guard).
+
+    #[test]
+    #[serial]
+    fn enforce_strict_actor_mode_returns_err_when_strict_and_no_actor() {
+        // Strict mode ON + no actor + comm pack = Err.
+        let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+        let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        assert!(
+            result.is_err(),
+            "enforce_strict_actor_mode must return Err when strict mode is ON \
+             and no actor is configured (comm pack loaded)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+            "error message must name the env var; got: {msg}"
+        );
+        assert!(
+            msg.contains("KHIVE_ACTOR"),
+            "error message must name the remedy; got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn enforce_strict_actor_mode_ok_when_strict_and_actor_configured() {
+        // Strict mode ON + proper actor = Ok (comm pack present is irrelevant).
+        let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+        let result = enforce_strict_actor_mode(Some("lambda:tenant-x"), &packs(&["kg", "comm"]));
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        assert!(
+            result.is_ok(),
+            "enforce_strict_actor_mode must return Ok when actor is properly configured"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn enforce_strict_actor_mode_ok_when_strict_off_and_no_actor() {
+        // Strict mode OFF + no actor = Ok (the DEFAULT / OSS path must be unchanged).
+        // This is the most critical regression guard: ensure the default-off path
+        // never fires the guard.
+        let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let result = enforce_strict_actor_mode(None, &packs(&["kg", "comm", "memory"]));
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        assert!(
+            result.is_ok(),
+            "enforce_strict_actor_mode must return Ok when strict mode is OFF \
+             (default OSS path must be completely unchanged)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn enforce_strict_actor_mode_ok_when_strict_on_but_no_comm_pack() {
+        // Strict mode ON but comm pack not loaded = Ok (no risk of party-line).
+        let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+        let result = enforce_strict_actor_mode(None, &packs(&["kg", "memory"]));
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        assert!(
+            result.is_ok(),
+            "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
+             (no party-line risk even without actor)"
+        );
     }
 }

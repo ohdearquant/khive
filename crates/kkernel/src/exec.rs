@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use khive_mcp::serve::enforce_strict_actor_mode;
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
@@ -357,6 +358,7 @@ async fn run_exec_inline(
 
     // ── in-process fallback ───────────────────────────────────────────────────
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
     let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let params = RequestParams {
@@ -409,6 +411,7 @@ async fn run_exec_ops_file(
     // for bulk apply — bulk throughput benefits from a single warm runtime, not
     // the round-trip overhead of socket forwarding per chunk).
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
     let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     apply_ops_file(&server, ops, presentation).await
