@@ -330,13 +330,19 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
                 let user = &userinfo[..colon];
                 let pass = &userinfo[colon + 1..];
                 if !user.is_empty() && !pass.is_empty() && pass.len() >= 4 {
-                    // Return a slice starting from the scheme.
-                    // Walk back from at_abs to find the start of the scheme.
+                    // Return a slice starting from the scheme.  Walk back from
+                    // `at_abs` to the first non-scheme char and resume just past
+                    // it.  Use `char_indices` and skip by the separator's full
+                    // UTF-8 width: a multibyte separator (e.g. CJK prose before a
+                    // credential URL) would otherwise leave `scheme_start` inside
+                    // the codepoint and panic the slice below.
                     let scheme_start = text[..at_abs]
-                        .rfind(|c: char| {
-                            !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.'
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| {
+                            !c.is_ascii_alphanumeric() && *c != '+' && *c != '-' && *c != '.'
                         })
-                        .map(|p| p + 1)
+                        .map(|(idx, c)| idx + c.len_utf8())
                         .unwrap_or(0);
                     // Ensure there are no spaces in userinfo (not a code snippet).
                     if !userinfo.contains(' ') && !userinfo.contains('\n') {
@@ -1113,6 +1119,25 @@ mod tests {
             assert!(
                 check(content).is_err(),
                 "known-prefix secret glued after CJK must be blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_userinfo_after_cjk_does_not_panic_and_is_flagged() {
+        // Round-3 regression: a credential URL glued after CJK prose panicked,
+        // because scheme_start was (separator byte index + 1) — one byte into a
+        // multibyte CJK separator — and the slice fell on a non-char boundary.
+        // The public check() API must return a controlled error, never panic.
+        let cases = [
+            "数据postgresql://dbuser:S3cr3tP4ss@db.example.com/db", // gitleaks:allow
+            "配置mysql://root:hunter2pw@10.0.0.1:3306/app",         // gitleaks:allow
+            "连接redis://svc:V3ryS3cretPw@cache.internal:6379",     // gitleaks:allow
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "credential URL after CJK must be blocked, not panic: {content:?}"
             );
         }
     }
