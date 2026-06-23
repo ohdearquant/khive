@@ -334,6 +334,15 @@ async fn run_exec_inline(
     presentation: Option<String>,
     save_file: Option<String>,
 ) -> Result<()> {
+    // ── strict-actor gate (before any forwarding) ─────────────────────────────
+    // Must run BEFORE the daemon fast-path so that a comm-capable anonymous daemon
+    // already running cannot be used to bypass KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1.
+    // The daemon receives requests over a socket and dispatches comm verbs — the
+    // same tenant-isolation risk as in-process dispatch.  Checking only in the
+    // in-process fallback (as was the case before this fix) allowed a strict-mode
+    // client to silently forward through a pre-existing anonymous daemon and exit 0.
+    enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
+
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
     // we would need to parse it back to apply the sink).  Skip daemon forwarding
@@ -358,7 +367,8 @@ async fn run_exec_inline(
 
     // ── in-process fallback ───────────────────────────────────────────────────
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
+    // Note: enforce_strict_actor_mode was called above before the daemon fast-path;
+    // it is not repeated here — the single early check covers both paths.
     let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let params = RequestParams {
@@ -623,6 +633,140 @@ mod tests {
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(count, 0, "dry-run must not write any entities");
+    }
+
+    // ── strict-actor mode: daemon bypass regression ───────────────────────────
+
+    /// Regression: `run_exec_inline` must enforce the strict-actor gate BEFORE
+    /// forwarding to the daemon, so a comm-capable anonymous daemon already running
+    /// cannot be used to bypass `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`.
+    ///
+    /// Prior to this fix, `enforce_strict_actor_mode` was only called in the
+    /// in-process fallback path (after the daemon fast-path returned).  An attacker
+    /// or misconfigured operator could start a no-actor daemon, then run strict-mode
+    /// `kkernel exec` which would forward through it and exit 0.
+    ///
+    /// The fix moves the check to before the daemon block.  This test drives
+    /// `run_exec_inline` directly with a config that has `comm` in the pack list
+    /// and no actor identity.  It must return an `Err` whose message names
+    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR` regardless of whether a daemon is reachable
+    /// (KHIVE_NO_DAEMON=1 is set to keep the test isolated from any running daemon,
+    /// but the error should fire before any forwarding attempt anyway).
+    #[tokio::test]
+    #[serial]
+    async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
+        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+        // Belt-and-suspenders: ensure no daemon is contacted even if one happens
+        // to be running.  The error should fire before forwarding, but we make the
+        // test deterministic by also suppressing the daemon path.
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+
+        let cfg = RuntimeConfig {
+            db_path: None, // in-memory
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: None, // no actor — triggers the strict-mode gate
+            ..RuntimeConfig::default()
+        };
+
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+
+        // Restore env.
+        match prev_strict {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        match prev_no_daemon {
+            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
+            None => std::env::remove_var("KHIVE_NO_DAEMON"),
+        }
+
+        assert!(
+            result.is_err(),
+            "run_exec_inline must return Err under strict mode + comm + no actor; got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+            "error must name the strict-mode env var; got: {msg}"
+        );
+        assert!(
+            msg.contains("KHIVE_ACTOR"),
+            "error must name the remedy (KHIVE_ACTOR); got: {msg}"
+        );
+    }
+
+    /// Complement: strict mode must NOT reject when comm is loaded and an actor
+    /// IS configured — the daemon fast-path must remain available in that case.
+    #[tokio::test]
+    #[serial]
+    async fn strict_mode_allows_exec_when_comm_and_actor_configured() {
+        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+        std::env::set_var("KHIVE_NO_DAEMON", "1"); // force in-process to avoid daemon dep
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: Some("lambda:tenant-x".to_string()), // actor configured → no gate
+            ..RuntimeConfig::default()
+        };
+
+        // The strict gate must pass; the actual dispatch will succeed (stats() is safe).
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+
+        match prev_strict {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        match prev_no_daemon {
+            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
+            None => std::env::remove_var("KHIVE_NO_DAEMON"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "run_exec_inline must succeed under strict mode when actor IS configured; got: {result:?}"
+        );
+    }
+
+    /// Default-off regression: when KHIVE_REQUIRE_ATTRIBUTED_ACTOR is unset,
+    /// run_exec_inline must NOT reject even with comm + no actor (OSS default path).
+    #[tokio::test]
+    #[serial]
+    async fn strict_mode_off_exec_inline_passes_with_comm_no_actor() {
+        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"); // default OFF
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: None,
+            ..RuntimeConfig::default()
+        };
+
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+
+        match prev_strict {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+        match prev_no_daemon {
+            Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
+            None => std::env::remove_var("KHIVE_NO_DAEMON"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "run_exec_inline must NOT reject when strict mode is OFF (OSS default); got: {result:?}"
+        );
     }
 
     #[tokio::test]
