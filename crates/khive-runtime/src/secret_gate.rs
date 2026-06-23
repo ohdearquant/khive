@@ -30,12 +30,16 @@
 //!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
-//! - Tokens containing non-ASCII characters (CJK prose, accented text, emoji)
-//!   — not subject to the entropy heuristic.  Real base64/hex/base64url
-//!   credentials are ASCII; multibyte UTF-8 otherwise inflates the byte-wise
-//!   Shannon entropy and false-positives on natural-language non-Latin content.
-//!   The literal-prefix checks still apply (a prefixed secret is caught even
-//!   with a trailing non-ASCII character).
+//! - Non-ASCII characters (CJK prose, accented text, emoji) act as token
+//!   delimiters for the entropy heuristic: only maximal ASCII runs are
+//!   entropy-checked.  Real base64/hex/base64url credentials are ASCII, and
+//!   `shannon_entropy` runs over UTF-8 bytes — multibyte codepoints inflate the
+//!   byte-wise entropy and false-positive on natural-language non-Latin content.
+//!   Treating non-ASCII as a delimiter (rather than skipping any whitespace
+//!   token that merely contains it) keeps CJK prose unflagged while still
+//!   catching an ASCII credential glued to CJK text/punctuation/fullwidth
+//!   whitespace.  The literal-prefix checks (Layer 1) run independently and
+//!   catch a prefixed secret regardless of adjacent non-ASCII characters.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -392,9 +396,16 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 }
 
 fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
-    // Tokenize once: collect all whitespace-delimited tokens with their byte offsets.
+    // Tokenize into maximal ASCII non-whitespace runs, recording each run's byte
+    // offset.  Non-ASCII characters are delimiters (alongside ASCII whitespace):
+    // real base64/hex/base64url credentials are ASCII, so splitting on non-ASCII
+    // isolates an ASCII credential glued to CJK text/punctuation/fullwidth
+    // whitespace, while a run of natural-language CJK yields no ASCII run long
+    // enough to trip the length floor below.  On pure-ASCII input this is
+    // identical to `split_ascii_whitespace`.
     let tokens: Vec<(usize, &str)> = text
-        .split_ascii_whitespace()
+        .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+        .filter(|t| !t.is_empty())
         .map(|t| {
             let offset = t.as_ptr() as usize - text.as_ptr() as usize;
             (offset, t)
@@ -408,18 +419,8 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
             continue;
         }
 
-        // The entropy heuristic targets base64/hex/base64url credential runs,
-        // which are ASCII by construction.  A token containing non-ASCII
-        // characters (CJK prose, accented text, emoji) cannot be such a
-        // credential, and `shannon_entropy` runs over UTF-8 bytes — multibyte
-        // codepoints inflate the byte-wise entropy above the threshold, so a
-        // run of natural-language CJK reads as high-entropy.  Skip non-ASCII
-        // tokens to avoid blocking legitimate non-Latin content.  Prefixed
-        // secrets (sk-ant-, AKIA, …) are still caught by the Layer-1 pattern
-        // checks regardless of any trailing non-ASCII char.
-        if !token.is_ascii() {
-            continue;
-        }
+        // `token` is ASCII here (non-ASCII was split out at tokenization), so
+        // `shannon_entropy` over its bytes is a true per-character entropy.
 
         // UUID and sha-prefixed base64 content hashes (SRI / npm lockfile) are
         // unconditionally allowlisted: their forms are unambiguous regardless of
@@ -1047,6 +1048,45 @@ mod tests {
         assert!(
             check(&content).is_err(),
             "ASCII secret in CJK context must still be blocked (and must not panic)"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_glued_to_cjk_is_still_flagged() {
+        // Regression: a prefixless high-entropy credential glued (no ASCII
+        // whitespace) to CJK text, CJK brackets/quotes, a fullwidth space, or a
+        // fullwidth colon used to slip through, because the whole whitespace token
+        // contained a non-ASCII byte and was skipped wholesale.  Non-ASCII is now
+        // a token delimiter, so the ASCII credential run is isolated and
+        // entropy-checked while the surrounding ±120-byte window still sees the
+        // trigger word.
+        let secret = "X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let cases = [
+            format!("api_key {secret}数据"),     // CJK suffix glued to the token
+            format!("api_key 「{secret}」"),     // CJK brackets wrap the token
+            format!("api_key　{secret}"),        // U+3000 ideographic space separator
+            format!("api_key：{secret}"),        // U+FF1A fullwidth colon separator
+            format!("数据{secret}更新 api_key"), // CJK-glued prefix, trigger after
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "ASCII secret glued to CJK must be blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_entropy_ascii_run_without_trigger_is_not_flagged() {
+        // The non-ASCII-as-delimiter change must not weaken the trigger-context
+        // discipline: a high-entropy ASCII run isolated from CJK prose but NOT
+        // near a credential trigger word is still allowed (only the tokenizer
+        // changed, not the `near_trigger` gate).
+        let secret = "X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let content = format!("数据库连接{secret}核心模块设计文档");
+        assert!(
+            check(&content).is_ok(),
+            "high-entropy ASCII run with no trigger word must not be flagged"
         );
     }
 
