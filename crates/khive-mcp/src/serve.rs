@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_runtime::{
     config_from_env, run_migrations, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig, StorageBackend,
-    VerbRegistryBuilder,
+    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig,
+    StorageBackend, VerbRegistryBuilder,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -514,11 +514,23 @@ fn build_server_multi_backend(
         .apply_schema_plans_with_map(&backend_for_pack, main_ref)
         .map_err(|e| anyhow::anyhow!("pack schema boot failure: {e}"))?;
 
-    Ok(KhiveMcpServer::from_registry_with_meta(
-        registry,
-        default_namespace.as_str(),
-        &config_id,
-    ))
+    // Wire the main backend's pool for background WAL checkpointing. The pool is
+    // only present for file-backed databases; in-memory backends return None here
+    // so that checkpoint_once never runs on a non-WAL connection.
+    let pool: Option<Arc<ConnectionPool>> = if main_backend.is_file_backed() {
+        Some(main_backend.pool_arc())
+    } else {
+        None
+    };
+
+    let server =
+        KhiveMcpServer::from_registry_with_meta(registry, default_namespace.as_str(), &config_id);
+
+    Ok(if let Some(p) = pool {
+        server.with_pool(p)
+    } else {
+        server
+    })
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.

@@ -5,6 +5,8 @@
 
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
+/// Periodic WAL checkpoint task.
+pub mod checkpoint;
 /// Error types for the SQLite layer.
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
@@ -19,6 +21,7 @@ pub mod sql_bridge;
 pub mod stores;
 
 pub use backend::StorageBackend;
+pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig};
 pub use error::SqliteError;
 pub use migrations::{
     inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,

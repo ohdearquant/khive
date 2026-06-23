@@ -11,6 +11,7 @@ categories.workspace = true
 description = "khive MCP server library — served via the kkernel binary"
 
 [dependencies]
+khive-db = { version = "0.2.11", path = "../khive-db" }
 khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
 khive-storage = { version = "0.2.11", path = "../khive-storage" }
 khive-request = { version = "0.2.11", path = "../khive-request" }
