@@ -2,10 +2,17 @@
 #
 # What this does: when khive-leo[bot] opens a non-draft PR, this workflow
 # calls `gh pr merge --auto --squash`. The --auto flag instructs GitHub to
-# complete the actual merge ONLY once all branch-protection conditions pass:
-# required status checks green + CODEOWNERS review approved. This workflow
-# does NOT merge anything itself -- it registers intent and GitHub enforces
-# the gate. CODEOWNERS and branch protection remain the authoritative safety.
+# complete the actual merge ONLY once ruleset conditions pass: the full
+# required-status-check battery (the "gate wall" — ADR-066 §1) goes green.
+# In the autonomous-merge model there is no required human approval and no
+# CODEOWNERS gate; the gate wall is the reviewer. This workflow does NOT merge
+# anything itself -- it registers intent and GitHub's ruleset enforces the
+# wall. The ruleset (id 17362266) remains the authoritative safety boundary.
+#
+# Scope note: this is intentionally bot-author-scoped. The autonomous fleet's
+# PRs auto-merge on green; a human's own PR is mergeable on green but still
+# waits for a deliberate merge (or an explicit `gh pr merge --auto`). Humans
+# keep a beat on their own PRs while the fleet runs free.
 #
 # Activation: inert by default. Set the repo variable LEO_AUTOMERGE_ENABLED
 # to the string 'true' to activate. Revert the variable to deactivate with
