@@ -121,13 +121,16 @@ jobs:
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           manifest-path: crates/Cargo.toml
-          # No `package:` scope — gate the whole publishable workspace. Nearly all
-          # members (khive-types, khive-runtime, khive-pack-kg, …) are live on
-          # crates.io at 0.2.11, and khive-mcp re-exports runtime types, so a break
-          # in a lib crate that does not surface through khive-mcp would otherwise
-          # slip past this required check. cargo-semver-checks compares each member
-          # against its crates.io baseline; every member is published, so there is
-          # no missing-baseline error.
+          # No `package:` scope — gate the whole publishable workspace so a break in
+          # a lib crate that does not surface through khive-mcp is still caught.
+          # cargo-semver-checks compares each member against its crates.io baseline.
+          # 29 of the 30 workspace members are live on crates.io at 0.2.11; the lone
+          # exception is khive-quant (SQ8 codecs), which has never been published and
+          # so has NO crates.io baseline. Left in scope it makes the gate un-runnable
+          # (missing-baseline error: `crate khive-quant does not exist`), so it is
+          # excluded until its first publish — at which point drop it from `exclude:`
+          # to gate it too.
+          exclude: khive-quant
 
   doc-build:
     name: Doc build (-D warnings)
