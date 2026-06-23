@@ -6356,31 +6356,40 @@ async fn search_note_properties_filter_excludes_non_matching_notes() {
     );
 }
 
-/// #223 recall-cliff regression: when more than `limit` notes share high FTS
-/// relevance but only a lower-ranked note carries the target tag, the filter
-/// must still return it within the FILTERED_SCAN_CAP (500) window.
+/// #223 recall-cliff regression: verifies that a note carrying the target tag
+/// but ranking below position 40 (the old `(limit*4).min(100)=40` handler cap
+/// with limit=10) is still returned when the NEW cap of 500 is in effect.
 ///
-/// Corpus: 12 notes with identical query text but tag "noise" + 1 note with
-/// the same text and tag "rare". With `limit=10` and the old `limit*4=40` cap
-/// the rare note would be visible (it's within 40). With limit=10 and cap=500
-/// the rare note is always in the window. The test asserts it is returned.
+/// Design:
+///   - 45 "noise" notes whose content repeats the query term 8× — BM25 ranks
+///     them well above the rare note which uses the term only once.
+///   - 1 "rare" note with the term once — ranks at position 46 in the
+///     unfiltered corpus, safely beyond the old cap of 40 but well within 500.
 ///
-/// For CASE B (post-filter, bounded scan) this is the correct assertion:
-/// the matching note is returned because the corpus (13 total) fits inside
-/// the FILTERED_SCAN_CAP=500 bound. An anti-regression note: if this ever
-/// starts failing it means the scan cap was lowered below the corpus size.
+/// Two-phase assertion:
+///   1. Unfiltered search (limit=500) confirms the rare note's rank is > 40
+///      and <= 500 — proving the geometry. This assertion FAILS under the old
+///      cap (the rare note would be absent from a limit=40 result set).
+///   2. Filtered search (tags=["rare"], limit=10) asserts the rare note IS
+///      returned — proving the NEW cap of 500 reaches it.
+///
+/// If someone reverts the handler cap to `(limit*4).min(100)`, phase 2 will
+/// fail because search_notes(limit=40) truncates before reaching rank 46.
 #[tokio::test]
 async fn search_note_tag_filter_recall_cliff_bounded_scan() {
     let pack = pack();
 
-    // Create 12 high-ranking notes with tag "noise".
-    for i in 0..12u32 {
+    // 45 noise notes: content repeats the query term 8× so BM25 places them
+    // well above the rare note (1 occurrence). This pushes the rare note to
+    // rank ~46, beyond the old handler cap of (10*4).min(100)=40.
+    for i in 0..45u32 {
+        let repeated = "cliffterm nvk223rc ".repeat(8);
         pack.dispatch(
             "create",
             json!({
                 "kind": "note",
                 "note_kind": "observation",
-                "content": format!("cliff regression query text nvk223 item {i}"),
+                "content": format!("{repeated}noise {i}"),
                 "properties": {"tags": ["noise"]}
             }),
         )
@@ -6388,15 +6397,15 @@ async fn search_note_tag_filter_recall_cliff_bounded_scan() {
         .unwrap_or_else(|e| panic!("create noise note {i} must succeed: {e}"));
     }
 
-    // Create 1 matching note with tag "rare" — same query text, lower salience
-    // (not set, so default 0.5 same as noise notes; FTS ranking determines order).
+    // The rare note uses the query term only once → ranks below all 45 noise
+    // notes in BM25 order (position ~46).
     let rare = pack
         .dispatch(
             "create",
             json!({
                 "kind": "note",
                 "note_kind": "observation",
-                "content": "cliff regression query text nvk223 item rare",
+                "content": "cliffterm nvk223rc rare",
                 "properties": {"tags": ["rare"]}
             }),
         )
@@ -6404,14 +6413,51 @@ async fn search_note_tag_filter_recall_cliff_bounded_scan() {
         .expect("create rare note must succeed");
     let rare_id = rare.get("id").and_then(Value::as_str).expect("id");
 
-    // Search with limit=10 and tag filter "rare". The 13-note corpus fits
-    // inside FILTERED_SCAN_CAP=500, so the rare note must be returned.
+    // Phase 1 — geometry check: unfiltered search with limit=500 must include
+    // the rare note, and its rank must be > 40 (the old cap) and <= 500.
+    // This asserts the rare note sits in the window the NEW cap opens up.
+    let unfiltered = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "note",
+                "query": "cliffterm nvk223rc",
+                "limit": 500,
+            }),
+        )
+        .await
+        .expect("#223: unfiltered search must not error");
+
+    let all_ids: Vec<String> = unfiltered
+        .as_array()
+        .expect("response must be array")
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+
+    let rare_rank = all_ids
+        .iter()
+        .position(|id| id == rare_id)
+        .map(|pos| pos + 1) // 1-based rank
+        .expect("#223[phase1]: rare note must appear in the unfiltered result set");
+
+    assert!(
+        rare_rank > 40,
+        "#223[phase1]: rare note rank must be > 40 (old handler cap) so the cliff is real; got rank={rare_rank}"
+    );
+    assert!(
+        rare_rank <= 500,
+        "#223[phase1]: rare note rank must be <= 500 (new handler cap); got rank={rare_rank}"
+    );
+
+    // Phase 2 — filter check: with tag filter "rare" and limit=10 the new
+    // handler cap of 500 must reach the rare note; the old cap of 40 would not.
     let resp = pack
         .dispatch(
             "search",
             json!({
                 "kind": "note",
-                "query": "cliff regression query text nvk223",
+                "query": "cliffterm nvk223rc",
                 "tags": ["rare"],
                 "limit": 10,
             }),
@@ -6420,19 +6466,19 @@ async fn search_note_tag_filter_recall_cliff_bounded_scan() {
         .expect("#223: filtered search must not error");
 
     let arr = resp.as_array().expect("response must be array");
-    let ids: Vec<&str> = arr
+    let filtered_ids: Vec<&str> = arr
         .iter()
         .filter_map(|h| h.get("id").and_then(Value::as_str))
         .collect();
 
     assert!(
-        ids.contains(&rare_id),
-        "#223: rare note must be returned within bounded scan window; ids={ids:?}"
+        filtered_ids.contains(&rare_id),
+        "#223[phase2]: rare note (rank={rare_rank} > 40) must be returned with new cap=500; ids={filtered_ids:?}"
     );
     assert!(
-        ids.len() <= 10,
-        "#223: result must not exceed limit=10; got {}: ids={ids:?}",
-        ids.len()
+        filtered_ids.len() <= 10,
+        "#223[phase2]: result must not exceed limit=10; got {}: ids={filtered_ids:?}",
+        filtered_ids.len()
     );
 }
 

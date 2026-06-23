@@ -194,18 +194,22 @@ impl KgPack {
                     )
                     .await?;
 
-                // Fetch each note to capture kind and properties for post-filtering.
+                // Batch-fetch all candidate notes in one IN(...) query instead of
+                // N individual gets. Notes absent from the batch result (deleted
+                // between the search and the fetch) are simply absent from the map
+                // and filtered out by the `note_meta.get` guard below.
                 let note_meta: HashMap<Uuid, (String, Option<Value>)> = if hits.is_empty() {
                     HashMap::new()
                 } else {
+                    let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
                     let note_store = self.runtime.notes(token)?;
-                    let mut map = HashMap::new();
-                    for h in &hits {
-                        if let Ok(Some(n)) = note_store.get_note(h.note_id).await {
-                            map.insert(h.note_id, (n.kind, n.properties));
-                        }
-                    }
-                    map
+                    note_store
+                        .get_notes_batch(&candidate_ids)
+                        .await
+                        .map_err(RuntimeError::Storage)?
+                        .into_iter()
+                        .map(|n| (n.id, (n.kind, n.properties)))
+                        .collect()
                 };
 
                 let filtered_hits: Vec<_> = if props_filter.is_some() || tag_filter.is_some() {
