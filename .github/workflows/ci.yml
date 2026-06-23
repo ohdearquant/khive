@@ -48,15 +48,21 @@ jobs:
       # RustSec DB (0.18.x fails to load the DB entirely). cargo-deny-action@v2
       # bakes 0.19.8 into its image and exposes NO input to override the binary
       # version (it has no `deny-version` input), so we install the pinned binary
-      # ourselves rather than depend on the image version. The version is logged
-      # before the check runs, so CI proves which binary gated.
+      # ourselves rather than depend on the image version.
+      #
+      # The installer action is pinned to an immutable commit SHA (not the mutable
+      # @v2 tag), and the next step ASSERTS the resolved version is exactly 0.19.9
+      # before gating. In an autonomous-merge model logs are not review: if the
+      # installer ever drifts (tag moves, binstall fallback resolves a different
+      # build), the assertion fails the job rather than silently gating with the
+      # wrong binary.
       - name: Install pinned cargo-deny (0.19.9)
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-deny@0.19.9
       - name: cargo-deny advisories (hard gate)
         run: |
-          cargo-deny --version
+          test "$(cargo-deny --version)" = "cargo-deny 0.19.9"
           cargo deny --manifest-path crates/Cargo.toml check advisories
 
   data-leak-guard:
