@@ -48,8 +48,8 @@
 #       Ocean's explicit go.
 #
 # BOOTSTRAP ORDER (do this before STEP=gates can pass its preflight):
-#   1. Merge #215 (Supply-chain gate) and #216 (SemVer/Doc/Dependency-review/
-#      Coverage gates) to main. The gate PRs are themselves blocked by the 1-
+#   1. Merge #215 (Supply-chain gate) and #216 (Doc/Dependency-review/Coverage
+#      gates) to main. The gate PRs are themselves blocked by the 1-
 #      approval rule, so this first batch is Ocean's HC-7 merge.
 #   2. #216 must target main (or an integration/** branch) for its CI to run at
 #      all: ci.yml triggers on `pull_request: branches: [main, integration/**]`,
@@ -87,8 +87,16 @@ STEP="${STEP:-gates}"
 #                               (gitleaks)", "Docs lint",
 #                               "Marketplace example validator"
 #   ci.yml (lands with #215):   "Supply-chain (cargo-deny)"
-#   ci.yml (lands with #216):   "SemVer checks", "Doc build (-D warnings)",
-#                               "Dependency review", "Coverage ratchet"
+#   ci.yml (lands with #216):   "Doc build (-D warnings)", "Dependency review",
+#                               "Coverage ratchet"
+# RELOCATED (NOT a per-PR gate): "SemVer checks". cargo-semver-checks compares each
+#   crate to its crates.io baseline at the SAME version; mid-cycle on a fixed dev
+#   version it is red on accumulated unreleased breaks (and red on main's own push),
+#   so it can never go green as a per-PR required check. It is enforced at the
+#   publish boundary instead, where the version actually bumps and the check is
+#   green-able: the "SemVer gate (release)" job in release.yml (publish-all depends
+#   on it) and the cargo-semver-checks preflight in scripts/publish.sh. This is a
+#   real gate on the publish path, not a deferred follow-up (ADR-066 §3).
 # EXCLUDED (intentionally NOT required): the two path-filtered bench gates,
 #   "ANN structural regression gate (synthetic, hermetic)" (bench-1m.yml) and
 #   "Pipeline Regression Gate" (bench-pipeline.yml). They only report when a PR
@@ -103,7 +111,6 @@ REQUIRED_CONTEXTS=(
   "Docs lint"
   "Marketplace example validator"
   "Supply-chain (cargo-deny)"
-  "SemVer checks"
   "Doc build (-D warnings)"
   "Dependency review"
   "Coverage ratchet"
@@ -291,6 +298,37 @@ step_gates() {
   fi
 }
 
+# Create one deployment-branch policy, tolerating ONLY the documented duplicate
+# case (HTTP 422 — a policy with that name already exists on a rerun). Any other
+# failure (auth, 404, rate-limit, malformed) is fatal: a silently-dropped policy
+# would leave the publish environment's ref allowlist wider than intended.
+post_branch_policy() {
+  local name="$1" type="$2" out rc
+  out="$(gh api --method POST \
+    "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" \
+    -f name="${name}" -f type="${type}" 2>&1)"
+  rc=$?
+  if (( rc == 0 )); then
+    return 0
+  fi
+  if grep -qiE 'HTTP 422|already exists|already been taken' <<<"${out}"; then
+    echo "[release-gate] ${type} policy '${name}' already present — leaving as-is."
+    return 0
+  fi
+  echo "ABORT: failed to create ${type} policy '${name}' on '${ENVIRONMENT}':" >&2
+  echo "${out}" >&2
+  exit 1
+}
+
+# Assert a named/typed policy is present in the environment's allowlist. Tolerates
+# the API omitting `type` on older responses by treating a missing type as a match.
+assert_branch_policy() {
+  local policies="$1" name="$2" type="$3"
+  jq -e --arg n "${name}" --arg t "${type}" \
+    '[.branch_policies[]? | select(.name==$n and ((.type==$t) or (.type==null)))] | length > 0' \
+    <<<"${policies}" >/dev/null
+}
+
 step_release_gate() {
   echo "[STEP release-gate] Creating '${ENVIRONMENT}' environment with a required reviewer."
   # Don't clobber an already-hardened environment. The env 404s before first
@@ -308,14 +346,33 @@ step_release_gate() {
   local admin_id admin_login body
   admin_id="$(gh api user --jq .id)"
   admin_login="$(gh api user --jq .login)"
+  # Restrict which refs may deploy to the publish environment to `main` and `v*`
+  # release tags. This is the structural half of the workflow_dispatch hole fix:
+  # a manual release dispatched from an arbitrary feature branch cannot deploy
+  # here. (release.yml adds the matching workflow-level guard refusing manual
+  # dispatch from any ref but main.) custom_branch_policies=true means the named
+  # policies POSTed below are the allowlist.
   body="$(jq -n --argjson id "${admin_id}" \
-    '{wait_timer:0, reviewers:[{type:"User", id:$id}], deployment_branch_policy:null}')"
+    '{wait_timer:0, reviewers:[{type:"User", id:$id}], deployment_branch_policy:{protected_branches:false, custom_branch_policies:true}}')"
   if [[ "${DRY_RUN}" != "false" ]]; then
     echo "[DRY RUN] PUT repos/${REPO}/environments/${ENVIRONMENT} (required reviewer: ${admin_login}, id ${admin_id})"
     echo "${body}" | jq .
+    echo "[DRY RUN] POST deployment-branch-policies: tag 'v*', branch 'main'"
   else
     echo "${body}" | gh api --method PUT "repos/${REPO}/environments/${ENVIRONMENT}" --input - >/dev/null
-    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login})."
+    # Define the ref allowlist. post_branch_policy is fatal on any non-duplicate
+    # failure, so a dropped policy aborts the activation instead of silently
+    # widening the allowlist.
+    post_branch_policy 'v*' 'tag'
+    post_branch_policy 'main' 'branch'
+    # Read back and prove both policies are actually present before declaring success.
+    local policies
+    policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies")"
+    assert_branch_policy "${policies}" 'main' 'branch' \
+      || { echo "ABORT: 'main' branch policy missing after apply." >&2; exit 1; }
+    assert_branch_policy "${policies}" 'v*' 'tag' \
+      || { echo "ABORT: 'v*' tag policy missing after apply." >&2; exit 1; }
+    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main, v* tags)."
   fi
 }
 
@@ -335,15 +392,32 @@ preflight_autonomy() {
     exit 1
   fi
 
-  local reviewers
-  reviewers="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}" \
-    --jq '[.protection_rules[]? | select(.type=="required_reviewers") | .reviewers[]?] | length' \
-    2>/dev/null || echo 0)"
+  local env_json reviewers custom_policies
+  env_json="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}" 2>/dev/null || echo '{}')"
+  reviewers="$(jq -r \
+    '[.protection_rules[]? | select(.type=="required_reviewers") | .reviewers[]?] | length' \
+    <<<"${env_json}" 2>/dev/null || echo 0)"
   if [[ "${reviewers}" -lt 1 ]]; then
     echo "ABORT: '${ENVIRONMENT}' environment has no required reviewer — run STEP=release-gate first." >&2
     exit 1
   fi
-  echo "Preflight OK: wall is up (all contexts required) and release gate has ${reviewers} reviewer(s)."
+
+  # A required reviewer is necessary but not sufficient: without a restricted ref
+  # allowlist, a release dispatched from any branch could still target the gate.
+  custom_policies="$(jq -r '.deployment_branch_policy.custom_branch_policies // false' \
+    <<<"${env_json}" 2>/dev/null || echo false)"
+  if [[ "${custom_policies}" != "true" ]]; then
+    echo "ABORT: '${ENVIRONMENT}' does not restrict deployment branches (custom_branch_policies != true) — run STEP=release-gate first." >&2
+    exit 1
+  fi
+  local policies spec pname ptype
+  policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" 2>/dev/null || echo '{}')"
+  for spec in "main:branch" "v*:tag"; do
+    pname="${spec%%:*}"; ptype="${spec##*:}"
+    assert_branch_policy "${policies}" "${pname}" "${ptype}" \
+      || { echo "ABORT: '${ENVIRONMENT}' missing deployment policy ${pname} (${ptype}) — run STEP=release-gate first." >&2; exit 1; }
+  done
+  echo "Preflight OK: wall is up (all contexts required), release gate has ${reviewers} reviewer(s), ref allowlist = main + v* tags."
 }
 
 step_autonomy() {

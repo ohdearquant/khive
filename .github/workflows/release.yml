@@ -134,12 +134,50 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────
+  # Release-time SemVer gate (ADR-066 §3). The per-PR semver job was removed in
+  # #216: cargo-semver-checks compares each crate against its crates.io baseline
+  # at the SAME version, so on a fixed mid-cycle dev version it is permanently
+  # red and can never anchor the autonomous-merge wall. It belongs HERE, where
+  # the version actually bumps and the API delta must match the bump. publish-all
+  # depends on this job, so a semver-incoherent tag cannot publish. The crates.io
+  # library-publish path (scripts/publish.sh) runs the same check independently.
+  # ─────────────────────────────────────────────────────────────────────────
+  semver-gate:
+    name: SemVer gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      # A manual workflow_dispatch can select any ref. Only `main` is allowed to
+      # cut a manual release, so the SemVer gate that runs is always main's
+      # current one — never an older ref whose release.yml predates this gate.
+      # Tag pushes (push event) are unaffected: a v* tag's own checked-out
+      # workflow carries the gate. publish-all depends on this job, so a blocked
+      # dispatch never reaches a publish step.
+      - name: Guard — manual dispatch only from main
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::workflow_dispatch is only permitted from refs/heads/main (got ${{ github.ref }})." >&2
+          echo "Manual releases must dispatch from main so the current SemVer gate applies." >&2
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Check semver vs crates.io baseline
+        # Pinned to a commit SHA, not the mutable @v2 tag (same drift rationale
+        # as the #215 cargo-deny installer pin): a release gate must not drift.
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          manifest-path: crates/Cargo.toml
+          # khive-quant (SQ8 codecs) has never been published, so it has no
+          # crates.io baseline and makes the check un-runnable if left in scope.
+          # Drop it from `exclude:` once it is first published to gate it too.
+          exclude: khive-quant
+
+  # ─────────────────────────────────────────────────────────────────────────
   # Phase 2: Publish all subpackages + umbrella atomically in a single job.
   # Runs only after ALL Phase 1 jobs succeed (needs: build-platform with
-  # fail-fast: true propagates any single failure here).
+  # fail-fast: true propagates any single failure here) and the release SemVer
+  # gate passes.
   # ─────────────────────────────────────────────────────────────────────────
   publish-all:
-    needs: build-platform
+    needs: [build-platform, semver-gate]
     runs-on: ubuntu-latest
     # ADR-066 release gate: in the autonomous-merge model the human approval
     # moves from per-PR to per-release. This job publishes to npm; the

@@ -108,3 +108,100 @@ jobs:
           python-version: "3.12"
       - name: Validate marketplace SKILL/agent verb examples
         run: python3 marketplace/_validators/check_examples.py
+
+  doc-build:
+    name: Doc build (-D warnings)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      - name: Build docs (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    # Declare the read scope the action needs explicitly so the gate does not
+    # depend on ambient GITHUB_TOKEN defaults (an org policy could tighten them).
+    # No pull-requests:write — comment-summary-in-pr is not enabled.
+    permissions:
+      contents: read
+    # This action only works on pull_request events — it diffs the dependency
+    # graph between the base and head commits.  Skip on push to main/integration.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Fail on high or critical vulnerabilities only; low/moderate are
+          # informational to avoid blocking on transitive noise.
+          fail-on-severity: high
+          # Mirror the license allow-list from crates/deny.toml so the two
+          # gates stay consistent.  GPL/LGPL/AGPL are implicitly denied because
+          # they are absent from the allow list.
+          allow-licenses: >-
+            Apache-2.0, Apache-2.0 WITH LLVM-exception, MIT, ISC, BSD-2-Clause,
+            BSD-3-Clause, Unicode-3.0, Zlib, MIT-0, BSL-1.0, 0BSD, CC0-1.0,
+            Unlicense, MPL-2.0, CDLA-Permissive-2.0
+
+  coverage-ratchet:
+    name: Coverage ratchet
+    runs-on: ubuntu-latest
+    # Read-only gate: fails a PR whose line coverage regresses below the committed
+    # baseline (coverage-baseline.txt). It does NOT push to main — the baseline is
+    # raised only by an explicit PR that edits coverage-baseline.txt, so every
+    # change to main (the floor included) goes through the gate wall. Auto-pushing
+    # a ratchet commit would require a direct-to-main write path that bypasses the
+    # required-checks wall, which the autonomous-merge model (ADR-066) forbids;
+    # under that model the bot is not a ruleset bypass actor, so the push would be
+    # rejected and fail the job on every merge.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
+      # #215 cargo-deny installer pin): a required gate's tooling must not drift.
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-llvm-cov
+      - name: Compute coverage
+        working-directory: crates
+        run: |
+          # Extract TOTAL *line* coverage from the structured JSON export, not by
+          # column position. In `--summary-only` text the TOTAL row has Regions%
+          # in field 4 and Lines% in field 10, so the prior `awk '{print $4}'`
+          # silently gated on REGION coverage while logs claimed line coverage.
+          # `.data[0].totals.lines.percent` is unambiguous and format-stable.
+          cargo llvm-cov --workspace --summary-only --json > /tmp/cov.json
+          CURRENT=$(jq -r '.data[0].totals.lines.percent' /tmp/cov.json)
+          echo "Current line coverage: ${CURRENT}%"
+          echo "CURRENT_COVERAGE=${CURRENT}" >> "$GITHUB_ENV"
+      - name: Check coverage does not regress
+        run: |
+          BASELINE=$(cat coverage-baseline.txt | tr -d '[:space:]')
+          CURRENT="${CURRENT_COVERAGE}"
+          echo "Baseline: ${BASELINE}%  Current: ${CURRENT}%"
+          # Allow 0.1 percentage-point measurement noise (compiler non-determinism).
+          python3 -c "
+          import sys
+          baseline = float('${BASELINE}')
+          current  = float('${CURRENT}')
+          epsilon  = 0.1
+          if current < baseline - epsilon:
+              print(f'FAIL: coverage dropped {baseline:.2f}% -> {current:.2f}%  (epsilon={epsilon}%)')
+              sys.exit(1)
+          print(f'OK: {current:.2f}% >= {baseline:.2f}% - {epsilon}% threshold')
+          "

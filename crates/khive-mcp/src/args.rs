@@ -88,7 +88,7 @@ pub struct Args {
     ///
     /// Precedence (highest to lowest):
     ///   1. --brain-profile (this flag)
-    ///   2. [runtime] brain_profile in project khive.toml / global ~/.khive/config.toml
+    ///   2. \[runtime\] brain_profile in project khive.toml / global ~/.khive/config.toml
     ///   3. KHIVE_BRAIN_PROFILE env var
     ///   4. Namespace-bound profile (resolved at feedback time via brain.resolve)
     ///   5. Pack-local global tuning prior

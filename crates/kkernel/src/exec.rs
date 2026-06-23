@@ -18,7 +18,7 @@
 //! `kkernel exec --ops-file batch.jsonl` reads a JSONL file where each
 //! non-blank line is a JSON op object `{"tool":"verb","args":{...}}`.  All
 //! lines are parsed first; a malformed line aborts before any writes.  Valid
-//! ops are dispatched in chunks of [`OPS_FILE_CHUNK_SIZE`] through the same
+//! ops are dispatched in chunks of 100 (`OPS_FILE_CHUNK_SIZE`) through the same
 //! in-process runtime path (daemon fast-path is intentionally skipped for
 //! bulk apply — the daemon is warm-state optimised, not throughput optimised).
 //! A progress line is printed per chunk.  `--dry-run` validates every line and

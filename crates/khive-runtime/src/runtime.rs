@@ -320,7 +320,7 @@ impl KhiveRuntime {
     /// denial.
     ///
     /// The returned token's read visibility set defaults to `[ns]` — identical
-    /// to the pre-visibility-set behaviour. Use [`authorize_with_visibility`]
+    /// to the pre-visibility-set behaviour. Use [`Self::authorize_with_visibility`]
     /// to mint a token that can read additional namespaces.
     ///
     /// When `actor_id` is configured in `RuntimeConfig`, the token carries that
