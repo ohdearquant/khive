@@ -30,6 +30,18 @@
 //!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
+//! - Non-ASCII characters (CJK prose, accented text, emoji) act as token
+//!   delimiters for the entropy heuristic: only maximal ASCII runs are
+//!   entropy-checked.  Real base64/hex/base64url credentials are ASCII, and
+//!   `shannon_entropy` runs over UTF-8 bytes — multibyte codepoints inflate the
+//!   byte-wise entropy and false-positive on natural-language non-Latin content.
+//!   Treating non-ASCII as a delimiter (rather than skipping any whitespace
+//!   token that merely contains it) keeps CJK prose unflagged while still
+//!   catching an ASCII credential glued to CJK text/punctuation/fullwidth
+//!   whitespace.  The literal-prefix checks (Layer 1) treat any
+//!   non-ASCII-alphanumeric char (CJK, accented text, emoji) as a token
+//!   boundary, so a known-prefix secret is caught whether the adjacent
+//!   non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -192,7 +204,7 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
             text[..pos]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric())
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
         if at_boundary {
             let payload_start = pos + 6; // skip "FlyV1 "
@@ -246,10 +258,14 @@ fn find_prefix_token<'a>(text: &'a str, needle: &str, min_len: usize) -> Option<
     while let Some(rel) = text[start..].find(needle) {
         let abs = start + rel;
         // Require that the needle starts at a token boundary (start-of-string
-        // or preceded by whitespace / punctuation that isn't alphanumeric).
+        // or preceded by a non-ASCII-alphanumeric char).  The needles are ASCII,
+        // so only an ASCII alphanumeric can be a real continuation of the same
+        // token; CJK/accented text (which Rust counts as `is_alphanumeric`) must
+        // act as a delimiter, else a secret glued to non-Latin prose (`数据AKIA…`)
+        // is missed.
         let at_boundary = abs == 0 || {
             let prev = text[..abs].chars().next_back().unwrap_or(' ');
-            !prev.is_alphanumeric()
+            !prev.is_ascii_alphanumeric()
         };
         if at_boundary {
             let token = extract_token(&text[abs..]);
@@ -314,13 +330,19 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
                 let user = &userinfo[..colon];
                 let pass = &userinfo[colon + 1..];
                 if !user.is_empty() && !pass.is_empty() && pass.len() >= 4 {
-                    // Return a slice starting from the scheme.
-                    // Walk back from at_abs to find the start of the scheme.
+                    // Return a slice starting from the scheme.  Walk back from
+                    // `at_abs` to the first non-scheme char and resume just past
+                    // it.  Use `char_indices` and skip by the separator's full
+                    // UTF-8 width: a multibyte separator (e.g. CJK prose before a
+                    // credential URL) would otherwise leave `scheme_start` inside
+                    // the codepoint and panic the slice below.
                     let scheme_start = text[..at_abs]
-                        .rfind(|c: char| {
-                            !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.'
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| {
+                            !c.is_ascii_alphanumeric() && *c != '+' && *c != '-' && *c != '.'
                         })
-                        .map(|p| p + 1)
+                        .map(|(idx, c)| idx + c.len_utf8())
                         .unwrap_or(0);
                     // Ensure there are no spaces in userinfo (not a code snippet).
                     if !userinfo.contains(' ') && !userinfo.contains('\n') {
@@ -374,10 +396,28 @@ const ENTROPY_THRESHOLD: f64 = 4.5;
 /// Window around a trigger word in which a high-entropy token must appear.
 const TRIGGER_WINDOW: usize = 120;
 
+/// Largest index `<= i` that lies on a UTF-8 char boundary of `s`. Stable
+/// replacement for the unstable `str::floor_char_boundary`; used to snap
+/// byte-offset windows that may land inside a multibyte char before slicing.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
-    // Tokenize once: collect all whitespace-delimited tokens with their byte offsets.
+    // Tokenize into maximal ASCII non-whitespace runs, recording each run's byte
+    // offset.  Non-ASCII characters are delimiters (alongside ASCII whitespace):
+    // real base64/hex/base64url credentials are ASCII, so splitting on non-ASCII
+    // isolates an ASCII credential glued to CJK text/punctuation/fullwidth
+    // whitespace, while a run of natural-language CJK yields no ASCII run long
+    // enough to trip the length floor below.  On pure-ASCII input this is
+    // identical to `split_ascii_whitespace`.
     let tokens: Vec<(usize, &str)> = text
-        .split_ascii_whitespace()
+        .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+        .filter(|t| !t.is_empty())
         .map(|t| {
             let offset = t.as_ptr() as usize - text.as_ptr() as usize;
             (offset, t)
@@ -391,6 +431,9 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
             continue;
         }
 
+        // `token` is ASCII here (non-ASCII was split out at tokenization), so
+        // `shannon_entropy` over its bytes is a true per-character entropy.
+
         // UUID and sha-prefixed base64 content hashes (SRI / npm lockfile) are
         // unconditionally allowlisted: their forms are unambiguous regardless of
         // surrounding context.
@@ -401,8 +444,8 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
         // Compute the trigger window before deciding whether to allowlist hex
         // tokens.  A pure-hex token near a credential trigger word cannot be
         // safely assumed to be a non-secret hash and must be entropy-checked.
-        let window_start = tok_offset.saturating_sub(TRIGGER_WINDOW);
-        let window_end = (tok_offset + raw_token.len() + TRIGGER_WINDOW).min(text.len());
+        let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
+        let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
         let low_window = window.to_ascii_lowercase();
 
@@ -445,8 +488,9 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
 }
 
 /// Returns `true` when `low_window` contains the word `token` as a standalone
-/// word — i.e. surrounded by non-alphanumeric boundaries — but NOT as part of
-/// compound identifiers such as `tokenizer`, `token_count`, or `next_token`.
+/// word — i.e. surrounded by non-ASCII-alphanumeric boundaries (CJK/accented
+/// prose counts as a boundary) — but NOT as part of compound identifiers such
+/// as `tokenizer`, `token_count`, or `next_token`.
 fn has_standalone_token(low_window: &str) -> bool {
     let needle = "token";
     let mut start = 0;
@@ -456,13 +500,13 @@ fn has_standalone_token(low_window: &str) -> bool {
             || low_window[..abs]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         let after_end = abs + needle.len();
         let after_ok = after_end >= low_window.len()
             || low_window[after_end..]
                 .chars()
                 .next()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         if before_ok && after_ok {
             return true;
         }
@@ -492,7 +536,7 @@ fn has_token_assignment(low_window: &str) -> bool {
             || low_window[..abs]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
         let after_end = abs + needle.len();
         // Require `=` or `:` immediately after `token` (possibly with surrounding
         // whitespace or quotes stripped by the time we see the lowercased window).
@@ -975,6 +1019,166 @@ mod tests {
         // A truly random-looking string should exceed 4.5 bits/char.
         let s = b"X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // 32 mixed base64 chars
         assert!(shannon_entropy(s) > 4.5, "entropy={}", shannon_entropy(s));
+    }
+
+    #[test]
+    fn cjk_prose_near_trigger_is_not_flagged() {
+        // Regression: a multibyte CJK run (~19 chars = 57 bytes) clears the
+        // byte-length floor, and `shannon_entropy` over UTF-8 bytes reads it as
+        // high-entropy — so a Chinese title near the `auth` trigger word used to
+        // false-positive as `high-entropy-token`.  Non-ASCII tokens are now
+        // skipped by the entropy heuristic: real base64/hex credentials are
+        // ASCII, so this cannot hide a secret.
+        let content = "更新 auth 配置数据库连接管理系统核心模块设计文档";
+        assert!(
+            check(content).is_ok(),
+            "CJK prose near a trigger word must not be flagged as a secret"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_near_trigger_still_flagged() {
+        // The non-ASCII skip must NOT weaken detection of genuine ASCII
+        // high-entropy credentials near a trigger word.
+        let content = "api_key X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1";
+        assert!(
+            check(content).is_err(),
+            "ASCII high-entropy token near a trigger word must still be blocked"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_in_cjk_context_does_not_panic_and_is_flagged() {
+        // The ±120-byte trigger window around an ASCII token can land in the
+        // middle of a multibyte CJK character when the token is embedded in
+        // non-Latin prose.  Slicing on a non-char-boundary would panic — the
+        // window bounds are snapped via `floor_char_boundary`.  Detection of
+        // the genuine ASCII secret must still fire.
+        let cjk = "数据库连接管理系统核心模块设计文档".repeat(6); // 17 chars × 6 = 306 bytes
+                                                                  // The leading single-byte `x` breaks 3-byte CJK alignment so the window
+                                                                  // start (token_offset - 120) lands mid-character without the snap.
+        let content = format!("{cjk}x api_key X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1 {cjk}");
+        assert!(
+            check(&content).is_err(),
+            "ASCII secret in CJK context must still be blocked (and must not panic)"
+        );
+    }
+
+    #[test]
+    fn ascii_secret_glued_to_cjk_is_still_flagged() {
+        // Regression: a prefixless high-entropy credential glued (no ASCII
+        // whitespace) to CJK text, CJK brackets/quotes, a fullwidth space, or a
+        // fullwidth colon used to slip through, because the whole whitespace token
+        // contained a non-ASCII byte and was skipped wholesale.  Non-ASCII is now
+        // a token delimiter, so the ASCII credential run is isolated and
+        // entropy-checked while the surrounding ±120-byte window still sees the
+        // trigger word.
+        let secret = "X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let cases = [
+            format!("api_key {secret}数据"),     // CJK suffix glued to the token
+            format!("api_key 「{secret}」"),     // CJK brackets wrap the token
+            format!("api_key　{secret}"),        // U+3000 ideographic space separator
+            format!("api_key：{secret}"),        // U+FF1A fullwidth colon separator
+            format!("数据{secret}更新 api_key"), // CJK-glued prefix, trigger after
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "ASCII secret glued to CJK must be blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_entropy_ascii_run_without_trigger_is_not_flagged() {
+        // The non-ASCII-as-delimiter change must not weaken the trigger-context
+        // discipline: a high-entropy ASCII run isolated from CJK prose but NOT
+        // near a credential trigger word is still allowed (only the tokenizer
+        // changed, not the `near_trigger` gate).
+        let secret = "X9kZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let content = format!("数据库连接{secret}核心模块设计文档");
+        assert!(
+            check(&content).is_ok(),
+            "high-entropy ASCII run with no trigger word must not be flagged"
+        );
+    }
+
+    #[test]
+    fn known_prefix_secret_glued_after_cjk_is_still_flagged() {
+        // Round-2 regression: a Layer-1 known-prefix secret glued directly after
+        // CJK prose (no ASCII whitespace) was missed, because the prefix boundary
+        // check used `is_alphanumeric` — which Rust counts true for CJK — so the
+        // preceding ideograph was not treated as a delimiter.  These credentials
+        // must be caught with no nearby ASCII trigger word, on the left side too.
+        let cases = [
+            "数据AKIAIOSFODNN7EXAMPLE",             // gitleaks:allow
+            "令牌github_pat_11ABCDEFG0HIJKLMNOPQR", // gitleaks:allow
+            "密钥sk-ant-api03-AAAAAAAAAAAAAAAAAA",  // gitleaks:allow
+            "配置FlyV1 fm2_AAAABBBBCCCCDDDD",       // gitleaks:allow
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "known-prefix secret glued after CJK must be blocked: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_userinfo_after_cjk_does_not_panic_and_is_flagged() {
+        // Round-3 regression: a credential URL glued after CJK prose panicked,
+        // because scheme_start was (separator byte index + 1) — one byte into a
+        // multibyte CJK separator — and the slice fell on a non-char boundary.
+        // The public check() API must return a controlled error, never panic.
+        let cases = [
+            "数据postgresql://dbuser:S3cr3tP4ss@db.example.com/db", // gitleaks:allow
+            "配置mysql://root:hunter2pw@10.0.0.1:3306/app",         // gitleaks:allow
+            "连接redis://svc:V3ryS3cretPw@cache.internal:6379",     // gitleaks:allow
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "credential URL after CJK must be blocked, not panic: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_glued_token_trigger_is_still_flagged() {
+        // Round-4 regression: `token=`/`token:`/standalone `token` glued directly
+        // after non-ASCII prose was missed because has_standalone_token /
+        // has_token_assignment used is_alphanumeric for the word boundary — CJK,
+        // accented letters, and fullwidth digits all count as alphanumeric in
+        // Rust, so the preceding char was not seen as a boundary and the `token`
+        // trigger was suppressed, leaving the high-entropy value unflagged.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let blocked = [
+            format!("数据token={opaque}"),    // CJK + assignment form, ASCII '='
+            format!("配置token: {opaque}"),   // CJK + assignment form, ASCII ':'
+            format!("密钥token {opaque}"),    // CJK + standalone-word form
+            format!("résumétoken: {opaque}"), // accented letter before `token`
+            format!("１token: {opaque}"),     // fullwidth digit before `token`
+        ];
+        for content in &blocked {
+            assert!(
+                check(content).is_err(),
+                "non-ASCII-glued token trigger must flag the value: {content:?}"
+            );
+        }
+        // Compound identifiers stay excluded — the `_` boundary rule is unchanged
+        // and an ASCII letter before `token` is still a continuation, so these
+        // (including the pure-ASCII `servicetoken:`) must still pass.
+        let allowed = [
+            format!("数据next_token: {opaque}"),
+            format!("数据token_count: {opaque}"),
+            format!("servicetoken: {opaque}"),
+        ];
+        for content in &allowed {
+            assert!(
+                check(content).is_ok(),
+                "compound token identifier must not be flagged: {content:?}"
+            );
+        }
     }
 
     #[test]
