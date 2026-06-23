@@ -93,6 +93,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-058](ADR-058-brain-posterior-read-path.md)          | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking (Proposed)                            |
 | [ADR-059](ADR-059-namespace-write-tiers.md)              | Namespace Write Tiers and Cross-Namespace Link Access Control (Withdrawn — superseded by ADR-007 Rev 2)         |
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)   | Pack-Extensible by-ID Resolution (Accepted)                                                                     |
+| [ADR-066](ADR-066-autonomous-merge-pipeline.md)          | Autonomous Merge Pipeline — Gate Wall as Reviewer, Human Gate at Release (Proposed)                             |
 
 ## Closed Taxonomies — Quick Reference
 
