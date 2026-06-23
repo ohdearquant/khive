@@ -17,8 +17,18 @@ cargo fmt --all -- --check
 echo "=== SQL Lint ==="
 sh "$SCRIPT_DIR/lint-sql.sh"
 
-echo "=== No-Stub Guard ==="
-sh "$SCRIPT_DIR/check-no-stubs.sh"
+echo "=== No-Stub Guard (clippy restriction lints) ==="
+# AST-aware "No stubs. Ever." enforcement. clippy parses the macros, so it is
+# immune to the grep failure modes (spacing like `todo !()`, brace forms like
+# `unimplemented!{}`, macro names inside comments or string literals). Scoped to
+# --lib --bins = shipping source only (excludes tests/benches/examples), matching
+# the prior policy. khive-merge is excluded from the workspace (forward-deployed),
+# so it gets its own pass to preserve coverage.
+NOSTUB_LINTS="-Dclippy::todo -Dclippy::unimplemented -Dclippy::dbg_macro"
+# shellcheck disable=SC2086
+cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS
+# shellcheck disable=SC2086
+cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --lib --bins -- $NOSTUB_LINTS
 
 echo "=== Clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
