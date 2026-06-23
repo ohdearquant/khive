@@ -141,6 +141,15 @@ jobs:
   publish-all:
     needs: build-platform
     runs-on: ubuntu-latest
+    # ADR-066 release gate: in the autonomous-merge model the human approval
+    # moves from per-PR to per-release. This job publishes to npm; the
+    # 'publish' environment carries a required reviewer (Ocean), so even an
+    # automated or accidental tag pauses here until a human authorizes the
+    # deployment. The environment is created by scripts/apply-autonomous-merge.sh
+    # (STEP=release-gate). Until that runs, the gate is dormant (the environment
+    # auto-creates unprotected on first use) — apply the release gate before
+    # flipping the ruleset to zero approvals.
+    environment: publish
 
     steps:
       - uses: actions/checkout@v4
