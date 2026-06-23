@@ -317,6 +317,23 @@ impl ConnectionPool {
         self.writer()
     }
 
+    /// Zero-wait writer checkout for background tasks.
+    ///
+    /// Uses `try_lock()` (no timeout, no spin) — returns `Err` immediately when
+    /// any other caller holds the writer Mutex. Background tasks (e.g. the WAL
+    /// checkpoint task) MUST use this instead of `try_writer` so that a busy
+    /// writer causes the background task to skip its current tick rather than
+    /// stalling for up to `checkout_timeout` (default 5s) while write traffic
+    /// is in progress.
+    pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        let guard = self.writer.try_lock().ok_or_else(|| {
+            SqliteError::InvalidData(
+                "writer connection busy (checkpoint skipped this tick)".to_string(),
+            )
+        })?;
+        Ok(WriterGuard { guard })
+    }
+
     /// Get the current number of available reader connections.
     pub fn available_readers(&self) -> usize {
         self.readers.len()
@@ -504,6 +521,7 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn pool_config_default_values_match_constants() {
@@ -522,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_config_env_override_wal_autocheckpoint() {
         std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "8000");
         let cfg = PoolConfig::default();
@@ -530,6 +549,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_config_env_override_journal_size_limit() {
         std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "134217728");
         let cfg = PoolConfig::default();
@@ -538,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_config_env_override_busy_timeout() {
         std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "60");
         let cfg = PoolConfig::default();
@@ -546,6 +567,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_config_env_override_checkout_timeout() {
         std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "10");
         let cfg = PoolConfig::default();
@@ -554,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pool_config_env_invalid_falls_back_to_default() {
         std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "not_a_number");
         std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "");

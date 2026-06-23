@@ -2,14 +2,16 @@
 //!
 //! Issues `PRAGMA wal_checkpoint(PASSIVE)` on a configurable interval and
 //! escalates to `PRAGMA wal_checkpoint(TRUNCATE)` when the WAL page count
-//! exceeds a high-water mark. Both operations are submitted through the pool's
-//! writer connection so they are serialized with active writers and never
-//! contend with reads in flight.
+//! exceeds a high-water mark.
+//!
+//! Non-contending design: `checkpoint_once` uses `try_writer_nowait` (zero-wait
+//! `try_lock`) so a tick is skipped immediately when any writer holds the mutex,
+//! rather than blocking for up to `checkout_timeout`. The checkpoint task must
+//! never stall active write traffic — a skipped tick is always preferable.
 //!
 //! PASSIVE: yields if any reader holds a WAL snapshot — never blocks.
-//! TRUNCATE: resets the WAL to zero length after checkpointing; only safe when
-//! no reader is active, but `wal_checkpoint(TRUNCATE)` in SQLite degrades to
-//! PASSIVE if readers are present, so it is safe to call unconditionally.
+//! TRUNCATE: resets the WAL to zero length after checkpointing; degrades to
+//! PASSIVE behavior when readers are present, so it is safe to call unconditionally.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,13 +70,17 @@ impl CheckpointConfig {
 
         if let Ok(v) = std::env::var("KHIVE_WAL_WARN_PAGES") {
             if let Ok(n) = v.parse::<u64>() {
-                cfg.warn_pages = n;
+                if n > 0 {
+                    cfg.warn_pages = n;
+                }
             }
         }
 
         if let Ok(v) = std::env::var("KHIVE_WAL_HIGH_WATER_PAGES") {
             if let Ok(n) = v.parse::<u64>() {
-                cfg.high_water_pages = n;
+                if n > 0 {
+                    cfg.high_water_pages = n;
+                }
             }
         }
 
@@ -92,9 +98,8 @@ impl CheckpointConfig {
 /// WAL page count exceeds `config.high_water_pages` it upgrades to
 /// `PRAGMA wal_checkpoint(TRUNCATE)` to reclaim disk space.
 ///
-/// All pragma calls go through `pool.try_writer()` so they are serialized
-/// with active write transactions. If the writer is busy the call is skipped
-/// and retried on the next tick.
+/// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
+/// current tick to be skipped rather than stalling write traffic.
 pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointConfig) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -117,8 +122,11 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
 /// Returns without error: all failures are logged at warn level and skipped.
 /// This is intentional — a failed checkpoint is non-fatal and will be retried
 /// on the next tick.
+///
+/// Uses `try_writer_nowait` so that a busy active writer causes this tick to
+/// be skipped immediately rather than stalling for up to `checkout_timeout`.
 pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) {
-    let writer = match pool.try_writer() {
+    let writer = match pool.try_writer_nowait() {
         Ok(w) => w,
         Err(_) => return,
     };
@@ -172,6 +180,7 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use serial_test::serial;
 
     fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
         let cfg = PoolConfig {
@@ -245,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn checkpoint_config_env_override() {
         std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "250");
         std::env::set_var("KHIVE_WAL_WARN_PAGES", "1500");
@@ -262,6 +272,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn checkpoint_config_defaults_on_invalid_env() {
         let default = CheckpointConfig::default();
 
@@ -277,5 +288,34 @@ mod tests {
 
         assert_eq!(cfg.interval, default.interval);
         assert_eq!(cfg.warn_pages, default.warn_pages);
+        assert_eq!(cfg.high_water_pages, default.high_water_pages);
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_config_rejects_zero_for_all_fields() {
+        let default = CheckpointConfig::default();
+        std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "0");
+        std::env::set_var("KHIVE_WAL_WARN_PAGES", "0");
+        std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "0");
+
+        let cfg = CheckpointConfig::from_env();
+
+        std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
+        std::env::remove_var("KHIVE_WAL_WARN_PAGES");
+        std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
+
+        assert_eq!(
+            cfg.interval, default.interval,
+            "zero interval must fall back to default"
+        );
+        assert_eq!(
+            cfg.warn_pages, default.warn_pages,
+            "zero warn_pages must fall back to default"
+        );
+        assert_eq!(
+            cfg.high_water_pages, default.high_water_pages,
+            "zero high_water_pages must fall back to default"
+        );
     }
 }

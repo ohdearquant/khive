@@ -378,6 +378,16 @@ impl KhiveMcpServer {
         self
     }
 
+    /// Attach a connection pool for the WAL checkpoint background task.
+    ///
+    /// Used by the multi-backend boot path to wire the main backend's pool into a
+    /// server built via `from_registry_with_meta` (which cannot carry a pool itself
+    /// because registry-only construction has no access to the backend layer).
+    pub fn with_pool(mut self, pool: Arc<ConnectionPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
     ///
     /// Returns `Some(result)` when the coordinator handled the op (caller should skip
