@@ -65,22 +65,22 @@ The pool Mutex is not the only write serialization point. The table below lists 
 write entry point in the current codebase (production / file-backed mode, which is what
 `StorageBackend::sqlite` produces — `backend.rs:29,38` sets `is_file_backed: true`).
 
-| #  | Entry point                                                                                                                                    | File                                                 | file-backed path                                                                 |
-| -- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------- |
-| 1  | `SqlEntityStore::with_writer`                                                                                                                  | `stores/entity.rs:68-80`                             | pool Mutex (`pool.try_writer()`)                                                 |
-| 2  | `SqlNoteStore::with_writer`                                                                                                                    | `stores/note.rs:69-81`                               | pool Mutex (`pool.try_writer()`)                                                 |
-| 3  | `SqlGraphStore::with_writer`                                                                                                                   | `stores/graph.rs:111-130`                            | **standalone connection** (`open_standalone_writer`)                             |
-| 4  | `SqlFtsStore::with_writer`                                                                                                                     | `stores/text.rs:130-149`                             | **standalone connection** (`open_standalone_writer`)                             |
-| 5  | `SqlEventStore::with_writer`                                                                                                                   | `stores/event.rs:104-123`                            | **standalone connection** (`open_standalone_writer`)                             |
-| 6  | `SqliteSparseStore::with_writer`                                                                                                               | `stores/sparse.rs:133-145`                           | pool Mutex (`pool.try_writer()`) — no file-backed branch                         |
-| 7  | `SqliteVecStore::with_writer`                                                                                                                  | `stores/vectors.rs:217-229`                          | pool Mutex (`pool.try_writer()`) — no file-backed branch                         |
-| 8  | `SqlBridge::writer()`                                                                                                                          | `sql_bridge.rs:791-801`                              | **standalone connection** (`open_standalone_writer`)                             |
-| 9  | `SqlBridge::begin_tx()`                                                                                                                        | `sql_bridge.rs:804-853`                              | **standalone connection** + `BEGIN IMMEDIATE`                                    |
-| 10 | `SqlBridge::execute_batch()`                                                                                                                   | `sql_bridge.rs:312-338`                              | runs on the connection owned by `SqliteWriter`, which is a standalone connection |
-| 11 | `curation::merge_entity`                                                                                                                       | `curation.rs:316-326`                                | pool Mutex (`pool.writer()`) directly                                            |
-| 12 | `curation::merge_note`                                                                                                                         | `curation.rs:638-645`                                | pool Mutex (`pool.writer()`) directly                                            |
-| 13 | `operations::link`                                                                                                                             | `operations.rs:3061-3073`                            | pool Mutex (`pool.writer()`) directly                                            |
-| 14 | `StorageBackend DDL helpers` (`apply_schema`, `apply_pack_ddl`, `entity_store`, `graph_store`, `note_store`, `event_store`, `vec_store`, etc.) | `backend.rs:108,132,158,185,214,241,302,399,464,534` | pool Mutex (`pool.try_writer()`) directly                                        |
+| #  | Entry point                                                                                                                                                                                                                                                                                                                                                                                        | File                                                 | file-backed path                                                                                                                                                                     |
+| -- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1  | `SqlEntityStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                      | `stores/entity.rs:68-80`                             | pool Mutex (`pool.try_writer()`)                                                                                                                                                     |
+| 2  | `SqlNoteStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                        | `stores/note.rs:69-81`                               | pool Mutex (`pool.try_writer()`)                                                                                                                                                     |
+| 3  | `SqlGraphStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                       | `stores/graph.rs:111-130`                            | **standalone connection** (`open_standalone_writer`)                                                                                                                                 |
+| 4  | `SqlFtsStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                         | `stores/text.rs:130-149`                             | **standalone connection** (`open_standalone_writer`)                                                                                                                                 |
+| 5  | `SqlEventStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                       | `stores/event.rs:104-123`                            | **standalone connection** (`open_standalone_writer`)                                                                                                                                 |
+| 6  | `SqliteSparseStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                   | `stores/sparse.rs:133-145`                           | pool Mutex (`pool.try_writer()`) — no file-backed branch                                                                                                                             |
+| 7  | `SqliteVecStore::with_writer`                                                                                                                                                                                                                                                                                                                                                                      | `stores/vectors.rs:217-229`                          | pool Mutex (`pool.try_writer()`) — no file-backed branch                                                                                                                             |
+| 8  | `SqlBridge::writer()`                                                                                                                                                                                                                                                                                                                                                                              | `sql_bridge.rs:791-801`                              | **standalone connection** (`open_standalone_writer`)                                                                                                                                 |
+| 9  | `SqlBridge::begin_tx()`                                                                                                                                                                                                                                                                                                                                                                            | `sql_bridge.rs:804-853`                              | **standalone connection** + `BEGIN IMMEDIATE`                                                                                                                                        |
+| 10 | `SqlBridge::execute_batch()`                                                                                                                                                                                                                                                                                                                                                                       | `sql_bridge.rs:312-338`                              | runs on the connection owned by `SqliteWriter`, which is a standalone connection                                                                                                     |
+| 11 | `curation::merge_entity`                                                                                                                                                                                                                                                                                                                                                                           | `curation.rs:316-326`                                | pool Mutex (`pool.writer()`) directly                                                                                                                                                |
+| 12 | `curation::merge_note`                                                                                                                                                                                                                                                                                                                                                                             | `curation.rs:638-645`                                | pool Mutex (`pool.writer()`) directly                                                                                                                                                |
+| 13 | `operations::link`                                                                                                                                                                                                                                                                                                                                                                                 | `operations.rs:3061-3073`                            | pool Mutex (`pool.writer()`) directly                                                                                                                                                |
+| 14 | `StorageBackend startup/bootstrap writes` (`apply_schema`, `apply_pack_ddl`, `entity_store`, `graph_store`, `note_store`, `event_store`, `vec_store`, etc. **and** `register_embedding_model` at `backend.rs:392` — acquires pool writer at `:399`, INSERTs into `_embedding_models` at `:408`; called via `register_configured_embedding_models` at `config.rs:374`, invoked at `runtime.rs:132`) | `backend.rs:108,132,158,185,214,241,302,399,464,534` | pool Mutex (`pool.try_writer()`) directly; these are startup-only sequential writes (DDL and embedding-model registry DML) that run before the accept loop admits concurrent traffic |
 
 Entries 3, 4, 5, 8, 9, and 10 open a **new standalone connection per operation** in
 file-backed mode, each configured with `busy_timeout` (`sql_bridge.rs:141`,
@@ -200,24 +200,40 @@ migrated to route through the writer task channel. Specifically:
 
 - Entries 1, 2, 6, 7 (`entity`, `note`, `sparse`, `vectors` stores): replace the `with_writer`
   helper so it sends a `WriteRequest` and awaits the oneshot reply, instead of calling
-  `pool.try_writer()` inside `spawn_blocking`.
+  `pool.try_writer()` inside `spawn_blocking`. **Additionally**, seven store methods issue their
+  own `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` calls inside the `with_writer` closure body,
+  independent of the helper entry point. These method-level transaction-control sites are:
+  `entity.rs:325`, `note.rs:348`, `graph.rs:390`, `text.rs:330`, `event.rs:652`, `sparse.rs:249`,
+  and `vectors.rs:355`. Migrating only the `with_writer` helper leaves these sites intact. A
+  `BEGIN IMMEDIATE` issued inside the WriterTask's outer transaction violates SQLite's nested-BEGIN
+  rule and breaks the SAVEPOINT-per-request design. The migration must therefore also rewrite
+  each of these seven sites so the store methods no longer manage their own transaction boundaries:
+  transaction ownership moves entirely to `WriterTask`, which wraps each drained request in a
+  per-request SAVEPOINT (see Component B). After rewriting, the store closure bodies contain only
+  DML statements and SAVEPOINT operations issued by the WriterTask wrapper — never a bare `BEGIN
+  IMMEDIATE`.
 - Entries 3, 4, 5 (`graph`, `text`, `event` stores): replace the `with_writer` helper so it
   sends a `WriteRequest` and awaits the reply, instead of calling `open_standalone_writer()`.
   The `is_file_backed` branch that currently opens a standalone connection is removed; the writer
   task owns the single writer connection regardless of whether the backend is file-backed or
-  in-memory.
+  in-memory. The method-level `BEGIN IMMEDIATE` sites in these stores (graph.rs:390, text.rs:330,
+  event.rs:652) are subject to the same rewrite requirement stated above.
 - Entries 8, 9, 10 (`SqlBridge::writer()`, `begin_tx()`, `execute_batch()`): `SqlBridge::writer()`
   and `execute_batch()` are updated to send through the channel. `begin_tx()` is left with its
   current standalone-connection behavior until the follow-up ADR for #195 specifies the
   transaction ownership model; this is an acknowledged gap (see Consequences).
 - Entries 11, 12, 13 (`curation::merge_entity`, `curation::merge_note`, `operations::link`):
   replace direct `pool.writer()` calls with channel sends.
-- Entry 14 (DDL helpers in `backend.rs`): DDL is applied during daemon startup before the
-  accept loop begins and before concurrent agents connect. DDL helpers continue to use
-  `pool.try_writer()` directly during the startup phase; they do not need to route through the
-  writer task channel because no concurrent writes can occur during startup.
+- Entry 14 (startup/bootstrap writes in `backend.rs`): these run during sequential daemon startup
+  before the accept loop begins and before concurrent agents connect. They continue to use
+  `pool.try_writer()` directly; they do not route through the writer task channel because no
+  concurrent writes can occur during startup. See also the Minor note on row 14 in the inventory.
 
-After migration, `BEGIN IMMEDIATE` is called in exactly one location: inside `WriterTask`.
+After migration, `BEGIN IMMEDIATE` for daemon write traffic is owned solely by `WriterTask`,
+**excluding** `SqlBridge::begin_tx()` (deferred to the #195 follow-up ADR) and the
+startup/bootstrap writes in `backend.rs` (sequential, pre-accept-loop). The narrow guarantee is:
+no in-flight concurrent write request reaching the accept loop issues `BEGIN IMMEDIATE` outside
+`WriterTask`.
 
 **Reads are unaffected**: `with_reader` paths and standalone reader connections
 (`open_standalone_reader` in `sql_bridge.rs:101`) are not routed through the writer task.
@@ -266,10 +282,13 @@ processing a solo request and commits it in isolation.
 
 ### Component C: WAL checkpoint discipline
 
-**What has shipped (Slice 1 / PR #221)**: `CheckpointConfig` (interval, warn threshold,
+**What is in flight (Slice 1 / PR #221)**: `CheckpointConfig` (interval, warn threshold,
 high-water threshold, all from-env) and `run_checkpoint_task` (a periodic loop spawned in the
-daemon) were implemented as a self-contained, ADR-independent change. That work is complete and
-merged. It is not conditional on this ADR.
+daemon) are implemented in PR #221 (branch `perf/khive-db-wal-checkpoint`), which is currently
+in adversarial review and not yet merged. This work is self-contained and ADR-independent. It
+is a prerequisite for Component C's coordination signal: PR #221 must land before ADR-067's
+`WriterTask` can wire to the checkpoint discipline it provides. Do not claim PR #221 is
+merged or complete until the merge commit is confirmed.
 
 **What this ADR adds (Slice 2)**: the writer task coordinates with the checkpoint task by
 exposing a write-activity signal (for example, a shared `AtomicBool` or a tokio watch channel)
@@ -287,32 +306,61 @@ not committed or rolled back within a configurable timeout (`TXN_WATCHDOG_SECS`,
 the watchdog issues `ROLLBACK` and returns `StorageError::WatchdogTimeout` to all senders
 whose requests were in the timed-out batch.
 
-**Execution model**: the writer task is a Tokio async task that owns a `JoinHandle` for each
-`spawn_blocking` call it issues to run the blocking SQLite statement. The watchdog wraps the
-`JoinHandle` in a `tokio::time::timeout`:
+**Execution model**: the writer task is a Tokio async task that dispatches each batch to a
+`spawn_blocking` closure. The `rusqlite::Connection` is moved into that closure for the duration
+of the blocking call; the async task cannot touch the same connection while the blocking closure
+is running. Cancelling the `JoinHandle` does not cancel the running blocking closure. Therefore,
+the writer task cannot issue a `ROLLBACK` on a separate connection to roll back a transaction on
+a different connection — rolling back on a different connection rolls back nothing.
+
+The implementable watchdog uses `rusqlite`'s interrupt API. **Before** moving the connection
+into `spawn_blocking`, the writer task obtains an interrupt handle:
 
 ```rust
+let interrupt_handle = conn.get_interrupt_handle(); // InterruptHandle: Send + Sync
+let handle = tokio::task::spawn_blocking(move || {
+    // conn is moved in here; the async task no longer holds it
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // ... execute batch statements ...
+    conn.execute_batch("COMMIT")?;
+    Ok(conn) // return the connection on success
+});
 let result = tokio::time::timeout(
     Duration::from_secs(TXN_WATCHDOG_SECS),
-    spawn_blocking_handle,
+    handle,
 ).await;
+if result.is_err() {
+    // Timeout elapsed — interrupt the in-flight SQL statement inside the closure.
+    interrupt_handle.interrupt();
+    // The closure's next SQLite call returns SQLITE_INTERRUPT
+    // (rusqlite::Error::SqliteFailure with code Interrupt).
+    // The closure — which still owns the connection — performs ROLLBACK locally
+    // and returns the error. Await the (now-completing) JoinHandle to observe the result.
+    ...
+}
 ```
 
-If the timeout fires before the blocking call returns, the writer task issues
-`conn.execute_batch("ROLLBACK")` on a separate blocking call and sends
-`StorageError::WatchdogTimeout` to every oneshot sender in the timed-out batch. The connection
-is then considered poisoned and the writer task opens a fresh connection before accepting the
-next batch.
+Key properties of this mechanism:
 
-**Relationship to `busy_timeout`**: `busy_timeout` (30 s, `pool.rs:29`) governs the per-connection
-SQLite lock-acquisition wait on `BEGIN IMMEDIATE`. The watchdog governs the total transaction
-duration after `BEGIN IMMEDIATE` has been acquired. Both remain configured; they address different
-phases. After migration, `busy_timeout` applies only to the writer task's single connection
-(and to the checkpoint connection), not to a pool of competing writers.
+- The watchdog **interrupts** the in-flight SQL statement via `InterruptHandle::interrupt()`.
+  It does **not** roll back on a foreign connection.
+- The blocking closure still owns the connection when the interrupt fires. The closure is
+  responsible for detecting `SqliteFailure { code: ErrorCode::OperationInterrupted }` and
+  executing `ROLLBACK` before returning.
+- `busy_timeout` (30 s, `pool.rs:29`) governs the per-connection SQLite lock-acquisition wait
+  on `BEGIN IMMEDIATE`. The watchdog governs total transaction duration after `BEGIN IMMEDIATE`
+  has been acquired. They address different phases and are not interchangeable. Both remain
+  configured after migration.
+- `InterruptHandle` is `Send + Sync` and safe to hold in the async task while the blocking
+  closure runs. It is obtained via `Connection::get_interrupt_handle()` (rusqlite 0.33 stable
+  API).
 
-**ROLLBACK failure handling**: if `ROLLBACK` itself times out or returns an error (for example,
-because the connection is in an unrecoverable state), the writer task logs the error, closes the
-connection, and opens a fresh connection. It does not retry the original batch.
+**ROLLBACK failure handling**: if the `ROLLBACK` inside the closure itself fails (for example,
+if the connection is in an unrecoverable state after interrupt), the closure returns an error.
+The writer task observes this via the now-completing `JoinHandle`, marks the connection
+poisoned, and opens a fresh connection before accepting the next batch. It does not retry the
+original batch. `StorageError::WatchdogTimeout` is sent to every oneshot sender whose requests
+were in the timed-out batch.
 
 ### Component E: Transport layer (unchanged)
 
@@ -402,9 +450,12 @@ unnecessary.
 
 ### Positive
 
-- Eliminates both contention paths: pool Mutex contention (entries 1, 2, 6, 7, 11, 12, 13, 14)
-  and standalone-connection `BEGIN IMMEDIATE` contention (entries 3, 4, 5, 8, 9, 10). After
-  migration, `BEGIN IMMEDIATE` is called in exactly one place.
+- Eliminates both contention paths for daemon write traffic: pool Mutex contention (entries 1, 2,
+  6, 7, 11, 12, 13) and standalone-connection `BEGIN IMMEDIATE` contention (entries 3, 4, 5, 8,
+  10). After migration, `BEGIN IMMEDIATE` for concurrent write requests routed through the accept
+  loop is called only inside `WriterTask`. The two exceptions — `SqlBridge::begin_tx()` (deferred
+  to the #195 follow-up ADR) and startup/bootstrap writes in `backend.rs` (sequential,
+  pre-accept-loop) — are not part of the concurrent write traffic this ADR targets.
 - Batched commits amortize WAL write-lock acquisition, improving write throughput under load.
 - Per-request SAVEPOINTs preserve the existing server.rs per-op independence contract: a failure
   in one request does not roll back unrelated concurrent requests.
@@ -444,10 +495,12 @@ unnecessary.
 
 The recommended landing sequence is:
 
-**Slice 1 (complete, PR #221)**: `CheckpointConfig` with interval, warn threshold, and
+**Slice 1 (in-flight, PR #221)**: `CheckpointConfig` with interval, warn threshold, and
 high-water threshold, all overridable by environment variables. `run_checkpoint_task` spawned
 in the daemon. This is a standalone de-risk measure that reduces wedge probability immediately
-and does not require this ADR. Already merged.
+and does not require this ADR. PR #221 (branch `perf/khive-db-wal-checkpoint`) is in adversarial
+review and not yet merged. Slice 1 must land before Slice 2's `WriterTask` can wire to the
+checkpoint coordination signal PR #221 provides.
 
 **Slice 2 (this ADR): Write-owner task and write queue**. After ADR-067 is accepted:
 
@@ -517,5 +570,5 @@ The following are explicitly excluded from this ADR:
 - `crates/khive-mcp/src/server.rs` — Single/Parallel per-op independence contract (`server.rs:566-568`); per-op result preservation (`server.rs:637,755`)
 - `crates/khive-runtime/src/daemon.rs` — `run_daemon` accept loop (`daemon.rs:466`)
 - `crates/kkernel/src/exec.rs` — `apply_ops_file` and daemon fast-path bypass (`exec.rs:214`, `408`)
-- PR #221 — Slice 1: `CheckpointConfig` and `run_checkpoint_task` (merged, ADR-independent)
+- PR #221 — Slice 1: `CheckpointConfig` and `run_checkpoint_task` (in-flight, ADR-independent; must land before Slice 2)
 - Issue #195: cross-op atomicity for `--ops-file` bulk apply
