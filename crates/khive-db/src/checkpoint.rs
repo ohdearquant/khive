@@ -1,17 +1,24 @@
 //! Periodic WAL checkpoint task for the connection pool.
 //!
-//! Issues `PRAGMA wal_checkpoint(PASSIVE)` on a configurable interval and
-//! escalates to `PRAGMA wal_checkpoint(TRUNCATE)` when the WAL page count
-//! exceeds a high-water mark.
+//! Issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — including when the
+//! WAL page count exceeds the high-water mark. PASSIVE is the only mode the
+//! periodic task ever uses.
 //!
 //! Non-contending design: `checkpoint_once` uses `try_writer_nowait` (zero-wait
 //! `try_lock`) so a tick is skipped immediately when any writer holds the mutex,
 //! rather than blocking for up to `checkout_timeout`. The checkpoint task must
 //! never stall active write traffic — a skipped tick is always preferable.
 //!
-//! PASSIVE: yields if any reader holds a WAL snapshot — never blocks.
-//! TRUNCATE: resets the WAL to zero length after checkpointing; degrades to
-//! PASSIVE behavior when readers are present, so it is safe to call unconditionally.
+//! Why TRUNCATE is excluded from the periodic path: TRUNCATE inherits RESTART
+//! semantics — it waits for active readers to release their WAL snapshots and
+//! invokes the busy handler before acquiring the exclusive lock needed to reset
+//! the WAL file. With PoolConfig's 30 s busy_timeout, the task could sit inside
+//! SQLite holding the sole writer connection for up to 30 s, stalling all normal
+//! write traffic. PASSIVE never waits for readers; it checkpoints as many frames
+//! as currently possible and returns promptly. When WAL pressure is sustained
+//! (high_water_pages exceeded), the task emits a WARNING so an operator or
+//! scheduler can perform a blocking TRUNCATE at a safe moment outside normal
+//! traffic.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +43,12 @@ pub struct CheckpointConfig {
     /// Default: 2000 pages (~8 MB at 4 KiB page size).
     pub warn_pages: u64,
 
-    /// WAL page count above which the task escalates from PASSIVE to TRUNCATE.
+    /// WAL page count above which a high-pressure WARNING is logged.
+    ///
+    /// The periodic task always runs PASSIVE regardless; this threshold signals
+    /// that a long-lived reader may be pinning an old WAL snapshot that PASSIVE
+    /// cannot reclaim. An operator can then schedule a blocking TRUNCATE at a
+    /// safe moment outside normal write traffic.
     ///
     /// Overridable via `KHIVE_WAL_HIGH_WATER_PAGES`.
     /// Default: 6000 pages (~24 MB at 4 KiB page size).
@@ -94,9 +106,10 @@ impl CheckpointConfig {
 /// `tokio::spawn`. It loops until the pool is dropped (the `Arc` count
 /// falls to one, meaning this task holds the last reference).
 ///
-/// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick. When the
-/// WAL page count exceeds `config.high_water_pages` it upgrades to
-/// `PRAGMA wal_checkpoint(TRUNCATE)` to reclaim disk space.
+/// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick. PASSIVE is
+/// the only checkpoint mode used; see the module-level doc for why TRUNCATE is
+/// excluded. When the WAL page count exceeds `config.high_water_pages` a
+/// WARNING is logged to signal sustained WAL pressure.
 ///
 /// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
 /// current tick to be skipped rather than stalling write traffic.
@@ -132,29 +145,29 @@ pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) {
     };
 
     let wal_pages = query_wal_pages(writer.conn());
-    let mode = if wal_pages >= config.high_water_pages {
+
+    if wal_pages >= config.high_water_pages {
         tracing::warn!(
             wal_pages,
             high_water = config.high_water_pages,
-            "WAL high-water mark exceeded; escalating to TRUNCATE checkpoint"
+            "WAL high-water mark exceeded; sustained WAL pressure — \
+             a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
         );
-        "TRUNCATE"
-    } else {
-        if wal_pages >= config.warn_pages {
-            tracing::warn!(
-                wal_pages,
-                warn_threshold = config.warn_pages,
-                "WAL page count approaching checkpoint threshold"
-            );
-        }
-        "PASSIVE"
-    };
+    } else if wal_pages >= config.warn_pages {
+        tracing::warn!(
+            wal_pages,
+            warn_threshold = config.warn_pages,
+            "WAL page count approaching checkpoint threshold"
+        );
+    }
 
-    let sql = format!("PRAGMA wal_checkpoint({mode})");
-    if let Err(e) = writer.conn().execute_batch(&sql) {
-        tracing::warn!(error = %e, mode, "WAL checkpoint failed");
+    if let Err(e) = writer
+        .conn()
+        .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+    {
+        tracing::warn!(error = %e, "WAL checkpoint failed");
     } else {
-        tracing::debug!(mode, wal_pages, "WAL checkpoint issued");
+        tracing::debug!(wal_pages, "WAL checkpoint issued");
     }
 }
 
@@ -162,11 +175,11 @@ pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) {
 ///
 /// The pragma returns a 3-column row `(busy, log, checkpointed)`, where `log`
 /// (column index 1) is the number of frames currently in the WAL file — the
-/// backlog the high-water escalation keys off. (Column 2 is `checkpointed`, the
+/// backlog the high-water threshold keys off. (Column 2 is `checkpointed`, the
 /// frames moved *by this call*, which is not the WAL size.) The no-arg pragma
 /// also performs a PASSIVE checkpoint as a side effect; the subsequent explicit
-/// checkpoint in `checkpoint_once` is therefore a deliberate second pass that
-/// can escalate to TRUNCATE.
+/// `PRAGMA wal_checkpoint(PASSIVE)` in `checkpoint_once` is a deliberate second
+/// pass that can checkpoint any frames written between the two calls.
 ///
 /// Returns 0 on any error (e.g. in-memory DB where WAL is not active, which
 /// reports `log = -1`).
@@ -289,6 +302,55 @@ mod tests {
         assert_eq!(cfg.interval, default.interval);
         assert_eq!(cfg.warn_pages, default.warn_pages);
         assert_eq!(cfg.high_water_pages, default.high_water_pages);
+    }
+
+    /// Regression: a high-water tick must not block behind an active reader.
+    ///
+    /// Opens a read connection and holds it for the duration, then triggers a
+    /// `checkpoint_once` with `high_water_pages = 1` so the high-water path
+    /// is taken. Asserts the call returns within 200 ms — proving PASSIVE
+    /// semantics (no reader wait). A TRUNCATE at this point would block for up
+    /// to `PoolConfig::busy_timeout` (30 s default).
+    #[test]
+    fn checkpoint_high_water_does_not_block_behind_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("high_water_test.db");
+        let pool = file_pool(&path);
+
+        // Write some data so the WAL is non-trivial.
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        // Hold an open read connection for the duration of the checkpoint call.
+        let reader = pool.reader().expect("reader");
+
+        // high_water_pages = 1 ensures the high-water branch is taken for any
+        // non-trivial WAL (even after the table write above).
+        let config = CheckpointConfig {
+            high_water_pages: 1,
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        checkpoint_once(&pool, &config);
+        let elapsed = start.elapsed();
+
+        drop(reader);
+
+        // PASSIVE returns immediately regardless of readers.
+        // TRUNCATE would block for up to busy_timeout (30 s) here.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "checkpoint_once with active reader took {:?}; expected <200ms (PASSIVE must not block)",
+            elapsed
+        );
     }
 
     #[test]
