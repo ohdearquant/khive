@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
-    KhiveRuntime, NamespaceToken, ParamDef, RuntimeError, VerbCategory, VerbRegistry,
-    VerbRegistryBuilder, Visibility,
+    EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
+    VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 use khive_storage::Note;
 use khive_types::Pack;
@@ -6808,6 +6808,58 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
     assert_eq!(
         count, 0,
         "malformed items rejection must create nothing; got {listed}"
+    );
+}
+
+// ── High-2 (Round 2): entity-type validator is installed by normal pack registration ──
+
+/// Build a `(KhiveRuntime, VerbRegistry)` pair using the same boot sequence as
+/// the production MCP server: register the pack, build the registry, install edge
+/// rules + entity-type validators.  No manual call to
+/// `install_entity_type_validator` is made — the validator must arrive via
+/// `call_register_entity_type_validators`.
+fn pack_with_validators() -> (KhiveRuntime, VerbRegistry) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    // Production boot: call entity-type validator registration without manually
+    // calling install_entity_type_validator.
+    registry.call_register_entity_type_validators(&rt);
+    (rt, registry)
+}
+
+/// After normal pack registration (`call_register_entity_type_validators`),
+/// direct `runtime.create_many` must reject unregistered `entity_type` values
+/// without any manual call to `install_entity_type_validator`.
+#[tokio::test]
+async fn create_many_runtime_validator_installed_via_pack_registration() {
+    let (rt, _registry) = pack_with_validators();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let bad_specs = vec![EntityCreateSpec {
+        kind: "concept".into(),
+        entity_type: Some("not_a_registered_type".into()),
+        name: "ShouldNotLand".into(),
+        description: None,
+        properties: None,
+        tags: vec![],
+    }];
+
+    let result = rt.create_many(&tok, bad_specs).await;
+    assert!(
+        matches!(result, Err(RuntimeError::InvalidInput(_))),
+        "direct runtime.create_many must reject unknown entity_type once \
+         validator is installed via pack registration; got {result:?}"
+    );
+
+    // Zero rows written.
+    let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        0,
+        "rejected create_many must write nothing; got {rows:?}"
     );
 }
 

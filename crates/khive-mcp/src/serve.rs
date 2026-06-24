@@ -236,6 +236,7 @@ pub fn build_registry_for_multi_backend(
         rt.install_edge_rules(registry.all_edge_rules());
     }
     registry.call_register_embedders(&default_runtime);
+    registry.call_register_entity_type_validators(&default_runtime);
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
         .iter()
@@ -570,12 +571,13 @@ fn build_server_multi_backend(
         .build()
         .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
 
-    // Install edge rules and embedders.
+    // Install edge rules, embedders, and entity-type validators.
     default_runtime.install_edge_rules(registry.all_edge_rules());
     for rt in per_pack_runtimes.values() {
         rt.install_edge_rules(registry.all_edge_rules());
     }
     registry.call_register_embedders(&default_runtime);
+    registry.call_register_entity_type_validators(&default_runtime);
 
     // Apply schema plans to each pack's assigned backend (ADR-028 §7: collision = boot failure).
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes

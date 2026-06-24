@@ -20,7 +20,12 @@ use crate::error::{RuntimeError, RuntimeResult};
 /// Callback type for pack-installed entity-type validation (ADR-004).
 ///
 /// `(kind, entity_type) → Ok(normalised_type | None)` or `InvalidInput`.
-type EntityTypeValidatorFn =
+/// Callback type for pack-installed entity-type validators.
+///
+/// Receives `(kind, entity_type)` and returns the normalised type string,
+/// or `RuntimeError::InvalidInput` if the type is not registered for that kind.
+/// When `entity_type` is `None`, the implementation must return `Ok(None)`.
+pub type EntityTypeValidatorFn =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
 
 pub use crate::config::{

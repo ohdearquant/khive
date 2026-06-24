@@ -17,9 +17,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
-    PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter, TextQueryMode,
-    TextSearchRequest, TraversalRequest,
+    BatchWriteSummary, DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -76,6 +76,10 @@ pub fn arm_vector_fail_after(n: usize) {
 static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
+/// create_note_inner and create_many tests cannot disarm each other.
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
 ///
@@ -86,6 +90,17 @@ static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail(ns: &str) {
     *FTS_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
+///
+/// The next `create_many` call whose namespace equals `ns` returns an injected
+/// error at the FTS upsert step (after entity rows are committed), then disarms.
+/// Calls on other namespaces are unaffected.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_fail_many(ns: &str) {
+    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
@@ -3681,13 +3696,67 @@ impl KhiveRuntime {
             )));
         }
 
-        // Phase 3: single bulk FTS write; on failure, hard-delete all entity rows.
+        // Phase 3: single bulk FTS write.
+        //
+        // The FTS store commits partial batches and signals per-document failures
+        // via BatchWriteSummary.failed (same as the entity store in Phase 2).
+        // We must capture the summary and treat failed > 0 as an error.
+        //
+        // Compensation is symmetric: on any FTS failure (Err or failed > 0),
+        // we first delete any FTS documents that may have landed, then
+        // hard-delete the entity rows.  This order matters: the entity delete
+        // is the authoritative write; FTS is a derived index.  Cleaning FTS
+        // first avoids a window where entity rows are gone but stale FTS rows
+        // survive.
         let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
-        let fts_result = match self.text(token) {
-            Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
-            Err(e) => Err(e),
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_many_inject = {
+            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
+            if g.as_deref() == Some(ns) {
+                *g = None;
+                true
+            } else {
+                false
+            }
         };
-        if let Err(e) = fts_result {
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_many_inject = false;
+
+        let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
+            Err(RuntimeError::Internal(
+                "injected FTS failure for create_many".to_string(),
+            ))
+        } else {
+            match self.text(token) {
+                Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
+                Err(e) => Err(e),
+            }
+        };
+
+        let fts_err: Option<RuntimeError> = match fts_summary_result {
+            Err(e) => Some(e),
+            Ok(summary) if summary.failed > 0 => Some(RuntimeError::Internal(format!(
+                "create_many: {}/{} FTS rows failed to index (first error: {}); \
+                 all rows rolled back",
+                summary.failed, summary.attempted, summary.first_error
+            ))),
+            Ok(_) => None,
+        };
+
+        if let Some(e) = fts_err {
+            // Clean up any FTS docs that landed before deleting entity rows.
+            if let Ok(fts) = self.text(token) {
+                for entity in &entities {
+                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to remove FTS doc during rollback"
+                        );
+                    }
+                }
+            }
             if let Ok(store) = self.entities(token) {
                 for entity in &entities {
                     if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
@@ -7496,6 +7565,69 @@ mod tests {
             entities[0].entity_type.as_deref(),
             Some("algorithm"),
             "entity_type must be stored as returned by the validator"
+        );
+    }
+
+    // High-1: FTS failure in create_many rolls back both substrates.
+    //
+    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // error; the test asserts zero rows in both `entities` and `fts_entities`.
+    #[tokio::test]
+    async fn create_many_fts_failure_rolls_back_both_substrates() {
+        // Use a unique namespace so the process-global one-shot is unaffected by
+        // other concurrent tests.
+        let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "FtsRollbackA".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "FtsRollbackB".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        arm_fts_fail_many(&ns);
+        let result = rt.create_many(&tok, specs).await;
+
+        assert!(
+            result.is_err(),
+            "create_many must return Err when FTS write fails"
+        );
+
+        // Entity substrate must be empty — entity rows must have been rolled back.
+        let entity_rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            entity_rows.len(),
+            0,
+            "entity rows must be rolled back on FTS failure; found {entity_rows:?}"
+        );
+
+        // FTS substrate must be empty — no stale fts_entities rows.
+        let fts = rt.text(&tok).unwrap();
+        let fts_count = fts
+            .count(TextFilter {
+                ids: vec![],
+                kinds: vec![],
+                namespaces: vec![ns.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fts_count, 0,
+            "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
         );
     }
 

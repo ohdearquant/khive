@@ -311,6 +311,10 @@ impl KhiveMcpServer {
         // Must happen after the registry is built (packs are ordered)
         // and before any `remember`/`recall` calls that would resolve embedders.
         registry.call_register_embedders(&runtime);
+        // Invoke `PackRuntime::register_entity_type_validator` on every pack so
+        // entity-type validation is active at the runtime layer for all write
+        // paths, including direct `create_many` callers that bypass the handler.
+        registry.call_register_entity_type_validators(&runtime);
         // Apply pack-auxiliary schema plans at startup so pack tables are
         // present before any handler runs. Errors are logged but not propagated
         // so a single pack's schema failure cannot abort startup.

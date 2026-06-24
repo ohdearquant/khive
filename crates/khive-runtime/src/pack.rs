@@ -190,6 +190,19 @@ pub trait PackRuntime: Send + Sync {
     /// use built-in lattice models do not need to override this method.
     fn register_embedders(&self, _runtime: &KhiveRuntime) {}
 
+    /// Install a pack-owned entity-type validator on the runtime.
+    ///
+    /// Called by the transport during pack initialisation, after the registry
+    /// is built and before the first verb dispatch, so that `create_many` and
+    /// `create_entity` reject unregistered `entity_type` values at the runtime
+    /// layer in addition to the handler layer.
+    ///
+    /// Packs that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`) should
+    /// override this to install their registry's `resolve` function.  The
+    /// default no-op leaves the runtime validator absent (skip-when-None), which
+    /// is the correct behaviour for bare runtimes without packs.
+    fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
+
     /// Warm up any in-memory state from persisted snapshots (optional).
     ///
     /// Called by the transport after all packs are registered but before
@@ -1242,6 +1255,21 @@ impl VerbRegistry {
     pub fn call_register_embedders(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_embedders(runtime);
+        }
+    }
+
+    /// Invoke `PackRuntime::register_entity_type_validator` on every registered pack.
+    ///
+    /// Called by the transport during startup, after the registry is built and
+    /// before the first verb dispatch, so that entity-type validation at the
+    /// runtime layer is active for all write paths including direct `create_many`
+    /// callers that bypass the handler layer.
+    ///
+    /// Packs whose `register_entity_type_validator` is the default no-op pay
+    /// no overhead.
+    pub fn call_register_entity_type_validators(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_entity_type_validator(runtime);
         }
     }
 

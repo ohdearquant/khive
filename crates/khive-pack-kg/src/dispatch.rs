@@ -3,8 +3,12 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use std::sync::Arc;
+
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
+};
 use khive_types::{EdgeEndpointRule, HandlerDef};
 
 use crate::handler_defs::{handle_verbs, KG_HANDLERS};
@@ -50,6 +54,21 @@ impl PackRuntime for KgPack {
 
     async fn warm(&self) {
         let _ = self.runtime.embed("khive warmup").await;
+    }
+
+    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
+        let validator: EntityTypeValidatorFn = Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let ek: khive_types::EntityKind = kind
+                .parse()
+                .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind:?}")))?;
+            crate::entity_type_registry::EntityTypeRegistry::global()
+                .resolve(ek, Some(raw))
+                .map(|r| r.entity_type)
+        });
+        runtime.install_entity_type_validator(validator);
     }
 
     async fn dispatch(
