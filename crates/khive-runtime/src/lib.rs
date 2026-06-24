@@ -57,7 +57,7 @@ pub use objectives::{
 };
 #[cfg(any(test, feature = "fault-injection"))]
 pub use operations::{arm_fts_fail, arm_vector_fail, arm_vector_fail_after};
-pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
+pub use operations::{EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,
     PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime,

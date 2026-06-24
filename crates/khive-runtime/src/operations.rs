@@ -3582,6 +3582,91 @@ impl KhiveRuntime {
         }
         Ok(persisted)
     }
+
+    /// Create a batch of entities atomically.
+    ///
+    /// All specs are validated before any write. If ANY spec fails validation
+    /// (unknown kind, empty name, secret-gate violation), the method returns
+    /// that error and no entities are written.
+    ///
+    /// Storage writes are issued as ONE `upsert_entities` call followed by ONE
+    /// `upsert_documents` call — the same primitives that the single-entity path
+    /// uses, but batched. Embedding is intentionally skipped: bulk structural
+    /// ingest is the expected use-case, and dense vectors are backfilled later
+    /// via a `reindex` call. Callers that need immediate vector search
+    /// immediately after creation should use per-entity `create_entity` instead.
+    ///
+    /// On FTS failure, every newly written entity row is hard-deleted to maintain
+    /// consistency (mirrors the single-entity rollback in `create_entity`).
+    pub async fn create_many(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<EntityCreateSpec>,
+    ) -> RuntimeResult<Vec<Entity>> {
+        if specs.is_empty() {
+            return Ok(vec![]);
+        }
+        let ns = token.namespace().as_str();
+
+        // Phase 1: validate ALL specs before any write.
+        let mut entities = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            self.validate_entity_kind(&spec.kind)?;
+            if spec.name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+            }
+            crate::secret_gate::check(&spec.name)?;
+            if let Some(d) = &spec.description {
+                crate::secret_gate::check(d)?;
+            }
+            if let Some(ref p) = spec.properties {
+                crate::secret_gate::check_json(p)?;
+            }
+            crate::secret_gate::check_tags(&spec.tags)?;
+
+            let mut entity = Entity::new(ns, &spec.kind, &spec.name)
+                .with_entity_type(spec.entity_type.as_deref());
+            if let Some(d) = &spec.description {
+                entity = entity.with_description(d);
+            }
+            if let Some(p) = spec.properties.clone() {
+                entity = entity.with_properties(p);
+            }
+            if !spec.tags.is_empty() {
+                entity = entity.with_tags(spec.tags.clone());
+            }
+            entities.push(entity);
+        }
+
+        // Phase 2: single bulk entity write.
+        self.entities(token)?
+            .upsert_entities(entities.clone())
+            .await?;
+
+        // Phase 3: single bulk FTS write; on failure, hard-delete all entity rows.
+        let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
+        let fts_result = match self.text(token) {
+            Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = fts_result {
+            if let Ok(store) = self.entities(token) {
+                for entity in &entities {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to roll back entity row after FTS failure"
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // Embedding is skipped intentionally — see doc comment above.
+        Ok(entities)
+    }
 }
 
 /// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
@@ -3594,6 +3679,21 @@ pub struct LinkSpec {
     pub relation: EdgeRelation,
     pub weight: f64,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Fully specified entity creation request — input to [`KhiveRuntime::create_many`].
+///
+/// `entity_type` must already be validated by the caller (e.g. via
+/// `validate_entity_type` in the pack handler); the runtime accepts the raw
+/// string and passes it through to `Entity::with_entity_type`.
+#[derive(Clone, Debug)]
+pub struct EntityCreateSpec {
+    pub kind: String,
+    pub entity_type: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Option<serde_json::Value>,
+    pub tags: Vec<String>,
 }
 
 // INLINE TEST JUSTIFICATION: tests here exercise private helpers (canonical_edge_endpoints,
@@ -7211,6 +7311,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "upsert must not duplicate the edge row");
+    }
+
+    // ── create_many: batch entity creation ───────────────────────────────────
+
+    #[tokio::test]
+    async fn create_many_persists_all_entities() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let specs: Vec<EntityCreateSpec> = (0..5)
+            .map(|i| EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: format!("BulkConcept-{i}"),
+                description: Some(format!("desc {i}")),
+                properties: None,
+                tags: vec!["bulk-test".into()],
+            })
+            .collect();
+
+        let entities = rt.create_many(&tok, specs).await.unwrap();
+        assert_eq!(entities.len(), 5, "all 5 entities must be returned");
+
+        // Verify each one is retrievable from storage.
+        for entity in &entities {
+            let fetched = rt.get_entity(&tok, entity.id).await.unwrap();
+            assert_eq!(fetched.id, entity.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_many_empty_name_rejects_atomically() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "ValidEntity".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "".into(), // invalid — triggers atomic rejection
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        let result = rt.create_many(&tok, specs).await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "empty name must produce InvalidInput error"
+        );
+
+        // Nothing must have been written — list_entities returns 0 items.
+        let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "atomic rejection must leave storage unchanged"
+        );
     }
 
     // ── PR-A1: cross-namespace get_edge now succeeds (UUID v4 is globally unique) ──

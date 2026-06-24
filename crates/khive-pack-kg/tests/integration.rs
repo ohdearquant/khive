@@ -149,6 +149,63 @@ async fn create_entity_valid_kind_concept_succeeds() {
     );
 }
 
+// Regression: bulk `create(items=[...])` must NOT require a redundant top-level
+// `kind` — each item carries its own kind. The single-record `kind` requirement
+// runs only after the bulk early-exit. Caught when the requirement fired first.
+#[tokio::test]
+async fn create_bulk_items_without_top_level_kind_succeeds() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "BulkOne", "entity_type": "theorem"},
+                    {"kind": "concept", "name": "BulkTwo"}
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create without top-level kind must succeed");
+    assert_eq!(result.get("attempted").and_then(Value::as_u64), Some(2));
+    assert_eq!(result.get("created").and_then(Value::as_u64), Some(2));
+    assert_eq!(result.get("failed").and_then(Value::as_u64), Some(0));
+}
+
+// Regression: bulk create is atomic — one invalid item (empty name) rejects the
+// whole batch and writes nothing.
+#[tokio::test]
+async fn create_bulk_items_atomic_rejects_on_invalid_item() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ShouldNotLand"},
+                    {"kind": "concept", "name": ""}
+                ]
+            }),
+        )
+        .await
+        .expect_err("empty name in a bulk item must reject the batch");
+    assert!(
+        is_invalid_input(&err),
+        "expected InvalidInput, got: {err:?}"
+    );
+    // Nothing was written: a follow-up search for the valid name finds no entity.
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let items = listed.get("items").and_then(Value::as_array);
+    let count = items.map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "atomic rejection must leave storage empty; got {listed}"
+    );
+}
+
 #[tokio::test]
 async fn create_entity_alias_paper_normalizes_to_document() {
     let pack = pack();

@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
@@ -19,11 +19,14 @@ impl KgPack {
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let raw_kind = params
+        // `kind` is required for the single-record path but NOT for the bulk
+        // `items` path (each item carries its own kind). Defer the requirement
+        // until after the bulk early-exit so `create(items=[...])` works without
+        // a redundant top-level `kind`.
+        let raw_kind_opt = params
             .get("kind")
             .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?
-            .to_string();
+            .map(str::to_string);
 
         const CREATE_USER_KEYS: &[&str] = &[
             "kind",
@@ -47,6 +50,9 @@ impl KgPack {
             "start",
             "end",
             "depends_on",
+            "items",
+            "atomic",
+            "verbose",
         ];
         if let Some(obj) = params.as_object() {
             for key in obj.keys() {
@@ -59,6 +65,132 @@ impl KgPack {
             }
         }
 
+        // ── Bulk path ──────────────────────────────────────────────────────────
+        // Early exit: if `items` is present, handle bulk entity creation and
+        // return before the single-record path executes.
+        {
+            let maybe_items = params.get("items").and_then(|v| {
+                serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(v.clone()).ok()
+            });
+            if let Some(entries) = maybe_items {
+                let attempted = entries.len();
+                if attempted > 1000 {
+                    return Err(RuntimeError::InvalidInput(
+                        "bulk create limited to 1000 entries per request".into(),
+                    ));
+                }
+                let atomic = params
+                    .get("atomic")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let verbose = params
+                    .get("verbose")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                // Build EntityCreateSpec for every entry, resolving kind/entity_type at
+                // the handler layer (same helpers used by the single-entity path).
+                let mut specs: Vec<EntityCreateSpec> = Vec::with_capacity(attempted);
+                for (idx, entry) in entries.into_iter().enumerate() {
+                    // Resolve the item's own kind.
+                    let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
+                        RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}"))
+                    })?;
+                    let canonical = match &item_kind_spec {
+                        KindSpec::Entity { specific } => {
+                            let legacy = entry.entity_kind.as_deref();
+                            super::common::reconcile_specific(
+                                specific.clone(),
+                                legacy,
+                                |s| super::common::canonical_entity_kind(s, registry),
+                                "entity_kind",
+                            )
+                            .map_err(|e| {
+                                RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
+                            })?
+                            .ok_or_else(|| RuntimeError::InvalidInput(format!(
+                                "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
+                            )))?
+                        }
+                        _ => {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "items[{idx}]: bulk create only supports entity kinds; got {:?}",
+                                entry.kind
+                            )));
+                        }
+                    };
+                    let validated_type =
+                        validate_entity_type(&canonical, entry.entity_type.as_deref()).map_err(
+                            |e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")),
+                        )?;
+                    specs.push(EntityCreateSpec {
+                        kind: canonical,
+                        entity_type: validated_type,
+                        name: entry.name,
+                        description: entry.description,
+                        properties: entry.properties,
+                        tags: entry.tags.unwrap_or_default(),
+                    });
+                }
+
+                if atomic {
+                    let entities = self.runtime.create_many(token, specs).await?;
+                    let created = entities.len();
+                    let mut resp = serde_json::json!({
+                        "attempted": attempted,
+                        "created": created,
+                        "skipped": 0,
+                        "failed": 0,
+                    });
+                    if verbose {
+                        resp["entities"] = serde_json::to_value(&entities)
+                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                    }
+                    return super::common::to_json(&resp);
+                } else {
+                    // Non-atomic: best-effort, per-item errors collected.
+                    let mut results: Vec<serde_json::Value> = Vec::new();
+                    let mut error_list: Vec<serde_json::Value> = Vec::new();
+                    for (idx, spec) in specs.into_iter().enumerate() {
+                        match self.runtime.create_many(token, vec![spec]).await {
+                            Ok(mut v) => {
+                                if verbose {
+                                    if let Some(e) = v.pop() {
+                                        if let Ok(jv) = serde_json::to_value(&e) {
+                                            results.push(jv);
+                                        }
+                                    }
+                                } else {
+                                    results.push(serde_json::Value::Null);
+                                }
+                            }
+                            Err(e) => {
+                                error_list.push(
+                                    serde_json::json!({"index": idx, "error": format!("{e}")}),
+                                );
+                            }
+                        }
+                    }
+                    let mut resp = serde_json::json!({
+                        "attempted": attempted,
+                        "created": results.len(),
+                        "skipped": 0,
+                        "failed": error_list.len(),
+                        "errors": error_list,
+                    });
+                    if verbose {
+                        resp["entities"] = serde_json::Value::Array(
+                            results.into_iter().filter(|v| !v.is_null()).collect(),
+                        );
+                    }
+                    return super::common::to_json(&resp);
+                }
+            }
+        }
+        // ── End bulk path ──────────────────────────────────────────────────────
+
+        let raw_kind = raw_kind_opt
+            .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?;
         let spec = resolve_kind_spec(&raw_kind, registry)?;
 
         let (sub_kind, hook) = match &spec {
