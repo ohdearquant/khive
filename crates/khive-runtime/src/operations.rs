@@ -3608,10 +3608,18 @@ impl KhiveRuntime {
         }
         let ns = token.namespace().as_str();
 
-        // Phase 1: validate ALL specs before any write.
+        // Phase 1: validate ALL specs before any write (ADR-004).
+        // Includes entity-type validation via the pack-installed validator when available.
+        // Any validation failure here guarantees zero rows are written.
         let mut entities = Vec::with_capacity(specs.len());
         for spec in &specs {
             self.validate_entity_kind(&spec.kind)?;
+            // High-2: validate entity_type at the runtime layer via pack-installed callback.
+            // When no validator is installed (bare runtime, unit tests without packs),
+            // the type passes through unchanged — same skip-when-absent pattern as
+            // validate_entity_kind. The handler layer remains the primary enforcement point.
+            let validated_type =
+                self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
             if spec.name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
@@ -3624,8 +3632,8 @@ impl KhiveRuntime {
             }
             crate::secret_gate::check_tags(&spec.tags)?;
 
-            let mut entity = Entity::new(ns, &spec.kind, &spec.name)
-                .with_entity_type(spec.entity_type.as_deref());
+            let mut entity =
+                Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
             if let Some(d) = &spec.description {
                 entity = entity.with_description(d);
             }
@@ -3639,9 +3647,39 @@ impl KhiveRuntime {
         }
 
         // Phase 2: single bulk entity write.
-        self.entities(token)?
+        // High-1: capture the BatchWriteSummary to detect partial failures.
+        // The store commits the transaction even when some rows fail (per-row error
+        // isolation). If any row failed, compensate by hard-deleting the rows that DID
+        // land, then return Err so the caller sees zero net writes.
+        //
+        // NOTE: this compensation path (delete-on-partial-failure) is a stopgap until
+        // a true single-transaction bulk primitive is available in the entity store.
+        // That primitive (writing entity rows and FTS rows in one SQL transaction) is
+        // tracked as a follow-up issue.
+        let entity_summary = self
+            .entities(token)?
             .upsert_entities(entities.clone())
             .await?;
+
+        if entity_summary.failed > 0 {
+            // Compensate: hard-delete any entity rows that did land.
+            if let Ok(store) = self.entities(token) {
+                for entity in &entities {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to roll back entity row after partial entity write"
+                        );
+                    }
+                }
+            }
+            return Err(RuntimeError::Internal(format!(
+                "create_many: {}/{} entity rows failed to write (first error: {}); \
+                 all rows rolled back",
+                entity_summary.failed, entity_summary.attempted, entity_summary.first_error
+            )));
+        }
 
         // Phase 3: single bulk FTS write; on failure, hard-delete all entity rows.
         let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
@@ -3683,9 +3721,11 @@ pub struct LinkSpec {
 
 /// Fully specified entity creation request — input to [`KhiveRuntime::create_many`].
 ///
-/// `entity_type` must already be validated by the caller (e.g. via
-/// `validate_entity_type` in the pack handler); the runtime accepts the raw
-/// string and passes it through to `Entity::with_entity_type`.
+/// `entity_type` is validated at the runtime layer by the pack-installed
+/// entity-type validator (ADR-004 §runtime-layer validation). When a validator
+/// is installed (e.g. by `KgPack`), unknown types are rejected with the valid
+/// set listed. When no validator is installed (bare runtime without packs),
+/// the value passes through — the handler layer is the primary enforcement point.
 #[derive(Clone, Debug)]
 pub struct EntityCreateSpec {
     pub kind: String,
@@ -7377,6 +7417,85 @@ mod tests {
             rows.len(),
             0,
             "atomic rejection must leave storage unchanged"
+        );
+    }
+
+    // High-2: entity_type validated at runtime layer when validator is installed.
+    #[tokio::test]
+    async fn create_many_rejects_unknown_entity_type_when_validator_installed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Install a mock validator that only accepts "algorithm" for "concept".
+        rt.install_entity_type_validator(Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            if kind == "concept" && raw == "algorithm" {
+                return Ok(Some("algorithm".to_string()));
+            }
+            Err(RuntimeError::InvalidInput(format!(
+                "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+            )))
+        }));
+
+        let bad_spec = vec![EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: Some("not_a_registered_type".into()),
+            name: "ShouldNotLand".into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        }];
+
+        let result = rt.create_many(&tok, bad_spec).await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "unknown entity_type must be rejected by the runtime-layer validator; got {result:?}"
+        );
+
+        // Zero rows written — validator fires before any storage call.
+        let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "validator rejection must leave storage empty"
+        );
+    }
+
+    // High-2: valid entity_type passes through and is normalised by the validator.
+    #[tokio::test]
+    async fn create_many_accepts_valid_entity_type_via_validator() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        rt.install_entity_type_validator(Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            if kind == "concept" && raw == "algorithm" {
+                return Ok(Some("algorithm".to_string()));
+            }
+            Err(RuntimeError::InvalidInput(format!(
+                "unknown entity_type {raw:?} for {kind:?}"
+            )))
+        }));
+
+        let specs = vec![EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: Some("algorithm".into()),
+            name: "BubbleSort".into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        }];
+
+        let entities = rt.create_many(&tok, specs).await.unwrap();
+        assert_eq!(entities.len(), 1, "valid entity_type must be accepted");
+        assert_eq!(
+            entities[0].entity_type.as_deref(),
+            Some("algorithm"),
+            "entity_type must be stored as returned by the validator"
         );
     }
 

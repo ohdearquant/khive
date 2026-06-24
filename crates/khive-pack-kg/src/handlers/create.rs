@@ -68,10 +68,25 @@ impl KgPack {
         // ── Bulk path ──────────────────────────────────────────────────────────
         // Early exit: if `items` is present, handle bulk entity creation and
         // return before the single-record path executes.
+        //
+        // Med-1: if `items` is present but malformed, return an error immediately.
+        // The previous `.ok()` silently dropped parse failures and fell through to
+        // the singleton path, creating a surprising "TopLevelCreated" entity when
+        // a bulk item contained an unknown field.
         {
-            let maybe_items = params.get("items").and_then(|v| {
-                serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(v.clone()).ok()
-            });
+            let maybe_items = if params.get("items").is_some() {
+                let raw = params["items"].clone();
+                match serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(raw) {
+                    Ok(entries) => Some(entries),
+                    Err(e) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "create: malformed `items` — could not parse bulk entries: {e}"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
             if let Some(entries) = maybe_items {
                 let attempted = entries.len();
                 if attempted > 1000 {

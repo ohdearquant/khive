@@ -6768,3 +6768,82 @@ async fn formal_depends_on_accepted_with_formal_pack() {
     let edge = result.unwrap();
     assert_eq!(edge["relation"], "depends_on");
 }
+
+// ── Med-1 regression: malformed `items` must not fall through to singleton ──────
+
+/// A malformed bulk payload (unknown field in an item) must return an error and
+/// must NOT create the top-level entity that was named in the enclosing params.
+///
+/// Pre-fix: `serde_json::from_value(...).ok()` swallowed the parse error, the
+/// bulk path was skipped, and the singleton path ran — creating "TopLevelCreated"
+/// silently even though the caller intended a bulk create.
+#[tokio::test]
+async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "TopLevelCreated",
+                "items": [{"kind": "concept", "name": "ShouldBeBulk", "extra_unknown": 1}]
+            }),
+        )
+        .await
+        .expect_err("malformed items must produce an error");
+    assert!(
+        is_invalid_input(&err),
+        "malformed items must return InvalidInput, got: {err:?}"
+    );
+    // Neither the bulk item nor the top-level entity must have been written.
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "malformed items rejection must create nothing; got {listed}"
+    );
+}
+
+// ── High-2: invalid entity_type in bulk items is rejected at the handler layer ──
+
+/// An invalid `entity_type` inside a bulk item must be rejected with the valid
+/// types listed, and must write nothing.
+#[tokio::test]
+async fn create_bulk_items_invalid_entity_type_rejects_batch() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ValidConcept", "entity_type": "not_a_registered_type"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("unknown entity_type in bulk item must be rejected");
+    assert!(
+        is_invalid_input(&err),
+        "unknown entity_type must return InvalidInput, got: {err:?}"
+    );
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "entity_type rejection must write nothing; got {listed}"
+    );
+}
