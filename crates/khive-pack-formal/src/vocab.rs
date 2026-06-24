@@ -2,11 +2,23 @@
 //! relation set, keyed on `entity_type` via `EntityOfType`.
 //!
 //! These rules extend the base contract without tightening it. Every endpoint
-//! uses `EndpointKind::EntityOfType` so the match runs against
-//! `Entity::entity_type`, not the base `kind` field (`"concept"` for all six
-//! formal-math subtypes). The closed `EdgeRelation` variants are unchanged.
+//! uses `EndpointKind::EntityOfType` so the match enforces the full
+//! `(EntityKind, entity_type)` registry pair required by ADR-001:102: the base
+//! `kind` must be `"concept"` for all six formal-math subtypes, and the
+//! `entity_type` must match the declared subtype. The closed `EdgeRelation`
+//! variants are unchanged.
 
 use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind};
+
+/// Shorthand macro — all formal-math subtypes belong to `kind = "concept"`.
+macro_rules! formal_ep {
+    ($et:literal) => {
+        EndpointKind::EntityOfType {
+            kind: "concept",
+            entity_type: $et,
+        }
+    };
+}
 
 /// Additive edge endpoint rules for the formal-math ontology.
 ///
@@ -16,110 +28,110 @@ pub(crate) static FORMAL_EDGE_RULES: [EdgeEndpointRule; 21] = [
     // ── depends_on: prerequisite chain (source uses / builds on target) ────
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("theorem"),
-        target: EndpointKind::EntityOfType("theorem"),
+        source: formal_ep!("theorem"),
+        target: formal_ep!("theorem"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("theorem"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("theorem"),
+        target: formal_ep!("definition"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("theorem"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("theorem"),
+        target: formal_ep!("structure"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("theorem"),
-        target: EndpointKind::EntityOfType("axiom"),
+        source: formal_ep!("theorem"),
+        target: formal_ep!("axiom"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("definition"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("structure"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("theorem"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("theorem"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("axiom"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("axiom"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("instance"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("instance"),
+        target: formal_ep!("structure"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("instance"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("instance"),
+        target: formal_ep!("definition"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("theorem"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("theorem"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("definition"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("structure"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("axiom"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("axiom"),
     },
     // ── instance_of: instance implements a structure ───────────────────────
     EdgeEndpointRule {
         relation: EdgeRelation::InstanceOf,
-        source: EndpointKind::EntityOfType("instance"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("instance"),
+        target: formal_ep!("structure"),
     },
     // ── extends: structural / definitional inheritance ─────────────────────
     EdgeEndpointRule {
         relation: EdgeRelation::Extends,
-        source: EndpointKind::EntityOfType("structure"),
-        target: EndpointKind::EntityOfType("structure"),
+        source: formal_ep!("structure"),
+        target: formal_ep!("structure"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::Extends,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("definition"),
     },
     // ── variant_of: restatement / anti-farm signal ────────────────────────
     EdgeEndpointRule {
         relation: EdgeRelation::VariantOf,
-        source: EndpointKind::EntityOfType("theorem"),
-        target: EndpointKind::EntityOfType("theorem"),
+        source: formal_ep!("theorem"),
+        target: formal_ep!("theorem"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::VariantOf,
-        source: EndpointKind::EntityOfType("definition"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("definition"),
+        target: formal_ep!("definition"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::VariantOf,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("theorem"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("theorem"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::VariantOf,
-        source: EndpointKind::EntityOfType("goal"),
-        target: EndpointKind::EntityOfType("definition"),
+        source: formal_ep!("goal"),
+        target: formal_ep!("definition"),
     },
 ];

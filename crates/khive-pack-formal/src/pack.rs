@@ -120,8 +120,16 @@ mod tests {
     fn formal_edge_rules_contains_variant_of_theorem_to_theorem() {
         let found = FORMAL_EDGE_RULES.iter().any(|r| {
             r.relation == EdgeRelation::VariantOf
-                && r.source == EndpointKind::EntityOfType("theorem")
-                && r.target == EndpointKind::EntityOfType("theorem")
+                && r.source
+                    == EndpointKind::EntityOfType {
+                        kind: "concept",
+                        entity_type: "theorem",
+                    }
+                && r.target
+                    == EndpointKind::EntityOfType {
+                        kind: "concept",
+                        entity_type: "theorem",
+                    }
         });
         assert!(
             found,
@@ -133,8 +141,16 @@ mod tests {
     fn formal_edge_rules_contains_depends_on_goal_to_theorem() {
         let found = FORMAL_EDGE_RULES.iter().any(|r| {
             r.relation == EdgeRelation::DependsOn
-                && r.source == EndpointKind::EntityOfType("goal")
-                && r.target == EndpointKind::EntityOfType("theorem")
+                && r.source
+                    == EndpointKind::EntityOfType {
+                        kind: "concept",
+                        entity_type: "goal",
+                    }
+                && r.target
+                    == EndpointKind::EntityOfType {
+                        kind: "concept",
+                        entity_type: "theorem",
+                    }
         });
         assert!(
             found,

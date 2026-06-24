@@ -196,7 +196,10 @@ fn endpoint_matches(
     match spec {
         EndpointKind::EntityOfKind(k) => substrate == "entity" && *k == kind,
         EndpointKind::NoteOfKind(k) => substrate == "note" && *k == kind,
-        EndpointKind::EntityOfType(t) => substrate == "entity" && entity_type == Some(*t),
+        EndpointKind::EntityOfType {
+            kind: k,
+            entity_type: t,
+        } => substrate == "entity" && *k == kind && entity_type == Some(*t),
     }
 }
 
@@ -8205,15 +8208,21 @@ mod tests {
         let kind = "concept";
         let et = Some("theorem");
 
-        // EntityOfType matches the subtype.
+        // EntityOfType matches only when BOTH base kind and subtype match.
         assert!(endpoint_matches(
-            &EndpointKind::EntityOfType("theorem"),
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
             "entity",
             kind,
             et
         ));
         assert!(!endpoint_matches(
-            &EndpointKind::EntityOfType("definition"),
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "definition",
+            },
             "entity",
             kind,
             et
@@ -8237,16 +8246,59 @@ mod tests {
 
         // EntityOfType rejects non-entity substrates and entities with no subtype.
         assert!(!endpoint_matches(
-            &EndpointKind::EntityOfType("theorem"),
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
             "note",
             "task",
             None
         ));
         assert!(!endpoint_matches(
-            &EndpointKind::EntityOfType("theorem"),
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
             "entity",
             kind,
             None
+        ));
+    }
+
+    #[test]
+    fn endpoint_of_type_requires_base_kind_match() {
+        // Regression: an entity with entity_type="theorem" but base kind != "concept"
+        // must NOT match a formal concept rule. This was the exact bypass codex named:
+        // before the fix, EntityOfType("theorem") ignored the base kind entirely.
+        let wrong_base_kind = "project"; // not "concept"
+        let et = Some("theorem");
+
+        // The formal rule requires kind="concept". A "project" entity with
+        // entity_type="theorem" must not match — even though the subtype string
+        // matches — because the base kind differs.
+        assert!(
+            !endpoint_matches(
+                &EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "theorem",
+                },
+                "entity",
+                wrong_base_kind,
+                et
+            ),
+            "EntityOfType must reject an entity whose base kind != rule.kind \
+             even when entity_type matches — the pre-fix bug admitted this"
+        );
+
+        // The correct concept entity with the same subtype still matches.
+        assert!(endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            "entity",
+            "concept",
+            et
         ));
     }
 

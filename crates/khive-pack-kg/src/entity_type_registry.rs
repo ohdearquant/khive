@@ -6,6 +6,34 @@ use khive_types::EntityKind;
 
 use khive_runtime::RuntimeError;
 
+/// Normalise a raw `entity_type` string to canonical snake_case.
+///
+/// Pipeline: trim → lowercase → runs of separators (space, hyphen, underscore)
+/// collapsed to a single `_` → leading/trailing `_` stripped.
+///
+/// This implements the ADR-001:106 write-time normalisation step that precedes
+/// alias resolution.
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_sep = true; // treat start as separator so leading _ are stripped
+    for ch in s.chars() {
+        if ch == ' ' || ch == '-' || ch == '_' {
+            if !prev_sep && !out.is_empty() {
+                out.push('_');
+                prev_sep = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    // Strip trailing `_` that the loop may have emitted.
+    if out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
 /// One entry in the registry: a canonical subtype name for a specific kind,
 /// together with any accepted aliases.
 #[derive(Clone, Debug)]
@@ -389,7 +417,7 @@ impl EntityTypeRegistry {
             });
         };
 
-        let normalised = raw_type.trim().to_ascii_lowercase();
+        let normalised = to_snake_case(raw_type.trim());
 
         // Try kind-qualified lookup first (unambiguous).
         let kind_key = format!("{}:{}", kind.name(), normalised);
@@ -718,5 +746,60 @@ mod tests {
             .resolve(EntityKind::Document, Some("paper"))
             .expect("global registry must resolve paper");
         assert_eq!(res.entity_type.as_deref(), Some("paper"));
+    }
+
+    // ── snake_case normalisation (ADR-001:106) ───────────────────────────────
+
+    #[test]
+    fn to_snake_case_converts_hyphen_to_underscore() {
+        assert_eq!(to_snake_case("proof-goal"), "proof_goal");
+    }
+
+    #[test]
+    fn to_snake_case_converts_space_to_underscore() {
+        assert_eq!(to_snake_case("Proof Goal"), "proof_goal");
+    }
+
+    #[test]
+    fn to_snake_case_collapses_mixed_separators() {
+        assert_eq!(to_snake_case("proof - goal"), "proof_goal");
+        assert_eq!(to_snake_case("proof__goal"), "proof_goal");
+    }
+
+    #[test]
+    fn to_snake_case_strips_leading_trailing_separators() {
+        assert_eq!(to_snake_case("-theorem-"), "theorem");
+        assert_eq!(to_snake_case(" theorem "), "theorem");
+    }
+
+    #[test]
+    fn resolve_proof_goal_hyphen_normalises_to_goal() {
+        // ADR-001:106: "proof-goal" must normalise to "proof_goal" and then
+        // alias-resolve to the canonical name "goal".
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Concept, Some("proof-goal"))
+            .expect("proof-goal must resolve via snake_case normalisation + alias");
+        assert_eq!(res.entity_type.as_deref(), Some("goal"));
+    }
+
+    #[test]
+    fn resolve_proof_goal_space_normalises_to_goal() {
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Concept, Some("Proof Goal"))
+            .expect("Proof Goal must resolve via snake_case normalisation + alias");
+        assert_eq!(res.entity_type.as_deref(), Some("goal"));
+    }
+
+    #[test]
+    fn resolve_blog_hyphen_normalises_to_blog_post_non_formal() {
+        // Prove the fix is not formal-only: "blog-post" (a Document subtype) must
+        // normalise and resolve to the canonical name "blog_post".
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Document, Some("blog-post"))
+            .expect("blog-post must normalise to blog_post");
+        assert_eq!(res.entity_type.as_deref(), Some("blog_post"));
     }
 }

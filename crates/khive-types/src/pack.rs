@@ -166,13 +166,20 @@ pub enum EndpointKind {
     NoteOfKind(&'static str),
     /// An entity whose `kind` field equals the given string (e.g. `"concept"`).
     EntityOfKind(&'static str),
-    /// An entity whose `entity_type` subtype equals the given string (e.g.
-    /// `"theorem"`). Matches the pack-owned `Entity::entity_type` field, not the
-    /// base `kind`. Required for granular entity subtypes (formal-math
-    /// theorem/definition, AMR gene/drug/pathogen): `EntityOfKind` only sees the
-    /// base kind (`"concept"`), so an `EntityOfKind("theorem")` rule is silently
-    /// inert. Additive — tightens nothing in the closed relation set.
-    EntityOfType(&'static str),
+    /// An entity whose base `kind` AND `entity_type` subtype both match the
+    /// given strings (e.g. `kind: "concept", entity_type: "theorem"`). Both
+    /// fields must match — enforcing the `(EntityKind, entity_type)` registry
+    /// invariant required by ADR-001:102. Required for granular entity subtypes
+    /// (formal-math theorem/definition, AMR gene/drug/pathogen): `EntityOfKind`
+    /// only sees the base kind (`"concept"`), so an `EntityOfKind("theorem")`
+    /// rule is silently inert. Additive — tightens nothing in the closed relation
+    /// set.
+    EntityOfType {
+        /// Base entity kind that must match (e.g. `"concept"`).
+        kind: &'static str,
+        /// Canonical `entity_type` subtype that must match (e.g. `"theorem"`).
+        entity_type: &'static str,
+    },
 }
 
 /// A pack-declared endpoint rule for a specific edge relation.
