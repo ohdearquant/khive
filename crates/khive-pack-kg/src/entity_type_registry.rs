@@ -64,6 +64,37 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "algorithm",
         aliases: &["algo"],
     },
+    // ── Formal math ─────────────────────────────────────────────────────────
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "theorem",
+        aliases: &["lemma", "proposition", "corollary"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "definition",
+        aliases: &["def"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "structure",
+        aliases: &["inductive", "struct", "class"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "instance",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "axiom",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "goal",
+        aliases: &["proof_goal"],
+    },
     EntityTypeDef {
         kind: EntityKind::Concept,
         type_name: "technique",
@@ -656,6 +687,26 @@ mod tests {
             s.contains("algorithm"),
             "Concept valid types must include algorithm; got: {s}"
         );
+    }
+
+    #[test]
+    fn resolve_inductive_alias_to_structure() {
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Concept, Some("inductive"))
+            .expect("inductive is a valid alias for structure");
+        assert_eq!(res.kind, EntityKind::Concept);
+        assert_eq!(res.entity_type.as_deref(), Some("structure"));
+    }
+
+    #[test]
+    fn resolve_goal_subtype() {
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Concept, Some("goal"))
+            .expect("goal is a valid Concept subtype");
+        assert_eq!(res.kind, EntityKind::Concept);
+        assert_eq!(res.entity_type.as_deref(), Some("goal"));
     }
 
     // ── Global registry ──────────────────────────────────────────────────────
