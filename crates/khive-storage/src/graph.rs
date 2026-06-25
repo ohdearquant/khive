@@ -37,6 +37,46 @@ pub trait GraphStore: Send + Sync + 'static {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> StorageResult<Vec<NeighborHit>>;
+    /// Fetch multiple edges by their link IDs in a single round-trip.
+    ///
+    /// IDs that are not found (absent or soft-deleted) are silently skipped;
+    /// the returned `Vec` may be shorter than `ids`. Backends that support
+    /// batched `IN (...)` queries should override this; the default loops
+    /// `get_edge` so non-SQLite backends keep compiling unchanged.
+    ///
+    /// Callers must chunk large ID lists before calling if they need a strict
+    /// size bound; this method does not enforce a maximum.
+    async fn get_edges(&self, ids: &[LinkId]) -> StorageResult<Vec<Edge>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(edge) = self.get_edge(id).await? {
+                out.push(edge);
+            }
+        }
+        Ok(out)
+    }
+    /// Return neighbors for multiple source nodes in a single round-trip,
+    /// yielding `(source_id, hit)` pairs.
+    ///
+    /// The `query` parameters (direction, relations, min_weight) are applied
+    /// uniformly to every source node. `query.limit` is applied **per source**:
+    /// each source returns at most `limit` hits. Backends that support batched
+    /// `source_id IN (...)` queries should override this; the default loops
+    /// `neighbors` so non-SQLite backends keep compiling unchanged.
+    async fn batch_neighbors(
+        &self,
+        sources: &[Uuid],
+        query: NeighborQuery,
+    ) -> StorageResult<Vec<(Uuid, NeighborHit)>> {
+        let mut out = Vec::new();
+        for &src in sources {
+            let hits = self.neighbors(src, query.clone()).await?;
+            for hit in hits {
+                out.push((src, hit));
+            }
+        }
+        Ok(out)
+    }
     /// Multi-hop BFS traversal from the given roots.
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
     /// Hard-delete every incident edge (source or target) for `node_id`, regardless of soft-delete

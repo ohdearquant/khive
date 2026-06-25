@@ -67,6 +67,16 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn query_edges(&self, filter: EdgeFilter, page: Page) -> StorageResult<Vec<Edge>>;
     async fn count_edges(&self, filter: EdgeFilter) -> StorageResult<u64>;
     async fn neighbors(&self, query: NeighborQuery) -> StorageResult<Vec<NeighborHit>>;
+    /// Batched form of `get_edge`: fetch multiple edges in one round-trip via
+    /// `WHERE id IN (...)`. Default impl loops `get_edge`; SQLite backend overrides.
+    async fn get_edges(&self, ids: &[LinkId]) -> StorageResult<Vec<Edge>> { ... }
+    /// Batched form of `neighbors`: expand multiple source nodes in one round-trip,
+    /// returning `(source_id, hit)` pairs. Default impl loops `neighbors`; SQLite overrides.
+    async fn batch_neighbors(
+        &self,
+        sources: &[Uuid],
+        query: NeighborQuery,
+    ) -> StorageResult<Vec<(Uuid, NeighborHit)>> { ... }
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
 }
 
