@@ -1256,13 +1256,7 @@ fn main() {
         .bank_run_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("perf/bench-runs"));
-    bank_run_json(
-        &bank_dir,
-        &produced_at,
-        &git_sha,
-        &args.target_key,
-        &json_str,
-    );
+    bank_run_json(&bank_dir, &produced_at, &git_sha, &args.dataset, &json_str);
 
     println!("assertions.overall: {}", output["assertions"]["overall"]);
     println!("exit_code: {exit_code}");
@@ -1272,15 +1266,16 @@ fn main() {
 
 // ─── tracked run banking ─────────────────────────────────────────────────────
 
-fn bank_run_json(dir: &Path, produced_at: &str, git_sha: &str, target_key: &str, json_str: &str) {
-    // Filename: <date>-<sha7>-<sanitized-target>.json
+fn bank_run_json(dir: &Path, produced_at: &str, git_sha: &str, dataset: &str, json_str: &str) {
+    // Filename: <date>-<sha7>-<dataset>.json — keyed on the dataset that actually ran,
+    // not the assertion target_key, so a synthetic run can never bank under a production name.
     let date_part = produced_at
         .get(..10)
         .unwrap_or("0000-00-00")
         .replace('-', "");
     let sha7 = &git_sha[..git_sha.len().min(7)];
-    let target_safe = target_key.replace('/', "_");
-    let filename = format!("{date_part}-{sha7}-{target_safe}.json");
+    let dataset_safe = dataset.replace(['/', ' '], "_");
+    let filename = format!("{date_part}-{sha7}-{dataset_safe}.json");
     let dest = dir.join(&filename);
 
     if let Err(e) = std::fs::create_dir_all(dir) {
