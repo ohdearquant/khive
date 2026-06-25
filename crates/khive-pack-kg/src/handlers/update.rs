@@ -14,6 +14,88 @@ use super::common::{
 };
 use crate::KgPack;
 
+// ---------------------------------------------------------------------------
+// Field applicability guard (authoritative field sets per substrate)
+//
+// Valid fields per substrate (source of truth: handler_defs.rs:241-243 +
+// EntityPatch / NotePatch / EdgePatch in crates/khive-runtime/src/curation.rs):
+//
+//   Entity: name, description, tags, properties
+//   Note:   name, content, salience, decay_factor, properties
+//           (notes have NO top-level tags column; tags live in properties["tags"])
+//   Edge:   relation, weight, properties
+//
+// Any present-but-inapplicable field is rejected with a fail-loud error naming
+// the offending field and listing the substrate's valid set.  This function
+// MUST be updated whenever UpdateParams or a patch struct changes.
+// ---------------------------------------------------------------------------
+fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
+    let (bad_field, valid): (Option<&str>, &str) = match spec {
+        KindSpec::Entity { .. } => {
+            let bad = if p.content.is_some() {
+                Some("content")
+            } else if p.salience.is_some() {
+                Some("salience")
+            } else if p.decay_factor.is_some() {
+                Some("decay_factor")
+            } else if p.relation.is_some() {
+                Some("relation")
+            } else if p.weight.is_some() {
+                Some("weight")
+            } else {
+                None
+            };
+            (bad, "name, description, tags, properties")
+        }
+        KindSpec::Note { .. } => {
+            let bad = if p.description.is_some() {
+                Some("description")
+            } else if p.tags.is_some() {
+                Some("tags")
+            } else if p.relation.is_some() {
+                Some("relation")
+            } else if p.weight.is_some() {
+                Some("weight")
+            } else {
+                None
+            };
+            (bad, "name, content, salience, decay_factor, properties")
+        }
+        KindSpec::Edge => {
+            let bad = if p.name.is_some() {
+                Some("name")
+            } else if p.description.is_some() {
+                Some("description")
+            } else if p.content.is_some() {
+                Some("content")
+            } else if p.tags.is_some() {
+                Some("tags")
+            } else if p.salience.is_some() {
+                Some("salience")
+            } else if p.decay_factor.is_some() {
+                Some("decay_factor")
+            } else {
+                None
+            };
+            (bad, "relation, weight, properties")
+        }
+        // Event/Proposal are rejected by the match arms below; no field check needed.
+        KindSpec::Event | KindSpec::Proposal => return Ok(()),
+    };
+    if let Some(field) = bad_field {
+        let substrate = match spec {
+            KindSpec::Entity { .. } => "an entity",
+            KindSpec::Note { .. } => "a note",
+            KindSpec::Edge => "an edge",
+            _ => unreachable!(),
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "field '{field}' is not valid for {substrate}; valid fields: {valid}"
+        )));
+    }
+    Ok(())
+}
+
 impl KgPack {
     pub(crate) async fn infer_kind_from_uuid(
         &self,
@@ -107,17 +189,10 @@ impl KgPack {
             },
         };
 
+        reject_inapplicable_fields(&spec, &p)?;
+
         match spec {
             KindSpec::Entity { specific } => {
-                // `content` is a note-only field; reject it explicitly so callers
-                // learn the correct field name rather than silently losing their edit.
-                if p.content.is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "field 'content' is not valid for an entity; \
-                         valid fields: name, description, tags, properties"
-                            .into(),
-                    ));
-                }
                 let entity = self.runtime.get_entity(token, id).await?;
                 if specific.as_ref().is_some_and(|k| entity.kind != *k) {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
@@ -133,26 +208,6 @@ impl KgPack {
                 )?))
             }
             KindSpec::Edge => {
-                // Reject non-edge fields explicitly; edges only accept relation, weight,
-                // properties. Silently dropping caller text fields is the same bug class
-                // this PR exists to kill.
-                let bad_field = if p.name.is_some() {
-                    Some("name")
-                } else if p.description.is_some() {
-                    Some("description")
-                } else if p.content.is_some() {
-                    Some("content")
-                } else if p.tags.is_some() {
-                    Some("tags")
-                } else {
-                    None
-                };
-                if let Some(field) = bad_field {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "field '{field}' is not valid for an edge; \
-                         valid fields: relation, weight, properties"
-                    )));
-                }
                 let relation = p.relation.as_deref().map(parse_relation).transpose()?;
                 let patch = EdgePatch {
                     relation,
@@ -162,16 +217,6 @@ impl KgPack {
                 to_json(&self.runtime.update_edge(token, id, patch).await?)
             }
             KindSpec::Note { specific } => {
-                // `description` is an entity-only field; reject it explicitly so
-                // callers learn the correct field name rather than silently losing
-                // their edit (CLAUDE.md: "Don't silently coerce invalid input").
-                if p.description.is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "field 'description' is not valid for a note; \
-                         valid fields: content, name, tags, properties, salience, decay_factor"
-                            .into(),
-                    ));
-                }
                 let note = self
                     .runtime
                     .notes(token)?
