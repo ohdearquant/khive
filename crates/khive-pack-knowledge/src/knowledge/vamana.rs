@@ -64,6 +64,14 @@ pub(crate) fn new_shared() -> SharedAnn {
     })
 }
 
+// Recover a poisoned warming Mutex rather than aborting: the guarded HashSet<AnnKey>
+// stays logically valid through a poison (spurious presence/absence is tolerable).
+fn warming_guard(
+    m: &std::sync::Mutex<HashSet<AnnKey>>,
+) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Insert `bridge` under `key` only if the slot is empty. Returns `true` when
 /// the bridge was inserted, `false` if the key was already present.
 pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: AnnBridge) -> bool {
@@ -86,10 +94,7 @@ pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
         .write()
         .await
         .retain(|k, _| k.namespace != namespace);
-    ann.warming
-        .lock()
-        .expect("warming lock")
-        .retain(|k| k.namespace != namespace);
+    warming_guard(&ann.warming).retain(|k| k.namespace != namespace);
 }
 
 /// Search the already-loaded index for `key`. Returns `None` on cache miss.
@@ -109,7 +114,7 @@ pub(crate) async fn search_loaded(
 /// `false` means either (a) the index is already loaded, or (b) no warm has
 /// been triggered for this key at all (e.g. the corpus is empty).
 pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
-    let in_warming = ann.warming.lock().expect("warming lock").contains(key);
+    let in_warming = warming_guard(&ann.warming).contains(key);
     if !in_warming {
         return false;
     }
@@ -541,7 +546,7 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     let key = AnnKey::new(&ns, &model);
 
     {
-        let mut warming = ann.warming.lock().expect("warming lock");
+        let mut warming = warming_guard(&ann.warming);
         if warming.contains(&key) {
             return; // already warming or warmed
         }
@@ -558,7 +563,7 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
         // If loading failed, remove from warming so a later search can retry.
         let loaded = ann.indexes.read().await.contains_key(&key);
         if !loaded {
-            ann.warming.lock().expect("warming lock").remove(&key);
+            warming_guard(&ann.warming).remove(&key);
         }
     });
 }
@@ -632,7 +637,7 @@ pub(crate) async fn ensure_ann_for_model(
 /// yet loaded" state that triggers the cold-start guard in `suggest`/`search`.
 #[cfg(test)]
 pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
-    ann.warming.lock().expect("warming lock").insert(key);
+    warming_guard(&ann.warming).insert(key);
 }
 
 #[cfg(test)]
@@ -849,5 +854,42 @@ mod tests {
         // Poll with a 500ms timeout; the insert happens at ~40ms so it should succeed.
         let ready = wait_for_ann(&ann, &key, 500, 10).await;
         assert!(ready, "must return true when index appears before timeout");
+    }
+
+    // ── poison recovery ───────────────────────────────────────────────────────
+
+    /// Poison the warming Mutex by panicking while holding the guard, then verify
+    /// that `warming_guard` and callers built on it survive and return sane results.
+    ///
+    /// This test WOULD panic if `warming_guard` were reverted to `.expect("warming
+    /// lock")`, because a poisoned Mutex causes `lock()` to return `Err`, and
+    /// `.expect()` converts that to a panic.
+    #[test]
+    fn warming_guard_recovers_from_poison() {
+        let ann = new_shared();
+        let key = AnnKey::new("poison-ns", "poison-model");
+
+        // Poison the mutex by sharing the Ann via Arc across a thread that panics
+        // while holding the guard.
+        let ann2 = ann.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = ann2.warming.lock().expect("pre-poison lock");
+            panic!("deliberate poison");
+        })
+        .join(); // returns Err — the thread panicked, Mutex is now poisoned
+
+        // `warming_guard` must recover the guard without panicking.
+        let guard = warming_guard(&ann.warming);
+        assert!(
+            !guard.contains(&key),
+            "recovered guard must report key absent (HashSet is empty after poison)"
+        );
+        drop(guard);
+
+        // Higher-level callers built on `warming_guard` must also succeed.
+        assert!(
+            !is_warming_not_loaded(&ann, &key),
+            "is_warming_not_loaded must not panic on poisoned Mutex"
+        );
     }
 }
