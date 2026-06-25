@@ -14,7 +14,7 @@ khive gives your agent:
 8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
 9. **Brain** — Bayesian profile tuning from feedback signals
 
-All 7 packs load by default. **65 public verbs** across the packs.
+All 7 packs load by default. **67 public verbs** across the packs.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -64,13 +64,15 @@ or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` f
 
 `gtd.assign` accepts `context_entity_id` to anchor a task to a KG entity.
 
-### Memory pack — 3 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
+### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                           | When to use                                 |
-| ----------------- | ------------------------------------------------------ | ------------------------------------------- |
-| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state          |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions  |
-| `memory.feedback` | Emit explicit feedback on a recalled memory            | Signal useful/not_useful to tune posteriors |
+| Verb              | What it does                                           | When to use                                         |
+| ----------------- | ------------------------------------------------------ | --------------------------------------------------- |
+| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state                  |
+| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions          |
+| `memory.feedback` | Emit explicit feedback on a recalled memory            | Signal useful/not_useful to tune posteriors         |
+| `memory.prune`    | Soft-delete memories below a salience threshold        | Trim low-value memories to prevent unbounded growth |
+| `memory.vacuum`   | Hard-delete soft-deleted memories and reclaim storage  | Periodic maintenance after heavy prune runs         |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
@@ -147,6 +149,12 @@ sends and reads as the shared `"local"` party line.
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
+
+`knowledge.edit` takes `sections=[{section_type, content, heading?, sort_order?}]`. `section_type`
+is a **closed enum** — valid values: `overview` | `core_model` | `boundary_conditions` |
+`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
+`references` | `other`. Content must be **at least 80 characters**. Shorter content or an
+unrecognized `section_type` returns a validation error listing the valid values.
 
 ### How to call a verb
 
@@ -342,13 +350,13 @@ These are the KG pack verbs. Other packs are documented in their verb tables abo
 | `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, tags, source_id, target_id, relations, min_weight, max_weight, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read | `{"kind":"entity","entity_kind":"concept","tags":["ml"]}`    |
 | `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge)                                                                                                                                                             | `{"id":"<uuid>","description":"Updated desc"}`               |
 | `delete`    | **id** (UUID); hard (default: false)                                                                                                                                                                                                             | `{"id":"<uuid>","hard":true}`                                |
-| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union)                                                                                                                                                                             | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
+| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union). Returns `{kept_id, removed_id, edges_rewired, …}` — no top-level `id` field. Chain as `merge(...) \| link(source_id=$prev.kept_id, …)`, **not** `$prev.id`.                | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
 | `search`    | **kind** (entity\|note), **query** (text); entity_kind, entity_type, note_kind, tags, include_superseded (note), properties (entity post-filter), min_score, limit                                                                               | `{"kind":"entity","query":"attention mechanism"}`            |
 | `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0)                                                                                                                                                                                     | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
 | `neighbors` | **node_id**; direction (out\|in\|both), relations, min_weight, limit                                                                                                                                                                             | `{"node_id":"<uuid>","direction":"both"}`                    |
 | `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots                                                                                                                                                                            | `{"roots":["<uuid>"],"max_depth":2}`                         |
 | `query`     | **query** (GQL or SPARQL string) — **read-only**: write-shaped input (SPARQL `INSERT`/`DELETE`/`LOAD`, GQL/Cypher `CREATE`/`DELETE`/`SET`/`MERGE`) is rejected; use `create`, `update`, `link`, `merge`, `delete` to mutate                      | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
-| `propose`   | **kind** (entity\|note\|edge), fields for the proposed change                                                                                                                                                                                    | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
+| `propose`   | **kind** (entity\|note\|edge), fields for the proposed change. Returns `{id, status, proposer, title}`. Chain as `propose(...) \| review(id=$prev.id, …)`, **not** `$prev.proposal_id`. Use JSON form for nested `changeset` objects.            | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
 | `review`    | **id** (proposal UUID), **verdict** (approve\|reject); comment                                                                                                                                                                                   | `{"id":"<uuid>","verdict":"approve"}`                        |
 | `withdraw`  | **id** (proposal UUID)                                                                                                                                                                                                                           | `{"id":"<uuid>"}`                                            |
 
