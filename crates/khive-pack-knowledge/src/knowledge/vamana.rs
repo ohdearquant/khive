@@ -872,11 +872,16 @@ mod tests {
         // Poison the mutex by sharing the Ann via Arc across a thread that panics
         // while holding the guard.
         let ann2 = ann.clone();
-        let _ = std::thread::spawn(move || {
+        let join_result = std::thread::spawn(move || {
             let _guard = ann2.warming.lock().expect("pre-poison lock");
             panic!("deliberate poison");
         })
-        .join(); // returns Err — the thread panicked, Mutex is now poisoned
+        .join();
+        assert!(join_result.is_err(), "poison thread must have panicked");
+        assert!(
+            ann.warming.is_poisoned(),
+            "mutex must be poisoned before recovery"
+        );
 
         // `warming_guard` must recover the guard without panicking.
         let guard = warming_guard(&ann.warming);
