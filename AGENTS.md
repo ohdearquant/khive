@@ -24,7 +24,7 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 
 All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
 or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
-[ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics and namespace contract are
+[ADR-027](docs/adr/ADR-027-dynamic-pack-loading.md)). Verb semantics and namespace contract are
 defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
 ### KG pack — 16 verbs (bare names, no prefix)
@@ -50,7 +50,7 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
 `get`, `update`, `delete` are UUID-only — they auto-detect whether the record is an entity, note,
 or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` for `list`;
-`kind=event` for audit events per [ADR-038](docs/adr/ADR-038-events-surface.md)).
+`kind=event` for audit events per [ADR-022](docs/adr/ADR-022-events-query-surface.md)).
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
@@ -251,7 +251,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-resource-entity-kind.md))
+## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
 
 | Kind       | What it represents                                                         |
 | ---------- | -------------------------------------------------------------------------- |
