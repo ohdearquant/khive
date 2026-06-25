@@ -164,7 +164,7 @@ pub fn build_registry_for_multi_backend(
         rt_config.backend_id = BackendId::new(backend_name);
         per_pack_runtimes_local.insert(
             pack_name.clone(),
-            KhiveRuntime::from_backend(backend, rt_config),
+            build_pack_runtime(backend, backend_name, rt_config, &main_backend),
         );
     }
 
@@ -478,6 +478,8 @@ fn build_server_multi_backend(
         .clone();
 
     // Build per-pack runtimes: each pack gets its assigned backend, or `main` as fallback.
+    // Secondary-backend packs have `core_backend` wired so that `rt.core()` returns a
+    // main-bound handle (ADR-073: linkable notes must land in the main backend).
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
@@ -494,7 +496,7 @@ fn build_server_multi_backend(
         rt_config.backend_id = BackendId::new(backend_name);
         per_pack_runtimes.insert(
             pack_name.clone(),
-            KhiveRuntime::from_backend(backend, rt_config),
+            build_pack_runtime(backend, backend_name, rt_config, &main_backend),
         );
     }
 
@@ -602,6 +604,27 @@ fn build_server_multi_backend(
     } else {
         server
     })
+}
+
+/// Construct one per-pack runtime, wiring `core_backend` for secondary-backend packs.
+///
+/// Centralizing this in one helper ensures that both `build_registry_for_multi_backend`
+/// and `build_server_multi_backend` apply the same ADR-073 wiring. Without it, a
+/// secondary pack served via `build_server_multi_backend` would receive
+/// `core_backend = None`, causing `core()` to fall back to `self.clone()` and write
+/// linkable records to the secondary backend instead of main.
+fn build_pack_runtime(
+    backend: Arc<StorageBackend>,
+    backend_name: &str,
+    rt_config: RuntimeConfig,
+    main_backend: &Arc<StorageBackend>,
+) -> KhiveRuntime {
+    let rt = KhiveRuntime::from_backend(backend, rt_config);
+    if backend_name != BackendId::MAIN {
+        rt.with_core_backend(main_backend.clone())
+    } else {
+        rt
+    }
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
@@ -1174,6 +1197,79 @@ brain_profile = "project-profile"
             first_comm_ok,
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// Regression for ADR-073 codex r1: a pack assigned to a secondary backend must
+    /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
+    ///
+    /// Before the fix, `build_server_multi_backend` called `KhiveRuntime::from_backend`
+    /// directly (without `with_core_backend`), so `core()` fell back to `self.clone()` and
+    /// returned the secondary-backend handle — silently defeating the ADR-073 contract.
+    /// Both boot paths now delegate to `build_pack_runtime`, which applies the wiring in
+    /// one place and prevents any future path from drifting.
+    #[test]
+    fn secondary_pack_runtime_core_resolves_to_main_after_build_registry() {
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg)
+            .expect("multi-backend registry must boot");
+
+        let comm_rt = result
+            .per_pack_runtimes
+            .get("comm")
+            .expect("comm pack runtime must be present in per_pack_runtimes");
+
+        // Own backend_id is "secondary" — not main.
+        assert_eq!(
+            comm_rt.backend_id().as_str(),
+            "secondary",
+            "comm pack runtime's own backend_id must be \"secondary\""
+        );
+
+        // ADR-073 contract: core() on a secondary-backend pack must return a
+        // main-bound handle, not a clone of self. Failure here means the
+        // build_pack_runtime wiring was not applied.
+        assert_eq!(
+            comm_rt.core().backend_id().as_str(),
+            BackendId::MAIN,
+            "secondary-backend pack must have core_backend wired to main (ADR-073); \
+             core().backend_id() returned {:?} — build_pack_runtime wiring missing",
+            comm_rt.core().backend_id().as_str()
         );
     }
 

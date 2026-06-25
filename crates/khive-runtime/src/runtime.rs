@@ -30,6 +30,10 @@ pub use crate::config::{
 #[derive(Clone)]
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
+    /// When `Some`, holds the main backend so that `core()` can return a
+    /// main-bound runtime handle without constructing a new connection.
+    /// `None` when this runtime is already bound to the main backend.
+    core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
     /// Pack-extensible embedder registry.
     ///
@@ -84,6 +88,7 @@ impl KhiveRuntime {
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
+            core_backend: None,
             config,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -110,6 +115,7 @@ impl KhiveRuntime {
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
+            core_backend: None,
             config,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -135,12 +141,69 @@ impl KhiveRuntime {
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
+            core_backend: None,
             config,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Wire this runtime as a secondary-backend runtime pointing at `core`.
+    ///
+    /// After this call, `self.core()` returns a handle to `core` rather than
+    /// cloning `self`. The caller (the boot path, not pack code) is responsible
+    /// for passing the correct main backend.
+    ///
+    /// Panics in debug builds if `self.config.backend_id == BackendId::MAIN`,
+    /// because the main runtime does not need a core pointer.
+    pub fn with_core_backend(mut self, core: Arc<StorageBackend>) -> Self {
+        debug_assert_ne!(
+            self.config.backend_id.as_str(),
+            BackendId::MAIN,
+            "with_core_backend must not be called on the main runtime"
+        );
+        self.core_backend = Some(core);
+        self
+    }
+
+    /// Return a runtime handle bound to the main (shared-graph) backend.
+    ///
+    /// When `self` is already the main runtime (`core_backend` is `None`),
+    /// this returns a clone of `self` — no new backend reference is acquired.
+    ///
+    /// When `self` is a secondary-backend runtime (`core_backend` is `Some`),
+    /// this returns a new `KhiveRuntime` backed by the main
+    /// `Arc<StorageBackend>` and sharing all registry state (`embedder_registry`,
+    /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`) with `self`.
+    /// No database I/O occurs; no embedding models are reloaded.
+    ///
+    /// Use `core()` for notes and entities that must reside in the shared graph
+    /// so that `memory.recall`, cross-pack search, and `annotates` edges work.
+    /// Use `self` (or `self.sql()`) for pack-auxiliary bulk tables.
+    ///
+    /// Handlers that call `core()` more than once per request or loop should bind
+    /// `let core = self.core();` once and reuse it, since each call clones
+    /// `RuntimeConfig` (a heap-allocated struct containing `Vec<String>` fields).
+    pub fn core(&self) -> KhiveRuntime {
+        match &self.core_backend {
+            None => self.clone(),
+            Some(main_arc) => {
+                let mut core_config = self.config.clone();
+                core_config.backend_id = BackendId::main();
+                KhiveRuntime {
+                    backend: main_arc.clone(),
+                    core_backend: None,
+                    config: core_config,
+                    embedder_registry: self.embedder_registry.clone(),
+                    default_embedder_name: self.default_embedder_name.clone(),
+                    edge_rules: self.edge_rules.clone(),
+                    valid_entity_kinds: self.valid_entity_kinds.clone(),
+                    valid_note_kinds: self.valid_note_kinds.clone(),
+                }
+            }
         }
     }
 
@@ -1026,6 +1089,269 @@ mod tests {
     }
 
     // ---- list_embedding_models tests ----
+
+    // ---- ADR-073: core_backend accessor tests ----
+
+    /// Create a migrated in-memory backend (for tests that need raw Arc<StorageBackend>).
+    fn migrated_memory_backend() -> Arc<StorageBackend> {
+        let backend = StorageBackend::memory().expect("memory backend");
+        {
+            let mut writer = backend.pool().try_writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        Arc::new(backend)
+    }
+
+    fn secondary_config() -> RuntimeConfig {
+        RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::new("lore"),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        }
+    }
+
+    #[test]
+    fn core_on_main_runtime_returns_same_backend_id() {
+        // For a main-bound runtime, core() must return a clone with backend_id == "main".
+        let rt = KhiveRuntime::memory().unwrap();
+        assert_eq!(rt.backend_id().as_str(), BackendId::MAIN);
+        let core_rt = rt.core();
+        assert_eq!(core_rt.backend_id().as_str(), BackendId::MAIN);
+    }
+
+    #[tokio::test]
+    async fn core_on_main_runtime_round_trips_note() {
+        // core() on a main-bound runtime (core_backend = None) returns self.clone(),
+        // so a note written through core() is readable through the original runtime.
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        let note = rt
+            .core()
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "adr073-main-round-trip",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note via core()");
+
+        let found = rt
+            .notes(&tok)
+            .expect("notes store")
+            .get_note(note.id)
+            .await
+            .expect("get_note");
+
+        assert!(
+            found.is_some(),
+            "note written via core() must be visible through original rt"
+        );
+    }
+
+    /// Decisive ADR-073 test: proves note→main and aux→secondary are each isolated.
+    ///
+    /// Backend A = main; backend B = secondary.
+    /// rt_secondary is bound to B with core_backend = Some(A).
+    ///
+    /// Direction 1 (note → main):
+    ///   rt_secondary.core().create_note(...) must land in A (visible from rt_main)
+    ///   and NOT in B (not visible from rt_secondary).
+    ///
+    /// Direction 2 (aux → secondary):
+    ///   A raw SQL write via rt_secondary.sql() lands in B only; A is untouched.
+    #[tokio::test]
+    async fn cross_backend_split_note_to_main_aux_to_secondary() {
+        use khive_storage::{SqlStatement, SqlValue};
+
+        // Two independent in-memory SQLite databases.
+        let main_arc = migrated_memory_backend();
+        let secondary_arc = migrated_memory_backend();
+
+        let main_config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+
+        let rt_main = KhiveRuntime::from_backend(main_arc.clone(), main_config);
+        let rt_secondary = KhiveRuntime::from_backend(secondary_arc, secondary_config())
+            .with_core_backend(main_arc.clone());
+
+        let tok = NamespaceToken::local();
+
+        // ── Direction 1: note must land in A (main), not in B (secondary) ──
+
+        let note = rt_secondary
+            .core()
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "adr073-split-test",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note via core()");
+        let note_id = note.id;
+
+        // Visible from main (A).
+        let in_main = rt_main
+            .notes(&tok)
+            .expect("main notes store")
+            .get_note(note_id)
+            .await
+            .expect("get_note from main");
+        assert!(
+            in_main.is_some(),
+            "note written via core() must appear in main backend A"
+        );
+
+        // Not visible from secondary (B).
+        let in_secondary = rt_secondary
+            .notes(&tok)
+            .expect("secondary notes store")
+            .get_note(note_id)
+            .await
+            .expect("get_note from secondary");
+        assert!(
+            in_secondary.is_none(),
+            "note written to main via core() must NOT appear in secondary backend B"
+        );
+
+        // ── Direction 2: aux write via rt_secondary.sql() lands in B, not A ──
+
+        // Create a test-only table in B and insert a sentinel row.
+        {
+            let mut writer = rt_secondary.sql().writer().await.expect("secondary writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "CREATE TABLE IF NOT EXISTS _test_adr073_aux \
+                          (marker TEXT PRIMARY KEY)"
+                        .into(),
+                    params: vec![],
+                    label: None,
+                })
+                .await
+                .expect("create aux table in B");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO _test_adr073_aux VALUES (?1)".into(),
+                    params: vec![SqlValue::Text("b-side-sentinel".into())],
+                    label: None,
+                })
+                .await
+                .expect("insert into aux table in B");
+        }
+
+        // Row is present in B.
+        let mut reader_b = rt_secondary.sql().reader().await.expect("secondary reader");
+        let rows_b = reader_b
+            .query_all(SqlStatement {
+                sql: "SELECT marker FROM _test_adr073_aux".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("select from B");
+        assert_eq!(rows_b.len(), 1, "aux row must exist in B");
+        match rows_b[0].get("marker") {
+            Some(SqlValue::Text(s)) => {
+                assert_eq!(s, "b-side-sentinel", "sentinel value must match")
+            }
+            other => panic!("expected Text('b-side-sentinel'), got {other:?}"),
+        }
+
+        // Row is absent from A (table does not exist there).
+        let mut reader_a = rt_main.sql().reader().await.expect("main reader");
+        let result_a = reader_a
+            .query_all(SqlStatement {
+                sql: "SELECT marker FROM _test_adr073_aux".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        // A does not have this table → must error or return no rows.
+        match result_a {
+            Err(e) => assert!(
+                e.to_string().contains("no such table"),
+                "expected 'no such table' error from A, got: {e}"
+            ),
+            Ok(rows) => assert!(
+                rows.is_empty(),
+                "aux table must not have rows in A, got {} rows",
+                rows.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn constructors_leave_core_backend_none_by_behavior() {
+        // core() on any standard constructor returns a clone with same backend_id —
+        // proof that core_backend = None (returns self.clone(), not a different backend).
+        let rt_mem = KhiveRuntime::memory().unwrap();
+        assert_eq!(rt_mem.core().backend_id().as_str(), BackendId::MAIN);
+
+        let backend = migrated_memory_backend();
+        let rt_from = KhiveRuntime::from_backend(
+            backend,
+            RuntimeConfig {
+                db_path: None,
+                default_namespace: Namespace::local(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string()],
+                backend_id: BackendId::new("lore"),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+            },
+        );
+        // from_backend with backend_id="lore" and no core_backend: core() returns
+        // self.clone() which has backend_id="lore" (not "main").
+        assert_eq!(rt_from.core().backend_id().as_str(), "lore");
+    }
+
+    #[test]
+    fn with_core_backend_sets_core_then_core_returns_main_id() {
+        // After wiring, core() must return a runtime with backend_id == "main".
+        let main_arc = migrated_memory_backend();
+        let secondary_arc = migrated_memory_backend();
+
+        let rt_secondary = KhiveRuntime::from_backend(secondary_arc, secondary_config())
+            .with_core_backend(main_arc);
+
+        assert_eq!(rt_secondary.backend_id().as_str(), "lore");
+        assert_eq!(
+            rt_secondary.core().backend_id().as_str(),
+            BackendId::MAIN,
+            "core() on a secondary runtime must return a main-bound handle"
+        );
+    }
 
     #[tokio::test]
     async fn list_embedding_models_returns_empty_when_table_absent() {
