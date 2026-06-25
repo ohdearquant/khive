@@ -678,3 +678,315 @@ fn validate_weight_accepts_valid_range() {
     assert_eq!(validate_weight(Some(0.5)).unwrap(), 0.5);
     assert_eq!(validate_weight(Some(1.0)).unwrap(), 1.0);
 }
+
+// Regression: update(id=<note>, description=...) must return an explicit error,
+// not silently drop the field and return ok:true with stale content.
+// The silent-drop was the original bug: description is an entity-only field;
+// passing it on a note caused updated_at to bump while content stayed unchanged.
+#[tokio::test]
+async fn update_note_with_entity_field_description_returns_error() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    // Create a note with known content.
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "original content",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    // Attempt to update the note using the entity-only field `description`.
+    let result = pack
+        .handle_update(
+            &token,
+            json!({ "id": note.id.to_string(), "description": "should be rejected" }),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update note with entity-only field 'description' must return an error, got ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("description"),
+        "error must name the invalid field 'description'; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("content"),
+        "error must list 'content' as a valid note field; got: {err_msg}"
+    );
+
+    // Confirm note content is unchanged after the rejected update.
+    let unchanged = rt
+        .notes(&token)
+        .unwrap()
+        .get_note(note.id)
+        .await
+        .unwrap()
+        .expect("note must still exist");
+    assert_eq!(
+        unchanged.content, "original content",
+        "note content must be unchanged after rejected update"
+    );
+}
+
+// Regression (symmetric): update(id=<entity>, content=...) must return an
+// explicit error — `content` is a note-only field.
+#[tokio::test]
+async fn update_entity_with_note_field_content_returns_error() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let entity = rt
+        .create_entity(&token, "concept", None, "MyEntity", None, None, vec![])
+        .await
+        .expect("create entity");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_update(
+            &token,
+            json!({ "id": entity.id.to_string(), "content": "should be rejected" }),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update entity with note-only field 'content' must return an error, got ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("content"),
+        "error must name the invalid field 'content'; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("description"),
+        "error must list 'description' as a valid entity field; got: {err_msg}"
+    );
+
+    // Confirm entity name is unchanged after the rejected update.
+    let unchanged = rt
+        .get_entity(&token, entity.id)
+        .await
+        .expect("get_entity must not fail");
+    assert_eq!(
+        unchanged.name, "MyEntity",
+        "entity name must be unchanged after rejected update"
+    );
+}
+
+// Regression (edge branch): update(id=<edge>, description=...) must return an
+// explicit error — edges only accept relation, weight, properties.
+#[tokio::test]
+async fn update_edge_with_non_edge_field_returns_error() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+    use khive_types::EdgeRelation;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let src = rt
+        .create_entity(&token, "concept", None, "SrcConcept", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "concept", None, "TgtConcept", None, None, vec![])
+        .await
+        .expect("create target entity");
+    let edge = rt
+        .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
+        .await
+        .expect("create edge");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    // Attempt to update the edge using the non-edge field `description`.
+    let result = pack
+        .handle_update(
+            &token,
+            json!({ "id": edge.id.to_string(), "description": "should be rejected" }),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update edge with non-edge field 'description' must return an error, got ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("description"),
+        "error must name the invalid field 'description'; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("relation"),
+        "error must list 'relation' as a valid edge field; got: {err_msg}"
+    );
+
+    // Confirm the edge is unchanged after the rejected update.
+    let unchanged = rt
+        .get_edge(&token, edge.id.into())
+        .await
+        .expect("get_edge must not fail")
+        .expect("edge must still exist");
+    assert_eq!(
+        unchanged.weight, 0.8,
+        "edge weight must be unchanged after rejected update"
+    );
+}
+
+// HIGH regression: update(note_id, tags=[...]) must return an explicit error.
+// Notes have no top-level tags column; tags live in properties["tags"].
+// Before the fix, tags was silently dropped on the note path (the error string
+// even advertised it as valid — making the bug worse for callers following docs).
+#[tokio::test]
+async fn update_note_with_entity_field_tags_returns_error() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "note content unchanged",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_update(
+            &token,
+            json!({ "id": note.id.to_string(), "tags": ["rust", "ml"] }),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update note with entity-only field 'tags' must return an error, got ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("tags"),
+        "error must name the invalid field 'tags'; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("content"),
+        "error must list 'content' as a valid note field; got: {err_msg}"
+    );
+
+    // Confirm note content is unchanged.
+    let unchanged = rt
+        .notes(&token)
+        .unwrap()
+        .get_note(note.id)
+        .await
+        .unwrap()
+        .expect("note must still exist");
+    assert_eq!(
+        unchanged.content, "note content unchanged",
+        "note content must be unchanged after rejected update"
+    );
+}
+
+// MEDIUM regression: update(entity_id, salience=...) must return an explicit
+// error — salience is a note-only field and was silently dropped on entities.
+#[tokio::test]
+async fn update_entity_with_note_field_salience_returns_error() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+
+    let entity = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "SalienceEntity",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_update(
+            &token,
+            json!({ "id": entity.id.to_string(), "salience": 0.9 }),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update entity with note-only field 'salience' must return an error, got ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("salience"),
+        "error must name the invalid field 'salience'; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("description"),
+        "error must list 'description' as a valid entity field; got: {err_msg}"
+    );
+
+    // Confirm entity name is unchanged.
+    let unchanged = rt
+        .get_entity(&token, entity.id)
+        .await
+        .expect("get_entity must not fail");
+    assert_eq!(
+        unchanged.name, "SalienceEntity",
+        "entity name must be unchanged after rejected update"
+    );
+}
