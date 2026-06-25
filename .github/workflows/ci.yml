@@ -65,6 +65,21 @@ jobs:
           test "$(cargo-deny --version)" = "cargo-deny 0.19.9"
           cargo deny --manifest-path crates/Cargo.toml check advisories
 
+  no-stub-guard:
+    name: No-stub guard
+    runs-on: ubuntu-latest
+    # Grep-based gate: no Rust toolchain needed.  Blocks todo!() and
+    # unimplemented!() in non-test crates/ source, and unreachable!()/panic!()
+    # whose message argument contains a stub-intent word (stub, not implemented,
+    # not yet, placeholder, fixme, tbd).  Inline #[cfg(test)] blocks are
+    # excluded by brace-depth tracking in the Python scanner.
+    # Mark as `required` in branch-protection once the activation battery lands
+    # (ADR-066 §activation, issue #228 follow-up — Ocean/infra action).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for stub-intent macros in shipping source
+        run: bash scripts/check-no-stubs.sh
+
   data-leak-guard:
     name: JSON/JSONL data-leak guard
     runs-on: ubuntu-latest
