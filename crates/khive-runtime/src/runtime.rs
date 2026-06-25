@@ -183,6 +183,10 @@ impl KhiveRuntime {
     /// Use `core()` for notes and entities that must reside in the shared graph
     /// so that `memory.recall`, cross-pack search, and `annotates` edges work.
     /// Use `self` (or `self.sql()`) for pack-auxiliary bulk tables.
+    ///
+    /// Handlers that call `core()` more than once per request or loop should bind
+    /// `let core = self.core();` once and reuse it, since each call clones
+    /// `RuntimeConfig` (a heap-allocated struct containing `Vec<String>` fields).
     pub fn core(&self) -> KhiveRuntime {
         match &self.core_backend {
             None => self.clone(),

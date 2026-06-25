@@ -212,6 +212,14 @@ a note via `core()` and a bulk row via `self` cannot create an edge between thos
 records. The note should carry any linking information as properties or be linked from
 a main-side entity using a main-side edge.
 
+**No cross-backend atomicity.** A handler that writes a note via `core()` (the main
+backend) and auxiliary rows via `self.sql()` (the pack's secondary backend) performs two
+independent transactions across two SQLite files. If the first commit succeeds and the
+second fails — or if the process crashes between them — one side is committed and the
+other is not, leaving an orphaned record. Pack handlers must design writes to be
+idempotent or provide compensating operations; they must not assume a single transaction
+spans both the main and the secondary backend.
+
 **The `Pack::dispatch` signature is unchanged.** Pack handlers receive a `&VerbRegistry`
 and a `&KhiveRuntime` (the pack's assigned runtime). The pack's verb handler code calls
 `self_runtime.core()` when it needs to write a main-side record. No dispatch-layer
