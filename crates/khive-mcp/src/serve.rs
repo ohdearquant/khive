@@ -162,10 +162,13 @@ pub fn build_registry_for_multi_backend(
             .unwrap_or_else(|| main_backend.clone());
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::new(backend_name);
-        per_pack_runtimes_local.insert(
-            pack_name.clone(),
-            KhiveRuntime::from_backend(backend, rt_config),
-        );
+        let rt = KhiveRuntime::from_backend(backend, rt_config);
+        let rt = if backend_name != BackendId::MAIN {
+            rt.with_core_backend(main_backend.clone())
+        } else {
+            rt
+        };
+        per_pack_runtimes_local.insert(pack_name.clone(), rt);
     }
 
     let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
