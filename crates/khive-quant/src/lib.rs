@@ -420,7 +420,7 @@ impl Sq8Codec {
 /// offset terms cancel and `gs²` factorizes — but the round-trip error relative to
 /// the original f32 L2² can reach ~15% for anisotropic or out-of-distribution data.
 /// Recall safety must be established by probe (see `sq8_recall_parity_vs_f32_oracle`
-/// and `sq8_ood_recall_with_fallback`), not by an exactness argument.
+/// and `sq8_ood_fallback_deterministic_ranking_flip`), not by an exactness argument.
 /// No residual pass, no gate, no silent fallback for anisotropic data.
 ///
 /// Historical note: the predecessor per-dim codec required `approx_l2_sq_fast` + an

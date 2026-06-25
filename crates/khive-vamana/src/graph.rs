@@ -916,8 +916,11 @@ pub(crate) fn greedy_search_inner_sq8(
 /// SQ8 acquisition-tier robust prune (ADR-052 §1, two-tier principle).
 ///
 /// Uses `GsSq8Codec::l2_sq` on pre-encoded corpus vectors for candidate scoring and
-/// the alpha diversity check. Selected neighbor IDs are the same as the f32 variant;
-/// callers that need exact distances re-score after prune.
+/// ordering; equal SQ8 scores are tiebroken by exact f32 distance. The alpha
+/// diversity predicate itself uses exact f32 distances on both sides (node→candidate
+/// and selected→candidate), so equal-code collisions cannot vacuously prune. Selected
+/// neighbor IDs match the f32 variant on the collision cases covered by tests; callers
+/// that need exact distances re-score after prune.
 // REASON: mirrors robust_prune_inner signature with two additional SQ8 params (encoded, codec).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn robust_prune_inner_sq8(
