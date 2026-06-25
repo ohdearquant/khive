@@ -1,0 +1,148 @@
+{
+  "assertions": {
+    "checks": [],
+    "exit_code": 1,
+    "overall": "SKIPPED",
+    "target_key": "khive-vamana/scale-proof/khive-real-384",
+    "targets_file": "perf/targets.toml"
+  },
+  "caveats": [
+    "3-point fit",
+    "GT recomputed by brute-force L2 on each subset (provided GT indexes full base — invalid for subsets)",
+    "build exponent is Omega(N) floor — sublinear claim is query+update only",
+    "latency measured warm-cache on single-node; cold-cache latency is higher"
+  ],
+  "config": {
+    "alpha": 1.0,
+    "build_batch": 1024,
+    "k": 10,
+    "max_degree": 64,
+    "max_iso_beam": 1024,
+    "n_gt_queries": 200,
+    "n_latency_queries": 200,
+    "search_list_size": 128,
+    "target_recall": 0.95
+  },
+  "dataset": {
+    "base_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.CcPFlJqiKu/sift_base.fvecs",
+    "base_n": 2000,
+    "dim": 32,
+    "intrinsic_dim_approx": null,
+    "name": "synthetic-validation",
+    "normalization": "l2",
+    "query_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.CcPFlJqiKu/sift_query.fvecs",
+    "query_n": 200,
+    "seed": null,
+    "source_url": null
+  },
+  "decisive_question": {
+    "criteria": {
+      "a_beam_exp": 0.06875176187496737,
+      "a_beam_flat": true,
+      "b_query_exp": 0.3787946331460286,
+      "b_query_sublinear": true,
+      "c_recall_holds": true,
+      "d_beats_brute_force": true,
+      "d_max_n": 2000,
+      "d_speedup_at_max_n": 4.107612903225807,
+      "per_n_recall": [
+        {
+          "n": 500,
+          "recall": 0.9910000000000002,
+          "saturated": false
+        },
+        {
+          "n": 1000,
+          "recall": 0.9760000000000008,
+          "saturated": false
+        },
+        {
+          "n": 2000,
+          "recall": 0.9605000000000016,
+          "saturated": false
+        }
+      ]
+    },
+    "verdict": "YES — all criteria met: beam flat, query sublinear, recall >=0.95, ANN beats brute force"
+  },
+  "fits": {
+    "beam_growth_exponent": 0.06875176187496737,
+    "beam_growth_r2": 0.75,
+    "bruteforce_exponent": 1.0036802365694624,
+    "bruteforce_r2": 0.9997750822431402,
+    "build_wallclock_exponent": 0.9488815435275434,
+    "build_wallclock_r2": 0.9995149421164622,
+    "build_work_exponent": null,
+    "build_work_r2": null,
+    "iso_recall_query_exponent_warm": 0.3787946331460286,
+    "iso_recall_query_r2_warm": 0.9277552143865629,
+    "note": "3-point fit"
+  },
+  "git_sha": "22a819009d400ddd5ce790c30920b6b09ad804b0",
+  "gt_policy": {
+    "note": "any provided GT file indexes the full base and is invalid for subsets",
+    "source": "brute-force recomputed on subset"
+  },
+  "loadavg1": 3.81,
+  "machine_model": "Apple M2 Max",
+  "produced_at": "2026-06-25T06:59:28Z",
+  "ram_bytes": 34359738368,
+  "rows": [
+    {
+      "bruteforce_p50_us": 3.9589999999999996,
+      "build_distance_calls": null,
+      "build_ms": 20.575833000000003,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 10,
+      "n": 500,
+      "per_query_resident_bytes": null,
+      "per_query_resident_exceeds_llc": false,
+      "query_flushed_p50_us": null,
+      "query_warm_max_us": 3.166,
+      "query_warm_p50_us": 2.292,
+      "query_warm_p95_us": 2.7089999999999996,
+      "query_warm_p99_us": 3.0,
+      "recall_at_10": 0.9910000000000002,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 1.7273123909249564
+    },
+    {
+      "bruteforce_p50_us": 8.083,
+      "build_distance_calls": null,
+      "build_ms": 38.734708,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 10,
+      "n": 1000,
+      "per_query_resident_bytes": null,
+      "per_query_resident_exceeds_llc": false,
+      "query_flushed_p50_us": null,
+      "query_warm_max_us": 3.5,
+      "query_warm_p50_us": 2.625,
+      "query_warm_p95_us": 3.0410000000000004,
+      "query_warm_p99_us": 3.291,
+      "recall_at_10": 0.9760000000000008,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 3.0792380952380953
+    },
+    {
+      "bruteforce_p50_us": 15.917,
+      "build_distance_calls": null,
+      "build_ms": 76.67275,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 11,
+      "n": 2000,
+      "per_query_resident_bytes": null,
+      "per_query_resident_exceeds_llc": false,
+      "query_flushed_p50_us": null,
+      "query_warm_max_us": 4.792,
+      "query_warm_p50_us": 3.875,
+      "query_warm_p95_us": 4.5,
+      "query_warm_p99_us": 4.7090000000000005,
+      "recall_at_10": 0.9605000000000016,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 4.107612903225807
+    }
+  ],
+  "runner_os": "macos-arm64",
+  "schema_version": "1.0"
+}

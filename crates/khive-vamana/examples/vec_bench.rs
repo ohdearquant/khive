@@ -54,6 +54,7 @@ struct Args {
     intrinsic_dim: f64,
     normalization: String,
     source_url: Option<String>,
+    bank_run_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -69,6 +70,7 @@ fn parse_args() -> Args {
     let mut intrinsic_dim = 0.0f64;
     let mut normalization = String::from("l2");
     let mut source_url: Option<String> = None;
+    let mut bank_run_dir: Option<PathBuf> = None;
 
     while let Some(key) = args_iter.next() {
         match key.as_str() {
@@ -134,6 +136,11 @@ fn parse_args() -> Args {
                     source_url = Some(val);
                 }
             }
+            "--bank-run" => {
+                if let Some(val) = args_iter.next() {
+                    bank_run_dir = Some(PathBuf::from(val));
+                }
+            }
             _ => {}
         }
     }
@@ -150,6 +157,7 @@ fn parse_args() -> Args {
         intrinsic_dim,
         normalization,
         source_url,
+        bank_run_dir,
     }
 }
 
@@ -528,7 +536,6 @@ fn collect_runner_os() -> String {
         }
     }
     if cfg!(target_os = "macos") {
-        // Detect arm64 vs x86_64
         let arch = std::process::Command::new("uname")
             .arg("-m")
             .output()
@@ -541,6 +548,82 @@ fn collect_runner_os() -> String {
         "linux-x86_64".to_string()
     } else {
         "unknown".to_string()
+    }
+}
+
+fn collect_machine_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // hw.model gives the board model (e.g. "Mac14,6"); machdep.cpu.brand_string
+        // gives the human-readable chip name (e.g. "Apple M2 Max").
+        let brand = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(b) = brand {
+            return b;
+        }
+        // Fallback to hw.model if brand string unavailable (e.g. Apple Silicon without
+        // the machdep key populated on older macOS releases).
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.model"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "macos-unknown".to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "linux-unknown".to_string())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "unknown".to_string()
+    }
+}
+
+fn collect_ram_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            // /proc/meminfo reports kB
+            .map(|kb| kb * 1024)
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0u64
     }
 }
 
@@ -771,6 +854,8 @@ fn main() {
     let produced_at = collect_produced_at();
     let git_sha = collect_git_sha();
     let runner_os = collect_runner_os();
+    let machine_model = collect_machine_model();
+    let ram_bytes = collect_ram_bytes();
     let loadavg1 = collect_loadavg1();
 
     let targets_path = args
@@ -788,7 +873,7 @@ fn main() {
         args.alpha
     );
     println!("N values: {:?}", args.ns);
-    println!("produced_at: {produced_at}  git_sha: {git_sha}  runner_os: {runner_os}  loadavg1: {loadavg1:.2}");
+    println!("produced_at: {produced_at}  git_sha: {git_sha}  runner_os: {runner_os}  machine_model: {machine_model}  ram_bytes: {ram_bytes}  loadavg1: {loadavg1:.2}");
     println!();
 
     print!("Loading base vectors... ");
@@ -1105,6 +1190,8 @@ fn main() {
         "produced_at": produced_at,
         "git_sha": git_sha,
         "runner_os": runner_os,
+        "machine_model": machine_model,
+        "ram_bytes": ram_bytes,
         "loadavg1": loadavg1,
         "dataset": {
             "name": args.dataset,
@@ -1163,10 +1250,48 @@ fn main() {
     // Always write JSON BEFORE process::exit so failures are inspectable.
     std::fs::write(&args.out, &json_str).expect("failed to write JSON");
     println!("JSON written to: {}", args.out.display());
+
+    // Bank a copy to the tracked path so provenance is version-controlled.
+    let bank_dir = args
+        .bank_run_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("perf/bench-runs"));
+    bank_run_json(
+        &bank_dir,
+        &produced_at,
+        &git_sha,
+        &args.target_key,
+        &json_str,
+    );
+
     println!("assertions.overall: {}", output["assertions"]["overall"]);
     println!("exit_code: {exit_code}");
 
     std::process::exit(exit_code);
+}
+
+// ─── tracked run banking ─────────────────────────────────────────────────────
+
+fn bank_run_json(dir: &Path, produced_at: &str, git_sha: &str, target_key: &str, json_str: &str) {
+    // Filename: <date>-<sha7>-<sanitized-target>.json
+    let date_part = produced_at
+        .get(..10)
+        .unwrap_or("0000-00-00")
+        .replace('-', "");
+    let sha7 = &git_sha[..git_sha.len().min(7)];
+    let target_safe = target_key.replace('/', "_");
+    let filename = format!("{date_part}-{sha7}-{target_safe}.json");
+    let dest = dir.join(&filename);
+
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("WARNING: could not create bank dir {}: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = std::fs::write(&dest, json_str) {
+        eprintln!("WARNING: could not write bank file {}: {e}", dest.display());
+        return;
+    }
+    println!("Run banked to: {}", dest.display());
 }
 
 // ─── assertions builder ───────────────────────────────────────────────────────

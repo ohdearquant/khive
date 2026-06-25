@@ -169,7 +169,8 @@ set +e
     --dataset "$DATASET" \
     --targets "$TARGETS_TOML" \
     --target-key "$TARGET_KEY" \
-    --out "$BENCH_JSON"
+    --out "$BENCH_JSON" \
+    --bank-run "$REPO_ROOT/perf/bench-runs"
 ) 2>&1 | tee -a "$LOG_FILE"
 BENCH_EXIT="${PIPESTATUS[0]}"
 set -e

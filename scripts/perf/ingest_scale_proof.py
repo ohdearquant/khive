@@ -35,6 +35,7 @@ LEDGER_HEADER = [
     "p99_us",
     "build_ms",
     "speedup",
+    "brute_us",
     "pass",
     "loadavg",
     "notes",
@@ -68,8 +69,11 @@ def ensure_ledger(ledger_path: pathlib.Path) -> None:
         print(f"Created new ledger: {ledger_path}", file=sys.stderr)
 
 
-def build_notes(bench_row: dict, runner_os: str, dataset_name: str) -> str:
-    return f"{dataset_name} {runner_os}"
+def build_notes(bench_row: dict, runner_os: str, dataset_name: str, machine_model: str) -> str:
+    parts = [dataset_name, runner_os]
+    if machine_model and machine_model not in runner_os:
+        parts.append(machine_model)
+    return " ".join(parts)
 
 
 def main() -> None:
@@ -98,6 +102,7 @@ def main() -> None:
     produced_at = data.get("produced_at", "")
     git_sha = data.get("git_sha", "")
     runner_os = data.get("runner_os", "")
+    machine_model = data.get("machine_model", "")
     loadavg1 = float(data.get("loadavg1", 0.0))
 
     assertions = data.get("assertions", {})
@@ -125,12 +130,15 @@ def main() -> None:
             p99 = bench_row.get("query_warm_p99_us", "")
             build_ms = bench_row.get("build_ms", "")
             speedup = bench_row.get("speedup_vs_brute_force", "")
+            brute_us = bench_row.get("bruteforce_p50_us", "")
 
             # Round floats to reasonable precision for readability.
             if isinstance(recall, float):
                 recall = round(recall, 4)
             if isinstance(speedup, float):
                 speedup = round(speedup, 1)
+            if isinstance(brute_us, float):
+                brute_us = round(brute_us, 3)
             if isinstance(build_ms, float):
                 build_ms = round(build_ms, 3)
             if isinstance(p50, float):
@@ -140,7 +148,7 @@ def main() -> None:
             if isinstance(p99, float):
                 p99 = round(p99, 3)
 
-            notes = build_notes(bench_row, runner_os, dataset_name)
+            notes = build_notes(bench_row, runner_os, dataset_name, machine_model)
 
             ledger_row = {
                 "date": produced_at,
@@ -154,6 +162,7 @@ def main() -> None:
                 "p99_us": p99,
                 "build_ms": build_ms,
                 "speedup": speedup,
+                "brute_us": brute_us,
                 "pass": pass_str,
                 "loadavg": loadavg1,
                 "notes": notes,
@@ -166,7 +175,7 @@ def main() -> None:
         sha_short = str(r["sha"])[:8]
         print(
             f"  n={r['n']:>8}  beam={r['beam']:>4}  recall={r['recall_at_10']}  "
-            f"p50={r['p50_us']}µs  p95={r['p95_us']}µs  "
+            f"p50={r['p50_us']}µs  p95={r['p95_us']}µs  brute_us={r['brute_us']}µs  "
             f"speedup={r['speedup']}x  {r['pass']}  sha={sha_short}"
         )
 
