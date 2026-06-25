@@ -90,11 +90,20 @@ An item where `in_flat_recall = false` and `found_via_graph = true` is a graph-e
 
 **Axis 2: RANK-lift.** For actionable items already in flat recall, record the rank position with and without graph-proximity weighting. A positive rank shift (lower rank number) when graph proximity is enabled is a rank-lift event.
 
-The lattice loop logs the boolean pair plus rank for each delta into the `khive-runs` dataset. GitHub #80 (retrieval coverage metric, currently at 0.0) is the measurement accumulation point. The headline parity number — the fraction of sessions where graph recall outperformed flat recall on at least one axis — is a TODO pending lattice accumulation.
+The lattice loop logs the boolean pair plus rank for each delta into the `khive-runs` dataset. GitHub #80 (retrieval coverage metric, currently at 0.0) is the measurement accumulation point. The headline parity number, the fraction of sessions where graph recall outperformed flat recall on at least one axis, is a TODO pending lattice accumulation.
+
+**Measurement evidence (accumulating).** Two discovery iterations are logged so far. They point in opposite directions, which is the intended honest signal rather than a problem.
+
+| Delta   | Discovery sweep      | Actionable prior                                              | recall-lift                                                  | rank-lift                            | Outcome                     |
+| ------- | -------------------- | ------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------ | --------------------------- |
+| delta-1 | `flash.rs` codex     | old, salience 0.72, flat rank #2 at raw 0.475                 | +1/2 (sibling cluster surfaced only via graph)               | +1 (graph promotes rank #2 to #1)    | graph fusion wins           |
+| delta-2 | `standard.rs` kernel | fresh session lessons, salience 0.85, decay 0.0, flat rank #1 | low, about +0.25 (entity leg adds marginal taxonomy framing) | about 0 (flat #1 already actionable) | flat plus salience suffices |
+
+The lift is conditional on the corpus. Graph proximity adds the most when the actionable prior is old, low-salience, or poorly ranked by raw cosine, which is exactly when flat retrieval under-ranks it. When the actionable priors are recent high-salience captures, the existing `salience` and `temporal` features already rank them first and graph proximity adds little. delta-2 is the control row that establishes this boundary, and it is logged precisely because flat recall won it.
 
 ### 4. Default-on gate
 
-Graph fusion becomes a default recall feature only after measured recall-parity evidence at scale. Until that threshold is established, the feature ships opt-in: `graph_proximity` is not present in the default `RecallConfig.reranker_weights` (which defaults to `HashMap::new()`). Callers who want graph-aware recall add the key explicitly or configure it in pack settings. The parity evidence and Ocean sign-off are both required to flip the default.
+Graph fusion becomes a default recall feature only after measured recall-parity evidence at scale. The delta-1 and delta-2 split above shows the default question is not binary: graph proximity earns default-on for corpora where stale, low-salience priors still carry actionable weight, and adds little where recent high-salience captures dominate. A scale measurement therefore reports the distribution of lift across corpus age and salience, not a single average. Until that threshold is established, the feature ships opt-in: `graph_proximity` is not present in the default `RecallConfig.reranker_weights` (which defaults to `HashMap::new()`). Callers who want graph-aware recall add the key explicitly or configure it in pack settings. The parity evidence and Ocean sign-off are both required to flip the default.
 
 ---
 
