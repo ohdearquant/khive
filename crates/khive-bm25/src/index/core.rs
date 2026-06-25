@@ -133,8 +133,8 @@ impl Clone for Bm25Index {
         let block_max_clone = self
             .block_max_state
             .read()
-            .map(|state| state.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         Self {
             inverted_index: self.inverted_index.clone(),
@@ -745,6 +745,83 @@ mod regression_tests {
         assert!(
             result.is_err(),
             "posting list with unsorted doc_ids must be rejected"
+        );
+    }
+
+    #[test]
+    fn bm25_index_clone_recovers_idf_cache_from_poisoned_lock() {
+        let mut index = Bm25Index::default();
+        // Index enough documents so the IDF cache gets populated.
+        for i in 0..5 {
+            index
+                .index_document(format!("doc{i}"), "rust systems programming")
+                .unwrap();
+        }
+        // Warm the IDF cache by running a search.
+        let _ = index.search("rust", 10);
+        assert!(
+            !index.is_idf_cache_empty(),
+            "IDF cache must be populated before poisoning"
+        );
+
+        // Poison the IDF cache lock by panicking inside its write-lock scope.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = index.idf_cache.by_df.write().unwrap();
+            panic!("intentional idf cache poison");
+        });
+        assert!(
+            index.idf_cache.by_df.read().is_err(),
+            "IDF cache lock must be poisoned"
+        );
+
+        // Clone must preserve populated IDF cache, not collapse to empty.
+        let cloned = index.clone();
+        assert!(
+            !cloned.is_idf_cache_empty(),
+            "cloned index must retain non-empty IDF cache after lock was poisoned"
+        );
+
+        // Search results must be non-empty (scores non-zero) — not silently zeroed.
+        let results = cloned.search("rust", 10);
+        assert_eq!(
+            results.len(),
+            5,
+            "all documents must be found in clone of poisoned index"
+        );
+        assert!(
+            results.iter().all(|(_id, score)| score.to_f64() > 0.0),
+            "BM25 scores must be non-zero; a collapsed IDF cache would produce score=0"
+        );
+    }
+
+    #[test]
+    fn bm25_index_clone_recovers_block_max_state_from_poisoned_lock() {
+        let mut index = Bm25Index::default();
+        for i in 0..4 {
+            index
+                .index_document(format!("doc{i}"), "search engine indexing")
+                .unwrap();
+        }
+        // Force block-max metadata to be built.
+        index.ensure_block_max_metadata();
+
+        // Poison the block_max_state lock.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = index.block_max_state.write().unwrap();
+            panic!("intentional block_max poison");
+        });
+        assert!(
+            index.block_max_state.read().is_err(),
+            "block_max_state lock must be poisoned"
+        );
+
+        // Clone must succeed and the clone must be searchable.
+        let cloned = index.clone();
+        let results = cloned.search("search", 10);
+        assert_eq!(
+            results.len(),
+            4,
+            "all documents must be found in clone after block_max_state lock was poisoned"
         );
     }
 }
