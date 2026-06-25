@@ -958,20 +958,22 @@ pub(crate) fn robust_prune_inner_sq8(
     let alpha2 = (alpha * alpha) as f32;
     let mut selected: Vec<u32> = Vec::with_capacity(max_degree);
 
-    'candidate: for (candidate_id, d2_node_candidate) in pool {
+    'candidate: for (candidate_id, _sq8_d2) in pool {
         if selected.len() == max_degree {
             break;
         }
+        // Use exact f32 node->candidate distance for the alpha predicate RHS.
+        // SQ8 d2_node_candidate is not used here: when node and candidate collide
+        // in code space (e.g., both map to code 0), the SQ8 distance is 0, which
+        // makes alpha² * dist(selected, candidate) <= 0 vacuously true and
+        // incorrectly prunes candidates that exact f32 would keep.
+        let d2_node_candidate_exact = l2_squared(node_vec, row(vectors, dimensions, candidate_id));
         for &selected_id in &selected {
-            // Diversity check: if alpha² * dist(selected, candidate) ≤ dist(node, candidate),
-            // candidate is pruned (too close to an already-selected neighbor).
-            // Using f32 exact distances here for the inter-selected check to avoid
-            // compounding quantization error in the diversity predicate.
             let d2_selected_candidate = l2_squared(
                 row(vectors, dimensions, selected_id),
                 row(vectors, dimensions, candidate_id),
             );
-            if alpha2 * d2_selected_candidate <= d2_node_candidate {
+            if alpha2 * d2_selected_candidate <= d2_node_candidate_exact {
                 continue 'candidate;
             }
         }

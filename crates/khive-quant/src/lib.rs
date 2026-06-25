@@ -13,10 +13,12 @@
 //! A single shared scale `gs = max_range_across_dims / 255` is used for all dims;
 //! per-dim `min_i` offsets are still subtracted before quantizing.
 //!
-//! L2² in code space: `gs² × Σ (a_i - b_i)²` — algebraically exact (offsets cancel,
-//! one scalar factorizes out). No residual pass needed, no gate, no silent fallback.
-//! Small-range dims contribute proportionally fewer codes and proportionally less
-//! L2 signal — an honest trade-off documented in ADR-107.
+//! L2² in code space: `gs² × Σ (a_i - b_i)²` — exact after the lossy f32→u8 encode
+//! (offsets cancel, one scalar factorizes out). No anisotropy gate or residual pass for
+//! in-distribution vectors; OOD queries (components outside the trained range) fall back
+//! to exact f32 in the caller (see `VamanaIndex::search`). Small-range dims contribute
+//! proportionally fewer codes and proportionally less L2 signal — an honest trade-off
+//! documented in ADR-107.
 //!
 //! # Hot-loop NEON helpers (`u8_dot_u32`, `u8_l2sq_u32`)
 //!
