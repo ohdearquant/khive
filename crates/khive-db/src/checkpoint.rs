@@ -364,23 +364,27 @@ mod tests {
     /// `PRAGMA wal_checkpoint(TRUNCATE)`. Confirmed by reasoning: TRUNCATE inherits
     /// RESTART semantics and will invoke the busy handler (sleeping up to
     /// `busy_timeout`) while waiting for the open reader snapshot to release.
-    /// With `busy_timeout = 200ms` a TRUNCATE regression causes the call to take
-    /// ~200ms, blowing the <50ms assertion. PASSIVE returns in <1ms even with an
+    /// With `busy_timeout = 2000ms` a TRUNCATE regression causes the call to take
+    /// ~2000ms, blowing the <500ms assertion. PASSIVE returns in <1ms even with an
     /// open reader, because PASSIVE never waits for readers.
     ///
-    /// Why `busy_timeout = 200ms`: the test pool uses a small busy_timeout so a
-    /// TRUNCATE regression fails fast (~200ms), not after the 30s production default.
+    /// Why `busy_timeout = 2000ms` and threshold `< 500ms`: the original 200ms
+    /// busy_timeout / 50ms threshold was too tight for contended CI runners where
+    /// PASSIVE legitimately takes 50-200ms under parallel-test load. Raising the
+    /// busy_timeout to 2000ms keeps the PASSIVE path well below 500ms while a
+    /// TRUNCATE regression blocks for ~2000ms — a 4x safety margin on both sides.
     #[test]
     fn checkpoint_high_water_does_not_block_behind_reader() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("high_water_test.db");
 
-        // Use a small busy_timeout so a TRUNCATE regression fails fast (~200ms)
-        // rather than hanging the test suite for the 30s production default.
+        // busy_timeout = 2000ms: a TRUNCATE regression blocks ~2s (clearly caught by
+        // the <500ms assertion below), but PASSIVE returns well within 500ms even on
+        // a heavily loaded CI runner. 4x margin on both sides vs. the old 200ms/50ms.
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
-                busy_timeout: Duration::from_millis(200),
+                busy_timeout: Duration::from_millis(2000),
                 ..PoolConfig::default()
             })
             .expect("pool open"),
@@ -425,11 +429,13 @@ mod tests {
         drop(reader);
 
         // PASSIVE returns in <1ms even with an open reader snapshot.
-        // A TRUNCATE regression would block ~busy_timeout (200ms) and fail here.
+        // A TRUNCATE regression would block ~busy_timeout (2000ms) and fail here.
+        // 500ms threshold is generous for CI jitter while staying well below 2000ms.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
+            elapsed < std::time::Duration::from_millis(500),
             "checkpoint_once with active reader snapshot took {:?}; \
-             expected <50ms (PASSIVE must not block on readers)",
+             expected <500ms (PASSIVE must not block on readers; \
+             a TRUNCATE regression would block ~2000ms)",
             elapsed
         );
     }
