@@ -950,3 +950,94 @@ async fn get_edges_chunk_boundary() {
         "get_edges must return all {count} edges across the chunk boundary"
     );
 }
+
+/// batch_neighbors Direction::Both chunk-boundary test.
+///
+/// With the old const CHUNK=880, Direction::Both would bind ~1761 variables
+/// (1 ns + 880 out_srcs + 880 in_srcs) into a single SQLite statement,
+/// blowing past SQLITE_MAX_VARIABLE_NUMBER=999 and returning an error.
+///
+/// This test uses 500 source nodes — enough that a single Both chunk would
+/// have exceeded 999 variables under the old constant.  After the fix the
+/// computed chunk_size for Both (no filters, no limit) is ~474, so the 500
+/// sources are split into two chunks, each staying within budget.
+///
+/// Correctness: for a random sample of sources, batch result must equal the
+/// per-source neighbors() result.
+#[tokio::test]
+async fn batch_neighbors_both_chunk_boundary() {
+    let store = setup_memory_store();
+
+    // Create 500 source nodes, each with one outgoing and one incoming edge.
+    let source_count = 500usize;
+    let mut sources: Vec<Uuid> = Vec::with_capacity(source_count);
+    for _ in 0..source_count {
+        let centre = Uuid::new_v4();
+        let out_tgt = Uuid::new_v4();
+        let in_src = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(centre, out_tgt, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(in_src, centre, EdgeRelation::Extends, 0.8))
+            .await
+            .unwrap();
+        sources.push(centre);
+    }
+
+    let q_both = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    // Must not error (would panic with "too many SQL variables" pre-fix).
+    let batch_hits = store
+        .batch_neighbors(&sources, q_both.clone())
+        .await
+        .unwrap();
+
+    // Each source has exactly 2 neighbours (one out, one in).
+    assert_eq!(
+        batch_hits.len(),
+        source_count * 2,
+        "Both chunk-boundary: must return 2 hits per source (1 out + 1 in)"
+    );
+
+    // Spot-check: first, middle, and last source match per-source neighbors().
+    for &idx in &[0, source_count / 2, source_count - 1] {
+        let src = sources[idx];
+        let single: HashSet<Uuid> = store
+            .neighbors(src, q_both.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| h.node_id)
+            .collect();
+        let from_batch: HashSet<Uuid> = batch_hits
+            .iter()
+            .filter(|(origin, _)| *origin == src)
+            .map(|(_, h)| h.node_id)
+            .collect();
+        assert_eq!(
+            from_batch, single,
+            "spot-check source {idx}: batch result must match neighbors()"
+        );
+    }
+
+    // Also verify with limit=1: each source gets at most 1 hit total.
+    let q_limit = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: Some(1),
+        min_weight: None,
+    };
+    let limited_hits = store.batch_neighbors(&sources, q_limit).await.unwrap();
+    assert_eq!(
+        limited_hits.len(),
+        source_count,
+        "Both chunk-boundary with limit=1: must return exactly 1 hit per source"
+    );
+}

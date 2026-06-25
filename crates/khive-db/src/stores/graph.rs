@@ -542,13 +542,35 @@ impl GraphStore for SqlGraphStore {
         if sources.is_empty() {
             return Ok(Vec::new());
         }
-        // Chunk source IDs to stay within SQLite variable limit.
-        // ?1 = namespace, ?2..?N+1 = sources, then optional filter params.
-        const CHUNK: usize = 880;
+        // Compute a per-call chunk size that keeps the total bound parameter count
+        // safely under SQLITE_MAX_VARIABLE_NUMBER (999).
+        //
+        // Variable budget:
+        //   1  = namespace (?1, shared across all halves of a UNION ALL)
+        //   1  = limit (optional, worst-case reserve)
+        //   halves × (src_count + per_half_filter) = the IN-list + filter params
+        //
+        // For Direction::Both the UNION ALL doubles the source IN-list and filter
+        // params (each half is a fully independent positional-parameter block).
+        // For Out/In there is only one half.
+        //
+        // We target 950 total to leave a comfortable margin below 999, then cap at
+        // 880 to preserve the existing ceiling for the single-direction common case.
+        let per_half_filter =
+            query.relations.as_ref().map_or(0, |r| r.len()) + query.min_weight.is_some() as usize;
+        let halves: usize = if query.direction == Direction::Both {
+            2
+        } else {
+            1
+        };
+        let fixed = 1 /*ns*/ + 1 /*limit*/ + halves * per_half_filter;
+        let max_src = (950usize.saturating_sub(fixed) / halves).max(1);
+        let chunk_size = max_src.min(880);
+
         let namespace = self.namespace.clone();
         let mut result: Vec<(Uuid, NeighborHit)> = Vec::new();
 
-        for chunk in sources.chunks(CHUNK) {
+        for chunk in sources.chunks(chunk_size) {
             let chunk_owned: Vec<Uuid> = chunk.to_vec();
             let query_clone = query.clone();
             let ns = namespace.clone();
