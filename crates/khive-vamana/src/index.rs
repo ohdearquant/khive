@@ -18,8 +18,8 @@ use crate::{
     distance::l2_squared,
     error::{Result, VamanaError},
     graph::{
-        greedy_search_inner_sq8, is_tombstoned_bit, robust_prune_inner, sort_dedup_u32,
-        VamanaGraph, VisitedSet,
+        greedy_search_inner, greedy_search_inner_sq8, is_tombstoned_bit, robust_prune_inner,
+        sort_dedup_u32, VamanaGraph, VisitedSet,
     },
 };
 
@@ -409,21 +409,40 @@ impl VamanaIndex {
             None
         };
         let mut visited = VisitedSet::new(self.num_vectors);
-        let query_enc = self.gs_codec.encode(query);
-        let result = greedy_search_inner_sq8(
-            self.vectors()?,
-            self.dimensions,
-            &self.gs_codes,
-            &self.gs_codec,
-            self.graph.adjacency(),
-            query,
-            &query_enc,
-            self.graph.medoid(),
-            k,
-            self.config.search_list_size,
-            &mut visited,
-            tombstones,
-        );
+
+        // OOD fallback (ADR-052 §2): if any query component lies outside the codec's
+        // trained range [min_d, min_d + 255·gs], encoding clamps that dimension and
+        // SQ8 distances cannot correctly order the frontier. Fall back to exact f32
+        // greedy search for this query; in-distribution queries keep the SQ8 path.
+        let result = if self.gs_codec.is_in_distribution(query) {
+            let query_enc = self.gs_codec.encode(query);
+            greedy_search_inner_sq8(
+                self.vectors()?,
+                self.dimensions,
+                &self.gs_codes,
+                &self.gs_codec,
+                self.graph.adjacency(),
+                query,
+                &query_enc,
+                self.graph.medoid(),
+                k,
+                self.config.search_list_size,
+                &mut visited,
+                tombstones,
+            )
+        } else {
+            greedy_search_inner(
+                self.vectors()?,
+                self.dimensions,
+                self.graph.adjacency(),
+                query,
+                self.graph.medoid(),
+                k,
+                self.config.search_list_size,
+                &mut visited,
+                tombstones,
+            )
+        };
 
         let mut output = result.results;
         output.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
@@ -3658,6 +3677,174 @@ mod tests {
         assert!(
             sq8_recall >= 0.80,
             "SQ8 recall@10 {sq8_recall:.4} < 0.80 — absolute floor violated"
+        );
+    }
+
+    /// OOD fallback recall gate (ADR-052 §2 — Finding 1).
+    ///
+    /// Builds on in-distribution corpus, then queries with vectors deliberately
+    /// OUTSIDE the trained range (clamp-heavy). The OOD fallback must yield recall
+    /// parity with the f32/brute-force oracle — guaranteed by the exact f32 path.
+    #[test]
+    fn sq8_ood_recall_with_fallback() {
+        const N: usize = 500;
+        const DIM: usize = 16;
+        const K: usize = 5;
+        const NUM_QUERIES: usize = 20;
+
+        // Build corpus in [0.0, 1.0] per component.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA052_0002);
+        let corpus: Vec<f32> = (0..N * DIM).map(|_| rng.gen_range(0.0f32..1.0)).collect();
+
+        let cfg = VamanaConfig::with_dimensions(DIM)
+            .with_max_degree(16)
+            .with_search_list_size(32);
+        let index = VamanaIndex::build(&corpus, cfg).expect("build failed");
+
+        // Verify the codec range: corpus is [0, 1] so codec min ≈ 0, max ≈ 1.
+        // OOD queries: components in [-2.0, -1.0] — well outside trained [0, 1].
+        let ood_queries: Vec<f32> = (0..NUM_QUERIES * DIM)
+            .map(|_| rng.gen_range(-2.0f32..-1.0))
+            .collect();
+
+        // Verify that the queries are actually OOD (codec must clamp them).
+        for qi in 0..NUM_QUERIES {
+            let q = &ood_queries[qi * DIM..(qi + 1) * DIM];
+            assert!(
+                !index.gs_codec.is_in_distribution(q),
+                "query {qi} was unexpectedly in-distribution; test corpus or range logic is wrong"
+            );
+        }
+
+        let vecs = index.vectors().expect("vectors");
+        let mut total_recall = 0.0f64;
+        let denom = K as f64;
+
+        for qi in 0..NUM_QUERIES {
+            let q = &ood_queries[qi * DIM..(qi + 1) * DIM];
+
+            // Ground truth: exact brute-force.
+            let gt = exact_search(vecs, DIM, q, K, None);
+            let gt_ids: std::collections::HashSet<u32> = gt.iter().map(|(id, _)| *id).collect();
+
+            // OOD path: index.search() triggers the f32 fallback (is_in_distribution=false).
+            let result = index.search(q, K).expect("ood search failed");
+            let result_ids: std::collections::HashSet<u32> =
+                result.iter().map(|(id, _)| *id).collect();
+            total_recall += result_ids.intersection(&gt_ids).count() as f64 / denom;
+        }
+
+        let ood_recall = total_recall / NUM_QUERIES as f64;
+        println!("sq8_ood_fallback | ood_recall@5={ood_recall:.4} (f32 fallback, expect ≈1.0)");
+
+        // The f32 fallback is exact greedy search — recall should match the oracle.
+        assert!(
+            ood_recall >= 0.95,
+            "OOD f32-fallback recall@5 {ood_recall:.4} < 0.95 — fallback is not working correctly"
+        );
+    }
+
+    /// Equal-code collision test (ADR-052 §2 — Finding 3).
+    ///
+    /// Forces two distinct f32 vectors to collide in u8 code space (low-dim corpus
+    /// trained on [0, 1] quantizes differently from a corpus with range >> 1/255).
+    /// Asserts that both greedy search and RobustPrune return the same neighbor
+    /// ranking as the exact f32 path when SQ8 codes collide.
+    #[test]
+    fn sq8_equal_code_collision_correctness() {
+        use crate::graph::{greedy_search_inner_sq8, robust_prune_inner, robust_prune_inner_sq8};
+        use khive_quant::GsSq8Codec;
+
+        // 1-D corpus: two vectors very close together so they quantize to the same code.
+        // Codec trained on [0.0, 1.0] in 1-D: gs = 1.0/255 ≈ 0.00392.
+        // v0=0.0 → code 0; v1=0.001 → code round(0.001/0.00392) = round(0.255) = 0.
+        // Both map to code 0. Only exact f32 can distinguish them.
+        const DIM: usize = 1;
+        let vectors: Vec<f32> = vec![0.0, 0.001, 0.9];
+        let codec = GsSq8Codec::train_flat(&vectors, DIM);
+        let encoded: Vec<_> = (0..3)
+            .map(|i| codec.encode(&vectors[i * DIM..(i + 1) * DIM]))
+            .collect();
+
+        // Verify collision: v0 and v1 should have identical codes.
+        assert_eq!(
+            encoded[0].codes, encoded[1].codes,
+            "vectors 0 and 1 must collide in u8 code space for this test to be meaningful"
+        );
+
+        // Build a simple graph: node 0 → [1, 2], node 1 → [0, 2], node 2 → [0, 1].
+        let n = 3usize;
+        let adjacency: Vec<Vec<u32>> = vec![vec![1, 2], vec![0, 2], vec![0, 1]];
+        let mut visited = crate::graph::VisitedSet::new(n);
+
+        // Query = v0 (0.0). Exact nearest: v1 (d=0.001²=0.000001), then v2 (d=0.81).
+        let query = vec![0.0f32; DIM];
+        let query_enc = codec.encode(&query);
+
+        // SQ8 greedy search — must tiebreak v0/v1 collision by f32 → return v1 first.
+        let sq8_result = greedy_search_inner_sq8(
+            &vectors,
+            DIM,
+            &encoded,
+            &codec,
+            &adjacency,
+            &query,
+            &query_enc,
+            0, // start at node 0
+            2,
+            4,
+            &mut visited,
+            None,
+        );
+        let sq8_ids: Vec<u32> = sq8_result.results.iter().map(|(id, _)| *id).collect();
+
+        // f32 greedy search — oracle.
+        let mut visited_f32 = crate::graph::VisitedSet::new(n);
+        let f32_result = greedy_search_inner(
+            &vectors,
+            DIM,
+            &adjacency,
+            &query,
+            0,
+            2,
+            4,
+            &mut visited_f32,
+            None,
+        );
+        let f32_ids: Vec<u32> = f32_result.results.iter().map(|(id, _)| *id).collect();
+
+        println!("sq8_collision | sq8_top2={sq8_ids:?}  f32_top2={f32_ids:?}");
+        assert_eq!(
+            sq8_ids, f32_ids,
+            "SQ8 greedy search must return same top-2 as f32 oracle when codes collide"
+        );
+
+        // RobustPrune collision test: candidates [0, 1, 2] from node perspective of node 2.
+        // Node 2 is at 0.9. Nearest in f32: v1 (d=(0.9-0.001)²=0.808), v0 (d=(0.9)²=0.81).
+        // With alpha=1.0, all candidates should be selected (diversity check won't prune).
+        let sq8_prune = robust_prune_inner_sq8(
+            &vectors,
+            DIM,
+            &encoded,
+            &codec,
+            2, // node
+            vec![0, 1],
+            1.0,
+            2,
+        );
+        let f32_prune = robust_prune_inner(
+            &vectors,
+            DIM,
+            2, // node
+            vec![0, 1],
+            1.0,
+            2,
+        );
+
+        println!("sq8_collision prune | sq8={sq8_prune:?}  f32={f32_prune:?}");
+        assert_eq!(
+            sq8_prune, f32_prune,
+            "RobustPrune must return same neighbors as f32 variant when codes collide"
         );
     }
 }

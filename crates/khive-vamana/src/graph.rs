@@ -838,9 +838,13 @@ pub(crate) fn greedy_search_inner_sq8(
         .enumerate()
         .filter(|(_, c)| !c.expanded)
         .min_by(|(_, a), (_, b)| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
+            // Tiebreak equal SQ8 codes with exact f32; different f32 vectors can
+            // map to the same u8 code (clamped or low-resolution dimensions).
+            a.distance.total_cmp(&b.distance).then_with(|| {
+                let fa = l2_squared(query, row(vectors, dimensions, a.id));
+                let fb = l2_squared(query, row(vectors, dimensions, b.id));
+                fa.total_cmp(&fb).then_with(|| a.id.cmp(&b.id))
+            })
         })
     {
         let current_id = frontier[best_idx].id;
@@ -941,8 +945,14 @@ pub(crate) fn robust_prune_inner_sq8(
         pool.push((candidate, d2));
     }
 
+    // Tiebreak equal SQ8 codes with exact f32 to match greedy_search_inner_sq8 ordering.
+    let node_vec = row(vectors, dimensions, node);
     pool.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
-        a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
+        a_d.total_cmp(b_d).then_with(|| {
+            let fa = l2_squared(node_vec, row(vectors, dimensions, *a_id));
+            let fb = l2_squared(node_vec, row(vectors, dimensions, *b_id));
+            fa.total_cmp(&fb).then_with(|| a_id.cmp(b_id))
+        })
     });
 
     let alpha2 = (alpha * alpha) as f32;
