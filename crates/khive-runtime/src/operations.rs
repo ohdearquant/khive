@@ -790,6 +790,46 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
+    /// Like `get_entities_by_ids` but scoped to the token's full visible-namespace
+    /// set (`primary ∪ extra_visible`) instead of primary only.
+    ///
+    /// Graph expansion (`neighbors`, `traverse`) iterates over all visible
+    /// namespaces, so enrichment must use the same scope — otherwise neighbors
+    /// or path nodes whose entities live in an extra-visible namespace are left
+    /// with `name = None`, `kind = None`.  Missing or out-of-scope IDs are
+    /// silently omitted (best-effort, same as `get_entities_by_ids`).
+    async fn get_entities_by_ids_visible(
+        &self,
+        token: &NamespaceToken,
+        ids: &[Uuid],
+    ) -> RuntimeResult<Vec<Entity>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
+        let filter = EntityFilter {
+            ids: ids.to_vec(),
+            namespaces,
+            ..Default::default()
+        };
+        let page = self
+            .entities(token)?
+            .query_entities(
+                token.namespace().as_str(),
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: ids.len() as u32,
+                },
+            )
+            .await?;
+        Ok(page.items)
+    }
+
     /// Enforce that `record_ns` is within the caller's visible namespace set.
     ///
     /// Returns `Err(NotFound)` when the record namespace is not in the visible
@@ -1668,9 +1708,11 @@ impl KhiveRuntime {
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
     /// entity or note record. Best-effort: unresolved IDs leave the fields `None`.
     ///
-    /// Uses a single batched entity lookup via `get_entities_by_ids`, then a
-    /// batched note lookup (`get_notes_batch`) for the residual IDs not resolved
-    /// as entities.  Order and identity of hits is preserved via `HashMap` re-index.
+    /// Uses a single batched entity lookup via `get_entities_by_ids_visible`
+    /// (scoped to the token's full visible-namespace set so that neighbors in
+    /// extra-visible namespaces are enriched), then a batched note lookup
+    /// (`get_notes_batch`) for the residual IDs not resolved as entities.
+    /// Order and identity of hits is preserved via `HashMap` re-index.
     async fn enrich_neighbor_hits(&self, token: &NamespaceToken, hits: &mut [NeighborHit]) {
         if hits.is_empty() {
             return;
@@ -1691,7 +1733,7 @@ impl KhiveRuntime {
         };
 
         let entity_map: HashMap<Uuid, Entity> = self
-            .get_entities_by_ids(token, &unique_ids)
+            .get_entities_by_ids_visible(token, &unique_ids)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1742,9 +1784,9 @@ impl KhiveRuntime {
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
     /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
     ///
-    /// Uses a single batched entity lookup across all paths (unique node IDs
-    /// deduped), then re-indexes each node via `HashMap`.  Node IDs that repeat
-    /// across paths are fetched exactly once.
+    /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
+    /// live in extra-visible namespaces are enriched correctly.  Node IDs that
+    /// repeat across paths are fetched exactly once.
     async fn enrich_path_nodes(&self, token: &NamespaceToken, paths: &mut [GraphPath]) {
         if paths.is_empty() {
             return;
@@ -1767,7 +1809,7 @@ impl KhiveRuntime {
         };
 
         let entity_map: HashMap<Uuid, Entity> = self
-            .get_entities_by_ids(token, &unique_ids)
+            .get_entities_by_ids_visible(token, &unique_ids)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -8589,5 +8631,60 @@ mod tests {
         assert_eq!(paths[1].nodes[0].kind.as_deref(), Some("document"));
         assert_eq!(paths[1].nodes[1].name.as_deref(), Some("Alpha"));
         assert_eq!(paths[1].nodes[1].kind.as_deref(), Some("concept"));
+    }
+
+    /// enrich_neighbor_hits and enrich_path_nodes must resolve entities whose
+    /// namespace is in the token's extra-visible set (not only the primary).
+    ///
+    /// Regression for PR #253 review finding: the old `get_entities_by_ids`
+    /// call left `filter.namespaces` unset, which collapses to
+    /// `namespace = primary` in `build_entity_where`.  Graph expansion already
+    /// crosses visible namespaces, so enrichment must match that scope.
+    #[tokio::test]
+    async fn enrich_resolves_entities_in_extra_visible_namespace() {
+        let rt = KhiveRuntime::memory().unwrap();
+
+        let ns_a = Namespace::parse("enrich-ns-a").unwrap();
+        let ns_b = Namespace::parse("enrich-ns-b").unwrap();
+
+        let tok_b = rt.authorize(ns_b.clone()).unwrap();
+
+        // Entity lives in ns-b.
+        let entity_b = rt
+            .create_entity(&tok_b, "concept", None, "EntityInB", None, None, vec![])
+            .await
+            .unwrap();
+        assert_eq!(entity_b.namespace, "enrich-ns-b");
+
+        // Token whose primary is ns-a but ns-b is in the visible set.
+        let vis_tok = rt
+            .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+            .unwrap();
+
+        // ── neighbor hits ──────────────────────────────────────────────────
+        let mut hits = vec![neighbor_hit(entity_b.id)];
+        rt.enrich_neighbor_hits(&vis_tok, &mut hits).await;
+
+        assert_eq!(
+            hits[0].name.as_deref(),
+            Some("EntityInB"),
+            "entity in extra-visible ns must be enriched by enrich_neighbor_hits"
+        );
+        assert_eq!(hits[0].kind.as_deref(), Some("concept"));
+
+        // ── path nodes ─────────────────────────────────────────────────────
+        let mut paths = vec![GraphPath {
+            root_id: entity_b.id,
+            nodes: vec![path_node(entity_b.id, 0)],
+            total_weight: 1.0,
+        }];
+        rt.enrich_path_nodes(&vis_tok, &mut paths).await;
+
+        assert_eq!(
+            paths[0].nodes[0].name.as_deref(),
+            Some("EntityInB"),
+            "entity in extra-visible ns must be enriched by enrich_path_nodes"
+        );
+        assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
     }
 }
