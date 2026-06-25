@@ -13,10 +13,12 @@
 //! A single shared scale `gs = max_range_across_dims / 255` is used for all dims;
 //! per-dim `min_i` offsets are still subtracted before quantizing.
 //!
-//! L2² in code space: `gs² × Σ (a_i - b_i)²` — algebraically exact (offsets cancel,
-//! one scalar factorizes out). No residual pass needed, no gate, no silent fallback.
-//! Small-range dims contribute proportionally fewer codes and proportionally less
-//! L2 signal — an honest trade-off documented in ADR-052.
+//! L2² in code space: `gs² × Σ (a_i - b_i)²` — exact after the lossy f32→u8 encode
+//! (offsets cancel, one scalar factorizes out). No anisotropy gate or residual pass for
+//! in-distribution vectors; OOD queries (components outside the trained range) fall back
+//! to exact f32 in the caller (see `VamanaIndex::search`). Small-range dims contribute
+//! proportionally fewer codes and proportionally less L2 signal — an honest trade-off
+//! documented in ADR-052.
 //!
 //! # Hot-loop NEON helpers (`u8_dot_u32`, `u8_l2sq_u32`)
 //!
@@ -413,9 +415,13 @@ impl Sq8Codec {
 /// Per-dim offsets (`min_i`) are still subtracted before quantizing so codes span
 /// [0, 255] for the widest dim and fewer levels for narrower dims (honest trade-off).
 ///
-/// L2² identity: `||a-b||² ≈ gs² × Σ (a_i - b_i)²` — algebraically exact in code
-/// space (offset terms cancel, scalar `gs²` factorizes). No residual pass, no gate,
-/// no silent fallback for anisotropic data.
+/// Encoding is **lossy**: f32 components are rounded and clamped to u8 before storage.
+/// L2² in code space (`gs² × Σ (a_i - b_i)²`) is exact *after* that lossy encode —
+/// offset terms cancel and `gs²` factorizes — but the round-trip error relative to
+/// the original f32 L2² can reach ~15% for anisotropic or out-of-distribution data.
+/// Recall safety must be established by probe (see `sq8_recall_parity_vs_f32_oracle`
+/// and `sq8_ood_fallback_deterministic_ranking_flip`), not by an exactness argument.
+/// No residual pass, no gate, no silent fallback for anisotropic data.
 ///
 /// Historical note: the predecessor per-dim codec required `approx_l2_sq_fast` + an
 /// anisotropy gate (ratio ≤ 4.0) to achieve the integer-only hot path. The gate was
@@ -591,13 +597,14 @@ impl GsSq8Codec {
             .collect()
     }
 
-    /// Approximate squared L2 distance — algebraically exact in code space.
+    /// Approximate squared L2 distance.
     ///
     /// `||a-b||² ≈ gs² × Σ (a_i - b_i)²`
     ///
-    /// Offset terms cancel (both vectors use the same per-dim `min_i`).
-    /// The single scalar `gs²` factorizes out, leaving pure `u8_l2sq_u32` integer
-    /// arithmetic on the NEON path (~13 ns at 384d).
+    /// Exact in code space (offset terms cancel, `gs²` factorizes) after the
+    /// lossy f32→u8 encode. Per-round-trip L2 error can reach ~15%; recall
+    /// safety is established by probe, not by this formula.
+    /// The NEON path runs ~13 ns at 384-d.
     #[inline]
     pub fn l2_sq(&self, a: &GsEncodedVector, b: &GsEncodedVector) -> f32 {
         self.gs_sq * u8_l2sq_u32(&a.codes, &b.codes) as f32
@@ -606,6 +613,19 @@ impl GsSq8Codec {
     /// Number of dimensions.
     pub fn dims(&self) -> usize {
         self.min.len()
+    }
+
+    /// Returns `true` if every component of `v` falls within the trained range
+    /// `[min_d, min_d + 255 * gs]` (i.e., encoding would produce no clamping).
+    ///
+    /// When this returns `false` at least one dimension is out-of-distribution;
+    /// callers that need correctness guarantees should fall back to exact f32.
+    #[inline]
+    pub fn is_in_distribution(&self, v: &[f32]) -> bool {
+        let max_code = 255.0 * self.gs;
+        v.iter()
+            .zip(self.min.iter())
+            .all(|(&x, &mn)| x >= mn && x <= mn + max_code)
     }
 }
 

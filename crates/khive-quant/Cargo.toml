@@ -14,3 +14,8 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "sq8_kernel"
+harness = false
