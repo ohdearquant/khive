@@ -493,6 +493,222 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn get_edges(&self, ids: &[LinkId]) -> Result<Vec<Edge>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite SQLITE_MAX_VARIABLE_NUMBER defaults to 999; chunk at 900 to stay safe.
+        const CHUNK: usize = 900;
+        let id_strs: Vec<String> = ids.iter().map(|id| Uuid::from(*id).to_string()).collect();
+
+        let mut result: Vec<Edge> = Vec::with_capacity(ids.len());
+        for chunk in id_strs.chunks(CHUNK) {
+            let chunk_owned: Vec<String> = chunk.to_vec();
+            let edges = self
+                .with_reader("get_edges", move |conn| {
+                    let placeholders: Vec<String> =
+                        (1..=chunk_owned.len()).map(|i| format!("?{}", i)).collect();
+                    let sql = format!(
+                        "SELECT namespace, id, source_id, target_id, relation, weight, \
+                                created_at, updated_at, deleted_at, metadata, target_backend \
+                         FROM graph_edges WHERE id IN ({}) AND deleted_at IS NULL",
+                        placeholders.join(",")
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(params.as_slice(), read_edge)?;
+                    let mut edges = Vec::new();
+                    for row in rows {
+                        edges.push(row?);
+                    }
+                    Ok(edges)
+                })
+                .await?;
+            result.extend(edges);
+        }
+        Ok(result)
+    }
+
+    async fn batch_neighbors(
+        &self,
+        sources: &[Uuid],
+        query: NeighborQuery,
+    ) -> Result<Vec<(Uuid, NeighborHit)>, StorageError> {
+        use khive_storage::types::Direction;
+
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Chunk source IDs to stay within SQLite variable limit.  We bind
+        // ?1 (namespace) + ?2..?N+1 (source IDs) + optional relation/weight
+        // params, so we leave a 20-slot buffer for those extra params.
+        const CHUNK: usize = 880;
+        let namespace = self.namespace.clone();
+        let mut result: Vec<(Uuid, NeighborHit)> = Vec::new();
+
+        for chunk in sources.chunks(CHUNK) {
+            let chunk_owned: Vec<Uuid> = chunk.to_vec();
+            let query_clone = query.clone();
+            let ns = namespace.clone();
+
+            // Helper closure that executes one directional IN-list query and returns
+            // (origin_id, NeighborHit) pairs.  `direction_out=true` queries outgoing
+            // edges (source_id IN sources); `false` queries incoming (target_id IN
+            // sources).
+            let run_direction = |conn: &rusqlite::Connection,
+                                 src_strs: &[String],
+                                 ns: &str,
+                                 direction_out: bool,
+                                 q: &NeighborQuery|
+             -> Result<Vec<(Uuid, NeighborHit)>, rusqlite::Error> {
+                // Bind params: ?1 = namespace, ?2..?N+1 = source IDs.
+                let placeholders: Vec<String> =
+                    (2..2 + src_strs.len()).map(|i| format!("?{}", i)).collect();
+                let in_list = placeholders.join(",");
+
+                let (origin_col, filter_col, node_col) = if direction_out {
+                    ("source_id", "source_id", "target_id")
+                } else {
+                    ("target_id", "target_id", "source_id")
+                };
+
+                let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                let mut conditions: Vec<String> = Vec::new();
+                let mut param_idx = 2 + src_strs.len();
+
+                if let Some(ref rels) = q.relations {
+                    if !rels.is_empty() {
+                        let ps: Vec<String> = rels
+                            .iter()
+                            .map(|r| {
+                                extra_params.push(Box::new(r.to_string()));
+                                let p = format!("?{}", param_idx);
+                                param_idx += 1;
+                                p
+                            })
+                            .collect();
+                        conditions.push(format!("relation IN ({})", ps.join(",")));
+                    }
+                }
+                if let Some(min_w) = q.min_weight {
+                    extra_params.push(Box::new(min_w));
+                    conditions.push(format!("weight >= ?{}", param_idx));
+                    param_idx += 1;
+                }
+                let where_extra = if conditions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" AND {}", conditions.join(" AND "))
+                };
+
+                let limit_clause = if let Some(lim) = q.limit {
+                    extra_params.push(Box::new(lim as i64));
+                    // Per-source LIMIT using a window ROW_NUMBER partition.
+                    format!(" WHERE rn <= ?{}", param_idx)
+                } else {
+                    String::new()
+                };
+
+                let inner_sql = format!(
+                    "SELECT {origin_col} AS origin_id, {node_col} AS node_id, \
+                                id AS edge_id, relation, weight \
+                         FROM graph_edges \
+                         WHERE namespace = ?1 AND {filter_col} IN ({in_list}) \
+                           AND deleted_at IS NULL{where_extra}",
+                    origin_col = origin_col,
+                    node_col = node_col,
+                    filter_col = filter_col,
+                    in_list = in_list,
+                    where_extra = where_extra,
+                );
+
+                let full_sql = if q.limit.is_some() {
+                    format!(
+                        "SELECT origin_id, node_id, edge_id, relation, weight \
+                             FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY origin_id) AS rn \
+                                   FROM ({})){}",
+                        inner_sql, limit_clause
+                    )
+                } else {
+                    format!(
+                        "SELECT origin_id, node_id, edge_id, relation, weight FROM ({})",
+                        inner_sql
+                    )
+                };
+
+                let mut stmt = conn.prepare(&full_sql)?;
+
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                all_params.push(Box::new(ns.to_string()));
+                for s in src_strs {
+                    all_params.push(Box::new(s.clone()));
+                }
+                all_params.extend(extra_params);
+
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let origin_str: String = row.get(0)?;
+                    let nid_str: String = row.get(1)?;
+                    let eid_str: String = row.get(2)?;
+                    let relation_str: String = row.get(3)?;
+                    let weight: f64 = row.get(4)?;
+                    Ok((origin_str, nid_str, eid_str, relation_str, weight))
+                })?;
+
+                let mut pairs = Vec::new();
+                for row in rows {
+                    let (origin_str, nid_str, eid_str, relation_str, weight) = row?;
+                    let origin = parse_uuid(&origin_str)?;
+                    let node_id = parse_uuid(&nid_str)?;
+                    let edge_id = parse_uuid(&eid_str)?;
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    pairs.push((
+                        origin,
+                        NeighborHit {
+                            node_id,
+                            edge_id,
+                            relation,
+                            weight,
+                            name: None,
+                            kind: None,
+                        },
+                    ));
+                }
+                Ok(pairs)
+            };
+
+            let pairs = self
+                .with_reader("batch_neighbors", move |conn| {
+                    let src_strs: Vec<String> = chunk_owned.iter().map(|u| u.to_string()).collect();
+
+                    match query_clone.direction {
+                        Direction::Out => run_direction(conn, &src_strs, &ns, true, &query_clone),
+                        Direction::In => run_direction(conn, &src_strs, &ns, false, &query_clone),
+                        Direction::Both => {
+                            let mut out = run_direction(conn, &src_strs, &ns, true, &query_clone)?;
+                            let inc = run_direction(conn, &src_strs, &ns, false, &query_clone)?;
+                            out.extend(inc);
+                            Ok(out)
+                        }
+                    }
+                })
+                .await?;
+            result.extend(pairs);
+        }
+        Ok(result)
+    }
+
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = Uuid::from(id).to_string();
 
