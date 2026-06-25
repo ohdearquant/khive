@@ -95,6 +95,8 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)   | Pack-Extensible by-ID Resolution (Accepted)                                                                     |
 | [ADR-069](ADR-069-subject-model.md)                      | Subject Model — Domain-Ontology Ingestion and Map Pipeline (Proposed)                                           |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)          | Autonomous Merge Pipeline — Gate Wall as Reviewer, Human Gate at Release (Proposed)                             |
+| [ADR-067](ADR-067-write-owner-daemon.md)                 | Write-Owner Daemon — Single-Writer Task and Write Queue (Proposed)                                              |
+| [ADR-068](ADR-068-cloud-multitenancy-topology.md)        | Cloud Multi-Tenancy Topology and Tenant Isolation (Proposed)                                                    |
 
 ## Closed Taxonomies — Quick Reference
 
