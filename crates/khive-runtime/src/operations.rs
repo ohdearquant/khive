@@ -790,6 +790,46 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
+    /// Like `get_entities_by_ids` but scoped to the token's full visible-namespace
+    /// set (`primary ∪ extra_visible`) instead of primary only.
+    ///
+    /// Graph expansion (`neighbors`, `traverse`) iterates over all visible
+    /// namespaces, so enrichment must use the same scope — otherwise neighbors
+    /// or path nodes whose entities live in an extra-visible namespace are left
+    /// with `name = None`, `kind = None`.  Missing or out-of-scope IDs are
+    /// silently omitted (best-effort, same as `get_entities_by_ids`).
+    async fn get_entities_by_ids_visible(
+        &self,
+        token: &NamespaceToken,
+        ids: &[Uuid],
+    ) -> RuntimeResult<Vec<Entity>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect();
+        let filter = EntityFilter {
+            ids: ids.to_vec(),
+            namespaces,
+            ..Default::default()
+        };
+        let page = self
+            .entities(token)?
+            .query_entities(
+                token.namespace().as_str(),
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: ids.len() as u32,
+                },
+            )
+            .await?;
+        Ok(page.items)
+    }
+
     /// Enforce that `record_ns` is within the caller's visible namespace set.
     ///
     /// Returns `Err(NotFound)` when the record namespace is not in the visible
@@ -1667,52 +1707,120 @@ impl KhiveRuntime {
 
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
     /// entity or note record. Best-effort: unresolved IDs leave the fields `None`.
+    ///
+    /// Uses a single batched entity lookup via `get_entities_by_ids_visible`
+    /// (scoped to the token's full visible-namespace set so that neighbors in
+    /// extra-visible namespaces are enriched), then a batched note lookup
+    /// (`get_notes_batch`) for the residual IDs not resolved as entities.
+    /// Order and identity of hits is preserved via `HashMap` re-index.
     async fn enrich_neighbor_hits(&self, token: &NamespaceToken, hits: &mut [NeighborHit]) {
         if hits.is_empty() {
             return;
         }
 
-        let entity_store = self.entities(token).ok();
-        let note_store = self.notes(token).ok();
+        // Deduplicated IDs for the batch call.
+        let unique_ids: Vec<Uuid> = {
+            let mut seen = std::collections::HashSet::new();
+            hits.iter()
+                .filter_map(|h| {
+                    if seen.insert(h.node_id) {
+                        Some(h.node_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let entity_map: HashMap<Uuid, Entity> = self
+            .get_entities_by_ids_visible(token, &unique_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect();
+
+        // Batch note lookup for IDs not found as entities.
+        let residual_ids: Vec<Uuid> = unique_ids
+            .iter()
+            .filter(|id| !entity_map.contains_key(id))
+            .copied()
+            .collect();
+
+        let note_map: HashMap<Uuid, Note> = if !residual_ids.is_empty() {
+            if let Ok(store) = self.notes(token) {
+                store
+                    .get_notes_batch(&residual_ids)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.id, n))
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
 
         for hit in hits.iter_mut() {
-            if let Some(store) = &entity_store {
-                if let Ok(Some(entity)) = store.get_entity(hit.node_id).await {
-                    hit.name = Some(entity.name);
-                    hit.kind = Some(entity.kind);
-                    continue;
-                }
-            }
-
-            if let Some(store) = &note_store {
-                if let Ok(Some(note)) = store.get_note(hit.node_id).await {
-                    let kind = note.kind;
-                    let name = note
-                        .name
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| format!("[{kind}]"));
-                    hit.name = Some(name);
-                    hit.kind = Some(kind);
-                }
+            if let Some(entity) = entity_map.get(&hit.node_id) {
+                hit.name = Some(entity.name.clone());
+                hit.kind = Some(entity.kind.clone());
+            } else if let Some(note) = note_map.get(&hit.node_id) {
+                let kind = note.kind.clone();
+                let name = note
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| format!("[{kind}]"));
+                hit.name = Some(name);
+                hit.kind = Some(kind);
             }
         }
     }
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
     /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
+    ///
+    /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
+    /// live in extra-visible namespaces are enriched correctly.  Node IDs that
+    /// repeat across paths are fetched exactly once.
     async fn enrich_path_nodes(&self, token: &NamespaceToken, paths: &mut [GraphPath]) {
         if paths.is_empty() {
             return;
         }
-        let store = match self.entities(token) {
-            Ok(s) => s,
-            Err(_) => return,
+
+        // Deduplicate node IDs across all paths before the batch call.
+        let unique_ids: Vec<Uuid> = {
+            let mut seen = std::collections::HashSet::new();
+            paths
+                .iter()
+                .flat_map(|p| p.nodes.iter())
+                .filter_map(|n| {
+                    if seen.insert(n.node_id) {
+                        Some(n.node_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         };
+
+        let entity_map: HashMap<Uuid, Entity> = self
+            .get_entities_by_ids_visible(token, &unique_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect();
+
         for path in paths.iter_mut() {
             for node in path.nodes.iter_mut() {
-                if let Ok(Some(entity)) = store.get_entity(node.node_id).await {
-                    node.name = Some(entity.name);
-                    node.kind = Some(entity.kind);
+                if let Some(entity) = entity_map.get(&node.node_id) {
+                    node.name = Some(entity.name.clone());
+                    node.kind = Some(entity.kind.clone());
                 }
             }
         }
@@ -3502,6 +3610,7 @@ mod tests {
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use crate::Namespace;
     use async_trait::async_trait;
+    use khive_storage::types::PathNode;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -8383,5 +8492,199 @@ mod tests {
         // The match in GTD handlers.rs now handles PackRecord → InvalidInput.
         // We can verify the enum variant is reachable.
         assert!(matches!(pr, Resolved::PackRecord { .. }));
+    }
+
+    // ── #249 regression: batched enrich_neighbor_hits / enrich_path_nodes ────
+
+    fn neighbor_hit(node_id: Uuid) -> NeighborHit {
+        NeighborHit {
+            node_id,
+            edge_id: Uuid::new_v4(),
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            name: None,
+            kind: None,
+        }
+    }
+
+    fn path_node(node_id: Uuid, depth: usize) -> PathNode {
+        PathNode {
+            node_id,
+            via_edge: None,
+            depth,
+            name: None,
+            kind: None,
+        }
+    }
+
+    /// enrich_neighbor_hits: entity hit resolved, note hit resolved with
+    /// name-fallback to "[kind]", bogus UUID left as None.  Order preserved.
+    #[tokio::test]
+    async fn enrich_neighbor_hits_batch_entity_note_and_bogus() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Create an entity neighbor.
+        let entity = rt
+            .create_entity(&tok, "concept", None, "MyEntity", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Nameless note — name falls back to "[observation]".
+        let note = rt
+            .create_note(&tok, "observation", None, "body", Some(0.5), None, vec![])
+            .await
+            .unwrap();
+
+        let bogus_id = Uuid::new_v4();
+
+        let mut hits = vec![
+            neighbor_hit(entity.id),
+            neighbor_hit(note.id),
+            neighbor_hit(bogus_id),
+        ];
+
+        rt.enrich_neighbor_hits(&tok, &mut hits).await;
+
+        assert_eq!(hits[0].name.as_deref(), Some("MyEntity"));
+        assert_eq!(hits[0].kind.as_deref(), Some("concept"));
+
+        assert_eq!(hits[1].name.as_deref(), Some("[observation]"));
+        assert_eq!(hits[1].kind.as_deref(), Some("observation"));
+
+        assert!(hits[2].name.is_none());
+        assert!(hits[2].kind.is_none());
+    }
+
+    /// enrich_neighbor_hits: note with a non-empty name uses the actual name.
+    #[tokio::test]
+    async fn enrich_neighbor_hits_note_with_name_uses_name() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let note = rt
+            .create_note(
+                &tok,
+                "insight",
+                Some("NoteTitle"),
+                "body",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let mut hits = vec![neighbor_hit(note.id)];
+        rt.enrich_neighbor_hits(&tok, &mut hits).await;
+
+        assert_eq!(hits[0].name.as_deref(), Some("NoteTitle"));
+        assert_eq!(hits[0].kind.as_deref(), Some("insight"));
+    }
+
+    /// enrich_path_nodes: two paths sharing a repeated node_id; each node
+    /// enriched from a single batch; unresolved node stays None.
+    #[tokio::test]
+    async fn enrich_path_nodes_batch_dedup_and_unresolved() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let ea = rt
+            .create_entity(&tok, "concept", None, "Alpha", None, None, vec![])
+            .await
+            .unwrap();
+        let eb = rt
+            .create_entity(&tok, "document", None, "Beta", None, None, vec![])
+            .await
+            .unwrap();
+        let bogus_id = Uuid::new_v4();
+
+        // Path 1: ea → eb → bogus  |  Path 2: eb → ea  (shared nodes, reversed)
+        let mut paths = vec![
+            GraphPath {
+                root_id: ea.id,
+                nodes: vec![
+                    path_node(ea.id, 0),
+                    path_node(eb.id, 1),
+                    path_node(bogus_id, 2),
+                ],
+                total_weight: 1.0,
+            },
+            GraphPath {
+                root_id: eb.id,
+                nodes: vec![path_node(eb.id, 0), path_node(ea.id, 1)],
+                total_weight: 1.0,
+            },
+        ];
+
+        rt.enrich_path_nodes(&tok, &mut paths).await;
+
+        assert_eq!(paths[0].nodes[0].name.as_deref(), Some("Alpha"));
+        assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
+        assert_eq!(paths[0].nodes[1].name.as_deref(), Some("Beta"));
+        assert_eq!(paths[0].nodes[1].kind.as_deref(), Some("document"));
+        assert!(paths[0].nodes[2].name.is_none());
+        assert!(paths[0].nodes[2].kind.is_none());
+
+        // Shared nodes resolve from the same HashMap — order within each path is preserved.
+        assert_eq!(paths[1].nodes[0].name.as_deref(), Some("Beta"));
+        assert_eq!(paths[1].nodes[0].kind.as_deref(), Some("document"));
+        assert_eq!(paths[1].nodes[1].name.as_deref(), Some("Alpha"));
+        assert_eq!(paths[1].nodes[1].kind.as_deref(), Some("concept"));
+    }
+
+    /// enrich_neighbor_hits and enrich_path_nodes must resolve entities whose
+    /// namespace is in the token's extra-visible set (not only the primary).
+    ///
+    /// Regression for PR #253 review finding: the old `get_entities_by_ids`
+    /// call left `filter.namespaces` unset, which collapses to
+    /// `namespace = primary` in `build_entity_where`.  Graph expansion already
+    /// crosses visible namespaces, so enrichment must match that scope.
+    #[tokio::test]
+    async fn enrich_resolves_entities_in_extra_visible_namespace() {
+        let rt = KhiveRuntime::memory().unwrap();
+
+        let ns_a = Namespace::parse("enrich-ns-a").unwrap();
+        let ns_b = Namespace::parse("enrich-ns-b").unwrap();
+
+        let tok_b = rt.authorize(ns_b.clone()).unwrap();
+
+        // Entity lives in ns-b.
+        let entity_b = rt
+            .create_entity(&tok_b, "concept", None, "EntityInB", None, None, vec![])
+            .await
+            .unwrap();
+        assert_eq!(entity_b.namespace, "enrich-ns-b");
+
+        // Token whose primary is ns-a but ns-b is in the visible set.
+        let vis_tok = rt
+            .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+            .unwrap();
+
+        // ── neighbor hits ──────────────────────────────────────────────────
+        let mut hits = vec![neighbor_hit(entity_b.id)];
+        rt.enrich_neighbor_hits(&vis_tok, &mut hits).await;
+
+        assert_eq!(
+            hits[0].name.as_deref(),
+            Some("EntityInB"),
+            "entity in extra-visible ns must be enriched by enrich_neighbor_hits"
+        );
+        assert_eq!(hits[0].kind.as_deref(), Some("concept"));
+
+        // ── path nodes ─────────────────────────────────────────────────────
+        let mut paths = vec![GraphPath {
+            root_id: entity_b.id,
+            nodes: vec![path_node(entity_b.id, 0)],
+            total_weight: 1.0,
+        }];
+        rt.enrich_path_nodes(&vis_tok, &mut paths).await;
+
+        assert_eq!(
+            paths[0].nodes[0].name.as_deref(),
+            Some("EntityInB"),
+            "entity in extra-visible ns must be enriched by enrich_path_nodes"
+        );
+        assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
     }
 }
