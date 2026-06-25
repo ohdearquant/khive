@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
+khive-pack-formal = { version = "0.2.11", path = "../khive-pack-formal" }
 
 [[test]]
 name = "integration"

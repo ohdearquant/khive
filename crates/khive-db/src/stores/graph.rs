@@ -493,6 +493,295 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn get_edges(&self, ids: &[LinkId]) -> Result<Vec<Edge>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite SQLITE_MAX_VARIABLE_NUMBER defaults to 999; chunk at 900 to stay safe.
+        const CHUNK: usize = 900;
+        let id_strs: Vec<String> = ids.iter().map(|id| Uuid::from(*id).to_string()).collect();
+
+        let mut result: Vec<Edge> = Vec::with_capacity(ids.len());
+        for chunk in id_strs.chunks(CHUNK) {
+            let chunk_owned: Vec<String> = chunk.to_vec();
+            let edges = self
+                .with_reader("get_edges", move |conn| {
+                    let placeholders: Vec<String> =
+                        (1..=chunk_owned.len()).map(|i| format!("?{}", i)).collect();
+                    let sql = format!(
+                        "SELECT namespace, id, source_id, target_id, relation, weight, \
+                                created_at, updated_at, deleted_at, metadata, target_backend \
+                         FROM graph_edges WHERE id IN ({}) AND deleted_at IS NULL",
+                        placeholders.join(",")
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(params.as_slice(), read_edge)?;
+                    let mut edges = Vec::new();
+                    for row in rows {
+                        edges.push(row?);
+                    }
+                    Ok(edges)
+                })
+                .await?;
+            result.extend(edges);
+        }
+        Ok(result)
+    }
+
+    async fn batch_neighbors(
+        &self,
+        sources: &[Uuid],
+        query: NeighborQuery,
+    ) -> Result<Vec<(Uuid, NeighborHit)>, StorageError> {
+        use khive_storage::types::Direction;
+
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Compute a per-call chunk size that keeps the total bound parameter count
+        // safely under SQLITE_MAX_VARIABLE_NUMBER (999).
+        //
+        // Variable budget:
+        //   1  = namespace (?1, shared across all halves of a UNION ALL)
+        //   1  = limit (optional, worst-case reserve)
+        //   halves × (src_count + per_half_filter) = the IN-list + filter params
+        //
+        // For Direction::Both the UNION ALL doubles the source IN-list and filter
+        // params (each half is a fully independent positional-parameter block).
+        // For Out/In there is only one half.
+        //
+        // We target 950 total to leave a comfortable margin below 999, then cap at
+        // 880 to preserve the existing ceiling for the single-direction common case.
+        let per_half_filter =
+            query.relations.as_ref().map_or(0, |r| r.len()) + query.min_weight.is_some() as usize;
+        let halves: usize = if query.direction == Direction::Both {
+            2
+        } else {
+            1
+        };
+        let fixed = 1 /*ns*/ + 1 /*limit*/ + halves * per_half_filter;
+        let max_src = (950usize.saturating_sub(fixed) / halves).max(1);
+        let chunk_size = max_src.min(880);
+
+        let namespace = self.namespace.clone();
+        let mut result: Vec<(Uuid, NeighborHit)> = Vec::new();
+
+        for chunk in sources.chunks(chunk_size) {
+            let chunk_owned: Vec<Uuid> = chunk.to_vec();
+            let query_clone = query.clone();
+            let ns = namespace.clone();
+
+            let pairs = self
+                .with_reader("batch_neighbors", move |conn| {
+                    let src_strs: Vec<String> = chunk_owned.iter().map(|u| u.to_string()).collect();
+
+                    // Build the inner SELECT for one direction, using positional
+                    // params starting at `first_src_param` for the source IN-list.
+                    // Returns (sql_fragment, extra_param_values) where extra_param_values
+                    // covers relations and min_weight filters only (NOT the limit).
+                    let build_inner_sql =
+                        |direction_out: bool,
+                         first_src_param: usize,
+                         q: &NeighborQuery|
+                         -> (String, Vec<String>, Option<f64>) {
+                            let placeholders: Vec<String> = (first_src_param
+                                ..first_src_param + src_strs.len())
+                                .map(|i| format!("?{i}"))
+                                .collect();
+                            let in_list = placeholders.join(",");
+
+                            let (origin_col, filter_col, node_col) = if direction_out {
+                                ("source_id", "source_id", "target_id")
+                            } else {
+                                ("target_id", "target_id", "source_id")
+                            };
+
+                            let mut rel_params: Vec<String> = Vec::new();
+                            let mut conditions: Vec<String> = Vec::new();
+                            let mut param_idx = first_src_param + src_strs.len();
+
+                            if let Some(ref rels) = q.relations {
+                                if !rels.is_empty() {
+                                    let ps: Vec<String> = rels
+                                        .iter()
+                                        .map(|r| {
+                                            rel_params.push(r.to_string());
+                                            let p = format!("?{param_idx}");
+                                            param_idx += 1;
+                                            p
+                                        })
+                                        .collect();
+                                    conditions.push(format!("relation IN ({})", ps.join(",")));
+                                }
+                            }
+
+                            // min_weight is returned separately so it can be added to
+                            // all_params AFTER the rel_params block, at the right index.
+                            let min_weight_val = if let Some(min_w) = q.min_weight {
+                                conditions.push(format!("weight >= ?{param_idx}"));
+                                Some(min_w)
+                            } else {
+                                None
+                            };
+
+                            let where_extra = if conditions.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" AND {}", conditions.join(" AND "))
+                            };
+
+                            let sql = format!(
+                                "SELECT {origin_col} AS origin_id, {node_col} AS node_id, \
+                             id AS edge_id, relation, weight \
+                             FROM graph_edges \
+                             WHERE namespace = ?1 AND {filter_col} IN ({in_list}) \
+                               AND deleted_at IS NULL{where_extra}",
+                            );
+                            (sql, rel_params, min_weight_val)
+                        };
+
+                    // For Direction::Both we need to build a UNION ALL of both inner
+                    // selects and then apply the per-source ROW_NUMBER limit ONCE over
+                    // the combined set.  This matches the single-source neighbors()
+                    // behaviour where Both uses a single UNION ALL + one outer LIMIT.
+                    //
+                    // Param layout:
+                    //   Out/In:  ?1=ns  ?2..?N+1=srcs  ?extras...  [?limit]
+                    //   Both:    ?1=ns  ?2..?N+1=out_srcs  out_extras...
+                    //                   ?M..?M+N=in_srcs   in_extras...  [?limit]
+                    //
+                    // `build_inner_sql` receives `first_src_param` so it generates the
+                    // correct placeholder indices for each half.
+
+                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    all_params.push(Box::new(ns.to_string())); // ?1
+
+                    let combined_inner: String;
+                    let limit_param_idx: usize;
+
+                    match query_clone.direction {
+                        Direction::Out | Direction::In => {
+                            let direction_out = matches!(query_clone.direction, Direction::Out);
+                            let (sql, rel_params, min_weight_val) =
+                                build_inner_sql(direction_out, 2, &query_clone);
+                            combined_inner = sql;
+
+                            // Bind: ?1=ns (done), ?2..?N+1=srcs, rel_params, [min_weight]
+                            for s in &src_strs {
+                                all_params.push(Box::new(s.clone()));
+                            }
+                            for r in rel_params {
+                                all_params.push(Box::new(r));
+                            }
+                            if let Some(mw) = min_weight_val {
+                                all_params.push(Box::new(mw));
+                            }
+                            limit_param_idx = all_params.len() + 1;
+                        }
+                        Direction::Both => {
+                            // Out half: src params at ?2..?N+1
+                            let (out_sql, out_rels, out_mw) =
+                                build_inner_sql(true, 2, &query_clone);
+                            let after_out_srcs = 2 + src_strs.len();
+                            let after_out_rels = after_out_srcs + out_rels.len();
+                            let after_out_mw =
+                                after_out_rels + if out_mw.is_some() { 1 } else { 0 };
+                            let in_first = after_out_mw;
+
+                            // In half: src params start at `in_first`
+                            let (in_sql, in_rels, in_mw) =
+                                build_inner_sql(false, in_first, &query_clone);
+
+                            combined_inner = format!("{out_sql} UNION ALL {in_sql}");
+
+                            // Bind layout: ns | out_srcs | out_rels | [out_mw] | in_srcs | in_rels | [in_mw]
+                            for s in &src_strs {
+                                all_params.push(Box::new(s.clone())); // out sources
+                            }
+                            for r in out_rels {
+                                all_params.push(Box::new(r));
+                            }
+                            if let Some(mw) = out_mw {
+                                all_params.push(Box::new(mw));
+                            }
+                            for s in &src_strs {
+                                all_params.push(Box::new(s.clone())); // in sources
+                            }
+                            for r in in_rels {
+                                all_params.push(Box::new(r));
+                            }
+                            if let Some(mw) = in_mw {
+                                all_params.push(Box::new(mw));
+                            }
+                            limit_param_idx = all_params.len() + 1;
+                        }
+                    }
+
+                    // Wrap combined inner with per-source ROW_NUMBER limit if needed.
+                    let full_sql = if let Some(lim) = query_clone.limit {
+                        all_params.push(Box::new(lim as i64));
+                        format!(
+                            "SELECT origin_id, node_id, edge_id, relation, weight \
+                             FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY origin_id) AS rn \
+                                   FROM ({combined_inner})) WHERE rn <= ?{limit_param_idx}",
+                        )
+                    } else {
+                        format!(
+                            "SELECT origin_id, node_id, edge_id, relation, weight \
+                             FROM ({combined_inner})",
+                        )
+                    };
+
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        all_params.iter().map(|p| p.as_ref()).collect();
+
+                    let mut stmt = conn.prepare(&full_sql)?;
+                    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                        let origin_str: String = row.get(0)?;
+                        let nid_str: String = row.get(1)?;
+                        let eid_str: String = row.get(2)?;
+                        let relation_str: String = row.get(3)?;
+                        let weight: f64 = row.get(4)?;
+                        Ok((origin_str, nid_str, eid_str, relation_str, weight))
+                    })?;
+
+                    let mut pairs = Vec::new();
+                    for row in rows {
+                        let (origin_str, nid_str, eid_str, relation_str, weight) = row?;
+                        let origin = parse_uuid(&origin_str)?;
+                        let node_id = parse_uuid(&nid_str)?;
+                        let edge_id = parse_uuid(&eid_str)?;
+                        let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        pairs.push((
+                            origin,
+                            NeighborHit {
+                                node_id,
+                                edge_id,
+                                relation,
+                                weight,
+                                name: None,
+                                kind: None,
+                            },
+                        ));
+                    }
+                    Ok(pairs)
+                })
+                .await?;
+            result.extend(pairs);
+        }
+        Ok(result)
+    }
+
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = Uuid::from(id).to_string();
 

@@ -40,8 +40,8 @@ pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
-    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig, ConnectionPool,
-    StorageBackend,
+    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig, CheckpointTick,
+    ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,

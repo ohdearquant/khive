@@ -172,22 +172,34 @@ pub enum Resolved {
     },
 }
 
-/// Map a resolved endpoint to its `(substrate, kind)` pair, or `None` if
-/// the substrate is not a valid edge endpoint (events, edges).
-fn resolved_pair(r: Option<&Resolved>) -> Option<(&'static str, &str)> {
+/// Map a resolved endpoint to its `(substrate, kind, entity_type)` triple, or
+/// `None` if the substrate is not a valid edge endpoint (events, edges).
+///
+/// `entity_type` carries the pack-owned granular subtype (`Entity::entity_type`,
+/// e.g. `"theorem"`); it is `None` for notes and for entities with no subtype.
+fn resolved_pair(r: Option<&Resolved>) -> Option<(&'static str, &str, Option<&str>)> {
     match r? {
-        Resolved::Entity(e) => Some(("entity", e.kind.as_str())),
-        Resolved::Note(n) => Some(("note", n.kind.as_str())),
+        Resolved::Entity(e) => Some(("entity", e.kind.as_str(), e.entity_type.as_deref())),
+        Resolved::Note(n) => Some(("note", n.kind.as_str(), None)),
         Resolved::Event(_) => None,
         Resolved::PackRecord { .. } => None,
     }
 }
 
-/// `true` if `spec` matches the given substrate + kind pair.
-fn endpoint_matches(spec: &EndpointKind, substrate: &str, kind: &str) -> bool {
+/// `true` if `spec` matches the given substrate + kind + entity_type triple.
+fn endpoint_matches(
+    spec: &EndpointKind,
+    substrate: &str,
+    kind: &str,
+    entity_type: Option<&str>,
+) -> bool {
     match spec {
         EndpointKind::EntityOfKind(k) => substrate == "entity" && *k == kind,
         EndpointKind::NoteOfKind(k) => substrate == "note" && *k == kind,
+        EndpointKind::EntityOfType {
+            kind: k,
+            entity_type: t,
+        } => substrate == "entity" && *k == kind && entity_type == Some(*t),
     }
 }
 
@@ -199,16 +211,16 @@ fn pack_rule_allows(
     src: Option<&Resolved>,
     tgt: Option<&Resolved>,
 ) -> bool {
-    let Some((src_sub, src_kind)) = resolved_pair(src) else {
+    let Some((src_sub, src_kind, src_type)) = resolved_pair(src) else {
         return false;
     };
-    let Some((tgt_sub, tgt_kind)) = resolved_pair(tgt) else {
+    let Some((tgt_sub, tgt_kind, tgt_type)) = resolved_pair(tgt) else {
         return false;
     };
     rules.iter().any(|r| {
         r.relation == relation
-            && endpoint_matches(&r.source, src_sub, src_kind)
-            && endpoint_matches(&r.target, tgt_sub, tgt_kind)
+            && endpoint_matches(&r.source, src_sub, src_kind, src_type)
+            && endpoint_matches(&r.target, tgt_sub, tgt_kind, tgt_type)
     })
 }
 
@@ -8176,6 +8188,118 @@ mod tests {
             resolved_pair(Some(&pr)).is_none(),
             "PackRecord must not be a valid edge endpoint"
         );
+    }
+
+    #[test]
+    fn resolved_pair_surfaces_entity_type() {
+        let e = Resolved::Entity(
+            Entity::new("mathlib", "concept", "Nat.add_comm").with_entity_type(Some("theorem")),
+        );
+        assert_eq!(
+            resolved_pair(Some(&e)),
+            Some(("entity", "concept", Some("theorem"))),
+            "entity_type subtype must be surfaced alongside base kind"
+        );
+    }
+
+    #[test]
+    fn endpoint_of_type_matches_subtype_not_base_kind() {
+        // An entity whose base kind is "concept" and subtype is "theorem".
+        let kind = "concept";
+        let et = Some("theorem");
+
+        // EntityOfType matches only when BOTH base kind and subtype match.
+        assert!(endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            "entity",
+            kind,
+            et
+        ));
+        assert!(!endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "definition",
+            },
+            "entity",
+            kind,
+            et
+        ));
+
+        // The silently-inert trap (ADR-069 A7): EntityOfKind sees only the BASE
+        // kind, so EntityOfKind("theorem") never matches a concept/theorem.
+        assert!(!endpoint_matches(
+            &EndpointKind::EntityOfKind("theorem"),
+            "entity",
+            kind,
+            et
+        ));
+        // EntityOfKind still matches the base kind.
+        assert!(endpoint_matches(
+            &EndpointKind::EntityOfKind("concept"),
+            "entity",
+            kind,
+            et
+        ));
+
+        // EntityOfType rejects non-entity substrates and entities with no subtype.
+        assert!(!endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            "note",
+            "task",
+            None
+        ));
+        assert!(!endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            "entity",
+            kind,
+            None
+        ));
+    }
+
+    #[test]
+    fn endpoint_of_type_requires_base_kind_match() {
+        // Regression: an entity with entity_type="theorem" but base kind != "concept"
+        // must NOT match a formal concept rule. This was the exact bypass codex named:
+        // before the fix, EntityOfType("theorem") ignored the base kind entirely.
+        let wrong_base_kind = "project"; // not "concept"
+        let et = Some("theorem");
+
+        // The formal rule requires kind="concept". A "project" entity with
+        // entity_type="theorem" must not match — even though the subtype string
+        // matches — because the base kind differs.
+        assert!(
+            !endpoint_matches(
+                &EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "theorem",
+                },
+                "entity",
+                wrong_base_kind,
+                et
+            ),
+            "EntityOfType must reject an entity whose base kind != rule.kind \
+             even when entity_type matches — the pre-fix bug admitted this"
+        );
+
+        // The correct concept entity with the same subtype still matches.
+        assert!(endpoint_matches(
+            &EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            "entity",
+            "concept",
+            et
+        ));
     }
 
     #[tokio::test]

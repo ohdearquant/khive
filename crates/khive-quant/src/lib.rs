@@ -18,7 +18,7 @@
 //! in-distribution vectors; OOD queries (components outside the trained range) fall back
 //! to exact f32 in the caller (see `VamanaIndex::search`). Small-range dims contribute
 //! proportionally fewer codes and proportionally less L2 signal — an honest trade-off
-//! documented in ADR-107.
+//! documented in ADR-052.
 //!
 //! # Hot-loop NEON helpers (`u8_dot_u32`, `u8_l2sq_u32`)
 //!
@@ -427,7 +427,7 @@ impl Sq8Codec {
 /// anisotropy gate (ratio ≤ 4.0) to achieve the integer-only hot path. The gate was
 /// calibrated on an LCG corpus that gave ratio ≈ 4.0; real transformer embeddings
 /// have rogue dimensions (ratio 10–32) that silently fell back to the full residual
-/// path, defeating the purpose. Global-scale eliminates the gate entirely — see ADR-107.
+/// path, defeating the purpose. Global-scale eliminates the gate entirely — see ADR-052.
 #[derive(Debug, Clone)]
 pub struct GsSq8Codec {
     /// Per-dimension minimum values.

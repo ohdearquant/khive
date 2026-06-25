@@ -1672,4 +1672,182 @@ mod tests {
             "masked length ({reported_len}) should be less than full string length ({full_len})"
         );
     }
+
+    // ── UTF-8 char-boundary reproduction tests ───────────────────────────────
+    //
+    // These tests verify that no code path in secret_gate panics when multibyte
+    // UTF-8 characters (emoji, CJK, accented Latin) appear at positions where
+    // byte-level slicing could land mid-codepoint.  Each test targets a specific
+    // code path.  A panic means the bug is live; a pass means the path is safe.
+
+    /// `build_match` masked preview: if the detected candidate starts with
+    /// multibyte chars the "first 6 chars" preview must not slice on a byte
+    /// boundary that falls mid-codepoint.  build_match already uses
+    /// `chars().take(6)`, but we exercise it with emoji-prefixed candidates.
+    #[test]
+    fn utf8_build_match_preview_multibyte_prefix_no_panic() {
+        // "🔑" = 4 bytes; repeat 3 times = 12 bytes for only 3 chars.
+        // A ghp_-prefixed token with an emoji: let's construct a scenario where
+        // a known-prefix secret is immediately adjacent to multibyte content so
+        // that build_match receives a slice starting at a multibyte char.
+        // PEM block with multibyte chars in the body exercises build_match on a
+        // candidate that may contain non-ASCII.
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let fake = format!("{}\n🔑密钥\n-----END RSA PRIVATE KEY-----", header);
+        // Must not panic; mask must not echo full body.
+        let m = scan(&fake);
+        assert!(m.is_some(), "PEM with emoji body must still be caught");
+        let m = m.unwrap();
+        assert!(
+            !m.masked.contains("🔑密钥"),
+            "mask must not echo the emoji body"
+        );
+    }
+
+    /// `extract_token` called with a string starting with multibyte chars:
+    /// the FlyV1 handler calls `extract_token(&text[payload_start..])` where
+    /// `payload_start` is just past "FlyV1 " (ASCII).  If the payload is ASCII
+    /// this is trivially safe, but we verify it cannot panic when the rest of
+    /// the text after the payload contains multibyte chars.
+    #[test]
+    fn utf8_extract_token_multibyte_suffix_no_panic() {
+        // "FlyV1 ABCDEFGHIJ密钥" — the payload is "ABCDEFGHIJ密钥"; extract_token
+        // must stop at the ideographic chars (which are NOT ASCII whitespace) and
+        // return the whole glued run without panicking.
+        let text = "FlyV1 ABCDEFGHIJ密钥";
+        // scan() must not panic.
+        let _ = scan(text);
+    }
+
+    /// `find_prefix_token` with multibyte chars immediately before and after
+    /// the known prefix: checks text[..abs] boundary slices and
+    /// extract_token(&text[abs..]) do not panic.
+    #[test]
+    fn utf8_prefix_detector_multibyte_adjacent_no_panic() {
+        // 🔑 (4 bytes) immediately before AKIA: boundary at abs = 4, which is a
+        // valid char boundary (end of the emoji).  extract_token sees ASCII from abs.
+        let text = "🔑AKIAFAKEKEY00000000000000";
+        let _ = scan(text); // must not panic
+
+        // é (U+00E9 = 2 bytes) immediately before ghp_:
+        let text2 = "éghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let _ = scan(text2); // must not panic
+
+        // Emoji immediately after the token — extract_token ends at the emoji
+        // (non-whitespace, but non-ASCII acts as delimiter in entropy heuristic).
+        // For prefix tokens extract_token stops at ASCII whitespace only, so the
+        // emoji would be included in the token length measurement.
+        let text3 = "AKIAFAKEKEY00000000000000🔑";
+        let _ = scan(text3); // must not panic
+    }
+
+    /// `find_jwt` with multibyte chars as "whitespace" adjacent to a JWT-like
+    /// candidate: `i = end + 1` could skip into a multibyte char if `end`
+    /// pointed at a non-ASCII byte.  The position() search only looks for ASCII
+    /// whitespace bytes, so a multibyte space (U+3000) is NOT found — `end`
+    /// equals bytes.len() and `i = bytes.len() + 1` exits the loop.  Still
+    /// verify no panic on CJK-surrounded JWT-like content.
+    #[test]
+    fn utf8_jwt_multibyte_adjacent_no_panic() {
+        // A (fake) JWT-like triple surrounded by CJK text.
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.FAKE_SIG_XXXXXXXXXXXX"; // gitleaks:allow
+        let text = format!("数据{jwt}密钥");
+        let _ = scan(&text); // must not panic
+
+        // JWT followed by ideographic space (U+3000 = 3 bytes 0xE3 0x80 0x80) —
+        // not matched by the ASCII-whitespace position() search.
+        let text2 = format!("{jwt}\u{3000}morecontent");
+        let _ = scan(&text2); // must not panic
+
+        // JWT followed by emoji
+        let text3 = format!("{jwt}🔑");
+        let _ = scan(&text3); // must not panic
+    }
+
+    /// `find_url_userinfo` with multibyte chars between "://" and "@":
+    /// `at_pos` from `rest.find('@')` and `colon` from `userinfo.find(':')` are
+    /// ASCII markers (char boundaries), but `scheme_start` calculation uses
+    /// char_indices().rev() which must handle multibyte chars in the scheme
+    /// prefix correctly.
+    #[test]
+    fn utf8_url_userinfo_multibyte_scheme_no_panic() {
+        // CJK glued to a credential URL — the scheme_start walker must not place
+        // the start inside a multibyte codepoint.
+        let cases = [
+            "🔑postgresql://dbuser:S3cr3tP4ss@db.example.com/db", // gitleaks:allow
+            "密钥mysql://root:hunter2pw@10.0.0.1:3306/app",       // gitleaks:allow
+            "éredis://svc:V3ryS3cretPw@cache.internal:6379",      // gitleaks:allow
+        ];
+        for text in &cases {
+            // Must not panic and must detect the credential.
+            let result = scan(text);
+            assert!(
+                result.is_some(),
+                "URL credential after multibyte must be caught: {text:?}"
+            );
+        }
+    }
+
+    /// `check_entropy_heuristic` window slicing with multibyte content at the
+    /// ±TRIGGER_WINDOW boundary: `floor_char_boundary` must prevent slicing
+    /// on a non-char boundary.
+    #[test]
+    fn utf8_entropy_window_multibyte_boundary_no_panic() {
+        // Construct content where the TRIGGER_WINDOW (120 bytes) boundary falls
+        // inside a 3-byte CJK character.  Repeat "数" (U+6570 = 3 bytes) to fill
+        // exactly 119 bytes, then add an ASCII trigger word + high-entropy token.
+        // Window start: token_offset - 120 = lands inside one of the CJK chars.
+        let cjk_fill = "数".repeat(39); // 39 × 3 = 117 bytes
+        assert_eq!(cjk_fill.len(), 117);
+        // Pad with 2 more ASCII chars ("xy") so that the 120-byte window lands at
+        // byte 119 which is the second byte of the 40th "数" — mid-multibyte.
+        let secret = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let content = format!("{cjk_fill}xy key {secret}");
+        let _ = scan(&content); // must not panic
+
+        // Also test the right edge: token ends at byte offset, window_end =
+        // token_offset + raw_token.len() + 120 may land mid-multibyte.
+        let content2 = format!("key {secret}{cjk_fill}xy");
+        let _ = scan(&content2); // must not panic
+    }
+
+    /// `check()` top-level fuzz: a large batch of inputs with multibyte
+    /// characters at various offsets to catch any remaining panic sites.
+    /// All results must be either Ok or Err (not a panic).
+    #[test]
+    fn utf8_no_panic_property_test() {
+        let multibyte_items = [
+            "🔑",       // 4-byte emoji
+            "密",       // 3-byte CJK
+            "é",        // 2-byte accented Latin
+            "\u{3000}", // 3-byte ideographic space
+            "🇺🇸",       // 8-byte emoji flag (two surrogate-like scalars)
+        ];
+        let secrets = [
+            "AKIAFAKEKEY00000000000000",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sk-ant-api03-AAAAAAAAAAAAAAA",
+            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1",
+            "FlyV1 fm2_AAAABBBBCCCCDDDDEEEEFFFF",
+        ];
+        for mb in &multibyte_items {
+            for secret in &secrets {
+                for sep in &["", " ", "\n"] {
+                    // multibyte before secret
+                    let s = format!("{mb}{sep}{secret}");
+                    let _ = check(&s);
+                    // multibyte after secret
+                    let s = format!("{secret}{sep}{mb}");
+                    let _ = check(&s);
+                    // multibyte both sides
+                    let s = format!("{mb}{sep}{secret}{sep}{mb}");
+                    let _ = check(&s);
+                    // repeated multibyte filling TRIGGER_WINDOW boundary
+                    let fill = mb.repeat(50);
+                    let s = format!("{fill} api_key {secret} {fill}");
+                    let _ = check(&s);
+                }
+            }
+        }
+    }
 }

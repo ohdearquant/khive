@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use khive_storage::types::{Direction, TraversalOptions};
+use std::collections::HashSet;
 
 fn setup_memory_store() -> SqlGraphStore {
     let config = PoolConfig {
@@ -615,5 +616,428 @@ async fn upsert_edge_namespace_stored_on_record() {
     assert_eq!(
         stored.namespace, ns,
         "namespace column must survive the write/read roundtrip"
+    );
+}
+
+// ---- batch_neighbors parity tests (HIGH bug regression guard) ----
+
+/// Build a star graph: centre node with `out_count` outgoing edges and
+/// `in_count` incoming edges.  Returns (centre, out_targets, in_sources,
+/// out_edge_ids, in_edge_ids).
+async fn build_star(
+    store: &SqlGraphStore,
+    out_count: usize,
+    in_count: usize,
+) -> (Uuid, Vec<Uuid>, Vec<Uuid>) {
+    let centre = Uuid::new_v4();
+    let mut out_nodes = Vec::new();
+    let mut in_nodes = Vec::new();
+    for _ in 0..out_count {
+        let tgt = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(centre, tgt, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        out_nodes.push(tgt);
+    }
+    for _ in 0..in_count {
+        let src = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(src, centre, EdgeRelation::Extends, 0.8))
+            .await
+            .unwrap();
+        in_nodes.push(src);
+    }
+    (centre, out_nodes, in_nodes)
+}
+
+fn neighbour_set(hits: &[(Uuid, NeighborHit)]) -> HashSet<Uuid> {
+    hits.iter().map(|(_, h)| h.node_id).collect()
+}
+
+fn single_neighbour_set(hits: &[NeighborHit]) -> HashSet<Uuid> {
+    hits.iter().map(|h| h.node_id).collect()
+}
+
+/// PARITY REGRESSION GUARD — the critical bug (HIGH).
+/// For Direction::Both + limit=Some(1), batch_neighbors must return AT MOST
+/// `limit` hits per source, not up to 2× (one per direction).
+/// Before the fix, Both ran Out and In separately and concatenated, so a node
+/// with ≥1 outgoing AND ≥1 incoming edge would yield 2 hits when limit=1.
+#[tokio::test]
+async fn batch_neighbors_both_limit_matches_single_source_neighbors() {
+    let store = setup_memory_store();
+    // 2 outgoing, 2 incoming from centre
+    let (centre, out_nodes, in_nodes) = build_star(&store, 2, 2).await;
+
+    let q_both_limit1 = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: Some(1),
+        min_weight: None,
+    };
+
+    // single-source neighbors() — ground truth
+    let single_hits = store
+        .neighbors(centre, q_both_limit1.clone())
+        .await
+        .unwrap();
+    // batch_neighbors with the same query
+    let batch_hits = store
+        .batch_neighbors(&[centre], q_both_limit1.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batch_hits.len(),
+        single_hits.len(),
+        "batch_neighbors Both+limit=1 must return same count as neighbors() \
+         (was 2× before fix)"
+    );
+
+    // Sanity: single-source also returns 1 when limit=1
+    assert_eq!(single_hits.len(), 1, "neighbors() must respect limit=1");
+
+    // Ensure the returned node is one of the actual neighbours.
+    let all_neighbours: HashSet<Uuid> = out_nodes.iter().chain(in_nodes.iter()).copied().collect();
+    let batch_node_ids: HashSet<Uuid> = batch_hits.iter().map(|(_, h)| h.node_id).collect();
+    for nid in &batch_node_ids {
+        assert!(
+            all_neighbours.contains(nid),
+            "batch result must be a real neighbour of centre"
+        );
+    }
+}
+
+/// PARITY: set equality for Out direction, with and without limit.
+#[tokio::test]
+async fn batch_neighbors_out_parity_with_neighbors() {
+    let store = setup_memory_store();
+    let (centre, out_nodes, _) = build_star(&store, 3, 2).await;
+
+    let q_out = NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    let single: HashSet<Uuid> =
+        single_neighbour_set(&store.neighbors(centre, q_out.clone()).await.unwrap());
+    let batch: HashSet<Uuid> = neighbour_set(
+        &store
+            .batch_neighbors(&[centre], q_out.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(batch, single, "Out: batch must equal single-source set");
+
+    let expected: HashSet<Uuid> = out_nodes.iter().copied().collect();
+    assert_eq!(
+        batch, expected,
+        "Out: must return exactly the out-neighbours"
+    );
+}
+
+/// PARITY: set equality for In direction.
+#[tokio::test]
+async fn batch_neighbors_in_parity_with_neighbors() {
+    let store = setup_memory_store();
+    let (centre, _, in_nodes) = build_star(&store, 2, 3).await;
+
+    let q_in = NeighborQuery {
+        direction: Direction::In,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    let single: HashSet<Uuid> =
+        single_neighbour_set(&store.neighbors(centre, q_in.clone()).await.unwrap());
+    let batch: HashSet<Uuid> = neighbour_set(
+        &store
+            .batch_neighbors(&[centre], q_in.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(batch, single, "In: batch must equal single-source set");
+
+    let expected: HashSet<Uuid> = in_nodes.iter().copied().collect();
+    assert_eq!(batch, expected, "In: must return exactly the in-neighbours");
+}
+
+/// PARITY: set equality for Both direction, no limit.
+#[tokio::test]
+async fn batch_neighbors_both_parity_no_limit() {
+    let store = setup_memory_store();
+    let (centre, out_nodes, in_nodes) = build_star(&store, 2, 3).await;
+
+    let q_both = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    let single: HashSet<Uuid> =
+        single_neighbour_set(&store.neighbors(centre, q_both.clone()).await.unwrap());
+    let batch: HashSet<Uuid> = neighbour_set(
+        &store
+            .batch_neighbors(&[centre], q_both.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(batch, single, "Both: batch must equal single-source set");
+
+    let expected: HashSet<Uuid> = out_nodes.iter().chain(in_nodes.iter()).copied().collect();
+    assert_eq!(batch, expected, "Both: must return all neighbours");
+}
+
+/// PARITY: relations filter applies correctly across directions.
+#[tokio::test]
+async fn batch_neighbors_relations_filter_parity() {
+    let store = setup_memory_store();
+    let centre = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    // outgoing: one Extends, one DependsOn
+    store
+        .upsert_edge(make_edge(centre, a, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(centre, b, EdgeRelation::DependsOn, 1.0))
+        .await
+        .unwrap();
+
+    let q = NeighborQuery {
+        direction: Direction::Out,
+        relations: Some(vec![EdgeRelation::Extends]),
+        limit: None,
+        min_weight: None,
+    };
+
+    let single: HashSet<Uuid> =
+        single_neighbour_set(&store.neighbors(centre, q.clone()).await.unwrap());
+    let batch: HashSet<Uuid> = neighbour_set(&store.batch_neighbors(&[centre], q).await.unwrap());
+
+    assert_eq!(batch, single, "relations filter: batch must match single");
+    assert!(
+        batch.contains(&a),
+        "filtered result must include Extends target"
+    );
+    assert!(
+        !batch.contains(&b),
+        "filtered result must exclude DependsOn target"
+    );
+}
+
+/// PARITY: min_weight filter applies correctly.
+#[tokio::test]
+async fn batch_neighbors_min_weight_filter_parity() {
+    let store = setup_memory_store();
+    let centre = Uuid::new_v4();
+    let heavy = Uuid::new_v4();
+    let light = Uuid::new_v4();
+    store
+        .upsert_edge(make_edge(centre, heavy, EdgeRelation::Extends, 0.9))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(centre, light, EdgeRelation::Extends, 0.3))
+        .await
+        .unwrap();
+
+    let q = NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: None,
+        min_weight: Some(0.5),
+    };
+
+    let single: HashSet<Uuid> =
+        single_neighbour_set(&store.neighbors(centre, q.clone()).await.unwrap());
+    let batch: HashSet<Uuid> = neighbour_set(&store.batch_neighbors(&[centre], q).await.unwrap());
+
+    assert_eq!(batch, single, "min_weight filter: batch must match single");
+    assert!(
+        batch.contains(&heavy),
+        "must include edge above weight threshold"
+    );
+    assert!(
+        !batch.contains(&light),
+        "must exclude edge below weight threshold"
+    );
+}
+
+// ---- get_edges direct SQLite tests ----
+
+/// get_edges must return all requested edges regardless of request order.
+#[tokio::test]
+async fn get_edges_order_independent() {
+    let store = setup_memory_store();
+
+    let edges: Vec<Edge> = (0..5)
+        .map(|i| {
+            make_edge(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                EdgeRelation::Extends,
+                i as f64,
+            )
+        })
+        .collect();
+    let ids: Vec<LinkId> = edges.iter().map(|e| e.id).collect();
+    for e in edges {
+        store.upsert_edge(e).await.unwrap();
+    }
+
+    // Request in reversed order
+    let mut reversed = ids.clone();
+    reversed.reverse();
+
+    let result = store.get_edges(&reversed).await.unwrap();
+    let result_ids: HashSet<LinkId> = result.iter().map(|e| e.id).collect();
+    let expected_ids: HashSet<LinkId> = ids.iter().copied().collect();
+    assert_eq!(
+        result_ids, expected_ids,
+        "get_edges must return all edges regardless of request order"
+    );
+}
+
+/// Soft-deleted or nonexistent IDs are silently omitted.
+#[tokio::test]
+async fn get_edges_omits_deleted_and_missing() {
+    let store = setup_memory_store();
+
+    let live = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    let soft = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::DependsOn, 0.5);
+    let ghost_id = LinkId::from(Uuid::new_v4()); // never inserted
+
+    let live_id = live.id;
+    let soft_id = soft.id;
+
+    store.upsert_edge(live).await.unwrap();
+    store.upsert_edge(soft).await.unwrap();
+    // Soft-delete the second edge
+    store.delete_edge(soft_id, DeleteMode::Soft).await.unwrap();
+
+    let result = store
+        .get_edges(&[live_id, soft_id, ghost_id])
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1, "only the live edge must be returned");
+    assert_eq!(result[0].id, live_id, "returned edge must be the live one");
+}
+
+/// get_edges with more than 900 IDs (chunk boundary) returns all live edges.
+#[tokio::test]
+async fn get_edges_chunk_boundary() {
+    let store = setup_memory_store();
+
+    let count = 950usize;
+    let edges: Vec<Edge> = (0..count)
+        .map(|_| make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    let ids: Vec<LinkId> = edges.iter().map(|e| e.id).collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let result = store.get_edges(&ids).await.unwrap();
+    assert_eq!(
+        result.len(),
+        count,
+        "get_edges must return all {count} edges across the chunk boundary"
+    );
+}
+
+/// batch_neighbors Direction::Both chunk-boundary test.
+///
+/// With the old const CHUNK=880, Direction::Both would bind ~1761 variables
+/// (1 ns + 880 out_srcs + 880 in_srcs) into a single SQLite statement,
+/// blowing past SQLITE_MAX_VARIABLE_NUMBER=999 and returning an error.
+///
+/// This test uses 500 source nodes — enough that a single Both chunk would
+/// have exceeded 999 variables under the old constant.  After the fix the
+/// computed chunk_size for Both (no filters, no limit) is ~474, so the 500
+/// sources are split into two chunks, each staying within budget.
+///
+/// Correctness: for a random sample of sources, batch result must equal the
+/// per-source neighbors() result.
+#[tokio::test]
+async fn batch_neighbors_both_chunk_boundary() {
+    let store = setup_memory_store();
+
+    // Create 500 source nodes, each with one outgoing and one incoming edge.
+    let source_count = 500usize;
+    let mut sources: Vec<Uuid> = Vec::with_capacity(source_count);
+    for _ in 0..source_count {
+        let centre = Uuid::new_v4();
+        let out_tgt = Uuid::new_v4();
+        let in_src = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(centre, out_tgt, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(in_src, centre, EdgeRelation::Extends, 0.8))
+            .await
+            .unwrap();
+        sources.push(centre);
+    }
+
+    let q_both = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    // Must not error (would panic with "too many SQL variables" pre-fix).
+    let batch_hits = store
+        .batch_neighbors(&sources, q_both.clone())
+        .await
+        .unwrap();
+
+    // Each source has exactly 2 neighbours (one out, one in).
+    assert_eq!(
+        batch_hits.len(),
+        source_count * 2,
+        "Both chunk-boundary: must return 2 hits per source (1 out + 1 in)"
+    );
+
+    // Spot-check: first, middle, and last source match per-source neighbors().
+    for &idx in &[0, source_count / 2, source_count - 1] {
+        let src = sources[idx];
+        let single: HashSet<Uuid> = store
+            .neighbors(src, q_both.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| h.node_id)
+            .collect();
+        let from_batch: HashSet<Uuid> = batch_hits
+            .iter()
+            .filter(|(origin, _)| *origin == src)
+            .map(|(_, h)| h.node_id)
+            .collect();
+        assert_eq!(
+            from_batch, single,
+            "spot-check source {idx}: batch result must match neighbors()"
+        );
+    }
+
+    // Also verify with limit=1: each source gets at most 1 hit total.
+    let q_limit = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: Some(1),
+        min_weight: None,
+    };
+    let limited_hits = store.batch_neighbors(&sources, q_limit).await.unwrap();
+    assert_eq!(
+        limited_hits.len(),
+        source_count,
+        "Both chunk-boundary with limit=1: must return exactly 1 hit per source"
     );
 }

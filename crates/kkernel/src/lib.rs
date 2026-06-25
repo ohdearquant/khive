@@ -26,6 +26,7 @@ pub mod vector;
 mod _pack_links {
     use khive_pack_brain::BrainPack as _;
     use khive_pack_comm::CommPack as _;
+    use khive_pack_formal::FormalPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
     use khive_pack_knowledge::KnowledgePack as _;
