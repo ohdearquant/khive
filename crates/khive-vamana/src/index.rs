@@ -11,11 +11,16 @@ use memmap2::MmapOptions;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use khive_quant::{GsEncodedVector, GsSq8Codec};
+
 use crate::{
     config::VamanaConfig,
     distance::l2_squared,
     error::{Result, VamanaError},
-    graph::{is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, VamanaGraph, VisitedSet},
+    graph::{
+        greedy_search_inner_sq8, is_tombstoned_bit, robust_prune_inner, sort_dedup_u32,
+        VamanaGraph, VisitedSet,
+    },
 };
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
@@ -304,6 +309,11 @@ pub struct VamanaIndex {
     /// Trigger tau for consolidation: fire when `ops_since_consolidation >= consolidation_tau`.
     /// Field on `VamanaIndex`, not `VamanaConfig` — this is operational policy, not topology (OQ5).
     consolidation_tau: usize,
+    // ---- SQ8 acquisition tier (ADR-052 §1, Step 2) ----
+    /// Global-scale SQ8 codec trained over the build corpus; used for acquisition-tier distances.
+    gs_codec: GsSq8Codec,
+    /// Pre-encoded corpus vectors (one `GsEncodedVector` per node, ordinal-stable).
+    gs_codes: Vec<GsEncodedVector>,
 }
 
 struct IndexMetadata {
@@ -312,6 +322,16 @@ struct IndexMetadata {
     max_degree: usize,
     search_list_size: usize,
     alpha: f64,
+}
+
+/// Train a `GsSq8Codec` and encode `vectors` for the SQ8 acquisition tier.
+///
+/// Called by all index constructors (build, load, from_snapshot) so the codec
+/// is always consistent with the stored vectors.
+fn train_codec_and_encode(vectors: &[f32], dims: usize) -> (GsSq8Codec, Vec<GsEncodedVector>) {
+    let codec = GsSq8Codec::train_flat(vectors, dims);
+    let codes = codec.encode_flat_par(vectors, dims);
+    (codec, codes)
 }
 
 /// Scan a flat f32 slice for any non-finite value, returning an error on the first hit.
@@ -326,6 +346,9 @@ fn require_finite(values: &[f32], location: &str) -> Result<()> {
 
 impl VamanaIndex {
     /// Build from row-major flat slice. Errors if config invalid, empty, wrong length, non-finite, or N > u32::MAX.
+    ///
+    /// Uses `GsSq8Codec` for the acquisition-tier distance during graph construction
+    /// (ADR-052 §1, Step 2: default-on for Vamana, algebraically exact in code space).
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         config.validate()?;
         if vectors.is_empty() {
@@ -343,7 +366,9 @@ impl VamanaIndex {
             return Err(VamanaError::TooManyVectors { count: num_vectors });
         }
 
-        let graph = VamanaGraph::build(vectors, &config)?;
+        let (gs_codec, gs_codes) = train_codec_and_encode(vectors, config.dimensions);
+
+        let graph = VamanaGraph::build_sq8(vectors, &gs_codes, &gs_codec, &config)?;
         let dimensions = config.dimensions;
 
         Ok(Self {
@@ -357,10 +382,15 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            gs_codec,
+            gs_codes,
         })
     }
 
     /// Search for `k` nearest neighbors. Errors if dimension mismatch or non-finite query values.
+    ///
+    /// Uses `GsSq8Codec` for acquisition-tier traversal; returned distances are exact f32 L2²
+    /// (ADR-052 §1 two-tier: SQ8 for candidate selection, exact f32 for final results).
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.dimensions {
             return Err(VamanaError::DimensionMismatch {
@@ -379,15 +409,21 @@ impl VamanaIndex {
             None
         };
         let mut visited = VisitedSet::new(self.num_vectors);
-        let result = self.graph.greedy_search(
+        let query_enc = self.gs_codec.encode(query);
+        let result = greedy_search_inner_sq8(
             self.vectors()?,
             self.dimensions,
+            &self.gs_codes,
+            &self.gs_codec,
+            self.graph.adjacency(),
             query,
+            &query_enc,
+            self.graph.medoid(),
             k,
             self.config.search_list_size,
             &mut visited,
             tombstones,
-        )?;
+        );
 
         let mut output = result.results;
         output.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
@@ -443,6 +479,8 @@ impl VamanaIndex {
         // This must run before any tombstone call — lazy init would silently skip repair.
         graph.rebuild_reverse_adj_from_adjacency();
 
+        let (gs_codec, gs_codes) = train_codec_and_encode(storage.as_slice()?, meta.dimensions);
+
         Ok(Self {
             vectors: storage,
             graph,
@@ -454,6 +492,8 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            gs_codec,
+            gs_codes,
         })
     }
 
@@ -839,6 +879,8 @@ impl VamanaIndex {
             .map(|w| w.count_ones() as usize)
             .sum();
 
+        let (gs_codec, gs_codes) = train_codec_and_encode(storage.as_slice()?, dimensions);
+
         Ok(Self {
             vectors: storage,
             graph,
@@ -850,6 +892,8 @@ impl VamanaIndex {
             ops_since_consolidation: lifecycle.ops_since_consolidation,
             free_slots: lifecycle.free_slots,
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            gs_codec,
+            gs_codes,
         })
     }
 
@@ -1059,6 +1103,8 @@ impl VamanaIndex {
         // This must run before any tombstone call — lazy init would silently skip repair.
         graph.rebuild_reverse_adj_from_adjacency();
 
+        let (gs_codec, gs_codes) = train_codec_and_encode(&ix.vectors, dimensions);
+
         Ok(Self {
             vectors: VectorStorage::Owned(ix.vectors.clone()),
             graph,
@@ -1070,6 +1116,8 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            gs_codec,
+            gs_codes,
         })
     }
 
@@ -1204,6 +1252,8 @@ impl VamanaIndex {
                     ))
                 }
             }
+            // Update SQ8 code for the recycled slot.
+            self.gs_codes[ordinal as usize] = self.gs_codec.encode(vector);
         } else {
             // Append path: assign next ordinal and extend storage.
             ordinal = self.num_vectors as u32;
@@ -1227,6 +1277,8 @@ impl VamanaIndex {
                     ))
                 }
             }
+            // Append SQ8 code for the new slot.
+            self.gs_codes.push(self.gs_codec.encode(vector));
         }
 
         // Graph wiring.
@@ -1243,6 +1295,11 @@ impl VamanaIndex {
                 None
             };
 
+            // Insert uses exact f32 distances for graph wiring. The SQ8 codec is
+            // trained on the build corpus; inserted vectors may be out of that range,
+            // causing u8 clamping and wrong orderings. Exact f32 is correct here —
+            // insert is not a hot path. The gs_codes entry for ordinal is already
+            // written above (recycle or push) so search() uses SQ8 correctly.
             let mut visited = VisitedSet::new(self.num_vectors);
             let search_result = self.graph.greedy_search(
                 vecs,
@@ -1446,6 +1503,12 @@ impl VamanaIndex {
         }
         new_graph.rebuild_reverse_adj_from_adjacency();
 
+        // Compact the SQ8 code table to match the new ordinal space.
+        let new_gs_codes: Vec<GsEncodedVector> = new_to_old
+            .iter()
+            .map(|&old| self.gs_codes[old as usize].clone())
+            .collect();
+
         self.graph = new_graph;
         self.vectors = VectorStorage::Owned(new_vecs);
         self.num_vectors = m;
@@ -1453,6 +1516,7 @@ impl VamanaIndex {
         self.tombstone_count = 0;
         self.free_slots.clear();
         self.ops_since_consolidation = 0;
+        self.gs_codes = new_gs_codes;
 
         Ok(new_to_old)
     }
@@ -1764,6 +1828,8 @@ fn wolverine_repair(
             .collect();
         sort_dedup_u32(&mut pool);
 
+        // Use exact f32 distances for repair: the SQ8 codec is trained on the
+        // build corpus and may be stale for vectors inserted after training.
         let new_neighbors = robust_prune_inner(vectors, dimensions, p, pool, alpha, max_degree);
 
         // Replace adjacency[p] and update reverse_adj in lockstep (PR1 invariant).
@@ -2490,6 +2556,7 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::greedy_search_inner;
     use rand::{prelude::*, SeedableRng};
 
     fn rand_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
@@ -3510,6 +3577,87 @@ mod tests {
         assert!(
             matches!(loaded.vectors, VectorStorage::Mmap { .. }),
             "Mmap must stay Mmap after no-op consolidate"
+        );
+    }
+
+    /// SQ8 recall parity gate (ADR-052 §1, Step 2).
+    ///
+    /// Builds one SQ8-wired index, then measures recall@10 for two search oracles
+    /// on the same graph topology:
+    ///   - f32 oracle  : `greedy_search_inner` (exact f32 distances throughout)
+    ///   - SQ8 oracle  : `greedy_search_inner_sq8` (SQ8 acquisition + f32 re-score)
+    ///
+    /// Asserts: SQ8 recall >= f32 recall - 0.02 (tolerance for integer rounding).
+    /// Prints actual values so the PR body can quote measured numbers.
+    #[test]
+    fn sq8_recall_parity_vs_f32_oracle() {
+        const N: usize = 1000;
+        const DIM: usize = 384;
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 30;
+
+        let vectors = rand_unit_vectors(N, DIM, 0xA052_0000);
+        let queries = rand_unit_vectors(NUM_QUERIES, DIM, 0xA052_0001);
+
+        let cfg = VamanaConfig::with_dimensions(DIM)
+            .with_max_degree(32)
+            .with_search_list_size(64);
+
+        // Build the SQ8-wired index (ADR-052 §1 Step 2 default-on path).
+        let index = VamanaIndex::build(&vectors, cfg).expect("build failed");
+        let vecs = index.vectors().expect("vectors");
+        let adj = index.graph.adjacency();
+        let medoid = index.graph.medoid();
+
+        let mut f32_total = 0.0f64;
+        let mut sq8_total = 0.0f64;
+        let live_count = N;
+        let denom = K.min(live_count) as f64;
+
+        for qi in 0..NUM_QUERIES {
+            let q = &queries[qi * DIM..(qi + 1) * DIM];
+
+            // Ground truth: exact f32 brute-force.
+            let gt = exact_search(vecs, DIM, q, K, None);
+            let gt_ids: std::collections::HashSet<u32> = gt.iter().map(|(id, _)| *id).collect();
+
+            // f32 oracle: greedy search with exact f32 distances.
+            let mut visited_f32 = VisitedSet::new(N);
+            let f32_result = greedy_search_inner(
+                vecs,
+                DIM,
+                adj,
+                q,
+                medoid,
+                K,
+                index.config.search_list_size,
+                &mut visited_f32,
+                None,
+            );
+            let f32_ids: std::collections::HashSet<u32> =
+                f32_result.results.iter().map(|(id, _)| *id).collect();
+            f32_total += f32_ids.intersection(&gt_ids).count() as f64 / denom;
+
+            // SQ8 oracle: greedy search with SQ8 acquisition distances + f32 re-score.
+            let sq8_result = index.search(q, K).expect("sq8 search failed");
+            let sq8_ids: std::collections::HashSet<u32> =
+                sq8_result.iter().map(|(id, _)| *id).collect();
+            sq8_total += sq8_ids.intersection(&gt_ids).count() as f64 / denom;
+        }
+
+        let f32_recall = f32_total / NUM_QUERIES as f64;
+        let sq8_recall = sq8_total / NUM_QUERIES as f64;
+        let delta = f32_recall - sq8_recall;
+
+        println!("sq8_recall_parity | f32_recall@10={f32_recall:.4}  sq8_recall@10={sq8_recall:.4}  delta={delta:.4}");
+
+        assert!(
+            sq8_recall >= f32_recall - 0.02,
+            "SQ8 recall@10 {sq8_recall:.4} is more than 0.02 below f32 recall@10 {f32_recall:.4} (delta={delta:.4})"
+        );
+        assert!(
+            sq8_recall >= 0.80,
+            "SQ8 recall@10 {sq8_recall:.4} < 0.80 — absolute floor violated"
         );
     }
 }

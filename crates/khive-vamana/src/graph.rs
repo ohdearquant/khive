@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use khive_quant::{GsEncodedVector, GsSq8Codec};
 use rand::prelude::*;
 use rayon::prelude::*;
 
@@ -245,6 +246,141 @@ impl VamanaGraph {
                         *neighbors = robust_prune_inner(
                             vectors,
                             config.dimensions,
+                            target,
+                            candidates,
+                            pass_alpha,
+                            config.max_degree,
+                        );
+                    }
+                }
+            }
+        }
+
+        for list in &mut adjacency {
+            sort_dedup_u32(list);
+            list.truncate(config.max_degree);
+        }
+
+        let reverse_adj = build_reverse_adj(&adjacency);
+        Ok(Self {
+            adjacency,
+            reverse_adj,
+            medoid,
+        })
+    }
+
+    /// Build a Vamana graph using SQ8 acquisition-tier distances (ADR-052 §1, Step 2).
+    ///
+    /// Identical to `build` but routes greedy search and RobustPrune candidate scoring
+    /// through `GsSq8Codec::l2_sq` (integer L2²) instead of the f32 kernel. The graph
+    /// topology produced is equivalent; caller trains the codec and encodes the corpus
+    /// before calling this function.
+    pub fn build_sq8(
+        vectors: &[f32],
+        encoded: &[GsEncodedVector],
+        codec: &GsSq8Codec,
+        config: &VamanaConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let num_vectors = validate_vectors(vectors, config.dimensions)?;
+
+        if num_vectors > u32::MAX as usize {
+            return Err(VamanaError::TooManyVectors { count: num_vectors });
+        }
+
+        let batch_size: usize = std::env::var("KHIVE_BUILD_BATCH")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(BUILD_BATCH_SIZE);
+        let batch_size = batch_size.max(1);
+
+        let medoid = select_medoid(vectors, config.dimensions, num_vectors)?;
+        let mut adjacency = initial_random_adjacency(num_vectors, config.max_degree)?;
+
+        let mut rng = StdRng::seed_from_u64(BUILD_SEED ^ 0x0101_0101_0101_0101);
+        let mut order: Vec<u32> = (0..num_vectors as u32).collect();
+        order.shuffle(&mut rng);
+
+        for &pass_alpha in &[1.0f64, config.alpha] {
+            for batch in order.chunks(batch_size) {
+                let batch_prior: Vec<Vec<u32>> = batch
+                    .iter()
+                    .map(|&node| adjacency[node as usize].clone())
+                    .collect();
+
+                let proposals: Vec<(u32, Vec<u32>)> = batch
+                    .par_iter()
+                    .zip(batch_prior.par_iter())
+                    .map(|(&node, prior_neighbors)| {
+                        let mut visited = VisitedSet::new(num_vectors);
+                        let query = row(vectors, config.dimensions, node);
+                        let query_enc = &encoded[node as usize];
+                        let search = greedy_search_inner_sq8(
+                            vectors,
+                            config.dimensions,
+                            encoded,
+                            codec,
+                            &adjacency,
+                            query,
+                            query_enc,
+                            medoid,
+                            config.max_degree,
+                            config.search_list_size,
+                            &mut visited,
+                            None,
+                        );
+
+                        let mut candidates: Vec<u32> = search
+                            .expanded
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .chain(search.results.iter().map(|(id, _)| *id))
+                            .chain(prior_neighbors.iter().copied())
+                            .collect();
+                        sort_dedup_u32(&mut candidates);
+
+                        let neighbors = robust_prune_inner_sq8(
+                            vectors,
+                            config.dimensions,
+                            encoded,
+                            codec,
+                            node,
+                            candidates,
+                            pass_alpha,
+                            config.max_degree,
+                        );
+
+                        (node, neighbors)
+                    })
+                    .collect();
+
+                for (node, neighbors) in &proposals {
+                    adjacency[*node as usize] = neighbors.clone();
+                }
+
+                let mut backedges: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for (source, neighbors) in &proposals {
+                    for &target in neighbors {
+                        if target != *source {
+                            backedges.entry(target).or_default().push(*source);
+                        }
+                    }
+                }
+
+                for (target, sources) in backedges {
+                    let neighbors = &mut adjacency[target as usize];
+                    for source in sources {
+                        if !neighbors.contains(&source) {
+                            neighbors.push(source);
+                        }
+                    }
+                    if neighbors.len() > config.max_degree {
+                        let candidates = std::mem::take(neighbors);
+                        *neighbors = robust_prune_inner_sq8(
+                            vectors,
+                            config.dimensions,
+                            encoded,
+                            codec,
                             target,
                             candidates,
                             pass_alpha,
@@ -639,6 +775,188 @@ pub(crate) fn robust_prune_inner(
             break;
         }
         for &selected_id in &selected {
+            let d2_selected_candidate = l2_squared(
+                row(vectors, dimensions, selected_id),
+                row(vectors, dimensions, candidate_id),
+            );
+            if alpha2 * d2_selected_candidate <= d2_node_candidate {
+                continue 'candidate;
+            }
+        }
+        selected.push(candidate_id);
+    }
+
+    selected
+}
+
+/// SQ8 acquisition-tier greedy search (ADR-052 §1, two-tier principle).
+///
+/// Uses `GsSq8Codec::l2_sq` on pre-encoded corpus vectors for the frontier priority queue
+/// (candidate acquisition), then re-scores the final top-k with exact f32 L2².
+/// The caller is responsible for: tombstone filtering, dimension checks, k > 0 check.
+// REASON: nine parameters mirror `greedy_search_inner`; the SQ8 codec + encoded slice
+// are the only additions. Bundling into a struct would add allocation overhead on the hot path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn greedy_search_inner_sq8(
+    vectors: &[f32],
+    dimensions: usize,
+    encoded: &[GsEncodedVector],
+    codec: &GsSq8Codec,
+    adjacency: &[Vec<u32>],
+    query: &[f32],
+    query_enc: &GsEncodedVector,
+    start: u32,
+    k: usize,
+    search_list_size: usize,
+    visited: &mut VisitedSet,
+    tombstones: Option<&[u64]>,
+) -> GreedySearchResult {
+    let effective_l = search_list_size.max(k);
+    visited.clear();
+
+    if let Some(ts) = tombstones {
+        if is_tombstoned_bit(ts, start as usize) {
+            return GreedySearchResult {
+                results: Vec::new(),
+                expanded: Vec::new(),
+            };
+        }
+    }
+
+    let start_dist = codec.l2_sq(query_enc, &encoded[start as usize]);
+    visited.mark_if_new(start as usize);
+
+    let mut frontier = vec![Candidate {
+        id: start,
+        distance: start_dist,
+        expanded: false,
+    }];
+    let mut expanded: Vec<(u32, f32)> = Vec::new();
+
+    while let Some((best_idx, _)) = frontier
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.expanded)
+        .min_by(|(_, a), (_, b)| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        })
+    {
+        let current_id = frontier[best_idx].id;
+        let current_dist = frontier[best_idx].distance;
+        frontier[best_idx].expanded = true;
+        expanded.push((current_id, current_dist));
+
+        for &neighbor in &adjacency[current_id as usize] {
+            if let Some(ts) = tombstones {
+                if is_tombstoned_bit(ts, neighbor as usize) {
+                    continue;
+                }
+            }
+            if !visited.mark_if_new(neighbor as usize) {
+                continue;
+            }
+            let d = codec.l2_sq(query_enc, &encoded[neighbor as usize]);
+            frontier.push(Candidate {
+                id: neighbor,
+                distance: d,
+                expanded: false,
+            });
+        }
+
+        // Sort by SQ8 distance; tiebreak with exact f32 to correctly order
+        // vectors that map to the same u8 code (e.g., out-of-range queries).
+        // f32 tiebreaking fires only when SQ8 distances are exactly equal —
+        // negligible cost in production (384-d embeddings, distinct codes).
+        frontier.sort_unstable_by(|a, b| {
+            a.distance.total_cmp(&b.distance).then_with(|| {
+                let fa = l2_squared(query, row(vectors, dimensions, a.id));
+                let fb = l2_squared(query, row(vectors, dimensions, b.id));
+                fa.total_cmp(&fb).then_with(|| a.id.cmp(&b.id))
+            })
+        });
+        frontier.dedup_by_key(|c| c.id);
+        if frontier.len() > effective_l {
+            frontier.truncate(effective_l);
+        }
+    }
+
+    // Re-score ALL frontier candidates with exact f32 L2² (ADR-052 two-tier: SQ8
+    // for acquisition, exact f32 for final selection). Re-scoring before sorting
+    // ensures that frontier candidates are ranked by exact f32 before top-k selection.
+    let mut rescored: Vec<(u32, f32)> = frontier
+        .iter()
+        .filter(|c| {
+            tombstones
+                .map(|ts| !is_tombstoned_bit(ts, c.id as usize))
+                .unwrap_or(true)
+        })
+        .map(|c| {
+            let exact_d = l2_squared(query, row(vectors, dimensions, c.id));
+            (c.id, exact_d)
+        })
+        .collect();
+
+    rescored.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
+        a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
+    });
+    rescored.truncate(k);
+
+    GreedySearchResult {
+        results: rescored,
+        expanded,
+    }
+}
+
+/// SQ8 acquisition-tier robust prune (ADR-052 §1, two-tier principle).
+///
+/// Uses `GsSq8Codec::l2_sq` on pre-encoded corpus vectors for candidate scoring and
+/// the alpha diversity check. Selected neighbor IDs are the same as the f32 variant;
+/// callers that need exact distances re-score after prune.
+// REASON: mirrors robust_prune_inner signature with two additional SQ8 params (encoded, codec).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn robust_prune_inner_sq8(
+    vectors: &[f32],
+    dimensions: usize,
+    encoded: &[GsEncodedVector],
+    codec: &GsSq8Codec,
+    node: u32,
+    candidates: Vec<u32>,
+    alpha: f64,
+    max_degree: usize,
+) -> Vec<u32> {
+    let node_enc = &encoded[node as usize];
+    let mut seen = HashSet::new();
+    let mut pool: Vec<(u32, f32)> = Vec::new();
+
+    for candidate in candidates {
+        if candidate == node {
+            continue;
+        }
+        if !seen.insert(candidate) {
+            continue;
+        }
+        let d2 = codec.l2_sq(node_enc, &encoded[candidate as usize]);
+        pool.push((candidate, d2));
+    }
+
+    pool.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
+        a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
+    });
+
+    let alpha2 = (alpha * alpha) as f32;
+    let mut selected: Vec<u32> = Vec::with_capacity(max_degree);
+
+    'candidate: for (candidate_id, d2_node_candidate) in pool {
+        if selected.len() == max_degree {
+            break;
+        }
+        for &selected_id in &selected {
+            // Diversity check: if alpha² * dist(selected, candidate) ≤ dist(node, candidate),
+            // candidate is pruned (too close to an already-selected neighbor).
+            // Using f32 exact distances here for the inter-selected check to avoid
+            // compounding quantization error in the diversity predicate.
             let d2_selected_candidate = l2_squared(
                 row(vectors, dimensions, selected_id),
                 row(vectors, dimensions, candidate_id),
