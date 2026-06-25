@@ -57,6 +57,11 @@ pub struct HandlerDef {
 pub enum EndpointKind {
     NoteOfKind(&'static str),
     EntityOfKind(&'static str),
+    // Match a granular entity SUBTYPE (the `entity_type` property), bound to its
+    // base entity kind. A subtype rule MUST carry both: the matcher requires
+    // base-kind == `kind` AND entity_type == `entity_type`. `EntityOfKind` alone
+    // sees only the base kind, so it is inert for subtype targeting.
+    EntityOfType { kind: &'static str, entity_type: &'static str },
 }
 
 pub struct EdgeEndpointRule {
@@ -474,6 +479,26 @@ broadens it for task notes.
 
 **Additive only.** A pack cannot tighten ADR-002's base contract. It cannot remove
 relations from being legal between two entity kinds. It can only add new legal pairs.
+
+**Subtype endpoints.** A rule may target a granular entity SUBTYPE (the `entity_type`
+property — e.g. `theorem`, `definition`) via `EndpointKind::EntityOfType { kind,
+entity_type }`. The subtype rule MUST bind its base entity kind: the matcher accepts an
+endpoint only when the row's base kind equals `kind` AND its `entity_type` equals
+`entity_type`. Do not reach for `EntityOfKind("theorem")` to target a subtype — that
+variant compares the base kind alone (`concept`), so it is silently inert against a
+subtype. Subtype matching relies on the `(EntityKind, entity_type)` registry invariant
+(ADR-001); binding the base kind is what keeps a rule from matching a mistyped row.
+
+```rust
+// In khive-pack-formal: theorem -[depends_on]-> definition (both concept subtypes)
+const EDGE_RULES: &[EdgeEndpointRule] = &[
+    EdgeEndpointRule {
+        relation: EdgeRelation::DependsOn,
+        source: EndpointKind::EntityOfType { kind: "concept", entity_type: "theorem" },
+        target: EndpointKind::EntityOfType { kind: "concept", entity_type: "definition" },
+    },
+];
+```
 
 `VerbRegistry::all_edge_rules()` aggregates contributions. The runtime's edge endpoint
 validator (per ADR-002 + this aggregation) checks both the base contract and the pack

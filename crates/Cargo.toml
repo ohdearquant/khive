@@ -24,6 +24,7 @@ members = [
     "khive-pack-brain",
     "khive-pack-comm",
     "khive-pack-schedule",
+    "khive-pack-formal",
     "khive-pack-template",
     "khive-pack-knowledge",
     "khive-mcp",
