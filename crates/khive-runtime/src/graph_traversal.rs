@@ -110,10 +110,10 @@ impl KhiveRuntime {
             for (node_id, edge_id) in level_new {
                 let via_edge = edge_map.get(&edge_id).cloned().or(None);
                 // via_edge being None here means the edge was soft-deleted between
-                // the neighbors call and get_edges — treat it as missing rather than
-                // error to preserve BFS liveness.
+                // the neighbors call and the get_edges call. Return NotFound rather
+                // than silently dropping the node, so the concurrent-delete race
+                // surfaces instead of yielding a misleadingly-incomplete path.
                 if via_edge.is_none() {
-                    // Edge vanished (concurrent soft-delete); skip this node.
                     return Err(RuntimeError::NotFound(format!("edge {} missing", edge_id)));
                 }
                 results.push(PathNode {
