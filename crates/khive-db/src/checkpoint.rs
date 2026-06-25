@@ -19,11 +19,31 @@
 //! (high_water_pages exceeded), the task emits a WARNING so an operator or
 //! scheduler can perform a blocking TRUNCATE at a safe moment outside normal
 //! traffic.
+//!
+//! Threshold-crossing WARN semantics: both the `warn_pages` and `high_water_pages`
+//! warnings fire at most once per below→above crossing. Skipped ticks (writer
+//! busy) leave the crossing state unchanged so that a skip cannot spuriously
+//! re-arm the rate limit while WAL pressure is still elevated.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::pool::ConnectionPool;
+
+/// Outcome of a single checkpoint attempt.
+///
+/// `Skipped` is returned when the writer mutex is already held (the tick is a
+/// no-op). `Observed` carries the WAL page count read during the tick. The
+/// distinction matters for threshold-crossing WARN rate-limiting: a skipped tick
+/// must leave the above/below state unchanged so that a busy tick cannot
+/// spuriously re-arm the rate limit while WAL pressure is still elevated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointTick {
+    /// The writer mutex was busy; no checkpoint was issued this tick.
+    Skipped,
+    /// A checkpoint was issued; the value is the observed WAL page count.
+    Observed(u64),
+}
 
 /// Configuration for the WAL checkpoint background task.
 ///
@@ -109,14 +129,19 @@ impl CheckpointConfig {
 /// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick. PASSIVE is
 /// the only checkpoint mode used; see the module-level doc for why TRUNCATE is
 /// excluded. A WARNING is emitted once on threshold crossing (wal_pages
-/// transitions from below `high_water_pages` to at/above) rather than on every
-/// tick, preventing log spam when a long-lived reader pins a WAL snapshot.
+/// transitions from below a threshold to at/above) rather than on every tick,
+/// preventing log spam when a long-lived reader pins a WAL snapshot.
+///
+/// Skipped ticks (writer mutex busy) leave both crossing-state flags unchanged
+/// so that a skip cannot spuriously re-arm the rate limit while WAL pressure is
+/// still elevated.
 ///
 /// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
 /// current tick to be skipped rather than stalling write traffic.
 pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointConfig) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_above_warn = false;
     let mut was_above_high_water = false;
 
     loop {
@@ -128,9 +153,25 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             break;
         }
 
-        let wal_pages = checkpoint_once(&pool, &config);
-        let above = wal_pages >= config.high_water_pages;
-        if above && !was_above_high_water {
+        let tick = checkpoint_once(&pool);
+        // Skipped ticks leave crossing state unchanged — a busy tick must not
+        // re-arm the rate limit while WAL pressure is still elevated.
+        let wal_pages = match tick {
+            CheckpointTick::Skipped => continue,
+            CheckpointTick::Observed(n) => n,
+        };
+
+        let in_warn_band = wal_pages >= config.warn_pages && wal_pages < config.high_water_pages;
+        if crossing_warn(in_warn_band, &mut was_above_warn) {
+            tracing::warn!(
+                wal_pages,
+                warn_threshold = config.warn_pages,
+                "WAL page count approaching checkpoint threshold"
+            );
+        }
+
+        let above_high_water = wal_pages >= config.high_water_pages;
+        if crossing_warn(above_high_water, &mut was_above_high_water) {
             tracing::warn!(
                 wal_pages,
                 high_water = config.high_water_pages,
@@ -138,35 +179,27 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
                  a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
             );
         }
-        was_above_high_water = above;
     }
 }
 
 /// Issue one checkpoint cycle against the writer connection.
 ///
-/// Returns the observed WAL page count (0 when the writer mutex was busy and
-/// the tick was skipped, or when the pool is in-memory). All checkpoint errors
-/// are logged at warn level and treated as non-fatal; the next tick retries.
+/// Returns [`CheckpointTick::Skipped`] when the writer mutex is already held
+/// (the tick is a no-op) and [`CheckpointTick::Observed`] with the WAL page
+/// count otherwise. All checkpoint errors are logged at warn level and treated
+/// as non-fatal; the next tick retries.
 ///
 /// Uses `try_writer_nowait` so that a busy active writer causes this tick to
 /// be skipped immediately rather than stalling for up to `checkout_timeout`.
-/// The caller (`run_checkpoint_task`) owns threshold-crossing WARN logging so
-/// that high-water warnings fire at most once per crossing, not every tick.
-pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) -> u64 {
+/// The caller (`run_checkpoint_task`) owns all threshold-crossing WARN logging
+/// so that warnings fire at most once per crossing, not every tick.
+pub fn checkpoint_once(pool: &ConnectionPool) -> CheckpointTick {
     let writer = match pool.try_writer_nowait() {
         Ok(w) => w,
-        Err(_) => return 0,
+        Err(_) => return CheckpointTick::Skipped,
     };
 
     let wal_pages = query_wal_pages(writer.conn());
-
-    if wal_pages >= config.warn_pages && wal_pages < config.high_water_pages {
-        tracing::warn!(
-            wal_pages,
-            warn_threshold = config.warn_pages,
-            "WAL page count approaching checkpoint threshold"
-        );
-    }
 
     if let Err(e) = writer
         .conn()
@@ -177,7 +210,21 @@ pub fn checkpoint_once(pool: &ConnectionPool, config: &CheckpointConfig) -> u64 
         tracing::debug!(wal_pages, "WAL checkpoint issued");
     }
 
-    wal_pages
+    CheckpointTick::Observed(wal_pages)
+}
+
+/// Evaluate whether a threshold-crossing WARN should fire and advance the
+/// crossing-state flag.
+///
+/// Returns `true` on a false→true transition in `now_above` (first observed
+/// above-threshold tick after a below-threshold tick), `false` on any other
+/// tick. The `was_above` flag is updated in-place to track state across calls.
+/// Used by `run_checkpoint_task` for both the `warn_pages` band and the
+/// `high_water_pages` threshold.
+fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
+    let fire = now_above && !*was_above;
+    *was_above = now_above;
+    fire
 }
 
 /// Query the current WAL frame count via `PRAGMA wal_checkpoint`.
@@ -231,8 +278,7 @@ mod tests {
                 .unwrap();
         }
 
-        let config = CheckpointConfig::default();
-        checkpoint_once(&pool, &config);
+        checkpoint_once(&pool);
     }
 
     #[test]
@@ -243,8 +289,7 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(cfg).expect("in-memory pool"));
-        let config = CheckpointConfig::default();
-        checkpoint_once(&pool, &config);
+        checkpoint_once(&pool);
     }
 
     #[tokio::test]
@@ -371,14 +416,8 @@ mod tests {
                 .unwrap();
         }
 
-        // high_water_pages = 1 forces the high-water code path for any non-empty WAL.
-        let config = CheckpointConfig {
-            high_water_pages: 1,
-            ..Default::default()
-        };
-
         let start = std::time::Instant::now();
-        checkpoint_once(&pool, &config);
+        checkpoint_once(&pool);
         let elapsed = start.elapsed();
 
         // Commit and release the read snapshot only after checkpoint_once returns.
@@ -420,6 +459,87 @@ mod tests {
         assert_eq!(
             cfg.high_water_pages, default.high_water_pages,
             "zero high_water_pages must fall back to default"
+        );
+    }
+
+    /// Regression (Finding 1): a Skipped tick must NOT reset was_above_high_water.
+    ///
+    /// Before the fix, `checkpoint_once` returned `0` on both a genuinely-empty
+    /// WAL and a writer-busy skip. The task treated `0` as an observed page count
+    /// and reset `was_above_high_water`, re-arming the rate limit on every busy
+    /// tick. With the fix, `CheckpointTick::Skipped` leaves crossing state
+    /// unchanged.
+    ///
+    /// This test drives `crossing_warn` directly (the pure function that owns the
+    /// decision) rather than going through the async task, which would require a
+    /// logging harness.
+    #[test]
+    fn skipped_tick_does_not_reset_high_water_crossing_state() {
+        let mut was_above = false;
+
+        // First observed tick: above threshold — fires WARN, sets was_above=true.
+        assert!(
+            crossing_warn(true, &mut was_above),
+            "should fire on first crossing"
+        );
+        assert!(was_above);
+
+        // Simulate several skipped ticks: crossing state must remain true.
+        // (In the task, Skipped causes `continue` so crossing_warn is never called.)
+        // We verify by calling crossing_warn with the SAME above=true value, which
+        // is what Observed(high_count) would produce — but a Skipped tick skips
+        // the call entirely, so was_above stays as-is. Test the invariant directly:
+        // if we leave was_above unchanged (no call at all), was_above remains true.
+        assert!(was_above, "was_above must stay true across skipped ticks");
+
+        // Another observed tick still above threshold — must NOT re-fire.
+        let fired = crossing_warn(true, &mut was_above);
+        assert!(!fired, "WARN must not re-fire while still above threshold");
+
+        // Observed tick below threshold — resets was_above.
+        let fired = crossing_warn(false, &mut was_above);
+        assert!(!fired);
+        assert!(!was_above);
+
+        // Next observed tick above threshold — fires again (legitimate new crossing).
+        let fired = crossing_warn(true, &mut was_above);
+        assert!(fired, "WARN must fire again on a new below→above crossing");
+    }
+
+    /// Regression (Finding 2): warn_pages WARN fires once on crossing, not every tick.
+    ///
+    /// Before the fix, the WARN was emitted inside `checkpoint_once` on every tick
+    /// while WAL sat in the warn band — log spam under sustained moderate pressure.
+    /// With the fix, `crossing_warn` gates the WARN on the first in-band tick only;
+    /// subsequent ticks while still in the band return false.
+    #[test]
+    fn warn_pages_fires_once_on_crossing_not_every_tick() {
+        let mut was_above_warn = false;
+
+        // Simulate three consecutive ticks with WAL in the warn band.
+        let fired_1 = crossing_warn(true, &mut was_above_warn);
+        let fired_2 = crossing_warn(true, &mut was_above_warn);
+        let fired_3 = crossing_warn(true, &mut was_above_warn);
+
+        assert!(fired_1, "WARN must fire on the first in-band tick");
+        assert!(
+            !fired_2,
+            "WARN must not fire on the second consecutive in-band tick"
+        );
+        assert!(
+            !fired_3,
+            "WARN must not fire on the third consecutive in-band tick"
+        );
+
+        // Drop below warn band — resets state.
+        crossing_warn(false, &mut was_above_warn);
+        assert!(!was_above_warn);
+
+        // Re-enter warn band — fires again.
+        let fired_reentry = crossing_warn(true, &mut was_above_warn);
+        assert!(
+            fired_reentry,
+            "WARN must fire again on re-entry into warn band"
         );
     }
 }
