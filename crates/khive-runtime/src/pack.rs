@@ -849,7 +849,14 @@ impl VerbRegistry {
             .unwrap_or_else(|| self.default_namespace.clone());
         let ns = Namespace::parse(&ns_str)
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let gate_req = GateRequest::new(ActorRef::anonymous(), ns, verb, params.clone());
+        // ADR-057: thread the configured actor identity into the gate request so
+        // the gate can distinguish human vs agent callers at the dispatch seam.
+        // Mirrors the actor resolution used by the token-minting path below.
+        let gate_actor = match self.actor_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+            _ => ActorRef::anonymous(),
+        };
+        let gate_req = GateRequest::new(gate_actor, ns, verb, params.clone());
 
         // Consult the gate.
         //
@@ -2230,6 +2237,71 @@ mod tests {
         assert_eq!(ev.namespace, "tenant-q");
         assert_eq!(ev.verb, "list");
         assert_eq!(ev.actor.kind, "anonymous");
+    }
+
+    // ---- Actor attribution threading into gate request (ADR-057) ----
+
+    /// A gate spy that captures the raw `GateRequest` it receives.
+    #[derive(Default, Debug)]
+    struct ActorCapturingGate {
+        requests: std::sync::Mutex<Vec<GateRequest>>,
+    }
+
+    impl Gate for ActorCapturingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(GateDecision::allow())
+        }
+    }
+
+    /// When `actor_id` is configured, the gate request carries that actor, not
+    /// anonymous. This exercises the ADR-057 attribution fix: the gate can
+    /// distinguish an agent caller from an unauthenticated caller.
+    #[tokio::test]
+    async fn gate_request_carries_configured_actor_when_actor_id_is_set() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        builder.with_actor_id(Some("team-abc:implementer".to_string()));
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let reqs = gate.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(
+            req.actor.kind, "actor",
+            "gate request must carry kind='actor' when actor_id is configured"
+        );
+        assert_eq!(
+            req.actor.id, "team-abc:implementer",
+            "gate request must carry the configured actor id"
+        );
+    }
+
+    /// When no `actor_id` is configured, the gate request still receives the
+    /// anonymous actor (no regression to the party-line default).
+    #[tokio::test]
+    async fn gate_request_carries_anonymous_when_no_actor_id_configured() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        // actor_id left at default (None).
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let reqs = gate.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(
+            req.actor.kind, "anonymous",
+            "gate request must carry anonymous actor when no actor_id is configured"
+        );
+        assert_eq!(req.actor.id, "local");
     }
 
     // ---- Rego gate: fail-closed end-to-end (issue #30) ----
