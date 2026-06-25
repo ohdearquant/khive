@@ -21,7 +21,7 @@ pub mod sql_bridge;
 pub mod stores;
 
 pub use backend::StorageBackend;
-pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig};
+pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointTick};
 pub use error::SqliteError;
 pub use migrations::{
     inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
