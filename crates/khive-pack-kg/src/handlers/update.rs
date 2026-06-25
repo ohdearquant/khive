@@ -109,6 +109,15 @@ impl KgPack {
 
         match spec {
             KindSpec::Entity { specific } => {
+                // `content` is a note-only field; reject it explicitly so callers
+                // learn the correct field name rather than silently losing their edit.
+                if p.content.is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "field 'content' is not valid for an entity; \
+                         valid fields: name, description, tags, properties"
+                            .into(),
+                    ));
+                }
                 let entity = self.runtime.get_entity(token, id).await?;
                 if specific.as_ref().is_some_and(|k| entity.kind != *k) {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
@@ -124,6 +133,26 @@ impl KgPack {
                 )?))
             }
             KindSpec::Edge => {
+                // Reject non-edge fields explicitly; edges only accept relation, weight,
+                // properties. Silently dropping caller text fields is the same bug class
+                // this PR exists to kill.
+                let bad_field = if p.name.is_some() {
+                    Some("name")
+                } else if p.description.is_some() {
+                    Some("description")
+                } else if p.content.is_some() {
+                    Some("content")
+                } else if p.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                };
+                if let Some(field) = bad_field {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "field '{field}' is not valid for an edge; \
+                         valid fields: relation, weight, properties"
+                    )));
+                }
                 let relation = p.relation.as_deref().map(parse_relation).transpose()?;
                 let patch = EdgePatch {
                     relation,
@@ -133,6 +162,16 @@ impl KgPack {
                 to_json(&self.runtime.update_edge(token, id, patch).await?)
             }
             KindSpec::Note { specific } => {
+                // `description` is an entity-only field; reject it explicitly so
+                // callers learn the correct field name rather than silently losing
+                // their edit (CLAUDE.md: "Don't silently coerce invalid input").
+                if p.description.is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "field 'description' is not valid for a note; \
+                         valid fields: content, name, tags, properties, salience, decay_factor"
+                            .into(),
+                    ));
+                }
                 let note = self
                     .runtime
                     .notes(token)?
