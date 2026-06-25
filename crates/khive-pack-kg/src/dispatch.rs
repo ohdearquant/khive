@@ -56,7 +56,13 @@ impl PackRuntime for KgPack {
         let _ = self.runtime.embed("khive warmup").await;
     }
 
-    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
+    fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {
+        // Install the validator on the runtime this pack OWNS, not on the
+        // caller-supplied runtime.  In a multi-backend deployment the pack
+        // is constructed with a per-pack runtime (see PackRegistry::
+        // register_packs_with_runtimes); `self.runtime` is that runtime.
+        // In a single-backend deployment `self.runtime` IS the single
+        // runtime, so behaviour is identical to the previous call-through.
         let validator: EntityTypeValidatorFn = Arc::new(|kind, entity_type| {
             let Some(raw) = entity_type else {
                 return Ok(None);
@@ -68,7 +74,7 @@ impl PackRuntime for KgPack {
                 .resolve(ek, Some(raw))
                 .map(|r| r.entity_type)
         });
-        runtime.install_entity_type_validator(validator);
+        self.runtime.install_entity_type_validator(validator);
     }
 
     async fn dispatch(

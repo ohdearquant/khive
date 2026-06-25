@@ -80,6 +80,11 @@ static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 /// create_note_inner and create_many tests cannot disarm each other.
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
+/// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
 ///
@@ -101,6 +106,18 @@ pub fn arm_fts_fail(ns: &str) {
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many(ns: &str) {
     *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
+///
+/// The next `create_many` call whose namespace equals `ns` returns
+/// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
+/// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_fail_many_partial(ns: &str) {
+    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
@@ -3723,10 +3740,32 @@ impl KhiveRuntime {
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_many_inject = false;
 
+        // Partial-failure seam: returns Ok(summary) with failed > 0 so the
+        // `summary.failed > 0` rollback branch is exercised in tests.
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_many_inject_partial = {
+            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
+            if g.as_deref() == Some(ns) {
+                *g = None;
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_many_inject_partial = false;
+
         let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
             Err(RuntimeError::Internal(
                 "injected FTS failure for create_many".to_string(),
             ))
+        } else if fts_many_inject_partial {
+            Ok(BatchWriteSummary {
+                attempted: docs.len() as u64,
+                affected: docs.len().saturating_sub(1) as u64,
+                failed: 1,
+                first_error: "injected partial FTS failure for create_many".to_string(),
+            })
         } else {
             match self.text(token) {
                 Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
@@ -7628,6 +7667,71 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    // Round-3 Medium: FTS partial-failure (Ok(summary) with summary.failed > 0)
+    // rolls back both substrates.
+    //
+    // The production code has a distinct arm:
+    //   Ok(summary) if summary.failed > 0 => return Err(...)
+    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
+    // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
+    // Both entity rows and FTS rows must be empty after rollback.
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_rolls_back_both_substrates() {
+        let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "PartialRollbackA".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "PartialRollbackB".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        arm_fts_fail_many_partial(&ns);
+        let result = rt.create_many(&tok, specs).await;
+
+        assert!(
+            result.is_err(),
+            "create_many must return Err when FTS summary.failed > 0"
+        );
+
+        // Entity substrate must be empty — entity rows must have been rolled back.
+        let entity_rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            entity_rows.len(),
+            0,
+            "entity rows must be rolled back when FTS summary.failed > 0; found {entity_rows:?}"
+        );
+
+        // FTS substrate must be empty — no stale fts_entities rows.
+        let fts = rt.text(&tok).unwrap();
+        let fts_count = fts
+            .count(TextFilter {
+                ids: vec![],
+                kinds: vec![],
+                namespaces: vec![ns.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fts_count, 0,
+            "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
         );
     }
 

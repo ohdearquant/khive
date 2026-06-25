@@ -56,7 +56,10 @@ pub use objectives::{
     TemporalRecencyObjective, TextRelevanceObjective, VectorSimilarityObjective,
 };
 #[cfg(any(test, feature = "fault-injection"))]
-pub use operations::{arm_fts_fail, arm_fts_fail_many, arm_vector_fail, arm_vector_fail_after};
+pub use operations::{
+    arm_fts_fail, arm_fts_fail_many, arm_fts_fail_many_partial, arm_vector_fail,
+    arm_vector_fail_after,
+};
 pub use operations::{EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,

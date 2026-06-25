@@ -6863,6 +6863,83 @@ async fn create_many_runtime_validator_installed_via_pack_registration() {
     );
 }
 
+// ── Round-3 High: multi-backend per-pack runtime validator regression ──
+
+/// In a multi-backend deployment the KG pack is constructed with its OWN runtime
+/// (not the `default_runtime`).  After `call_register_entity_type_validators` the
+/// KG pack's per-pack runtime must reject an unknown `entity_type` — even though
+/// the call passes the `default_runtime`, not the per-pack one.
+///
+/// This is the production path: `PackRegistry::register_packs_with_runtimes` gives
+/// the `kg` pack its own runtime, then serve.rs calls
+/// `registry.call_register_entity_type_validators(&default_runtime)`.  Without the
+/// R3 fix (self.runtime install), the per-pack runtime has no validator and
+/// `runtime.create_many` with an unknown `entity_type` silently succeeds.
+#[tokio::test]
+async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backend() {
+    use khive_runtime::{EntityCreateSpec, PackRegistry};
+    use std::collections::HashMap;
+
+    // Two separate in-memory runtimes simulate a multi-backend deployment.
+    let default_runtime = KhiveRuntime::memory().expect("default runtime");
+    let kg_runtime = KhiveRuntime::memory().expect("kg per-pack runtime");
+
+    // Map "kg" → kg_runtime (the distinct per-pack backend).
+    let mut runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
+    runtimes.insert("kg".to_string(), kg_runtime.clone());
+
+    // Register packs the production way: kg uses kg_runtime, everything else uses default.
+    let mut builder = VerbRegistryBuilder::new();
+    PackRegistry::register_packs_with_runtimes(
+        &["kg".to_string()],
+        &runtimes,
+        &default_runtime,
+        &mut builder,
+    )
+    .expect("pack registration must succeed");
+
+    let registry = builder.build().expect("registry build must succeed");
+
+    // Install edge rules on both runtimes (mirrors serve.rs).
+    default_runtime.install_edge_rules(registry.all_edge_rules());
+    kg_runtime.install_edge_rules(registry.all_edge_rules());
+
+    // Install entity-type validators — serve.rs passes &default_runtime here.
+    // With the R3 fix KgPack ignores the arg and installs onto self.runtime
+    // (kg_runtime).  Without the fix kg_runtime has no validator.
+    registry.call_register_entity_type_validators(&default_runtime);
+
+    // Now drive create_many directly on the KG pack's OWN runtime with an
+    // unknown entity_type — no manual install_entity_type_validator call.
+    let tok = kg_runtime.authorize(Namespace::local()).expect("authorize");
+    let bad_specs = vec![EntityCreateSpec {
+        kind: "concept".into(),
+        entity_type: Some("not_a_registered_type".into()),
+        name: "ShouldBeRejected".into(),
+        description: None,
+        properties: None,
+        tags: vec![],
+    }];
+
+    let result = kg_runtime.create_many(&tok, bad_specs).await;
+    assert!(
+        matches!(result, Err(RuntimeError::InvalidInput(_))),
+        "per-pack runtime must reject unknown entity_type once the KG pack's \
+         register_entity_type_validator installs onto self.runtime; got {result:?}"
+    );
+
+    // Zero rows written.
+    let rows = kg_runtime
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        0,
+        "rejected create_many must write nothing; got {rows:?}"
+    );
+}
+
 // ── High-2: invalid entity_type in bulk items is rejected at the handler layer ──
 
 /// An invalid `entity_type` inside a bulk item must be rejected with the valid
