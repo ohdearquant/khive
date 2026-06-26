@@ -285,17 +285,24 @@ def test_read_outbound_rejection(proc):
     print("  [ok] read outbound rejection: error mentions outbound/direction")
 
 
-def test_cross_namespace_denial(proc):
-    """send with to='other-ns' → error containing 'cross' or 'namespace'."""
-    err = call_verb_expect_error(proc, "comm.send", {
+def test_actor_addressed_send(proc):
+    """send with to='other-ns' succeeds as actor-addressed delivery (ADR-057).
+
+    ADR-057 reinterpreted the `to` field as an actor label within the caller's
+    namespace. Cross-namespace denial was removed: both copies land in the
+    caller's namespace and the actor label is stored in `to_actor`. Sends to
+    any non-empty actor label must succeed.
+    """
+    result = call_verb(proc, "comm.send", {
         "to": "other-ns",
-        "content": "should be denied",
+        "content": "actor-addressed message",
     })
-    assert err, "expected a non-empty error message"
-    assert "cross" in err.lower() or "namespace" in err.lower(), (
-        f"error must mention 'cross' or 'namespace': {err!r}"
+    assert result.get("id"), f"send must return id: {result}"
+    assert result.get("full_id"), f"send must return full_id: {result}"
+    assert result.get("to") == "other-ns", (
+        f"to field must preserve the actor label: {result}"
     )
-    print("  [ok] cross-namespace denial: error mentions cross/namespace")
+    print("  [ok] actor-addressed send: to='other-ns' accepted (ADR-057)")
 
 
 def test_inbox_status_filter(proc):
@@ -417,7 +424,7 @@ def main():
         test_empty_content_rejection,
         test_empty_to_rejection,
         test_read_outbound_rejection,
-        test_cross_namespace_denial,
+        test_actor_addressed_send,
         test_inbox_status_filter,
         test_reply_to_non_message_note,
         test_thread_nonexistent_id,

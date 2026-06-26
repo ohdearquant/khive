@@ -305,7 +305,7 @@ def test_topic_list_all(proc):
         call_verb(proc, "knowledge.learn", {"name": name})
 
     result = call_verb(proc, "knowledge.topic", {})
-    items = result["items"]
+    items = result["results"]
     assert isinstance(items, list), f"expected list, got: {type(items)}"
     assert len(items) >= 3, f"expected at least 3 concepts, got {len(items)}: {items}"
     total = result["total"]
@@ -320,7 +320,7 @@ def test_topic_domain_filter(proc):
     call_verb(proc, "knowledge.learn", {"name": "KVCache", "domain": "inference"})
 
     result = call_verb(proc, "knowledge.topic", {"domain": "attention"})
-    items = result["items"]
+    items = result["results"]
     names = [i["name"] for i in items]
     assert len(items) == 2, f"expected 2 attention concepts, got {len(items)}: {names}"
     assert "MHA" in names, f"MHA missing: {names}"
@@ -334,7 +334,7 @@ def test_topic_domain_case_insensitive(proc):
     call_verb(proc, "knowledge.learn", {"name": "PagedAttention", "domain": "Attention"})
 
     result = call_verb(proc, "knowledge.topic", {"domain": "ATTENTION"})
-    items = result["items"]
+    items = result["results"]
     names = [i["name"] for i in items]
     assert any("PagedAttention" == n for n in names), (
         f"case-insensitive match must find PagedAttention: {names}"
@@ -354,7 +354,7 @@ def test_topic_with_query_fts(proc):
     })
 
     result = call_verb(proc, "knowledge.topic", {"query": "SpeculativeDecodingXYZ"})
-    items = result["items"]
+    items = result["results"]
     names = [i["name"] for i in items]
     assert any("SpeculativeDecodingXYZ" == n for n in names), (
         f"FTS query must find exact name match: {names}"
@@ -371,7 +371,7 @@ def test_topic_limit(proc):
         call_verb(proc, "knowledge.learn", {"name": f"LimitConcept{i}"})
 
     result = call_verb(proc, "knowledge.topic", {"limit": 2})
-    items = result["items"]
+    items = result["results"]
     total = result["total"]
     assert len(items) <= 2, f"limit=2 must return at most 2 items, got {len(items)}"
     assert total >= 5, (
