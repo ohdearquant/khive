@@ -22,7 +22,7 @@ const GOLDEN_TOLERANCE: f64 = 1e-6;
 
 /// Golden test corpus for reproducible scoring.
 fn setup_golden_corpus() -> Bm25Index {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     // Fixed corpus with known characteristics:
     // doc1: 4 tokens (quick, brown, fox, jumps)
     // doc2: 3 tokens (lazy, brown, dog)
@@ -136,7 +136,7 @@ fn golden_rare_term_high_idf() {
 #[test]
 fn golden_term_frequency_saturation() {
     // Test that repeated terms show saturation (TF component approaches k1+1=2.2)
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
 
     // doc1 has "test" once, doc2 has it 5 times
     index.index_document("doc1".to_string(), "test").unwrap();
@@ -183,7 +183,7 @@ fn golden_term_frequency_saturation() {
 #[test]
 fn golden_length_normalization() {
     // Test length normalization with same term frequency
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
 
     // Both have "test" once, but different lengths
     index.index_document("short".to_string(), "test").unwrap();

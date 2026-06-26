@@ -240,7 +240,7 @@ fn test_max_tf() {
 fn test_brute_force_search_various_sizes() {
     use crate::{Bm25Config, Bm25Index};
 
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
 
     // Index enough documents to exercise different batch sizes.
     // The word "alpha" appears in all 100 docs, giving a posting list of 100.
@@ -322,7 +322,7 @@ fn test_score_batch_scalar_8_matches_reference() {
 fn test_empty_posting_list_search() {
     use crate::{Bm25Config, Bm25Index};
 
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     index.index_document("doc1", "hello world").unwrap();
 
     // Search for a term not in the index.

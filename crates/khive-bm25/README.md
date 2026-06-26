@@ -18,7 +18,7 @@ acceleration.
 ```rust
 use khive_bm25::{Bm25Config, Bm25Index};
 
-let mut index = Bm25Index::new(Bm25Config::default());
+let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
 
 index.index_document("doc1", "the quick brown fox").unwrap();
 index.index_document("doc2", "the lazy dog").unwrap();
@@ -38,7 +38,7 @@ for (doc_id, score) in &results {
 
 ```rust
 let config = Bm25Config::new(2.0, 0.5);
-let index = Bm25Index::new(config);
+let index = Bm25Index::try_new(config).expect("valid config");
 ```
 
 Both parameters must be finite and non-negative. `b` must be in `[0.0, 1.0]`.

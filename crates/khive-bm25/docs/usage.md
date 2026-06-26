@@ -19,7 +19,7 @@ $$
 ```rust
 use khive_bm25::{Bm25Config, Bm25Index};
 
-let mut index = Bm25Index::new(Bm25Config::default());
+let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
 
 index.index_document("doc1", "the quick brown fox").unwrap();
 index.index_document("doc2", "the lazy dog").unwrap();
