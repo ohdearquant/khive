@@ -1,62 +1,80 @@
 """Canonical constants and closed sets for khive contract tests.
 
 These are facts derived from the ADRs — not generated at runtime.
+Test modules import from here so there is one source of truth.
 """
 
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Entity kind taxonomy (ADR-001)
+# Entity kind taxonomy (ADR-001 + ADR-048)
+# 8 base kinds + resource (ADR-048) = 9 total
+# Source of truth: crates/khive-pack-kg/src/vocab.rs EntityKind::NAMES
 # ---------------------------------------------------------------------------
 
 ENTITY_KINDS: frozenset[str] = frozenset(
     {
         "concept",
-        "person",
-        "project",
-        "tool",
         "document",
-        "event",
-        "location",
-        "organization",
+        "dataset",
+        "project",
+        "person",
+        "org",
+        "artifact",
+        "service",
         "resource",
-        "tag",
     }
 )
 
 # ---------------------------------------------------------------------------
 # Note kind taxonomy (ADR-013)
+# 5 canonical kinds — no aliases accepted
+# Source of truth: crates/khive-pack-kg/src/vocab.rs NoteKind::NAMES
 # ---------------------------------------------------------------------------
 
 NOTE_KINDS: frozenset[str] = frozenset(
     {
         "observation",
+        "insight",
         "question",
-        "hypothesis",
-        "conclusion",
+        "decision",
         "reference",
     }
 )
 
 # ---------------------------------------------------------------------------
-# Edge relation ontology (ADR-002)
+# Edge relation ontology (ADR-002 base 15 + ADR-055 epistemic 2 = 17 total)
+# Source of truth: crates/khive-types/src/edge.rs EdgeRelation::VALID_NAMES
 # ---------------------------------------------------------------------------
 
 EDGE_RELATIONS: frozenset[str] = frozenset(
     {
-        "extends",
-        "implements",
-        "depends_on",
-        "uses",
-        "produces",
-        "relates_to",
-        "contradicts",
-        "supersedes",
-        "annotates",
+        # Structure
         "contains",
         "part_of",
+        "instance_of",
+        # Derivation
+        "extends",
+        "variant_of",
+        "introduced_by",
+        "supersedes",
+        # Provenance
+        "derived_from",
+        # Temporal
+        "precedes",
+        # Dependency
+        "depends_on",
         "enables",
-        "blocks",
+        # Implementation
+        "implements",
+        # Lateral
+        "competes_with",
+        "composed_with",
+        # Annotation
+        "annotates",
+        # Epistemic (ADR-055)
+        "supports",
+        "refutes",
     }
 )
 
@@ -65,6 +83,8 @@ ANNOTATES_SOURCE_MUST_BE_NOTE = True
 
 # ---------------------------------------------------------------------------
 # Product verb manifest (ADR-023 / ADR-025 / ADR-027)
+# KG pack ships 16 verbs; bare names (no pack prefix).
+# Source of truth: crates/khive-pack-kg/src/handler_defs.rs KG_HANDLERS
 # ---------------------------------------------------------------------------
 
 KG_VERBS: frozenset[str] = frozenset(
@@ -80,6 +100,11 @@ KG_VERBS: frozenset[str] = frozenset(
         "neighbors",
         "traverse",
         "query",
+        "stats",
+        "propose",
+        "review",
+        "withdraw",
+        "verbs",
     }
 )
 
@@ -102,8 +127,9 @@ MEMORY_VERBS: frozenset[str] = frozenset(
 
 DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS | GTD_VERBS | MEMORY_VERBS
 
-# The play spec says "15 product verbs"; the baseline exposes 18.
-# DISCOVERABLE_PRODUCT_VERBS (18) subsumes the stated minimum (15).
+# The play spec says "15 product verbs"; the baseline exposes 23
+# (KG:16 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (23) subsumes
+# the stated minimum (15).
 PLAY_SPEC_MINIMUM_VERB_COUNT = 15
 
 # ---------------------------------------------------------------------------

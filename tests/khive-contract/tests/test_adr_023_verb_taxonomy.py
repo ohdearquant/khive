@@ -9,22 +9,26 @@ from __future__ import annotations
 import pytest
 
 from khive_contract.client import KhiveMcpSession
+from khive_contract.fixtures import KG_VERBS as _KG_VERBS
 
-# All 18 baseline product verbs
+# KG verbs imported from fixtures.py — single source of truth (16 verbs).
+KG_VERBS = tuple(sorted(_KG_VERBS))
+
+GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
+MEMORY_VERBS = ("memory.remember", "memory.recall")
+
+# All 23 baseline product verbs (KG:16 + GTD:5 + memory:2).
+# Written as a set literal so the manifest AST-introspector can parse it.
 VERBS_UNDER_TEST = {
-    # KG substrate (11) — bare names; no pack prefix
+    # KG substrate (16) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
+    "stats", "propose", "review", "withdraw", "verbs",
     # GTD (5) — dotted pack.verb form
     "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
     # Memory (2) — dotted pack.verb form
     "memory.remember", "memory.recall",
 }
-
-KG_VERBS = ("create", "get", "list", "update", "delete", "merge",
-            "search", "link", "neighbors", "traverse", "query")
-GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
-MEMORY_VERBS = ("memory.remember", "memory.recall")
 
 
 @pytest.mark.adr_023

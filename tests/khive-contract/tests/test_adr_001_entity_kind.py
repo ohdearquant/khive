@@ -1,7 +1,7 @@
 """Entity kind taxonomy contract tests.
 
 ADR: ADR-001
-section: Entity kinds closed-set registry; MCP verb resolution; Registry contract
+section: 9 entity kinds closed-set registry; MCP verb resolution; Registry contract
 """
 
 from __future__ import annotations
@@ -9,11 +9,13 @@ from __future__ import annotations
 import pytest
 
 from khive_contract.client import KhiveMcpSession, KhiveOperationError
+from khive_contract.fixtures import ENTITY_KINDS
 
 VERBS_UNDER_TEST = {"create", "list", "get"}
 
-# Runtime-confirmed entity kinds (6 legacy kinds; ADR-001 spec adds artifact/service as drift)
-RUNTIME_ENTITY_KINDS = ("concept", "document", "project", "dataset", "person", "org")
+# All 9 entity kinds confirmed in the runtime (ADR-001 base 8 + ADR-048 resource).
+# Imported from fixtures.py — single source of truth.
+RUNTIME_ENTITY_KINDS = tuple(sorted(ENTITY_KINDS))
 
 
 @pytest.mark.adr_001
@@ -28,7 +30,7 @@ def test_create_list_get_each_entity_kind(
     """Create, list-filtered, and get each runtime entity kind.
 
     ADR: ADR-001
-    section: 8 entity kinds / MCP verb resolution
+    section: 9 entity kinds / MCP verb resolution
 
     Each create returns an id and name; list filtered by that entity_kind contains
     the returned id; get returns a kind=="entity" wrapper with matching data.
@@ -79,7 +81,7 @@ def test_invalid_entity_kind_reports_closed_set(
     section: Registry contract
 
     The error must name 'galaxy' and list all valid entity kinds so agents
-    can self-correct.  Currently the runtime exposes 6 legacy kinds.
+    can self-correct.  The runtime exposes all 9 entity kinds.
     """
     envelope = khive_session.request_batch([
         {"tool": "create", "args": {
