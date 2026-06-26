@@ -663,41 +663,42 @@ async fn upsert_entities(
     let store = runtime.entities(&token).context("opening entity store")?;
     let text = runtime.text(&token).context("opening text store")?;
 
-    // Phase 1: build Entity and FTS doc Vecs in one pass.
+    // Convert and write SYNC_CHUNK_SIZE records at a time so that peak
+    // converted-buffer memory is O(SYNC_CHUNK_SIZE), not O(records.len()).
     // Field mapping is identical to the previous per-row loop so that
     // sync, create, update, merge, and reindex produce identical shapes.
-    let mut entities_buf = Vec::with_capacity(records.len());
-    let mut docs_buf = Vec::with_capacity(records.len());
-    for r in records {
-        let created_at = parse_ts_micros(r.created_at.as_deref());
-        let updated_at = parse_ts_micros(r.updated_at.as_deref());
-        let entity = khive_storage::entity::Entity {
-            id: r.id,
-            namespace: namespace.to_string(),
-            kind: r.kind.clone(),
-            entity_type: None,
-            name: r.name.clone(),
-            description: r.description.clone(),
-            properties: r.properties.clone(),
-            tags: r.tags.clone(),
-            created_at,
-            updated_at,
-            deleted_at: None,
-            merge_event_id: None,
-            merged_into: None,
-        };
-        // Use the canonical FTS document constructor so sync, create, update,
-        // merge, and reindex all produce identical document shapes.
-        let fts_doc = entity_fts_document(&entity);
-        entities_buf.push(entity);
-        docs_buf.push(fts_doc);
-    }
-
-    // Phase 2: entity rows — one BEGIN IMMEDIATE / COMMIT per chunk.
     let mut count = 0usize;
-    for chunk in entities_buf.chunks(SYNC_CHUNK_SIZE) {
+    for chunk in records.chunks(SYNC_CHUNK_SIZE) {
+        let mut entities_chunk = Vec::with_capacity(chunk.len());
+        let mut docs_chunk = Vec::with_capacity(chunk.len());
+        for r in chunk {
+            let created_at = parse_ts_micros(r.created_at.as_deref());
+            let updated_at = parse_ts_micros(r.updated_at.as_deref());
+            let entity = khive_storage::entity::Entity {
+                id: r.id,
+                namespace: namespace.to_string(),
+                kind: r.kind.clone(),
+                entity_type: None,
+                name: r.name.clone(),
+                description: r.description.clone(),
+                properties: r.properties.clone(),
+                tags: r.tags.clone(),
+                created_at,
+                updated_at,
+                deleted_at: None,
+                merge_event_id: None,
+                merged_into: None,
+            };
+            // Use the canonical FTS document constructor so sync, create, update,
+            // merge, and reindex all produce identical document shapes.
+            let fts_doc = entity_fts_document(&entity);
+            entities_chunk.push(entity);
+            docs_chunk.push(fts_doc);
+        }
+
+        // Entity rows — one BEGIN IMMEDIATE / COMMIT per chunk.
         let summary = store
-            .upsert_entities(chunk.to_vec())
+            .upsert_entities(entities_chunk)
             .await
             .context("batch upsert entities")?;
         if summary.failed > 0 {
@@ -709,14 +710,12 @@ async fn upsert_entities(
             ));
         }
         count += summary.affected as usize;
-    }
 
-    // Phase 3: FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
-    // Vectors are intentionally skipped: they are local-only derived state
-    // and will be computed by `kkernel kg embed` when needed.
-    for chunk in docs_buf.chunks(SYNC_CHUNK_SIZE) {
+        // FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
+        // Vectors are intentionally skipped: they are local-only derived state
+        // and will be computed by `kkernel kg embed` when needed.
         let summary = text
-            .upsert_documents(chunk.to_vec())
+            .upsert_documents(docs_chunk)
             .await
             .context("batch FTS upsert")?;
         if summary.failed > 0 {
@@ -740,41 +739,40 @@ async fn upsert_edges(
     let token = runtime.authorize(ns)?;
     let graph = runtime.graph(&token).context("opening graph store")?;
 
-    // Build all Edge structs first (same construction as the previous loop body).
+    // Convert and write SYNC_CHUNK_SIZE edges at a time so that peak
+    // converted-buffer memory is O(SYNC_CHUNK_SIZE), not O(records.len()).
     // Edge relation validation already ran in run_sync before the tmp DB was
     // created, so parse() here should always succeed.
-    let mut edge_buf = Vec::with_capacity(records.len());
-    for r in records {
-        let relation: EdgeRelation = r
-            .relation
-            .parse()
-            .map_err(|e| anyhow!("invalid relation {:?}: {}", r.relation, e))?;
-        let created_at =
-            chrono::DateTime::from_timestamp_micros(parse_ts_micros(r.created_at.as_deref()))
-                .unwrap_or_else(chrono::Utc::now);
-        let edge = Edge {
-            id: LinkId::from(r.edge_id),
-            namespace: namespace.to_string(),
-            source_id: r.source,
-            target_id: r.target,
-            relation,
-            weight: r.weight,
-            created_at,
-            updated_at: created_at,
-            deleted_at: None,
-            metadata: None,
-            target_backend: None,
-        };
-        edge_buf.push(edge);
-    }
-
-    // One BEGIN IMMEDIATE / COMMIT per SYNC_CHUNK_SIZE edges.
     // upsert_edges rolls back the entire chunk on the first storage error
     // and returns Err, which propagates via ? without advancing count.
     let mut count = 0usize;
-    for chunk in edge_buf.chunks(SYNC_CHUNK_SIZE) {
+    for chunk in records.chunks(SYNC_CHUNK_SIZE) {
+        let mut edge_chunk = Vec::with_capacity(chunk.len());
+        for r in chunk {
+            let relation: EdgeRelation = r
+                .relation
+                .parse()
+                .map_err(|e| anyhow!("invalid relation {:?}: {}", r.relation, e))?;
+            let created_at =
+                chrono::DateTime::from_timestamp_micros(parse_ts_micros(r.created_at.as_deref()))
+                    .unwrap_or_else(chrono::Utc::now);
+            let edge = Edge {
+                id: LinkId::from(r.edge_id),
+                namespace: namespace.to_string(),
+                source_id: r.source,
+                target_id: r.target,
+                relation,
+                weight: r.weight,
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            };
+            edge_chunk.push(edge);
+        }
         let summary = graph
-            .upsert_edges(chunk.to_vec())
+            .upsert_edges(edge_chunk)
             .await
             .context("batch upsert edges")?;
         count += summary.affected as usize;
