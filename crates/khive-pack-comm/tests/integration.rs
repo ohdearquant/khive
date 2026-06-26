@@ -3706,30 +3706,15 @@ async fn t_c2_inbox_isolation_cross_actor() {
     );
 }
 
-/// Executable spec for issue #224 (Gate actor identity gap).
+/// Verifies that the configured actor identity reaches the gate (issue #224 fix).
 ///
-/// DESIRED behavior: when `actor_id = "lambda:tenant-x"` is configured on the
-/// registry, `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a
-/// cloud TenantGate can enforce per-actor policies.
-///
-/// CURRENT behavior: `VerbRegistry::dispatch` passes `ActorRef::anonymous()`
-/// (id = "local") to the gate regardless of the configured `actor_id`
-/// (pack.rs:852). The configured actor is used only AFTER the gate consult
-/// to mint the NamespaceToken for storage access — the gate never sees it.
-///
-/// This test is marked `#[ignore]` because it asserts the DESIRED behavior that
-/// is NOT yet implemented. It will become passing once the architectural fix
-/// tracked in issue #224 is implemented (threading authenticated actor identity
-/// into `VerbRegistry::dispatch` before the gate consult).
-///
-/// DO NOT DELETE this test. It is an executable contract spec: when issue #224
-/// is resolved and the `#[ignore]` is removed, the CI gate will verify the fix.
+/// When `actor_id = "lambda:tenant-x"` is set on the `VerbRegistryBuilder`, the
+/// `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a cloud
+/// `TenantGate` can enforce per-actor policies. Fixed in PR #234 by threading the
+/// configured actor into `VerbRegistry::dispatch` before the gate consult.
 ///
 /// See: https://github.com/ohdearquant/khive/issues/224
 #[tokio::test]
-#[ignore = "issue #224: GateRequest.actor is always ActorRef::anonymous() today; \
-             removing #[ignore] gates the architectural fix (pack.rs:852 must pass \
-             configured actor_id to GateRequest, not ActorRef::anonymous())"]
 async fn t_c2_gate_receives_configured_actor_not_anonymous() {
     use khive_runtime::{Gate, GateDecision, GateError, GateRef, GateRequest};
     use std::sync::Mutex;
