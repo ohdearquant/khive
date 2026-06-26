@@ -196,7 +196,7 @@ The memory pack is a thin pack over the notes substrate. It declares:
 - **Vocabulary**: one note kind (`memory`); no entity kinds; no new edge endpoint rules
   (the existing `annotates` rule from the kg pack accepts any note→any-substrate target,
   which covers `memory→entity` and `memory→note` provenance edges)
-- **Verbs**: `remember`, `recall`
+- **Verbs**: `remember`, `recall`, `feedback`, `prune`, `vacuum`
 - **Storage profile**: hot tier (same as kg/gtd packs); `default_backend="main"`
 - **Requires**: `kg` (memory pack delegates CRUD to kg-pack note handlers)
 

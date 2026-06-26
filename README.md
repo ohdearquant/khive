@@ -18,19 +18,19 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 ## What you get
 
-| Capability                  | How                                                                                                                      |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| **67 verbs, 7 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge — all load by default                                                  |
-| **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                            |
-| **Typed edges**             | 15 closed relations in 8 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation) |
-| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                      |
-| **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths |
-| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                   |
-| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                        |
-| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                               |
-| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                        |
-| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                               |
-| **Namespace attribution**   | Every record stamped with a namespace; one shared store in OSS, tenant isolation enforced at the Gate in cloud           |
+| Capability                  | How                                                                                                                                 |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **67 verbs, 7 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge — all load by default                                                             |
+| **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                       |
+| **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic) |
+| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                 |
+| **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths            |
+| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                              |
+| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                                   |
+| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                                          |
+| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                                   |
+| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                                          |
+| **Namespace attribution**   | Every record stamped with a namespace; one shared store in OSS, tenant isolation enforced at the Gate in cloud                      |
 
 ---
 
