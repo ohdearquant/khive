@@ -974,15 +974,25 @@ async fn dispatch_via_coordinator_inner(
                         None
                     }
                 });
-            let tags_owned: Vec<String> = args_value
-                .get("tags")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Parse tags strictly: absent/null → no filter (empty Vec); present and
+            // valid Vec<String> → use as-is (including empty array → no filter);
+            // present but not a Vec<String> → reject with a per-op error so the
+            // multi-backend path matches single-backend behaviour, which rejects
+            // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
+            // filter_map(as_str) would silently drop non-string entries and produce
+            // an empty Vec, bypassing the filter and returning unfiltered results.
+            let tags_owned: Vec<String> = match args_value.get("tags") {
+                None | Some(Value::Null) => vec![],
+                Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return Some(Err((
+                            "search".to_string(),
+                            json!("tags must be an array of strings"),
+                        )));
+                    }
+                },
+            };
 
             let coord_result = coord
                 .fan_out_search(

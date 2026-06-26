@@ -335,6 +335,57 @@ pub(crate) mod tests {
         );
     }
 
+    /// T6d: A multi-backend search with a malformed `tags` value must return a
+    /// per-op error (`ok: false`) rather than silently returning unfiltered results.
+    ///
+    /// Single-backend rejects malformed tags via `SearchParams` deserialisation
+    /// (RuntimeError::InvalidInput → `ok: false`).  Multi-backend must match that
+    /// contract: the server must reject before reaching the coordinator, not silently
+    /// collapse the filter to an empty Vec.
+    ///
+    /// This test FAILS against the old `filter_map(as_str)` code (which would call
+    /// the coordinator with an empty tags Vec and return `ok: true, result: []`),
+    /// and PASSES after the strict `serde_json::from_value::<Vec<String>>` fix.
+    #[tokio::test]
+    async fn t6d_malformed_tags_return_per_op_error_in_multi_backend() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        // Pass a non-string entry in the tags array; the strict parser must reject this.
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="anything", tags=[42])"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+            })
+            .await
+            .expect("T6d: dispatch must not return an MCP-level error");
+
+        let result_val: serde_json::Value =
+            serde_json::from_str(&raw).expect("T6d: response must be valid JSON");
+        let first = result_val
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .expect("T6d: results array must be non-empty");
+        assert_eq!(
+            first.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "T6d: malformed tags must produce ok=false; got {:?}",
+            first
+        );
+        // The coordinator must NOT have been called — rejection happens before dispatch.
+        assert!(
+            !coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6d: coordinator must not be reached when tags validation fails"
+        );
+    }
+
     /// T6c: A single-backend server must NOT route through the coordinator.
     ///
     /// When the coordinator reports `is_single_backend() == true`, the zero-change
