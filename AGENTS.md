@@ -247,7 +247,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-resource-entity-kind.md))
+## The 9 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md), [ADR-048](docs/adr/ADR-048-knowledge-section-profiles.md))
 
 | Kind       | What it represents                                                         |
 | ---------- | -------------------------------------------------------------------------- |
@@ -353,7 +353,7 @@ These are the KG pack verbs. Other packs are documented in their verb tables abo
 | `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots                                                                                                                                                                            | `{"roots":["<uuid>"],"max_depth":2}`                         |
 | `query`     | **query** (GQL or SPARQL string) — **read-only**: write-shaped input (SPARQL `INSERT`/`DELETE`/`LOAD`, GQL/Cypher `CREATE`/`DELETE`/`SET`/`MERGE`) is rejected; use `create`, `update`, `link`, `merge`, `delete` to mutate                      | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
 | `propose`   | **kind** (entity\|note\|edge), fields for the proposed change                                                                                                                                                                                    | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
-| `review`    | **id** (proposal UUID), **verdict** (approve\|reject); comment                                                                                                                                                                                   | `{"id":"<uuid>","verdict":"approve"}`                        |
+| `review`    | **id** (proposal UUID), **decision** (approve\|reject\|comment\|request_changes); comment                                                                                                                                                        | `{"id":"<uuid>","decision":"approve"}`                       |
 | `withdraw`  | **id** (proposal UUID)                                                                                                                                                                                                                           | `{"id":"<uuid>"}`                                            |
 
 ### When to use which retrieval verb
@@ -530,13 +530,13 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 
 ## Daemon and warm startup
 
-khive-mcp auto-spawns a background daemon (`khive-mcp --daemon`) on the first request. The daemon
-keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall` are fast on
-subsequent calls. Users do not need to configure or manage the daemon — it starts automatically and
-cleans up on exit.
+The `kkernel` binary auto-spawns a background daemon (`kkernel mcp --daemon`) on the first request.
+The daemon keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall`
+are fast on subsequent calls. Users do not need to configure or manage the daemon — it starts
+automatically and cleans up on exit.
 
 The daemon communicates over a Unix socket (`khived.sock`). If you see stale-process errors after a
-rebuild, kill zombie processes: `pkill -f khive-mcp` then reconnect.
+rebuild, kill zombie processes: `pkill -f kkernel` then reconnect.
 
 ---
 

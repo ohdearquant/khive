@@ -259,7 +259,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
 
 ### MCP tool changes
 
-- The MCP server exposes exactly one tool: `request` (ADR-027). There are no per-verb tool
+- The MCP server exposes exactly one tool: `request` (ADR-016). There are no per-verb tool
   files — the only schema in `crates/khive-mcp/src/tools/` is `request.rs` (the `RequestParams`
   struct).
 - DSL parsing lives in the `khive-request` crate (ADR-028). Edits to the parser go there,
@@ -267,7 +267,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
 - MCP server (`crates/khive-mcp/src/server.rs`) is a thin dispatch shell — calls
   `khive_request::parse_request`, then routes each parsed op through the registry. No
   business logic.
-- **Verb handler logic lives in the pack** (`crates/khive-pack-kg/src/handlers.rs`).
+- **Verb handler logic lives in the pack** (`crates/khive-pack-kg/src/handlers/`).
 - Runtime methods live in `crates/khive-runtime/src/operations.rs` (or `curation.rs`,
   `retrieval.rs`, `graph_traversal.rs`).
 - **Invalid DSL** (parse/lex failure) returns RPC-level `McpError::invalid_params` from
@@ -367,20 +367,20 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ## What lives where
 
-| Want to do...                                               | Edit this                                                                                                                             |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Add a new verb                                              | Pack handler in `crates/khive-pack-kg/src/handlers.rs` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
-| Change DSL syntax                                           | `crates/khive-request/src/lib.rs` + unit tests (ADR-016)                                                                              |
-| Change MCP surface shape                                    | `crates/khive-mcp/src/server.rs` (ADR-016 — `request` is the only tool)                                                               |
-| Add a runtime operation                                     | `crates/khive-runtime/src/operations.rs`                                                                                              |
-| Change DB schema                                            | New `crates/khive-db/sql/NNN-<name>.sql` file + register it as a new `VersionedMigration` in `crates/khive-db/src/migrations.rs`      |
-| Add a new entity kind                                       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                               |
-| Add a new edge relation                                     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                  |
-| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"); additive only             |
-| Add a new note kind                                         | `crates/khive-pack-kg/src/vocab.rs` + ADR-013 amendment                                                                               |
-| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` ([ADR-017](docs/adr/ADR-017-pack-standard.md))                                          |
-| Fix a query parser bug                                      | `crates/khive-query/src/parsers/` + add regression test                                                                               |
-| Fix a storage bug                                           | `crates/khive-db/src/stores/` + test                                                                                                  |
+| Want to do...                                               | Edit this                                                                                                                           |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Add a new verb                                              | Pack handler in `crates/khive-pack-kg/src/handlers/` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
+| Change DSL syntax                                           | `crates/khive-request/src/lib.rs` + unit tests (ADR-016)                                                                            |
+| Change MCP surface shape                                    | `crates/khive-mcp/src/server.rs` (ADR-016 — `request` is the only tool)                                                             |
+| Add a runtime operation                                     | `crates/khive-runtime/src/operations.rs`                                                                                            |
+| Change DB schema                                            | New `crates/khive-db/sql/NNN-<name>.sql` file + register it as a new `VersionedMigration` in `crates/khive-db/src/migrations.rs`    |
+| Add a new entity kind                                       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                             |
+| Add a new edge relation                                     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                |
+| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"); additive only           |
+| Add a new note kind                                         | `crates/khive-pack-kg/src/vocab.rs` + ADR-013 amendment                                                                             |
+| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` ([ADR-017](docs/adr/ADR-017-pack-standard.md))                                        |
+| Fix a query parser bug                                      | `crates/khive-query/src/parsers/` + add regression test                                                                             |
+| Fix a storage bug                                           | `crates/khive-db/src/stores/` + test                                                                                                |
 
 ---
 
