@@ -1,0 +1,23 @@
+[project]
+name = "khive-contract"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8",
+    "pytest-benchmark>=4",
+    "jsonschema>=4",
+    "anyio>=4",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
