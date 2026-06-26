@@ -1180,3 +1180,278 @@ async fn batch_neighbors_both_chunk_boundary() {
         "Both chunk-boundary with limit=1: must return exactly 1 hit per source"
     );
 }
+
+// ---- per-root limit regression (codex-mandated) ----
+
+/// Regression guard for the per-root `limit` regression introduced when N
+/// roots were batched into a single CTE with one global SQL LIMIT.
+///
+/// Graph: A→B and C→D (two independent chains).  With `limit=1` and
+/// `include_roots=false`, EVERY root must receive its own capped result —
+/// not just the lexicographically-first root_id.
+///
+/// This test FAILs on the pre-fix code (global LIMIT returns 1 row total,
+/// so only one root gets a path) and PASSes after the fix (Rust-level
+/// per-root truncation after SQL returns all rows).
+#[tokio::test]
+async fn test_traverse_per_root_limit_capped_independently() {
+    let store = setup_memory_store();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let d = Uuid::new_v4();
+
+    // Two independent one-hop chains: A→B and C→D.
+    store
+        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let request = TraversalRequest {
+        roots: vec![a, c],
+        options: TraversalOptions {
+            max_depth: 2,
+            direction: Direction::Out,
+            relations: None,
+            min_weight: None,
+            limit: Some(1),
+        },
+        include_roots: false,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+
+    // Both roots must produce a path — global SQL LIMIT would drop one.
+    assert_eq!(
+        paths.len(),
+        2,
+        "both roots must produce a path even with limit=1 \
+         (per-root cap, not global cap)"
+    );
+
+    // Each root gets exactly one node.
+    for path in &paths {
+        assert_eq!(
+            path.nodes.len(),
+            1,
+            "root {:?}: limit=1 must cap to exactly one non-root node",
+            path.root_id
+        );
+    }
+
+    // Correct child per root.
+    let path_a = paths.iter().find(|p| p.root_id == a).expect("path for A");
+    let path_c = paths.iter().find(|p| p.root_id == c).expect("path for C");
+    assert_eq!(path_a.nodes[0].node_id, b, "root A must reach child B");
+    assert_eq!(path_c.nodes[0].node_id, d, "root C must reach child D");
+}
+
+// ---- batch == per-root decomposition equivalence tests ----
+
+/// Equivalence fixture: for a small deterministic graph, batched
+/// `traverse([A, E])` must produce the same per-root results as running
+/// `traverse([A])` and `traverse([E])` independently.
+///
+/// The fixture exercises a matrix of parameters:
+///   include_roots ∈ {true, false}
+///   with and without a relation filter
+///   with and without min_weight
+///   with a finite limit  ← catches the Major per-root-limit bug class
+///
+/// Graph (two independent linear chains — no diamond — so via_edge is
+/// unambiguous and the comparison is exact field-by-field):
+///   A → B (w=0.9) → C (w=0.8) → D (w=0.7)   [relation: Extends]
+///   E → F (w=0.6) → G (w=0.5)                [relation: Extends]
+#[tokio::test]
+async fn test_traverse_batch_equals_per_root_decomposition() {
+    let store = setup_memory_store();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let d = Uuid::new_v4();
+    let e = Uuid::new_v4();
+    let f = Uuid::new_v4();
+    let g = Uuid::new_v4();
+
+    for (src, tgt, w) in [
+        (a, b, 0.9_f64),
+        (b, c, 0.8),
+        (c, d, 0.7),
+        (e, f, 0.6),
+        (f, g, 0.5),
+    ] {
+        store
+            .upsert_edge(make_edge(src, tgt, EdgeRelation::Extends, w))
+            .await
+            .unwrap();
+    }
+
+    // Sort PathNode by (depth, node_id) so the comparison is stable even
+    // if SQLite returns same-depth nodes in different orders between calls.
+    let sort_nodes = |nodes: &mut Vec<khive_storage::types::PathNode>| {
+        nodes.sort_by_key(|n| (n.depth, n.node_id));
+    };
+
+    // (include_roots, direction, relation_filter, min_weight, limit)
+    // Direction is Clone but not Copy, so we build TraversalOptions per iteration.
+    struct Case {
+        include_roots: bool,
+        direction: Direction,
+        relation_filter: Option<EdgeRelation>,
+        min_weight: Option<f64>,
+        limit: Option<u32>,
+    }
+    let cases = [
+        Case {
+            include_roots: false,
+            direction: Direction::Out,
+            relation_filter: None,
+            min_weight: None,
+            limit: None,
+        },
+        Case {
+            include_roots: true,
+            direction: Direction::Out,
+            relation_filter: None,
+            min_weight: None,
+            limit: None,
+        },
+        Case {
+            include_roots: false,
+            direction: Direction::Out,
+            relation_filter: None,
+            min_weight: None,
+            limit: Some(1),
+        },
+        Case {
+            include_roots: false,
+            direction: Direction::Out,
+            relation_filter: None,
+            min_weight: None,
+            limit: Some(2),
+        },
+        Case {
+            include_roots: false,
+            direction: Direction::Out,
+            relation_filter: Some(EdgeRelation::Extends),
+            min_weight: None,
+            limit: None,
+        },
+        Case {
+            include_roots: false,
+            direction: Direction::Out,
+            relation_filter: None,
+            min_weight: Some(0.65),
+            limit: None,
+        },
+    ];
+
+    for case in &cases {
+        let opts = TraversalOptions {
+            max_depth: 4,
+            direction: case.direction.clone(),
+            relations: case.relation_filter.map(|r| vec![r]),
+            min_weight: case.min_weight,
+            limit: case.limit,
+        };
+
+        let batched = store
+            .traverse(TraversalRequest {
+                roots: vec![a, e],
+                options: opts.clone(),
+                include_roots: case.include_roots,
+            })
+            .await
+            .unwrap();
+        let single_a = store
+            .traverse(TraversalRequest {
+                roots: vec![a],
+                options: opts.clone(),
+                include_roots: case.include_roots,
+            })
+            .await
+            .unwrap();
+        let single_e = store
+            .traverse(TraversalRequest {
+                roots: vec![e],
+                options: opts,
+                include_roots: case.include_roots,
+            })
+            .await
+            .unwrap();
+
+        for (root_id, single_result) in [(a, &single_a), (e, &single_e)] {
+            let batch_path = batched.iter().find(|p| p.root_id == root_id);
+            let single_path = single_result.first();
+
+            let label = format!(
+                "root={root_id:?} params=(include_roots={},dir={:?},rel={:?},\
+                 min_w={:?},limit={:?})",
+                case.include_roots,
+                case.direction,
+                case.relation_filter,
+                case.min_weight,
+                case.limit,
+            );
+
+            match (batch_path, single_path) {
+                (None, None) => {}
+                (Some(bp), Some(sp)) => {
+                    let mut bn = bp.nodes.clone();
+                    let mut sn = sp.nodes.clone();
+                    sort_nodes(&mut bn);
+                    sort_nodes(&mut sn);
+
+                    assert_eq!(
+                        bn.len(),
+                        sn.len(),
+                        "{label}: node count mismatch batch={} single={}",
+                        bn.len(),
+                        sn.len()
+                    );
+                    for (bi, si) in bn.iter().zip(sn.iter()) {
+                        assert_eq!(
+                            bi.node_id, si.node_id,
+                            "{label}: node_id mismatch at depth {}",
+                            bi.depth
+                        );
+                        assert_eq!(
+                            bi.depth, si.depth,
+                            "{label}: depth mismatch for node {}",
+                            bi.node_id
+                        );
+                        assert_eq!(
+                            bi.via_edge, si.via_edge,
+                            "{label}: via_edge mismatch for node {}",
+                            bi.node_id
+                        );
+                    }
+                    assert!(
+                        (bp.total_weight - sp.total_weight).abs() < 1e-9,
+                        "{label}: total_weight mismatch batch={} single={}",
+                        bp.total_weight,
+                        sp.total_weight
+                    );
+                }
+                (None, Some(sp)) => {
+                    panic!(
+                        "{label}: batch missing path that single found ({} nodes)",
+                        sp.nodes.len()
+                    );
+                }
+                (Some(bp), None) => {
+                    panic!(
+                        "{label}: batch has path ({} nodes) that single didn't produce",
+                        bp.nodes.len()
+                    );
+                }
+            }
+        }
+    }
+}

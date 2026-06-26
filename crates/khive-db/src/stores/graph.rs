@@ -1052,15 +1052,9 @@ impl GraphStore for SqlGraphStore {
             if let Some(min_w) = opts.min_weight {
                 extra_params.push(Box::new(min_w));
                 weight_cond = format!(" AND e.weight >= ?{extra_param_idx}");
-                extra_param_idx += 1;
+                // extra_param_idx would advance here if more params followed;
+                // limit is now applied in Rust (see below), so no SQL param needed.
             }
-
-            let limit_clause = if let Some(lim) = opts.limit {
-                extra_params.push(Box::new(lim as i64));
-                format!(" LIMIT ?{extra_param_idx}")
-            } else {
-                String::new()
-            };
 
             // Seed rows: one per root, each referencing its own param 3× (root_id,
             // node_id, and the initial path string all carry the same UUID).
@@ -1092,7 +1086,7 @@ impl GraphStore for SqlGraphStore {
                  ) \
                  SELECT root_id, node_id, edge_id, depth, total_weight \
                  FROM traversal WHERE depth > 0 \
-                 ORDER BY root_id, depth{limit}",
+                 ORDER BY root_id, depth",
                 seeds = seeds,
                 next_node = next_node,
                 join_condition = join_condition,
@@ -1100,7 +1094,6 @@ impl GraphStore for SqlGraphStore {
                 depth = depth_param,
                 rel_cond = relation_cond,
                 wt_cond = weight_cond,
-                limit = limit_clause,
             );
 
             // Build the flat param list matching the layout above.
@@ -1125,22 +1118,28 @@ impl GraphStore for SqlGraphStore {
                 Ok((root_str, node_str, edge_str, depth, total_weight))
             })?;
 
-            // Accumulate per-root state: (nodes, max_weight, seen_set).
-            let mut root_data: HashMap<Uuid, (Vec<PathNode>, f64, HashSet<Uuid>)> =
+            // Accumulate per-root state: (nodes_with_path_weight, seen_set).
+            // Each entry carries the PathNode and its cumulative path weight from
+            // the SQL row, so the Rust-level per-root limit truncation can compute
+            // an accurate max_weight over the kept nodes.
+            let mut root_data: HashMap<Uuid, (Vec<(PathNode, f64)>, HashSet<Uuid>)> =
                 HashMap::with_capacity(n_roots);
 
             // Pre-seed with root nodes when include_roots is set.
             for root_id in &roots {
-                let (nodes, _, seen) = root_data.entry(*root_id).or_default();
+                let (nodes, seen) = root_data.entry(*root_id).or_default();
                 if include_roots {
                     seen.insert(*root_id);
-                    nodes.push(PathNode {
-                        node_id: *root_id,
-                        via_edge: None,
-                        depth: 0,
-                        name: None,
-                        kind: None,
-                    });
+                    nodes.push((
+                        PathNode {
+                            node_id: *root_id,
+                            via_edge: None,
+                            depth: 0,
+                            name: None,
+                            kind: None,
+                        },
+                        0.0,
+                    ));
                 }
             }
 
@@ -1152,34 +1151,45 @@ impl GraphStore for SqlGraphStore {
                 let root_id = parse_uuid(&root_str)?;
                 let node_id = parse_uuid(&node_str)?;
 
-                let (nodes, max_weight, seen) = root_data.entry(root_id).or_default();
+                let (nodes, seen) = root_data.entry(root_id).or_default();
                 if !seen.insert(node_id) {
                     continue;
                 }
                 let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
-                nodes.push(PathNode {
-                    node_id,
-                    via_edge,
-                    depth: depth as usize,
-                    name: None,
-                    kind: None,
-                });
-                if total_weight > *max_weight {
-                    *max_weight = total_weight;
-                }
+                nodes.push((
+                    PathNode {
+                        node_id,
+                        via_edge,
+                        depth: depth as usize,
+                        name: None,
+                        kind: None,
+                    },
+                    total_weight,
+                ));
             }
 
             // Reconstruct Vec<GraphPath> in original root order.
+            // Per-root limit: counts only non-root nodes against the cap, matching
+            // the original per-root-CTE semantics where the SQL LIMIT applied only
+            // to depth > 0 rows.  Truncation is on the post-dedup list (BFS order),
+            // so the shallowest `limit` reachable nodes are kept per root.
             let mut all_paths: Vec<GraphPath> = Vec::with_capacity(n_roots);
             for root_id in &roots {
-                if let Some((nodes, max_weight, _)) = root_data.remove(root_id) {
-                    if !nodes.is_empty() {
-                        all_paths.push(GraphPath {
-                            root_id: *root_id,
-                            nodes,
-                            total_weight: max_weight,
-                        });
+                if let Some((mut nw, _)) = root_data.remove(root_id) {
+                    if nw.is_empty() {
+                        continue;
                     }
+                    if let Some(lim) = opts.limit {
+                        let root_count = usize::from(include_roots);
+                        nw.truncate(root_count + lim as usize);
+                    }
+                    let max_weight = nw.iter().map(|(_, w)| *w).fold(0.0_f64, f64::max);
+                    let nodes: Vec<PathNode> = nw.into_iter().map(|(n, _)| n).collect();
+                    all_paths.push(GraphPath {
+                        root_id: *root_id,
+                        nodes,
+                        total_weight: max_weight,
+                    });
                 }
             }
 
