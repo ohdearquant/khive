@@ -9537,5 +9537,83 @@ mod tests {
             "goal->goal variant_of must be allowed via the base concept->concept rule \
              even when EntityOfType rules for variant_of are installed; got {result:?}"
         );
+
+        // Fail-closed check: additive rules must not make validation fail-open.
+        // A goal(concept) -> project variant_of edge has no matching pack rule
+        // (project is not in the installed variant_of rules) and no matching base
+        // rule (no (concept, VariantOf, project) row). It must be rejected.
+        let p = rt
+            .create_entity(&tok, "project", None, "Proj", None, None, vec![])
+            .await
+            .unwrap();
+        let bad = rt
+            .link(&tok, a.id, p.id, EdgeRelation::VariantOf, 1.0, None)
+            .await;
+        assert!(
+            bad.is_err(),
+            "additive pack rules must not make validation fail-open; \
+             goal(concept)->project variant_of must be rejected (pack miss + base miss); \
+             got {bad:?}"
+        );
+    }
+
+    // Load-bearing positive: a pack EntityOfType rule adds an endpoint the base contract
+    // does not cover. The base contract has no (concept, DependsOn, concept) row (the
+    // DependsOn rows are project/service/artifact only). A theorem->definition DependsOn
+    // edge can therefore ONLY pass through the pack rule, proving the union is load-bearing.
+    #[tokio::test]
+    async fn link_depends_on_theorem_to_definition_allowed_only_via_pack_rule() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Confirm the base contract does NOT allow concept->concept DependsOn.
+        // (Documented here so the assertion below is not a tautology.)
+        assert!(
+            !base_entity_rule_allows("concept", EdgeRelation::DependsOn, "concept"),
+            "base contract must not allow concept->concept DependsOn; \
+             test would be vacuous if this precondition fails"
+        );
+
+        // Install a single EntityOfType rule: theorem depends_on definition.
+        // With no rules, the link would be rejected by the base contract.
+        // With this rule, it must be accepted via the pack path (lines 1173-1179).
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::DependsOn,
+            source: EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            target: EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "definition",
+            },
+        }]);
+
+        let thm = rt
+            .create_entity(&tok, "concept", Some("theorem"), "T1", None, None, vec![])
+            .await
+            .unwrap();
+        let def = rt
+            .create_entity(
+                &tok,
+                "concept",
+                Some("definition"),
+                "D1",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // This can only pass through the pack rule — the base contract rejects it.
+        let result = rt
+            .link(&tok, thm.id, def.id, EdgeRelation::DependsOn, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "theorem->definition DependsOn must be allowed by the installed pack rule; \
+             the base contract has no concept->concept DependsOn row; got {result:?}"
+        );
     }
 }
