@@ -194,9 +194,22 @@ def main():
         first = verbs_result["verbs"][0]
         for key in ("verb", "pack", "description", "category"):
             assert key in first, f"verb entry missing key {key!r}: {first}"
-        # pack= filter: kg pack must expose at least its own verbs
+        # pack= filter: handler_defs.rs:729 applies pack_name.eq_ignore_ascii_case(pk);
+        # each returned entry carries its "pack" field (handler_defs.rs:736).
+        # Assertions must be non-vacuous: total >= 1 would pass even if the filter
+        # were ignored (67 unfiltered verbs satisfy it), so we verify the filter itself.
         kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})
-        assert kg_verbs["total"] >= 1, f"kg pack filter must return >= 1 verb: {kg_verbs}"
+        assert len(kg_verbs["verbs"]) > 0, f"kg pack filter must return a nonempty list: {kg_verbs}"
+        assert kg_verbs["total"] == len(kg_verbs["verbs"]), (
+            f"total must equal len(verbs): total={kg_verbs['total']} list={len(kg_verbs['verbs'])}"
+        )
+        kg_verb_packs = [v["pack"].lower() for v in kg_verbs["verbs"]]
+        assert all(p == "kg" for p in kg_verb_packs), (
+            f"every entry returned by pack=kg filter must have pack='kg': {kg_verb_packs}"
+        )
+        kg_verb_names = [v["verb"] for v in kg_verbs["verbs"]]
+        assert "create" in kg_verb_names, f"'create' must appear in kg-filtered verbs: {kg_verb_names}"
+        assert "stats" in kg_verb_names, f"'stats' must appear in kg-filtered verbs: {kg_verb_names}"
         print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
 
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
