@@ -186,7 +186,15 @@ def main():
         assert "verbs" in verbs_result, f"verbs must return 'verbs' key: {verbs_result}"
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
-        assert verbs_result["total"] >= 1, f"total must be >= 1: {verbs_result}"
+        # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
+        # unset) loads all 7 production packs, so verbs() returns exactly 67
+        # user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # dispatch arms). Update this number when the pack set or verb surface
+        # changes; a silent drift here is the bug this assertion exists to catch.
+        assert verbs_result["total"] == 67, (
+            f"expected 67 user-facing verbs from the 7 default packs, "
+            f"got {verbs_result['total']}: {verbs_result}"
+        )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
         assert "create" in verb_names, f"'create' must appear in verbs listing: {verb_names}"
         assert "stats" in verb_names, f"'stats' must appear in verbs listing: {verb_names}"
@@ -196,8 +204,8 @@ def main():
             assert key in first, f"verb entry missing key {key!r}: {first}"
         # pack= filter: handler_defs.rs:729 applies pack_name.eq_ignore_ascii_case(pk);
         # each returned entry carries its "pack" field (handler_defs.rs:736).
-        # Assertions must be non-vacuous: total >= 1 would pass even if the filter
-        # were ignored (67 unfiltered verbs satisfy it), so we verify the filter itself.
+        # Assertions must be non-vacuous: a pack=kg filter that was ignored would
+        # return the full 67-verb list, so we verify the filter returns only kg verbs.
         kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})
         assert len(kg_verbs["verbs"]) > 0, f"kg pack filter must return a nonempty list: {kg_verbs}"
         assert kg_verbs["total"] == len(kg_verbs["verbs"]), (

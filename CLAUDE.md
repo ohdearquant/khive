@@ -167,7 +167,7 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 7 production packs: kg, gtd, memory, brain, comm, schedule, knowledge
-(65 verbs total).
+(67 verbs total).
 
 ### KG pack verbs (16 — ADR-017, ADR-046)
 
