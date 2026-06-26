@@ -331,7 +331,7 @@ pub struct OrphanSweepResult {
     pub deleted: u64,
     /// Rows that would be deleted (populated even when `dry_run = false`).
     pub would_delete: u64,
-    /// Whether `max_delete` was reached before the full scan completed.
+    /// Whether `would_delete` exceeded `max_delete`, meaning deletion was capped after full counting.
     pub max_delete_hit: bool,
 }
 ```
