@@ -26,6 +26,7 @@ impl KnowledgeHandlers {
         let p: UpsertAtomsParams = deser(params)?;
         if p.chunk_size.is_some() {
             tracing::warn!(
+                chunk_size = ?p.chunk_size,
                 "upsert_atoms: chunk_size is accepted but not yet implemented; \
                  server-side chunking is not performed"
             );
@@ -559,6 +560,7 @@ impl KnowledgeHandlers {
         let p: DeleteAtomsParams = deser(params)?;
         if p.cascade.is_some() {
             tracing::warn!(
+                cascade = ?p.cascade,
                 "delete_atoms: cascade is accepted but not yet implemented; \
                  sections are not cascade-deleted when atoms are soft-deleted"
             );
@@ -783,7 +785,7 @@ mod tests {
 
     // Ignored-param warning coverage: verify that chunk_size and cascade are still
     // accepted by the param structs (no deserialization error) and that the fields
-    // are Some when supplied, confirming the warning branch is reachable.
+    // are Some when supplied, confirming the warning branch precondition is satisfiable.
 
     #[test]
     fn upsert_atoms_chunk_size_accepted_and_detectable() {
@@ -795,7 +797,7 @@ mod tests {
         .expect("upsert_atoms params with chunk_size must deserialize without error");
         assert!(
             p.chunk_size.is_some(),
-            "chunk_size must be Some when supplied so the warning branch fires"
+            "chunk_size must be Some when supplied so the warning branch precondition is satisfiable"
         );
     }
 
@@ -809,7 +811,7 @@ mod tests {
         .expect("delete_atoms params with cascade must deserialize without error");
         assert!(
             p.cascade.is_some(),
-            "cascade must be Some when supplied so the warning branch fires"
+            "cascade must be Some when supplied so the warning branch precondition is satisfiable"
         );
     }
 }
