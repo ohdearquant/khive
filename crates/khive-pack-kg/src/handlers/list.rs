@@ -199,9 +199,10 @@ impl KgPack {
                                         None => return false,
                                     };
                                     let matches = stored == wanted_thread
-                                        || (stored.len() >= 8
-                                            && wanted_thread.len() >= 8
-                                            && stored[..8] == wanted_thread[..8]);
+                                        || matches!(
+                                            (stored.get(..8), wanted_thread.get(..8)),
+                                            (Some(a), Some(b)) if a == b
+                                        );
                                     if !matches {
                                         return false;
                                     }

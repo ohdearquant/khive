@@ -628,6 +628,113 @@ async fn ensure_note_kind_rejects_foreign_note_before_kind_check() {
     }
 }
 
+// Regression: list(kind=note, thread_id=<filter>) must not panic when a stored
+// thread_id contains a multi-byte UTF-8 character whose second byte falls at
+// byte index 8. The old code used `stored[..8]` (a byte-index slice) which
+// panics when byte 8 is not a char boundary. The fix uses `str::get(..8)`
+// which returns None for invalid boundaries, converting the panic into a safe
+// no-match result while leaving ASCII (UUID) thread_ids unaffected.
+#[tokio::test]
+async fn list_note_thread_filter_non_ascii_stored_no_panic() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    // "1234567α": 7 ASCII bytes then α (U+03B1, 2 bytes) = 9 total bytes.
+    // Byte index 8 is the second byte of α, not a char boundary.
+    // The old code reached stored[..8] here and panicked.
+    let non_ascii_thread = "1234567\u{03B1}";
+
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "note with non-ASCII thread_id",
+        None,
+        Some(serde_json::json!({"thread_id": non_ascii_thread})),
+        vec![],
+    )
+    .await
+    .expect("create note with non-ASCII thread_id");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    // Filter with a different 8-byte ASCII string so exact equality fails and
+    // the prefix branch is reached.  On the old code, stored[..8] on
+    // "1234567α" panics; with the fix it safely returns no match.
+    let result = pack
+        .handle_list(
+            &token,
+            serde_json::json!({"kind": "note", "thread_id": "12345678"}),
+            &registry,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "list with non-ASCII stored thread_id must not panic; got: {:?}",
+        result.err()
+    );
+    let arr = result.unwrap();
+    assert!(
+        arr.as_array()
+            .expect("list result must be a JSON array")
+            .is_empty(),
+        "no note should match a non-overlapping thread_id prefix"
+    );
+}
+
+// Complement: exact-match on a non-ASCII thread_id must still return the note
+// (the exact-equality branch fires before any byte slicing).
+#[tokio::test]
+async fn list_note_thread_filter_non_ascii_exact_match() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let non_ascii_thread = "1234567\u{03B1}";
+
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "note with non-ASCII thread_id exact",
+        None,
+        Some(serde_json::json!({"thread_id": non_ascii_thread})),
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let result = pack
+        .handle_list(
+            &token,
+            serde_json::json!({"kind": "note", "thread_id": non_ascii_thread}),
+            &registry,
+        )
+        .await
+        .expect("exact-match list must succeed");
+
+    let arr = result.as_array().expect("list result must be a JSON array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "exact-match on non-ASCII thread_id must return the note"
+    );
+}
+
 // ---- Weight validation tests (KG-AUD-002) ----
 
 #[test]
