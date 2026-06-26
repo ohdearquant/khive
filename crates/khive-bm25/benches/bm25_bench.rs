@@ -323,7 +323,7 @@ fn gen_doc(rng: &mut StdRng, num_words: usize) -> String {
 
 fn build_index(n_docs: usize, words_per_doc: usize) -> Bm25Index {
     let mut rng = StdRng::seed_from_u64(42);
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     for i in 0..n_docs {
         let doc = gen_doc(&mut rng, words_per_doc);
         index.index_document(format!("doc{i}"), &doc).unwrap();
@@ -343,7 +343,7 @@ fn bench_index_throughput(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("docs", n), &n, |b, &n| {
             b.iter(|| {
                 let mut rng = StdRng::seed_from_u64(42);
-                let mut index = Bm25Index::new(Bm25Config::default());
+                let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
                 for i in 0..n {
                     let doc = gen_doc(&mut rng, 200);
                     index

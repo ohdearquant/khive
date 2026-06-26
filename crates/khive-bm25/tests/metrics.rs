@@ -5,7 +5,9 @@ use std::sync::Arc;
 #[test]
 fn index_document_emits_metrics() {
     let sink = Arc::new(RecordingSink::new());
-    let mut index = Bm25Index::new(Bm25Config::default()).with_metrics(sink.clone());
+    let mut index = Bm25Index::try_new(Bm25Config::default())
+        .expect("valid config")
+        .with_metrics(sink.clone());
 
     index.index_document("doc1", "the quick brown fox").unwrap();
 
@@ -36,7 +38,9 @@ fn index_document_emits_metrics() {
 #[test]
 fn search_emits_metrics() {
     let sink = Arc::new(RecordingSink::new());
-    let mut index = Bm25Index::new(Bm25Config::default()).with_metrics(sink.clone());
+    let mut index = Bm25Index::try_new(Bm25Config::default())
+        .expect("valid config")
+        .with_metrics(sink.clone());
 
     index.index_document("doc1", "the quick brown fox").unwrap();
     index.index_document("doc2", "the lazy dog").unwrap();
@@ -76,14 +80,14 @@ fn search_emits_metrics() {
 #[test]
 fn no_metrics_without_sink() {
     // Ensure no panic when metrics is None (default)
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     index.index_document("doc1", "hello world").unwrap();
     let _ = index.search("hello", 5);
 }
 
 #[test]
 fn set_metrics_at_runtime() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     index.index_document("doc1", "hello world").unwrap();
 
     // Attach sink
@@ -105,7 +109,9 @@ fn set_metrics_at_runtime() {
 #[test]
 fn search_on_empty_index_still_emits() {
     let sink = Arc::new(RecordingSink::new());
-    let index = Bm25Index::new(Bm25Config::default()).with_metrics(sink.clone());
+    let index = Bm25Index::try_new(Bm25Config::default())
+        .expect("valid config")
+        .with_metrics(sink.clone());
 
     let results = index.search("anything", 5);
     assert!(results.is_empty());
@@ -121,7 +127,9 @@ fn search_on_empty_index_still_emits() {
 #[test]
 fn multiple_operations_accumulate_events() {
     let sink = Arc::new(RecordingSink::new());
-    let mut index = Bm25Index::new(Bm25Config::default()).with_metrics(sink.clone());
+    let mut index = Bm25Index::try_new(Bm25Config::default())
+        .expect("valid config")
+        .with_metrics(sink.clone());
 
     // 3 index operations
     index.index_document("d1", "alpha beta").unwrap();
@@ -140,7 +148,9 @@ fn multiple_operations_accumulate_events() {
 #[test]
 fn index_duration_is_nonnegative() {
     let sink = Arc::new(RecordingSink::new());
-    let mut index = Bm25Index::new(Bm25Config::default()).with_metrics(sink.clone());
+    let mut index = Bm25Index::try_new(Bm25Config::default())
+        .expect("valid config")
+        .with_metrics(sink.clone());
 
     index
         .index_document("doc1", "test document content")

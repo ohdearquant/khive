@@ -15,7 +15,7 @@ fn test_no_budget_allows_unlimited_indexing() {
 #[test]
 fn test_budget_blocks_new_document_when_exceeded() {
     let config = Bm25Config::default().with_memory_budget(1_100);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
 
     // First doc should succeed (index starts empty)
     index
@@ -49,7 +49,7 @@ fn test_budget_blocks_new_document_when_exceeded() {
 #[test]
 fn test_budget_reindex_bypasses_check() {
     let config = Bm25Config::default().with_memory_budget(2_000);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
 
     // Index initial doc
     index
@@ -127,14 +127,14 @@ fn test_memory_budget_getter_setter() {
 #[test]
 fn test_budget_from_config() {
     let config = Bm25Config::default().with_memory_budget(10_000);
-    let index = Bm25Index::new(config);
+    let index = Bm25Index::try_new(config).expect("valid config");
     assert_eq!(index.memory_budget(), Some(10_000));
 }
 
 #[test]
 fn test_budget_exceeded_error_details() {
     let config = Bm25Config::default().with_memory_budget(1);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
 
     // Budget of 1 byte is too small for any document
     let result = index.index_document("doc1", "hello world");
@@ -158,7 +158,7 @@ fn test_budget_exceeded_error_details() {
 #[test]
 fn test_search_unaffected_by_budget() {
     let config = Bm25Config::default().with_memory_budget(100_000);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
 
     index.index_document("doc1", "quick brown fox").unwrap();
     index.index_document("doc2", "lazy brown dog").unwrap();
@@ -171,7 +171,7 @@ fn test_search_unaffected_by_budget() {
 #[test]
 fn test_budget_allows_removal_then_insert() {
     let config = Bm25Config::default().with_memory_budget(3_000);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
 
     // Fill the index
     let mut last_success = 0;

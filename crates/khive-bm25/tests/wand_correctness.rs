@@ -174,7 +174,7 @@ fn bmw_matches_bruteforce_on_random_zipf_corpora() {
     let zipf = ZipfSampler::new(vocab.len(), 1.07);
 
     for (case_idx, &doc_count) in [1_000usize, 2_500, 10_000].iter().enumerate() {
-        let mut index = Bm25Index::new(Bm25Config::default());
+        let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
         build_zipf_corpus(&mut index, doc_count, 0xC0FFEE + case_idx as u64);
 
         let mut rng = XorShift64::new(0xBAD5EED + doc_count as u64);
@@ -200,7 +200,7 @@ fn bmw_matches_bruteforce_on_random_zipf_corpora() {
 
 #[test]
 fn bmw_handles_empty_index_and_zero_k() {
-    let index = Bm25Index::new(Bm25Config::default());
+    let index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     let mut ctx = SearchContext::new();
 
     assert!(index
@@ -216,7 +216,7 @@ fn bmw_handles_empty_index_and_zero_k() {
 
 #[test]
 fn bmw_handles_single_document_and_large_k() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     index
         .index_document("doc1", "alpha beta gamma alpha")
         .unwrap();
@@ -234,7 +234,7 @@ fn bmw_handles_single_document_and_large_k() {
 
 #[test]
 fn bmw_handles_all_docs_match_and_no_docs_match() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     for doc_idx in 0..300 {
         index
             .index_document(format!("doc_{doc_idx}"), &format!("common term_{doc_idx}"))
@@ -256,7 +256,7 @@ fn bmw_handles_all_docs_match_and_no_docs_match() {
 
 #[test]
 fn bmw_handles_many_term_queries() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     build_zipf_corpus(&mut index, 2_000, 0x1234_5678);
 
     let query = "tok_0000 tok_0001 tok_0002 tok_0003 tok_0004 tok_0005 tok_0006 tok_0007";
@@ -271,7 +271,7 @@ fn bmw_handles_many_term_queries() {
 
 #[test]
 fn bmw_block_boundary_regression() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     let filler = " filler filler filler filler filler filler filler filler";
 
     for doc_idx in 0..(DEFAULT_BLOCK_SIZE * 2) {
@@ -307,7 +307,7 @@ fn bmw_block_boundary_regression() {
 
 #[test]
 fn sorted_posting_lists_are_maintained_across_mutations() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     index.index_document("c", "alpha beta").unwrap();
     index.index_document("a", "alpha gamma").unwrap();
     index.index_document("b", "alpha delta").unwrap();

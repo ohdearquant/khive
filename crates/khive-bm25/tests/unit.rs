@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 #[test]
 fn test_new_index() {
-    let index = Bm25Index::new(Bm25Config::default());
+    let index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     assert_eq!(index.doc_count(), 0);
     assert!((index.avg_doc_length() - 0.0).abs() < f64::EPSILON);
 }
@@ -363,7 +363,7 @@ fn test_punctuation_handling() {
 #[test]
 fn test_config_custom() {
     let config = Bm25Config::new(2.0, 0.5);
-    let mut index = Bm25Index::new(config);
+    let mut index = Bm25Index::try_new(config).expect("valid config");
     index
         .index_document("doc1".to_string(), "test document")
         .unwrap();
@@ -444,7 +444,8 @@ fn test_serde_roundtrip() {
 fn test_custom_tokenizer() {
     // Create a custom tokenizer with minimum length 4
     let tokenizer: BoxedTokenizer = Arc::new(SimpleTokenizer::new(true, 4));
-    let mut index = Bm25Index::with_tokenizer(Bm25Config::default(), tokenizer);
+    let mut index =
+        Bm25Index::try_with_tokenizer(Bm25Config::default(), tokenizer).expect("valid config");
 
     // "the", "a" will be filtered out (< 4 chars)
     index

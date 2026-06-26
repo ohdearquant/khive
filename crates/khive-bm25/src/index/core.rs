@@ -160,7 +160,7 @@ impl Clone for Bm25Index {
 
 impl Default for Bm25Index {
     fn default() -> Self {
-        Self::new(Bm25Config::default())
+        Self::try_new(Bm25Config::default()).expect("default Bm25Config is always valid")
     }
 }
 
@@ -247,11 +247,20 @@ impl<'de> serde::Deserialize<'de> for Bm25Index {
 
 impl Bm25Index {
     /// Create a new empty BM25 index. Panics on invalid config; use `try_new` for an error.
+    #[deprecated(
+        note = "use `try_new` (or `try_with_tokenizer`), which returns a Result instead of panicking on an invalid config"
+    )]
     pub fn new(config: Bm25Config) -> Self {
-        if let Err(e) = config.validate() {
-            panic!("invalid BM25 config: {e}");
-        }
-        Self {
+        Self::try_new(config).expect("invalid BM25 config")
+    }
+
+    /// Non-panicking constructor. Returns `Err(RetrievalError::Configuration(...))`
+    /// if the config is invalid instead of panicking.
+    pub fn try_new(config: Bm25Config) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|e| RetrievalError::Configuration(format!("invalid BM25 config: {e}")))?;
+        Ok(Self {
             inverted_index: HashMap::new(),
             doc_lengths: HashMap::new(),
             id_to_internal: HashMap::new(),
@@ -268,24 +277,16 @@ impl Bm25Index {
             config,
             tokenizer: Arc::new(SimpleTokenizer::default()),
             metrics: None,
-        }
+        })
     }
 
-    /// Non-panicking constructor.  Returns `Err(RetrievalError::Configuration(…))`
+    /// Non-panicking constructor with a custom tokenizer. Returns `Err(RetrievalError::Configuration(...))`
     /// if the config is invalid instead of panicking.
-    pub fn try_new(config: Bm25Config) -> Result<Self> {
+    pub fn try_with_tokenizer(config: Bm25Config, tokenizer: BoxedTokenizer) -> Result<Self> {
         config
             .validate()
             .map_err(|e| RetrievalError::Configuration(format!("invalid BM25 config: {e}")))?;
-        Ok(Self::new(config))
-    }
-
-    /// Create a new BM25 index with a custom tokenizer. Panics on invalid config.
-    pub fn with_tokenizer(config: Bm25Config, tokenizer: BoxedTokenizer) -> Self {
-        if let Err(e) = config.validate() {
-            panic!("invalid BM25 config: {e}");
-        }
-        Self {
+        Ok(Self {
             inverted_index: HashMap::new(),
             doc_lengths: HashMap::new(),
             id_to_internal: HashMap::new(),
@@ -302,7 +303,15 @@ impl Bm25Index {
             config,
             tokenizer,
             metrics: None,
-        }
+        })
+    }
+
+    /// Create a new BM25 index with a custom tokenizer. Panics on invalid config.
+    #[deprecated(
+        note = "use `try_new` (or `try_with_tokenizer`), which returns a Result instead of panicking on an invalid config"
+    )]
+    pub fn with_tokenizer(config: Bm25Config, tokenizer: BoxedTokenizer) -> Self {
+        Self::try_with_tokenizer(config, tokenizer).expect("invalid BM25 config")
     }
 
     /// Set the tokenizer. Does not re-tokenize existing documents.
@@ -658,7 +667,7 @@ mod regression_tests {
     #[test]
     fn budget_check_does_not_overflow() {
         let config = Bm25Config::default().with_memory_budget(1);
-        let mut index = Bm25Index::new(config);
+        let mut index = Bm25Index::try_new(config).expect("valid config");
         let result = index.index_document("doc1", "hello world");
         assert!(result.is_err(), "budget should be exceeded");
     }
@@ -678,6 +687,28 @@ mod regression_tests {
         assert!(
             Bm25Index::try_new(config).is_err(),
             "Inf b must be rejected by try_new"
+        );
+    }
+
+    #[test]
+    fn config_nan_k1_rejected_by_try_with_tokenizer() {
+        use std::sync::Arc;
+        let config = Bm25Config::new(f64::NAN, 0.75);
+        let tokenizer = Arc::new(crate::tokenizer::SimpleTokenizer::default());
+        assert!(
+            Bm25Index::try_with_tokenizer(config, tokenizer).is_err(),
+            "NaN k1 must be rejected by try_with_tokenizer"
+        );
+    }
+
+    #[test]
+    fn config_inf_b_rejected_by_try_with_tokenizer() {
+        use std::sync::Arc;
+        let config = Bm25Config::new(1.2, f64::INFINITY);
+        let tokenizer = Arc::new(crate::tokenizer::SimpleTokenizer::default());
+        assert!(
+            Bm25Index::try_with_tokenizer(config, tokenizer).is_err(),
+            "Inf b must be rejected by try_with_tokenizer"
         );
     }
 

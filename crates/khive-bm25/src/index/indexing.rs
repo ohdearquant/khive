@@ -258,7 +258,7 @@ mod forward_index_tests {
 
     #[test]
     fn test_search_results_unchanged_after_add_remove_cycle() {
-        let mut baseline_index = Bm25Index::new(Bm25Config::default());
+        let mut baseline_index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
         baseline_index
             .index_document("doc1", "quick brown fox")
             .unwrap();

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[test]
 fn index_lifecycle_create_index_search_rank() {
-    let mut index = Bm25Index::new(Bm25Config::default());
+    let mut index = Bm25Index::try_new(Bm25Config::default()).expect("valid config");
     assert_eq!(index.doc_count(), 0);
 
     index
@@ -247,7 +247,8 @@ impl Tokenizer for UppercasePreservingTokenizer {
 #[test]
 fn custom_tokenizer_is_called_for_indexing_and_search() {
     let tokenizer: BoxedTokenizer = Arc::new(UppercasePreservingTokenizer);
-    let mut index = Bm25Index::with_tokenizer(Bm25Config::default(), tokenizer);
+    let mut index =
+        Bm25Index::try_with_tokenizer(Bm25Config::default(), tokenizer).expect("valid config");
 
     // With the custom tokenizer "Rust" and "rust" are different tokens
     index
@@ -272,7 +273,8 @@ fn custom_tokenizer_is_called_for_indexing_and_search() {
 fn custom_tokenizer_min_length_filters_short_tokens() {
     // SimpleTokenizer with min_length=4 filters stop words and short tokens
     let tokenizer: BoxedTokenizer = Arc::new(SimpleTokenizer::new(true, 4));
-    let mut index = Bm25Index::with_tokenizer(Bm25Config::default(), tokenizer);
+    let mut index =
+        Bm25Index::try_with_tokenizer(Bm25Config::default(), tokenizer).expect("valid config");
 
     index.index_document("doc1", "the quick brown fox").unwrap();
 
