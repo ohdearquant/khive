@@ -7,7 +7,8 @@
 > The §"Context" and §"Rationale / Why not token rebinding" sections remain authoritative
 > historical background for why the override was introduced and why it was removed.
 
-**Status**: Proposed — pending Ocean review
+**Status**: Accepted — core decision shipped with initial codebase; §"Decision" absorbed and
+confirmed by ADR-007 Rev 3 (#164, 2026-06-17). See supersession note above.
 **Date**: 2026-06-03
 **Supersedes**: ADR-007 §"Namespace-by-Layer Rule" (KG pack rebinding only)
 **References**: ADR-007 (Rev 3), ADR-028, ADR-029
