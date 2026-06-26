@@ -167,6 +167,38 @@ def main():
         paper_id = paper["id"]
         print(f"  [ok] create entity — paper ({paper_id[:8]}...)")
 
+        # stats: aggregate substrate counts.
+        # Result shape from stats.rs:30-34: {"entities": int, "edges": int, "notes": int}.
+        # At this point: 3 entities created, 0 edges, 0 notes — a clean deterministic state.
+        counts = call_verb(proc, "stats", {})
+        assert isinstance(counts.get("entities"), int), f"stats must return integer 'entities': {counts}"
+        assert isinstance(counts.get("edges"), int), f"stats must return integer 'edges': {counts}"
+        assert isinstance(counts.get("notes"), int), f"stats must return integer 'notes': {counts}"
+        assert counts["entities"] == 3, f"expected 3 entities after creates, got {counts}"
+        assert counts["edges"] == 0, f"expected 0 edges before any link, got {counts}"
+        assert counts["notes"] == 0, f"expected 0 notes before any note create, got {counts}"
+        print(f"  [ok] stats — entities={counts['entities']} edges={counts['edges']} notes={counts['notes']}")
+
+        # verbs: verb discovery introspection.
+        # Result shape from handler_defs.rs:746-748: {"verbs": list, "total": int}.
+        # Each entry has verb, pack, description, category (handler_defs.rs:735-742).
+        verbs_result = call_verb(proc, "verbs", {})
+        assert "verbs" in verbs_result, f"verbs must return 'verbs' key: {verbs_result}"
+        assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
+        assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
+        assert verbs_result["total"] >= 1, f"total must be >= 1: {verbs_result}"
+        verb_names = [v["verb"] for v in verbs_result["verbs"]]
+        assert "create" in verb_names, f"'create' must appear in verbs listing: {verb_names}"
+        assert "stats" in verb_names, f"'stats' must appear in verbs listing: {verb_names}"
+        # each entry carries verb, pack, description, category per handler_defs.rs:735-742
+        first = verbs_result["verbs"][0]
+        for key in ("verb", "pack", "description", "category"):
+            assert key in first, f"verb entry missing key {key!r}: {first}"
+        # pack= filter: kg pack must expose at least its own verbs
+        kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})
+        assert kg_verbs["total"] >= 1, f"kg pack filter must return >= 1 verb: {kg_verbs}"
+        print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
+
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
         #    granular kind at top level — same shape as create/list)
         fetched = call_verb(proc, "get", {"id": lora_id})
@@ -524,7 +556,131 @@ def memory_smoke():
         assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"
         print(f"  [memory] memory.recall — {len(hits)} hit(s)")
 
+        # memory.prune dry-run: count candidates without deleting.
+        # Result shape from prune.rs:121-127: {"pruned": 0, "dry_run": true, "would_prune": int, "namespace": str}.
+        prune_dry = call_verb(proc, "memory.prune", {
+            "min_salience": 0.5,
+            "before": 0,  # 0 = skip expiry filter (prune.rs:101-102: Some(0) => None)
+            "dry_run": True,
+        })
+        assert prune_dry.get("dry_run") is True, f"dry_run response must set dry_run=true: {prune_dry}"
+        assert "would_prune" in prune_dry, f"dry_run response must include would_prune key: {prune_dry}"
+        print(f"  [memory] memory.prune(dry_run=True) — would_prune={prune_dry['would_prune']}")
+
+        # Store a low-salience memory so the real prune has something to delete.
+        mem_low = call_verb(proc, "memory.remember", {
+            "content": "ephemeral low-salience note for prune coverage test",
+            "salience": 0.1,
+            "memory_type": "episodic",
+        })
+        assert mem_low is not None, "low-salience memory.remember must return a result"
+
+        # memory.prune real run: salience < 0.2 filter removes the 0.1-salience memory.
+        # before=0 skips expiry filter (NULL expires_at rows are safe regardless).
+        # Result shape from prune.rs:138-142: {"pruned": int, "dry_run": false, "namespace": str}.
+        prune_result = call_verb(proc, "memory.prune", {
+            "min_salience": 0.2,
+            "before": 0,
+        })
+        assert prune_result.get("dry_run") is False, f"real prune must set dry_run=false: {prune_result}"
+        assert "pruned" in prune_result, f"prune response must include pruned count: {prune_result}"
+        assert prune_result["pruned"] >= 1, (
+            f"at least the 0.1-salience memory must be pruned: {prune_result}"
+        )
+        print(f"  [memory] memory.prune — pruned={prune_result['pruned']}")
+
+        # memory.vacuum: reclaim space freed by soft-deleted rows.
+        # Result shape from prune.rs:156-158: {"ok": true}.
+        vacuum_result = call_verb(proc, "memory.vacuum", {})
+        assert vacuum_result.get("ok") is True, f"memory.vacuum must return ok=true: {vacuum_result}"
+        print(f"  [memory] memory.vacuum — ok")
+
         print(f"\n  MEMORY PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def formal_smoke():
+    """Smoke test for the formal-pack EntityOfType edge rules (vocab.rs).
+
+    The formal pack (khive-pack-formal) adds 21 additive endpoint rules keyed
+    on entity_type (vocab.rs:27-137). Formal math entities are plain concept
+    entities with entity_type set to the subtype ("theorem", "definition", etc.).
+    The pair exercised here:
+
+        depends_on: theorem -> definition  (vocab.rs:37-42)
+
+    Without the formal pack, concept depends_on concept is rejected by the base
+    contract (operations.rs:298-304: depends_on is p->p, s->{p,s,a,ds}, a->{p,s}).
+    With --pack formal loaded, EndpointKind::EntityOfType matching in
+    operations.rs:231-234 (substrate=="entity" && kind==k && entity_type==Some(t))
+    permits it.
+    """
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    proc = subprocess.Popen(
+        [
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "formal",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "formal-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # Create a concept entity with entity_type="theorem".
+        # entity_type is stored via Entity::with_entity_type (operations.rs:487),
+        # making it available to the EntityOfType endpoint matcher.
+        thm = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "entity_type": "theorem",
+            "name": "FormalSmokeTheorem",
+            "description": "Synthetic theorem for formal-pack smoke coverage",
+        })
+        assert thm["name"] == "FormalSmokeTheorem", f"unexpected create result: {thm}"
+        thm_id = thm["id"]
+        print(f"  [formal] create concept entity_type=theorem — {thm_id[:8]}...")
+
+        # Create a concept entity with entity_type="definition".
+        defn = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "entity_type": "definition",
+            "name": "FormalSmokeDefinition",
+            "description": "Synthetic definition for formal-pack smoke coverage",
+        })
+        defn_id = defn["id"]
+        print(f"  [formal] create concept entity_type=definition — {defn_id[:8]}...")
+
+        # Link theorem -[depends_on]-> definition.
+        # Permitted by FORMAL_EDGE_RULES[1] (vocab.rs:37-42):
+        #   EdgeEndpointRule { relation: DependsOn,
+        #     source: EntityOfType { kind: "concept", entity_type: "theorem" },
+        #     target: EntityOfType { kind: "concept", entity_type: "definition" } }
+        edge = call_verb(proc, "link", {
+            "source_id": thm_id,
+            "target_id": defn_id,
+            "relation": "depends_on",
+            "weight": 1.0,
+        })
+        assert edge["relation"] == "depends_on", (
+            f"formal-pack depends_on edge must succeed: {edge}"
+        )
+        print(f"  [formal] link theorem -[depends_on]-> definition — ok")
+
+        print(f"\n  FORMAL PACK SMOKE TESTS PASSED")
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -730,6 +886,12 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [memory FAIL] {e}")
             code = 3
+    if code == 0 and os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
+        try:
+            formal_smoke()
+        except Exception as e:
+            print(f"  [formal FAIL] {e}")
+            code = 5
     if code == 0 and os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
         try:
             epistemic_smoke()
