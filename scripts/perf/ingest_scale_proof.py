@@ -69,10 +69,19 @@ def ensure_ledger(ledger_path: pathlib.Path) -> None:
         print(f"Created new ledger: {ledger_path}", file=sys.stderr)
 
 
-def build_notes(bench_row: dict, runner_os: str, dataset_name: str, machine_model: str) -> str:
+def build_notes(
+    bench_row: dict,
+    runner_os: str,
+    dataset_name: str,
+    machine_model: str,
+    ram_bytes: int,
+) -> str:
     parts = [dataset_name, runner_os]
     if machine_model and machine_model not in runner_os:
         parts.append(machine_model)
+    if ram_bytes > 0:
+        ram_gib = ram_bytes / (1024**3)
+        parts.append(f"{ram_gib:.0f}GiB")
     return " ".join(parts)
 
 
@@ -103,6 +112,7 @@ def main() -> None:
     git_sha = data.get("git_sha", "")
     runner_os = data.get("runner_os", "")
     machine_model = data.get("machine_model", "")
+    ram_bytes = int(data.get("ram_bytes", 0))
     loadavg1 = float(data.get("loadavg1", 0.0))
 
     assertions = data.get("assertions", {})
@@ -148,7 +158,7 @@ def main() -> None:
             if isinstance(p99, float):
                 p99 = round(p99, 3)
 
-            notes = build_notes(bench_row, runner_os, dataset_name, machine_model)
+            notes = build_notes(bench_row, runner_os, dataset_name, machine_model, ram_bytes)
 
             ledger_row = {
                 "date": produced_at,
