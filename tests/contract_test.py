@@ -600,7 +600,7 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     # ---- Invalid entity_kind ----
     err_ek = _expect_rpc_error(proc, "create", {
         "kind": "entity",
-        "entity_kind": "galaxy",   # not in the 6-element closed set
+        "entity_kind": "galaxy",   # not in the 9-element closed set
         "name": "StarSystem",
     })
     assert err_ek, "Expected non-empty error for invalid entity_kind"
@@ -608,7 +608,8 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
         f"Error should name the offending kind 'galaxy': {err_ek!r}"
     )
     # The full closed set must be listed so agents can self-correct.
-    for kind in ("concept", "document", "project", "dataset", "person", "org"):
+    for kind in ("concept", "document", "project", "dataset", "person", "org",
+                 "artifact", "service", "resource"):
         assert kind in err_ek, (
             f"Valid entity_kind '{kind}' missing from error message: {err_ek!r}"
         )

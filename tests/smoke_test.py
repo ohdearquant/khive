@@ -894,29 +894,41 @@ def epistemic_smoke():
 
 
 if __name__ == "__main__":
+    failed_sections: list[str] = []
+
     code = main()
-    if code == 0 and os.environ.get("KHIVE_SMOKE_GTD", "1") != "0":
+    if code != 0:
+        failed_sections.append("kg")
+
+    if os.environ.get("KHIVE_SMOKE_GTD", "1") != "0":
         try:
             gtd_smoke()
         except Exception as e:
             print(f"  [gtd FAIL] {e}")
-            code = 2
-    if code == 0 and os.environ.get("KHIVE_SMOKE_MEMORY", "1") != "0":
+            failed_sections.append("gtd")
+
+    if os.environ.get("KHIVE_SMOKE_MEMORY", "1") != "0":
         try:
             memory_smoke()
         except Exception as e:
             print(f"  [memory FAIL] {e}")
-            code = 3
-    if code == 0 and os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
+            failed_sections.append("memory")
+
+    if os.environ.get("KHIVE_SMOKE_FORMAL", "1") != "0":
         try:
             formal_smoke()
         except Exception as e:
             print(f"  [formal FAIL] {e}")
-            code = 5
-    if code == 0 and os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
+            failed_sections.append("formal")
+
+    if os.environ.get("KHIVE_SMOKE_EPISTEMIC", "1") != "0":
         try:
             epistemic_smoke()
         except Exception as e:
             print(f"  [epistemic FAIL] {e}")
-            code = 4
-    sys.exit(code)
+            failed_sections.append("epistemic")
+
+    if failed_sections:
+        print(f"\nFAILED sections: {', '.join(failed_sections)}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)

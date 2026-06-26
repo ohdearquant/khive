@@ -3619,7 +3619,8 @@ allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
 //     tenants when actor_id IS configured.
 //   - #224 (gate actor identity gap): the GateRequest.actor must carry the
 //     configured actor identity, not ActorRef::anonymous(), so a cloud TenantGate
-//     can act on it. This assertion FAILS today — see the #[ignore] test below.
+//     can act on it. Fixed in PR #271, which removed the #[ignore] attribute.
+//     The test now passes unconditionally.
 
 /// When two registries share the same storage backend but carry distinct
 /// configured actor identities, `comm.inbox` must isolate each actor's view:
