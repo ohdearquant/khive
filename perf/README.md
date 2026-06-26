@@ -35,7 +35,7 @@ bench run; they are never hand-typed.
 | `brute_us` | float | Brute-force p50 latency baseline (see provenance note below) |
 | `pass` | PASS/FAIL | Whether all `targets.toml` checks passed for this row |
 | `loadavg` | float | 1-minute load average on the runner at measurement time |
-| `notes` | string | Free-form provenance annotation (dataset, runner, derivation flags) |
+| `notes` | string | Provenance annotation: dataset name, runner OS, machine model (CPU brand string or board identifier), RAM in GiB, and any derivation flags such as `brute_us=back-derived` |
 
 ### Source of ledger values
 
@@ -44,6 +44,49 @@ The bench binary measures ANN query latency, brute-force latency, recall, and
 build time, then writes a JSON file. `scripts/perf/ingest_scale_proof.py` reads
 that JSON and appends one CSV row per N point. No column is hand-computed after
 a run.
+
+The `notes` column is built from JSON top-level fields as follows:
+
+```
+{dataset_name} {runner_os} [{machine_model}] [{ram_gib}GiB]
+```
+
+`machine_model` is the CPU brand string (e.g. "Apple M2 Max") on macOS or the
+`model name` from `/proc/cpuinfo` on Linux; omitted if the string is empty or
+already contained in `runner_os`. `ram_gib` is derived from `ram_bytes` (RAM in
+bytes, read from `hw.memsize` on macOS or `MemTotal` on Linux); omitted when
+unavailable (0). Both fields are populated by the bench binary at run time.
+
+---
+
+## bench-runs/ provenance JSON schema
+
+Each file in `bench-runs/` is the complete output JSON from one bench invocation,
+named `{YYYYMMDD}-{sha7}-{dataset}.json`. These files are committed to the
+repository and provide the authoritative provenance record for each banked row.
+
+Top-level fields in each JSON:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | string | Always `"1.0"` |
+| `produced_at` | ISO-8601 UTC | Timestamp at which the bench ran |
+| `git_sha` | string | Full SHA of the commit under test |
+| `runner_os` | string | OS and architecture tag (e.g. `macos-arm64`) |
+| `machine_model` | string | CPU brand string or board model identifier |
+| `ram_bytes` | integer | Physical RAM in bytes (0 when unavailable) |
+| `loadavg1` | float | 1-minute load average at measurement time |
+| `dataset` | object | Dataset metadata (name, dim, base_n, query_n, etc.) |
+| `config` | object | Index build config (max_degree, search_list_size, alpha, etc.) |
+| `rows` | array | Per-N measurement rows (one per `--ns` point) |
+| `fits` | object | Log-log OLS scaling exponents across all N points |
+| `assertions` | object | Evaluated checks from `targets.toml` with PASS/FAIL per check |
+| `caveats` | array | Automatically generated provenance caveats |
+
+Each element of `rows` carries `bruteforce_p50_us` (directly measured, not
+derived), `speedup_vs_brute_force`, `query_warm_p50_us`, `recall_at_10`, and
+related fields. `ram_bytes` is a JSON-level field only; it is incorporated into
+the ledger `notes` column as `{N}GiB`.
 
 ---
 
@@ -64,6 +107,38 @@ Back-derived `brute_us` values are therefore **not independently measured
 baselines** for those rows. They are reconstructed from the `speedup` ratio.
 Rows produced by future runs (post-PR #239) will carry a directly measured
 `brute_us` read from `bruteforce_p50_us` in the bench JSON.
+
+---
+
+## Reconciling the 341x and 34x speedup figures
+
+Two speedup figures appear in the khive-vamana documentation:
+
+- **341x** (ledger, sha `eb6696c`, 2026-06-15, PR #153): iso-recall beam = 49,
+  warm p50 = 171 µs, `brute_us` = 58 330 µs (back-derived from 341.4 * 170.8).
+- **34x** (ADR-054 evidence, `evidence/adr-054/probe-results-sift-3pt.json`,
+  2026-06-14): iso-recall beam = 64 (floor-pinned), warm p50 = 334 µs, brute
+  p50 = 11 510 µs (directly measured in that run).
+
+These are **different runs with different configurations**, not measurement errors:
+
+1. The ADR-054 probe pinned the beam at the MAX_DEGREE floor (64) throughout.
+   The PR #153 run used the iso-recall binary search, which found beam = 49 at
+   N = 1M, yielding roughly half the query latency (171 µs vs 334 µs).
+2. The PR #153 brute-force figure (58 330 µs back-derived) is arithmetically
+   reconstructed and reflects the brute-force measurement from that run but
+   cannot be independently verified without a committed raw JSON. Future runs
+   commit raw JSON to `bench-runs/`, making the directly measured `bruteforce_p50_us`
+   auditable and the speedup ratio independently verifiable.
+3. The 34x figure (ADR-054) is the result for a higher-beam configuration and
+   is NOT a contradiction of 341x; both are internally consistent for their
+   respective run parameters.
+
+The actionable conclusion: the headline speedup figure depends materially on
+the iso-recall beam used. The 341x figure is valid for the iso-recall
+beam-optimal configuration at N = 1M. Future comparison runs should confirm
+`bruteforce_p50_us` from the committed `bench-runs/` JSON rather than the
+back-derived ledger value.
 
 ---
 
