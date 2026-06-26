@@ -315,6 +315,40 @@ def test_entity_search_props_filter_before_truncation_widening(
     })
     target_id = target["id"]
 
+    # Self-asserting phase: confirm the target's unfiltered rank lies in (4, 200].
+    # Budget chain for limit=1:
+    #   naive (no widening):  runtime candidates = 1 * 4  =   4
+    #   handler widens:       search_limit = min(1*50,500) = 50
+    #   runtime over-fetch:   candidates  = 50 * 4        = 200
+    # Source: crates/khive-pack-kg/src/handlers/search.rs (lines ~64-70, widening formula)
+    #         crates/khive-runtime/src/retrieval.rs (CANDIDATE_MULTIPLIER=4, line 67)
+    # The target must be at rank > 4 (proves widening is needed) and rank <= 200
+    # (proves the widened budget is sufficient).  Exact rank is NOT asserted —
+    # the (4, 200] band stays robust to minor FTS scoring drift.
+    unfiltered = khive_session.verb("search", {
+        "kind": "entity",
+        "query": "sfwidp_probe sfwidp_signal",
+        "limit": 200,
+        "namespace": ns,
+    })
+    assert isinstance(unfiltered, list), (
+        f"unfiltered search must return a list; got {type(unfiltered)}"
+    )
+    unfiltered_ids = [h.get("id", "") for h in unfiltered]
+    assert target_id in unfiltered_ids, (
+        "target must appear in unfiltered results at limit=200 (setup sanity check); "
+        f"total unfiltered hits={len(unfiltered_ids)}"
+    )
+    target_rank = unfiltered_ids.index(target_id) + 1  # 1-indexed
+    assert target_rank > 4, (
+        f"target must rank below the naive budget floor (rank > 4); got rank={target_rank}. "
+        "Decoy FTS signal is insufficiently dominant — check decoy_blob repetitions."
+    )
+    assert target_rank <= 200, (
+        f"target must be within the widened budget ceiling (rank <= 200); got rank={target_rank}. "
+        "Budget model is off — verify handler widening and runtime CANDIDATE_MULTIPLIER."
+    )
+
     hits = khive_session.verb("search", {
         "kind": "entity",
         "query": "sfwidp_probe sfwidp_signal",
@@ -329,7 +363,7 @@ def test_entity_search_props_filter_before_truncation_widening(
         f"got {len(hits)}: {hits}"
     )
     assert hits[0].get("id") == target_id, (
-        "the property-filtered target entity (at rank 52 without filter) must be returned; "
+        f"the property-filtered target entity (unfiltered rank={target_rank}) must be returned; "
         f"got {hits[0]}"
     )
 
@@ -367,6 +401,37 @@ def test_entity_search_tag_filter_before_truncation_widening(
     })
     target_id = target["id"]
 
+    # Self-asserting phase: confirm the target's unfiltered rank lies in (4, 200].
+    # Budget chain for limit=1:
+    #   naive (no widening):  runtime candidates = 1 * 4  =   4
+    #   handler widens:       search_limit = min(1*50,500) = 50
+    #   runtime over-fetch:   candidates  = 50 * 4        = 200
+    # Source: crates/khive-pack-kg/src/handlers/search.rs (lines ~64-70, widening formula)
+    #         crates/khive-runtime/src/retrieval.rs (CANDIDATE_MULTIPLIER=4, line 67)
+    unfiltered = khive_session.verb("search", {
+        "kind": "entity",
+        "query": "sfwidt_probe sfwidt_signal",
+        "limit": 200,
+        "namespace": ns,
+    })
+    assert isinstance(unfiltered, list), (
+        f"unfiltered search must return a list; got {type(unfiltered)}"
+    )
+    unfiltered_ids = [h.get("id", "") for h in unfiltered]
+    assert target_id in unfiltered_ids, (
+        "target must appear in unfiltered results at limit=200 (setup sanity check); "
+        f"total unfiltered hits={len(unfiltered_ids)}"
+    )
+    target_rank = unfiltered_ids.index(target_id) + 1  # 1-indexed
+    assert target_rank > 4, (
+        f"target must rank below the naive budget floor (rank > 4); got rank={target_rank}. "
+        "Decoy FTS signal is insufficiently dominant — check decoy_blob repetitions."
+    )
+    assert target_rank <= 200, (
+        f"target must be within the widened budget ceiling (rank <= 200); got rank={target_rank}. "
+        "Budget model is off — verify handler widening and runtime CANDIDATE_MULTIPLIER."
+    )
+
     hits = khive_session.verb("search", {
         "kind": "entity",
         "query": "sfwidt_probe sfwidt_signal",
@@ -381,7 +446,7 @@ def test_entity_search_tag_filter_before_truncation_widening(
         f"got {len(hits)}: {hits}"
     )
     assert hits[0].get("id") == target_id, (
-        "the tag-filtered target entity (at rank 52 without filter) must be returned; "
+        f"the tag-filtered target entity (unfiltered rank={target_rank}) must be returned; "
         f"got {hits[0]}"
     )
 
@@ -533,6 +598,37 @@ def test_note_search_props_filter_before_truncation_widening(
     })
     target_id = target["id"]
 
+    # Self-asserting phase: confirm the target's unfiltered rank lies in (4, 200].
+    # Budget chain for limit=1:
+    #   naive (no widening):  runtime candidates = 1 * 4  =   4
+    #   handler widens:       search_limit = min(1*50,500) = 50
+    #   runtime over-fetch:   candidates  = 50 * 4        = 200
+    # Source: crates/khive-pack-kg/src/handlers/search.rs (lines ~171-178, note branch)
+    #         crates/khive-runtime/src/operations.rs (lines ~2409-2427, candidates=limit*4)
+    unfiltered = khive_session.verb("search", {
+        "kind": "note",
+        "query": "sfnwidp_probe sfnwidp_signal",
+        "limit": 200,
+        "namespace": ns,
+    })
+    assert isinstance(unfiltered, list), (
+        f"unfiltered search must return a list; got {type(unfiltered)}"
+    )
+    unfiltered_ids = [h.get("id", "") for h in unfiltered]
+    assert target_id in unfiltered_ids, (
+        "target must appear in unfiltered results at limit=200 (setup sanity check); "
+        f"total unfiltered hits={len(unfiltered_ids)}"
+    )
+    target_rank = unfiltered_ids.index(target_id) + 1  # 1-indexed
+    assert target_rank > 4, (
+        f"target must rank below the naive budget floor (rank > 4); got rank={target_rank}. "
+        "Decoy FTS signal is insufficiently dominant — check decoy_blob repetitions."
+    )
+    assert target_rank <= 200, (
+        f"target must be within the widened budget ceiling (rank <= 200); got rank={target_rank}. "
+        "Budget model is off — verify handler widening and runtime CANDIDATE_MULTIPLIER."
+    )
+
     hits = khive_session.verb("search", {
         "kind": "note",
         "query": "sfnwidp_probe sfnwidp_signal",
@@ -547,7 +643,7 @@ def test_note_search_props_filter_before_truncation_widening(
         f"got {len(hits)}: {hits}"
     )
     assert hits[0].get("id") == target_id, (
-        "the property-filtered target note (at rank 52 without filter) must be returned; "
+        f"the property-filtered target note (unfiltered rank={target_rank}) must be returned; "
         f"got {hits[0]}"
     )
 
@@ -583,6 +679,37 @@ def test_note_search_tag_filter_before_truncation_widening(
     })
     target_id = target["id"]
 
+    # Self-asserting phase: confirm the target's unfiltered rank lies in (4, 200].
+    # Budget chain for limit=1:
+    #   naive (no widening):  runtime candidates = 1 * 4  =   4
+    #   handler widens:       search_limit = min(1*50,500) = 50
+    #   runtime over-fetch:   candidates  = 50 * 4        = 200
+    # Source: crates/khive-pack-kg/src/handlers/search.rs (lines ~171-178, note branch)
+    #         crates/khive-runtime/src/operations.rs (lines ~2409-2427, candidates=limit*4)
+    unfiltered = khive_session.verb("search", {
+        "kind": "note",
+        "query": "sfnwidt_probe sfnwidt_signal",
+        "limit": 200,
+        "namespace": ns,
+    })
+    assert isinstance(unfiltered, list), (
+        f"unfiltered search must return a list; got {type(unfiltered)}"
+    )
+    unfiltered_ids = [h.get("id", "") for h in unfiltered]
+    assert target_id in unfiltered_ids, (
+        "target must appear in unfiltered results at limit=200 (setup sanity check); "
+        f"total unfiltered hits={len(unfiltered_ids)}"
+    )
+    target_rank = unfiltered_ids.index(target_id) + 1  # 1-indexed
+    assert target_rank > 4, (
+        f"target must rank below the naive budget floor (rank > 4); got rank={target_rank}. "
+        "Decoy FTS signal is insufficiently dominant — check decoy_blob repetitions."
+    )
+    assert target_rank <= 200, (
+        f"target must be within the widened budget ceiling (rank <= 200); got rank={target_rank}. "
+        "Budget model is off — verify handler widening and runtime CANDIDATE_MULTIPLIER."
+    )
+
     hits = khive_session.verb("search", {
         "kind": "note",
         "query": "sfnwidt_probe sfnwidt_signal",
@@ -597,6 +724,6 @@ def test_note_search_tag_filter_before_truncation_widening(
         f"got {len(hits)}: {hits}"
     )
     assert hits[0].get("id") == target_id, (
-        "the tag-filtered target note (at rank 52 without filter) must be returned; "
+        f"the tag-filtered target note (unfiltered rank={target_rank}) must be returned; "
         f"got {hits[0]}"
     )
