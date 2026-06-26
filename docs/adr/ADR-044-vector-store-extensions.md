@@ -339,7 +339,9 @@ pub struct OrphanSweepResult {
 ```rust
 // On VectorStore trait:
 /// Find vector rows whose subject_id has no corresponding live record in the SQL
-/// substrate (entities / notes / memories with `deleted_at IS NULL`).
+/// substrate (`entities` / `notes` with `deleted_at IS NULL`). Memory records
+/// are stored as notes with `kind = 'memory'`, so a memory vector is protected
+/// only by its row in `notes` -- there is no separate `memories` table.
 ///
 /// A vector is orphaned when its subject_id is either absent from all substrate
 /// tables, or present with `deleted_at IS NOT NULL`. Soft-deleted substrate rows

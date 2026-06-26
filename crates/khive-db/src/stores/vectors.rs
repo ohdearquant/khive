@@ -821,9 +821,37 @@ impl VectorStore for SqliteVecStore {
         let dry_run = config.dry_run;
 
         self.with_writer("orphan_sweep", move |conn| {
-            // Acquire a write lock for the entire sweep to eliminate the TOCTOU
-            // window between counting orphans and deleting them (ADR-044 §5).
-            conn.execute_batch("BEGIN IMMEDIATE")?;
+            // RAII transaction guard: acquires BEGIN IMMEDIATE on construction and
+            // issues ROLLBACK on drop if commit() was never called.  This prevents
+            // the connection from being left with an open transaction when any of
+            // the inner `?`-propagated errors fire (scan COUNT, would-delete COUNT,
+            // or DELETE), which would poison the pooled writer for subsequent callers.
+            struct ImmediateTx<'a> {
+                conn: &'a rusqlite::Connection,
+                done: bool,
+            }
+            impl<'a> ImmediateTx<'a> {
+                fn begin(conn: &'a rusqlite::Connection) -> rusqlite::Result<Self> {
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
+                    Ok(ImmediateTx { conn, done: false })
+                }
+                fn commit(mut self) -> rusqlite::Result<()> {
+                    // Set done BEFORE executing so that if COMMIT fails and this
+                    // struct is dropped by the `?` propagation, Drop does not issue
+                    // a redundant ROLLBACK (SQLite auto-rolls-back on COMMIT failure).
+                    self.done = true;
+                    self.conn.execute_batch("COMMIT")
+                }
+            }
+            impl Drop for ImmediateTx<'_> {
+                fn drop(&mut self) {
+                    if !self.done {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                    }
+                }
+            }
+
+            let tx = ImmediateTx::begin(conn)?;
 
             // Optional-filter clause shared across all three queries.
             // Each ?N appears twice (IS NULL guard + json_each call); SQLite
@@ -914,7 +942,7 @@ impl VectorStore for SqliteVecStore {
                 )? as i64
             };
 
-            conn.execute_batch("COMMIT")?;
+            tx.commit()?;
 
             Ok(OrphanSweepResult {
                 scanned: scanned as u64,
@@ -2629,5 +2657,144 @@ mod orphan_sweep_tests {
         assert!(!e1.contains(&id1), "id1 must be swept");
         assert!(!e2.contains(&id2), "id2 must be swept");
         assert!(e3.contains(&id3), "id3 not in allowlist must survive");
+    }
+
+    // ── helpers for note substrate rows ─────────────────────────────────────
+
+    fn insert_note(pool: &Arc<crate::pool::ConnectionPool>, id: Uuid, deleted_at: Option<i64>) {
+        let id_str = id.to_string();
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute(
+                "INSERT INTO notes (id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id_str, deleted_at],
+            )
+            .expect("insert note");
+    }
+
+    // ── test 9: live note → vector kept ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_keeps_live_note() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_note_live", 4);
+        let store = make_store(Arc::clone(&pool), "sw_note_live", 4, "ns:nlive");
+        let ns = "ns:nlive";
+
+        let id = Uuid::new_v4();
+        insert_note(&pool, id, None); // live note row
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Note,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r = store
+            .orphan_sweep(&sweep_all(100, false))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1);
+        assert_eq!(r.would_delete, 0, "live note is not an orphan");
+        assert_eq!(r.deleted, 0);
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(present.contains(&id), "live note's vec must survive");
+    }
+
+    // ── test 10: soft-deleted note → vector swept ─────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_sweeps_soft_deleted_note() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_note_soft", 4);
+        let store = make_store(Arc::clone(&pool), "sw_note_soft", 4, "ns:nsoft");
+        let ns = "ns:nsoft";
+
+        let id = Uuid::new_v4();
+        insert_note(&pool, id, Some(1_000_000)); // soft-deleted note row
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Note,
+                ns,
+                "body",
+                vec![vec4(0.5, 0.5, 0.5, 0.5)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r = store
+            .orphan_sweep(&sweep_all(100, false))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1);
+        assert_eq!(r.would_delete, 1, "soft-deleted note counts as orphan");
+        assert_eq!(r.deleted, 1);
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(
+            !present.contains(&id),
+            "soft-deleted note's vec must be swept"
+        );
+    }
+
+    // ── test 11: mid-transaction error must NOT poison the pooled connection ──
+    //
+    // Regression for the transaction-leak bug: if orphan_sweep errors after
+    // BEGIN IMMEDIATE but before COMMIT, the pooled writer must NOT be left
+    // with an open transaction.  Without the RAII guard, the next writer
+    // call fails with "cannot start a transaction within a transaction".
+    //
+    // Deterministic injection: we create the vec table but deliberately omit
+    // the substrate tables.  The anti-join queries reference `entities` and
+    // `notes`, so the first scan COUNT fails with "no such table: entities".
+    // After the error, we immediately perform a normal vector insert on the
+    // same store and assert it succeeds — proving the connection is clean.
+
+    #[tokio::test]
+    async fn orphan_sweep_error_does_not_poison_connection() {
+        let pool = make_pool();
+        // Note: create_substrate_tables is intentionally NOT called here.
+        create_vec_table(&pool, "sw_poison", 4);
+        let store = make_store(Arc::clone(&pool), "sw_poison", 4, "ns:poison");
+        let ns = "ns:poison";
+
+        // orphan_sweep must fail because `entities` / `notes` do not exist.
+        let sweep_result = store.orphan_sweep(&sweep_all(100, false)).await;
+        assert!(
+            sweep_result.is_err(),
+            "sweep must fail when substrate tables are absent"
+        );
+
+        // The connection must not be poisoned: a normal vector insert must succeed.
+        let id = Uuid::new_v4();
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert after failed sweep must succeed (connection not poisoned)");
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(
+            present.contains(&id),
+            "vector inserted after failed sweep must be present"
+        );
     }
 }
