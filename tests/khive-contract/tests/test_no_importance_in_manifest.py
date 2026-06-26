@@ -175,6 +175,8 @@ def _is_allowed(line: str) -> bool:
         "earlier draft aliased `importance`",  # ADR-021 historical note
         "Separate `importance` column", # ADR-021 alternatives table
         "relative importance during",  # engine_config.rs English prose (not a param name)
+        "the memory's importance, decayed",  # docs/guide/memory.md prose explaining salience
+        "weigh the importance of different words",  # khive-text bench sample text (Transformer prose)
     ):
         if allowed in line:
             return True
