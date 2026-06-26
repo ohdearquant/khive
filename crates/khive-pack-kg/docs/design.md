@@ -14,7 +14,7 @@ the khive binary.
 | ADR                                                                | What it governs                                   | Status      |
 | ------------------------------------------------------------------ | ------------------------------------------------- | ----------- |
 | [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)    | Implemented |
-| [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 15 edge relations, closed set                     | Implemented |
+| [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
 | [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                  | Implemented |
 | [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                 | Implemented |
 | [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                       | Implemented |

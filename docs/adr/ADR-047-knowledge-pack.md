@@ -63,6 +63,10 @@ requires at minimum three steps: `create(kind="concept", ...)`, optionally
 `link(relation="introduced_by", ...)`, and `search(kind="concept", ...)` for retrieval.
 These three steps recur in every research-agent workflow.
 
+> **Amended**: ADR-048 added a 9th entity kind (`resource`); ADR-055 added 2 epistemic
+> relations (`supports`, `refutes`); the current totals are 9 entity kinds and 17 edge
+> relations.
+
 Agents that work exclusively with research concepts encounter two friction points:
 
 1. **Domain promotion is manual.** `create` accepts a `tags` list; callers must

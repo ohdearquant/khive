@@ -92,9 +92,9 @@ batch of them), and khive dispatches it to the appropriate pack handler.
 
 ### 1. Create an entity
 
-Entities are the nodes in your knowledge graph. khive has 8 entity kinds:
+Entities are the nodes in your knowledge graph. khive has 9 entity kinds:
 `concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`,
-`service`.
+`service`, `resource`.
 
 ```
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={domain: \"attention\", year: 2022})")

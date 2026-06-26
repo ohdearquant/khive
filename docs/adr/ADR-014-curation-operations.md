@@ -527,7 +527,7 @@ never specify `substrate` directly.
 ## References
 
 - ADR-001: Entity Kind Taxonomy — entity_type validation via EntityTypeRegistry.
-- ADR-002: Edge Ontology — 15 relations, endpoint legality.
+- ADR-002: Edge Ontology — 15 base relations, endpoint legality. (Amended by ADR-055: current total is 17.)
 - ADR-004: Substrate Observables — Note kind_status lifecycle validation.
 - ADR-005: Storage Capability Traits — `EntityStore`, `GraphStore`, `NoteStore`,
   `EventStore`, `VectorStore`, `TextSearch` are the primitives curation composes.

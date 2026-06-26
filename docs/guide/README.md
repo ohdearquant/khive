@@ -23,7 +23,7 @@ the exact `request(ops="...")` syntax for every common operation.
 ## What khive is
 
 khive is a structured persistence layer for AI research agents. It provides a
-typed knowledge graph (8 entity kinds, 15 edge relations, 5 note kinds), hybrid
+typed knowledge graph (9 entity kinds, 17 edge relations, 5 note kinds), hybrid
 search (FTS5 + vector + RRF fusion), GQL/SPARQL queries, task management, agent
 memory with decay-weighted recall, inter-agent messaging, scheduling, and a
 knowledge corpus with reranking.
