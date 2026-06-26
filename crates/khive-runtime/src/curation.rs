@@ -163,6 +163,27 @@ impl From<EdgeListFilter> for EdgeFilter {
 }
 
 // ---------------------------------------------------------------------------
+// Private types
+// ---------------------------------------------------------------------------
+
+// REASON: EdgeRow fields are populated via rusqlite row mapping. The struct is fully
+// constructed even when not all fields are read back after construction. The complete
+// field mapping guards against column-order bugs when the schema changes.
+#[allow(dead_code)]
+struct EdgeRow {
+    id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: String,
+    weight: f64,
+    created_at: i64,
+    updated_at: i64,
+    deleted_at: Option<i64>,
+    target_backend: Option<String>,
+    metadata: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
@@ -866,23 +887,6 @@ fn merge_entity_sql(
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
     // --- Collect edges incident to from_id ---
-    // REASON: EdgeRow fields are populated via rusqlite row mapping; the struct is fully
-    // constructed even though not all fields are read back after construction — the
-    // complete mapping guards against column-order bugs when the schema changes.
-    #[allow(dead_code)]
-    struct EdgeRow {
-        id: Uuid,
-        source_id: Uuid,
-        target_id: Uuid,
-        relation: String,
-        weight: f64,
-        created_at: i64,
-        updated_at: i64,
-        deleted_at: Option<i64>,
-        target_backend: Option<String>,
-        metadata: Option<String>,
-    }
-
     let parse_id =
         |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
 
@@ -1318,20 +1322,6 @@ fn merge_note_sql(
     let from_str = from_id.to_string();
 
     // Collect edges incident to from_id.
-    // REASON: same as merge_entity_sql — full field mapping prevents column-order bugs.
-    #[allow(dead_code)]
-    struct EdgeRow {
-        id: Uuid,
-        source_id: Uuid,
-        target_id: Uuid,
-        relation: String,
-        weight: f64,
-        created_at: i64,
-        updated_at: i64,
-        deleted_at: Option<i64>,
-        target_backend: Option<String>,
-        metadata: Option<String>,
-    }
     let parse_id =
         |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
 
