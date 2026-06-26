@@ -994,6 +994,8 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn traverse(&self, request: TraversalRequest) -> Result<Vec<GraphPath>, StorageError> {
+        use std::collections::{HashMap, HashSet};
+
         use khive_storage::types::Direction;
 
         if request.roots.is_empty() {
@@ -1006,107 +1008,130 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
 
         self.with_reader("traverse", move |conn| {
-            let mut all_paths: Vec<GraphPath> = Vec::new();
+            let n_roots = roots.len();
 
+            // Determine join direction and the expression for the "next" node in
+            // the expansion step.
+            let (join_condition, next_node) = match opts.direction {
+                Direction::Out => ("e.source_id = t.node_id", "e.target_id"),
+                Direction::In => ("e.target_id = t.node_id", "e.source_id"),
+                Direction::Both => (
+                    "(e.source_id = t.node_id OR e.target_id = t.node_id)",
+                    "CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END",
+                ),
+            };
+
+            // Param layout:
+            //   ?1 .. ?{n_roots}     — root UUID strings (each used 3× in their seed row)
+            //   ?{n_roots + 1}       — namespace
+            //   ?{n_roots + 2}       — max_depth
+            //   ?{n_roots + 3} ..    — optional relation / weight / limit params
+            let ns_param = n_roots + 1;
+            let depth_param = n_roots + 2;
+            let mut extra_param_idx = n_roots + 3;
+
+            let mut relation_cond = String::new();
+            let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+            if let Some(ref rels) = opts.relations {
+                if !rels.is_empty() {
+                    let placeholders: Vec<String> = rels
+                        .iter()
+                        .map(|r| {
+                            extra_params.push(Box::new(r.to_string()));
+                            let p = format!("?{extra_param_idx}");
+                            extra_param_idx += 1;
+                            p
+                        })
+                        .collect();
+                    relation_cond = format!(" AND e.relation IN ({})", placeholders.join(","));
+                }
+            }
+
+            let mut weight_cond = String::new();
+            if let Some(min_w) = opts.min_weight {
+                extra_params.push(Box::new(min_w));
+                weight_cond = format!(" AND e.weight >= ?{extra_param_idx}");
+                extra_param_idx += 1;
+            }
+
+            let limit_clause = if let Some(lim) = opts.limit {
+                extra_params.push(Box::new(lim as i64));
+                format!(" LIMIT ?{extra_param_idx}")
+            } else {
+                String::new()
+            };
+
+            // Seed rows: one per root, each referencing its own param 3× (root_id,
+            // node_id, and the initial path string all carry the same UUID).
+            let seed_rows: Vec<String> = (1..=n_roots)
+                .map(|i| format!("(?{i}, ?{i}, NULL, 0, ?{i}, 0.0)"))
+                .collect();
+            let seeds = seed_rows.join(", ");
+
+            // Single CTE covering all roots.  CROSS JOIN forces SQLite to put the
+            // frontier (t) as the outer loop and seek graph_edges by source/target
+            // (ns, source_id) index, avoiding the O(edges × frontier) plan that
+            // the plain INNER JOIN produces (#250, #251).
+            let cte_sql = format!(
+                "WITH RECURSIVE traversal(\
+                     root_id, node_id, edge_id, depth, path, total_weight\
+                 ) AS (\
+                     VALUES {seeds} \
+                     UNION ALL \
+                     SELECT t.root_id, {next_node}, e.id, t.depth + 1, \
+                            t.path || ',' || {next_node}, \
+                            t.total_weight + e.weight \
+                     FROM traversal t CROSS JOIN graph_edges e \
+                         ON {join_condition} \
+                     WHERE e.namespace = ?{ns} \
+                       AND e.deleted_at IS NULL \
+                       AND t.depth < ?{depth} \
+                       AND (',' || t.path || ',') NOT LIKE '%,' || {next_node} || ',%'\
+                       {rel_cond}{wt_cond} \
+                 ) \
+                 SELECT root_id, node_id, edge_id, depth, total_weight \
+                 FROM traversal WHERE depth > 0 \
+                 ORDER BY root_id, depth{limit}",
+                seeds = seeds,
+                next_node = next_node,
+                join_condition = join_condition,
+                ns = ns_param,
+                depth = depth_param,
+                rel_cond = relation_cond,
+                wt_cond = weight_cond,
+                limit = limit_clause,
+            );
+
+            // Build the flat param list matching the layout above.
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             for root_id in &roots {
-                let root_str = root_id.to_string();
+                all_params.push(Box::new(root_id.to_string()));
+            }
+            all_params.push(Box::new(namespace.clone()));
+            all_params.push(Box::new(opts.max_depth as i64));
+            all_params.extend(extra_params);
 
-                let (join_condition, next_node) = match opts.direction {
-                    Direction::Out => ("e.source_id = t.node_id", "e.target_id"),
-                    Direction::In => ("e.target_id = t.node_id", "e.source_id"),
-                    Direction::Both => (
-                        "(e.source_id = t.node_id OR e.target_id = t.node_id)",
-                        "CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END",
-                    ),
-                };
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
 
-                let mut relation_cond = String::new();
-                let mut relation_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                let mut param_idx = 4;
+            let mut stmt = conn.prepare(&cte_sql)?;
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let root_str: String = row.get(0)?;
+                let node_str: String = row.get(1)?;
+                let edge_str: Option<String> = row.get(2)?;
+                let depth: i64 = row.get(3)?;
+                let total_weight: f64 = row.get(4)?;
+                Ok((root_str, node_str, edge_str, depth, total_weight))
+            })?;
 
-                if let Some(ref rels) = opts.relations {
-                    if !rels.is_empty() {
-                        let placeholders: Vec<String> = rels
-                            .iter()
-                            .map(|r| {
-                                relation_params.push(Box::new(r.to_string()));
-                                let p = format!("?{}", param_idx);
-                                param_idx += 1;
-                                p
-                            })
-                            .collect();
-                        relation_cond =
-                            format!(" AND e.relation IN ({})", placeholders.join(","));
-                    }
-                }
+            // Accumulate per-root state: (nodes, max_weight, seen_set).
+            let mut root_data: HashMap<Uuid, (Vec<PathNode>, f64, HashSet<Uuid>)> =
+                HashMap::with_capacity(n_roots);
 
-                let mut weight_cond = String::new();
-                if let Some(min_w) = opts.min_weight {
-                    relation_params.push(Box::new(min_w));
-                    weight_cond = format!(" AND e.weight >= ?{}", param_idx);
-                    param_idx += 1;
-                }
-
-                let limit_clause = if let Some(lim) = opts.limit {
-                    relation_params.push(Box::new(lim as i64));
-                    format!(" LIMIT ?{}", param_idx)
-                } else {
-                    String::new()
-                };
-
-                let cte_sql = format!(
-                    "WITH RECURSIVE traversal(node_id, edge_id, depth, path, total_weight) AS (\
-                         SELECT ?2, NULL, 0, ?2, 0.0 \
-                         UNION ALL \
-                         SELECT {next_node}, e.id, t.depth + 1, \
-                                t.path || ',' || {next_node}, \
-                                t.total_weight + e.weight \
-                         FROM graph_edges e \
-                         JOIN traversal t ON {join_condition} \
-                         WHERE e.namespace = ?1 \
-                           AND e.deleted_at IS NULL \
-                           AND t.depth < ?3 \
-                           AND (',' || t.path || ',') NOT LIKE '%,' || {next_node} || ',%'{rel_cond}{wt_cond} \
-                     ) \
-                     SELECT node_id, edge_id, depth, path, total_weight \
-                     FROM traversal WHERE depth > 0 \
-                     ORDER BY depth{limit}",
-                    next_node = next_node,
-                    join_condition = join_condition,
-                    rel_cond = relation_cond,
-                    wt_cond = weight_cond,
-                    limit = limit_clause,
-                );
-
-                let mut stmt = conn.prepare(&cte_sql)?;
-
-                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                all_params.push(Box::new(namespace.clone()));
-                all_params.push(Box::new(root_str.clone()));
-                all_params.push(Box::new(opts.max_depth as i64));
-                all_params.extend(relation_params);
-
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    all_params.iter().map(|p| p.as_ref()).collect();
-
-                let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                    let node_str: String = row.get(0)?;
-                    let edge_str: Option<String> = row.get(1)?;
-                    let depth: i64 = row.get(2)?;
-                    let _path: String = row.get(3)?;
-                    let total_weight: f64 = row.get(4)?;
-                    Ok((node_str, edge_str, depth, total_weight))
-                })?;
-
-                let mut nodes = Vec::new();
-                let mut max_weight = 0.0f64;
-                // Track visited node IDs to deduplicate multi-path reachability
-                // (#285). Rows are ordered by depth (shallowest first), so the
-                // first occurrence is the BFS-order first-visit — that is the
-                // one we keep.
-                let mut seen: std::collections::HashSet<Uuid> =
-                    std::collections::HashSet::new();
-
+            // Pre-seed with root nodes when include_roots is set.
+            for root_id in &roots {
+                let (nodes, _, seen) = root_data.entry(*root_id).or_default();
                 if include_roots {
                     seen.insert(*root_id);
                     nodes.push(PathNode {
@@ -1117,33 +1142,44 @@ impl GraphStore for SqlGraphStore {
                         kind: None,
                     });
                 }
+            }
 
-                for row in rows {
-                    let (node_str, edge_str, depth, total_weight) = row?;
-                    let node_id = parse_uuid(&node_str)?;
-                    // Skip nodes already seen via an earlier (shallower) path.
-                    if !seen.insert(node_id) {
-                        continue;
-                    }
-                    let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
-                    nodes.push(PathNode {
-                        node_id,
-                        via_edge,
-                        depth: depth as usize,
-                        name: None,
-                        kind: None,
-                    });
-                    if total_weight > max_weight {
-                        max_weight = total_weight;
-                    }
+            // The CTE is ordered by (root_id, depth), so the first occurrence of
+            // each (root_id, node_id) pair is the shallowest-depth path — that is
+            // the one we keep (BFS first-visit semantics, matching #285).
+            for row in rows {
+                let (root_str, node_str, edge_str, depth, total_weight) = row?;
+                let root_id = parse_uuid(&root_str)?;
+                let node_id = parse_uuid(&node_str)?;
+
+                let (nodes, max_weight, seen) = root_data.entry(root_id).or_default();
+                if !seen.insert(node_id) {
+                    continue;
                 }
+                let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
+                nodes.push(PathNode {
+                    node_id,
+                    via_edge,
+                    depth: depth as usize,
+                    name: None,
+                    kind: None,
+                });
+                if total_weight > *max_weight {
+                    *max_weight = total_weight;
+                }
+            }
 
-                if nodes.len() > if include_roots { 1 } else { 0 } || include_roots {
-                    all_paths.push(GraphPath {
-                        root_id: *root_id,
-                        nodes,
-                        total_weight: max_weight,
-                    });
+            // Reconstruct Vec<GraphPath> in original root order.
+            let mut all_paths: Vec<GraphPath> = Vec::with_capacity(n_roots);
+            for root_id in &roots {
+                if let Some((nodes, max_weight, _)) = root_data.remove(root_id) {
+                    if !nodes.is_empty() {
+                        all_paths.push(GraphPath {
+                            root_id: *root_id,
+                            nodes,
+                            total_weight: max_weight,
+                        });
+                    }
                 }
             }
 

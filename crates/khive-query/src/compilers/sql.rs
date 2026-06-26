@@ -1212,8 +1212,8 @@ fn compile_variable_length(
                     t.path || ',' || {recurse_next}, \
                     t.total_weight + e.weight, \
                     e.id, e.relation, e.weight \
-             FROM traverse t \
-             JOIN graph_edges e ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+             FROM traverse t CROSS JOIN graph_edges e \
+                 ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              JOIN entities next_node ON next_node.id = ({recurse_next}) \
                     AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE t.depth < ?{depth_param} \

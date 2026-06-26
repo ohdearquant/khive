@@ -299,6 +299,145 @@ async fn test_traverse_preserves_first_path_metadata() {
     assert_eq!(d_nodes[0].depth, 2, "D lives at depth 2");
 }
 
+/// Multi-root batched traversal: two independent chains A→B→C and D→E→F.
+/// Each root must produce its own GraphPath with the correct node set.
+#[tokio::test]
+async fn test_traverse_multi_root_independent_chains() {
+    let store = setup_memory_store();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let d = Uuid::new_v4();
+    let e = Uuid::new_v4();
+    let f = Uuid::new_v4();
+
+    for (src, tgt) in [(a, b), (b, c), (d, e), (e, f)] {
+        store
+            .upsert_edge(make_edge(src, tgt, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let request = TraversalRequest {
+        roots: vec![a, d],
+        options: TraversalOptions::new(2).with_direction(Direction::Out),
+        include_roots: true,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+    assert_eq!(paths.len(), 2, "one GraphPath per root");
+
+    // Locate paths by root_id.
+    let path_a = paths
+        .iter()
+        .find(|p| p.root_id == a)
+        .expect("path for root A");
+    let path_d = paths
+        .iter()
+        .find(|p| p.root_id == d)
+        .expect("path for root D");
+
+    let ids_a: HashSet<Uuid> = path_a.nodes.iter().map(|n| n.node_id).collect();
+    assert!(ids_a.contains(&a), "root A in its own path");
+    assert!(ids_a.contains(&b), "depth-1 B in A's path");
+    assert!(ids_a.contains(&c), "depth-2 C in A's path");
+    assert!(!ids_a.contains(&d), "root D must not appear in A's path");
+
+    let ids_d: HashSet<Uuid> = path_d.nodes.iter().map(|n| n.node_id).collect();
+    assert!(ids_d.contains(&d), "root D in its own path");
+    assert!(ids_d.contains(&e), "depth-1 E in D's path");
+    assert!(ids_d.contains(&f), "depth-2 F in D's path");
+    assert!(!ids_d.contains(&a), "root A must not appear in D's path");
+}
+
+/// Multi-root with a shared neighbor: A→C and B→C.  C must appear in BOTH
+/// A's path and B's path (per-root isolation, not global dedup).
+#[tokio::test]
+async fn test_traverse_multi_root_shared_neighbor_appears_in_both() {
+    let store = setup_memory_store();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4(); // shared neighbor
+
+    for (src, tgt) in [(a, c), (b, c)] {
+        store
+            .upsert_edge(make_edge(src, tgt, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let request = TraversalRequest {
+        roots: vec![a, b],
+        options: TraversalOptions::new(1).with_direction(Direction::Out),
+        include_roots: false,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+    assert_eq!(paths.len(), 2, "one GraphPath per root");
+
+    for path in &paths {
+        let node_ids: HashSet<Uuid> = path.nodes.iter().map(|n| n.node_id).collect();
+        assert!(
+            node_ids.contains(&c),
+            "shared node C must appear in each root's path; root={:?}",
+            path.root_id
+        );
+    }
+}
+
+/// Query-count regression: a 15-node binary tree at max_depth=3 must be
+/// traversed in a single CTE execution (one conn.prepare call), not N CTEs.
+/// This test asserts the node-count result is correct, which would fail if
+/// the batched CTE produced duplicates or missed nodes.
+#[tokio::test]
+async fn test_traverse_binary_tree_result_count() {
+    let store = setup_memory_store();
+
+    // Build a complete binary tree of depth 3: root + 2 + 4 + 8 = 15 nodes.
+    let nodes: Vec<Uuid> = (0..15).map(|_| Uuid::new_v4()).collect();
+    for i in 0..7usize {
+        let left = 2 * i + 1;
+        let right = 2 * i + 2;
+        store
+            .upsert_edge(make_edge(nodes[i], nodes[left], EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(
+                nodes[i],
+                nodes[right],
+                EdgeRelation::Extends,
+                1.0,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let request = TraversalRequest {
+        roots: vec![nodes[0]],
+        options: TraversalOptions::new(3).with_direction(Direction::Out),
+        include_roots: true,
+    };
+
+    let paths = store.traverse(request).await.unwrap();
+    assert_eq!(paths.len(), 1);
+    // root + depth-1 (2) + depth-2 (4) + depth-3 (8) = 15
+    assert_eq!(
+        paths[0].nodes.len(),
+        15,
+        "binary tree depth-3 must yield exactly 15 nodes"
+    );
+    // Every depth-3 node must have a via_edge.
+    for node in paths[0].nodes.iter().filter(|n| n.depth == 3) {
+        assert!(
+            node.via_edge.is_some(),
+            "depth-3 nodes must carry a via_edge"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_metadata_roundtrip() {
     let store = setup_memory_store();
