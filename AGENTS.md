@@ -544,7 +544,7 @@ rebuild, kill zombie processes: `pkill -f kkernel` then reconnect.
 
 ---
 
-## Namespace (attribution-only — ADR-007 Rev 3)
+## Namespace (attribution-only — ADR-007 Rev 6)
 
 Namespace is a write-stamp on records. In OSS, every record is stored under namespace `"local"` by
 default. It is attribution, not isolation: queryable and filterable as a data column, but never a
