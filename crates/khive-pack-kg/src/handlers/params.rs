@@ -12,6 +12,19 @@ pub(crate) struct EdgeSpec {
     pub(crate) weight: Option<f64>,
 }
 
+/// A single entry in a bulk `create(items=[...])` request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BulkCreateEntry {
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) entity_kind: Option<String>,
+    pub(crate) entity_type: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) properties: Option<Value>,
+    pub(crate) tags: Option<Vec<String>>,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CreateParams {
     pub(crate) kind: String,

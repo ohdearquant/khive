@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
-    KhiveRuntime, NamespaceToken, ParamDef, RuntimeError, VerbCategory, VerbRegistry,
-    VerbRegistryBuilder, Visibility,
+    EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
+    VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 use khive_storage::Note;
 use khive_types::Pack;
@@ -146,6 +146,63 @@ async fn create_entity_valid_kind_concept_succeeds() {
         result.is_ok(),
         "valid entity_kind 'concept' must succeed: {:?}",
         result
+    );
+}
+
+// Regression: bulk `create(items=[...])` must NOT require a redundant top-level
+// `kind` — each item carries its own kind. The single-record `kind` requirement
+// runs only after the bulk early-exit. Caught when the requirement fired first.
+#[tokio::test]
+async fn create_bulk_items_without_top_level_kind_succeeds() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "BulkOne", "entity_type": "theorem"},
+                    {"kind": "concept", "name": "BulkTwo"}
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create without top-level kind must succeed");
+    assert_eq!(result.get("attempted").and_then(Value::as_u64), Some(2));
+    assert_eq!(result.get("created").and_then(Value::as_u64), Some(2));
+    assert_eq!(result.get("failed").and_then(Value::as_u64), Some(0));
+}
+
+// Regression: bulk create is atomic — one invalid item (empty name) rejects the
+// whole batch and writes nothing.
+#[tokio::test]
+async fn create_bulk_items_atomic_rejects_on_invalid_item() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ShouldNotLand"},
+                    {"kind": "concept", "name": ""}
+                ]
+            }),
+        )
+        .await
+        .expect_err("empty name in a bulk item must reject the batch");
+    assert!(
+        is_invalid_input(&err),
+        "expected InvalidInput, got: {err:?}"
+    );
+    // Nothing was written: a follow-up search for the valid name finds no entity.
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let items = listed.get("items").and_then(Value::as_array);
+    let count = items.map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "atomic rejection must leave storage empty; got {listed}"
     );
 }
 
@@ -6710,4 +6767,212 @@ async fn formal_depends_on_accepted_with_formal_pack() {
     );
     let edge = result.unwrap();
     assert_eq!(edge["relation"], "depends_on");
+}
+
+// ── Med-1 regression: malformed `items` must not fall through to singleton ──────
+
+/// A malformed bulk payload (unknown field in an item) must return an error and
+/// must NOT create the top-level entity that was named in the enclosing params.
+///
+/// Pre-fix: `serde_json::from_value(...).ok()` swallowed the parse error, the
+/// bulk path was skipped, and the singleton path ran — creating "TopLevelCreated"
+/// silently even though the caller intended a bulk create.
+#[tokio::test]
+async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "TopLevelCreated",
+                "items": [{"kind": "concept", "name": "ShouldBeBulk", "extra_unknown": 1}]
+            }),
+        )
+        .await
+        .expect_err("malformed items must produce an error");
+    assert!(
+        is_invalid_input(&err),
+        "malformed items must return InvalidInput, got: {err:?}"
+    );
+    // Neither the bulk item nor the top-level entity must have been written.
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "malformed items rejection must create nothing; got {listed}"
+    );
+}
+
+// ── High-2 (Round 2): entity-type validator is installed by normal pack registration ──
+
+/// Build a `(KhiveRuntime, VerbRegistry)` pair using the same boot sequence as
+/// the production MCP server: register the pack, build the registry, install edge
+/// rules + entity-type validators.  No manual call to
+/// `install_entity_type_validator` is made — the validator must arrive via
+/// `call_register_entity_type_validators`.
+fn pack_with_validators() -> (KhiveRuntime, VerbRegistry) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    // Production boot: call entity-type validator registration without manually
+    // calling install_entity_type_validator.
+    registry.call_register_entity_type_validators(&rt);
+    (rt, registry)
+}
+
+/// After normal pack registration (`call_register_entity_type_validators`),
+/// direct `runtime.create_many` must reject unregistered `entity_type` values
+/// without any manual call to `install_entity_type_validator`.
+#[tokio::test]
+async fn create_many_runtime_validator_installed_via_pack_registration() {
+    let (rt, _registry) = pack_with_validators();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let bad_specs = vec![EntityCreateSpec {
+        kind: "concept".into(),
+        entity_type: Some("not_a_registered_type".into()),
+        name: "ShouldNotLand".into(),
+        description: None,
+        properties: None,
+        tags: vec![],
+    }];
+
+    let result = rt.create_many(&tok, bad_specs).await;
+    assert!(
+        matches!(result, Err(RuntimeError::InvalidInput(_))),
+        "direct runtime.create_many must reject unknown entity_type once \
+         validator is installed via pack registration; got {result:?}"
+    );
+
+    // Zero rows written.
+    let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        0,
+        "rejected create_many must write nothing; got {rows:?}"
+    );
+}
+
+// ── Round-3 High: multi-backend per-pack runtime validator regression ──
+
+/// In a multi-backend deployment the KG pack is constructed with its OWN runtime
+/// (not the `default_runtime`).  After `call_register_entity_type_validators` the
+/// KG pack's per-pack runtime must reject an unknown `entity_type` — even though
+/// the call passes the `default_runtime`, not the per-pack one.
+///
+/// This is the production path: `PackRegistry::register_packs_with_runtimes` gives
+/// the `kg` pack its own runtime, then serve.rs calls
+/// `registry.call_register_entity_type_validators(&default_runtime)`.  Without the
+/// R3 fix (self.runtime install), the per-pack runtime has no validator and
+/// `runtime.create_many` with an unknown `entity_type` silently succeeds.
+#[tokio::test]
+async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backend() {
+    use khive_runtime::{EntityCreateSpec, PackRegistry};
+    use std::collections::HashMap;
+
+    // Two separate in-memory runtimes simulate a multi-backend deployment.
+    let default_runtime = KhiveRuntime::memory().expect("default runtime");
+    let kg_runtime = KhiveRuntime::memory().expect("kg per-pack runtime");
+
+    // Map "kg" → kg_runtime (the distinct per-pack backend).
+    let mut runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
+    runtimes.insert("kg".to_string(), kg_runtime.clone());
+
+    // Register packs the production way: kg uses kg_runtime, everything else uses default.
+    let mut builder = VerbRegistryBuilder::new();
+    PackRegistry::register_packs_with_runtimes(
+        &["kg".to_string()],
+        &runtimes,
+        &default_runtime,
+        &mut builder,
+    )
+    .expect("pack registration must succeed");
+
+    let registry = builder.build().expect("registry build must succeed");
+
+    // Install edge rules on both runtimes (mirrors serve.rs).
+    default_runtime.install_edge_rules(registry.all_edge_rules());
+    kg_runtime.install_edge_rules(registry.all_edge_rules());
+
+    // Install entity-type validators — serve.rs passes &default_runtime here.
+    // With the R3 fix KgPack ignores the arg and installs onto self.runtime
+    // (kg_runtime).  Without the fix kg_runtime has no validator.
+    registry.call_register_entity_type_validators(&default_runtime);
+
+    // Now drive create_many directly on the KG pack's OWN runtime with an
+    // unknown entity_type — no manual install_entity_type_validator call.
+    let tok = kg_runtime.authorize(Namespace::local()).expect("authorize");
+    let bad_specs = vec![EntityCreateSpec {
+        kind: "concept".into(),
+        entity_type: Some("not_a_registered_type".into()),
+        name: "ShouldBeRejected".into(),
+        description: None,
+        properties: None,
+        tags: vec![],
+    }];
+
+    let result = kg_runtime.create_many(&tok, bad_specs).await;
+    assert!(
+        matches!(result, Err(RuntimeError::InvalidInput(_))),
+        "per-pack runtime must reject unknown entity_type once the KG pack's \
+         register_entity_type_validator installs onto self.runtime; got {result:?}"
+    );
+
+    // Zero rows written.
+    let rows = kg_runtime
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        0,
+        "rejected create_many must write nothing; got {rows:?}"
+    );
+}
+
+// ── High-2: invalid entity_type in bulk items is rejected at the handler layer ──
+
+/// An invalid `entity_type` inside a bulk item must be rejected with the valid
+/// types listed, and must write nothing.
+#[tokio::test]
+async fn create_bulk_items_invalid_entity_type_rejects_batch() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ValidConcept", "entity_type": "not_a_registered_type"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("unknown entity_type in bulk item must be rejected");
+    assert!(
+        is_invalid_input(&err),
+        "unknown entity_type must return InvalidInput, got: {err:?}"
+    );
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list must succeed");
+    let count = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "entity_type rejection must write nothing; got {listed}"
+    );
 }

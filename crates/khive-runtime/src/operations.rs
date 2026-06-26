@@ -17,9 +17,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
-    PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter, TextQueryMode,
-    TextSearchRequest, TraversalRequest,
+    BatchWriteSummary, DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -76,6 +76,15 @@ pub fn arm_vector_fail_after(n: usize) {
 static FTS_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
+/// create_note_inner and create_many tests cannot disarm each other.
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
+/// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
+/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
 ///
@@ -86,6 +95,29 @@ static VECTOR_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail(ns: &str) {
     *FTS_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm the FTS failure injection for `create_many` targeting namespace `ns`.
+///
+/// The next `create_many` call whose namespace equals `ns` returns an injected
+/// error at the FTS upsert step (after entity rows are committed), then disarms.
+/// Calls on other namespaces are unaffected.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_fail_many(ns: &str) {
+    *FTS_FAIL_MANY_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm the FTS *partial*-failure injection for `create_many` targeting namespace `ns`.
+///
+/// The next `create_many` call whose namespace equals `ns` returns
+/// `Ok(BatchWriteSummary { attempted: 2, affected: 1, failed: 1, ... })` from the
+/// FTS upsert step, exercising the `summary.failed > 0` rollback branch (as opposed
+/// to the hard-`Err` branch exercised by `arm_fts_fail_many`).  Then disarms.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_fail_many_partial(ns: &str) {
+    *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
@@ -3582,6 +3614,205 @@ impl KhiveRuntime {
         }
         Ok(persisted)
     }
+
+    /// Create a batch of entities atomically.
+    ///
+    /// All specs are validated before any write. If ANY spec fails validation
+    /// (unknown kind, empty name, secret-gate violation), the method returns
+    /// that error and no entities are written.
+    ///
+    /// Storage writes are issued as ONE `upsert_entities` call followed by ONE
+    /// `upsert_documents` call — the same primitives that the single-entity path
+    /// uses, but batched. Embedding is intentionally skipped: bulk structural
+    /// ingest is the expected use-case, and dense vectors are backfilled later
+    /// via a `reindex` call. Callers that need immediate vector search
+    /// immediately after creation should use per-entity `create_entity` instead.
+    ///
+    /// On FTS failure, every newly written entity row is hard-deleted to maintain
+    /// consistency (mirrors the single-entity rollback in `create_entity`).
+    pub async fn create_many(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<EntityCreateSpec>,
+    ) -> RuntimeResult<Vec<Entity>> {
+        if specs.is_empty() {
+            return Ok(vec![]);
+        }
+        let ns = token.namespace().as_str();
+
+        // Phase 1: validate ALL specs before any write (ADR-004).
+        // Includes entity-type validation via the pack-installed validator when available.
+        // Any validation failure here guarantees zero rows are written.
+        let mut entities = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            self.validate_entity_kind(&spec.kind)?;
+            // High-2: validate entity_type at the runtime layer via pack-installed callback.
+            // When no validator is installed (bare runtime, unit tests without packs),
+            // the type passes through unchanged — same skip-when-absent pattern as
+            // validate_entity_kind. The handler layer remains the primary enforcement point.
+            let validated_type =
+                self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
+            if spec.name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+            }
+            crate::secret_gate::check(&spec.name)?;
+            if let Some(d) = &spec.description {
+                crate::secret_gate::check(d)?;
+            }
+            if let Some(ref p) = spec.properties {
+                crate::secret_gate::check_json(p)?;
+            }
+            crate::secret_gate::check_tags(&spec.tags)?;
+
+            let mut entity =
+                Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
+            if let Some(d) = &spec.description {
+                entity = entity.with_description(d);
+            }
+            if let Some(p) = spec.properties.clone() {
+                entity = entity.with_properties(p);
+            }
+            if !spec.tags.is_empty() {
+                entity = entity.with_tags(spec.tags.clone());
+            }
+            entities.push(entity);
+        }
+
+        // Phase 2: single bulk entity write.
+        // High-1: capture the BatchWriteSummary to detect partial failures.
+        // The store commits the transaction even when some rows fail (per-row error
+        // isolation). If any row failed, compensate by hard-deleting the rows that DID
+        // land, then return Err so the caller sees zero net writes.
+        //
+        // NOTE: this compensation path (delete-on-partial-failure) is a stopgap until
+        // a true single-transaction bulk primitive is available in the entity store.
+        // That primitive (writing entity rows and FTS rows in one SQL transaction) is
+        // tracked as a follow-up issue.
+        let entity_summary = self
+            .entities(token)?
+            .upsert_entities(entities.clone())
+            .await?;
+
+        if entity_summary.failed > 0 {
+            // Compensate: hard-delete any entity rows that did land.
+            if let Ok(store) = self.entities(token) {
+                for entity in &entities {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to roll back entity row after partial entity write"
+                        );
+                    }
+                }
+            }
+            return Err(RuntimeError::Internal(format!(
+                "create_many: {}/{} entity rows failed to write (first error: {}); \
+                 all rows rolled back",
+                entity_summary.failed, entity_summary.attempted, entity_summary.first_error
+            )));
+        }
+
+        // Phase 3: single bulk FTS write.
+        //
+        // The FTS store commits partial batches and signals per-document failures
+        // via BatchWriteSummary.failed (same as the entity store in Phase 2).
+        // We must capture the summary and treat failed > 0 as an error.
+        //
+        // Compensation is symmetric: on any FTS failure (Err or failed > 0),
+        // we first delete any FTS documents that may have landed, then
+        // hard-delete the entity rows.  This order matters: the entity delete
+        // is the authoritative write; FTS is a derived index.  Cleaning FTS
+        // first avoids a window where entity rows are gone but stale FTS rows
+        // survive.
+        let docs: Vec<_> = entities.iter().map(entity_fts_document).collect();
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_many_inject = {
+            let mut g = FTS_FAIL_MANY_NS.lock().unwrap();
+            if g.as_deref() == Some(ns) {
+                *g = None;
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_many_inject = false;
+
+        // Partial-failure seam: returns Ok(summary) with failed > 0 so the
+        // `summary.failed > 0` rollback branch is exercised in tests.
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_many_inject_partial = {
+            let mut g = FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap();
+            if g.as_deref() == Some(ns) {
+                *g = None;
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_many_inject_partial = false;
+
+        let fts_summary_result: RuntimeResult<BatchWriteSummary> = if fts_many_inject {
+            Err(RuntimeError::Internal(
+                "injected FTS failure for create_many".to_string(),
+            ))
+        } else if fts_many_inject_partial {
+            Ok(BatchWriteSummary {
+                attempted: docs.len() as u64,
+                affected: docs.len().saturating_sub(1) as u64,
+                failed: 1,
+                first_error: "injected partial FTS failure for create_many".to_string(),
+            })
+        } else {
+            match self.text(token) {
+                Ok(fts) => fts.upsert_documents(docs).await.map_err(RuntimeError::from),
+                Err(e) => Err(e),
+            }
+        };
+
+        let fts_err: Option<RuntimeError> = match fts_summary_result {
+            Err(e) => Some(e),
+            Ok(summary) if summary.failed > 0 => Some(RuntimeError::Internal(format!(
+                "create_many: {}/{} FTS rows failed to index (first error: {}); \
+                 all rows rolled back",
+                summary.failed, summary.attempted, summary.first_error
+            ))),
+            Ok(_) => None,
+        };
+
+        if let Some(e) = fts_err {
+            // Clean up any FTS docs that landed before deleting entity rows.
+            if let Ok(fts) = self.text(token) {
+                for entity in &entities {
+                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to remove FTS doc during rollback"
+                        );
+                    }
+                }
+            }
+            if let Ok(store) = self.entities(token) {
+                for entity in &entities {
+                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
+                        tracing::error!(
+                            error = %ce,
+                            id = %entity.id,
+                            "create_many: failed to roll back entity row after FTS failure"
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // Embedding is skipped intentionally — see doc comment above.
+        Ok(entities)
+    }
 }
 
 /// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
@@ -3594,6 +3825,23 @@ pub struct LinkSpec {
     pub relation: EdgeRelation,
     pub weight: f64,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Fully specified entity creation request — input to [`KhiveRuntime::create_many`].
+///
+/// `entity_type` is validated at the runtime layer by the pack-installed
+/// entity-type validator (ADR-004 §runtime-layer validation). When a validator
+/// is installed (e.g. by `KgPack`), unknown types are rejected with the valid
+/// set listed. When no validator is installed (bare runtime without packs),
+/// the value passes through — the handler layer is the primary enforcement point.
+#[derive(Clone, Debug)]
+pub struct EntityCreateSpec {
+    pub kind: String,
+    pub entity_type: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Option<serde_json::Value>,
+    pub tags: Vec<String>,
 }
 
 // INLINE TEST JUSTIFICATION: tests here exercise private helpers (canonical_edge_endpoints,
@@ -7211,6 +7459,280 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "upsert must not duplicate the edge row");
+    }
+
+    // ── create_many: batch entity creation ───────────────────────────────────
+
+    #[tokio::test]
+    async fn create_many_persists_all_entities() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let specs: Vec<EntityCreateSpec> = (0..5)
+            .map(|i| EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: format!("BulkConcept-{i}"),
+                description: Some(format!("desc {i}")),
+                properties: None,
+                tags: vec!["bulk-test".into()],
+            })
+            .collect();
+
+        let entities = rt.create_many(&tok, specs).await.unwrap();
+        assert_eq!(entities.len(), 5, "all 5 entities must be returned");
+
+        // Verify each one is retrievable from storage.
+        for entity in &entities {
+            let fetched = rt.get_entity(&tok, entity.id).await.unwrap();
+            assert_eq!(fetched.id, entity.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_many_empty_name_rejects_atomically() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "ValidEntity".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "".into(), // invalid — triggers atomic rejection
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        let result = rt.create_many(&tok, specs).await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "empty name must produce InvalidInput error"
+        );
+
+        // Nothing must have been written — list_entities returns 0 items.
+        let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "atomic rejection must leave storage unchanged"
+        );
+    }
+
+    // High-2: entity_type validated at runtime layer when validator is installed.
+    #[tokio::test]
+    async fn create_many_rejects_unknown_entity_type_when_validator_installed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Install a mock validator that only accepts "algorithm" for "concept".
+        rt.install_entity_type_validator(Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            if kind == "concept" && raw == "algorithm" {
+                return Ok(Some("algorithm".to_string()));
+            }
+            Err(RuntimeError::InvalidInput(format!(
+                "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+            )))
+        }));
+
+        let bad_spec = vec![EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: Some("not_a_registered_type".into()),
+            name: "ShouldNotLand".into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        }];
+
+        let result = rt.create_many(&tok, bad_spec).await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "unknown entity_type must be rejected by the runtime-layer validator; got {result:?}"
+        );
+
+        // Zero rows written — validator fires before any storage call.
+        let rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "validator rejection must leave storage empty"
+        );
+    }
+
+    // High-2: valid entity_type passes through and is normalised by the validator.
+    #[tokio::test]
+    async fn create_many_accepts_valid_entity_type_via_validator() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        rt.install_entity_type_validator(Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            if kind == "concept" && raw == "algorithm" {
+                return Ok(Some("algorithm".to_string()));
+            }
+            Err(RuntimeError::InvalidInput(format!(
+                "unknown entity_type {raw:?} for {kind:?}"
+            )))
+        }));
+
+        let specs = vec![EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: Some("algorithm".into()),
+            name: "BubbleSort".into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        }];
+
+        let entities = rt.create_many(&tok, specs).await.unwrap();
+        assert_eq!(entities.len(), 1, "valid entity_type must be accepted");
+        assert_eq!(
+            entities[0].entity_type.as_deref(),
+            Some("algorithm"),
+            "entity_type must be stored as returned by the validator"
+        );
+    }
+
+    // High-1: FTS failure in create_many rolls back both substrates.
+    //
+    // Arm `arm_fts_fail_many` before the call; the FTS phase returns an injected
+    // error; the test asserts zero rows in both `entities` and `fts_entities`.
+    #[tokio::test]
+    async fn create_many_fts_failure_rolls_back_both_substrates() {
+        // Use a unique namespace so the process-global one-shot is unaffected by
+        // other concurrent tests.
+        let ns = format!("fts-fail-many-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "FtsRollbackA".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "FtsRollbackB".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        arm_fts_fail_many(&ns);
+        let result = rt.create_many(&tok, specs).await;
+
+        assert!(
+            result.is_err(),
+            "create_many must return Err when FTS write fails"
+        );
+
+        // Entity substrate must be empty — entity rows must have been rolled back.
+        let entity_rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            entity_rows.len(),
+            0,
+            "entity rows must be rolled back on FTS failure; found {entity_rows:?}"
+        );
+
+        // FTS substrate must be empty — no stale fts_entities rows.
+        let fts = rt.text(&tok).unwrap();
+        let fts_count = fts
+            .count(TextFilter {
+                ids: vec![],
+                kinds: vec![],
+                namespaces: vec![ns.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fts_count, 0,
+            "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    // Round-3 Medium: FTS partial-failure (Ok(summary) with summary.failed > 0)
+    // rolls back both substrates.
+    //
+    // The production code has a distinct arm:
+    //   Ok(summary) if summary.failed > 0 => return Err(...)
+    // This test exercises that arm by arming `arm_fts_fail_many_partial`, which
+    // returns Ok(BatchWriteSummary { failed: 1, ... }) instead of a hard Err.
+    // Both entity rows and FTS rows must be empty after rollback.
+    #[tokio::test]
+    async fn create_many_fts_partial_failure_rolls_back_both_substrates() {
+        let ns = format!("fts-fail-partial-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "PartialRollbackA".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".into(),
+                entity_type: None,
+                name: "PartialRollbackB".into(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+        ];
+
+        arm_fts_fail_many_partial(&ns);
+        let result = rt.create_many(&tok, specs).await;
+
+        assert!(
+            result.is_err(),
+            "create_many must return Err when FTS summary.failed > 0"
+        );
+
+        // Entity substrate must be empty — entity rows must have been rolled back.
+        let entity_rows = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert_eq!(
+            entity_rows.len(),
+            0,
+            "entity rows must be rolled back when FTS summary.failed > 0; found {entity_rows:?}"
+        );
+
+        // FTS substrate must be empty — no stale fts_entities rows.
+        let fts = rt.text(&tok).unwrap();
+        let fts_count = fts
+            .count(TextFilter {
+                ids: vec![],
+                kinds: vec![],
+                namespaces: vec![ns.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fts_count, 0,
+            "fts_entities must be empty after partial-FTS-failure rollback; found {fts_count}"
+        );
     }
 
     // ── PR-A1: cross-namespace get_edge now succeeds (UUID v4 is globally unique) ──

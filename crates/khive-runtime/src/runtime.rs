@@ -15,7 +15,18 @@ use crate::config::{
     build_embedder_registry, parse_embedding_model_alias, register_configured_embedding_models,
     sanitize_key, vec_model_key,
 };
-use crate::error::RuntimeResult;
+use crate::error::{RuntimeError, RuntimeResult};
+
+/// Callback type for pack-installed entity-type validation (ADR-004).
+///
+/// `(kind, entity_type) → Ok(normalised_type | None)` or `InvalidInput`.
+/// Callback type for pack-installed entity-type validators.
+///
+/// Receives `(kind, entity_type)` and returns the normalised type string,
+/// or `RuntimeError::InvalidInput` if the type is not registered for that kind.
+/// When `entity_type` is `None`, the implementation must return `Ok(None)`.
+pub type EntityTypeValidatorFn =
+    Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
 
 pub use crate::config::{
     parse_pack_list, runtime_config_from_khive_config, BackendId, NamespaceToken, RuntimeConfig,
@@ -56,6 +67,13 @@ pub struct KhiveRuntime {
     /// handler layer is the primary enforcement point.
     valid_entity_kinds: Arc<RwLock<Vec<String>>>,
     valid_note_kinds: Arc<RwLock<Vec<String>>>,
+    /// Pack-installed entity-type validator (ADR-004 §runtime-layer validation).
+    ///
+    /// When `Some`, `create_many` calls this function to validate and normalise
+    /// each `(kind, entity_type)` pair before writing. When `None` (bare runtime
+    /// without packs), entity-type validation is skipped — the pack handler layer
+    /// is the primary enforcement point, same as for `valid_entity_kinds`.
+    entity_type_validator: Arc<RwLock<Option<EntityTypeValidatorFn>>>,
 }
 
 impl KhiveRuntime {
@@ -95,6 +113,7 @@ impl KhiveRuntime {
             edge_rules: Arc::new(RwLock::new(Vec::new())),
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            entity_type_validator: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -122,6 +141,7 @@ impl KhiveRuntime {
             edge_rules: Arc::new(RwLock::new(Vec::new())),
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            entity_type_validator: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -148,6 +168,7 @@ impl KhiveRuntime {
             edge_rules: Arc::new(RwLock::new(Vec::new())),
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            entity_type_validator: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -177,7 +198,8 @@ impl KhiveRuntime {
     /// When `self` is a secondary-backend runtime (`core_backend` is `Some`),
     /// this returns a new `KhiveRuntime` backed by the main
     /// `Arc<StorageBackend>` and sharing all registry state (`embedder_registry`,
-    /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`) with `self`.
+    /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`,
+    /// `entity_type_validator`) with `self`.
     /// No database I/O occurs; no embedding models are reloaded.
     ///
     /// Use `core()` for notes and entities that must reside in the shared graph
@@ -202,6 +224,7 @@ impl KhiveRuntime {
                     edge_rules: self.edge_rules.clone(),
                     valid_entity_kinds: self.valid_entity_kinds.clone(),
                     valid_note_kinds: self.valid_note_kinds.clone(),
+                    entity_type_validator: self.entity_type_validator.clone(),
                 }
             }
         }
@@ -556,6 +579,39 @@ impl KhiveRuntime {
                 "unknown note kind {kind:?}; valid: {}",
                 guard.join(", ")
             )))
+        }
+    }
+
+    /// Install a pack-supplied entity-type validator (ADR-004 §runtime-layer validation).
+    ///
+    /// Called by the `KgPack` during registration so that `create_many` can validate
+    /// `entity_type` values at the runtime layer, closing the hole where direct Rust
+    /// callers bypass the handler-layer `validate_entity_type` check.
+    ///
+    /// The callback receives `(kind, entity_type)` and returns the normalised type
+    /// string, or `RuntimeError::InvalidInput` if the type is not registered for that
+    /// kind. Passing `entity_type = None` must return `Ok(None)`.
+    pub fn install_entity_type_validator(&self, f: EntityTypeValidatorFn) {
+        if let Ok(mut guard) = self.entity_type_validator.write() {
+            *guard = Some(f);
+        }
+    }
+
+    /// Validate and normalise `entity_type` through the pack-installed validator.
+    ///
+    /// Returns `Ok(entity_type)` when no validator is installed (bare runtime).
+    /// Returns `InvalidInput` when a validator is installed and rejects the type.
+    pub(crate) fn validate_entity_type_for_kind(
+        &self,
+        kind: &str,
+        entity_type: Option<&str>,
+    ) -> crate::RuntimeResult<Option<String>> {
+        let guard = self.entity_type_validator.read().map_err(|_| {
+            crate::RuntimeError::Internal("entity type validator lock poisoned".into())
+        })?;
+        match guard.as_ref() {
+            None => Ok(entity_type.map(str::to_string)),
+            Some(validate) => validate(kind, entity_type),
         }
     }
 

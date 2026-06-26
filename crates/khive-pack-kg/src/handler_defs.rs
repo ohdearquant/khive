@@ -18,21 +18,26 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
-        description: "Create an entity or note",
+        description: "Create an entity or note (singleton) or a batch of entities (bulk via `items`).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
                 name: "kind",
                 param_type: "string",
-                required: true,
-                description: "Substrate or granular kind: \"entity\" | \"note\" | \"concept\" | \"document\" | \"observation\" | …",
+                // `kind` is required for the singleton path but NOT for the bulk path:
+                // each item in `items` carries its own `kind`. Required=false here to
+                // reflect that `create(items=[...])` is valid without a top-level `kind`.
+                required: false,
+                description: "Substrate or granular kind for the singleton path: \
+                              \"entity\" | \"note\" | \"concept\" | \"document\" | \
+                              \"observation\" | … Required when `items` is absent.",
             },
             ParamDef {
                 name: "name",
                 param_type: "string",
                 required: false,
-                description: "Human-readable name (entities).",
+                description: "Human-readable name (entities, singleton path).",
             },
             ParamDef {
                 name: "entity_kind",
@@ -50,7 +55,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "content",
                 param_type: "string",
                 required: false,
-                description: "Body text (notes).",
+                description: "Body text (notes, singleton path).",
             },
             ParamDef {
                 name: "description",
@@ -75,6 +80,33 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 param_type: "object",
                 required: false,
                 description: "Arbitrary JSON properties.",
+            },
+            ParamDef {
+                name: "items",
+                param_type: "array of object",
+                required: false,
+                description: "Bulk entity creation. Each element is an object with \
+                              `kind` (required), `name` (required), and optional \
+                              `entity_kind`, `entity_type`, `description`, `properties`, \
+                              `tags`. When present, the top-level `kind` is NOT required. \
+                              Capped at 1000 entries per request. Bulk-created entities \
+                              skip vector embedding and are not vector-searchable until \
+                              a subsequent `reindex` call.",
+            },
+            ParamDef {
+                name: "atomic",
+                param_type: "bool",
+                required: false,
+                description: "Bulk path only. When true (default), all items succeed or \
+                              none are written. When false, items are attempted individually \
+                              and per-item errors are collected in the response.",
+            },
+            ParamDef {
+                name: "verbose",
+                param_type: "bool",
+                required: false,
+                description: "Bulk path only. When true, the response includes the full \
+                              entity objects in an `entities` array.",
             },
         ],
     },
