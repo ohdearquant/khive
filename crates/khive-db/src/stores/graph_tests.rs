@@ -1642,14 +1642,16 @@ async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
     );
 }
 
-/// Regression: traverse must not fail with "too many SQL variables" when the
-/// root set is larger than CHUNK_ROOTS (900).
+/// Regression: traverse must not fail with "too many terms in compound SELECT"
+/// when the root set is larger than CHUNK_ROOTS (400).
 ///
-/// Pre-fix, all root UUIDs were bound into a single CTE VALUES clause.  With
-/// more than SQLITE_MAX_VARIABLE_NUMBER roots (999 on older builds) the query
-/// returned a StorageError.  After the fix roots are chunked at 900 (mirroring
-/// get_edges), so a call with 1 000 roots is split into two chunks and
-/// completes successfully.
+/// Pre-fix, all root UUIDs were bound into a single recursive-CTE VALUES clause.
+/// SQLite's SQLITE_LIMIT_COMPOUND_SELECT (default 500) counts each VALUES row as
+/// one compound-SELECT term; with 1 000 roots the query returned a StorageError
+/// before the 999-variable limit was even reached.  After the fix, roots are
+/// split into chunks of 400 (safely below both the 500 compound-SELECT limit and
+/// the 999 variable limit), so a call with 1 000 roots is split into three chunks
+/// and completes successfully.
 ///
 /// Graph: 1 000 roots, each with one distinct outgoing edge to a unique target.
 /// Correctness check: every root must appear in the result with exactly one
