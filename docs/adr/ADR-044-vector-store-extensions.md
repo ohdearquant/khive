@@ -385,10 +385,18 @@ AND  (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))
 -- wrap as: DELETE FROM t WHERE subject_id IN (SELECT subject_id FROM t WHERE [above] LIMIT :max_delete)
 ```
 
-The anti-join and `DELETE` are one statement under a `BEGIN IMMEDIATE` transaction,
-held for the duration of the sweep. This eliminates the TOCTOU window between
-"find orphans" and "delete orphans." The `LIMIT` ensures the writer lock is not held
-for an unbounded time on large tables.
+The sweep runs three SQL operations under one `BEGIN IMMEDIATE` transaction: a
+filtered `COUNT` for `scanned`, an anti-join `COUNT` for `would_delete`, and the
+capped `DELETE`. This eliminates the TOCTOU window between counting orphans and
+deleting them.
+
+`max_delete` bounds the number of rows **deleted** in a single run — it is a
+blast-radius and safety cap, not a scan or lock-hold duration limit. The
+`scanned` and `would_delete` counts require a full filtered table scan and an
+anti-join against the substrate tables, so the writer lock is held for a duration
+proportional to the filtered table size regardless of `max_delete`. This is
+acceptable because `orphan_sweep` is a CLI-only maintenance operation run by an
+operator, not a hot-path call.
 
 **Naming:** `subject_id_allowlist` (this ADR) replaces `include_subjects` (original
 draft). The rename makes the polarity explicit: allowlist means "only these are eligible

@@ -821,37 +821,22 @@ impl VectorStore for SqliteVecStore {
         let dry_run = config.dry_run;
 
         self.with_writer("orphan_sweep", move |conn| {
-            // RAII transaction guard: acquires BEGIN IMMEDIATE on construction and
-            // issues ROLLBACK on drop if commit() was never called.  This prevents
-            // the connection from being left with an open transaction when any of
-            // the inner `?`-propagated errors fire (scan COUNT, would-delete COUNT,
-            // or DELETE), which would poison the pooled writer for subsequent callers.
-            struct ImmediateTx<'a> {
-                conn: &'a rusqlite::Connection,
-                done: bool,
-            }
-            impl<'a> ImmediateTx<'a> {
-                fn begin(conn: &'a rusqlite::Connection) -> rusqlite::Result<Self> {
-                    conn.execute_batch("BEGIN IMMEDIATE")?;
-                    Ok(ImmediateTx { conn, done: false })
-                }
-                fn commit(mut self) -> rusqlite::Result<()> {
-                    // Set done BEFORE executing so that if COMMIT fails and this
-                    // struct is dropped by the `?` propagation, Drop does not issue
-                    // a redundant ROLLBACK (SQLite auto-rolls-back on COMMIT failure).
-                    self.done = true;
-                    self.conn.execute_batch("COMMIT")
-                }
-            }
-            impl Drop for ImmediateTx<'_> {
-                fn drop(&mut self) {
-                    if !self.done {
-                        let _ = self.conn.execute_batch("ROLLBACK");
-                    }
-                }
-            }
-
-            let tx = ImmediateTx::begin(conn)?;
+            // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
+            // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
+            // ROLLBACK when the connection still has an open transaction — covering both
+            // early-`?` errors AND a COMMIT that fails with SQLITE_BUSY (BUSY leaves
+            // the transaction open, so autocommit is false, and Drop rolls back).
+            // The hand-rolled guard used previously set `done = true` before COMMIT,
+            // which would have skipped the Drop-ROLLBACK on a BUSY COMMIT and re-poisoned
+            // the pool.  Using the native primitive avoids that class of bug entirely.
+            //
+            // `with_writer` serialises all callers through the pool mutex — at most one
+            // writer closure executes on this connection at a time, so no nested
+            // transactions can exist when this line runs.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Optional-filter clause shared across all three queries.
             // Each ?N appears twice (IS NULL guard + json_each call); SQLite
