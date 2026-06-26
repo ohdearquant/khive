@@ -24,6 +24,12 @@ impl KnowledgeHandlers {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: UpsertAtomsParams = deser(params)?;
+        if p.chunk_size.is_some() {
+            tracing::warn!(
+                "upsert_atoms: chunk_size is accepted but not yet implemented; \
+                 server-side chunking is not performed"
+            );
+        }
         if p.atoms.is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "atoms list must not be empty".into(),
@@ -551,6 +557,12 @@ impl KnowledgeHandlers {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: DeleteAtomsParams = deser(params)?;
+        if p.cascade.is_some() {
+            tracing::warn!(
+                "delete_atoms: cascade is accepted but not yet implemented; \
+                 sections are not cascade-deleted when atoms are soft-deleted"
+            );
+        }
         if p.ids.is_empty() {
             return Err(RuntimeError::InvalidInput("ids must not be empty".into()));
         }
@@ -766,6 +778,38 @@ mod tests {
             check(name).is_ok(),
             "normal atom name must pass; fired: {:?}",
             check(name).err()
+        );
+    }
+
+    // Ignored-param warning coverage: verify that chunk_size and cascade are still
+    // accepted by the param structs (no deserialization error) and that the fields
+    // are Some when supplied, confirming the warning branch is reachable.
+
+    #[test]
+    fn upsert_atoms_chunk_size_accepted_and_detectable() {
+        use crate::knowledge::schema::UpsertAtomsParams;
+        let p: UpsertAtomsParams = serde_json::from_value(serde_json::json!({
+            "atoms": [{"slug": "s", "name": "n", "content": "placeholder content for test"}],
+            "chunk_size": 100,
+        }))
+        .expect("upsert_atoms params with chunk_size must deserialize without error");
+        assert!(
+            p.chunk_size.is_some(),
+            "chunk_size must be Some when supplied so the warning branch fires"
+        );
+    }
+
+    #[test]
+    fn delete_atoms_cascade_accepted_and_detectable() {
+        use crate::knowledge::schema::DeleteAtomsParams;
+        let p: DeleteAtomsParams = serde_json::from_value(serde_json::json!({
+            "ids": ["some-atom-id"],
+            "cascade": true,
+        }))
+        .expect("delete_atoms params with cascade must deserialize without error");
+        assert!(
+            p.cascade.is_some(),
+            "cascade must be Some when supplied so the warning branch fires"
         );
     }
 }
