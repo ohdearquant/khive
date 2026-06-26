@@ -78,7 +78,7 @@ jobs:
         working-directory: .
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.94.1
 
@@ -108,7 +108,7 @@ jobs:
 
       - name: Upload synthetic ledger artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-synthetic-ledger
           path: perf/ci-synthetic-ledger.csv
@@ -135,7 +135,7 @@ jobs:
         working-directory: .
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.94.1
 
