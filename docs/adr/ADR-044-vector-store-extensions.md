@@ -598,3 +598,53 @@ if widespread adoption justifies it.
 - [ADR-032](ADR-032-brain-profile-orchestration.md) — §6.1 profile-scoped recall filter consumer
 - [ADR-033](ADR-033-recall-pipeline.md) — recall pipeline; `candidate_multiplier` reduction consumer
 - [ADR-043](ADR-043-embedding-model-migration.md) — `EmbedMigrationWorker` (`orphan_sweep`, `update`, `capabilities()`)
+- [ADR-071](ADR-071-backend-pluggable-runtime.md) — `capabilities()` default correction (see Amendment A2 below).
+
+## Amendment A2: `capabilities()` default must not assume SQLite (ADR-071, 2026-06-25)
+
+ADR-044 §1 specifies the default `capabilities()` implementation on `VectorStore`:
+
+```rust
+BASELINE.get_or_init(|| VectorStoreCapabilities {
+    // ...
+    max_dimensions: Some(8192),                   // sqlite-vec 0.1.9 limit
+    index_kinds:    vec![VectorIndexKind::SqliteVec],
+})
+```
+
+This default encodes two SQLite-specific values in a backend-neutral trait. ADR-005
+requires the storage traits to be backend-neutral. A non-SQLite backend that does not
+override `capabilities()` would incorrectly advertise SQLite constraints.
+
+ADR-071 §7 corrects the default to:
+
+```rust
+BASELINE.get_or_init(|| VectorStoreCapabilities {
+    supports_filter:       false,
+    supports_batch_search: false,
+    supports_quantization: false,
+    supports_update:       false,
+    supports_orphan_sweep: false,
+    supports_multi_field:  false,
+    max_dimensions:        None,   // no assumption; backend declares its own limit
+    index_kinds:           vec![], // no assumption; backend declares its own kinds
+})
+```
+
+`khive-db`'s `SqliteVecStore` overrides `capabilities()` and returns:
+
+```rust
+VectorStoreCapabilities {
+    // ...
+    max_dimensions: Some(8192),
+    index_kinds:    vec![VectorIndexKind::SqliteVec],
+}
+```
+
+`VectorIndexKind::SqliteVec` is NOT removed from the enum. It is the correct discriminant
+for the sqlite-vec backend. The correction is confined to the trait default; the sqlite-vec
+backend's override continues to advertise its capabilities correctly.
+
+ADR-044 §1's commentary "SqliteVec is the correct label for the v1 backend" remains
+accurate. The amendment removes only the claim that the trait-level default should carry
+SQLite-specific values.

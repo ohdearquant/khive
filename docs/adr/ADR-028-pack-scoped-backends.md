@@ -506,3 +506,66 @@ churn for single-backend deployments.
   per-pack engine views.
 - [ADR-035](ADR-035-cli-config-and-auto-embed.md) — project-vs-user TOML override
   resolution.
+- [ADR-071](ADR-071-backend-pluggable-runtime.md) — `BackendHandle` seam (see Amendment A1 below).
+
+## Amendment A1: `BackendHandle` replaces `Arc<StorageBackend>` (ADR-071, 2026-06-25)
+
+ADR-028 §3 specifies `KhiveRuntime { backend: Arc<StorageBackend>, ... }` in its deferred
+target Rust types. ADR-071 amends this: the field becomes `handle: BackendHandle`, where
+`BackendHandle` is a struct of `Arc<dyn Trait>` handles defined in `khive-runtime`.
+
+The amendment changes two items in ADR-028:
+
+**§3 — `KhiveRuntime` accepts an instantiated backend**
+
+The struct definition and constructor change from:
+
+```rust
+pub struct KhiveRuntime {
+    backend:   Arc<StorageBackend>,
+    embedders: Arc<EmbedderRegistry>,
+}
+
+impl KhiveRuntime {
+    pub fn from_backend(backend: Arc<StorageBackend>, embedders: Arc<EmbedderRegistry>) -> Self;
+    pub fn backend(&self) -> &StorageBackend;
+}
+```
+
+To:
+
+```rust
+pub struct KhiveRuntime {
+    handle:    BackendHandle,
+    embedders: Arc<EmbedderRegistry>,
+}
+
+impl KhiveRuntime {
+    /// Boot path constructs a BackendHandle from backend traits; runtime wraps it.
+    pub fn from_handle(handle: BackendHandle, embedders: Arc<EmbedderRegistry>) -> Self;
+
+    /// Convenience constructor for the shipped SQLite boot path.
+    pub fn from_sqlite(backend: Arc<StorageBackend>, embedders: Arc<EmbedderRegistry>) -> Self;
+
+    /// In-memory backend for tests.
+    pub fn memory() -> Result<Self, RuntimeError>;
+}
+```
+
+`KhiveRuntime::backend()` is removed. Code that accessed the backend directly accesses
+specific capability handles through `BackendHandle` instead.
+
+**§8 — Deferred target boot sequence**
+
+The boot sequence constructs a `BackendHandle` per pack (via `BackendHandle::from_sqlite`
+for the SQLite boot path) instead of an `Arc<StorageBackend>`. `KhiveRuntime::from_handle`
+replaces `KhiveRuntime::from_backend` at the pack-instantiation step:
+
+```rust
+let backend = backends.get(&pack_cfg.backend)?.clone();
+let handle   = BackendHandle::from_sqlite(backend);
+let runtime  = KhiveRuntime::from_handle(handle, engines);
+```
+
+All other ADR-028 mechanics (TOML shape, 1:1 pack-to-backend assignment, schema collision
+detection, declaration-order application, cross-pack composition) are unchanged.
