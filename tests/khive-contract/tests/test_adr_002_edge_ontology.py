@@ -1,7 +1,7 @@
 """Edge ontology contract tests.
 
 ADR: ADR-002
-section: 13 canonical relations; Base endpoint contract; Cascade behavior;
+section: 17 canonical relations; Base endpoint contract; Cascade behavior;
          Annotation relation; Endpoint validation
 """
 
@@ -10,12 +10,14 @@ from __future__ import annotations
 import pytest
 
 from khive_contract.client import KhiveMcpSession, KhiveOperationError
+from khive_contract.fixtures import EDGE_RELATIONS
 
 VERBS_UNDER_TEST = {"create", "link", "get", "list", "neighbors", "delete"}
 
 # Relations confirmed to work concept-to-concept in the runtime base allowlist.
-# introduced_by and implements require EDGE_RULES pack (specific endpoint types).
+# introduced_by and implements require specific non-concept endpoint types.
 # competes_with and composed_with are symmetric: runtime may canonicalize endpoint order.
+# supports and refutes (ADR-055 epistemic) also permit concept→concept.
 CONCEPT_CONCEPT_RELATIONS = (
     "extends",
     "enables",
@@ -26,14 +28,13 @@ CONCEPT_CONCEPT_RELATIONS = (
     "supersedes",
     "competes_with",
     "composed_with",
+    "supports",
+    "refutes",
 )
 
-# All 13 canonical relations (runtime-confirmed)
-ALL_CANONICAL_RELATIONS = (
-    "contains", "part_of", "instance_of", "extends", "variant_of",
-    "introduced_by", "supersedes", "depends_on", "enables",
-    "implements", "competes_with", "composed_with", "annotates",
-)
+# All 17 canonical relations (ADR-002 base 15 + ADR-055 epistemic 2).
+# Imported from fixtures.py — single source of truth.
+ALL_CANONICAL_RELATIONS = tuple(sorted(EDGE_RELATIONS))
 
 
 @pytest.mark.adr_002
@@ -85,7 +86,7 @@ def test_invalid_relation_reports_closed_relation_set(
     temp_namespace: str,
     sample_entity,
 ) -> None:
-    """link with invalid relation returns per-op error listing all 13 canonical relations.
+    """link with invalid relation returns per-op error listing all 17 canonical relations.
 
     ADR: ADR-002
     section: Rules; Closed-set taxonomy
@@ -109,7 +110,7 @@ def test_invalid_relation_reports_closed_relation_set(
     assert err, "Error message must be non-empty"
     assert "invented_by" in err, f"Error must name offending relation 'invented_by': {err!r}"
 
-    # All 13 canonical relations must be listed
+    # All 17 canonical relations must be listed
     for rel in ALL_CANONICAL_RELATIONS:
         assert rel in err, (
             f"Canonical relation '{rel}' missing from error message: {err!r}"
