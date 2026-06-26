@@ -48,9 +48,11 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 | `withdraw`  | Cancel an open proposal                          | Abandoning a staged change                               |
 | `verbs`     | List all registered verbs on this server         | Discovery — see what's available                         |
 
-`get`, `update`, `delete` are UUID-only — they auto-detect whether the record is an entity, note,
-or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` for `list`;
-`kind=event` for audit events per [ADR-022](docs/adr/ADR-022-events-query-surface.md)).
+`get`, `update`, `delete` are by-ID — they auto-detect whether the record is an entity, note, or
+edge. The `id` parameter accepts either a full UUID or a short hex prefix of at least 8 hex
+characters; shorter strings fall through to a name lookup. `create`, `list`, `search` require
+`kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
+[ADR-022](docs/adr/ADR-022-events-query-surface.md)).
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
@@ -63,6 +65,13 @@ or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` f
 | `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)      | Moving a task through its lifecycle      |
 
 `gtd.assign` accepts `context_entity_id` to anchor a task to a KG entity.
+
+Full `gtd.transition` allowed transitions:
+`inbox` → next | waiting | someday | active | done | cancelled;
+`next` → active | waiting | someday | done | cancelled (skipping `active` with `next -> done` is valid);
+`active` → next | waiting | done | cancelled;
+`waiting` | `someday` → next | active | done | cancelled;
+`done` and `cancelled` are terminal.
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
@@ -346,7 +355,7 @@ These are the KG pack verbs. Other packs are documented in their verb tables abo
 | Tool        | Fields                                                                                                                                                                                                                                           | Example                                                      |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
 | `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; entity_type, description, properties, tags, salience, annotates                                                                                | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
-| `get`       | **id** (UUID)                                                                                                                                                                                                                                    | `{"id":"<uuid>"}`                                            |
+| `get`       | **id** — full UUID or short hex prefix (minimum 8 hex characters)                                                                                                                                                                                | `{"id":"<uuid>"}`                                            |
 | `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, tags, source_id, target_id, relations, min_weight, max_weight, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read | `{"kind":"entity","entity_kind":"concept","tags":["ml"]}`    |
 | `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge)                                                                                                                                                             | `{"id":"<uuid>","description":"Updated desc"}`               |
 | `delete`    | **id** (UUID); hard (default: false)                                                                                                                                                                                                             | `{"id":"<uuid>","hard":true}`                                |
