@@ -216,6 +216,7 @@ async fn traverse_multi_hop() {
             ..Default::default()
         },
         include_roots: false,
+        include_properties: false,
     };
 
     let paths = rt.traverse(&tok, request).await.unwrap();

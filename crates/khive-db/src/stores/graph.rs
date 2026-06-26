@@ -771,6 +771,7 @@ impl GraphStore for SqlGraphStore {
                                 weight,
                                 name: None,
                                 kind: None,
+                                entity_type: None,
                             },
                         ));
                     }
@@ -985,6 +986,7 @@ impl GraphStore for SqlGraphStore {
                     weight,
                     name: None,
                     kind: None,
+                    entity_type: None,
                 });
             }
 
@@ -1057,6 +1059,7 @@ impl GraphStore for SqlGraphStore {
                             depth: 0,
                             name: None,
                             kind: None,
+                            properties: None,
                         },
                         0.0,
                     ));
@@ -1181,6 +1184,7 @@ impl GraphStore for SqlGraphStore {
                             depth: depth as usize,
                             name: None,
                             kind: None,
+                            properties: None,
                         },
                         total_weight,
                     ));

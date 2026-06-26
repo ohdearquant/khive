@@ -28,7 +28,7 @@ impl KgPack {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?;
-        let hits = self
+        let mut hits = self
             .runtime
             .neighbors_with_query(
                 token,
@@ -41,6 +41,14 @@ impl KgPack {
                 },
             )
             .await?;
+        // entity_type is a cheap String field already fetched in the same
+        // entity batch, so the clear happens handler-side rather than
+        // threading a flag down to the runtime layer.
+        if !p.include_entity_type.unwrap_or(false) {
+            for hit in &mut hits {
+                hit.entity_type = None;
+            }
+        }
         to_json(&hits)
     }
 
@@ -74,6 +82,7 @@ impl KgPack {
             roots,
             options,
             include_roots: p.include_roots.unwrap_or(true),
+            include_properties: p.include_properties.unwrap_or(false),
         };
         let paths = self.runtime.traverse(token, request).await?;
         to_json(&paths)

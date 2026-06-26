@@ -1677,7 +1677,8 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
-        self.enrich_path_nodes(token, &mut paths).await;
+        self.enrich_path_nodes(token, &mut paths, request.include_properties)
+            .await;
         // Filter out soft-deleted entity nodes from all path nodes (Fix 2).
         let all_node_ids: Vec<Uuid> = paths
             .iter()
@@ -1799,6 +1800,7 @@ impl KhiveRuntime {
             if let Some(entity) = entity_map.get(&hit.node_id) {
                 hit.name = Some(entity.name.clone());
                 hit.kind = Some(entity.kind.clone());
+                hit.entity_type = entity.entity_type.clone();
             } else if let Some(note) = note_map.get(&hit.node_id) {
                 let kind = note.kind.clone();
                 let name = note
@@ -1817,9 +1819,18 @@ impl KhiveRuntime {
     /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
-    /// live in extra-visible namespaces are enriched correctly.  Node IDs that
+    /// live in extra-visible namespaces are enriched correctly. Node IDs that
     /// repeat across paths are fetched exactly once.
-    async fn enrich_path_nodes(&self, token: &NamespaceToken, paths: &mut [GraphPath]) {
+    ///
+    /// `include_properties` gates whether `entity.properties` is cloned onto
+    /// each node. When `false` (the default), the potentially large JSON blob
+    /// is never read from the map, keeping the hot path allocation-free.
+    async fn enrich_path_nodes(
+        &self,
+        token: &NamespaceToken,
+        paths: &mut [GraphPath],
+        include_properties: bool,
+    ) {
         if paths.is_empty() {
             return;
         }
@@ -1853,6 +1864,9 @@ impl KhiveRuntime {
                 if let Some(entity) = entity_map.get(&node.node_id) {
                     node.name = Some(entity.name.clone());
                     node.kind = Some(entity.kind.clone());
+                    if include_properties {
+                        node.properties = entity.properties.clone();
+                    }
                 }
             }
         }
@@ -7817,6 +7831,7 @@ mod tests {
                         ..Default::default()
                     },
                     include_roots: true,
+                    include_properties: false,
                 },
             )
             .await;
@@ -9026,6 +9041,7 @@ mod tests {
             weight: 1.0,
             name: None,
             kind: None,
+            entity_type: None,
         }
     }
 
@@ -9036,6 +9052,7 @@ mod tests {
             depth,
             name: None,
             kind: None,
+            properties: None,
         }
     }
 
@@ -9139,7 +9156,7 @@ mod tests {
             },
         ];
 
-        rt.enrich_path_nodes(&tok, &mut paths).await;
+        rt.enrich_path_nodes(&tok, &mut paths, false).await;
 
         assert_eq!(paths[0].nodes[0].name.as_deref(), Some("Alpha"));
         assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
@@ -9200,7 +9217,7 @@ mod tests {
             nodes: vec![path_node(entity_b.id, 0)],
             total_weight: 1.0,
         }];
-        rt.enrich_path_nodes(&vis_tok, &mut paths).await;
+        rt.enrich_path_nodes(&vis_tok, &mut paths, false).await;
 
         assert_eq!(
             paths[0].nodes[0].name.as_deref(),
@@ -9208,6 +9225,92 @@ mod tests {
             "entity in extra-visible ns must be enriched by enrich_path_nodes"
         );
         assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
+    }
+
+    /// enrich_neighbor_hits populates entity_type from the already-fetched entity
+    /// batch when the entity has a non-null entity_type.  Entities without one and
+    /// note nodes leave entity_type as None.
+    #[tokio::test]
+    async fn enrich_neighbor_hits_populates_entity_type() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let props = serde_json::json!({"domain": "attention"});
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                Some("algorithm"),
+                "FlashAttn",
+                None,
+                Some(props),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let entity_no_type = rt
+            .create_entity(&tok, "concept", None, "PlainConcept", None, None, vec![])
+            .await
+            .unwrap();
+
+        let mut hits = vec![neighbor_hit(entity.id), neighbor_hit(entity_no_type.id)];
+        rt.enrich_neighbor_hits(&tok, &mut hits).await;
+
+        assert_eq!(hits[0].entity_type.as_deref(), Some("algorithm"));
+        assert!(
+            hits[1].entity_type.is_none(),
+            "entity without entity_type must leave the field as None"
+        );
+    }
+
+    /// enrich_path_nodes populates properties from the already-fetched entity
+    /// batch when the entity has a non-null properties blob.  Entities without
+    /// properties leave the field as None.
+    #[tokio::test]
+    async fn enrich_path_nodes_populates_properties() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let props = serde_json::json!({"year": 2024, "venue": "NeurIPS"});
+        let entity_with_props = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "AttentionPaper",
+                None,
+                Some(props.clone()),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let entity_no_props = rt
+            .create_entity(&tok, "concept", None, "BareConceptNode", None, None, vec![])
+            .await
+            .unwrap();
+
+        let mut paths = vec![GraphPath {
+            root_id: entity_with_props.id,
+            nodes: vec![
+                path_node(entity_with_props.id, 0),
+                path_node(entity_no_props.id, 1),
+            ],
+            total_weight: 1.0,
+        }];
+
+        rt.enrich_path_nodes(&tok, &mut paths, true).await;
+
+        assert_eq!(
+            paths[0].nodes[0].properties.as_ref(),
+            Some(&props),
+            "properties must be filled when entity has a non-null properties blob"
+        );
+        assert!(
+            paths[0].nodes[1].properties.is_none(),
+            "entity without properties must leave the field as None"
+        );
     }
 
     /// Regression: GraphStore::traverse must not fail with "too many SQL variables"
@@ -9269,6 +9372,7 @@ mod tests {
                     limit: None,
                 },
                 include_roots: false,
+                include_properties: false,
             })
             .await
             .unwrap();

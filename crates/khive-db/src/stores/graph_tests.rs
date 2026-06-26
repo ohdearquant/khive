@@ -174,6 +174,7 @@ async fn test_traverse_depth_2() {
         roots: vec![a],
         options: TraversalOptions::new(2).with_direction(Direction::Out),
         include_roots: true,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -220,6 +221,7 @@ async fn test_traverse_dedups_multipath_node() {
         roots: vec![a],
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: false,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -276,6 +278,7 @@ async fn test_traverse_preserves_first_path_metadata() {
         roots: vec![a],
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: false,
+        include_properties: false,
     };
 
     let paths1 = store.traverse(make_request()).await.unwrap();
@@ -323,6 +326,7 @@ async fn test_traverse_multi_root_independent_chains() {
         roots: vec![a, d],
         options: TraversalOptions::new(2).with_direction(Direction::Out),
         include_roots: true,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -372,6 +376,7 @@ async fn test_traverse_multi_root_shared_neighbor_appears_in_both() {
         roots: vec![a, b],
         options: TraversalOptions::new(1).with_direction(Direction::Out),
         include_roots: false,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -419,6 +424,7 @@ async fn test_traverse_binary_tree_result_count() {
         roots: vec![nodes[0]],
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: true,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1222,6 +1228,7 @@ async fn test_traverse_per_root_limit_capped_independently() {
             limit: Some(1),
         },
         include_roots: false,
+        include_properties: false,
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1375,6 +1382,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     roots: vec![root0, root1],
                     options: opts.clone(),
                     include_roots: case.include_roots,
+                    include_properties: false,
                 })
                 .await
                 .unwrap();
@@ -1383,6 +1391,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     roots: vec![root0],
                     options: opts.clone(),
                     include_roots: case.include_roots,
+                    include_properties: false,
                 })
                 .await
                 .unwrap();
@@ -1391,6 +1400,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     roots: vec![root1],
                     options: opts,
                     include_roots: case.include_roots,
+                    include_properties: false,
                 })
                 .await
                 .unwrap();
@@ -1630,6 +1640,7 @@ async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
                 limit: Some(0),
             },
             include_roots: false,
+            include_properties: false,
         })
         .await
         .unwrap();
@@ -1688,6 +1699,7 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
                 limit: None,
             },
             include_roots: false,
+            include_properties: false,
         })
         .await
         .unwrap();
