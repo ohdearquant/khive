@@ -124,6 +124,22 @@ not a competitive benchmark. PR #153 explicitly notes: "Do not lead with 341x."
 
 ---
 
+## Obtaining the SIFT-1M dataset
+
+The bench harness reads `sift_base.fvecs` and `sift_query.fvecs` from `$SIFT_DIR`.
+The dataset is published by IRISA at `http://corpus-texmex.irisa.fr/`.
+
+```bash
+mkdir -p "$SIFT_DIR"
+wget http://corpus-texmex.irisa.fr/sift.tar.gz -O /tmp/sift.tar.gz
+tar -xzf /tmp/sift.tar.gz -C "$SIFT_DIR" --strip-components=1
+```
+
+The archive is approximately 160 MB. After extraction, `$SIFT_DIR` should contain
+`sift_base.fvecs` (1 000 000 vectors) and `sift_query.fvecs` (10 000 query vectors).
+
+---
+
 ## Reproducing the banked run
 
 ```bash

@@ -33,7 +33,7 @@ WORKTREE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CRATES_DIR="${KHIVE_CRATES_DIR:-$WORKTREE_ROOT/crates}"
 PERF_DIR="${KHIVE_PERF_DIR:-/tmp/khive-perf}"
 OUT_DIR="${OUT_DIR:-$PERF_DIR}"
-BINARY="$CRATES_DIR/target/release/khive-mcp"
+BINARY="$CRATES_DIR/target/release/kkernel"
 SKIP_BUILD=0
 
 for arg in "$@"; do
@@ -109,7 +109,7 @@ db_path = sys.argv[2]
 extra = sys.argv[3:]
 
 env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-args = [binary, "--db", db_path, "--no-embed", "--log", "error"] + extra
+args = [binary, "mcp", "--db", db_path, "--no-embed", "--log", "error"] + extra
 
 start = time.perf_counter()
 proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
