@@ -642,6 +642,16 @@ async fn checkpoint_wal(runtime: &KhiveRuntime) -> Result<()> {
     Ok(())
 }
 
+// Number of rows committed per SQLite transaction during bulk sync.
+// 10_000 keeps WAL growth per chunk below ~40 MiB at an average 4 KiB entity,
+// while amortising transaction overhead across many rows.
+// In test builds the value is reduced so chunk-boundary tests run without
+// generating tens of thousands of synthetic rows.
+#[cfg(not(test))]
+const SYNC_CHUNK_SIZE: usize = 10_000;
+#[cfg(test)]
+const SYNC_CHUNK_SIZE: usize = 5;
+
 async fn upsert_entities(
     runtime: &KhiveRuntime,
     namespace: &str,
@@ -652,7 +662,12 @@ async fn upsert_entities(
     let token = runtime.authorize(ns)?;
     let store = runtime.entities(&token).context("opening entity store")?;
     let text = runtime.text(&token).context("opening text store")?;
-    let mut count = 0;
+
+    // Phase 1: build Entity and FTS doc Vecs in one pass.
+    // Field mapping is identical to the previous per-row loop so that
+    // sync, create, update, merge, and reindex produce identical shapes.
+    let mut entities_buf = Vec::with_capacity(records.len());
+    let mut docs_buf = Vec::with_capacity(records.len());
     for r in records {
         let created_at = parse_ts_micros(r.created_at.as_deref());
         let updated_at = parse_ts_micros(r.updated_at.as_deref());
@@ -674,17 +689,43 @@ async fn upsert_entities(
         // Use the canonical FTS document constructor so sync, create, update,
         // merge, and reindex all produce identical document shapes.
         let fts_doc = entity_fts_document(&entity);
-        store
-            .upsert_entity(entity)
+        entities_buf.push(entity);
+        docs_buf.push(fts_doc);
+    }
+
+    // Phase 2: entity rows — one BEGIN IMMEDIATE / COMMIT per chunk.
+    let mut count = 0usize;
+    for chunk in entities_buf.chunks(SYNC_CHUNK_SIZE) {
+        let summary = store
+            .upsert_entities(chunk.to_vec())
             .await
-            .with_context(|| format!("upsert entity {}", r.id))?;
-        // Populate FTS5 index so text search works after sync.
-        // Vectors are intentionally skipped: they are local-only derived state
-        // and will be computed by `kkernel kg embed` when needed.
-        text.upsert_document(fts_doc)
+            .context("batch upsert entities")?;
+        if summary.failed > 0 {
+            return Err(anyhow!(
+                "entity write: {}/{} rows failed (first: {})",
+                summary.failed,
+                summary.attempted,
+                summary.first_error
+            ));
+        }
+        count += summary.affected as usize;
+    }
+
+    // Phase 3: FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
+    // Vectors are intentionally skipped: they are local-only derived state
+    // and will be computed by `kkernel kg embed` when needed.
+    for chunk in docs_buf.chunks(SYNC_CHUNK_SIZE) {
+        let summary = text
+            .upsert_documents(chunk.to_vec())
             .await
-            .with_context(|| format!("fts index entity {}", r.id))?;
-        count += 1;
+            .context("batch FTS upsert")?;
+        if summary.failed > 0 {
+            return Err(anyhow!(
+                "FTS write: {}/{} docs failed in chunk",
+                summary.failed,
+                summary.attempted
+            ));
+        }
     }
     Ok(count)
 }
@@ -698,7 +739,11 @@ async fn upsert_edges(
         .map_err(|e| anyhow!("invalid namespace {namespace:?}: {e}"))?;
     let token = runtime.authorize(ns)?;
     let graph = runtime.graph(&token).context("opening graph store")?;
-    let mut count = 0;
+
+    // Build all Edge structs first (same construction as the previous loop body).
+    // Edge relation validation already ran in run_sync before the tmp DB was
+    // created, so parse() here should always succeed.
+    let mut edge_buf = Vec::with_capacity(records.len());
     for r in records {
         let relation: EdgeRelation = r
             .relation
@@ -720,11 +765,19 @@ async fn upsert_edges(
             metadata: None,
             target_backend: None,
         };
-        graph
-            .upsert_edge(edge)
+        edge_buf.push(edge);
+    }
+
+    // One BEGIN IMMEDIATE / COMMIT per SYNC_CHUNK_SIZE edges.
+    // upsert_edges rolls back the entire chunk on the first storage error
+    // and returns Err, which propagates via ? without advancing count.
+    let mut count = 0usize;
+    for chunk in edge_buf.chunks(SYNC_CHUNK_SIZE) {
+        let summary = graph
+            .upsert_edges(chunk.to_vec())
             .await
-            .with_context(|| format!("upsert edge {}", r.edge_id))?;
-        count += 1;
+            .context("batch upsert edges")?;
+        count += summary.affected as usize;
     }
     Ok(count)
 }
@@ -865,6 +918,116 @@ mod tests {
             .expect("entity Alpha must be retrievable after sync");
         assert_eq!(alpha.name, "Alpha");
         assert_eq!(alpha.kind, "concept");
+    }
+
+    /// Chunk-boundary round-trip: write N > SYNC_CHUNK_SIZE entities and edges
+    /// so the batching path exercises at least two transaction boundaries, then
+    /// verify the full count and spot-check the last record of the final chunk.
+    ///
+    /// In test builds SYNC_CHUNK_SIZE = 5, so N = 11 produces three chunks
+    /// (5 + 5 + 1) for both entities and edges.
+    #[tokio::test]
+    async fn sync_chunk_boundary_round_trip() {
+        const N: usize = 11; // > SYNC_CHUNK_SIZE (5 in test mode)
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+
+        // Generate N synthetic entity lines with predictable UUIDs.
+        let ids: Vec<uuid::Uuid> = (0..N).map(|_| uuid::Uuid::new_v4()).collect();
+        let entity_lines: Vec<String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                format!(
+                    r#"{{"id":"{id}","kind":"concept","name":"SyntheticEntity{i}","description":"Synthetic test entity {i} for chunk-boundary coverage","properties":{{}},"tags":["bench","synthetic"]}}"#
+                )
+            })
+            .collect();
+        let entities_ndjson = entity_lines.join("\n");
+
+        // Generate N synthetic edges: each entity points at the next one via
+        // "extends". The last entity wraps back to the first.
+        let edge_lines: Vec<String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &src)| {
+                let tgt = ids[(i + 1) % N];
+                let eid = uuid::Uuid::new_v4();
+                format!(
+                    r#"{{"edge_id":"{eid}","source":"{src}","target":"{tgt}","relation":"extends","weight":0.9,"properties":{{}}}}"#
+                )
+            })
+            .collect();
+        let edges_ndjson = edge_lines.join("\n");
+
+        write_repo(repo, &entities_ndjson, &edges_ndjson);
+
+        let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(report.entities, N, "all {N} entities must be written");
+        assert_eq!(report.edges, N, "all {N} edges must be written");
+
+        // Spot-check: the last entity (in the final partial chunk) must be readable.
+        let last_id = *ids.last().unwrap();
+        let ns = khive_types::Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let token = rt.authorize(ns).unwrap();
+        let last_entity = rt
+            .entities(&token)
+            .unwrap()
+            .get_entity(last_id)
+            .await
+            .unwrap()
+            .expect("last entity (final chunk) must be readable after sync");
+        assert_eq!(
+            last_entity.name,
+            format!("SyntheticEntity{}", N - 1),
+            "last entity name must match"
+        );
+    }
+
+    /// Error-abort: a parse failure before any DB write leaves the existing DB intact.
+    /// This covers the failure-semantics contract: sync aborts on the first error
+    /// and the target DB is never replaced by a partial result.
+    #[tokio::test]
+    async fn sync_aborts_on_invalid_ndjson_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"ORIGINAL").unwrap();
+
+        // Mix valid entities with one invalid line to trigger a parse error
+        // before any DB write.
+        let id_a = uuid::Uuid::new_v4();
+        let good_line = format!(
+            r#"{{"id":"{id_a}","kind":"concept","name":"Good","properties":{{}},"tags":[]}}"#
+        );
+        let bad_ndjson = format!("{good_line}\nnot-valid-json\n");
+        write_repo(repo, &bad_ndjson, "");
+
+        let err = run_sync(repo, &db_path, "test-ns")
+            .await
+            .expect_err("sync must fail on invalid NDJSON");
+        assert!(
+            err.to_string().contains("parsing entity")
+                || err.chain().any(|e| e.to_string().contains("expected")),
+            "error must describe the parse failure, got: {err}"
+        );
+
+        // DB must be untouched (atomic rename guarantee).
+        let after = std::fs::read(&db_path).unwrap();
+        assert_eq!(
+            after, b"ORIGINAL",
+            "failed sync must not replace existing DB"
+        );
     }
 
     #[tokio::test]
