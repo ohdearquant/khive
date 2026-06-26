@@ -246,8 +246,7 @@ pub(crate) async fn handle_read(
         .unwrap_or("");
     if direction == "outbound" {
         return Err(RuntimeError::InvalidInput(format!(
-            "read: cannot mark outbound message {id} as read (direction=outbound); \
-             read() is a recipient action for inbound messages only"
+            "read: message {id} is outbound; only received (inbound) messages can be marked as read"
         )));
     }
 
