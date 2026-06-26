@@ -1641,3 +1641,74 @@ async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
          qualify under the cap, so no GraphPath should be emitted at all"
     );
 }
+
+/// Regression: traverse must not fail with "too many SQL variables" when the
+/// root set is larger than CHUNK_ROOTS (900).
+///
+/// Pre-fix, all root UUIDs were bound into a single CTE VALUES clause.  With
+/// more than SQLITE_MAX_VARIABLE_NUMBER roots (999 on older builds) the query
+/// returned a StorageError.  After the fix roots are chunked at 900 (mirroring
+/// get_edges), so a call with 1 000 roots is split into two chunks and
+/// completes successfully.
+///
+/// Graph: 1 000 roots, each with one distinct outgoing edge to a unique target.
+/// Correctness check: every root must appear in the result with exactly one
+/// reachable node (its direct child).
+#[tokio::test]
+async fn traverse_chunks_root_binds_over_host_param_limit() {
+    let store = setup_memory_store();
+
+    const N: usize = 1_000;
+    let mut roots: Vec<Uuid> = Vec::with_capacity(N);
+    let mut expected_children: std::collections::HashMap<Uuid, Uuid> =
+        std::collections::HashMap::with_capacity(N);
+
+    for _ in 0..N {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store
+            .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        roots.push(root);
+        expected_children.insert(root, child);
+    }
+
+    // Must return Ok — no "too many SQL variables" error.
+    let paths = store
+        .traverse(TraversalRequest {
+            roots: roots.clone(),
+            options: TraversalOptions {
+                max_depth: 1,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: None,
+            },
+            include_roots: false,
+        })
+        .await
+        .unwrap();
+
+    // Every root must have exactly one reachable node (its direct child).
+    assert_eq!(
+        paths.len(),
+        N,
+        "traverse over {N} roots must return one GraphPath per root"
+    );
+
+    for path in &paths {
+        let expected_child = expected_children[&path.root_id];
+        assert_eq!(
+            path.nodes.len(),
+            1,
+            "root {:?} must reach exactly 1 node",
+            path.root_id
+        );
+        assert_eq!(
+            path.nodes[0].node_id, expected_child,
+            "root {:?} must reach its direct child",
+            path.root_id
+        );
+    }
+}
