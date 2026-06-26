@@ -643,7 +643,7 @@ async fn list_note_thread_filter_non_ascii_stored_no_panic() {
     let token = rt.authorize(Namespace::local()).unwrap();
 
     // "1234567α": 7 ASCII bytes then α (U+03B1, 2 bytes) = 9 total bytes.
-    // Byte index 8 is the second byte of α — not a char boundary.
+    // Byte index 8 is the second byte of α, not a char boundary.
     // The old code reached stored[..8] here and panicked.
     let non_ascii_thread = "1234567\u{03B1}";
 
