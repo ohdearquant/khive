@@ -198,7 +198,8 @@ impl KhiveRuntime {
     /// When `self` is a secondary-backend runtime (`core_backend` is `Some`),
     /// this returns a new `KhiveRuntime` backed by the main
     /// `Arc<StorageBackend>` and sharing all registry state (`embedder_registry`,
-    /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`) with `self`.
+    /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`,
+    /// `entity_type_validator`) with `self`.
     /// No database I/O occurs; no embedding models are reloaded.
     ///
     /// Use `core()` for notes and entities that must reside in the shared graph
@@ -223,6 +224,7 @@ impl KhiveRuntime {
                     edge_rules: self.edge_rules.clone(),
                     valid_entity_kinds: self.valid_entity_kinds.clone(),
                     valid_note_kinds: self.valid_note_kinds.clone(),
+                    entity_type_validator: self.entity_type_validator.clone(),
                 }
             }
         }
