@@ -1677,7 +1677,8 @@ impl KhiveRuntime {
             let mut ns_paths = self.graph(&temp)?.traverse(request.clone()).await?;
             paths.append(&mut ns_paths);
         }
-        self.enrich_path_nodes(token, &mut paths).await;
+        self.enrich_path_nodes(token, &mut paths, request.include_properties)
+            .await;
         // Filter out soft-deleted entity nodes from all path nodes (Fix 2).
         let all_node_ids: Vec<Uuid> = paths
             .iter()
@@ -1818,9 +1819,18 @@ impl KhiveRuntime {
     /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
-    /// live in extra-visible namespaces are enriched correctly.  Node IDs that
+    /// live in extra-visible namespaces are enriched correctly. Node IDs that
     /// repeat across paths are fetched exactly once.
-    async fn enrich_path_nodes(&self, token: &NamespaceToken, paths: &mut [GraphPath]) {
+    ///
+    /// `include_properties` gates whether `entity.properties` is cloned onto
+    /// each node. When `false` (the default), the potentially large JSON blob
+    /// is never read from the map, keeping the hot path allocation-free.
+    async fn enrich_path_nodes(
+        &self,
+        token: &NamespaceToken,
+        paths: &mut [GraphPath],
+        include_properties: bool,
+    ) {
         if paths.is_empty() {
             return;
         }
@@ -1854,7 +1864,9 @@ impl KhiveRuntime {
                 if let Some(entity) = entity_map.get(&node.node_id) {
                     node.name = Some(entity.name.clone());
                     node.kind = Some(entity.kind.clone());
-                    node.properties = entity.properties.clone();
+                    if include_properties {
+                        node.properties = entity.properties.clone();
+                    }
                 }
             }
         }
@@ -7819,6 +7831,7 @@ mod tests {
                         ..Default::default()
                     },
                     include_roots: true,
+                    include_properties: false,
                 },
             )
             .await;
@@ -9143,7 +9156,7 @@ mod tests {
             },
         ];
 
-        rt.enrich_path_nodes(&tok, &mut paths).await;
+        rt.enrich_path_nodes(&tok, &mut paths, false).await;
 
         assert_eq!(paths[0].nodes[0].name.as_deref(), Some("Alpha"));
         assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
@@ -9204,7 +9217,7 @@ mod tests {
             nodes: vec![path_node(entity_b.id, 0)],
             total_weight: 1.0,
         }];
-        rt.enrich_path_nodes(&vis_tok, &mut paths).await;
+        rt.enrich_path_nodes(&vis_tok, &mut paths, false).await;
 
         assert_eq!(
             paths[0].nodes[0].name.as_deref(),
@@ -9287,7 +9300,7 @@ mod tests {
             total_weight: 1.0,
         }];
 
-        rt.enrich_path_nodes(&tok, &mut paths).await;
+        rt.enrich_path_nodes(&tok, &mut paths, true).await;
 
         assert_eq!(
             paths[0].nodes[0].properties.as_ref(),
@@ -9359,6 +9372,7 @@ mod tests {
                     limit: None,
                 },
                 include_roots: false,
+                include_properties: false,
             })
             .await
             .unwrap();

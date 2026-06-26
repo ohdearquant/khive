@@ -369,6 +369,8 @@ struct TraversalRequestRaw {
     roots: Vec<Uuid>,
     options: TraversalOptionsRaw,
     include_roots: bool,
+    #[serde(default)]
+    include_properties: bool,
 }
 
 impl TryFrom<TraversalRequestRaw> for TraversalRequest {
@@ -379,6 +381,7 @@ impl TryFrom<TraversalRequestRaw> for TraversalRequest {
             roots: raw.roots,
             options: TraversalOptions::try_from(raw.options)?,
             include_roots: raw.include_roots,
+            include_properties: raw.include_properties,
         })
     }
 }
@@ -390,6 +393,10 @@ pub struct TraversalRequest {
     pub roots: Vec<Uuid>,
     pub options: TraversalOptions,
     pub include_roots: bool,
+    /// When `true`, `enrich_path_nodes` populates the `properties` map on each
+    /// `PathNode`. Default `false`; the wire shape is unchanged when absent.
+    #[serde(default)]
+    pub include_properties: bool,
 }
 
 /// One node along a traversal path.

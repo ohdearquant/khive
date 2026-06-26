@@ -41,6 +41,9 @@ impl KgPack {
                 },
             )
             .await?;
+        // entity_type is a cheap String field already fetched in the same
+        // entity batch, so the clear happens handler-side rather than
+        // threading a flag down to the runtime layer.
         if !p.include_entity_type.unwrap_or(false) {
             for hit in &mut hits {
                 hit.entity_type = None;
@@ -79,15 +82,9 @@ impl KgPack {
             roots,
             options,
             include_roots: p.include_roots.unwrap_or(true),
+            include_properties: p.include_properties.unwrap_or(false),
         };
-        let mut paths = self.runtime.traverse(token, request).await?;
-        if !p.include_properties.unwrap_or(false) {
-            for path in &mut paths {
-                for node in &mut path.nodes {
-                    node.properties = None;
-                }
-            }
-        }
+        let paths = self.runtime.traverse(token, request).await?;
         to_json(&paths)
     }
 

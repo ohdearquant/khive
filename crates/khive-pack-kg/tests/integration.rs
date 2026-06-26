@@ -1322,7 +1322,7 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
 
 /// neighbors with include_entity_type=true carries entity_type on each neighbor.
 /// neighbors without the param (default-off) must not include entity_type in
-/// the JSON response — the wire shape must be unchanged from today.
+/// the JSON response: the wire shape must be unchanged from today.
 #[tokio::test]
 async fn neighbors_include_entity_type_param() {
     let pack = pack();
