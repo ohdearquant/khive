@@ -1,4 +1,4 @@
-# perf/ — Performance Ledger
+# Performance Ledger (perf/)
 
 This directory holds the machine-generated performance record for khive-vamana's
 approximate nearest-neighbour (ANN) engine.
@@ -13,7 +13,7 @@ approximate nearest-neighbour (ANN) engine.
 
 ---
 
-## ledger.csv — column definitions
+## ledger.csv column definitions
 
 The ledger is the single source of truth for banked performance numbers. Rows
 are appended by `scripts/perf/ingest_scale_proof.py` after a successful
@@ -31,7 +31,7 @@ bench run; they are never hand-typed.
 | `p95_us` | float | Warm-cache query latency at the 95th percentile, microseconds |
 | `p99_us` | float | Warm-cache query latency at the 99th percentile, microseconds |
 | `build_ms` | float | Index build wall-clock time, milliseconds |
-| `speedup` | float | `brute_us / p50_us` — how much faster ANN query is than brute-force |
+| `speedup` | float | `brute_us / p50_us`: how much faster ANN query is than brute-force |
 | `brute_us` | float | Brute-force p50 latency baseline (see provenance note below) |
 | `pass` | PASS/FAIL | Whether all `targets.toml` checks passed for this row |
 | `loadavg` | float | 1-minute load average on the runner at measurement time |
@@ -67,7 +67,7 @@ Rows produced by future runs (post-PR #239) will carry a directly measured
 
 ---
 
-## Headline result — SIFT-1M
+## Headline result: SIFT-1M
 
 The numbers below are taken directly from `perf/ledger.csv` (rows with
 `notes` field `SIFT-1M-honest-3pt macos-arm64 brute_us=back-derived`) and
