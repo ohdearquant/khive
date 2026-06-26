@@ -60,6 +60,23 @@ def khive_memory_session() -> Iterator[KhiveMcpSession]:
         yield session
 
 
+@pytest.fixture(scope="session")
+def khive_formal_session() -> Iterator[KhiveMcpSession]:
+    """KG + formal-math ontology MCP session.
+
+    ADR: ADR-017 (pack standard, edge endpoint rules)
+    Spawn config: packs=("kg", "formal"), db=":memory:", no_embed=True, log="error".
+
+    The formal pack (crates/khive-pack-formal) registers 21 EntityOfType edge
+    endpoint rules for six concept subtypes (theorem, definition, structure,
+    instance, axiom, goal) — no verbs, pure ontology extension.
+    """
+    with KhiveMcpSession(
+        packs=("kg", "formal"), db=":memory:", no_embed=True, log="error"
+    ) as session:
+        yield session
+
+
 # ---------------------------------------------------------------------------
 # Function fixtures — unique per test, never shared.
 # ---------------------------------------------------------------------------

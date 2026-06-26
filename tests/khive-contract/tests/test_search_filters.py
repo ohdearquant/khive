@@ -28,9 +28,9 @@ Note on note tags: entity tags live in the top-level `tags` column; note
 tags live in `properties["tags"]` (notes have no dedicated tag column).
 The `search(tags=[...])` filter checks the correct field for each substrate.
 
-Out of scope (gated on unmerged work — do NOT add here):
-  - create_many bulk verb (#232, unmerged PR)
-  - khive-pack-formal / EntityOfType (#231, unmerged PR in codex review)
+Out of scope for this file (covered elsewhere in the suite):
+  - create_many bulk verb (#232) — see tests/test_create_many.py
+  - khive-pack-formal / EntityOfType (#231) — see tests/test_formal_pack.py
   - True N-physical-backend fan-out routing (storage-pluggability unmerged)
 """
 
