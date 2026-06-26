@@ -44,7 +44,6 @@ impl EntityKind {
         "resource",
     ];
 
-    #[allow(dead_code)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Concept => "concept",
