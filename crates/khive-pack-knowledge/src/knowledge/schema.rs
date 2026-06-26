@@ -107,7 +107,6 @@ pub(crate) struct UpsertAtomsParams {
     // REASON: chunk_size is accepted from callers as a hint for client-side pagination;
     // server-side chunking is not yet implemented but the field must be deserialized
     // so callers that send it don't receive unexpected errors.
-    #[allow(dead_code)]
     pub chunk_size: Option<usize>,
 }
 
@@ -166,7 +165,6 @@ pub(crate) struct DeleteAtomsParams {
     #[serde(default)]
     // REASON: cascade is accepted from callers for API forward-compatibility; cascading
     // delete behavior is not yet implemented (atoms are soft-deleted without affecting sections).
-    #[allow(dead_code)]
     pub cascade: Option<bool>,
 }
 
