@@ -331,7 +331,7 @@ pub struct OrphanSweepResult {
     pub deleted: u64,
     /// Rows that would be deleted (populated even when `dry_run = false`).
     pub would_delete: u64,
-    /// Whether `max_delete` was reached before the full scan completed.
+    /// Whether `would_delete` exceeded `max_delete`, meaning deletion was capped after full counting.
     pub max_delete_hit: bool,
 }
 ```
@@ -339,11 +339,14 @@ pub struct OrphanSweepResult {
 ```rust
 // On VectorStore trait:
 /// Find vector rows whose subject_id has no corresponding live record in the SQL
-/// substrate (entities / notes / memories with `deleted_at IS NULL`).
+/// substrate (`entities` / `notes` with `deleted_at IS NULL`). Memory records
+/// are stored as notes with `kind = 'memory'`, so a memory vector is protected
+/// only by its row in `notes` -- there is no separate `memories` table.
 ///
 /// A vector is orphaned when its subject_id is either absent from all substrate
-/// tables, or present with `deleted_at IS NOT NULL`. Soft-deleted records are NOT
-/// orphaned — the vector stays as long as the substrate row exists.
+/// tables, or present with `deleted_at IS NOT NULL`. Soft-deleted substrate rows
+/// (`deleted_at IS NOT NULL`) do not protect their vectors -- only rows with
+/// `deleted_at IS NULL` are treated as live.
 ///
 /// The anti-join + DELETE execute in one statement under the writer lock,
 /// preventing TOCTOU between the scan and the delete.
@@ -371,22 +374,29 @@ WHERE subject_id NOT IN (
     SELECT id FROM entities  WHERE deleted_at IS NULL
     UNION ALL
     SELECT id FROM notes     WHERE deleted_at IS NULL
-    UNION ALL
-    SELECT id FROM memories  WHERE deleted_at IS NULL
 )
 -- namespace filter:
-AND  (? IS NULL OR namespace IN (SELECT value FROM json_each(?)))
+AND  (?1 IS NULL OR namespace IN (SELECT value FROM json_each(?1)))
 -- substrate_kinds filter:
-AND  (? IS NULL OR kind IN (SELECT value FROM json_each(?)))
+AND  (?2 IS NULL OR kind IN (SELECT value FROM json_each(?2)))
 -- allowlist filter:
-AND  (? IS NULL OR subject_id IN (SELECT value FROM json_each(?)))
-LIMIT :max_delete
+AND  (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))
+-- portable capped delete (SQLITE_ENABLE_UPDATE_DELETE_LIMIT not compiled in bundled rusqlite):
+-- wrap as: DELETE FROM t WHERE subject_id IN (SELECT subject_id FROM t WHERE [above] LIMIT :max_delete)
 ```
 
-The anti-join and `DELETE` are one statement under a `BEGIN IMMEDIATE` transaction,
-held for the duration of the sweep. This eliminates the TOCTOU window between
-"find orphans" and "delete orphans." The `LIMIT` ensures the writer lock is not held
-for an unbounded time on large tables.
+The sweep runs three SQL operations under one `BEGIN IMMEDIATE` transaction: a
+filtered `COUNT` for `scanned`, an anti-join `COUNT` for `would_delete`, and the
+capped `DELETE`. This eliminates the TOCTOU window between counting orphans and
+deleting them.
+
+`max_delete` bounds the number of rows **deleted** in a single run — it is a
+blast-radius and safety cap, not a scan or lock-hold duration limit. The
+`scanned` and `would_delete` counts require a full filtered table scan and an
+anti-join against the substrate tables, so the writer lock is held for a duration
+proportional to the filtered table size regardless of `max_delete`. This is
+acceptable because `orphan_sweep` is a CLI-only maintenance operation run by an
+operator, not a hot-path call.
 
 **Naming:** `subject_id_allowlist` (this ADR) replaces `include_subjects` (original
 draft). The rename makes the polarity explicit: allowlist means "only these are eligible
