@@ -23,7 +23,7 @@ pub(crate) enum EntityKind {
 }
 
 impl EntityKind {
-    // REASON: ALL and NAMES are used exclusively in the test module below.
+    // REASON: ALL is used exclusively in the test module below.
     // Suppressed here because pub(crate) items in non-test code still trigger
     // dead_code if they have no callers outside cfg(test).
     #[allow(dead_code)]
@@ -39,7 +39,6 @@ impl EntityKind {
         Self::Resource,
     ];
 
-    #[allow(dead_code)]
     pub(crate) const NAMES: &'static [&'static str] = &[
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
         "resource",
