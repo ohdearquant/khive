@@ -50,6 +50,10 @@ echo "=== Deno Tests ==="
 
 echo "=== Smoke Test ==="
 python3 "$SCRIPT_DIR/../tests/smoke_test.py"
+python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
+python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
+python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"
+python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 
 echo "=== Contract Suite (khive-contract) ==="
 (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
