@@ -9209,4 +9209,89 @@ mod tests {
         );
         assert_eq!(paths[0].nodes[0].kind.as_deref(), Some("concept"));
     }
+
+    /// Regression: GraphStore::traverse must not fail with "too many SQL variables"
+    /// or "too many terms in compound SELECT" when the root set exceeds the chunk
+    /// boundary (400 roots per CTE VALUES clause after the fix).
+    ///
+    /// Graph: 1 000 roots, each with one distinct outgoing edge to a unique child.
+    /// The graph store's `traverse` is exercised directly (bypassing the runtime-level
+    /// entity-existence filter) to keep the test fast and targeted.
+    ///
+    /// Correctness: every root must appear in the result with exactly one reachable node.
+    #[tokio::test]
+    async fn traverse_chunks_root_binds_over_host_param_limit() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let graph = rt.graph(&tok).unwrap();
+
+        const N: usize = 1_000;
+        let now = chrono::Utc::now();
+
+        let mut roots: Vec<uuid::Uuid> = Vec::with_capacity(N);
+        let mut expected_children: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
+            std::collections::HashMap::with_capacity(N);
+
+        for _ in 0..N {
+            let root = uuid::Uuid::new_v4();
+            let child = uuid::Uuid::new_v4();
+            graph
+                .upsert_edge(Edge {
+                    id: LinkId::from(uuid::Uuid::new_v4()),
+                    namespace: "local".to_string(),
+                    source_id: root,
+                    target_id: child,
+                    relation: EdgeRelation::Extends,
+                    weight: 1.0,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+            roots.push(root);
+            expected_children.insert(root, child);
+        }
+
+        // Must return Ok: no "too many SQL variables" or "too many terms in compound SELECT".
+        let paths = graph
+            .traverse(TraversalRequest {
+                roots: roots.clone(),
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: None,
+                },
+                include_roots: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            paths.len(),
+            N,
+            "traverse over {N} roots must return one GraphPath per root"
+        );
+
+        for path in &paths {
+            let expected_child = expected_children[&path.root_id];
+            assert_eq!(
+                path.nodes.len(),
+                1,
+                "root {:?} must reach exactly 1 node",
+                path.root_id
+            );
+            assert_eq!(
+                path.nodes[0].node_id, expected_child,
+                "root {:?} must reach its direct child",
+                path.root_id
+            );
+        }
+    }
 }
