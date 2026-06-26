@@ -92,6 +92,9 @@ crates/khive-pack-memory/tests/fixtures/
 
 uv.lock
 pyproject.toml
+# Exception: the khive-contract integration suite is a committed uv project
+!tests/khive-contract/pyproject.toml
+!tests/khive-contract/uv.lock
 
 *results.json
 

@@ -51,4 +51,7 @@ echo "=== Deno Tests ==="
 echo "=== Smoke Test ==="
 python3 "$SCRIPT_DIR/../tests/smoke_test.py"
 
+echo "=== Contract Suite (khive-contract) ==="
+(cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
+
 echo "=== CI Passed ==="
