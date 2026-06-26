@@ -1254,23 +1254,38 @@ async fn test_traverse_per_root_limit_capped_independently() {
 // ---- batch == per-root decomposition equivalence tests ----
 
 /// Equivalence fixture: for a small deterministic graph, batched
-/// `traverse([A, E])` must produce the same per-root results as running
-/// `traverse([A])` and `traverse([E])` independently.
+/// `traverse([R0, R1])` must produce the same per-root results as running
+/// `traverse([R0])` and `traverse([R1])` independently, across four sections:
 ///
-/// The fixture exercises a matrix of parameters:
-///   include_roots ∈ {true, false}
-///   with and without a relation filter
-///   with and without min_weight
-///   with a finite limit  ← catches the Major per-root-limit bug class
+/// **Section A** – linear chains, Direction::Out, 6-case parameter matrix
+///   (include_roots, relation filter, min_weight, finite limit):
+///   A → B (w=0.9, Extends) → C (w=0.8) → D (w=0.7)
+///   E → F (w=0.6, Extends) → G (w=0.5)
 ///
-/// Graph (two independent linear chains — no diamond — so via_edge is
-/// unambiguous and the comparison is exact field-by-field):
-///   A → B (w=0.9) → C (w=0.8) → D (w=0.7)   [relation: Extends]
-///   E → F (w=0.6) → G (w=0.5)                [relation: Extends]
+/// **Section B** – diamond with shortcut, Direction::Out (depth/via_edge drift):
+///   H → VI (w=1.0, Extends) → K (w=1.0, Extends)
+///   H → K  (w=0.5, PartOf)  ← shortcut; K is at depth 1 from H via H→K,
+///                                          NOT depth 2 via H→VI→K.
+///   Batched CTE must attribute K's first visit to depth=1, via_edge=H→K edge.
+///
+/// **Section C** – same diamond, Direction::In (bidirectional traversal):
+///   roots [K, N].  K has two distinct incoming edges (H→K and VI→K); the
+///   batched CTE must assign each one its own via_edge independently.
+///
+/// **Section D** – same diamond + chain, Direction::Both:
+///   roots [VI, N].  VI has both in-edges (H→VI) and out-edges (VI→K).
+///
+/// M → N (w=1.0, Extends) — independent parallel chain used as the second
+///   root in Sections B/C/D.
+///
+/// Same-depth node ordering is resolved by sorting PathNodes by (depth, node_id)
+/// before the per-node comparison — no new ordering contract is introduced in
+/// production code.
 #[tokio::test]
 async fn test_traverse_batch_equals_per_root_decomposition() {
     let store = setup_memory_store();
 
+    // Section A nodes
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -1279,6 +1294,14 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
     let f = Uuid::new_v4();
     let g = Uuid::new_v4();
 
+    // Section B/C/D nodes
+    let h = Uuid::new_v4(); // diamond source
+    let vi = Uuid::new_v4(); // diamond intermediate
+    let k = Uuid::new_v4(); // convergent node (reachable from h directly AND via vi)
+    let m = Uuid::new_v4(); // independent parallel root
+    let n = Uuid::new_v4(); // child of m
+
+    // Section A edges
     for (src, tgt, w) in [
         (a, b, 0.9_f64),
         (b, c, 0.8),
@@ -1292,14 +1315,35 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
             .unwrap();
     }
 
-    // Sort PathNode by (depth, node_id) so the comparison is stable even
-    // if SQLite returns same-depth nodes in different orders between calls.
+    // Section B/C/D edges
+    store
+        .upsert_edge(make_edge(h, vi, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(vi, k, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    // Shortcut: K is reachable from H in one hop; the depth-2 path via VI→K must
+    // be suppressed by BFS first-visit in both batched and single-root traversals.
+    store
+        .upsert_edge(make_edge(h, k, EdgeRelation::PartOf, 0.5))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(m, n, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    // Sort PathNodes by (depth, node_id) for a stable comparison even when
+    // same-depth nodes appear in different orders between CTE executions.
+    // This resolves depth-1 tie-breaking without requiring a new ordering
+    // contract in production code.
     let sort_nodes = |nodes: &mut Vec<khive_storage::types::PathNode>| {
         nodes.sort_by_key(|n| (n.depth, n.node_id));
     };
 
-    // (include_roots, direction, relation_filter, min_weight, limit)
-    // Direction is Clone but not Copy, so we build TraversalOptions per iteration.
+    // Direction is Clone but not Copy; TraversalOptions is built per case.
     struct Case {
         include_roots: bool,
         direction: Direction,
@@ -1307,151 +1351,293 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
         min_weight: Option<f64>,
         limit: Option<u32>,
     }
-    let cases = [
-        Case {
-            include_roots: false,
-            direction: Direction::Out,
-            relation_filter: None,
-            min_weight: None,
-            limit: None,
-        },
-        Case {
-            include_roots: true,
-            direction: Direction::Out,
-            relation_filter: None,
-            min_weight: None,
-            limit: None,
-        },
-        Case {
-            include_roots: false,
-            direction: Direction::Out,
-            relation_filter: None,
-            min_weight: None,
-            limit: Some(1),
-        },
-        Case {
-            include_roots: false,
-            direction: Direction::Out,
-            relation_filter: None,
-            min_weight: None,
-            limit: Some(2),
-        },
-        Case {
-            include_roots: false,
-            direction: Direction::Out,
-            relation_filter: Some(EdgeRelation::Extends),
-            min_weight: None,
-            limit: None,
-        },
-        Case {
-            include_roots: false,
-            direction: Direction::Out,
-            relation_filter: None,
-            min_weight: Some(0.65),
-            limit: None,
-        },
-    ];
 
-    for case in &cases {
-        let opts = TraversalOptions {
-            max_depth: 4,
-            direction: case.direction.clone(),
-            relations: case.relation_filter.map(|r| vec![r]),
-            min_weight: case.min_weight,
-            limit: case.limit,
-        };
+    // run_cases: for each case, assert batched([r0, r1]) == decomposed([r0]) + ([r1]).
+    // Takes roots by value so it can be called for each section.
+    async fn run_cases(
+        store: &SqlGraphStore,
+        root0: Uuid,
+        root1: Uuid,
+        cases: &[Case],
+        sort_nodes: &dyn Fn(&mut Vec<khive_storage::types::PathNode>),
+    ) {
+        for case in cases {
+            let opts = TraversalOptions {
+                max_depth: 4,
+                direction: case.direction.clone(),
+                relations: case.relation_filter.map(|r| vec![r]),
+                min_weight: case.min_weight,
+                limit: case.limit,
+            };
 
-        let batched = store
-            .traverse(TraversalRequest {
-                roots: vec![a, e],
-                options: opts.clone(),
-                include_roots: case.include_roots,
-            })
-            .await
-            .unwrap();
-        let single_a = store
-            .traverse(TraversalRequest {
-                roots: vec![a],
-                options: opts.clone(),
-                include_roots: case.include_roots,
-            })
-            .await
-            .unwrap();
-        let single_e = store
-            .traverse(TraversalRequest {
-                roots: vec![e],
-                options: opts,
-                include_roots: case.include_roots,
-            })
-            .await
-            .unwrap();
+            let batched = store
+                .traverse(TraversalRequest {
+                    roots: vec![root0, root1],
+                    options: opts.clone(),
+                    include_roots: case.include_roots,
+                })
+                .await
+                .unwrap();
+            let single_0 = store
+                .traverse(TraversalRequest {
+                    roots: vec![root0],
+                    options: opts.clone(),
+                    include_roots: case.include_roots,
+                })
+                .await
+                .unwrap();
+            let single_1 = store
+                .traverse(TraversalRequest {
+                    roots: vec![root1],
+                    options: opts,
+                    include_roots: case.include_roots,
+                })
+                .await
+                .unwrap();
 
-        for (root_id, single_result) in [(a, &single_a), (e, &single_e)] {
-            let batch_path = batched.iter().find(|p| p.root_id == root_id);
-            let single_path = single_result.first();
+            for (root_id, single_result) in [(root0, &single_0), (root1, &single_1)] {
+                let batch_path = batched.iter().find(|p| p.root_id == root_id);
+                let single_path = single_result.first();
 
-            let label = format!(
-                "root={root_id:?} params=(include_roots={},dir={:?},rel={:?},\
-                 min_w={:?},limit={:?})",
-                case.include_roots,
-                case.direction,
-                case.relation_filter,
-                case.min_weight,
-                case.limit,
-            );
+                let label = format!(
+                    "root={root_id:?} params=(include_roots={},dir={:?},rel={:?},\
+                     min_w={:?},limit={:?})",
+                    case.include_roots,
+                    case.direction,
+                    case.relation_filter,
+                    case.min_weight,
+                    case.limit,
+                );
 
-            match (batch_path, single_path) {
-                (None, None) => {}
-                (Some(bp), Some(sp)) => {
-                    let mut bn = bp.nodes.clone();
-                    let mut sn = sp.nodes.clone();
-                    sort_nodes(&mut bn);
-                    sort_nodes(&mut sn);
+                match (batch_path, single_path) {
+                    (None, None) => {}
+                    (Some(bp), Some(sp)) => {
+                        let mut bn = bp.nodes.clone();
+                        let mut sn = sp.nodes.clone();
+                        sort_nodes(&mut bn);
+                        sort_nodes(&mut sn);
 
-                    assert_eq!(
-                        bn.len(),
-                        sn.len(),
-                        "{label}: node count mismatch batch={} single={}",
-                        bn.len(),
-                        sn.len()
-                    );
-                    for (bi, si) in bn.iter().zip(sn.iter()) {
                         assert_eq!(
-                            bi.node_id, si.node_id,
-                            "{label}: node_id mismatch at depth {}",
-                            bi.depth
+                            bn.len(),
+                            sn.len(),
+                            "{label}: node count mismatch batch={} single={}",
+                            bn.len(),
+                            sn.len()
                         );
-                        assert_eq!(
-                            bi.depth, si.depth,
-                            "{label}: depth mismatch for node {}",
-                            bi.node_id
-                        );
-                        assert_eq!(
-                            bi.via_edge, si.via_edge,
-                            "{label}: via_edge mismatch for node {}",
-                            bi.node_id
+                        for (bi, si) in bn.iter().zip(sn.iter()) {
+                            assert_eq!(
+                                bi.node_id, si.node_id,
+                                "{label}: node_id mismatch at depth {}",
+                                bi.depth
+                            );
+                            assert_eq!(
+                                bi.depth, si.depth,
+                                "{label}: depth mismatch for node {}",
+                                bi.node_id
+                            );
+                            assert_eq!(
+                                bi.via_edge, si.via_edge,
+                                "{label}: via_edge mismatch for node {}",
+                                bi.node_id
+                            );
+                        }
+                        assert!(
+                            (bp.total_weight - sp.total_weight).abs() < 1e-9,
+                            "{label}: total_weight mismatch batch={} single={}",
+                            bp.total_weight,
+                            sp.total_weight
                         );
                     }
-                    assert!(
-                        (bp.total_weight - sp.total_weight).abs() < 1e-9,
-                        "{label}: total_weight mismatch batch={} single={}",
-                        bp.total_weight,
-                        sp.total_weight
-                    );
-                }
-                (None, Some(sp)) => {
-                    panic!(
-                        "{label}: batch missing path that single found ({} nodes)",
-                        sp.nodes.len()
-                    );
-                }
-                (Some(bp), None) => {
-                    panic!(
-                        "{label}: batch has path ({} nodes) that single didn't produce",
-                        bp.nodes.len()
-                    );
+                    (None, Some(sp)) => {
+                        panic!(
+                            "{label}: batch missing path that single found ({} nodes)",
+                            sp.nodes.len()
+                        );
+                    }
+                    (Some(bp), None) => {
+                        panic!(
+                            "{label}: batch has path ({} nodes) that single didn't produce",
+                            bp.nodes.len()
+                        );
+                    }
                 }
             }
         }
     }
+
+    // ── Section A: linear chains, Direction::Out ──────────────────────────────
+    run_cases(
+        &store,
+        a,
+        e,
+        &[
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: true,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: Some(1),
+            },
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: Some(2),
+            },
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: Some(EdgeRelation::Extends),
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: Some(0.65),
+                limit: None,
+            },
+        ],
+        &sort_nodes,
+    )
+    .await;
+
+    // ── Section B: diamond, Direction::Out ────────────────────────────────────
+    // K must appear at depth=1 via the H→K shortcut edge, NOT at depth=2 via
+    // H→VI→K.  A bug in the batched CTE's per-root seen-set tracking would
+    // produce the wrong depth or via_edge for K.
+    run_cases(
+        &store,
+        h,
+        m,
+        &[
+            Case {
+                include_roots: false,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: true,
+                direction: Direction::Out,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+        ],
+        &sort_nodes,
+    )
+    .await;
+
+    // ── Section C: converging node, Direction::In ─────────────────────────────
+    // K has two distinct incoming edges (H→K via PartOf and VI→K via Extends).
+    // Both must appear independently in K's path; neither must bleed into N's path.
+    run_cases(
+        &store,
+        k,
+        n,
+        &[
+            Case {
+                include_roots: false,
+                direction: Direction::In,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: true,
+                direction: Direction::In,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+        ],
+        &sort_nodes,
+    )
+    .await;
+
+    // ── Section D: middle node, Direction::Both ───────────────────────────────
+    // VI has H→VI incoming and VI→K outgoing.  Direction::Both must walk both
+    // sides and produce identical results for the batched and single-root cases.
+    run_cases(
+        &store,
+        vi,
+        n,
+        &[
+            Case {
+                include_roots: false,
+                direction: Direction::Both,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+            Case {
+                include_roots: true,
+                direction: Direction::Both,
+                relation_filter: None,
+                min_weight: None,
+                limit: None,
+            },
+        ],
+        &sort_nodes,
+    )
+    .await;
+}
+
+/// Regression: `limit=0` with `include_roots=false` must emit NO path for that
+/// root, not an empty `GraphPath`.  Pre-fix, the Rust-level truncation reduced
+/// the node list to zero but still pushed a `GraphPath { nodes: [] }`.
+///
+/// This test must FAIL on the commit that introduced the per-root Rust truncation
+/// but BEFORE the post-truncation empty guard was added, and PASS after.
+#[tokio::test]
+async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
+    let store = setup_memory_store();
+
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+
+    store
+        .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let paths = store
+        .traverse(TraversalRequest {
+            roots: vec![root],
+            options: TraversalOptions {
+                max_depth: 2,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: Some(0),
+            },
+            include_roots: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths.len(),
+        0,
+        "limit=0 + include_roots=false: root has reachable children but no nodes \
+         qualify under the cap, so no GraphPath should be emitted at all"
+    );
 }

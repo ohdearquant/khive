@@ -1183,6 +1183,11 @@ impl GraphStore for SqlGraphStore {
                         let root_count = usize::from(include_roots);
                         nw.truncate(root_count + lim as usize);
                     }
+                    // Post-truncation guard: a limit=0 + include_roots=false call
+                    // truncates to zero nodes; there is nothing to emit.
+                    if nw.is_empty() {
+                        continue;
+                    }
                     let max_weight = nw.iter().map(|(_, w)| *w).fold(0.0_f64, f64::max);
                     let nodes: Vec<PathNode> = nw.into_iter().map(|(n, _)| n).collect();
                     all_paths.push(GraphPath {
