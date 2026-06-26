@@ -9398,4 +9398,144 @@ mod tests {
             );
         }
     }
+
+    // ── Additive EDGE_RULES composition: pack EntityOfType rules must not shadow
+    // the base EntityOfKind contract for the same relation. ──────────────────────
+    //
+    // When a pack contributes EntityOfType rules for a relation (e.g. variant_of:
+    // goal -> theorem and goal -> definition), the base contract's EntityOfKind
+    // rule for the same relation (concept -> concept) must still fire for entities
+    // whose base kind is "concept" but whose EntityOfType pair is not in any pack rule.
+    //
+    // Specifically: a goal entity resolves to base kind "concept". A goal -> goal
+    // variant_of edge has no matching pack rule (goal -> goal is not declared), so
+    // pack_rule_allows returns false. The validator then extracts the base kind
+    // ("concept") and checks base_entity_rule_allows, which returns true.
+    // The edge is therefore allowed: additive composition holds.
+
+    #[test]
+    fn pack_entity_of_type_rules_do_not_shadow_base_entity_of_kind_rule() {
+        // Formal-style EntityOfType rules for variant_of: goal -> theorem, goal -> definition.
+        // goal -> goal is deliberately absent — that case must fall through to the base rule.
+        let pack_rules: Vec<EdgeEndpointRule> = vec![
+            EdgeEndpointRule {
+                relation: EdgeRelation::VariantOf,
+                source: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "goal",
+                },
+                target: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "theorem",
+                },
+            },
+            EdgeEndpointRule {
+                relation: EdgeRelation::VariantOf,
+                source: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "goal",
+                },
+                target: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "definition",
+                },
+            },
+        ];
+
+        let goal_a =
+            Resolved::Entity(Entity::new("local", "concept", "G-a").with_entity_type(Some("goal")));
+        let goal_b =
+            Resolved::Entity(Entity::new("local", "concept", "G-b").with_entity_type(Some("goal")));
+
+        // Pack rules do not cover goal -> goal, so pack_rule_allows must return false.
+        assert!(
+            !pack_rule_allows(
+                &pack_rules,
+                EdgeRelation::VariantOf,
+                Some(&goal_a),
+                Some(&goal_b)
+            ),
+            "pack rules must not cover goal->goal variant_of (no such rule declared)"
+        );
+
+        // The base contract allows concept -> concept for variant_of.
+        // A goal entity's base kind is "concept", so this must return true.
+        assert!(
+            base_entity_rule_allows("concept", EdgeRelation::VariantOf, "concept"),
+            "base contract must allow concept->concept variant_of regardless of pack EntityOfType rules"
+        );
+    }
+
+    // Integration path: pack EntityOfType rules installed on the runtime must not
+    // block a goal->goal variant_of link that the base contract already permits.
+    // Exercises validate_edge_relation_endpoints lines 1173-1223:
+    //   pack miss -> extract e.kind ("concept") -> base_entity_rule_allows -> Ok.
+    #[tokio::test]
+    async fn link_variant_of_goal_to_goal_allowed_when_pack_has_entity_of_type_rules() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Install formal-style EntityOfType rules for variant_of (goal -> theorem/definition).
+        // goal -> goal is absent so the base concept->concept rule must carry this case.
+        rt.install_edge_rules(vec![
+            EdgeEndpointRule {
+                relation: EdgeRelation::VariantOf,
+                source: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "goal",
+                },
+                target: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "theorem",
+                },
+            },
+            EdgeEndpointRule {
+                relation: EdgeRelation::VariantOf,
+                source: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "goal",
+                },
+                target: EndpointKind::EntityOfType {
+                    kind: "concept",
+                    entity_type: "definition",
+                },
+            },
+        ]);
+
+        let a = rt
+            .create_entity(
+                &tok,
+                "concept",
+                Some("goal"),
+                "Goal Alpha",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(
+                &tok,
+                "concept",
+                Some("goal"),
+                "Goal Beta",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Neither endpoint matches any pack rule (no goal->goal rule).
+        // The base concept->concept rule must fire and allow the edge.
+        let result = rt
+            .link(&tok, a.id, b.id, EdgeRelation::VariantOf, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "goal->goal variant_of must be allowed via the base concept->concept rule \
+             even when EntityOfType rules for variant_of are installed; got {result:?}"
+        );
+    }
 }
