@@ -9,10 +9,11 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, VectorIndexKind, VectorRecord, VectorSearchHit,
-    VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, VectorIndexKind,
+    VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
 };
 use khive_storage::StorageCapability;
+use khive_storage::StorageResult;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
 
@@ -787,6 +788,144 @@ impl VectorStore for SqliteVecStore {
         .await
     }
 
+    async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
+        let table = self.table_name.clone();
+
+        // Serialize filter lists as JSON arrays for json_each() usage inside SQL.
+        // An empty list becomes None, which binds as NULL; the IS NULL guard then
+        // short-circuits to true, passing all rows through (= no filtering).
+        let ns_json: Option<String> = if config.namespaces.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&config.namespaces).ok()
+        };
+
+        let kind_json: Option<String> = if config.substrate_kinds.is_empty() {
+            None
+        } else {
+            let strs: Vec<String> = config
+                .substrate_kinds
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            serde_json::to_string(&strs).ok()
+        };
+
+        // None = all rows eligible; Some(ids) = only those IDs may be swept.
+        let allow_json: Option<String> = config.subject_id_allowlist.as_ref().map(|ids| {
+            let strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            serde_json::to_string(&strs).unwrap_or_default()
+        });
+
+        let max_delete = config.max_delete as i64;
+        let dry_run = config.dry_run;
+
+        self.with_writer("orphan_sweep", move |conn| {
+            // Acquire a write lock for the entire sweep to eliminate the TOCTOU
+            // window between counting orphans and deleting them (ADR-044 §5).
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+
+            // Optional-filter clause shared across all three queries.
+            // Each ?N appears twice (IS NULL guard + json_each call); SQLite
+            // reuses the same bound value for every occurrence of the same ?N.
+            //   ?1 = namespace JSON or NULL   ?2 = kind JSON or NULL
+            //   ?3 = allowlist JSON or NULL
+            let filter_pred = "(?1 IS NULL OR namespace IN (SELECT value FROM json_each(?1))) \
+                               AND (?2 IS NULL OR kind IN (SELECT value FROM json_each(?2))) \
+                               AND (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))";
+
+            // Live-subjects subquery used in the orphan anti-join.
+            //
+            // Policy-critical: `deleted_at IS NULL` means a soft-deleted substrate
+            // row is NOT considered live, so its vector is swept.
+            // To preserve vectors for soft-deleted subjects, remove the
+            // `deleted_at IS NULL` filter from both lines below (one-line change per
+            // table).  The `memories` table referenced in ADR-044 §5 does not exist;
+            // memory notes live in the `notes` table with kind = 'memory'.
+            let live_subq = "SELECT id FROM entities WHERE deleted_at IS NULL \
+                             UNION ALL \
+                             SELECT id FROM notes    WHERE deleted_at IS NULL";
+
+            let orphan_pred = format!(
+                "subject_id NOT IN ({live}) AND {f}",
+                live = live_subq,
+                f = filter_pred,
+            );
+
+            // 1. Scanned: rows matching the caller's filters (before orphan check).
+            let scan_sql = format!(
+                "SELECT COUNT(*) FROM {t} WHERE {f}",
+                t = table,
+                f = filter_pred
+            );
+            let scanned: i64 = conn.query_row(
+                &scan_sql,
+                rusqlite::params![
+                    ns_json.as_deref(),
+                    kind_json.as_deref(),
+                    allow_json.as_deref()
+                ],
+                |row| row.get(0),
+            )?;
+
+            // 2. Would-delete: orphaned rows among the scanned set.
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM {t} WHERE {p}",
+                t = table,
+                p = orphan_pred,
+            );
+            let would_delete: i64 = conn.query_row(
+                &count_sql,
+                rusqlite::params![
+                    ns_json.as_deref(),
+                    kind_json.as_deref(),
+                    allow_json.as_deref()
+                ],
+                |row| row.get(0),
+            )?;
+
+            let max_delete_hit = would_delete > max_delete;
+
+            // 3. Delete — skipped in dry-run mode.
+            //
+            // `DELETE … LIMIT N` requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which
+            // rusqlite's bundled SQLite does not enable.  Portable alternative:
+            // delete subject_ids returned by a capped SELECT subquery.  SQLite
+            // materialises the inner SELECT before running the outer DELETE, so there
+            // is no self-referential conflict.
+            let deleted: i64 = if dry_run {
+                0
+            } else {
+                let del_sql = format!(
+                    "DELETE FROM {t} WHERE subject_id IN (\
+                     SELECT subject_id FROM {t} WHERE {p} LIMIT ?4\
+                     )",
+                    t = table,
+                    p = orphan_pred,
+                );
+                conn.execute(
+                    &del_sql,
+                    rusqlite::params![
+                        ns_json.as_deref(),
+                        kind_json.as_deref(),
+                        allow_json.as_deref(),
+                        max_delete
+                    ],
+                )? as i64
+            };
+
+            conn.execute_batch("COMMIT")?;
+
+            Ok(OrphanSweepResult {
+                scanned: scanned as u64,
+                would_delete: would_delete as u64,
+                deleted: deleted as u64,
+                max_delete_hit,
+            })
+        })
+        .await
+    }
+
     fn capabilities(&self) -> &'static VectorStoreCapabilities {
         static SQLITE_VEC_CAPABILITIES: OnceLock<VectorStoreCapabilities> = OnceLock::new();
         SQLITE_VEC_CAPABILITIES.get_or_init(|| VectorStoreCapabilities {
@@ -794,7 +933,7 @@ impl VectorStore for SqliteVecStore {
             supports_batch_search: false,
             supports_quantization: false,
             supports_update: false,
-            supports_orphan_sweep: false,
+            supports_orphan_sweep: true,
             // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
             // subject per namespace is stored. Callers must use a single canonical
             // field (e.g. "content") and are not permitted to store both
@@ -1179,8 +1318,8 @@ mod capabilities_tests {
             "sqlite-vec does not support in-place update"
         );
         assert!(
-            !caps.supports_orphan_sweep,
-            "sqlite-vec does not support orphan sweep"
+            caps.supports_orphan_sweep,
+            "SqliteVecStore must advertise supports_orphan_sweep = true"
         );
         // sqlite-vec 0.1.9: SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
         assert_eq!(caps.max_dimensions, Some(8192));
@@ -2002,5 +2141,493 @@ mod atomic_replace_tests {
             "similarity to vec1 must be ~1.0 (got {sim:.6}); \
              a lower value means the stale embedding was not restored — transaction rollback failed"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orphan sweep tests
+// ---------------------------------------------------------------------------
+// Require the `vectors` feature because the sweep queries the vec0 virtual
+// table, which only exists when the sqlite-vec extension is loaded.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "vectors"))]
+mod orphan_sweep_tests {
+    use std::sync::Arc;
+
+    use khive_storage::types::{OrphanSweepConfig, OrphanSweepResult};
+    use khive_storage::VectorStore;
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn make_pool() -> Arc<crate::pool::ConnectionPool> {
+        use crate::pool::{ConnectionPool, PoolConfig};
+        crate::extension::ensure_extensions_loaded();
+        Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool"),
+        )
+    }
+
+    /// Create minimal substrate tables (id + deleted_at only — enough for the anti-join).
+    fn create_substrate_tables(pool: &Arc<crate::pool::ConnectionPool>) {
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS entities \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE IF NOT EXISTS notes \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER);",
+            )
+            .expect("create substrate tables");
+    }
+
+    fn create_vec_table(pool: &Arc<crate::pool::ConnectionPool>, model_key: &str, dims: usize) {
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+             subject_id TEXT PRIMARY KEY, \
+             namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, \
+             embedding float[{}] distance_metric=cosine)",
+            model_key, dims
+        );
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute_batch(&ddl)
+            .expect("create vec table");
+    }
+
+    fn make_store(
+        pool: Arc<crate::pool::ConnectionPool>,
+        model_key: &str,
+        dims: usize,
+        ns: &str,
+    ) -> SqliteVecStore {
+        SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new")
+    }
+
+    /// Insert a substrate row into `entities`.  `deleted_at = None` → live; `Some(ts)` → soft-deleted.
+    fn insert_entity(pool: &Arc<crate::pool::ConnectionPool>, id: Uuid, deleted_at: Option<i64>) {
+        let id_str = id.to_string();
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute(
+                "INSERT INTO entities (id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id_str, deleted_at],
+            )
+            .expect("insert entity");
+    }
+
+    fn vec4(a: f32, b: f32, c: f32, d: f32) -> Vec<f32> {
+        vec![a, b, c, d]
+    }
+
+    fn sweep_all(max_delete: u32, dry_run: bool) -> OrphanSweepConfig {
+        OrphanSweepConfig {
+            subject_id_allowlist: None,
+            namespaces: vec![],
+            substrate_kinds: vec![],
+            max_delete,
+            dry_run,
+        }
+    }
+
+    // ── test 1: live subject → vector kept ───────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_keeps_live_subject() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_live", 4);
+        let store = make_store(Arc::clone(&pool), "sw_live", 4, "ns:sw");
+        let ns = "ns:sw";
+
+        let id = Uuid::new_v4();
+        insert_entity(&pool, id, None); // live
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r: OrphanSweepResult = store
+            .orphan_sweep(&sweep_all(100, false))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1, "one vec row exists");
+        assert_eq!(r.would_delete, 0, "live subject is not an orphan");
+        assert_eq!(r.deleted, 0);
+        assert!(!r.max_delete_hit);
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(present.contains(&id), "live subject's vec must survive");
+    }
+
+    // ── test 2: soft-deleted subject → vector swept ──────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_sweeps_soft_deleted_subject() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_soft", 4);
+        let store = make_store(Arc::clone(&pool), "sw_soft", 4, "ns:soft");
+        let ns = "ns:soft";
+
+        let id = Uuid::new_v4();
+        insert_entity(&pool, id, Some(1_000_000)); // soft-deleted
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.5, 0.5, 0.5, 0.5)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r = store
+            .orphan_sweep(&sweep_all(100, false))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1);
+        assert_eq!(r.would_delete, 1, "soft-deleted subject counts as orphan");
+        assert_eq!(r.deleted, 1);
+        assert!(!r.max_delete_hit);
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(
+            !present.contains(&id),
+            "soft-deleted subject's vec must be swept"
+        );
+    }
+
+    // ── test 3: absent subject → vector swept ────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_sweeps_absent_subject() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_absent", 4);
+        let store = make_store(Arc::clone(&pool), "sw_absent", 4, "ns:absent");
+        let ns = "ns:absent";
+
+        let id = Uuid::new_v4(); // no substrate row at all
+
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r = store
+            .orphan_sweep(&sweep_all(100, false))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1);
+        assert_eq!(r.would_delete, 1, "absent subject counts as orphan");
+        assert_eq!(r.deleted, 1);
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(!present.contains(&id), "absent subject's vec must be swept");
+    }
+
+    // ── test 4: dry_run → nothing deleted, would_delete populated ────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_dry_run_does_not_delete() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_dry", 4);
+        let store = make_store(Arc::clone(&pool), "sw_dry", 4, "ns:dry");
+        let ns = "ns:dry";
+
+        let id = Uuid::new_v4(); // absent subject → orphan
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert vec");
+
+        let r = store
+            .orphan_sweep(&sweep_all(100, true))
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.would_delete, 1, "dry-run must still count the orphan");
+        assert_eq!(r.deleted, 0, "dry-run must not delete anything");
+
+        let present = store.batch_exists(&[id], ns).await.expect("exists");
+        assert!(present.contains(&id), "dry-run must not remove the vec");
+    }
+
+    // ── test 5: max_delete cap ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_max_delete_caps_deletion() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_cap", 4);
+        let store = make_store(Arc::clone(&pool), "sw_cap", 4, "ns:cap");
+        let ns = "ns:cap";
+
+        // Insert 5 orphaned vecs (no substrate rows).
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            let v = i as f32 / 10.0;
+            store
+                .insert(
+                    id,
+                    SubstrateKind::Entity,
+                    ns,
+                    "body",
+                    vec![vec![v, v + 0.1, v + 0.2, v + 0.3]],
+                )
+                .await
+                .expect("insert vec");
+        }
+
+        let r = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 2,
+                dry_run: false,
+            })
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 5);
+        assert_eq!(r.would_delete, 5);
+        assert_eq!(r.deleted, 2, "cap must stop at max_delete");
+        assert!(
+            r.max_delete_hit,
+            "max_delete_hit must be true when cap triggered"
+        );
+
+        // Verify exactly 3 vecs survive.
+        let mut surviving = 0usize;
+        for &id in &ids {
+            if store
+                .batch_exists(&[id], ns)
+                .await
+                .expect("exists")
+                .contains(&id)
+            {
+                surviving += 1;
+            }
+        }
+        assert_eq!(surviving, 3, "3 orphans must survive after cap");
+    }
+
+    // ── test 6: namespace filter ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_namespace_filter_scopes_sweep() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_ns", 4);
+        let store = make_store(Arc::clone(&pool), "sw_ns", 4, "ns:a");
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        store
+            .insert(
+                id_a,
+                SubstrateKind::Entity,
+                "ns:a",
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert ns:a");
+        store
+            .insert(
+                id_b,
+                SubstrateKind::Entity,
+                "ns:b",
+                "body",
+                vec![vec4(0.5, 0.6, 0.7, 0.8)],
+            )
+            .await
+            .expect("insert ns:b");
+
+        // Both are orphans (no substrate rows); sweep scoped to ns:a only.
+        let r = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec!["ns:a".to_string()],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: false,
+            })
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1, "only ns:a row visible to scoped sweep");
+        assert_eq!(r.deleted, 1);
+
+        let exists_a = store.batch_exists(&[id_a], "ns:a").await.expect("exists a");
+        let exists_b = store.batch_exists(&[id_b], "ns:b").await.expect("exists b");
+        assert!(!exists_a.contains(&id_a), "ns:a orphan must be swept");
+        assert!(exists_b.contains(&id_b), "ns:b vec must be untouched");
+    }
+
+    // ── test 7: substrate_kinds filter ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_substrate_kinds_filter_scopes_sweep() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_kind", 4);
+        let store = make_store(Arc::clone(&pool), "sw_kind", 4, "ns:kind");
+        let ns = "ns:kind";
+
+        let id_ent = Uuid::new_v4();
+        let id_note = Uuid::new_v4();
+
+        // Both orphaned; one entity-kind vec, one note-kind vec.
+        store
+            .insert(
+                id_ent,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec4(0.1, 0.2, 0.3, 0.4)],
+            )
+            .await
+            .expect("insert entity vec");
+        store
+            .insert(
+                id_note,
+                SubstrateKind::Note,
+                ns,
+                "body",
+                vec![vec4(0.5, 0.6, 0.7, 0.8)],
+            )
+            .await
+            .expect("insert note vec");
+
+        // Sweep only entity-kind vecs.
+        let r = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![SubstrateKind::Entity],
+                max_delete: 100,
+                dry_run: false,
+            })
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 1, "kind filter restricts scanned count");
+        assert_eq!(r.deleted, 1, "only entity-kind orphan is swept");
+
+        let ent_exists = store.batch_exists(&[id_ent], ns).await.expect("ent exists");
+        let note_exists = store
+            .batch_exists(&[id_note], ns)
+            .await
+            .expect("note exists");
+        assert!(
+            !ent_exists.contains(&id_ent),
+            "entity-kind orphan must be swept"
+        );
+        assert!(
+            note_exists.contains(&id_note),
+            "note-kind vec must be untouched"
+        );
+    }
+
+    // ── test 8: subject_id_allowlist filter ──────────────────────────────────
+
+    #[tokio::test]
+    async fn orphan_sweep_allowlist_restricts_eligible_rows() {
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_allow", 4);
+        let store = make_store(Arc::clone(&pool), "sw_allow", 4, "ns:allow");
+        let ns = "ns:allow";
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4(); // not in allowlist
+
+        for (i, &id) in [id1, id2, id3].iter().enumerate() {
+            let v = i as f32 * 0.1 + 0.1;
+            store
+                .insert(
+                    id,
+                    SubstrateKind::Entity,
+                    ns,
+                    "body",
+                    vec![vec![v, v, v, v]],
+                )
+                .await
+                .expect("insert vec");
+        }
+
+        // All are orphans; allowlist only allows id1 and id2 to be swept.
+        let r = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: Some(vec![id1, id2]),
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: false,
+            })
+            .await
+            .expect("sweep");
+
+        assert_eq!(r.scanned, 2, "allowlist restricts scanned to 2");
+        assert_eq!(r.would_delete, 2);
+        assert_eq!(r.deleted, 2, "both allowlisted orphans deleted");
+
+        let e1 = store.batch_exists(&[id1], ns).await.expect("e1");
+        let e2 = store.batch_exists(&[id2], ns).await.expect("e2");
+        let e3 = store.batch_exists(&[id3], ns).await.expect("e3");
+        assert!(!e1.contains(&id1), "id1 must be swept");
+        assert!(!e2.contains(&id2), "id2 must be swept");
+        assert!(e3.contains(&id3), "id3 not in allowlist must survive");
     }
 }

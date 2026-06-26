@@ -342,8 +342,9 @@ pub struct OrphanSweepResult {
 /// substrate (entities / notes / memories with `deleted_at IS NULL`).
 ///
 /// A vector is orphaned when its subject_id is either absent from all substrate
-/// tables, or present with `deleted_at IS NOT NULL`. Soft-deleted records are NOT
-/// orphaned — the vector stays as long as the substrate row exists.
+/// tables, or present with `deleted_at IS NOT NULL`. Soft-deleted substrate rows
+/// (`deleted_at IS NOT NULL`) do not protect their vectors -- only rows with
+/// `deleted_at IS NULL` are treated as live.
 ///
 /// The anti-join + DELETE execute in one statement under the writer lock,
 /// preventing TOCTOU between the scan and the delete.
@@ -371,16 +372,15 @@ WHERE subject_id NOT IN (
     SELECT id FROM entities  WHERE deleted_at IS NULL
     UNION ALL
     SELECT id FROM notes     WHERE deleted_at IS NULL
-    UNION ALL
-    SELECT id FROM memories  WHERE deleted_at IS NULL
 )
 -- namespace filter:
-AND  (? IS NULL OR namespace IN (SELECT value FROM json_each(?)))
+AND  (?1 IS NULL OR namespace IN (SELECT value FROM json_each(?1)))
 -- substrate_kinds filter:
-AND  (? IS NULL OR kind IN (SELECT value FROM json_each(?)))
+AND  (?2 IS NULL OR kind IN (SELECT value FROM json_each(?2)))
 -- allowlist filter:
-AND  (? IS NULL OR subject_id IN (SELECT value FROM json_each(?)))
-LIMIT :max_delete
+AND  (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))
+-- portable capped delete (SQLITE_ENABLE_UPDATE_DELETE_LIMIT not compiled in bundled rusqlite):
+-- wrap as: DELETE FROM t WHERE subject_id IN (SELECT subject_id FROM t WHERE [above] LIMIT :max_delete)
 ```
 
 The anti-join and `DELETE` are one statement under a `BEGIN IMMEDIATE` transaction,
