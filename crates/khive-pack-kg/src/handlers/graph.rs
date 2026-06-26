@@ -28,7 +28,7 @@ impl KgPack {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?;
-        let hits = self
+        let mut hits = self
             .runtime
             .neighbors_with_query(
                 token,
@@ -41,6 +41,11 @@ impl KgPack {
                 },
             )
             .await?;
+        if !p.include_entity_type.unwrap_or(false) {
+            for hit in &mut hits {
+                hit.entity_type = None;
+            }
+        }
         to_json(&hits)
     }
 
@@ -75,7 +80,14 @@ impl KgPack {
             options,
             include_roots: p.include_roots.unwrap_or(true),
         };
-        let paths = self.runtime.traverse(token, request).await?;
+        let mut paths = self.runtime.traverse(token, request).await?;
+        if !p.include_properties.unwrap_or(false) {
+            for path in &mut paths {
+                for node in &mut path.nodes {
+                    node.properties = None;
+                }
+            }
+        }
         to_json(&paths)
     }
 

@@ -268,6 +268,10 @@ pub struct NeighborQuery {
 /// Enrichment (#162): `name` and `kind` are populated by the runtime layer
 /// after the storage call returns. Storage `GraphStore` impls leave them
 /// `None`; the runtime batch-fetches the entity rows and fills them in.
+///
+/// Optional enrichment: `entity_type` is populated by the runtime when the
+/// caller passes `include_entity_type=true` to the `neighbors` verb. It is
+/// absent from the wire when `None` so the default result shape is unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NeighborHit {
     #[serde(rename = "id")]
@@ -279,6 +283,8 @@ pub struct NeighborHit {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
 }
 
 /// Raw deserialization target for [`TraversalOptions`].
@@ -390,6 +396,10 @@ pub struct TraversalRequest {
 ///
 /// Field naming (#148): JSON wire serialization is `id`. Enrichment (#162):
 /// `name`/`kind` are filled by the runtime layer after the storage call.
+///
+/// Optional enrichment: `properties` is populated by the runtime when the
+/// caller passes `include_properties=true` to the `traverse` verb. It is
+/// absent from the wire when `None` so the default result shape is unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PathNode {
     #[serde(rename = "id")]
@@ -400,6 +410,8 @@ pub struct PathNode {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Value>,
 }
 
 /// A complete traversal path from one root node to its reachable descendants.

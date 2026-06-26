@@ -1318,6 +1318,248 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
     );
 }
 
+// ---- include_entity_type / include_properties optional enrichment ----
+
+/// neighbors with include_entity_type=true carries entity_type on each neighbor.
+/// neighbors without the param (default-off) must not include entity_type in
+/// the JSON response — the wire shape must be unchanged from today.
+#[tokio::test]
+async fn neighbors_include_entity_type_param() {
+    let pack = pack();
+
+    let src = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "SrcNode", "entity_kind": "concept", "entity_type": "algorithm"}),
+        )
+        .await
+        .unwrap();
+    let tgt = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TgtNode", "entity_kind": "concept", "entity_type": "technique"}),
+        )
+        .await
+        .unwrap();
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+    pack.dispatch(
+        "link",
+        json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends", "weight": 1.0}),
+    )
+    .await
+    .unwrap();
+
+    // Default (no param): entity_type must be absent from the response.
+    let default_resp = pack
+        .dispatch("neighbors", json!({"id": src_id, "direction": "out"}))
+        .await
+        .expect("neighbors default must succeed");
+    let default_arr = default_resp.as_array().expect("array");
+    let default_hit = default_arr
+        .iter()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id))
+        .expect("must find tgt in default neighbors");
+    assert!(
+        default_hit.get("entity_type").is_none(),
+        "entity_type must be absent from the response when include_entity_type is not set; hit={default_hit}"
+    );
+
+    // With include_entity_type=true: entity_type must be present.
+    let enriched_resp = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": src_id, "direction": "out", "include_entity_type": true}),
+        )
+        .await
+        .expect("neighbors with include_entity_type must succeed");
+    let enriched_arr = enriched_resp.as_array().expect("array");
+    let enriched_hit = enriched_arr
+        .iter()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id))
+        .expect("must find tgt when include_entity_type=true");
+    assert_eq!(
+        enriched_hit.get("entity_type").and_then(Value::as_str),
+        Some("technique"),
+        "entity_type must equal the stored value when include_entity_type=true; hit={enriched_hit}"
+    );
+}
+
+/// neighbors with include_entity_type=false must not include entity_type even
+/// when the entity has one (explicit false is same as absent).
+#[tokio::test]
+async fn neighbors_include_entity_type_false_omits_field() {
+    let pack = pack();
+
+    let src = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "SrcNode2", "entity_kind": "concept", "entity_type": "algorithm"}),
+        )
+        .await
+        .unwrap();
+    let tgt = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TgtNode2", "entity_kind": "concept", "entity_type": "technique"}),
+        )
+        .await
+        .unwrap();
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+    pack.dispatch(
+        "link",
+        json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends", "weight": 1.0}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": src_id, "direction": "out", "include_entity_type": false}),
+        )
+        .await
+        .expect("neighbors with include_entity_type=false must succeed");
+    let arr = resp.as_array().expect("array");
+    let hit = arr
+        .iter()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id))
+        .expect("must find tgt");
+    assert!(
+        hit.get("entity_type").is_none(),
+        "entity_type must be absent when include_entity_type=false; hit={hit}"
+    );
+}
+
+/// traverse with include_properties=true carries properties on each path node.
+/// traverse without the param must not include properties in the JSON response.
+#[tokio::test]
+async fn traverse_include_properties_param() {
+    let pack = pack();
+
+    let props = json!({"year": 2024, "topic": "attention"});
+    let root = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "RootWithProps", "entity_kind": "concept", "properties": props}),
+        )
+        .await
+        .expect("create root must succeed");
+    let root_id = root.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let child = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ChildNode", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create child must succeed");
+    let child_id = child.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": root_id, "target_id": child_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    // Default (no param): properties must be absent from the response.
+    let default_paths = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": [root_id], "max_depth": 1, "direction": "out", "include_roots": true}),
+        )
+        .await
+        .expect("traverse default must succeed");
+    let default_arr = default_paths.as_array().expect("array");
+    assert!(!default_arr.is_empty(), "must return at least one path");
+    for path in default_arr {
+        let nodes = path["nodes"].as_array().expect("nodes array");
+        for node in nodes {
+            assert!(
+                node.get("properties").is_none(),
+                "properties must be absent from nodes when include_properties is not set; node={node}"
+            );
+        }
+    }
+
+    // With include_properties=true: root node must carry properties.
+    let enriched_paths = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": [root_id], "max_depth": 1, "direction": "out", "include_roots": true, "include_properties": true}),
+        )
+        .await
+        .expect("traverse with include_properties must succeed");
+    let enriched_arr = enriched_paths.as_array().expect("array");
+    let root_path = enriched_arr.first().expect("must have at least one path");
+    let nodes = root_path["nodes"].as_array().expect("nodes array");
+    let root_node = nodes
+        .iter()
+        .find(|n| n.get("id").and_then(Value::as_str) == Some(&root_id))
+        .expect("must find root node in path");
+    let node_props = root_node
+        .get("properties")
+        .expect("properties must be present when include_properties=true; root_node={root_node}");
+    assert_eq!(
+        node_props.get("year").and_then(Value::as_i64),
+        Some(2024),
+        "stored property year must be present in the response"
+    );
+}
+
+/// traverse with include_properties=false must not include properties even
+/// when entities have them (explicit false is same as absent).
+#[tokio::test]
+async fn traverse_include_properties_false_omits_field() {
+    let pack = pack();
+
+    let props = json!({"key": "value"});
+    let root = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "RootOmit", "entity_kind": "concept", "properties": props}),
+        )
+        .await
+        .expect("create must succeed");
+    let root_id = root.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let child = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ChildOmit", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create must succeed");
+    let child_id = child.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": root_id, "target_id": child_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    let paths = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": [root_id], "max_depth": 1, "include_roots": true, "include_properties": false}),
+        )
+        .await
+        .expect("traverse with include_properties=false must succeed");
+    let arr = paths.as_array().expect("array");
+    for path in arr {
+        let nodes = path["nodes"].as_array().expect("nodes array");
+        for node in nodes {
+            assert!(
+                node.get("properties").is_none(),
+                "properties must be absent when include_properties=false; node={node}"
+            );
+        }
+    }
+}
+
 // ---- Delete ----
 
 #[tokio::test]

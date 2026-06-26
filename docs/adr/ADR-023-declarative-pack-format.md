@@ -139,24 +139,24 @@ available to operator-only introspection.
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
 bare verb names (16 verbs total):
 
-| Verb        | Speech act  | Description                                                                      |
-| ----------- | ----------- | -------------------------------------------------------------------------------- |
-| `create`    | commissive  | Create an entity or note                                                         |
-| `get`       | assertive   | Fetch any record by UUID                                                         |
-| `list`      | assertive   | Structured browse with pagination                                                |
-| `update`    | declaration | Patch entity or edge fields                                                      |
-| `delete`    | declaration | Soft or hard delete a record                                                     |
-| `search`    | assertive   | Hybrid FTS + vector search                                                       |
-| `link`      | commissive  | Create a typed directed edge                                                     |
-| `neighbors` | assertive   | Immediate graph neighbors                                                        |
-| `traverse`  | assertive   | Multi-hop BFS traversal                                                          |
-| `query`     | assertive   | GQL/SPARQL pattern matching                                                      |
-| `merge`     | declaration | Deduplicate two entities                                                         |
-| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                      |
-| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`. |
-| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.             |
-| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                     |
-| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.        |
+| Verb        | Speech act  | Description                                                                                                 |
+| ----------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
+| `create`    | commissive  | Create an entity or note                                                                                    |
+| `get`       | assertive   | Fetch any record by UUID                                                                                    |
+| `list`      | assertive   | Structured browse with pagination                                                                           |
+| `update`    | declaration | Patch entity or edge fields                                                                                 |
+| `delete`    | declaration | Soft or hard delete a record                                                                                |
+| `search`    | assertive   | Hybrid FTS + vector search                                                                                  |
+| `link`      | commissive  | Create a typed directed edge                                                                                |
+| `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype   |
+| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties |
+| `query`     | assertive   | GQL/SPARQL pattern matching                                                                                 |
+| `merge`     | declaration | Deduplicate two entities                                                                                    |
+| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                 |
+| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`.                            |
+| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                        |
+| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                |
+| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                   |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers

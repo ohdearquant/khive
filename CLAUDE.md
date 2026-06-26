@@ -177,24 +177,24 @@ name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept
 `task`, `observation`, …). The registry resolves which substrate the granular form lives in.
 Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filter is rejected.
 
-| Verb        | Args                                         | What it does                                                  |
-| ----------- | -------------------------------------------- | ------------------------------------------------------------- |
-| `create`    | `kind=<substrate\|granular>` + fields        | Create an entity or note                                      |
-| `get`       | `id` (UUID)                                  | Fetch any record — auto-detects entity/note/edge              |
-| `list`      | `kind=<substrate\|granular>\|edge` + filters | Structured browse with pagination                             |
-| `stats`     | —                                            | Return aggregate KG substrate counts (entities, edges, notes) |
-| `update`    | `id` + patch fields                          | Patch entity (name/desc/props/tags) or edge (relation/weight) |
-| `delete`    | `id`, `hard?`                                | Soft-delete (default) or hard-delete with edge cascade        |
-| `merge`     | `into_id`, `from_id`                         | Deduplicate two entities (v0.1: entity-only)                  |
-| `search`    | `kind=<substrate\|granular>`, `query`        | Hybrid FTS5 + vector search with RRF fusion                   |
-| `link`      | `source_id`, `target_id`, `relation`         | Create a typed directed edge                                  |
-| `neighbors` | `node_id`, `direction?`, `relations?`        | Immediate graph neighbors                                     |
-| `traverse`  | `roots`, `max_depth?`, `relations?`          | Multi-hop BFS with filters                                    |
-| `query`     | GQL or SPARQL string                         | Pattern matching compiled to SQL                              |
-| `propose`   | `title`, `description`, `changeset`          | Create an event-sourced change proposal (ADR-046)             |
-| `review`    | `id`, `decision`, `comment?`                 | Approve, reject, or comment on a proposal                     |
-| `withdraw`  | `id`, `rationale?`                           | Rescind an open proposal (proposer-only)                      |
-| `verbs`     | `category?`, `pack?`                         | List all MCP-callable verbs registered on this server         |
+| Verb        | Args                                                          | What it does                                                                                   |
+| ----------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `create`    | `kind=<substrate\|granular>` + fields                         | Create an entity or note                                                                       |
+| `get`       | `id` (UUID)                                                   | Fetch any record — auto-detects entity/note/edge                                               |
+| `list`      | `kind=<substrate\|granular>\|edge` + filters                  | Structured browse with pagination                                                              |
+| `stats`     | —                                                             | Return aggregate KG substrate counts (entities, edges, notes)                                  |
+| `update`    | `id` + patch fields                                           | Patch entity (name/desc/props/tags) or edge (relation/weight)                                  |
+| `delete`    | `id`, `hard?`                                                 | Soft-delete (default) or hard-delete with edge cascade                                         |
+| `merge`     | `into_id`, `from_id`                                          | Deduplicate two entities (v0.1: entity-only)                                                   |
+| `search`    | `kind=<substrate\|granular>`, `query`                         | Hybrid FTS5 + vector search with RRF fusion                                                    |
+| `link`      | `source_id`, `target_id`, `relation`                          | Create a typed directed edge                                                                   |
+| `neighbors` | `node_id`, `direction?`, `relations?`, `include_entity_type?` | Immediate graph neighbors; `include_entity_type=true` adds entity subtype to each hit          |
+| `traverse`  | `roots`, `max_depth?`, `relations?`, `include_properties?`    | Multi-hop BFS with filters; `include_properties=true` adds entity properties to each path node |
+| `query`     | GQL or SPARQL string                                          | Pattern matching compiled to SQL                                                               |
+| `propose`   | `title`, `description`, `changeset`                           | Create an event-sourced change proposal (ADR-046)                                              |
+| `review`    | `id`, `decision`, `comment?`                                  | Approve, reject, or comment on a proposal                                                      |
+| `withdraw`  | `id`, `rationale?`                                            | Rescind an open proposal (proposer-only)                                                       |
+| `verbs`     | `category?`, `pack?`                                          | List all MCP-callable verbs registered on this server                                          |
 
 ### GTD pack verbs (5 — ADR-019, optional)
 

@@ -176,6 +176,9 @@ pub(crate) struct NeighborsParams {
     pub(crate) limit: Option<u32>,
     pub(crate) min_weight: Option<f64>,
     pub(crate) relations: Option<Vec<String>>,
+    /// When true, each neighbor in the result carries its `entity_type` field.
+    /// Absent or false: result shape is identical to today (no `entity_type` key).
+    pub(crate) include_entity_type: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +192,9 @@ pub(crate) struct TraverseParams {
     pub(crate) min_weight: Option<f64>,
     pub(crate) limit: Option<u32>,
     pub(crate) include_roots: Option<bool>,
+    /// When true, each path node in the result carries the entity `properties` map.
+    /// Absent or false: result shape is identical to today (no `properties` key).
+    pub(crate) include_properties: Option<bool>,
 }
 
 pub(crate) const HARD_CAP: usize = 10_000;
