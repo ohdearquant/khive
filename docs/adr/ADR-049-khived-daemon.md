@@ -16,7 +16,7 @@ index over the ~466K-vector corpus is held in memory. On a cold process it is re
 restoring a persisted snapshot (`retrieval_snapshots` BLOB) — today a **~350 MB JSON blob**
 that must be read from SQLite, `serde_json`-deserialized, and reconstructed into the graph.
 
-Two defects compound into a "dramatic regression" relative to the pre-OSS khive, which felt
+Two defects compound into a "dramatic regression" relative to the earlier implementation, which felt
 smooth:
 
 1. **Cold start is paid on every reconnect.** Because warm state lives in the process, and the
@@ -26,10 +26,10 @@ smooth:
    **inline** before fusing ANN hits. The user's first search hangs for the full restore
    instead of returning the FTS-only result immediately.
 
-The pre-OSS khive-internal solved (1) with a **daemon**: a long-lived process owning the warm
+The earlier implementation solved (1) with a **daemon**: a long-lived process owning the warm
 engine, with the CLI as a thin Unix-socket client (`apps/cli/src/server/`). That daemon was
 built against the old `StorageBackend` `service.action` dispatch and a large BFF/tenancy/auth
-surface that does not belong in OSS. The **pattern** ports; the code does not.
+surface that is not part of this codebase. The **pattern** ports; the code does not.
 
 ## Decision
 
@@ -102,9 +102,8 @@ Warm becomes **non-blocking**, benefiting both modes:
 ### Scope boundary (what this ADR deliberately excludes)
 
 - No socket auth/admin-token plane. The socket is `0600`, owner-only, loopback-equivalent —
-  the same trust boundary as the stdio process it replaces. (The old token plane existed for
-  the multi-tenant BFF, which OSS does not ship.)
-- No HTTP/SDK listener, no `/api/*`, no tenant registry.
+  the same trust boundary as the stdio process it replaces.
+- No HTTP/SDK listener, no `/api/*`.
 - No change to the snapshot format. Background warm makes the one-time JSON restore invisible;
   a `bincode`/mmap snapshot is a separate, orthogonal optimization (future ADR).
 - No multi-namespace daemon. v1 serves the single default namespace its registry was built
@@ -146,7 +145,7 @@ Warm becomes **non-blocking**, benefiting both modes:
 - [ADR-027](ADR-027-dynamic-pack-loading.md) — pack registry the daemon owns
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — `PackRuntime::warm()` / `register_embedders` hooks
 - [ADR-047](ADR-047-knowledge-pack.md), ADR-033 family — knowledge search + Vamana ANN
-- Pre-OSS reference: `khive-internal/apps/cli/src/server/` (daemon loop), `src/daemon.rs` (client)
+- Earlier reference: `apps/cli/src/server/` (daemon loop), `src/daemon.rs` (client)
 
 ## Amendment (2026-06-14): single-binary kkernel topology
 

@@ -212,7 +212,7 @@ a database server. Postgres requires a running process, network configuration, a
 operational overhead. SQLite is an embedded library — no server, no network, no
 configuration.
 
-For hosted deployments, SQLite's single-writer constraint is acceptable because khive's
+For networked deployments, SQLite's single-writer constraint is acceptable because khive's
 write pattern is low-throughput agent operations, not high-concurrency OLTP. If write
 throughput becomes a bottleneck, the multi-file federation model (multiple SQLite files
 with independent WAL) provides horizontal scaling within the embedded model.

@@ -2,9 +2,9 @@
 
 This guide covers how to configure `kkernel mcp` with multiple SQLite files so
 that different packs write to physically separate databases. The headline use
-case is isolating billing and operational data from agent memory: a studio
-deployment can store "khive AI LLC operation data" in its own file without that
-data mixing into the shared agent-memory database.
+case is isolating audit or operational records from agent memory: a deployment
+can store operator-specific data in its own file without that data mixing into
+the shared agent-memory database.
 
 References: [ADR-028](adr/ADR-028-pack-scoped-backends.md) (per-pack backend
 config), [ADR-029](adr/ADR-029-substrate-coordinator.md) (SubstrateCoordinator
@@ -21,7 +21,7 @@ calls to the correct runtime based on which pack owns the verb.
 
 Use multi-backend when you need:
 
-- **Physical file isolation.** Billing or operational records must not share a
+- **Physical file isolation.** Audit, operational, or custom-pack records must not share a
   WAL, page cache, or backup cadence with the agent-memory corpus.
 - **Independent backup granularity.** `sqlite3 .backup` can target one file
   without locking the other.
@@ -92,8 +92,8 @@ or `~/.khive/config.toml`; see [Config resolution](#config-resolution) below).
 ```toml
 # ── Actor identity ─────────────────────────────────────────────────────────────
 [actor]
-id = "lambda:studio"                # attribution label (optional)
-display_name = "khive studio node"  # advisory; not used by the runtime
+id = "lambda:app"                   # attribution label (optional)
+display_name = "khive app node"     # advisory; not used by the runtime
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 [[engines]]
@@ -112,16 +112,16 @@ path   = "~/.khive/agent.db"   # tilde is expanded to $HOME at boot
 # read_only = false             # default; set true to reject all writes
 
 [[backends]]
-name   = "billing"
+name   = "records"
 kind   = "sqlite"
-path   = "~/.khive/billing.db"
+path   = "~/.khive/records.db"
 
 # ── Per-pack routing ───────────────────────────────────────────────────────────
 # Packs not listed here fall back to "main".
 # The value of `backend` must match a [[backends]].name above.
 
-[packs.billing]           # hypothetical studio-side billing pack
-backend = "billing"
+[packs.records]           # hypothetical operator-supplied records pack
+backend = "records"
 
 # All built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm)
 # are left unlisted and therefore default to "main".
@@ -150,10 +150,10 @@ remove it from the config or wait for a future release that implements it
 
 ---
 
-## The billing-vs-memory isolation pattern
+## The custom-pack isolation pattern
 
-The recommended split for a studio deployment assigns all built-in agent packs
-to `main` and routes the studio billing pack to its own file.
+The recommended split assigns all built-in agent packs to `main` and routes
+a custom operator pack to its own file.
 
 ```toml
 [[backends]]
@@ -162,21 +162,21 @@ kind = "sqlite"
 path = "~/.khive/agent.db"
 
 [[backends]]
-name = "billing"
+name = "records"
 kind = "sqlite"
-path = "/var/lib/khive-studio/billing.db"
+path = "/var/lib/your-app/records.db"
 
 # Built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm)
 # are NOT listed here; they fall back to "main" automatically.
 
-[packs.billing]
-backend = "billing"
+[packs.records]
+backend = "records"
 ```
 
 The guarantee: each pack's substrate writes are confined to its assigned
 backend file. This is enforced structurally because `build_server_multi_backend`
 constructs one `KhiveRuntime` per pack, each wrapping its own
-`Arc<StorageBackend>`. The billing pack's runtime holds only the billing
+`Arc<StorageBackend>`. The custom pack's runtime holds only its assigned
 backend; it has no handle to `agent.db`. The isolation test
 (`multi_backend_isolates_pack_data_to_separate_files` in
 `crates/khive-mcp/src/serve.rs`) verifies this directly: it pins the `comm` pack
@@ -190,7 +190,7 @@ Assigning different namespaces to records is not a substitute for backend
 separation. ADR-007 Rule 0 states explicitly:
 
 > "Actor identity... is attribution only: stamped on write records and
-> gate-request context, available for logging, filtering, and cloud policy
+> gate-request context, available for logging, filtering, and operator policy
 > input. It never silently becomes the storage namespace and never gates by-ID
 > access."
 
@@ -201,20 +201,20 @@ And Rule 1:
 
 (Source: `docs/adr/ADR-007-namespace.md`, Rules 0 and 1.)
 
-Physical backend separation is the only mechanism that guarantees records from
-the billing pack cannot appear in an agent-memory query, regardless of namespace
+Physical backend separation is the only mechanism that guarantees records owned
+by one pack cannot appear in another pack's query, regardless of namespace
 values.
 
 ---
 
-## Studio integration and external packs
+## External pack integration
 
-There is no billing or CRM pack in the khive repository today. The design
-assumes that `studio-pack-billing` is a separate crate maintained in the
-khive-studio repository.
+No domain-specific operator packs are included in the khive repository. The design
+assumes that custom operator packs (such as `your-custom-pack`) are maintained in
+a separate crate and linked into a custom binary.
 
 Because packs self-register at link time via the `inventory` crate (ADR-027),
-once the billing crate is compiled into the studio binary it is available to the
+once a custom pack crate is compiled into the binary it is available to the
 server without any change to khive itself. From
 `crates/khive-runtime/src/pack.rs`:
 
@@ -241,12 +241,12 @@ pub fn register_packs_with_runtimes(
 
 The registry walks `inventory::iter::<PackRegistration>` to enumerate every
 pack linked into the process. Any pack crate that calls `inventory::submit!` at
-link time is discoverable without a code change to khive. Once the studio binary
-links in `studio-pack-billing`, the config entry `[packs.billing] backend =
-"billing"` is sufficient to route that pack to its own backend.
+link time is discoverable without a code change to khive. Once the binary
+links in `your-custom-pack`, the config entry `[packs.records] backend =
+"records"` is sufficient to route that pack to its own backend.
 
-The billing pack author is responsible for ensuring their pack name matches the
-string used in `[packs.*]`. No khive change is required.
+The pack author is responsible for ensuring their pack name matches the string
+used in `[packs.*]`. No khive change is required.
 
 ---
 
@@ -356,7 +356,7 @@ The parser validates that every `[packs.*].backend` value references a declared
 listed in `[[backends]]`) fails at config load with:
 
 ```
-[packs.billing].backend = "billing" references an unknown backend; \
+[packs.records].backend = "records" references an unknown backend; \
 defined backends: main
 ```
 

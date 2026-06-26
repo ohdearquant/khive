@@ -253,7 +253,7 @@ The canonical v1 set:
 | Field        | Type            | Added by   | Purpose                                         |
 | ------------ | --------------- | ---------- | ----------------------------------------------- |
 | `id`         | `Uuid`          | ADR-004    | Event identity (UUIDv7)                         |
-| `namespace`  | `String`        | ADR-004    | Tenant isolation                                |
+| `namespace`  | `String`        | ADR-004    | Record attribution and namespace scope          |
 | `verb`       | `String`        | ADR-004    | The verb that produced the event                |
 | `actor`      | `String`        | ADR-004    | Caller identity (agent, user, system)           |
 | `substrate`  | `SubstrateKind` | ADR-004    | The substrate the verb acted on                 |

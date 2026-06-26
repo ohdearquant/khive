@@ -40,23 +40,23 @@ This override existed to implement the ADR-007 "Namespace-by-Layer Rule" — KG 
 edges were always forced into the shared `default_namespace` (`local`) so that cross-project
 graph structure would be visible to all actors.
 
-The override is problematic in the cloud deployment model. `engine_config.rs:150-154` documents
-that cloud deployments derive namespace from an authenticated `NamespaceToken` and ignore the
+The override is problematic in deployments that derive namespace from an authenticated
+`NamespaceToken`. `engine_config.rs:150-154` documents that such deployments ignore the
 `[actor]` / `default_namespace` runtime config field. The KG pack override therefore pulls
-tenant entity/edge writes into a stale runtime-global namespace rather than the
-authenticated tenant namespace, causing cross-tenant data bleed.
+entity/edge writes into a stale runtime-global namespace rather than the authenticated
+namespace, causing data bleed across isolated actor namespaces.
 
 ## Problem
 
 The KG pack namespace override violates the `NamespaceToken` contract established at the
 registry boundary:
 
-1. **Cross-tenant bleed (cloud)**: A cloud tenant's entity create arrives with a
-   token carrying `namespace = tenant-A`. The pack override reads
-   `RuntimeConfig::default_namespace`, which is the OSS-era actor namespace, not the cloud
-   tenant namespace, and rewrites the token. Tenant-A entities land in the wrong namespace.
+1. **Cross-namespace bleed**: An entity create arrives with a token carrying
+   `namespace = actor-A`. The pack override reads `RuntimeConfig::default_namespace`,
+   which is the runtime-global default rather than the authenticated namespace, and rewrites
+   the token. Actor-A entities land in the wrong namespace.
 
-2. **Explicit namespace suppression (OSS)**: ADR-007's own OSS namespace-resolution text
+2. **Explicit namespace suppression**: ADR-007's own namespace-resolution text
    (`ADR-007:389`) states that verbs supplying `namespace=` explicitly must use that value
    unconditionally. The KG pack override silently ignores explicit caller namespaces, creating
    an internal contradiction within ADR-007.
@@ -72,8 +72,9 @@ The pack must not read `RuntimeConfig::default_namespace` to override that token
 
 ```rust
 // KG graph operations honor the NamespaceToken minted by VerbRegistry::dispatch.
-// OSS sharing comes from the registry/runtime default namespace; cloud isolation
-// comes from authenticated token namespace plus backend-file routing (ADR-050).
+// Shared-namespace deployments rely on the registry/runtime default namespace;
+// isolated-namespace deployments rely on the authenticated token namespace plus
+// backend-file routing (ADR-050).
 let graph_token = token;
 ```
 
@@ -81,7 +82,7 @@ Note scoping is **unchanged**: note, task, and event verbs already use the calle
 directly and are not affected by this decision.
 
 The rejected `with_shared_graph_namespace` toggle must not be added. Adding it creates two
-divergent namespace contracts and leaks cloud policy into pack construction.
+divergent namespace contracts and leaks routing policy into pack construction.
 
 ## Alternatives Considered
 
@@ -90,18 +91,18 @@ divergent namespace contracts and leaks cloud policy into pack construction.
 The existing behavior continues to force all KG entity/edge writes into
 `RuntimeConfig::default_namespace` regardless of the dispatched token. Rejected because:
 
-- It violates authenticated cloud tenant namespaces, causing cross-tenant bleed.
+- It violates authenticated tenant namespaces, causing cross-tenant bleed.
 - It contradicts ADR-007's own explicit-namespace rule (`ADR-007:389`).
 - It places policy inside the pack rather than at the authenticated dispatch boundary.
 
 ### Add `with_shared_graph_namespace(false)` toggle
 
-A boolean field on `KgPack` would disable the override when set to false. Cloud binaries would
-call `.with_shared_graph_namespace(false)`. Explicitly rejected by Ocean:
+A boolean field on `KgPack` would disable the override when set to false. Isolated-namespace
+deployments would call `.with_shared_graph_namespace(false)`. Explicitly rejected by Ocean:
 
 - Creates two contracts for the same pack; pack behavior becomes construction-time-dependent.
-- Leaks cloud/OSS routing policy into pack instantiation.
-- Complicates OSS deployments that might inadvertently pass the wrong value.
+- Leaks routing policy into pack instantiation.
+- Complicates deployments that might inadvertently pass the wrong value.
 
 ### Move isolation to backend-file routing plus token plus privilege (chosen)
 
@@ -115,26 +116,26 @@ mechanisms supply full tenant isolation without any pack namespace rewrite:
 - Cross-backend operations (when implemented) route through the ADR-029 coordinator.
 - The KG pack is a pure consumer of the token it receives.
 
-## OSS Preservation
+## Default-Deployment Preservation
 
 The single-user unified graph is preserved without the pack override.
 
-The OSS common path sends no explicit `namespace=` argument. `VerbRegistry::dispatch` falls
+The default path sends no explicit `namespace=` argument. `VerbRegistry::dispatch` falls
 back to `self.default_namespace`, which `KhiveRuntime` stamps from `actor.id` in the config
 (`engine_config.rs:150`; `runtime.rs:837`). The MCP server plumbs this default into the
 registry builder (`server.rs:178–181`). Every no-namespace-arg KG operation therefore lands
 in the same actor default namespace — the unified graph survives.
 
-The one intentional OSS semantic change:
+The one intentional semantic change:
 
-- **Before**: an OSS caller passing an explicit different `namespace=` for a KG entity/edge
+- **Before**: a caller passing an explicit different `namespace=` for a KG entity/edge
   verb was force-merged back into `default_namespace` by the pack override.
 - **After**: that explicit namespace lands where the caller asked, subject to the same registry
   validation and gate semantics as every other pack.
 
 This change is acceptable under ADR-007 by:
 
-- `In_pari_materia`: ADR-007's own OSS namespace-resolution amendment (`ADR-007:389`) already
+- `In_pari_materia`: ADR-007's own namespace-resolution amendment (`ADR-007:389`) already
   states explicit namespace values are used unconditionally. The pack override was an
   internal contradiction with that text.
 - `Last_in_time`: Ocean's current intent (2026-06 decision) and ADR-028/029 make isolation a
@@ -143,38 +144,40 @@ This change is acceptable under ADR-007 by:
 - `Constitutional`: removing the override reduces pack coupling from 7 to 6 approximate
   dependency edges, within the kappa < 0.3 target.
 
-## Cloud Seam
+## Isolation Seam
 
 ```text
-tenant request
+authenticated request
   → authenticated session / privilege gate
-  → NamespaceToken(namespace = tenant namespace)
-  → backend-file route for this tenant/pack  [ADR-028]
-  → KgPack honors token                       [this ADR]
+  → NamespaceToken(namespace = actor namespace)
+  → backend-file route for this actor/pack  [ADR-028]
+  → KgPack honors token                     [this ADR]
   → KhiveRuntime writes to routed backend under token.namespace()
 ```
 
 Cross-backend operations (federated link, traverse, search) route through the
 `SubstrateCoordinator` layer described in ADR-029. Pack crates do not own that routing.
 
-`khive-cloud` must drop all `with_shared_graph_namespace(false)` call sites (see coordination
-note) and rely on per-tenant backend routing plus token namespace plus privilege gate.
+Operators using custom binaries that previously called `with_shared_graph_namespace(false)`
+must remove those call sites. The method no longer exists; the pack now honors the dispatched
+token unconditionally. Isolated-namespace deployments should rely on per-actor backend routing
+plus token namespace plus privilege gate.
 
 ## Migration and Compatibility
 
 No schema migration is required.
 
-**Default-namespace data** (OSS, no explicit `namespace=` arg): same runtime default namespace
+**Default-namespace data** (no explicit `namespace=` arg): same runtime default namespace
 as before; no data moves and no queries break.
 
-**Explicit-namespace data** (OSS): entities that were previously force-merged into
+**Explicit-namespace data**: entities that were previously force-merged into
 `default_namespace` will now be created in the explicitly requested namespace. Existing data
 already written under `default_namespace` via the override is not automatically migrated.
 Callers that were relying on the implicit redirect must either stop passing an explicit
-namespace (inheriting the OSS default) or perform a targeted export/import under operator
+namespace (inheriting the default) or perform a targeted export/import under operator
 control.
 
-**Cloud accidental-bleed data**: any cloud tenant entities that landed in the stale
+**Accidental cross-namespace data**: any tenant entities that landed in the stale
 runtime-global namespace due to the override are not rewritten automatically. Remediation
 requires operator-controlled export/import or targeted SQL backfill once tenant namespaces are
 confirmed correct.
@@ -184,7 +187,7 @@ Compatibility guarantees:
 - Public handler signatures are unchanged.
 - Verb names and params are unchanged.
 - `namespace` remains consumed at the registry boundary and is not forwarded as raw pack params.
-- Existing default-namespace OSS callers see no behavior change.
+- Existing default-namespace callers see no behavior change.
 - Cross-namespace entity/edge reads continue to fail closed as `RuntimeError::NotFound`, avoiding
   an existence oracle.
 
@@ -201,8 +204,8 @@ Compatibility guarantees:
 - `namespace_token_with_namespace_preserves_actor` removed: this test documented the now-
   deleted pack dispatch simulation; `with_namespace` utility behavior belongs in runtime-token
   unit tests if needed.
-- `kg_oss_default_namespace_entities_colocate` added: two creates with the default `local`
-  token, both readable from `local` — OSS unified graph regression.
+- `kg_default_namespace_entities_colocate` added: two creates with the default `local`
+  token, both readable from `local` — unified graph regression test.
 
 **Stale comments updated** in `handlers.rs::handle_get`: removed "entities live in graph
 namespace" / "entities and edges use graph namespace"; replaced with "graph token, which is
@@ -212,19 +215,19 @@ the caller token under ADR-050."
 
 **Benefits**:
 
-- Eliminates cross-tenant bleed in cloud deployments.
+- Eliminates cross-tenant bleed in multi-tenant deployments.
 - Aligns KG pack with the typed `NamespaceToken` contract established at the registry boundary.
 - Reduces pack coupling (hidden `RuntimeConfig` dependency removed).
-- Unblocks explicit-namespace OSS callers to use the namespace they specify.
+- Unblocks explicit-namespace callers to use the namespace they specify.
 
 **Risks**:
 
-- An OSS caller who previously relied on the implicit redirect (passing `namespace=foo` but
+- A caller who previously relied on the implicit redirect (passing `namespace=foo` but
   expecting entities in `local`) will now land in `foo`. This is the correct behavior per
   ADR-007:389 but is a semantic change for such callers.
-- Cloud binary must be updated to drop `with_shared_graph_namespace(false)` calls before this
-  change is deployed; deploying the pack change without updating the cloud binary will cause a
-  compile error (`with_shared_graph_namespace` method no longer exists).
+- Operators using custom binaries that call `with_shared_graph_namespace(false)` must remove
+  those call sites before deploying this change; the method no longer exists and the binary will
+  fail to compile without removing them.
 
 ## Canons of Construction Applied
 

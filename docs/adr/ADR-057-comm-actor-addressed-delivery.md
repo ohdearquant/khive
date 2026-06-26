@@ -25,7 +25,7 @@ This creates two concrete failures documented in issue #57:
 **Failure 1 -- delivery denied.** `comm.send(to="lambda:leo")` resolves `to` as a namespace
 string. Because `"lambda:leo" != "local"`, `dual_write_message` attempts a cross-namespace
 write. The sender's `actor.allowed_outbound_namespaces` is empty by default (ADR-040), so
-the write is denied with `PermissionDenied`. Agent-to-agent messaging in the default OSS
+the write is denied with `PermissionDenied`. Agent-to-agent messaging in the default
 deployment is non-functional.
 
 **Failure 2 -- party-line inbox.** When senders work around Failure 1 by injecting routing
@@ -72,12 +72,13 @@ existing behavior.
 
 `to` names a namespace; the recipient namespace declares accepted senders; `dual_write_message`
 mints a recipient-scoped token via `NamespaceToken::with_namespace`. This is the design ADR-040
-Section "Cross-namespace messaging" specifies and what issue #13 addresses. It is the correct
-multi-tenant path for khive-cloud. It is not the fix for the local single-namespace case.
+Section "Cross-namespace messaging" specifies and what issue #13 addresses. It is the design
+path for multi-actor deployments. It is not the fix for the local single-namespace case.
 
-Option B is deferred. Issue #13 remains open and will be addressed in a future cloud-tier ADR
-(likely a companion to ADR-053). This ADR does not conflict with Option B; both can coexist
-because the actor-addressed path fires only when sender and recipient share a namespace.
+Option B is deferred. Issue #13 remains open for a future ADR covering multi-actor
+actor-addressed delivery (likely a companion to ADR-053). This ADR does not conflict with
+Option B; both can coexist because the actor-addressed path fires only when sender and
+recipient share a namespace.
 
 ### Scope of this implementation
 
@@ -170,7 +171,7 @@ mutated. When `subject` is null, `preview` provides a fallback scan line for the
 ### `comm.send` behavior change
 
 The `to` parameter is reinterpreted. When `to` does not start with a recognized remote
-transport prefix (currently there are none in OSS; ADR-056 channel adapters will introduce
+transport prefix (currently there are none in the default build; ADR-056 channel adapters will introduce
 prefixes such as `channel:telegram:`), the send is treated as actor-addressed within the
 caller's namespace:
 
@@ -348,8 +349,7 @@ unqueryable, not indexed, and imposes parsing overhead on every inbox consumer.
 the policy gate so that AllowAll mode permits cross-namespace delivery without an allowlist
 entry. Rejected as the primary fix because it does not solve the party-line inbox problem and
 requires agents to run in distinct namespaces, which returns to the corpus-orphaning problem
-of A2. Issue #13 remains valid as the Option B multi-tenant path and should be implemented
-separately.
+of A2. Issue #13 remains open as the multi-actor actor-addressed delivery path.
 
 **A5. Wait for #75.** Block actor-addressed delivery on the full actor-identity-on-every-request
 implementation. Rejected because the actor label needed for message routing is already available

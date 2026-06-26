@@ -239,7 +239,7 @@ pub struct SubstrateSearchPlan {
 }
 ```
 
-`NamespaceScope` is sealed: it is constructed only by the coordinator from a verified `&NamespaceToken`, never from a string. For privileged cross-namespace operations, the coordinator accepts an `AdminNamespaceToken` (or equivalent) issued only by the auth gate (ADR-018). Wildcards like `None`, `"*"`, or `Option<&str>` are not overloaded for cross-tenant scope.
+`NamespaceScope` is sealed: it is constructed only by the coordinator from a verified `&NamespaceToken`, never from a string. For privileged cross-namespace operations, the coordinator accepts an `AdminNamespaceToken` (or equivalent) issued only by the auth gate (ADR-018). Wildcards like `None`, `"*"`, or `Option<&str>` are not overloaded for cross-namespace scope.
 
 ### Engine-level vs backend-level fusion
 

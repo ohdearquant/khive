@@ -485,7 +485,7 @@ minimal. Operators who want GTD configure it explicitly.
 
 ### Positive
 
-- The OSS surface gains a production-quality GTD verb set without forking the schema
+- The verb surface gains a production-quality GTD verb set without forking the schema
   or substrate.
 - The pack standard (ADR-017) is validated against a non-KG use case — the system
   proves itself extensible.

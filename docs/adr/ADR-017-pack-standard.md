@@ -564,7 +564,7 @@ namespace propagation, and verb routing all converge.
 
 ### Built-in packs
 
-The OSS distribution ships three packs. Each demonstrates a different use case for the
+The default distribution ships three packs. Each demonstrates a different use case for the
 pack system:
 
 | Pack       | Kinds                         | Verbs                                                                                                                                     | Edge rules                | Purpose                                                                                             |
@@ -625,7 +625,7 @@ This is a deliberate choice. Dynamic loading would add:
 - Security surface (loading arbitrary code from the filesystem).
 - Linking complexity (`dlopen`, symbol resolution, lifetime management).
 
-For OSS use cases (research KG, agent memory, task tracking), compile-time composition
+For the primary use cases (research KG, agent memory, task tracking), compile-time composition
 is sufficient and significantly simpler. The pack crate ships its source; the operator
 or distribution maintainer chooses which packs to include. If dynamic loading becomes
 a real need (e.g., a marketplace of third-party packs), it gets its own ADR.
@@ -703,7 +703,7 @@ custom pack. The system supports it because there's no kg-specific machinery.
 ### Why compile-time over dynamic?
 
 Dynamic loading is a meaningful complexity increase (ABI, versioning, security,
-linking) for a benefit that doesn't materialize in OSS use cases. khive deployments are
+linking) for a benefit that doesn't materialize in the primary use cases. khive deployments are
 binaries built from source by the operator or distribution. The set of packs is known
 at build time.
 
@@ -756,7 +756,7 @@ dedicated ADR. v1 is compile-time.
   Mitigated: pack-level integration tests; the JSON boundary is where transport meets
   runtime anyway.
 - Compile-time composition means adding a pack requires rebuilding the binary.
-  Mitigated: this is OSS; rebuilding is normal. A future dynamic-loading ADR can
+  Mitigated: rebuilding from source is normal. A future dynamic-loading ADR can
   extend the model.
 - Pack authors must reason about endpoint semantics — no compile-time check that a
   rule is meaningful.

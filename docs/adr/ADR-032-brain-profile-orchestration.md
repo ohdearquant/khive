@@ -1194,9 +1194,9 @@ deployment.
 3. **Anchor cursor look-ahead bound.** Tentative K = 24 hours of event-log time. Unbounded
    look-ahead makes replay expensive and couples reconstruction cost to future event density.
 
-4. **Multi-tenant profile definitions.** Each tenant has its own profile state. Profile
-   definitions (the Fold and Objective code) are shared across tenants. Backtests are
-   tenant-scoped. This is the expected cloud deployment shape; it is not enforced by this ADR.
+4. **Multi-actor profile definitions.** In deployments with multiple actors, each actor may
+   have its own profile state while profile definitions (Fold and Objective code) remain shared.
+   Backtests are scoped to the actor. This is not enforced by this ADR.
 
 5. **LRU cache size.** 10K entity posteriors is a conservative default. Should be configurable
    per namespace based on corpus size. Too small: frequent eviction resets learned entity

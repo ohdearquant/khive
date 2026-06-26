@@ -24,7 +24,7 @@ Two domains remain unaddressed by the current pack set:
    "remind me in two hours" or "check this daily" has no pack-level intent primitive. Intent
    must be stored somewhere before an execution mechanism can act on it.
 
-Both domains appeared in the original internal khive server and were excluded from the OSS v0.1
+Both domains appeared in the original internal implementation and were excluded from the v0.1
 release pending design settlement. This ADR specifies them as two new first-party Rust packs:
 `khive-pack-comm` and `khive-pack-schedule`.
 
@@ -132,14 +132,15 @@ reconstruct conversation order from `sent_at` on messages sharing a `thread_id`.
 is propagated; otherwise the target message's own UUID becomes the `thread_id` for the new
 message chain.
 
-#### Cross-namespace messaging (deferred Option B — cloud path)
+#### Cross-namespace messaging (deferred Option B — multi-actor path)
 
 **Note (2026-06-17, ADR-007 Rev 3)**: The cross-namespace allowlist model described in this
-section is the deferred Option B (cloud/multi-tenant path) from ADR-057. It is NOT the current
-OSS implementation. Under ADR-007 Rev 3, comm is NO-CARRY: all comm messages stay in the
-caller's shared "local" namespace. Actor addressing uses `from_actor`/`to_actor` properties
-on message notes (ADR-057), not namespace partitions. The `allowed_outbound_namespaces`
-mechanism below is preserved for the future cloud path (Option B), but is not active in OSS.
+section is the deferred Option B (multi-actor deployment path) from ADR-057. It is NOT the
+current default implementation. Under ADR-007 Rev 3, comm is NO-CARRY: all comm messages stay
+in the caller's shared "local" namespace. Actor addressing uses `from_actor`/`to_actor`
+properties on message notes (ADR-057), not namespace partitions. The
+`allowed_outbound_namespaces` mechanism below is preserved for the future multi-actor path
+(Option B), but is not active in single-namespace deployments.
 
 `send` writes the inbound copy into the recipient's namespace. Whether this write is allowed
 depends on the **sender-side outbound allowlist** (`actor.allowed_outbound_namespaces` in the
@@ -152,7 +153,7 @@ namespace and uses it to write the inbound note, keeping the write operation nam
 The minted token has `namespace = recipient` and `visible = [recipient]`; it is an ordinary
 `NamespaceToken` that the comm handler uses in an append-only manner (one `create_note` call,
 never returned to the sender). The enforced boundary is the sender-side allowlist check plus
-the handler's single-create usage — not the token type. A future cloud-path authorization ADR
+the handler's single-create usage — not the token type. A future multi-actor authorization ADR
 will replace this with a type-enforced, append-only capability primitive. The denial error is
 `RuntimeError::PermissionDenied { verb: "comm.send" }`.
 
@@ -163,7 +164,7 @@ The `RuntimeError::CrossNamespaceWrite` variant is retained for the VCS/remote s
 is no longer returned by `comm.send`.
 
 The recipient-side `allowed_inbound_namespaces` (bilateral mutual opt-in) is reserved for a
-future cloud release and is not part of this OSS implementation.
+future release supporting multi-actor deployments and is not part of the current implementation.
 
 #### Message-to-entity attachment
 
@@ -312,7 +313,7 @@ process**. The pack stores intent. Two supported execution modes:
 1. **`kkernel scheduler` daemon mode** (future): `kkernel scheduler --db <path>` polls
    pending events and dispatches them via the internal verb registry. This mode is deferred
    to a future implementation ADR.
-2. **External scheduler integration**: An operator configures OS cron or a cloud scheduler
+2. **External scheduler integration**: An operator configures OS cron or an external scheduler
    to call `kkernel exec --pending-events` at an appropriate polling interval (minimum 1
    minute). The command fetches `schedule.agenda()`, dispatches due events, and marks them `fired`.
 
@@ -432,7 +433,7 @@ historical audit record.
 Real-time delivery requires pubsub infrastructure, persistent connections, delivery guarantees,
 and retry mechanics — none of which belong in the pack layer. Agents operate at agent-scale
 (seconds to minutes per turn), not millisecond-latency. A mailbox model matches the actual
-interaction cadence and avoids hard infrastructure dependencies in an OSS binary. Operators
+interaction cadence and avoids hard infrastructure dependencies in the binary. Operators
 who need real-time delivery build atop the mailbox by polling.
 
 ### Why intent-only for schedule
@@ -441,7 +442,7 @@ The pack cannot know what polling infrastructure exists in the execution environ
 that tries to own trigger evaluation requires in-process threads, signal handling, and
 graceful shutdown — machinery that belongs in the runtime binary, not a pack. Separating
 intent storage (pack) from trigger evaluation (runtime/external) keeps the pack composable
-across deployment modes: single-binary local use, daemon mode, cloud cron.
+across deployment modes: single-binary local use, daemon mode, external cron.
 
 ### Why five verbs for comm, four for schedule
 
@@ -474,7 +475,7 @@ standard `delete(id)` path.
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Embed comm in GTD (`message` as a task variant)  | Conflates communication with task lifecycle; `inbox` semantics are mailbox-oriented, not GTD-lifecycle-oriented; pollutes the GTD verb set                 |
 | Use `event` as the schedule note kind            | Terminology collision with substrate `Event` observable (ADR-004); confuses pack-level API readers                                                         |
-| Real-time comm delivery via pubsub               | Hard infrastructure dependency in an OSS binary; incompatible with single-process deployment; agent-scale interaction does not require sub-second delivery |
+| Real-time comm delivery via pubsub               | Hard infrastructure dependency in the binary; incompatible with single-process deployment; agent-scale interaction does not require sub-second delivery    |
 | In-process trigger loop in the schedule pack     | Couples pack to runtime threading model; prevents use in single-turn call mode; execution environment varies                                               |
 | Declarative pack format (ADR-023) for both packs | Both packs require verb handlers with business logic; declarative format applies to vocabulary-only packs                                                  |
 | Single combined `commsched` pack                 | Domain cohesion: communication and scheduling are independent concerns; callers that need only comm pay no schedule cost                                   |
@@ -539,7 +540,7 @@ standard `delete(id)` path.
    a namespace and write a note into that namespace. The exact resolution contract (namespace
    registry, alias table, or unresolved string) is deferred to ADR-018's namespace authority.
 
-   _Resolved 2026-06-15: see "Cross-namespace messaging (OSS policy)" section above._
+   _Resolved 2026-06-15: see "Cross-namespace messaging" section above._
 
 ## Implementation
 

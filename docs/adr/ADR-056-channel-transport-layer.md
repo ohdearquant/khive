@@ -310,7 +310,7 @@ The loop sleeps a fixed 5-second interval between `poll_all` calls.
 
 ### 7. Inbound polling vs webhook
 
-Long-poll is the default. The embedded OSS deployment runs with no routable public URL.
+Long-poll is the default. The embedded deployment runs with no routable public URL.
 Webhooks require one. Long-poll requires only an outbound HTTPS connection to the Bot API.
 
 `Channel::poll()` is adapter-defined. A webhook adapter can buffer received updates and drain

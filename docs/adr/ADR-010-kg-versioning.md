@@ -198,7 +198,7 @@ Data classes that may appear in NDJSON snapshots:
 | Edge properties   | `dependency_kind`, `weight`      | Low                                           |
 | Edge topology     | Which entities are linked        | Medium (reveals research structure)           |
 
-For hosted deployments:
+For multi-user deployments:
 
 - Private git repositories only. Do not push NDJSON snapshots to public repos.
 - Consider content encryption at the NDJSON layer before git commit if the deployment

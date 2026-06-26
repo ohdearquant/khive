@@ -125,7 +125,7 @@ disambiguating clock ties deterministically. Not overridable in v1.
 
 `count_events` exists on `EventStore` but a `count(kind="event", ...)` verb is **not**
 added in this ADR. Downstream consumers needing aggregate counts can issue
-`list(kind="event", limit=1000)` and aggregate client-side; OSS-scale event volumes
+`list(kind="event", limit=1000)` and aggregate client-side; typical event volumes
 make this feasible.
 
 A future verb `count(kind="event", group_by="verb")` is explicitly deferred — group-by
@@ -445,7 +445,7 @@ partial mutation happens before the rejection).
 | Dedicated verbs `list_events` / `get_event`            | Contradicts ADR-016 verb consolidation; duplicates existing structure; splits documentation.      |
 | GQL/SPARQL over events via `query(...)`                | Events are tabular with no edges; graph patterns are meaningless on row data.                     |
 | FTS via `search(kind="event", query=...)`              | `data` field is JSON; no natural FTS column; useful queries are predicate-based. Deferred.        |
-| `count(kind="event", group_by=...)` now                | Requires new GROUP BY path in storage; disproportionate to OSS use case. Deferred.                |
+| `count(kind="event", group_by=...)` now                | Requires new GROUP BY path in storage; disproportionate to current use case. Deferred.            |
 | Index-backed outcome filter (extend `EventFilter`)     | Breaking semver event for the storage crate; current volume doesn't justify.                      |
 | Skip composite index until needed                      | Predictable degradation as event tables grow; one-line DDL prevents it now.                       |
 | Silent no-op on `create`/`update`/`delete` over events | Hides agent logic errors; explicit immutability error is more diagnostic.                         |
@@ -468,8 +468,8 @@ partial mutation happens before the rejection).
 - The list handler grows an event branch. Maintenance surface increases by one match arm
   plus the `EventFilter`-construction sub-struct. Bounded scope.
 - Outcome filtering is post-query in v1. A caller filtering on `outcome="denied"` over a
-  namespace with many success events fetches more rows than needed. Acceptable at OSS
-  scale; tracked for future when high-volume cloud deployments stress it.
+  namespace with many success events fetches more rows than needed. Acceptable at
+  typical scale; tracked for future when high-volume deployments stress it.
 - The `get` UUID-resolution loop adds a third storage call in the miss path (entity miss
   → note miss → edge miss → event lookup). In practice agents calling `get` know the
   substrate; this degradation is only observable on unknown-UUID calls.
