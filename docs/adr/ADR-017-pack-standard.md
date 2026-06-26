@@ -4,6 +4,10 @@
 **Date**: 2026-05-23\
 **Authors**: Ocean, lambda:khive
 
+> **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
+> epistemic relations (`supports`, `refutes`), expanding the closed set from 15 to 17.
+> Occurrences of "15 edge relations" in this document reflect the original base set.
+
 ## Context
 
 khive's foundational substrate (ADR-001 through ADR-016) is closed and stable. Six

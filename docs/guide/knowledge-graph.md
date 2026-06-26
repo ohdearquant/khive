@@ -21,7 +21,7 @@ it is a note.
 
 ## Entity kinds
 
-khive has 8 entity kinds. This is a closed set — you cannot add new kinds
+khive has 9 entity kinds. This is a closed set — you cannot add new kinds
 without an ADR.
 
 ### concept
@@ -109,6 +109,18 @@ create(kind="entity", entity_kind="service", name="OpenAI API",
        properties={type: "api"})
 ```
 
+### resource
+
+Actionable knowledge resources: atoms, domain knowledge packs, skills. Governed
+by the KG pack (ADR-048). Use `resource` for reusable knowledge objects that are
+managed by the knowledge pack rather than authored as raw entities.
+
+```
+create(kind="entity", entity_kind="resource", name="retrieval-patterns",
+       description="Domain knowledge pack for hybrid retrieval patterns",
+       properties={type: "domain"})
+```
+
 ## Note kinds
 
 khive has 5 base note kinds (also a closed set):
@@ -129,7 +141,7 @@ through their respective pack verbs, not through `create(kind="note")`.
 
 ## Edge relations
 
-khive has 15 edge relations. This is a closed set enforced at compile time.
+khive has 17 edge relations (15 base + 2 epistemic via ADR-055). This is a closed set enforced at compile time.
 
 ### When to use each relation
 
@@ -188,6 +200,16 @@ khive has 15 edge relations. This is a closed set enforced at compile time.
 | ----------- | ---------------- | ----------------------------------------------------------- |
 | `annotates` | note to anything | An observation about a concept, a decision about a project. |
 
+**Epistemic** — evidence relationships (added by ADR-055):
+
+| Relation   | Direction         | When to use                                         |
+| ---------- | ----------------- | --------------------------------------------------- |
+| `supports` | evidence to claim | A paper or dataset supports a concept or finding.   |
+| `refutes`  | evidence to claim | A paper or experiment refutes a concept or finding. |
+
+`supports` and `refutes` are same-substrate: source and target must both be
+entities or both be notes. The source is the evidence; the target is the claim.
+
 ### Edge endpoint rules
 
 Not every `(source_kind, relation, target_kind)` triple is valid. The base
@@ -196,7 +218,8 @@ for each relation. Key rules:
 
 - `annotates` is the only cross-substrate relation. Source must be a note;
   target can be anything (entity, note, edge, event).
-- `supersedes` is same-substrate only: entity to entity, or note to note.
+- `supersedes`, `supports`, and `refutes` are same-substrate only: entity to
+  entity, or note to note.
 - All other 13 relations require entity-to-entity endpoints.
 - `competes_with` and `composed_with` are symmetric — the system canonicalizes
   direction internally.
@@ -209,7 +232,7 @@ KG pack adds person-to-org and org-to-org pairs. The GTD pack allows task-to-tas
 
 A sparse, fixed set of relations keeps the graph queryable. Ad-hoc relations
 like `uses`, `related_to`, or `loaded_by` fragment the graph and make traversal
-meaningless. If your relationship does not fit one of the 15, it is probably a
+meaningless. If your relationship does not fit one of the 17, it is probably a
 property on the entity rather than an edge.
 
 ## Modeling patterns

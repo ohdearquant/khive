@@ -47,6 +47,9 @@ ADR-022 §3b's append-only ordering invariant rests on events being a separate s
 from entities. Promoting events into the entity table to "make them queryable" would
 break replay determinism, cursor semantics, and PackEventConsumer atomicity (ADR-017).
 
+> **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
+> epistemic relations (`supports`, `refutes`); the current total is 17 edge relations.
+
 This ADR resolves the tension via a **hybrid** model: the event log stays canonical
 (append-only, ordered, cursor-anchored), and a **sibling projection table**
 `event_observations` records the structured references at write time. Synthetic graph

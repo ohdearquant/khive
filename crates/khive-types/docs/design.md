@@ -86,13 +86,14 @@ types for proposals, events, and namespace isolation.
 
 ### ADR-002: Edge Ontology
 
-- `EdgeRelation` is a closed enum with exactly 15 canonical relations.
+- `EdgeRelation` is a closed enum with exactly 17 canonical relations (15 base
+  per ADR-002 + 2 epistemic `supports`/`refutes` added by ADR-055).
 - `EdgeRelation::ALL` lists them in ontology-table order.
 - Wire format is snake_case (e.g., `"part_of"`, `"introduced_by"`).
 - `FromStr` accepts canonical snake_case names, hyphen variants, and squashed
   forms (e.g., `"partof"`, `"derivedfrom"`) for ergonomic DSL entry. Squashed
   forms are not stored on the wire.
-- `EdgeCategory` groups the 15 relations into 8 structural categories for query
+- `EdgeCategory` groups the 17 relations into 9 structural categories for query
   planners and UI rendering.
 - Symmetric relations (`competes_with`, `composed_with`) are identified via
   `is_symmetric()`.
