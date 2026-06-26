@@ -3770,8 +3770,9 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         .await
         .expect("inbox dispatch must not error");
 
-    // DESIRED: gate must have seen "lambda:tenant-x", not "local" (anonymous).
-    // CURRENT: gate sees "local" (ActorRef::anonymous()) — this is the #224 gap.
+    // The gate must have recorded the configured "lambda:tenant-x" actor, not
+    // "local" (anonymous). #234 threads the configured actor into dispatch so
+    // the gate sees it before the consult; a regression would record "local".
     let seen = gate.seen_actor_ids.lock().unwrap();
     assert!(
         seen.iter().any(|id| id == "lambda:tenant-x"),
