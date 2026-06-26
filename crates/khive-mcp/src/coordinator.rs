@@ -133,8 +133,15 @@ pub trait CoordinatorService: Send + Sync {
     /// (`entity_kind` for entity substrate, `note_kind` for note substrate).
     /// Pass `None` for substrate-level (`kind="entity"` or `kind="note"`) searches.
     ///
+    /// `props_filter` and `tags` are entity-substrate filters forwarded to each
+    /// backend's `hybrid_search`. When either is active the per-backend candidate
+    /// window is widened so that sparse matches ranked below the bare `limit` are
+    /// not cut off before filtering (mirrors the single-backend handler).
+    /// Both are ignored for note-substrate searches.
+    ///
     /// Granular kinds that cannot be resolved to a substrate fall through to the
     /// registry (single-backend path); the coordinator does not silently drop results.
+    #[allow(clippy::too_many_arguments)]
     async fn fan_out_search(
         &self,
         kind: &str,
@@ -142,6 +149,8 @@ pub trait CoordinatorService: Send + Sync {
         namespace: &Namespace,
         limit: u32,
         kind_filter: Option<&str>,
+        props_filter: Option<&serde_json::Value>,
+        tags: &[String],
     ) -> CoordSearchResult;
 
     /// True when only one backend is registered (zero-change invariant check).
@@ -211,6 +220,8 @@ pub(crate) mod tests {
             _namespace: &Namespace,
             _limit: u32,
             _kind_filter: Option<&str>,
+            _props_filter: Option<&serde_json::Value>,
+            _tags: &[String],
         ) -> CoordSearchResult {
             self.search_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);

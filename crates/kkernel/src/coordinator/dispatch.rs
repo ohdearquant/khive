@@ -333,10 +333,17 @@ impl SubstrateCoordinator {
     /// - entity substrate: `entity_kind` parameter of `hybrid_search`
     /// - note substrate: `note_kind` parameter of `search_notes`
     ///
-    /// Pass `None` for substrate-level searches (`kind="entity"` or `kind="note"`).
+    /// `props_filter` and `tags` are forwarded to each backend's `hybrid_search` when
+    /// `search_notes` is false. When either is active the per-backend candidate window is
+    /// widened (up to 500) so that sparse matches ranked below the bare `limit` are not
+    /// cut off before the filter is applied inside `hybrid_search`. Both parameters are
+    /// ignored for note-substrate searches.
+    ///
+    /// Pass `None`/`&[]` for substrate-level searches without filters.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_search(
         &self,
         query: &str,
@@ -344,7 +351,21 @@ impl SubstrateCoordinator {
         limit: u32,
         search_notes: bool,
         kind_filter: Option<&str>,
+        props_filter: Option<&serde_json::Value>,
+        tags: &[String],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        // Widen the per-backend candidate window when entity filters are active so
+        // that sparse matches ranked below the bare `limit` survive inside each
+        // backend's hybrid_search before being filtered (mirrors search.rs behaviour).
+        let search_limit = if !search_notes && (props_filter.is_some() || !tags.is_empty()) {
+            limit.saturating_mul(50).min(500)
+        } else {
+            limit
+        };
+
+        let props_filter_owned: Option<serde_json::Value> = props_filter.cloned();
+        let tags_owned: Vec<String> = tags.to_vec();
+
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
             .iter()
@@ -396,10 +417,20 @@ impl SubstrateCoordinator {
                 }
             } else {
                 match runtime
-                    .hybrid_search(&token, query, None, limit, kind_filter, None, &[], None)
+                    .hybrid_search(
+                        &token,
+                        query,
+                        None,
+                        search_limit,
+                        kind_filter,
+                        None,
+                        &tags_owned,
+                        props_filter_owned.as_ref(),
+                    )
                     .await
                 {
                     Ok(hits) => {
+                        let hits: Vec<SearchHit> = hits.into_iter().take(limit as usize).collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: hits.clone(),
@@ -435,6 +466,10 @@ impl SubstrateCoordinator {
             let q = query.clone();
             let ns = ns.clone();
             let kf = kind_filter_owned.clone();
+            let pf = props_filter_owned.clone();
+            let tg = tags_owned.clone();
+            let sl = search_limit;
+            let lim = limit;
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -458,7 +493,7 @@ impl SubstrateCoordinator {
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(&token, &q, None, limit, kf.as_deref(), false, &[], None)
+                        .search_notes(&token, &q, None, lim, kf.as_deref(), false, &[], None)
                         .await;
                     match result {
                         Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
@@ -466,10 +501,17 @@ impl SubstrateCoordinator {
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(&token, &q, None, limit, kf.as_deref(), None, &[], None)
+                        .hybrid_search(&token, &q, None, sl, kf.as_deref(), None, &tg, pf.as_ref())
                         .await;
                     match result {
-                        Ok(hits) => (backend_id, Ok(hits), None),
+                        Ok(hits) => {
+                            // Truncate to the user limit after filtering so each
+                            // backend contributes at most `limit` ranked hits to
+                            // the RRF merge (not the widened search_limit).
+                            let hits: Vec<SearchHit> =
+                                hits.into_iter().take(lim as usize).collect();
+                            (backend_id, Ok(hits), None)
+                        }
                         Err(e) => (backend_id, Err(e), None),
                     }
                 }

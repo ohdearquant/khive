@@ -184,7 +184,7 @@ async fn fan_out_search_single_backend_returns_hits() {
         .expect("create entity");
 
     let (hits, _note_hits, per_backend) = coord
-        .fan_out_search("FlashAttention", &ns, 10, false, None)
+        .fan_out_search("FlashAttention", &ns, 10, false, None, None, &[])
         .await;
 
     assert!(!hits.is_empty(), "should find the entity");
@@ -232,8 +232,9 @@ async fn fan_out_search_two_backends_merged() {
         .expect("create on lore");
 
     // Fan-out search for "LoRA" — both backends should contribute.
-    let (merged_hits, _note_hits, per_backend) =
-        coord.fan_out_search("LoRA", &ns, 10, false, None).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search("LoRA", &ns, 10, false, None, None, &[])
+        .await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     // Merged set should contain at least one hit from the combined results.
@@ -247,8 +248,9 @@ async fn fan_out_search_two_backends_merged() {
 async fn fan_out_search_empty_registry_returns_empty() {
     let coord = SubstrateCoordinator::new(BackendRegistry::new());
     let ns = Namespace::local();
-    let (hits, note_hits, per_backend) =
-        coord.fan_out_search("anything", &ns, 10, false, None).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search("anything", &ns, 10, false, None, None, &[])
+        .await;
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
     assert!(per_backend.is_empty());
@@ -289,7 +291,7 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     let coord = SubstrateCoordinator::new(registry).with_failing_backend("main");
 
     let (merged_hits, _note_hits, per_backend) = coord
-        .fan_out_search("PartialFailureProbe", &ns, 10, false, None)
+        .fan_out_search("PartialFailureProbe", &ns, 10, false, None, None, &[])
         .await;
 
     // Both backends must be reported.
@@ -461,8 +463,9 @@ async fn t1_single_backend_zero_change_invariant() {
     );
 
     // fan_out_search returns results equivalent to a single runtime search.
-    let (hits, _note_hits, per_backend) =
-        coord.fan_out_search("T1Entity", &ns, 10, false, None).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search("T1Entity", &ns, 10, false, None, None, &[])
+        .await;
     assert!(
         !hits.is_empty(),
         "T1: fan-out on single backend must return hits"
@@ -582,8 +585,9 @@ async fn t3_fan_out_search_merged_from_two_backends() {
     .expect("T3: create on beta");
 
     // Search "Entity" — should match both AlphaEntity and BetaEntity.
-    let (merged, _note_hits, per_backend) =
-        coord.fan_out_search("Entity", &ns, 20, false, None).await;
+    let (merged, _note_hits, per_backend) = coord
+        .fan_out_search("Entity", &ns, 20, false, None, None, &[])
+        .await;
 
     assert_eq!(per_backend.len(), 2, "T3: both backends in report");
     assert!(
@@ -715,7 +719,7 @@ async fn fan_out_note_search_two_backends() {
 
     // Note fan-out (search_notes=true).
     let (_entity_hits, note_hits, per_backend) = coord
-        .fan_out_search("observation", &ns, 10, true, None)
+        .fan_out_search("observation", &ns, 10, true, None, None, &[])
         .await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
@@ -724,6 +728,207 @@ async fn fan_out_note_search_two_backends() {
     assert!(
         !note_hits.is_empty(),
         "note fan-out must return hits, got 0"
+    );
+}
+
+// ---- props/tags filter regression (ADR-029 residual, khive#176) ----
+
+/// Entity on the non-primary backend whose properties match the filter must
+/// survive the fan-out; a sibling entity without the matching property must
+/// not appear in the results.
+///
+/// Query token "propsfiltertest" is embedded in both descriptions so FTS
+/// returns both candidates before the property predicate is applied.
+/// sanitize_fts5_query strips hyphens by removal rather than replacement, so
+/// all tokens here are plain lowercase ASCII with no punctuation.
+#[tokio::test]
+async fn fan_out_search_props_filter_drops_non_matching() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+
+    let ns = Namespace::local();
+
+    // Entity on "main" — does NOT have the target property.
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    rt_main
+        .create_entity(
+            &tok_main,
+            "concept",
+            None,
+            "PropsFanDecoy",
+            Some("propsfiltertest decoy entity without the matching property"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create decoy on main");
+
+    // Entity on "lore" — has the target property.
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+    let target = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "PropsFanTarget",
+            Some("propsfiltertest target entity with the matching property"),
+            Some(serde_json::json!({"status": "keep"})),
+            vec![],
+        )
+        .await
+        .expect("create target on lore");
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), rt_main);
+    registry.register(BackendId::new("lore"), rt_lore);
+    let coord = SubstrateCoordinator::new(registry);
+
+    let props = serde_json::json!({"status": "keep"});
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search("propsfiltertest", &ns, 10, false, None, Some(&props), &[])
+        .await;
+
+    let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
+    assert!(
+        hit_ids.contains(&target.id),
+        "entity with matching property must be in results; got {:?}",
+        hit_ids
+    );
+    assert!(
+        hit_ids.iter().all(|id| *id == target.id),
+        "only the matching entity should be returned; got {:?}",
+        hit_ids
+    );
+}
+
+/// With `limit=1` and the matching entity ranked below the decoy in raw text
+/// score, the matching entity must still be returned because the per-backend
+/// candidate window is widened when filters are active (before-truncation
+/// semantics parity with the single-backend handler).
+///
+/// Query token "truncsemtest" appears in both descriptions; sanitize_fts5_query
+/// passes it unchanged (no hyphens or special characters).
+#[tokio::test]
+async fn fan_out_search_props_filter_before_truncation_semantics() {
+    let rt = memory_runtime();
+    let ns = Namespace::local();
+    let tok = rt.authorize(ns.clone()).unwrap();
+
+    // Both entities contain the search token so FTS returns both as candidates.
+    // With widening (search_limit = min(1*50, 500) = 50) the full candidate set
+    // is fetched, the decoy is filtered by the property predicate, and the target
+    // survives. Without widening at limit=1 the decoy could crowd out the target.
+    rt.create_entity(
+        &tok,
+        "concept",
+        None,
+        "TruncSemAlpha",
+        Some("truncsemtest decoy entity without the filter property"),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create decoy");
+
+    let target = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "TruncSemBeta",
+            Some("truncsemtest target entity with the filter property"),
+            Some(serde_json::json!({"keep": true})),
+            vec![],
+        )
+        .await
+        .expect("create target");
+
+    let coord = SubstrateCoordinator::single(rt);
+
+    let props = serde_json::json!({"keep": true});
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search("truncsemtest", &ns, 1, false, None, Some(&props), &[])
+        .await;
+
+    let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one hit expected with limit=1; got {:?}",
+        hit_ids
+    );
+    assert_eq!(
+        hits[0].entity_id, target.id,
+        "the matching entity must be returned even at limit=1; got {:?}",
+        hit_ids
+    );
+}
+
+/// Tags filter: entity with matching tag survives; entity without it is dropped.
+///
+/// Query token "tagsfiltertest" is embedded in both descriptions so FTS returns
+/// both candidates before the tag predicate is applied inside hybrid_search.
+#[tokio::test]
+async fn fan_out_search_tags_filter_drops_non_matching() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    rt_main
+        .create_entity(
+            &tok_main,
+            "concept",
+            None,
+            "TagsFanDecoy",
+            Some("tagsfiltertest decoy entity without the target tag"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create untagged on main");
+
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+    let tagged = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "TagsFanMarked",
+            Some("tagsfiltertest target entity with the target tag"),
+            None,
+            vec!["target-tag".to_string()],
+        )
+        .await
+        .expect("create tagged on lore");
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), rt_main);
+    registry.register(BackendId::new("lore"), rt_lore);
+    let coord = SubstrateCoordinator::new(registry);
+
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search(
+            "tagsfiltertest",
+            &ns,
+            10,
+            false,
+            None,
+            None,
+            &["target-tag".to_string()],
+        )
+        .await;
+
+    let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
+    assert!(
+        hit_ids.contains(&tagged.id),
+        "tagged entity must be in results; got {:?}",
+        hit_ids
+    );
+    assert!(
+        hit_ids.iter().all(|id| *id == tagged.id),
+        "only the tagged entity should be returned; got {:?}",
+        hit_ids
     );
 }
 

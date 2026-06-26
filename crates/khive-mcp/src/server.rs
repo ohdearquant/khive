@@ -961,8 +961,39 @@ async fn dispatch_via_coordinator_inner(
                 other => Some(other),
             };
 
+            // Extract entity-substrate filters and forward them to each backend.
+            // When either is active the coordinator widens the per-backend candidate
+            // window so that sparse matches ranked below the bare limit are not cut
+            // off before filtering (before-truncation parity with the single-backend
+            // handler in search.rs).
+            let props_filter: Option<&serde_json::Value> =
+                args_value.get("properties").and_then(|v| {
+                    if v.as_object().is_some_and(|m| !m.is_empty()) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+            let tags_owned: Vec<String> = args_value
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let coord_result = coord
-                .fan_out_search(kind, query, &namespace, limit, kind_filter)
+                .fan_out_search(
+                    kind,
+                    query,
+                    &namespace,
+                    limit,
+                    kind_filter,
+                    props_filter,
+                    &tags_owned,
+                )
                 .await;
 
             // Shape result to match the kg search handler's output fields exactly.
@@ -971,10 +1002,6 @@ async fn dispatch_via_coordinator_inner(
             //   - score: RRF-merged, subject to min_score floor
             // Note hits:   [{id, note_kind, score, title, snippet}]
             //   - note_kind: real kind string fetched from the owning backend
-            //
-            // NOTE: props/tags filters are not applied here (deferred).
-            // All other parity gaps (kind filter, min_score, real kinds) are closed.
-            // TODO(ADR-029): apply props/tags entity filters in fan-out path — khive#176
             let result_val = if !coord_result.note_hits.is_empty()
                 || (coord_result.entity_hits.is_empty() && coord_result.note_hits.is_empty())
             {

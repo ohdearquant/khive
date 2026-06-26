@@ -98,11 +98,21 @@ impl CoordinatorService for SubstrateCoordinatorService {
         namespace: &Namespace,
         limit: u32,
         kind_filter: Option<&str>,
+        props_filter: Option<&serde_json::Value>,
+        tags: &[String],
     ) -> CoordSearchResult {
         let search_notes = is_note_substrate(kind);
         let (entity_hits, note_hits, per_backend) = self
             .inner
-            .fan_out_search(query, namespace, limit, search_notes, kind_filter)
+            .fan_out_search(
+                query,
+                namespace,
+                limit,
+                search_notes,
+                kind_filter,
+                props_filter,
+                tags,
+            )
             .await;
 
         let partial = per_backend.iter().any(|r| r.error.is_some());
