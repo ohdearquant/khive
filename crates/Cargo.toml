@@ -47,7 +47,7 @@ edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/khive"
-homepage = "https://github.com/ohdearquant"
+homepage = "https://github.com/ohdearquant/khive"
 keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]
 categories = ["database", "command-line-utilities"]
 
