@@ -297,6 +297,8 @@ pub(crate) mod tests {
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await;
 
@@ -324,6 +326,8 @@ pub(crate) mod tests {
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await;
 
@@ -360,6 +364,8 @@ pub(crate) mod tests {
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await
             .expect("T6d: dispatch must not return an MCP-level error");
@@ -412,6 +418,8 @@ pub(crate) mod tests {
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await;
 

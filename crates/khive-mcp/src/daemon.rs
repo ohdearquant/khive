@@ -69,12 +69,16 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         ops: String,
         presentation: Option<String>,
         presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
     ) -> Result<String, String> {
         let params = RequestParams {
             ops,
             presentation,
             presentation_per_op,
             save_to: None,
+            format,
+            format_per_op,
         };
         self.dispatch_request_local(params)
             .await
@@ -381,6 +385,8 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: true,
+        format: None,
+        format_per_op: None,
     };
     let deadline = std::time::Duration::from_millis(timeout_ms);
     match tokio::time::timeout(deadline, try_forward_inner(&probe)).await {
@@ -942,6 +948,8 @@ mod tests {
             config_id: "test".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
@@ -983,6 +991,8 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let resp = exchange(&sock, &req).await;
         assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
@@ -1002,6 +1012,8 @@ mod tests {
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await
             .expect("local dispatch of stats() must succeed");
@@ -1017,6 +1029,8 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let resp_other = exchange(&sock, &other).await;
         assert!(resp_other.namespace_mismatch);
@@ -1032,6 +1046,8 @@ mod tests {
             config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let resp_cfg = exchange(&sock, &mismatched_config).await;
         assert!(
@@ -1050,6 +1066,8 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: 0,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
@@ -1176,6 +1194,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -1277,6 +1297,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         // Call try_forward_inner directly to assert the discriminant.
@@ -1512,6 +1534,8 @@ mod tests {
             _ops: String,
             _presentation: Option<String>,
             _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
         ) -> Result<String, String> {
             // Return a string whose serialized DaemonResponseFrame JSON length
             // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
@@ -1574,6 +1598,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -1672,6 +1698,8 @@ mod tests {
             _ops: String,
             _presentation: Option<String>,
             _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
         ) -> Result<String, String> {
             DAEMON_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("{\"ok\":true,\"counted\":true}".to_string())
@@ -1784,6 +1812,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         let fwd = try_forward_inner(&real_frame).await;
         assert!(
@@ -1926,6 +1956,8 @@ mod tests {
             _ops: String,
             _presentation: Option<String>,
             _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
         ) -> Result<String, String> {
             Err("forced dispatch error: verb returned an error for testing".to_string())
         }
@@ -1976,6 +2008,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -2067,6 +2101,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         let outcome = try_forward_inner(&frame).await;
@@ -2140,6 +2176,8 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
 
         let outcome = try_forward_inner(&frame).await;

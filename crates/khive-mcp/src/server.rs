@@ -23,8 +23,9 @@ use serde_json::{json, Value};
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, KhiveRuntime, Namespace, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
-    RuntimeError, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    present, render_format, KhiveRuntime, Namespace, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 
 use khive_storage::EdgeRelation;
@@ -198,6 +199,10 @@ pub struct KhiveMcpServer {
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
     pool: Option<Arc<ConnectionPool>>,
+    /// Server-level default output format (ADR-078). Resolved from TOML →
+    /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
+    /// override this at dispatch time.
+    default_output_format: OutputFormat,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -332,6 +337,7 @@ impl KhiveMcpServer {
             config_id,
             coordinator: None,
             pool,
+            default_output_format: OutputFormat::Json,
         })
     }
 
@@ -351,6 +357,7 @@ impl KhiveMcpServer {
             config_id: "registry-only".to_string(),
             coordinator: None,
             pool: None,
+            default_output_format: OutputFormat::Json,
         }
     }
 
@@ -369,7 +376,18 @@ impl KhiveMcpServer {
             config_id: config_id.to_string(),
             coordinator: None,
             pool: None,
+            default_output_format: OutputFormat::Json,
         }
+    }
+
+    /// Override the server-level default output format (ADR-078).
+    ///
+    /// Called after construction to wire in the format resolved from
+    /// `KHIVE_OUTPUT_FORMAT` or `[runtime] default_output_format` in
+    /// `khive.toml`. Per-request `format` fields override this at dispatch time.
+    pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
+        self.default_output_format = fmt;
+        self
     }
 
     /// Attach a cross-backend coordinator (ADR-029 Phase 2).
@@ -1144,6 +1162,8 @@ result (e.g. create then link with the new entity's id)."#)]
                 config_id: self.config_id.clone(),
                 protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
                 probe_only: false,
+                format: p.format.clone(),
+                format_per_op: p.format_per_op.clone(),
             };
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;
@@ -1184,20 +1204,60 @@ impl KhiveMcpServer {
                 None
             };
 
+        // Resolve the output format for this request (ADR-078 §2 precedence):
+        // per-request `format` field → server default (already resolved from
+        // env + toml + builtin by `serve.rs`).
+        let batch_format = parse_output_format(p.format.as_deref())
+            .map_err(|e| McpError::invalid_params(e, None))?
+            .unwrap_or(self.default_output_format);
+
+        // Per-op format overrides (ADR-078 §8.4).
+        let format_per_op: Option<Vec<Option<OutputFormat>>> =
+            if let Some(per_op_strs) = p.format_per_op {
+                let mut fmts = Vec::with_capacity(per_op_strs.len());
+                for s in per_op_strs {
+                    let fmt = match s.as_deref() {
+                        None => None,
+                        Some(v) => Some(
+                            parse_output_format(Some(v))
+                                .map_err(|e| McpError::invalid_params(e, None))?
+                                .unwrap_or(batch_format),
+                        ),
+                    };
+                    fmts.push(fmt);
+                }
+                Some(fmts)
+            } else {
+                None
+            };
+
         let result = self
-            .run_parsed(parsed.ops, parsed.mode, presentation, presentation_per_op)
+            .run_parsed(
+                parsed.ops,
+                parsed.mode,
+                presentation,
+                presentation_per_op.clone(),
+            )
             .await;
 
         if let Some(path_str) = save_to {
             let path = std::path::Path::new(&path_str);
             let manifest = crate::save_sink::write_and_manifest(&result, path)
                 .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
-            return serde_json::to_string_pretty(&manifest)
+            // Manifests are always compact JSON regardless of format (lossless metadata).
+            return serde_json::to_string(&manifest)
                 .map_err(|e| McpError::internal_error(format!("serialize manifest: {e}"), None));
         }
 
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))
+        // Apply per-op format rendering (ADR-078 §8.4 and §9).
+        Ok(render_result(
+            result,
+            batch_format,
+            &format_per_op,
+            presentation,
+            &presentation_per_op,
+            &self.registry,
+        ))
     }
 }
 
@@ -1217,6 +1277,122 @@ fn parse_presentation_mode(s: Option<&str>) -> Result<PresentationMode, String> 
             "unknown presentation mode {other:?}; valid values: \"agent\", \"verbose\", \"human\""
         )),
     }
+}
+
+/// Parse an optional output format string from the request envelope (ADR-078).
+///
+/// `None` → `None` (caller uses server default). Known values: `"json"`, `"auto"`, `"table"`.
+fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> {
+    match s {
+        None => Ok(None),
+        Some("json") => Ok(Some(OutputFormat::Json)),
+        Some("auto") => Ok(Some(OutputFormat::Auto)),
+        Some("table") => Ok(Some(OutputFormat::Table)),
+        Some(other) => Err(format!(
+            "unknown output format {other:?}; valid values: \"json\", \"auto\", \"table\""
+        )),
+    }
+}
+
+/// Render the `run_parsed` result envelope using per-op format dispatch (ADR-078 §8.4).
+///
+/// For each op entry in `results`:
+/// - If `ok=false` (error entry): always compact JSON, never reformatted (§8.2).
+/// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format) and
+///   per-op presentation (presentation_per_op[i] → batch presentation, then the
+///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
+///   `result` payload with the effective presentation so that both
+///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (get/link/query/
+///   traverse/neighbors/brain.feedback) correctly skip the redundancy-drop
+///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///
+/// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
+/// When the result value is not a compound batch envelope (single-op fast path),
+/// the whole value is rendered with `batch_format` and `presentation`.
+fn render_result(
+    value: serde_json::Value,
+    batch_format: OutputFormat,
+    format_per_op: &Option<Vec<Option<OutputFormat>>>,
+    presentation: PresentationMode,
+    presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
+    registry: &VerbRegistry,
+) -> String {
+    // Fast path: if format is json and no per-op overrides, compact-serialize and return.
+    if batch_format == OutputFormat::Json && format_per_op.is_none() {
+        return serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    }
+
+    // Try to detect the compound batch envelope shape: { results: [...], summary: {...} }
+    if let serde_json::Value::Object(ref map) = value {
+        if let Some(serde_json::Value::Array(results)) = map.get("results") {
+            let mut out_results = Vec::with_capacity(results.len());
+            for (i, entry) in results.iter().enumerate() {
+                let per_op_fmt = format_per_op
+                    .as_ref()
+                    .and_then(|v| v.get(i))
+                    .and_then(|x| *x)
+                    .unwrap_or(batch_format);
+
+                // Resolve per-op presentation: per-op entry overrides batch default,
+                // then the AlwaysVerbose verb policy forces Verbose — mirroring the
+                // resolution `run_parsed` applies before presentation. Without this,
+                // a policy-verbose verb (get/link/query/traverse/neighbors/
+                // brain.feedback) dispatched under format=auto/table with the default
+                // Agent presentation would be redundancy-dropped at the format seam,
+                // stripping the namespace/properties it is declared AlwaysVerbose
+                // precisely to preserve.
+                let base_presentation = presentation_per_op
+                    .as_ref()
+                    .and_then(|v| v.get(i))
+                    .and_then(|o| *o)
+                    .unwrap_or(presentation);
+                let effective_presentation =
+                    match entry.get("tool").and_then(serde_json::Value::as_str) {
+                        Some(tool)
+                            if registry.presentation_policy_for(tool)
+                                == VerbPresentationPolicy::AlwaysVerbose =>
+                        {
+                            PresentationMode::Verbose
+                        }
+                        _ => base_presentation,
+                    };
+
+                // Error entries are never reformatted (§8.2).
+                let is_ok = entry
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if !is_ok || per_op_fmt == OutputFormat::Json {
+                    out_results.push(entry.clone());
+                    continue;
+                }
+
+                // For successful entries, render the `result` sub-value with the
+                // effective presentation so verbose ops skip the redundancy drop.
+                if let Some(result_val) = entry.get("result") {
+                    let rendered =
+                        render_format(result_val.clone(), per_op_fmt, effective_presentation);
+                    // Replace `result` with the rendered string.
+                    let mut new_entry = entry.clone();
+                    if let serde_json::Value::Object(ref mut emap) = new_entry {
+                        emap.insert("result".to_string(), serde_json::Value::String(rendered));
+                    }
+                    out_results.push(new_entry);
+                } else {
+                    out_results.push(entry.clone());
+                }
+            }
+
+            // Rebuild envelope: results rendered per-op, summary always compact.
+            let mut out_map = map.clone();
+            out_map.insert("results".to_string(), serde_json::Value::Array(out_results));
+            return serde_json::to_string(&serde_json::Value::Object(out_map))
+                .unwrap_or_else(|_| "null".to_string());
+        }
+    }
+
+    // Single-op or unknown shape: render the whole value with batch_format and presentation.
+    render_format(value, batch_format, presentation)
 }
 
 #[tool_handler]

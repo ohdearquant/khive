@@ -124,7 +124,7 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 // ── wire types ────────────────────────────────────────────────────────────────
 
 /// Request frame sent from a client to the daemon.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct DaemonRequestFrame {
     pub ops: String,
     pub presentation: Option<String>,
@@ -148,6 +148,13 @@ pub struct DaemonRequestFrame {
     /// Pre-probe clients omit this field (deserializes to false → normal dispatch).
     #[serde(default)]
     pub probe_only: bool,
+    /// Output format for this request (ADR-078). Forwarded to the daemon's
+    /// serialization seam. `None` means use the daemon's resolved default.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Per-operation output format overrides (ADR-078).
+    #[serde(default)]
+    pub format_per_op: Option<Vec<Option<String>>>,
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -227,12 +234,14 @@ pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Re
 /// future transport can do the same.
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
-    /// Dispatch a verb-DSL request string and return the JSON result.
+    /// Dispatch a verb-DSL request string and return the rendered result.
     async fn dispatch(
         &self,
         ops: String,
         presentation: Option<String>,
         presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
     ) -> Result<String, String>;
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
@@ -337,7 +346,13 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
         }
     } else {
         match dispatcher
-            .dispatch(frame.ops, frame.presentation, frame.presentation_per_op)
+            .dispatch(
+                frame.ops,
+                frame.presentation,
+                frame.presentation_per_op,
+                frame.format,
+                frame.format_per_op,
+            )
             .await
         {
             Ok(result) => DaemonResponseFrame {

@@ -10,6 +10,8 @@ use khive_types::namespace::Namespace;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::presentation::OutputFormat;
+
 // ---- Error type ----
 
 /// Errors produced while loading or validating a `KhiveConfig`.
@@ -282,6 +284,15 @@ pub struct RuntimeSectionConfig {
     /// global tuning prior is used as the final fallback.
     #[serde(default)]
     pub brain_profile: Option<String>,
+
+    /// Default output serialization format (ADR-078).
+    ///
+    /// Mirrors `--output-format` / `KHIVE_OUTPUT_FORMAT`. Precedence (highest to lowest):
+    /// per-request `format` field → `KHIVE_OUTPUT_FORMAT` → this field → builtin `json`.
+    ///
+    /// Accepted values: `"json"` (default), `"auto"`, `"table"`.
+    #[serde(default)]
+    pub default_output_format: Option<OutputFormat>,
 }
 
 impl KhiveConfig {

@@ -54,8 +54,12 @@ def recv(proc):
 
 
 def _call_request_raw(proc, ops_string):
-    """Send `request(ops=<ops_string>)`. Return the parsed response body."""
-    send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
+    """Send `request(ops=<ops_string>)`. Return the parsed response body.
+
+    Pins format=json (ADR-078) so the smoke test always receives lossless compact
+    JSON regardless of the server's default_output_format configuration.
+    """
+    send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string, "format": "json"}})
     resp = recv(proc)
     if "error" in resp:
         raise RuntimeError(f"MCP error calling request: {resp['error']}")
