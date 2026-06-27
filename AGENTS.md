@@ -75,13 +75,13 @@ Full `gtd.transition` allowed transitions:
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                           | When to use                                         |
-| ----------------- | ------------------------------------------------------ | --------------------------------------------------- |
-| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state                  |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions          |
-| `memory.feedback` | Emit explicit feedback on a recalled memory            | Signal useful/not_useful to tune posteriors         |
-| `memory.prune`    | Soft-delete memories below a salience threshold        | Trim low-value memories to prevent unbounded growth |
-| `memory.vacuum`   | Hard-delete soft-deleted memories and reclaim storage  | Periodic maintenance after heavy prune runs         |
+| Verb              | What it does                                                  | When to use                                         |
+| ----------------- | ------------------------------------------------------------- | --------------------------------------------------- |
+| `memory.remember` | Store a memory with salience and decay                        | Cross-session context, agent state                  |
+| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
+| `memory.feedback` | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
+| `memory.prune`    | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
+| `memory.vacuum`   | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.

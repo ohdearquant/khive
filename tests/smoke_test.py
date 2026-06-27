@@ -3,7 +3,7 @@
 
 Spawns the binary with an in-memory DB, sends JSON-RPC MCP requests, and
 verifies the full verb-consolidated surface works end-to-end. As of v0.2 the
-MCP server exposes a single tool, `request` (ADR-020 + ADR-027), that accepts
+MCP server exposes a single tool, `request` (ADR-016 + ADR-027), that accepts
 a function-call DSL or JSON-form batch; every verb is reached through it.
 
 Verb semantics (unchanged from v0.1): create, get, list, update, delete, merge,

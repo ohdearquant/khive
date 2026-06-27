@@ -3,7 +3,7 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: Ocean, lambda:khive
-**Consolidates**: ADR-069 (Request Batch Conflict Detection), ADR-070 (Bulk Link Creation)
+**Consolidates**: ADR-069 and ADR-070 — draft proposals, never published as standalone ADRs
 **Depends on**: ADR-002 (Edge Ontology), ADR-014 (Curation Operations), ADR-016 (Request DSL), ADR-017 (Pack Standard), ADR-029 (SubstrateCoordinator)
 
 ## Context

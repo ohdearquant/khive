@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "khive kernel — admin/management Rust binary (sync, pack introspection, db ops)"
+description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
 khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
