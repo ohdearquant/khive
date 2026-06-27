@@ -56,11 +56,10 @@ python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"
 python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 
 echo "=== Vector Smoke (embed/recall path gate) ==="
-# smoke_vector.py self-guards: it prints "SKIP: ..." and exits 0 when no
-# embedding model is configured (no KHIVE_EMBEDDING_MODEL env var and no
-# [[engines]] in .khive/config.toml / khive.toml / ~/.khive/config.toml).
-# GitHub Actions runners and contributor machines without a local model are
-# unaffected.  The gate activates automatically when the model is present.
+# smoke_vector.py self-guards empirically: it spawns kkernel, attempts one
+# memory.remember, and prints "SKIP: ..." + exits 0 when the embedder is not
+# usable (model weights absent or no engine resolves).  GitHub Actions runners
+# that lack the model weights are unaffected.  Set KHIVE_NO_EMBED=1 to bypass.
 python3 "$SCRIPT_DIR/../tests/smoke_vector.py"
 
 echo "=== Contract Suite (khive-contract) ==="
