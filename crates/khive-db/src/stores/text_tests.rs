@@ -1223,6 +1223,6 @@ async fn upsert_documents_first_error_populated_on_item_failure() {
     assert!(
         !summary.first_error.is_empty(),
         "first_error must describe the failure when failed > 0, \
-         but got an empty string — the error is being silently swallowed"
+         but got an empty string; the error is being silently swallowed"
     );
 }

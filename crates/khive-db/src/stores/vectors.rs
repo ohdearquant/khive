@@ -1308,7 +1308,7 @@ mod batch_exists_tests {
 /// Tests for `first_error` surfacing in `insert_batch`.
 ///
 /// These tests use only the pre-SAVEPOINT validation path (wrong vector count
-/// or wrong dimensions) so they do not need the `vectors` feature — no vec0
+/// or wrong dimensions) so they do not need the `vectors` feature; no vec0
 /// virtual table is accessed.
 #[cfg(test)]
 mod first_error_tests {
@@ -1350,7 +1350,7 @@ mod first_error_tests {
         )
         .expect("SqliteVecStore::new");
 
-        // Both records have wrong dimensions — they fail the pre-SAVEPOINT
+        // Both records have wrong dimensions, so they fail the pre-SAVEPOINT
         // validation and never touch the vec0 virtual table.
         let summary = store
             .insert_batch(vec![
@@ -1385,7 +1385,7 @@ mod first_error_tests {
         assert!(
             !summary.first_error.is_empty(),
             "first_error must be populated when failed > 0; \
-             got empty string — the validation error is silently swallowed"
+             got empty string; the validation error is silently swallowed"
         );
     }
 }
