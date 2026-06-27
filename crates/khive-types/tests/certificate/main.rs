@@ -8,9 +8,10 @@
 //! asserts both positive coverage (every eliminator is defeated) and negative
 //! controls (deliberately-redundant candidates are rejected).
 //!
-//! Endpoint-signature audit and EdgeRelation::ALL coverage gate live in the
-//! `khive-pack-kg` certificate test (`cargo test -p khive-pack-kg --test certificate`),
-//! which can depend on both khive-runtime and khive-pack-kg.
+//! The `EdgeRelation::ALL` coverage gate lives here in `coverage`. The live
+//! endpoint-signature audit lives in the khive-pack-kg certificate test
+//! (`cargo test -p khive-pack-kg --test certificate`), which depends on both
+//! khive-runtime and khive-pack-kg to read the real rules.
 
 mod harness;
 
