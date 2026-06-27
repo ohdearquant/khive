@@ -970,4 +970,51 @@ mod tests {
             .expect("limit param must be documented in query handler metadata");
         assert!(!limit_param.required, "limit must be optional");
     }
+
+    // ── issue #160 return-shape regressions ──────────────────────────────────
+
+    /// propose returns {id, ...}; the correct chain key is $prev.id, not $prev.proposal_id (#160).
+    /// The description may mention $prev.proposal_id in a "not this" warning, which is fine.
+    #[test]
+    fn propose_description_documents_id_field_not_proposal_id() {
+        let h = find_handler("propose");
+        assert!(
+            h.description.contains("Returns {id"),
+            "propose description must name the 'id' return field"
+        );
+        assert!(
+            h.description.contains("$prev.id"),
+            "propose description must document chaining via $prev.id"
+        );
+        // The description warns callers off $prev.proposal_id by name; the critical
+        // check is that $prev.id appears first as the authoritative form.
+        let id_pos = h
+            .description
+            .find("$prev.id")
+            .expect("$prev.id must appear in propose description");
+        let proposal_id_pos = h.description.find("$prev.proposal_id");
+        if let Some(pid_pos) = proposal_id_pos {
+            // $prev.proposal_id is only acceptable when it appears AFTER $prev.id
+            // (i.e., as a negative example, not as the recommended form).
+            assert!(
+                id_pos < pid_pos,
+                "propose description must present $prev.id before $prev.proposal_id"
+            );
+        }
+    }
+
+    /// merge returns {kept_id, removed_id, ...}; no top-level 'id' field.
+    /// Chain with $prev.kept_id, not $prev.id (#160).
+    #[test]
+    fn merge_description_documents_kept_id_and_removed_id_return_fields() {
+        let h = find_handler("merge");
+        assert!(
+            h.description.contains("kept_id") && h.description.contains("removed_id"),
+            "merge description must name both kept_id and removed_id return fields"
+        );
+        assert!(
+            h.description.contains("$prev.kept_id"),
+            "merge description must document chaining via $prev.kept_id"
+        );
+    }
 }
