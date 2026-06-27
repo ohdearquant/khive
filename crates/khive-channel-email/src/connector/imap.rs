@@ -111,7 +111,7 @@ impl ImapConnector for LiveImap {
             .select("INBOX")
             .await
             .map_err(|e| ChannelError::Transport(format!("IMAP SELECT INBOX failed: {e}")))?;
-        let uidvalidity = mailbox.uid_validity.unwrap_or(0);
+        let uid_validity = mailbox.uid_validity;
 
         // Search for messages since the given date.
         let since_str = since.format("%d-%b-%Y").to_string();
@@ -135,7 +135,9 @@ impl ImapConnector for LiveImap {
             .join(",");
 
         // Collect the fetch stream into owned bytes before releasing the session borrow.
-        let fetched_raw: Vec<(u32, Vec<u8>)> = {
+        // Each entry carries the raw UID as returned by the server (Option<u32>); zero
+        // and absent UIDs are validated inside process_mailbox_fetch.
+        let fetched_raw: Vec<(Option<u32>, Vec<u8>)> = {
             let mut stream = session
                 .uid_fetch(&uid_str, "RFC822")
                 .await
@@ -147,9 +149,8 @@ impl ImapConnector for LiveImap {
                 .await
                 .map_err(|e| ChannelError::Transport(format!("IMAP fetch stream error: {e}")))?
             {
-                let uid = msg.uid.unwrap_or(0);
                 if let Some(body) = msg.body() {
-                    collected.push((uid, body.to_vec()));
+                    collected.push((msg.uid, body.to_vec()));
                 }
             }
             collected
@@ -157,14 +158,57 @@ impl ImapConnector for LiveImap {
 
         let _ = session.logout().await;
 
-        let mut result = Vec::new();
-        for (uid, raw_bytes) in fetched_raw {
-            if let Some(email) = parse_raw_bytes(uid, &raw_bytes, &self.host, uidvalidity) {
-                result.push(email);
-            }
-        }
-        Ok(result)
+        process_mailbox_fetch(uid_validity, fetched_raw, &self.host)
     }
+}
+
+/// Validate UIDVALIDITY + per-message UIDs and build the `RawEmail` list.
+///
+/// `uid_validity` must be `Some(non-zero)`.  When it is `None` or `Some(0)` the
+/// whole batch is rejected as a transport error: UIDVALIDITY is required to form
+/// the stable `imap:{host}:{uidvalidity}:{uid}` dedup key, and without it we
+/// cannot safely identify or deduplicate messages.
+///
+/// Per-message UIDs that are `None` or `0` are skipped with a `warn!` log rather
+/// than failing the batch: one missing UID is a server quirk, not a reason to
+/// discard all other messages in the poll.
+///
+/// This function is extracted from `LiveImap::fetch_since` so the validation
+/// logic can be exercised without a live IMAP server.
+pub(crate) fn process_mailbox_fetch(
+    uid_validity: Option<u32>,
+    fetched_raw: Vec<(Option<u32>, Vec<u8>)>,
+    host: &str,
+) -> Result<Vec<RawEmail>, ChannelError> {
+    let uidvalidity = match uid_validity {
+        Some(v) if v != 0 => v,
+        _ => {
+            return Err(ChannelError::Transport(
+                "IMAP SELECT did not return a valid UIDVALIDITY; \
+                 cannot safely deduplicate messages — poll aborted"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let mut result = Vec::new();
+    for (uid_opt, raw_bytes) in fetched_raw {
+        let uid = match uid_opt {
+            Some(u) if u != 0 => u,
+            _ => {
+                tracing::warn!(
+                    host = %host,
+                    uidvalidity = %uidvalidity,
+                    "skipping message with missing or zero UID; cannot form a stable dedup key"
+                );
+                continue;
+            }
+        };
+        if let Some(email) = parse_raw_bytes(uid, &raw_bytes, host, uidvalidity) {
+            result.push(email);
+        }
+    }
+    Ok(result)
 }
 
 /// Parse raw RFC 822 bytes into a `RawEmail`.
@@ -400,6 +444,82 @@ mod tests {
         };
         assert_eq!(email.khive_thread_id(), Some("some-uuid"));
         assert_eq!(email.correlation(), Some("some-uuid"));
+    }
+
+    // --- process_mailbox_fetch guard tests ---
+
+    fn minimal_rfc822(from: &str, subject: &str) -> Vec<u8> {
+        format!("From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\r\nbody").into_bytes()
+    }
+
+    #[test]
+    fn process_mailbox_fetch_missing_uidvalidity_returns_error() {
+        let raw = minimal_rfc822("a@example.com", "test");
+        let result = process_mailbox_fetch(None, vec![(Some(1), raw)], "imap.example.com");
+        assert!(
+            result.is_err(),
+            "missing UIDVALIDITY must return a transport error"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("UIDVALIDITY"),
+            "error message should mention UIDVALIDITY; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn process_mailbox_fetch_zero_uidvalidity_returns_error() {
+        let raw = minimal_rfc822("a@example.com", "test");
+        let result = process_mailbox_fetch(Some(0), vec![(Some(1), raw)], "imap.example.com");
+        assert!(
+            result.is_err(),
+            "zero UIDVALIDITY must return a transport error"
+        );
+    }
+
+    #[test]
+    fn process_mailbox_fetch_missing_uid_skips_message() {
+        let raw = minimal_rfc822("a@example.com", "test");
+        let result =
+            process_mailbox_fetch(Some(999), vec![(None, raw)], "imap.example.com").unwrap();
+        assert!(
+            result.is_empty(),
+            "a message with missing UID must be skipped (not an error)"
+        );
+    }
+
+    #[test]
+    fn process_mailbox_fetch_zero_uid_skips_message() {
+        let raw = minimal_rfc822("a@example.com", "test");
+        let result =
+            process_mailbox_fetch(Some(999), vec![(Some(0), raw)], "imap.example.com").unwrap();
+        assert!(
+            result.is_empty(),
+            "a message with zero UID must be skipped (not an error)"
+        );
+    }
+
+    #[test]
+    fn process_mailbox_fetch_valid_inputs_produce_email() {
+        let raw = minimal_rfc822("alice@example.com", "hello");
+        let result =
+            process_mailbox_fetch(Some(1234), vec![(Some(7), raw)], "mail.example.com").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].imap_external_id, "imap:mail.example.com:1234:7");
+    }
+
+    #[test]
+    fn process_mailbox_fetch_skips_invalid_uid_continues_valid() {
+        let raw_bad = minimal_rfc822("bad@example.com", "bad");
+        let raw_good = minimal_rfc822("good@example.com", "good");
+        let result = process_mailbox_fetch(
+            Some(555),
+            vec![(Some(0), raw_bad), (Some(3), raw_good)],
+            "imap.example.com",
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1, "only the valid message should be returned");
+        assert_eq!(result[0].imap_external_id, "imap:imap.example.com:555:3");
     }
 
     #[test]
