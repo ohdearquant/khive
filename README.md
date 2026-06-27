@@ -50,7 +50,7 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-One MCP tool: `request` (ADR-020 + ADR-027). Every verb is a parsed op inside it.
+One MCP tool: `request` (ADR-016 + ADR-027). Every verb is a parsed op inside it.
 
 ```
 request(ops="verb(arg=value, arg=value)")              # single op
@@ -85,7 +85,7 @@ No language SDK to learn.
 │  kkernel mcp      — stdio MCP server (the `kkernel` binary)   │
 │  khived           — persistent daemon (ADR-049): warm runtime │
 │                     auto-spawned on first request             │
-│  1 tool: `request` (ADR-020 + ADR-027) — parses DSL,         │
+│  1 tool: `request` (ADR-016 + ADR-027) — parses DSL,         │
 │  dispatches each op through the VerbRegistry                 │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
