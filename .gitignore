@@ -103,3 +103,8 @@ perf/pipeline-ledger.csv
 
 # Synthetic ANN regression gate ledger — written by --ci-synthetic, uploaded as CI artifact; not committed.
 perf/ci-synthetic-ledger.csv
+
+# Raw bench-run JSON files banked by bench_1m.sh / vec_bench --bank-run.
+# Named {YYYYMMDD}-{sha7}-{dataset}.json; kept out of the repo to avoid large
+# generated files in PRs. The perf/bench-runs/ directory is tracked via .gitkeep.
+perf/bench-runs/*.json
