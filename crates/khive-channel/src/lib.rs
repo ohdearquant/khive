@@ -102,12 +102,27 @@ pub enum ChannelError {
 ///
 /// Implementors handle outbound delivery (`send`) and inbound polling (`poll`).
 /// Each adapter is identified by a stable kind string (e.g. `"email"`).
+///
+/// Note: `Debug` is intentionally NOT required. Concrete adapters hold credentials;
+/// requiring `Debug` would risk password leakage in logs via derived impls.
 #[async_trait]
 pub trait Channel: Send + Sync + 'static {
     /// Short stable identifier for this transport (e.g. `"email"`, `"telegram"`).
     fn kind(&self) -> &'static str;
 
+    /// Return `true` when this adapter has sufficient configuration to operate.
+    ///
+    /// The default implementation returns `true`; adapters with optional config
+    /// may override this to report their readiness without returning errors from
+    /// `poll` or `send` on every call.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     /// Send a single outbound message.
+    ///
+    /// Outbound write-back (reply routing from the KG note layer) is deferred
+    /// to a future release; `send` exists so the trait surface is complete.
     async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError>;
 
     /// Poll for new inbound messages since `since`.
@@ -261,6 +276,16 @@ mod tests {
         assert!(
             id.parse::<Uuid>().is_ok(),
             "correlation id must be a valid UUID"
+        );
+    }
+
+    #[test]
+    fn is_configured_default_returns_true() {
+        let ch = MockChannel::new(vec![]);
+        // Default impl must return true; concrete adapters may override.
+        assert!(
+            ch.is_configured(),
+            "default is_configured() must return true"
         );
     }
 

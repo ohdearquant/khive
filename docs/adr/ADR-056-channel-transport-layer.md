@@ -91,27 +91,40 @@ depend on `khive-pack-comm`.
 ```rust
 // crates/khive-channel/src/lib.rs
 
+// Note: Debug is intentionally NOT required. Concrete adapters hold credentials;
+// a derived Debug impl would leak passwords in logs.
 #[async_trait::async_trait]
-pub trait Channel: Send + Sync + std::fmt::Debug {
+pub trait Channel: Send + Sync + 'static {
     /// Stable short identifier: "telegram", "email".
     fn kind(&self) -> &'static str;
 
-    /// Returns false when required env vars are absent; adapter is silently bypassed.
-    fn is_configured(&self) -> bool;
+    /// Returns true when this adapter has sufficient configuration to operate.
+    ///
+    /// The default returns true. Adapters with optional configuration may
+    /// override this to report readiness without returning errors on every call.
+    fn is_configured(&self) -> bool {
+        true
+    }
 
-    /// Send an outbound envelope. Returns the external message id on success.
-    async fn send(&self, envelope: &ChannelEnvelope) -> Result<String, ChannelError>;
+    /// Send a single outbound message.
+    ///
+    /// Outbound write-back (§5c) and reply routing (§5d) are deferred to a
+    /// future release; this method exists so the trait surface is complete.
+    async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError>;
 
-    /// Return new inbound envelopes since the last successful call.
-    /// Adapters advance their own offset/cursor; repeated calls are idempotent.
-    async fn poll(&self) -> Result<Vec<ChannelEnvelope>, ChannelError>;
+    /// Poll for new inbound messages received since `since`.
+    ///
+    /// Returns envelopes ready to be ingested. Per-message validation errors
+    /// must be logged and skipped; one bad message must not abort the batch.
+    async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError>;
 }
 
 pub enum ChannelError {
-    NotConfigured,
-    Transport { kind: &'static str, message: String },
-    UnauthorizedSender { external_id: String },
-    ApiError { code: u32, message: String },
+    Config(String),
+    Transport(String),
+    Auth(String),
+    UnauthorizedSender(String),
+    InvalidEnvelope(String),
 }
 ```
 
@@ -244,29 +257,23 @@ is an optimization; the handler check is the authoritative guard).
 
 Steps 1 and 2 use the `idx_comm_message_external_id` index (§11).
 
-#### 5c. Outbound path and `external_id` write-back
+#### 5c. Outbound path and `external_id` write-back (DEFERRED -- not implemented in v1)
 
-The binary calls `channel_registry.send_outbound` after a successful
+This section describes the design intent for a future release. It is not implemented in the
+current PR. No outbound polling or external_id write-back logic exists in the shipping code.
+
+The intended design: the binary calls `channel_registry.send_outbound` after a successful
 `VerbRegistry::dispatch("comm.send", ...)` for messages directed to a configured external
 target. The external id returned by `send_outbound` is written back to the outbound note's
 `properties.external_id` via `VerbRegistry::dispatch("update", ...)` with a properties patch.
+`update_note` uses `merge_properties` with `PreferFrom` policy, preserving existing properties.
 
-The `update` verb's `update_note` implementation uses `merge_properties` with `PreferFrom`
-policy (curation.rs:503-507; confirmed by test
-`update_entity_properties_merges_preserving_existing_keys` at curation.rs:1858). Patching
-`{"external_id": "tg:...", "channel_kind": "telegram"}` into the outbound note's properties
-preserves the existing `direction`, `thread_id`, `read`, `sent_at`, `from`, `to` keys -- it
-does not replace the whole properties column. The write-back is safe.
+#### 5d. Reply routing (DEFERRED -- not implemented in v1)
 
-The mapping from a logical `to` address to a channel adapter is via configuration (DECISIONS #3,
-v1: implicit from env var presence).
-
-#### 5d. Reply routing
-
-When the agent calls `comm.reply(id=<uuid>)`, `handle_reply` writes the reply note locally as
-today. The binary observes the dispatch result, reads `properties.channel_kind` from the
-original inbound note, and calls `channel_registry.send_outbound` for the reply. The comm-pack
-handler is unchanged.
+This section describes the design intent for a future release. It is not implemented in the
+current PR. When implemented: the binary observes a `comm.reply` dispatch result, reads
+`properties.channel_kind` from the original inbound note, and calls
+`channel_registry.send_outbound` for the reply. The comm-pack handler is unchanged.
 
 ### 6. The polling loop lives in the binary, not in a pack
 
@@ -334,17 +341,18 @@ Credential values in DEBUG logs are masked as `{first6}...[N chars]`.
 
 Two layers, applied in order:
 
-**Primary (mandatory, durable)**: before each `comm.ingest` dispatch, the ingest loop (and the
-handler itself) queries `json_extract(properties,'$.external_id')` for a match. A match skips
-the write. This check is DB-backed and survives restarts. Telegram re-delivers un-acknowledged
-updates after a crash; the DB check catches every duplicate regardless of how long the process
-was down.
+**Primary (mandatory, durable)**: the `idx_comm_message_external_id` PARTIAL UNIQUE index
+(§11) enforces uniqueness atomically at insert time. When `comm.ingest` attempts to write a
+note whose `external_id` is already present for the same namespace and kind, the DB raises a
+UNIQUE constraint violation. The handler catches this, logs a debug entry, and returns a
+`{"ok": true, "deduplicated": true}` response. No note is written. This check is DB-backed
+and survives restarts; any re-delivered message is rejected at the storage layer.
 
 **Secondary (optimization, in-memory)**: the adapter maintains a dedup cache keyed by transport
 update id. Parameters from the openclaw reference (`bot-updates.ts:3-5`): TTL 5 minutes, max
 2000 entries. This avoids the DB round-trip for the common case of duplicate delivery within
-the same process lifetime. The cache starts empty on restart; the DB check covers all cases
-the cache misses.
+the same process lifetime. The cache starts empty on restart; the DB UNIQUE constraint covers
+all cases the cache misses.
 
 ### 11. Expression index on `external_id`
 
@@ -352,17 +360,22 @@ The dedup check (step 1) and thread resolution (step 2) in §5b both query
 `json_extract(properties,'$.external_id')`. Without an index, both are full scans of the notes
 table.
 
-`COMM_SCHEMA_PLAN_STMTS` in `vocab.rs` gains a third entry:
+`COMM_SCHEMA_PLAN_STMTS` in `vocab.rs` gains a fourth entry (the third was added by ADR-040):
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_comm_message_external_id
+CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id
     ON notes(namespace, kind, json_extract(properties, '$.external_id'))
     WHERE deleted_at IS NULL
+      AND json_extract(properties, '$.external_id') IS NOT NULL
+      AND json_extract(properties, '$.external_id') != ''
 ```
 
-This follows the exact pattern of the existing `idx_comm_message_direction` and
-`idx_comm_message_thread` (vocab.rs:16-24). It applies via `CREATE INDEX IF NOT EXISTS` at
-boot, idempotently, requiring no migration file.
+The index is PARTIAL UNIQUE: the `WHERE` clause excludes rows with a null or empty
+`external_id`, so notes without an external id (ordinary local messages) are unaffected.
+The uniqueness constraint enforces dedup atomically at insert time; the handler detects a
+UNIQUE constraint violation and returns `{"ok": true, "deduplicated": true}` without error.
+Applied via `CREATE UNIQUE INDEX IF NOT EXISTS` at boot, idempotently, requiring no migration
+file.
 
 ### 12. Rate limiting
 
@@ -391,15 +404,16 @@ The ingest loop enforces a configurable minimum inter-poll interval (default 5 s
 All configuration is read from environment variables at adapter construction. No filesystem
 config files are consulted. Credentials are never defaulted or logged.
 
-| Variable                         | Required | Default | Description                                           |
-| -------------------------------- | -------- | ------- | ----------------------------------------------------- |
-| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                   |
-| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                  |
-| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                  |
-| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                    |
-| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                         |
-| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password                         |
-| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 address) |
+| Variable                         | Required | Default | Description                                                                            |
+| -------------------------------- | -------- | ------- | -------------------------------------------------------------------------------------- |
+| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                                                    |
+| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                                                   |
+| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                                                   |
+| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                                                     |
+| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                                                          |
+| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password (never logged)                                           |
+| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 addr-spec)                                |
+| `KHIVE_EMAIL_INGEST_NAMESPACE`   | no       | `local` | Target namespace for ingested inbound messages; passed as `namespace` to `comm.ingest` |
 
 When any required variable is absent, `EmailChannelConfig::from_env()` returns
 `ChannelError::Config`. The MCP server logs a warning and skips the email adapter; it does not
@@ -408,12 +422,22 @@ crash.
 #### Inbound authentication (OQ-2 resolved)
 
 The adapter enforces a single-maintainer allowlist at the adapter boundary, before any note is
-written. On each inbound email, the `From:` header is parsed to its RFC 5322 addr-spec
-(lowercased, display name stripped). If it does not match `KHIVE_EMAIL_MAINTAINER_ADDRESS`, the
-message is silently dropped and `ChannelError::UnauthorizedSender` is returned. No note is
-written for unauthorized senders.
+written. Authentication rules:
 
-This resolves OQ-2: the env-var addr-spec comparison is the authoritative check for v1. The
+1. The `From:` header must contain exactly one address. Messages with zero or more than one
+   From address are rejected with `ChannelError::UnauthorizedSender`. Multi-From is an
+   unauthorized state regardless of address content.
+2. That single From addr-spec (lowercased, display name stripped) must match
+   `KHIVE_EMAIL_MAINTAINER_ADDRESS` exactly.
+3. If a `Sender:` header is present, its addr-spec must also match the maintainer. A Sender
+   that differs from the From address is rejected.
+4. Error messages intentionally omit the actual address values to avoid leaking sender
+   addresses to logs.
+
+Messages that fail any check are skipped with a warning that logs only the IMAP UID. No note
+is written for unauthorized or malformed senders.
+
+This resolves OQ-2: env-var addr-spec comparison is the authoritative check for v1. The
 anonymous actor default for `VerbRegistry::dispatch` is acceptable. No `ActorRef` mapping to
 ADR-053 is required at this layer; the adapter pre-filters before dispatch.
 
@@ -437,7 +461,10 @@ absent, it falls back to the `In-Reply-To` header. The resolved value is passed 
 `correlation_external_id` in the `comm.ingest` dispatch, and the handler performs the two-step
 DB lookup described in §5b.
 
-The inbound `Message-ID` header is used as `external_id` for dedup (§10).
+The inbound `external_id` for dedup is derived from the IMAP UIDVALIDITY and UID values
+obtained when selecting the INBOX: `imap:{host}:{uidvalidity}:{uid}`. This key is stable
+across reconnects and does not depend on the presence of a `Message-ID` header (which is
+optional and may be absent or forged). The `Message-ID` header is not used for dedup.
 
 #### Dependencies
 
@@ -467,8 +494,9 @@ acceptable. See §14.
 - `comm.inbox`, `comm.read`, `comm.reply`, and `comm.thread` are unchanged for agents.
 - A new `comm.ingest` `Visibility::Subhandler` verb is added to `khive-pack-comm` (`vocab.rs`
   - handler dispatch). It is not visible on the MCP wire.
-- `COMM_SCHEMA_PLAN_STMTS` gains a third index (`idx_comm_message_external_id`). Applied
-  idempotently at boot via `CREATE INDEX IF NOT EXISTS`. No migration file required.
+- `COMM_SCHEMA_PLAN_STMTS` gains a fourth entry: a PARTIAL UNIQUE index
+  `idx_comm_message_external_id` that enforces dedup atomically at insert time. Applied
+  idempotently at boot via `CREATE UNIQUE INDEX IF NOT EXISTS`. No migration file required.
 - The polling loop runs in `kkernel` as a `tokio::task`, holding `Arc<VerbRegistry>` and
   `Arc<ChannelRegistry>` (no `NamespaceToken` -- `dispatch` mints its own per call). It is
   cancelled on shutdown.
