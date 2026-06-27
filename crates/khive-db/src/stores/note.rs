@@ -341,6 +341,43 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
+        let namespace = note.namespace.clone();
+        let id_str = note.id.to_string();
+        let kind_str = note.kind.to_string();
+        let status_str = note.status.clone();
+        let properties_str = note
+            .properties
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        self.with_writer("try_insert_note", move |conn| {
+            let rows = conn.execute(
+                "INSERT OR IGNORE INTO notes \
+                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+                  properties, created_at, updated_at, deleted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    id_str,
+                    namespace,
+                    kind_str,
+                    status_str,
+                    note.name,
+                    note.content,
+                    note.salience,
+                    note.decay_factor,
+                    note.expires_at,
+                    properties_str,
+                    note.created_at,
+                    note.updated_at,
+                    note.deleted_at,
+                ],
+            )?;
+            Ok(rows > 0)
+        })
+        .await
+    }
+
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 

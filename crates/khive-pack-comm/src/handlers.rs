@@ -541,23 +541,13 @@ pub(crate) async fn handle_thread(
 /// `khive-mcp`). It is the authoritative write path for all channel-delivered
 /// messages; the polling loop must not bypass it.
 ///
-/// Deduplication: when `external_id` is supplied and a message note with the
-/// same `external_id` already exists in the namespace, the call returns
-/// successfully without creating a duplicate. The check is best-effort
-/// (no database-level unique constraint) and idempotent.
-/// Return `true` if the error is a SQLite UNIQUE constraint violation.
-///
-/// Used to detect duplicate `external_id` collisions on the
-/// `idx_comm_message_external_id` partial unique index without taking a
-/// direct dependency on `rusqlite` in this crate.
-fn is_unique_constraint_violation(e: &RuntimeError) -> bool {
-    e.to_string().contains("UNIQUE constraint")
-}
-
-///
 /// Thread resolution: when `correlation_external_id` is supplied, the handler
 /// queries for an existing message note whose `external_id` matches that value,
 /// reads its `thread_id`, and attaches the new note to the same thread.
+///
+/// Deduplication: when `external_id` is supplied, `try_create_note` uses
+/// `INSERT OR IGNORE` against the durable unique index on `external_id`.  A
+/// duplicate returns `Ok(None)` without error; the call is an idempotent no-op.
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -585,39 +575,6 @@ pub(crate) async fn handle_ingest(
 
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
-
-    // Deduplication: check for an existing message with the same external_id.
-    if let Some(ref ext_id) = p.external_id {
-        if !ext_id.is_empty() {
-            let dedup_filter = NoteFilter {
-                kind: Some("message".to_string()),
-                property_filters: vec![PropertyFilter {
-                    json_path: "$.external_id".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text(ext_id.clone()),
-                }],
-                ..Default::default()
-            };
-            let existing = store
-                .query_notes_filtered(
-                    ns,
-                    &dedup_filter,
-                    PageRequest {
-                        limit: 1,
-                        offset: 0,
-                    },
-                )
-                .await?;
-            if !existing.items.is_empty() {
-                tracing::debug!(external_id = %ext_id, "comm.ingest: duplicate message skipped");
-                return Ok(json!({
-                    "ok": true,
-                    "deduplicated": true,
-                    "external_id": ext_id,
-                }));
-            }
-        }
-    }
 
     // Thread resolution: if correlation_external_id is present, find the message
     // it refers to and extract its internal thread_id.
@@ -694,27 +651,27 @@ pub(crate) async fn handle_ingest(
     }
 
     let note = match runtime
-        .create_note(
+        .try_create_note(
             token,
             "message",
             p.subject.as_deref(),
             p.content.trim(),
-            None,
             Some(props),
-            Vec::new(),
         )
-        .await
+        .await?
     {
-        Ok(n) => n,
-        Err(e) if is_unique_constraint_violation(&e) => {
-            tracing::debug!("comm.ingest: duplicate blocked by unique index constraint");
+        Some(n) => n,
+        None => {
+            tracing::debug!(
+                external_id = ?p.external_id,
+                "comm.ingest: duplicate message skipped"
+            );
             return Ok(json!({
                 "ok": true,
                 "deduplicated": true,
                 "external_id": p.external_id,
             }));
         }
-        Err(e) => return Err(e),
     };
 
     Ok(json!({

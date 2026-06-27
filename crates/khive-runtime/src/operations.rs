@@ -1962,6 +1962,102 @@ impl KhiveRuntime {
         .await
     }
 
+    /// Insert a note using `INSERT OR IGNORE` semantics for atomic deduplication.
+    ///
+    /// Returns `Ok(Some(note))` when the note was newly written.  Returns
+    /// `Ok(None)` when a unique constraint (e.g. the `external_id` partial
+    /// index on comm message notes) was already satisfied by an existing row,
+    /// making this call a no-op.  FTS indexing and vector embedding are
+    /// attempted on success but treated as best-effort: failures are logged
+    /// and do not abort the write.
+    ///
+    /// This method is intentionally narrower than `create_note`: it skips
+    /// salience/decay, annotates edges, and embedding-model selection, which
+    /// are not needed for channel-ingest paths.
+    pub async fn try_create_note(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.validate_note_kind(kind)?;
+        crate::secret_gate::check(content)?;
+        if let Some(n) = name {
+            crate::secret_gate::check(n)?;
+        }
+        if let Some(ref p) = properties {
+            crate::secret_gate::check_json(p)?;
+        }
+
+        let ns = token.namespace().as_str();
+        let mut note = Note::new(ns, kind, content);
+        if let Some(n) = name {
+            note = note.with_name(n);
+        }
+        if let Some(p) = properties {
+            note = note.with_properties(p);
+        }
+
+        let inserted = self.notes(token)?.try_insert_note(note.clone()).await?;
+        if !inserted {
+            return Ok(None);
+        }
+
+        // Best-effort FTS: log and continue on failure.
+        if let Ok(fts) = self.text_for_notes(token) {
+            if let Err(e) = fts.upsert_document(note_fts_document(&note)).await {
+                tracing::warn!(
+                    note_id = %note.id,
+                    error = %e,
+                    "try_create_note: FTS indexing failed (non-fatal)"
+                );
+            }
+        }
+
+        // Best-effort vector embedding: log and continue on failure.
+        let embed_model_names = self.registered_embedding_model_names();
+        for model_name in &embed_model_names {
+            match self
+                .embed_document_with_model(model_name, &note.content)
+                .await
+            {
+                Ok(vector) => {
+                    if let Ok(vs) = self.vectors_for_model(token, model_name) {
+                        if let Err(e) = vs
+                            .insert(
+                                note.id,
+                                SubstrateKind::Note,
+                                ns,
+                                "note.content",
+                                vec![vector],
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                model = %model_name,
+                                error = %e,
+                                "try_create_note: vector insert failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note.id,
+                        model = %model_name,
+                        error = %e,
+                        "try_create_note: embedding failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        Ok(Some(note))
+    }
+
     // REASON: private inner function unifies all create_note variants; it receives every
     // optional parameter individually so that public variants can pass None without
     // requiring callers to construct an intermediate struct.

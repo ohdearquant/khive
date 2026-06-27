@@ -310,6 +310,14 @@ pub trait NoteStore: Send + Sync + 'static {
     /// Count notes in a namespace, optionally filtered by kind.
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 
+    /// Attempt to insert a note without overwriting an existing row.
+    ///
+    /// Uses `INSERT OR IGNORE` semantics: if any unique constraint fires
+    /// (primary key collision or a partial unique index such as the one on
+    /// `external_id`), the row is left unchanged and the method returns `false`.
+    /// Returns `true` when the row was newly written.
+    async fn try_insert_note(&self, note: Note) -> StorageResult<bool>;
+
     /// Fetch multiple notes by UUID in a single call.
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
         let mut out = Vec::with_capacity(ids.len());

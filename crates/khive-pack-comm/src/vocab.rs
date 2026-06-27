@@ -12,10 +12,12 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// `deleted_at IS NULL` is always present in filtered queries, so the partial
 /// condition is always satisfied and the index is eligible.
 /// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
-/// Statements are idempotent (`CREATE [UNIQUE] INDEX IF NOT EXISTS`).
-/// The `external_id` index is UNIQUE and PARTIAL (non-null, non-empty values only);
-/// this provides atomic deduplication for ingested channel messages.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
+/// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+///
+/// The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
+/// created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
+/// is the sole durable authority for that index.
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -30,11 +32,6 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
         json_extract(properties, '$.read'), \
         created_at DESC) \
         WHERE deleted_at IS NULL",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id \
-        ON notes(namespace, kind, json_extract(properties, '$.external_id')) \
-        WHERE deleted_at IS NULL \
-          AND json_extract(properties, '$.external_id') IS NOT NULL \
-          AND json_extract(properties, '$.external_id') != ''",
 ];
 
 pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
