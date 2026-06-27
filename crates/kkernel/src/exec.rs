@@ -38,7 +38,7 @@ use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_runtime::{KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
 
 // ── daemon-forward seam (Unix only) ─────────────────────────────────────────
 //
@@ -453,14 +453,22 @@ async fn run_exec_inline_with_forward(
     }
 
     // ── in-process fallback ───────────────────────────────────────────────────
-    // Apply the env-var tier (ADR-078 §2 tier-2: KHIVE_OUTPUT_FORMAT) before
-    // building the server, mirroring the serve path.  The CLI flag is then passed
-    // as the per-request `format` field (tier-1), which overrides the server default
-    // at dispatch time.
+    // Resolve the full ADR-078 §2 precedence chain before building the server,
+    // mirroring the serve path: env-var (tier-2: KHIVE_OUTPUT_FORMAT) over
+    // TOML `[runtime] default_output_format` (tier-3) over builtin json. The CLI
+    // flag is then passed as the per-request `format` field (tier-1), which
+    // overrides the server default at dispatch time. This block only runs in the
+    // in-process fallback — the common daemon-forward path returns above and the
+    // daemon applies its own serve-time TOML resolution — so the config load here
+    // is off the hot path.
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Note: enforce_strict_actor_mode was called above before the daemon fast-path;
     // it is not repeated here — the single early check covers both paths.
-    let env_fmt = apply_env_output_format(None);
+    let toml_default = KhiveConfig::load_with_home_fallback(None)
+        .ok()
+        .flatten()
+        .and_then(|c| c.runtime.default_output_format);
+    let env_fmt = apply_env_output_format(toml_default);
     let server = KhiveMcpServer::new(rt)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_default_output_format(env_fmt);
