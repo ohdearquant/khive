@@ -815,10 +815,8 @@ impl BrainPack {
         let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let target: uuid::Uuid = p
-            .target_id
-            .parse()
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid target_id: {e}")))?;
+        let target: uuid::Uuid =
+            resolve_auto_feedback_target(&self.runtime, token, &p.target_id).await?;
 
         let signal = match p.signal.as_str() {
             "useful" => "useful",

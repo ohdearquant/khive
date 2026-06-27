@@ -3919,3 +3919,35 @@ mod brain_005_section_signals {
         }
     }
 }
+
+// Regression: brain.feedback must accept a short hex prefix for target_id,
+// consistent with every other by-id verb (get, update, delete, link, …).
+// Before the fix, `target_id.parse::<Uuid>()` rejected anything shorter than
+// a full 36-char UUID with "invalid target_id: invalid length: ...".
+#[tokio::test]
+async fn feedback_accepts_short_prefix_target_id() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let full_uuid = create_test_entity(&rt, &token).await;
+    // Take the first 8 hex chars as the short prefix the agent would supply.
+    let prefix = &full_uuid[..8];
+
+    let result = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": prefix,
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("brain.feedback must accept an 8-char hex prefix for target_id");
+
+    assert_eq!(result["emitted"], json!(true), "emitted must be true");
+    assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
+}
