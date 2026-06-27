@@ -279,17 +279,19 @@ current PR. When implemented: the binary observes a `comm.reply` dispatch result
 The polling loop is a `tokio::task::spawn` inside `kkernel`'s startup sequence, after the
 `VerbRegistry` is built and before the MCP server begins accepting connections.
 
-**What the loop holds:**
+**What the loop holds (v1 shipped state):**
 
 - `Arc<ChannelRegistry>` for polling.
 - `Arc<VerbRegistry>` for dispatching `comm.ingest`.
-- A `tokio::CancellationToken` for clean shutdown.
 
 The loop does NOT hold a `NamespaceToken`. `VerbRegistry::dispatch` takes no external token
 (pack.rs:657 signature: `pub async fn dispatch(&self, verb: &str, params: Value)`). It extracts
 the namespace from `params["namespace"]` and mints its own token internally (pack.rs:750). A
 token obtained from `KhiveRuntime::authorize` is never consumed by `dispatch` and cannot serve
 as a per-dispatch credential.
+
+The v1 loop does not hold a cancellation token; it runs until the process exits. A configurable
+interval and explicit cancellation support are possible future additions.
 
 **Startup pre-flight (gate check only):** At startup, before the polling task is spawned, the
 binary calls `VerbRegistry::authorize_namespace(ingest_namespace)` once as a pre-flight check.
@@ -304,7 +306,7 @@ declares `"namespace"` as a `ParamDef` -- forwards the field to the handler (pac
 which writes the note into the correct namespace. This is what makes the inbound note visible in
 `comm.inbox` for the right agent.
 
-The loop sleeps a configurable interval (default 5 seconds) between `poll_all` calls.
+The loop sleeps a fixed 5-second interval between `poll_all` calls.
 
 ### 7. Inbound polling vs webhook
 
@@ -341,11 +343,13 @@ Credential values in DEBUG logs are masked as `{first6}...[N chars]`.
 Two layers, applied in order:
 
 **Primary (mandatory, durable)**: the `idx_comm_message_external_id` PARTIAL UNIQUE index
-(§11) enforces uniqueness atomically at insert time. When `comm.ingest` attempts to write a
-note whose `external_id` is already present for the same namespace and kind, the DB raises a
-UNIQUE constraint violation. The handler catches this, logs a debug entry, and returns a
-`{"ok": true, "deduplicated": true}` response. No note is written. This check is DB-backed
-and survives restarts; any re-delivered message is rejected at the storage layer.
+(§11) enforces uniqueness at insert time. `comm.ingest` inserts with `INSERT OR IGNORE`; when
+zero rows are written, the storage layer verifies whether the suppressed insert was caused by
+an `external_id` collision (a live note in the same namespace and kind with the same non-empty
+`external_id` already exists). If confirmed, the handler returns
+`{"ok": true, "deduplicated": true}` without error. Any other ignored constraint surfaces as a
+`StorageError` so it is not misreported as deduplication. No note body is ever lost. This check
+is DB-backed and survives restarts; any re-delivered message is rejected at the storage layer.
 
 **Secondary (optimization, in-memory)**: the adapter maintains a dedup cache keyed by transport
 update id. Parameters from the openclaw reference (`bot-updates.ts:3-5`): TTL 5 minutes, max
@@ -359,10 +363,19 @@ The dedup check (step 1) and thread resolution (step 2) in §5b both query
 `json_extract(properties,'$.external_id')`. Without an index, both are full scans of the notes
 table.
 
-`COMM_SCHEMA_PLAN_STMTS` in `vocab.rs` gains a fourth entry (the third was added by ADR-040):
+The index is created by schema migration V5 (`005-unique-comm-external-id.sql`). V5 first
+reconciles any duplicate rows: for each group of notes sharing the same
+`(namespace, kind, external_id)`, the earliest row (lowest rowid) is kept unchanged; all later
+duplicates have their `external_id` key removed from the properties JSON so they fall outside
+the partial-index WHERE clause and are excluded from the uniqueness constraint. Message bodies
+are preserved; only the redundant dedup key is cleared. V5 then drops any pre-existing
+non-unique index of the same name and creates the new UNIQUE variant unconditionally. Using
+`IF NOT EXISTS` at boot time would silently leave a pre-existing non-unique index in place;
+the versioned migration approach avoids that pitfall.
 
 ```sql
-CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id
+DROP INDEX IF EXISTS idx_comm_message_external_id;
+CREATE UNIQUE INDEX idx_comm_message_external_id
     ON notes(namespace, kind, json_extract(properties, '$.external_id'))
     WHERE deleted_at IS NULL
       AND json_extract(properties, '$.external_id') IS NOT NULL
@@ -371,13 +384,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id
 
 The index is PARTIAL UNIQUE: the `WHERE` clause excludes rows with a null or empty
 `external_id`, so notes without an external id (ordinary local messages) are unaffected.
-The uniqueness constraint enforces dedup atomically at insert time; the handler uses
-`INSERT OR IGNORE` so a duplicate `external_id` results in zero rows written and a
-`{"ok": true, "deduplicated": true}` response without error.
-Applied by schema migration V5 (`005-unique-comm-external-id.sql`), which first drops any
-pre-existing non-unique index of the same name before creating the UNIQUE variant. This
-migration is required; it cannot be applied idempotently at boot via `IF NOT EXISTS` because
-a prior non-unique index of the same name would silently survive the boot-time check.
 
 ### 12. Rate limiting
 
