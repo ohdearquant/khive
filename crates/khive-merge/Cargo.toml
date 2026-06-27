@@ -2,10 +2,14 @@
 # khive-merge is forward-deployed v2 infrastructure (not yet in the workspace
 # members list). This [workspace] table makes the crate standalone-compilable so
 # that `cargo check -p khive-merge` works without adding it to the root workspace.
+# [workspace.package] below declares the shared version for this standalone workspace.
+
+[workspace.package]
+version = "0.2.11"
 
 [package]
 name = "khive-merge"
-version = "0.2.11"
+version.workspace = true
 edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
