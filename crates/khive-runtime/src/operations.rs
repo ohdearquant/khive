@@ -256,81 +256,93 @@ fn pack_rule_allows(
     })
 }
 
-/// Base endpoint allowlist for entity→entity relations.
+/// Base entity endpoint allowlist — the closed set of permitted entity→entity
+/// relation triples.
 ///
-/// Returns `true` if `(src_kind, relation, tgt_kind)` is an explicitly listed
-/// triple in the base contract. `"*"` as `src_kind` means "any entity kind"
-/// (used for `instance_of` whose source is unrestricted).
+/// Each entry `(src_kind, relation, tgt_kind)` explicitly allows that combination.
+/// `"*"` as `src_kind` means "any entity kind" (used by `instance_of` whose source
+/// is unrestricted).
 ///
 /// Pack rules (via `EDGE_RULES`) are additive — they cannot remove rows here.
+/// Exposed via `base_entity_endpoint_rules()` for the ADR-076 certificate tests.
+pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
+    // Structure
+    ("concept", EdgeRelation::Contains, "concept"),
+    ("project", EdgeRelation::Contains, "project"),
+    ("project", EdgeRelation::Contains, "artifact"),
+    ("org", EdgeRelation::Contains, "project"),
+    ("org", EdgeRelation::Contains, "service"),
+    ("concept", EdgeRelation::PartOf, "concept"),
+    ("project", EdgeRelation::PartOf, "project"),
+    ("project", EdgeRelation::PartOf, "org"),
+    ("*", EdgeRelation::InstanceOf, "concept"),
+    ("service", EdgeRelation::InstanceOf, "project"),
+    // Derivation
+    ("concept", EdgeRelation::Extends, "concept"),
+    ("concept", EdgeRelation::VariantOf, "concept"),
+    ("artifact", EdgeRelation::VariantOf, "artifact"),
+    ("concept", EdgeRelation::IntroducedBy, "document"),
+    ("concept", EdgeRelation::IntroducedBy, "person"),
+    ("artifact", EdgeRelation::IntroducedBy, "document"),
+    // Provenance
+    ("artifact", EdgeRelation::DerivedFrom, "dataset"),
+    ("artifact", EdgeRelation::DerivedFrom, "document"),
+    ("artifact", EdgeRelation::DerivedFrom, "project"),
+    ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+    // Temporal
+    ("document", EdgeRelation::Precedes, "document"),
+    ("dataset", EdgeRelation::Precedes, "dataset"),
+    ("artifact", EdgeRelation::Precedes, "artifact"),
+    ("service", EdgeRelation::Precedes, "service"),
+    ("project", EdgeRelation::Precedes, "project"),
+    // Dependency
+    ("project", EdgeRelation::DependsOn, "project"),
+    ("service", EdgeRelation::DependsOn, "project"),
+    ("service", EdgeRelation::DependsOn, "service"),
+    ("service", EdgeRelation::DependsOn, "artifact"),
+    ("service", EdgeRelation::DependsOn, "dataset"),
+    ("artifact", EdgeRelation::DependsOn, "project"),
+    ("artifact", EdgeRelation::DependsOn, "service"),
+    ("concept", EdgeRelation::Enables, "concept"),
+    ("service", EdgeRelation::Enables, "concept"),
+    ("dataset", EdgeRelation::Enables, "concept"),
+    // Implementation
+    ("project", EdgeRelation::Implements, "concept"),
+    ("service", EdgeRelation::Implements, "concept"),
+    // Lateral
+    ("concept", EdgeRelation::CompetesWith, "concept"),
+    ("project", EdgeRelation::CompetesWith, "project"),
+    ("service", EdgeRelation::CompetesWith, "service"),
+    ("concept", EdgeRelation::ComposedWith, "concept"),
+    ("project", EdgeRelation::ComposedWith, "project"),
+    // Versioning (Supersedes — Concept/Document/Artifact/Service/Dataset only)
+    ("concept", EdgeRelation::Supersedes, "concept"),
+    ("document", EdgeRelation::Supersedes, "document"),
+    ("artifact", EdgeRelation::Supersedes, "artifact"),
+    ("service", EdgeRelation::Supersedes, "service"),
+    ("dataset", EdgeRelation::Supersedes, "dataset"),
+    // Epistemic (Supports/Refutes — evidence sources → Concept claim only)
+    ("concept", EdgeRelation::Supports, "concept"),
+    ("document", EdgeRelation::Supports, "concept"),
+    ("dataset", EdgeRelation::Supports, "concept"),
+    ("artifact", EdgeRelation::Supports, "concept"),
+    ("concept", EdgeRelation::Refutes, "concept"),
+    ("document", EdgeRelation::Refutes, "concept"),
+    ("dataset", EdgeRelation::Refutes, "concept"),
+    ("artifact", EdgeRelation::Refutes, "concept"),
+];
+
+/// Returns the base entity endpoint allowlist.
+///
+/// The returned slice is the same data that `base_entity_rule_allows` consults at
+/// runtime. Exposed for the ADR-076 certificate tests in `khive-pack-kg`, which
+/// must audit live rules rather than hand-copied snapshots.
+pub fn base_entity_endpoint_rules() -> &'static [(&'static str, EdgeRelation, &'static str)] {
+    BASE_ENTITY_ENDPOINT_RULES
+}
+
 fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
-    const RULES: &[(&str, EdgeRelation, &str)] = &[
-        // Structure
-        ("concept", EdgeRelation::Contains, "concept"),
-        ("project", EdgeRelation::Contains, "project"),
-        ("project", EdgeRelation::Contains, "artifact"),
-        ("org", EdgeRelation::Contains, "project"),
-        ("org", EdgeRelation::Contains, "service"),
-        ("concept", EdgeRelation::PartOf, "concept"),
-        ("project", EdgeRelation::PartOf, "project"),
-        ("project", EdgeRelation::PartOf, "org"),
-        ("*", EdgeRelation::InstanceOf, "concept"),
-        ("service", EdgeRelation::InstanceOf, "project"),
-        // Derivation
-        ("concept", EdgeRelation::Extends, "concept"),
-        ("concept", EdgeRelation::VariantOf, "concept"),
-        ("artifact", EdgeRelation::VariantOf, "artifact"),
-        ("concept", EdgeRelation::IntroducedBy, "document"),
-        ("concept", EdgeRelation::IntroducedBy, "person"),
-        ("artifact", EdgeRelation::IntroducedBy, "document"),
-        // Provenance
-        ("artifact", EdgeRelation::DerivedFrom, "dataset"),
-        ("artifact", EdgeRelation::DerivedFrom, "document"),
-        ("artifact", EdgeRelation::DerivedFrom, "project"),
-        ("artifact", EdgeRelation::DerivedFrom, "artifact"),
-        // Temporal
-        ("document", EdgeRelation::Precedes, "document"),
-        ("dataset", EdgeRelation::Precedes, "dataset"),
-        ("artifact", EdgeRelation::Precedes, "artifact"),
-        ("service", EdgeRelation::Precedes, "service"),
-        ("project", EdgeRelation::Precedes, "project"),
-        // Dependency
-        ("project", EdgeRelation::DependsOn, "project"),
-        ("service", EdgeRelation::DependsOn, "project"),
-        ("service", EdgeRelation::DependsOn, "service"),
-        ("service", EdgeRelation::DependsOn, "artifact"),
-        ("service", EdgeRelation::DependsOn, "dataset"),
-        ("artifact", EdgeRelation::DependsOn, "project"),
-        ("artifact", EdgeRelation::DependsOn, "service"),
-        ("concept", EdgeRelation::Enables, "concept"),
-        ("service", EdgeRelation::Enables, "concept"),
-        ("dataset", EdgeRelation::Enables, "concept"),
-        // Implementation
-        ("project", EdgeRelation::Implements, "concept"),
-        ("service", EdgeRelation::Implements, "concept"),
-        // Lateral
-        ("concept", EdgeRelation::CompetesWith, "concept"),
-        ("project", EdgeRelation::CompetesWith, "project"),
-        ("service", EdgeRelation::CompetesWith, "service"),
-        ("concept", EdgeRelation::ComposedWith, "concept"),
-        ("project", EdgeRelation::ComposedWith, "project"),
-        // Versioning (Supersedes — Concept/Document/Artifact/Service/Dataset only)
-        ("concept", EdgeRelation::Supersedes, "concept"),
-        ("document", EdgeRelation::Supersedes, "document"),
-        ("artifact", EdgeRelation::Supersedes, "artifact"),
-        ("service", EdgeRelation::Supersedes, "service"),
-        ("dataset", EdgeRelation::Supersedes, "dataset"),
-        // Epistemic (Supports/Refutes — evidence sources → Concept claim only)
-        ("concept", EdgeRelation::Supports, "concept"),
-        ("document", EdgeRelation::Supports, "concept"),
-        ("dataset", EdgeRelation::Supports, "concept"),
-        ("artifact", EdgeRelation::Supports, "concept"),
-        ("concept", EdgeRelation::Refutes, "concept"),
-        ("document", EdgeRelation::Refutes, "concept"),
-        ("dataset", EdgeRelation::Refutes, "concept"),
-        ("artifact", EdgeRelation::Refutes, "concept"),
-    ];
-    RULES.iter().any(|(src, rel, tgt)| {
+    BASE_ENTITY_ENDPOINT_RULES.iter().any(|(src, rel, tgt)| {
         *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
     })
 }
