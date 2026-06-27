@@ -1,11 +1,11 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-06-14\
 **Authors**: Ocean, lambda:khive\
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
 and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
-**Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter)
+**Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter)
 
 ## Context
 
@@ -381,46 +381,86 @@ The ingest loop enforces a configurable minimum inter-poll interval (default 5 s
 | Skip the expression index for v1                      | The dedup check is on the mandatory critical path for every inbound message. Full-scan risk under load.                                                                               |
 | In-memory LRU as primary dedup                        | LRU starts empty on restart, exactly when Telegram re-delivers un-acked updates. DB-first is required.                                                                                |
 
-## Open Questions (pending maintainer ruling)
+### 14. Email adapter (`khive-channel-email`)
 
-Both items below block the Telegram adapter implementation (#113). Neither can be resolved
-unilaterally; they require Ocean's explicit sign-off before an implementation PR is opened.
+`khive-channel-email` implements the `Channel` trait for SMTP/IMAP. It is a sibling crate to
+`khive-channel-telegram` at the same platform layer. See related issue #114.
 
-### OQ-1: Inbound `from` field format
+#### Configuration (env-only)
 
-**Source**: DECISIONS #8 (critic finding M2).
+All configuration is read from environment variables at adapter construction. No filesystem
+config files are consulted. Credentials are never defaulted or logged.
 
-The ingest loop sets the `from` field on each inbound note. Two options:
+| Variable                         | Required | Default | Description                                           |
+| -------------------------------- | -------- | ------- | ----------------------------------------------------- |
+| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                   |
+| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                  |
+| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                  |
+| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                    |
+| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                         |
+| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password                         |
+| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 address) |
 
-- **Option A** (current design position): preserve the channel-prefixed external form, e.g.,
-  `"tg:12345678"`. Store `properties.channel_kind` on the note so the agent can see the origin.
-  `comm.inbox` shows the external id, not a logical name.
+When any required variable is absent, `EmailChannelConfig::from_env()` returns
+`ChannelError::Config`. The MCP server logs a warning and skips the email adapter; it does not
+crash.
 
-- **Option B**: resolve `from` to the logical address (`"ocean"`) before writing. The raw
-  external id is visible only via `properties.external_id`. `comm.inbox` shows `"ocean"` as the
-  sender. Simpler for agents; hides the channel origin in the displayed sender field.
+#### Inbound authentication (OQ-2 resolved)
 
-The current implementation uses Option A. Option B is lossy; the channel-prefixed form is not
-recoverable from the note alone once collapsed.
+The adapter enforces a single-maintainer allowlist at the adapter boundary, before any note is
+written. On each inbound email, the `From:` header is parsed to its RFC 5322 addr-spec
+(lowercased, display name stripped). If it does not match `KHIVE_EMAIL_MAINTAINER_ADDRESS`, the
+message is silently dropped and `ChannelError::UnauthorizedSender` is returned. No note is
+written for unauthorized senders.
 
-**Maintainer decision needed**: confirm Option A or choose Option B.
+This resolves OQ-2: the env-var addr-spec comparison is the authoritative check for v1. The
+anonymous actor default for `VerbRegistry::dispatch` is acceptable. No `ActorRef` mapping to
+ADR-053 is required at this layer; the adapter pre-filters before dispatch.
 
-### OQ-2: Inbound auth identity model
+#### Sender address format (OQ-1 resolved)
 
-**Source**: DECISIONS CLAIM #5.
+Inbound envelopes carry the sender's email address in channel-prefixed form:
+`email:sender@example.com`. The `channel_kind` property on the written note is `"email"`.
+`comm.inbox` displays the channel-prefixed address as the sender (Option A from §OQ-1), which
+preserves the external address for agents that need to reply or correlate by sender.
 
-§8 specifies that Telegram inbound auth is by numeric `chat.id` configured via env var. The
-open question is how this identity claim ties to the ADR-053 actor model: specifically, whether
-the ingest loop should present an authenticated `ActorRef` to `VerbRegistry::dispatch` (rather
-than the anonymous default), and if so what `actor.kind` and `actor.id` values are canonical
-for the maintainer's Telegram identity.
+Outbound `ChannelEnvelope.from` values in `email:addr` form have the `email:` prefix stripped
+before the SMTP message is built.
 
-This is a security boundary question: the wrong answer could allow an unauthorized sender's
-message to reach `comm.inbox` if the auth check in the adapter is bypassed.
+This resolves OQ-1: Option A (channel-prefixed form) is the normative choice.
 
-**Maintainer decision needed**: specify the authoritative identity claim and how it maps to
-`ActorRef` fields, or confirm that numeric `chat.id` env-var check in the adapter is sufficient
-and that the anonymous actor default for `dispatch` is acceptable for v1.
+#### Thread correlation via `X-Khive-Thread-ID`
+
+Outbound emails carry a custom `X-Khive-Thread-ID` header whose value is the internal UUID
+`thread_id` of the outbound note. When a reply arrives, the adapter reads this header first; if
+absent, it falls back to the `In-Reply-To` header. The resolved value is passed as
+`correlation_external_id` in the `comm.ingest` dispatch, and the handler performs the two-step
+DB lookup described in §5b.
+
+The inbound `Message-ID` header is used as `external_id` for dedup (§10).
+
+#### Dependencies
+
+The email adapter uses `lettre 0.11` (SMTP, `tokio1-rustls-tls` transport), `async-imap 0.9`
+(IMAP UID fetch), `async-native-tls 0.5` (TLS layer), and `mail-parser 0.9` (RFC 822 parsing).
+These are workspace dependencies; the adapter crate declares them as non-optional.
+
+The `channel-email` feature in `khive-mcp/Cargo.toml` gates the adapter and the polling loop.
+When the feature is disabled (default), the binary compiles without any email dependency. When
+the feature is enabled and the required env vars are present at runtime, the loop starts; when
+they are absent, the loop is skipped with a log warning.
+
+## Open Questions
+
+The open questions from the original Proposed status are resolved by the decisions above and by
+the email adapter implementation (#114).
+
+**OQ-1 (from field format)** -- resolved: Option A (channel-prefixed form, e.g.,
+`email:sender@example.com`) is the normative choice. See §14.
+
+**OQ-2 (inbound auth identity model)** -- resolved: env-var RFC 5322 addr-spec comparison at
+the adapter boundary is sufficient for v1. The anonymous actor default for dispatch is
+acceptable. See §14.
 
 ## Consequences
 
