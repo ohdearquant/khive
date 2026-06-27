@@ -261,6 +261,15 @@ async fn main() -> Result<()> {
 
                 let coord =
                     SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+                // Resolve the ADR-078 output-format default (env > [runtime] TOML >
+                // builtin json) for this serve path too — the single-backend branch
+                // does this inside `serve::run`, but this multi-backend branch builds
+                // the server directly via `from_registry_with_meta`, which defaults to
+                // Json, so without this the fleet's `default_output_format` opt-in is
+                // silently ignored on the daemon's primary serve surface.
+                let output_format = khive_mcp::serve::apply_env_output_format(
+                    khive_cfg.runtime.default_output_format,
+                );
                 let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
                     multi.registry,
                     &multi.default_namespace,
@@ -268,7 +277,8 @@ async fn main() -> Result<()> {
                 )
                 .with_coordinator(
                     Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>
-                );
+                )
+                .with_default_output_format(output_format);
 
                 khive_mcp::serve::serve_server(server, &a, &transport_registry).await
             }

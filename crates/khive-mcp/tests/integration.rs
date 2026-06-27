@@ -4385,3 +4385,90 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
         "verbose op: properties.priority must survive the redundancy-drop pre-pass; rendered: {op1_rendered}"
     );
 }
+
+/// (fmt-4) AlwaysVerbose verbs must skip the redundancy-drop pre-pass under
+/// `format=auto` even with the DEFAULT Agent presentation and NO per-op override.
+///
+/// Pins the round-2 finding: `render_result` recomputed the format-time
+/// presentation only from `presentation_per_op` → batch default, blind to the
+/// `VerbPresentationPolicy::AlwaysVerbose` that `run_parsed` applies. So a
+/// policy-verbose verb (`get`) under `format=auto` with the default Agent mode
+/// was redundancy-dropped, stripping `namespace="local"` and duplicate
+/// `properties` keys it is declared AlwaysVerbose to preserve. The fix folds the
+/// AlwaysVerbose policy into the format-seam presentation. This is the *implicit
+/// policy* sibling of `presentation_per_op_verbose_preserves_*` (explicit override).
+#[tokio::test]
+async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let server = make_format_server();
+
+    // Create a GTD task: assignee/priority/status are echoed in both top-level
+    // and `properties`, and the record carries namespace="local".
+    let create_params = RequestParams {
+        ops: r#"gtd.assign(title="always-verbose-pin", priority="p1", assignee="lambda:test")"#
+            .to_string(),
+        presentation: Some("verbose".to_string()),
+        presentation_per_op: None,
+        save_to: None,
+        format: None,
+        format_per_op: None,
+    };
+    let create_raw = server
+        .dispatch_request_local(create_params)
+        .await
+        .expect("task creation must succeed");
+    let create_body: serde_json::Value = serde_json::from_str(&create_raw).unwrap();
+    let task_id = create_body["results"][0]["result"]["id"]
+        .as_str()
+        .expect("task id must be present");
+
+    // get() is AlwaysVerbose (ADR-045 §6). Dispatch it under format=auto with the
+    // DEFAULT Agent presentation and NO presentation_per_op override. The
+    // AlwaysVerbose policy must force Verbose at the format seam, so the
+    // redundancy-drop pre-pass is skipped and namespace/properties survive.
+    let get_params = RequestParams {
+        ops: format!(r#"get(id="{task_id}")"#),
+        presentation: None,        // → default Agent
+        presentation_per_op: None, // → no per-op override
+        save_to: None,
+        format: Some("auto".to_string()),
+        format_per_op: None,
+    };
+    let raw = server
+        .dispatch_request_local(get_params)
+        .await
+        .expect("get dispatch must succeed");
+
+    let body: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON envelope");
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "single get must produce 1 result");
+    assert_eq!(
+        results[0]["ok"],
+        serde_json::json!(true),
+        "get must succeed: {}",
+        results[0]
+    );
+
+    let rendered = results[0]["result"]
+        .as_str()
+        .expect("get result must be a rendered string under format=auto");
+
+    // namespace="local" is elided under agent+auto (§7.3) but MUST survive for an
+    // AlwaysVerbose verb — this is the regression the round-2 fix closes.
+    assert!(
+        rendered.contains("namespace"),
+        "AlwaysVerbose get: namespace must survive redundancy-drop under format=auto + \
+         default agent (no override); rendered: {rendered}"
+    );
+    // Duplicate properties keys (assignee/priority) are deduped under agent+auto
+    // but MUST survive for an AlwaysVerbose verb.
+    assert!(
+        rendered.contains("assignee"),
+        "AlwaysVerbose get: properties.assignee must survive redundancy-drop; rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("priority"),
+        "AlwaysVerbose get: properties.priority must survive redundancy-drop; rendered: {rendered}"
+    );
+}

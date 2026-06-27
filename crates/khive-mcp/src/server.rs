@@ -1256,6 +1256,7 @@ impl KhiveMcpServer {
             &format_per_op,
             presentation,
             &presentation_per_op,
+            &self.registry,
         ))
     }
 }
@@ -1298,10 +1299,12 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 /// For each op entry in `results`:
 /// - If `ok=false` (error entry): always compact JSON, never reformatted (§8.2).
 /// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format) and
-///   per-op presentation (presentation_per_op[i] → batch presentation), apply
-///   `render_format` to the `result` payload with the effective presentation so
-///   that `presentation_per_op=["verbose"]` correctly skips the redundancy-drop
-///   pre-pass (ADR-078 §7 + §8.4).
+///   per-op presentation (presentation_per_op[i] → batch presentation, then the
+///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
+///   `result` payload with the effective presentation so that both
+///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (get/link/query/
+///   traverse/neighbors/brain.feedback) correctly skip the redundancy-drop
+///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// When the result value is not a compound batch envelope (single-op fast path),
@@ -1312,6 +1315,7 @@ fn render_result(
     format_per_op: &Option<Vec<Option<OutputFormat>>>,
     presentation: PresentationMode,
     presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
+    registry: &VerbRegistry,
 ) -> String {
     // Fast path: if format is json and no per-op overrides, compact-serialize and return.
     if batch_format == OutputFormat::Json && format_per_op.is_none() {
@@ -1329,12 +1333,29 @@ fn render_result(
                     .and_then(|x| *x)
                     .unwrap_or(batch_format);
 
-                // Resolve per-op presentation: per-op entry overrides batch default.
-                let effective_presentation = presentation_per_op
+                // Resolve per-op presentation: per-op entry overrides batch default,
+                // then the AlwaysVerbose verb policy forces Verbose — mirroring the
+                // resolution `run_parsed` applies before presentation. Without this,
+                // a policy-verbose verb (get/link/query/traverse/neighbors/
+                // brain.feedback) dispatched under format=auto/table with the default
+                // Agent presentation would be redundancy-dropped at the format seam,
+                // stripping the namespace/properties it is declared AlwaysVerbose
+                // precisely to preserve.
+                let base_presentation = presentation_per_op
                     .as_ref()
                     .and_then(|v| v.get(i))
                     .and_then(|o| *o)
                     .unwrap_or(presentation);
+                let effective_presentation =
+                    match entry.get("tool").and_then(serde_json::Value::as_str) {
+                        Some(tool)
+                            if registry.presentation_policy_for(tool)
+                                == VerbPresentationPolicy::AlwaysVerbose =>
+                        {
+                            PresentationMode::Verbose
+                        }
+                        _ => base_presentation,
+                    };
 
                 // Error entries are never reformatted (§8.2).
                 let is_ok = entry
