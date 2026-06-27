@@ -46,7 +46,17 @@ In scope: agent-facing verb surface, handler visibility, composition semantics, 
 rules, the pack template.
 
 Not in scope: the foundational `Pack` / `PackRuntime` traits themselves (ADR-017), the
-storage placement model (ADR-028), inventory-based discovery (ADR-027).
+storage placement model (ADR-028), inventory-based discovery (ADR-027), or response
+serialization and rendering format (governed by ADR-045 `PresentationMode` and the ADR-078
+`format` axis).
+
+**Note on response format (ADR-078)**: The `request` tool wire envelope accepts a `format`
+parameter (`json` | `auto` | `table`) that selects the output serialization strategy.
+When `format` is not `json`, the response payload is a rendered non-JSON string (markdown table
+or flat key-value block) rather than a JSON structure. `format=json` is the canonical lossless
+machine-readable form and the required choice for any caller that parses the response
+programmatically. Pack handlers always return `Result<serde_json::Value, _>`; they have no
+awareness of the `format` axis.
 
 ## Decision
 

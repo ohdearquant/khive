@@ -3,6 +3,10 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: Ocean, lambda:khive
+**Extended by**: ADR-078 (Output Format and Shape-Aware Rendering), which introduces an orthogonal
+`format` axis (`json` / `auto` / `table`) and revises Agent-mode redundancy rules. ADR-078
+§7.1 partially supersedes the P-C1 implementation behavior that kept `full_id` present in all
+modes; see the note below at the `include_full_id` override section.
 **Depends on**:
 
 - ADR-016 (Request DSL — short-UUID-prefix resolution on input)
@@ -138,6 +142,12 @@ Independent of `PresentationMode`, callers may pass `include_full_id=true` at th
 envelope level (alongside `presentation`) to force full UUIDs in the response even
 under `PresentationMode::Agent` (which normally returns 8-char shortcodes). This is
 a separate axis from presentation mode and does NOT create a fourth mode.
+
+> **Note (ADR-078 §7.1)**: ADR-078 makes `full_id` suppression explicit for `format=auto` and
+> `format=table`. In those formats, `full_id` is omitted regardless of `PresentationMode`. It is
+> retained in `format=json`, in `PresentationMode::Verbose`, and when `include_full_id=true` is
+> set. This resolves the discrepancy between this ADR's stated "NOT included by default" intent
+> and the P-C1 code rule in `presentation.rs` that was keeping `full_id` unconditionally.
 
 Score truncation preserves ordering (3 sig figs is enough to compare scores)
 without burning tokens on float noise.
