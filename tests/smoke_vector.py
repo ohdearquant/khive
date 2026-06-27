@@ -13,9 +13,15 @@ spawning kkernel. If the model weights are not on disk the gate prints SKIP and
 exits 0 without touching the network. This keeps `make ci` clean on fresh
 machines and CI runners without model weights.
 
+The gate validates the default primary embedder (all-minilm-l6-v2) only.
+Both memory.remember and memory.recall are pinned to that model via the
+embedding_model arg, so kkernel's multi-model fan-out (it also registers
+paraphrase-multilingual-minilm-l12-v2 by default) never targets an uncached
+secondary model. Embedders are lazy-loaded via OnceCell, so an untargeted
+model is never built and never downloaded.
+
 Set KHIVE_NO_EMBED=1 to bypass the gate unconditionally.
 Set LATTICE_MODEL_CACHE to override the default model cache directory.
-Set KHIVE_EMBEDDING_MODEL to override the default model name (subdirectory).
 
 Usage:
     python3 tests/smoke_vector.py
@@ -25,6 +31,14 @@ import json
 import os
 import subprocess
 import sys
+
+# Primary embedder validated by this gate. Pinning both memory.remember and
+# memory.recall to this model prevents kkernel's multi-model fan-out
+# (operations.rs:2055) from targeting the secondary default model
+# (paraphrase-multilingual-minilm-l12-v2), which may not be cached. Embedders
+# are OnceCell lazy-loaded (embedder_registry.rs:52,55,156), so an untargeted
+# model is never built and never downloads from HuggingFace.
+EMBED_MODEL = "all-minilm-l6-v2"
 
 BINARY = os.environ.get(
     "KKERNEL_BINARY",
@@ -191,6 +205,7 @@ def test_vector_round_trip_and_recall_at_1():
                 "content": content,
                 "salience": 0.9,
                 "memory_type": "semantic",
+                "embedding_model": EMBED_MODEL,
             })
             assert result is not None, f"memory.remember must return a result for {key!r}"
             item_id = result.get("id")
@@ -208,6 +223,7 @@ def test_vector_round_trip_and_recall_at_1():
             hits = call_verb(proc, "memory.recall", {
                 "query": query,
                 "limit": len(ITEMS),
+                "embedding_model": EMBED_MODEL,
             })
 
             # Vectors actually written: recall must return at least one hit.
@@ -278,7 +294,7 @@ def main():
     cache_dir = os.environ.get("LATTICE_MODEL_CACHE") or os.path.join(
         os.path.expanduser("~"), ".lattice", "models"
     )
-    model = os.environ.get("KHIVE_EMBEDDING_MODEL", "all-minilm-l6-v2")
+    model = EMBED_MODEL
     model_dir = os.path.join(cache_dir, model)
     weights_present = os.path.exists(os.path.join(model_dir, "model.safetensors"))
     tokenizer_present = (
