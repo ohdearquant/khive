@@ -409,6 +409,16 @@ _ATOM_CONTENT_EPIST = (
     "systematic inquiry builds justified belief structures over time"
 )
 
+# Trigram-disjoint from "zymurgical" (no zym/ymu/mur/urg/rgi/gic/ica/cal
+# trigrams): used as the negative control proving FTS actually matched the
+# query rather than the public search path's full-scan fallback.
+_ATOM_CONTENT_PHOTO = (
+    "Photosynthetic chloroplast organelles within terrestrial flora harvest "
+    "incoming solar radiation thereby driving carbon fixation through light "
+    "dependent reactions that build glucose energy stores sustaining cellular "
+    "respiration across entire plant tissues daily"
+)
+
 # ≥80 characters, valid section_type
 _SECTION_CONTENT_OVERVIEW = (
     "An overview section providing detailed technical information about the atom "
@@ -450,22 +460,35 @@ def test_upsert_atoms_write_path(proc):
 
 
 def test_search_finds_draft_atoms(proc):
-    """search with include_drafts=True returns draft atoms by distinctive lexical token.
+    """search with include_drafts=True matches a draft atom by its distinctive token.
 
     Atoms are status=draft by default; search excludes drafts unless include_drafts=True.
-    FTS is lexical and works without embedding, so this is a real content assertion.
+    FTS is lexical and works without embedding. The public search path falls back to a
+    full scan (returning every atom at score 0.0) when FTS yields no rows, so a single
+    upserted atom would appear even if FTS matching were broken. To prove the FTS MATCH
+    actually fired we add a trigram-disjoint control atom (photo-search) and assert the
+    query (a) returns the matching atom with a positive score and (b) EXCLUDES the
+    control — both of which fail under the full-scan fallback.
     """
     call_verb(proc, "knowledge.upsert_atoms", {
         "atoms": [
             {"slug": "brew-search", "name": "BrewSearch", "content": _ATOM_CONTENT_BREW},
+            {"slug": "photo-search", "name": "PhotoSearch", "content": _ATOM_CONTENT_PHOTO},
         ]
     })
     r = call_verb(proc, "knowledge.search", {"query": "zymurgical", "include_drafts": True})
-    assert r["total"] >= 1, f"expected >=1 atom matching 'zymurgical': {r}"
     results = r.get("results", [])
-    slugs = [item["slug"] for item in results]
-    assert "brew-search" in slugs, f"brew-search not in search results: {slugs}"
-    print("  [ok] search finds draft atoms with include_drafts=True")
+    by_slug = {item["slug"]: item for item in results}
+    assert "brew-search" in by_slug, f"brew-search not in search results: {list(by_slug)}"
+    assert "photo-search" not in by_slug, (
+        f"photo-search (no 'zymurgical' trigrams) leaked into results — FTS MATCH bypassed "
+        f"by the full-scan fallback: {list(by_slug)}"
+    )
+    assert by_slug["brew-search"].get("score", 0) > 0, (
+        f"brew-search returned at score 0 — that is the fallback score, not an FTS match: "
+        f"{by_slug['brew-search']}"
+    )
+    print("  [ok] search FTS-matches draft atom and excludes trigram-disjoint control")
 
 
 def test_edit_sections_roundtrip(proc):
