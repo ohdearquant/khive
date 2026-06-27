@@ -62,8 +62,10 @@ unavailable (0). Both fields are populated by the bench binary at run time.
 ## bench-runs/ provenance JSON schema
 
 Each file in `bench-runs/` is the complete output JSON from one bench invocation,
-named `{YYYYMMDD}-{sha7}-{dataset}.json`. These files are committed to the
-repository and provide the authoritative provenance record for each banked row.
+named `{YYYYMMDD}-{sha7}-{dataset}.json`. These files are **gitignored** (see
+`.gitignore` entry for `perf/bench-runs/*.json`) to keep PRs code-only. They are
+written locally by `bench_1m.sh` and can be uploaded as CI artifacts if needed for
+auditing, but they are not committed to the repository.
 
 Top-level fields in each JSON:
 
@@ -127,9 +129,9 @@ These are **different runs with different configurations**, not measurement erro
    N = 1M, yielding roughly half the query latency (171 µs vs 334 µs).
 2. The PR #153 brute-force figure (58 330 µs back-derived) is arithmetically
    reconstructed and reflects the brute-force measurement from that run but
-   cannot be independently verified without a committed raw JSON. Future runs
-   commit raw JSON to `bench-runs/`, making the directly measured `bruteforce_p50_us`
-   auditable and the speedup ratio independently verifiable.
+   cannot be independently verified. Future runs write raw JSON to `bench-runs/`
+   (locally; gitignored), making the directly measured `bruteforce_p50_us`
+   available for local audit and uploadable as a CI artifact.
 3. The 34x figure (ADR-054) is the result for a higher-beam configuration and
    is NOT a contradiction of 341x; both are internally consistent for their
    respective run parameters.
@@ -137,8 +139,8 @@ These are **different runs with different configurations**, not measurement erro
 The actionable conclusion: the headline speedup figure depends materially on
 the iso-recall beam used. The 341x figure is valid for the iso-recall
 beam-optimal configuration at N = 1M. Future comparison runs should confirm
-`bruteforce_p50_us` from the committed `bench-runs/` JSON rather than the
-back-derived ledger value.
+`bruteforce_p50_us` from the `bench-runs/` JSON (written locally by the bench
+harness) rather than the back-derived ledger value.
 
 ---
 
