@@ -13,7 +13,7 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// condition is always satisfied and the index is eligible.
 /// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
 /// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -28,9 +28,12 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
         json_extract(properties, '$.read'), \
         created_at DESC) \
         WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_external_id \
+        ON notes(namespace, kind, json_extract(properties, '$.external_id')) \
+        WHERE deleted_at IS NULL",
 ];
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 5] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -132,6 +135,74 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 5] = [
                 param_type: "integer",
                 required: false,
                 description: "Max messages to return. Default 100, max 500.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.ingest",
+        description: "Ingest an inbound message from a channel adapter. Subhandler — not callable on the MCP wire.",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: true,
+                description: "Target namespace for the ingested message note.",
+            },
+            ParamDef {
+                name: "from",
+                param_type: "string",
+                required: true,
+                description: "Sender address in `channel-kind:addr` form (e.g. `email:alice@example.com`).",
+            },
+            ParamDef {
+                name: "to",
+                param_type: "string",
+                required: true,
+                description: "Recipient address in `channel-kind:addr` form.",
+            },
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: true,
+                description: "Message body text.",
+            },
+            ParamDef {
+                name: "subject",
+                param_type: "string",
+                required: false,
+                description: "Optional subject line.",
+            },
+            ParamDef {
+                name: "thread_id",
+                param_type: "uuid",
+                required: false,
+                description: "Optional internal thread UUID. When absent, a new thread root is created.",
+            },
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: false,
+                description: "Channel kind identifier (e.g. `email`).",
+            },
+            ParamDef {
+                name: "external_id",
+                param_type: "string",
+                required: false,
+                description: "External deduplication key (e.g. RFC 822 Message-ID). Duplicate messages are silently ignored.",
+            },
+            ParamDef {
+                name: "sent_at",
+                param_type: "string",
+                required: false,
+                description: "RFC 3339 timestamp of the original message.",
+            },
+            ParamDef {
+                name: "correlation_external_id",
+                param_type: "string",
+                required: false,
+                description: "External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID or In-Reply-To header value).",
             },
         ],
     },

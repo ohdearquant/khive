@@ -40,11 +40,11 @@ fn comm_pack_declares_message_note_kind() {
 }
 
 #[test]
-fn comm_pack_declares_five_handlers() {
+fn comm_pack_declares_six_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        5,
-        "comm pack must declare 5 handlers: send, inbox, read, reply, thread"
+        6,
+        "comm pack must declare 6 handlers: send, inbox, read, reply, thread, ingest"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
@@ -54,6 +54,10 @@ fn comm_pack_declares_five_handlers() {
     assert!(
         names.contains(&"comm.thread"),
         "comm.thread verb must be registered"
+    );
+    assert!(
+        names.contains(&"comm.ingest"),
+        "comm.ingest verb must be registered"
     );
 }
 
