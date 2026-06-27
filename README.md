@@ -117,6 +117,31 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ---
 
+## Performance
+
+Knowledge search runs on an in-process Vamana ANN index (`khive-vamana`). On the standard
+SIFT-1M benchmark, the index returns **recall@10 of 0.95 at a p50 query latency of 171µs over
+1,000,000 vectors**, measured on a single laptop (macos-arm64, commit `eb6696c`). Tail latency
+stays under 250µs and the index scales sublinearly as the corpus grows from 100K to 1M vectors:
+
+| Vectors | Recall@10 | p50   | p95   | p99   | Build  |
+| ------- | --------- | ----- | ----- | ----- | ------ |
+| 100K    | 0.9504    | 71µs  | 93µs  | 102µs | 11.1s  |
+| 316K    | 0.9523    | 130µs | 177µs | 200µs | 54.6s  |
+| 1M      | 0.9521    | 171µs | 216µs | 234µs | 320.8s |
+
+Query latency grows about 2.4x while the corpus grows 10x, so the search path is sublinear in
+corpus size over this range. Index build is a one-time cost paid at construction; it grows
+super-linearly here (about 29x build time for the 10x corpus).
+
+The speedups over exhaustive search implied by these latencies (89x at 100K, 153x at 316K, 341x
+at 1M) are computed against a back-derived brute-force baseline rather than a directly measured
+one (see [#167](https://github.com/ohdearquant/khive/issues/167)); treat them as indicative, not
+as a measured headline figure. The benchmark harness lives in `perf/`; raw data is in
+[`perf/ledger.csv`](perf/ledger.csv).
+
+---
+
 ## Crates
 
 | Crate                  | Purpose                                                                                                   |
