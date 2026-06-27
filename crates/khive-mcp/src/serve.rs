@@ -52,7 +52,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
                 ch_registry.register(Arc::new(email_ch));
                 let ch_registry = Arc::new(ch_registry);
                 let verb_reg = server.verb_registry_clone();
-                tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg));
+                let ingest_ns = ingest_namespace_from_env();
+                tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg, ingest_ns));
                 tracing::info!("email channel polling loop started");
             }
             Err(e) => {
@@ -89,6 +90,19 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     transport.serve(server, &opts).await
 }
 
+/// Resolve the target namespace for ingested channel messages.
+///
+/// Reads `KHIVE_EMAIL_INGEST_NAMESPACE`; falls back to `"local"` when the
+/// variable is unset or blank. Called once at server startup before the poll
+/// loop is spawned.
+#[cfg(feature = "channel-email")]
+fn ingest_namespace_from_env() -> String {
+    std::env::var("KHIVE_EMAIL_INGEST_NAMESPACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -97,6 +111,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 async fn channel_poll_loop(
     channels: std::sync::Arc<khive_channel::ChannelRegistry>,
     registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
 ) {
     use chrono::Utc;
     use serde_json::json;
@@ -114,7 +129,7 @@ async fn channel_poll_loop(
                 Ok(envelopes) => {
                     for env in envelopes {
                         let params = json!({
-                            "namespace": "local",
+                            "namespace": ingest_namespace,
                             "from": env.from,
                             "to": env.to,
                             "content": env.content,
@@ -1809,6 +1824,38 @@ brain_profile = "project-profile"
             "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
              got count={second_entity_count}"
         );
+    }
+
+    // --- ingest_namespace_from_env (Fix 4: namespace env var) ---
+
+    #[cfg(feature = "channel-email")]
+    mod ingest_ns_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_defaults_to_local() {
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ingest_namespace_from_env(), "local");
+        }
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_reads_env_var() {
+            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "lambda:mybot");
+            let ns = ingest_namespace_from_env();
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ns, "lambda:mybot");
+        }
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "  ");
+            let ns = ingest_namespace_from_env();
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ns, "local", "blank env var must fall back to default");
+        }
     }
 
     // --- should_warn_unattributed predicate ---
