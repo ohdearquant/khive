@@ -546,8 +546,10 @@ pub(crate) async fn handle_thread(
 /// reads its `thread_id`, and attaches the new note to the same thread.
 ///
 /// Deduplication: when `external_id` is supplied, `try_create_note` uses
-/// `INSERT OR IGNORE` against the durable unique index on `external_id`.  A
-/// duplicate returns `Ok(None)` without error; the call is an idempotent no-op.
+/// a verify-after-insert check on the durable unique index on `external_id`.
+/// A confirmed duplicate returns `Ok(None)` without error; only an
+/// external_id collision is treated as dedup — other constraint violations
+/// surface as errors.
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,

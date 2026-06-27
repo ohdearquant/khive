@@ -191,7 +191,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
                 name: "external_id",
                 param_type: "string",
                 required: false,
-                description: "External deduplication key (e.g. RFC 822 Message-ID). Duplicate messages are silently ignored.",
+                description: "Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.",
             },
             ParamDef {
                 name: "sent_at",

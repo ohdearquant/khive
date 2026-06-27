@@ -74,7 +74,7 @@ pub(crate) struct IngestParams {
     pub thread_id: Option<String>,
     #[serde(default)]
     pub channel_kind: Option<String>,
-    /// External deduplication key (e.g. RFC 822 Message-ID). Duplicates are silently ignored.
+    /// Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.
     #[serde(default)]
     pub external_id: Option<String>,
     /// RFC 3339 timestamp of the original message.
