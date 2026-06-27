@@ -1,0 +1,284 @@
+//! Channel transport abstraction (ADR-056).
+//!
+//! This crate defines the `Channel` trait, `ChannelEnvelope`, `ChannelRegistry`, and
+//! `ChannelError`. Concrete transport adapters (e.g. `khive-channel-email`) implement
+//! the `Channel` trait; the MCP server polls registered channels and ingests inbound
+//! messages via the `comm.ingest` subhandler verb.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// A message envelope passed between the channel transport and the runtime.
+///
+/// Outbound envelopes are produced by the runtime and delivered by a `Channel`.
+/// Inbound envelopes are produced by a `Channel` and consumed by the polling loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEnvelope {
+    /// Sender address in `channel-kind:address` form, e.g. `email:alice@example.com`.
+    pub from: String,
+    /// Recipient address in `channel-kind:address` form.
+    pub to: String,
+    /// Message body (plain text).
+    pub content: String,
+    /// Optional subject line (used by email and similar channels).
+    pub subject: Option<String>,
+    /// RFC 3339 timestamp of when the message was originally sent or received.
+    pub sent_at: Option<DateTime<Utc>>,
+    /// External deduplication key (e.g. RFC 822 Message-ID for email).
+    pub external_id: Option<String>,
+    /// External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID header
+    /// or In-Reply-To header value for email). The handler resolves this to an internal UUID.
+    pub correlation_external_id: Option<String>,
+    /// Arbitrary transport-specific key-value metadata.
+    pub metadata: HashMap<String, String>,
+}
+
+impl ChannelEnvelope {
+    /// Create a minimal outbound envelope.
+    pub fn new(from: impl Into<String>, to: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            content: content.into(),
+            subject: None,
+            sent_at: None,
+            external_id: None,
+            correlation_external_id: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Attach a subject line.
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    /// Attach a sent-at timestamp.
+    pub fn with_sent_at(mut self, ts: DateTime<Utc>) -> Self {
+        self.sent_at = Some(ts);
+        self
+    }
+
+    /// Attach an external deduplication key.
+    pub fn with_external_id(mut self, id: impl Into<String>) -> Self {
+        self.external_id = Some(id.into());
+        self
+    }
+
+    /// Attach a correlation key for thread resolution.
+    pub fn with_correlation(mut self, correlation: impl Into<String>) -> Self {
+        self.correlation_external_id = Some(correlation.into());
+        self
+    }
+}
+
+/// Errors produced by channel operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    /// Configuration is missing or invalid.
+    #[error("channel configuration error: {0}")]
+    Config(String),
+    /// Transport-level connection or I/O failure.
+    #[error("transport error: {0}")]
+    Transport(String),
+    /// Authentication failure (TLS, credentials, etc.).
+    #[error("authentication error: {0}")]
+    Auth(String),
+    /// Message was rejected because the sender is not authorized.
+    #[error("unauthorized sender: {0}")]
+    UnauthorizedSender(String),
+    /// The envelope is malformed or missing required fields.
+    #[error("invalid envelope: {0}")]
+    InvalidEnvelope(String),
+}
+
+/// A channel transport adapter.
+///
+/// Implementors handle outbound delivery (`send`) and inbound polling (`poll`).
+/// Each adapter is identified by a stable kind string (e.g. `"email"`).
+#[async_trait]
+pub trait Channel: Send + Sync + 'static {
+    /// Short stable identifier for this transport (e.g. `"email"`, `"telegram"`).
+    fn kind(&self) -> &'static str;
+
+    /// Send a single outbound message.
+    async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError>;
+
+    /// Poll for new inbound messages since `since`.
+    ///
+    /// Returns envelopes ready to be ingested. Callers are responsible for
+    /// deduplication via `external_id`; adapters should apply a best-effort
+    /// server-side filter on `since` to avoid fetching large backlogs.
+    async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError>;
+}
+
+/// Registry of named channel adapters.
+///
+/// The MCP server holds an `Arc<ChannelRegistry>` and polls all registered
+/// channels in a background loop, ingesting results via `comm.ingest`.
+#[derive(Default)]
+pub struct ChannelRegistry {
+    channels: HashMap<String, Arc<dyn Channel>>,
+}
+
+impl ChannelRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a channel adapter. Replaces any previous adapter with the same `kind`.
+    pub fn register(&mut self, channel: Arc<dyn Channel>) {
+        self.channels.insert(channel.kind().to_string(), channel);
+    }
+
+    /// Look up a channel by kind.
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn Channel>> {
+        self.channels.get(kind).cloned()
+    }
+
+    /// Iterate over all registered channels.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn Channel>)> {
+        self.channels.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Returns `true` if no channels are registered.
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    /// Number of registered channels.
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
+}
+
+/// Generate a new correlation ID suitable for embedding in a message header.
+pub fn new_thread_correlation_id() -> String {
+    Uuid::new_v4().as_hyphenated().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct MockChannel {
+        sent: Arc<Mutex<Vec<ChannelEnvelope>>>,
+        inbound: Vec<ChannelEnvelope>,
+    }
+
+    impl MockChannel {
+        fn new(inbound: Vec<ChannelEnvelope>) -> Self {
+            Self {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                inbound,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+            self.sent.lock().unwrap().push(envelope);
+            Ok(())
+        }
+
+        async fn poll(&self, _since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+            Ok(self.inbound.clone())
+        }
+    }
+
+    #[test]
+    fn envelope_builder_fields() {
+        let ts = Utc::now();
+        let env = ChannelEnvelope::new("email:a@example.com", "email:b@example.com", "hello")
+            .with_subject("Test")
+            .with_sent_at(ts)
+            .with_external_id("<msg1@example.com>")
+            .with_correlation("correlation-uuid");
+
+        assert_eq!(env.from, "email:a@example.com");
+        assert_eq!(env.to, "email:b@example.com");
+        assert_eq!(env.content, "hello");
+        assert_eq!(env.subject.as_deref(), Some("Test"));
+        assert_eq!(env.sent_at, Some(ts));
+        assert_eq!(env.external_id.as_deref(), Some("<msg1@example.com>"));
+        assert_eq!(
+            env.correlation_external_id.as_deref(),
+            Some("correlation-uuid")
+        );
+    }
+
+    #[test]
+    fn registry_register_and_get() {
+        let mut reg = ChannelRegistry::new();
+        let ch = Arc::new(MockChannel::new(vec![]));
+        reg.register(ch);
+        assert!(reg.get("mock").is_some());
+        assert!(reg.get("email").is_none());
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn registry_replaces_existing() {
+        let mut reg = ChannelRegistry::new();
+        reg.register(Arc::new(MockChannel::new(vec![])));
+        reg.register(Arc::new(MockChannel::new(vec![])));
+        assert_eq!(reg.len(), 1, "same kind replaces");
+    }
+
+    #[test]
+    fn registry_iter_yields_all() {
+        let mut reg = ChannelRegistry::new();
+        reg.register(Arc::new(MockChannel::new(vec![])));
+        let kinds: Vec<&str> = reg.iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, vec!["mock"]);
+    }
+
+    #[test]
+    fn channel_error_display() {
+        let e = ChannelError::Config("missing host".into());
+        assert!(e.to_string().contains("missing host"));
+        let e2 = ChannelError::UnauthorizedSender("attacker@example.com".into());
+        assert!(e2.to_string().contains("attacker@example.com"));
+    }
+
+    #[test]
+    fn new_thread_correlation_id_is_uuid() {
+        let id = new_thread_correlation_id();
+        assert!(
+            id.parse::<Uuid>().is_ok(),
+            "correlation id must be a valid UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_channel_send_and_poll() {
+        let inbound =
+            vec![
+                ChannelEnvelope::new("email:sender@example.com", "email:me@example.com", "body")
+                    .with_external_id("<id1@example.com>"),
+            ];
+        let ch = Arc::new(MockChannel::new(inbound.clone()));
+        let env_out =
+            ChannelEnvelope::new("email:me@example.com", "email:them@example.com", "reply");
+        ch.send(env_out).await.expect("send ok");
+        assert_eq!(ch.sent.lock().unwrap().len(), 1);
+
+        let polled = ch.poll(Utc::now()).await.expect("poll ok");
+        assert_eq!(polled.len(), 1);
+        assert_eq!(polled[0].external_id.as_deref(), Some("<id1@example.com>"));
+    }
+}
