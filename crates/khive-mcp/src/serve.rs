@@ -53,10 +53,17 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
                 let ch_registry = Arc::new(ch_registry);
                 let verb_reg = server.verb_registry_clone();
                 let ingest_ns = ingest_namespace_from_env();
-                if preflight_ingest_namespace(&ingest_ns, &verb_reg) {
-                    tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg, ingest_ns));
+                let ingest_ns_clone = ingest_ns.clone();
+                let verb_reg_clone = verb_reg.clone();
+                let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+                    tokio::task::spawn(channel_poll_loop(
+                        ch_registry,
+                        verb_reg_clone,
+                        ingest_ns_clone,
+                    ));
                     tracing::info!("email channel polling loop started");
-                } else {
+                });
+                if !spawned {
                     tracing::error!(
                         namespace = %ingest_ns,
                         "email channel polling loop NOT started: ingest namespace authorization failed (fail-closed)"
@@ -108,6 +115,25 @@ fn ingest_namespace_from_env() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Run `on_authorized` only when the ingest namespace passes the preflight check.
+///
+/// Returns `true` when the closure was called (preflight passed), `false`
+/// otherwise.  Tests can inject a counting closure to verify the loop is not
+/// started when preflight fails (ADR-056 §6 fail-closed contract).
+#[cfg(feature = "channel-email")]
+fn run_if_authorized(
+    ns_str: &str,
+    registry: &khive_runtime::VerbRegistry,
+    on_authorized: impl FnOnce(),
+) -> bool {
+    if preflight_ingest_namespace(ns_str, registry) {
+        on_authorized();
+        true
+    } else {
+        false
+    }
 }
 
 /// Validate and authorize the ingest namespace before spawning the poll loop.
@@ -1942,6 +1968,66 @@ brain_profile = "project-profile"
             assert!(
                 preflight_ingest_namespace("local", &registry),
                 "preflight must return true for a valid namespace when the gate allows"
+            );
+        }
+
+        // --- spawn-seam tests: verify the loop is NOT started on preflight failure ---
+
+        #[test]
+        fn spawn_not_called_when_gate_denies() {
+            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
+            use std::fmt;
+
+            #[derive(Debug)]
+            struct AlwaysDenyGate2;
+            impl fmt::Display for AlwaysDenyGate2 {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "AlwaysDenyGate2")
+                }
+            }
+            impl Gate for AlwaysDenyGate2 {
+                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                    Ok(GateDecision::deny("spawn seam test: always deny"))
+                }
+            }
+
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate2));
+            let registry = builder.build().expect("build registry with deny gate");
+
+            let mut spawn_count = 0usize;
+            let authorized = run_if_authorized("local", &registry, || {
+                spawn_count += 1;
+            });
+
+            assert!(
+                !authorized,
+                "run_if_authorized must return false when gate denies"
+            );
+            assert_eq!(
+                spawn_count, 0,
+                "spawn must not be called when preflight fails"
+            );
+        }
+
+        #[test]
+        fn spawn_not_called_when_namespace_invalid() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build empty registry");
+
+            let mut spawn_count = 0usize;
+            let authorized = run_if_authorized("", &registry, || {
+                spawn_count += 1;
+            });
+
+            assert!(
+                !authorized,
+                "run_if_authorized must return false for invalid namespace"
+            );
+            assert_eq!(
+                spawn_count, 0,
+                "spawn must not be called when namespace is invalid"
             );
         }
     }
