@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke + behavioural tests for the knowledge pack verbs (learn / cite / topic).
+"""Smoke + behavioural tests for the knowledge pack verbs.
+
+Covers: learn / cite / topic (behavioural) and upsert_atoms / list / get /
+search / edit / delete_atoms / stats / fold / suggest / compose (write-path
+round-trip + dispatch shape).
 
 Spawns khive-mcp with an in-memory DB, --no-embed, and --pack kg --pack knowledge,
 then drives every advertised behaviour through the MCP stdio `request` tool.
@@ -391,6 +395,252 @@ def test_cite_nonexistent_source(proc):
     print(f"  [ok] cite nonexistent source -> error ({err[:60]})")
 
 
+# ── content fixtures (≥20 words, lexically distinctive) ──────────────────────
+
+_ATOM_CONTENT_BREW = (
+    "Zymurgical fermentation processes in ancient brewing traditions where "
+    "yeast converts sugars into ethanol through anaerobic metabolic pathways "
+    "producing distinctive flavor compounds and carbonation effects"
+)
+
+_ATOM_CONTENT_EPIST = (
+    "Quizzical epistemological frameworks for analyzing knowledge acquisition "
+    "through Socratic dialogue where questions reveal hidden assumptions and "
+    "systematic inquiry builds justified belief structures over time"
+)
+
+# Trigram-disjoint from "zymurgical" (no zym/ymu/mur/urg/rgi/gic/ica/cal
+# trigrams): used as the negative control proving FTS actually matched the
+# query rather than the public search path's full-scan fallback.
+_ATOM_CONTENT_PHOTO = (
+    "Photosynthetic chloroplast organelles within terrestrial flora harvest "
+    "incoming solar radiation thereby driving carbon fixation through light "
+    "dependent reactions that build glucose energy stores sustaining cellular "
+    "respiration across entire plant tissues daily"
+)
+
+# ≥80 characters, valid section_type
+_SECTION_CONTENT_OVERVIEW = (
+    "An overview section providing detailed technical information about the atom "
+    "and how it integrates with the knowledge pack smoke test harness for regression coverage"
+)
+
+_DOMAIN_DESC = (
+    "A comprehensive test domain for smoke testing purposes covering "
+    "all aspects of the knowledge pack verb surface and integration tests "
+    "within the khive system for quality assurance and regression prevention"
+)
+
+
+# ── new test functions ────────────────────────────────────────────────────────
+
+def test_upsert_atoms_write_path(proc):
+    """upsert_atoms → list → get confirm the basic write path is wired end-to-end."""
+    r = call_verb(proc, "knowledge.upsert_atoms", {
+        "atoms": [
+            {"slug": "brew-atom", "name": "BrewAtom", "content": _ATOM_CONTENT_BREW, "tags": ["smoke"]},
+            {"slug": "epist-atom", "name": "EpistAtom", "content": _ATOM_CONTENT_EPIST, "tags": ["smoke"]},
+        ]
+    })
+    assert r["created"] == 2, f"expected created=2: {r}"
+    assert r["updated"] == 0, f"expected updated=0: {r}"
+    assert r["total"] == 2, f"expected total=2: {r}"
+
+    listed = call_verb(proc, "knowledge.list", {"limit": 10})
+    assert listed["total"] == 2, f"expected list total=2: {listed}"
+    slugs = {item["slug"] for item in listed.get("results", [])}
+    assert "brew-atom" in slugs, f"brew-atom missing from list: {slugs}"
+    assert "epist-atom" in slugs, f"epist-atom missing from list: {slugs}"
+
+    fetched = call_verb(proc, "knowledge.get", {"id": "brew-atom"})
+    assert fetched["name"] == "BrewAtom", f"wrong name: {fetched}"
+    assert fetched["slug"] == "brew-atom", f"wrong slug: {fetched}"
+    assert fetched["kind"] == "atom", f"wrong kind: {fetched}"
+    print("  [ok] upsert_atoms write path (upsert → list → get)")
+
+
+def test_search_finds_draft_atoms(proc):
+    """search with include_drafts=True matches a draft atom by its distinctive token.
+
+    Atoms are status=draft by default; search excludes drafts unless include_drafts=True.
+    FTS is lexical and works without embedding. The public search path falls back to a
+    full scan (returning every atom at score 0.0) when FTS yields no rows, so a single
+    upserted atom would appear even if FTS matching were broken. To prove the FTS MATCH
+    actually fired we add a trigram-disjoint control atom (photo-search) and assert the
+    query (a) returns the matching atom with a positive score and (b) EXCLUDES the
+    control — both of which fail under the full-scan fallback.
+    """
+    call_verb(proc, "knowledge.upsert_atoms", {
+        "atoms": [
+            {"slug": "brew-search", "name": "BrewSearch", "content": _ATOM_CONTENT_BREW},
+            {"slug": "photo-search", "name": "PhotoSearch", "content": _ATOM_CONTENT_PHOTO},
+        ]
+    })
+    r = call_verb(proc, "knowledge.search", {"query": "zymurgical", "include_drafts": True})
+    results = r.get("results", [])
+    by_slug = {item["slug"]: item for item in results}
+    assert "brew-search" in by_slug, f"brew-search not in search results: {list(by_slug)}"
+    assert "photo-search" not in by_slug, (
+        f"photo-search (no 'zymurgical' trigrams) leaked into results — FTS MATCH bypassed "
+        f"by the full-scan fallback: {list(by_slug)}"
+    )
+    assert by_slug["brew-search"].get("score", 0) > 0, (
+        f"brew-search returned at score 0 — that is the fallback score, not an FTS match: "
+        f"{by_slug['brew-search']}"
+    )
+    print("  [ok] search FTS-matches draft atom and excludes trigram-disjoint control")
+
+
+def test_edit_sections_roundtrip(proc):
+    """edit upserts a section; get(include_sections=True) returns it persisted."""
+    call_verb(proc, "knowledge.upsert_atoms", {
+        "atoms": [{"slug": "edit-smoke", "name": "EditSmoke", "content": _ATOM_CONTENT_BREW}]
+    })
+    edit_r = call_verb(proc, "knowledge.edit", {
+        "id": "edit-smoke",
+        "sections": [{"section_type": "overview", "content": _SECTION_CONTENT_OVERVIEW}],
+    })
+    assert edit_r["upserted"] == 1, f"expected upserted=1: {edit_r}"
+    inline_sections = edit_r.get("sections", [])
+    assert len(inline_sections) == 1, f"expected 1 section in edit response: {inline_sections}"
+    assert inline_sections[0]["section_type"] == "overview", (
+        f"wrong section_type in edit response: {inline_sections[0]}"
+    )
+
+    fetched = call_verb(proc, "knowledge.get", {"id": "edit-smoke", "include_sections": True})
+    stored = fetched.get("sections", [])
+    assert len(stored) >= 1, f"expected sections after edit: {fetched}"
+    types = [s["section_type"] for s in stored]
+    assert "overview" in types, f"overview section missing after edit: {types}"
+    print("  [ok] edit sections roundtrip")
+
+
+def test_delete_atoms_removes_atom(proc):
+    """delete_atoms removes the atom; subsequent get returns a per-op error."""
+    call_verb(proc, "knowledge.upsert_atoms", {
+        "atoms": [{"slug": "del-smoke", "name": "DelSmoke", "content": _ATOM_CONTENT_BREW}]
+    })
+    del_r = call_verb(proc, "knowledge.delete_atoms", {"ids": ["del-smoke"]})
+    assert del_r["deleted"] == 1, f"expected deleted=1: {del_r}"
+    assert del_r["requested"] == 1, f"expected requested=1: {del_r}"
+
+    err = call_verb_expect_error(proc, "knowledge.get", {"id": "del-smoke"})
+    assert err, "expected non-empty error after delete"
+    assert "not found" in err.lower(), f"error must mention 'not found': {err!r}"
+    print("  [ok] delete_atoms removes atom (get returns error afterward)")
+
+
+def test_stats_tracks_atom_count(proc):
+    """stats total_atoms increments by the number of atoms upserted."""
+    before = call_verb(proc, "knowledge.stats", {})
+    count_before = before["total_atoms"]
+
+    call_verb(proc, "knowledge.upsert_atoms", {
+        "atoms": [
+            {"slug": "stats-a", "name": "StatsA", "content": _ATOM_CONTENT_BREW},
+            {"slug": "stats-b", "name": "StatsB", "content": _ATOM_CONTENT_EPIST},
+        ]
+    })
+    after = call_verb(proc, "knowledge.stats", {})
+    count_after = after["total_atoms"]
+    assert count_after == count_before + 2, (
+        f"expected total_atoms to increase by 2: before={count_before} after={count_after}"
+    )
+    print(f"  [ok] stats tracks atom count ({count_before} → {count_after})")
+
+
+def test_fold_knapsack_budget_constrained(proc):
+    """fold selects highest-score items fitting in budget; overflow candidate excluded.
+
+    aaa(300)+ccc(250)+ddd(100)=650 == budget. bbb(400) would overflow 300+400=700 > 650.
+    """
+    r = call_verb(proc, "knowledge.fold", {
+        "candidates": [
+            {"id": "aaa", "score": 0.9, "size": 300},
+            {"id": "bbb", "score": 0.8, "size": 400},
+            {"id": "ccc", "score": 0.7, "size": 250},
+            {"id": "ddd", "score": 0.6, "size": 100},
+        ],
+        "budget": 650,
+    })
+    assert r["selected_count"] == 3, f"expected selected_count=3: {r}"
+    assert r["total_size"] == 650, f"expected total_size=650: {r}"
+    selected_ids = {item["id"] for item in r.get("selected", [])}
+    assert "aaa" in selected_ids, f"aaa (highest score) must be selected: {selected_ids}"
+    assert "ccc" in selected_ids, f"ccc must be selected: {selected_ids}"
+    assert "ddd" in selected_ids, f"ddd must be selected: {selected_ids}"
+    assert "bbb" not in selected_ids, f"bbb (overflows budget) must be excluded: {selected_ids}"
+    print("  [ok] fold knapsack budget-constrained (bbb excluded, total_size=650)")
+
+
+def test_fold_min_score_filter(proc):
+    """fold min_score excludes candidates below threshold regardless of remaining budget."""
+    r = call_verb(proc, "knowledge.fold", {
+        "candidates": [
+            {"id": "high", "score": 0.9, "size": 100},
+            {"id": "low",  "score": 0.3, "size": 100},
+        ],
+        "budget": 1000,
+        "min_score": 0.5,
+    })
+    assert r["selected_count"] == 1, f"expected only 1 item above min_score=0.5: {r}"
+    selected_ids = {item["id"] for item in r.get("selected", [])}
+    assert "high" in selected_ids, f"high-score item must be selected: {selected_ids}"
+    assert "low" not in selected_ids, (
+        f"low-score item must be excluded by min_score=0.5: {selected_ids}"
+    )
+    print("  [ok] fold min_score filter")
+
+
+def test_suggest_dispatch_smoke(proc):
+    """suggest returns expected shape (total as int) under no-corpus (empty but well-formed).
+
+    No domains are loaded in-memory, so total=0; this asserts dispatch + response shape only.
+    """
+    r = call_verb(proc, "knowledge.suggest", {
+        "query": (
+            "rust async tokio programming patterns middleware error handling "
+            "retry circuit breaker distributed systems fault tolerance"
+        ),
+        "limit": 5,
+    })
+    assert "total" in r, f"suggest result must carry 'total' key: {r}"
+    assert isinstance(r["total"], int), f"total must be int: {r}"
+    print(f"  [ok] suggest dispatch smoke (total={r['total']}, no-corpus shape verified)")
+
+
+def test_compose_dispatch_smoke(proc):
+    """compose returns expected shape (data.count, data.markdown, data.query) under no-corpus.
+
+    No atoms are loaded in-memory; this asserts dispatch + response structure only.
+    Query must be >=10 words for auto-compose mode.
+    """
+    r = call_verb(proc, "knowledge.compose", {
+        "query": (
+            "rust async tokio futures programming patterns middleware "
+            "error handling retry circuit breaker backoff"
+        ),
+    })
+    assert "data" in r, f"compose result must carry 'data' key: {r}"
+    data = r["data"]
+    assert "count" in data, f"data must carry 'count': {data}"
+    assert "markdown" in data, f"data must carry 'markdown': {data}"
+    assert "query" in data, f"data must carry 'query': {data}"
+    assert isinstance(data["count"], int), f"count must be int: {data}"
+    assert isinstance(data["markdown"], str), f"markdown must be str: {data}"
+    print(f"  [ok] compose dispatch smoke (count={data['count']}, no-corpus shape verified)")
+
+
+def test_upsert_atoms_missing_slug_error(proc):
+    """upsert_atoms with atom missing required slug returns per-op error mentioning slug."""
+    err = call_verb_expect_error(proc, "knowledge.upsert_atoms", {
+        "atoms": [{"name": "NoSlug", "content": _ATOM_CONTENT_BREW}]
+    })
+    assert err, "expected non-empty error"
+    assert "slug" in err.lower(), f"error must mention 'slug': {err!r}"
+    print(f"  [ok] upsert_atoms missing slug -> error ({err[:60]})")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -411,6 +661,20 @@ TESTS = [
     (test_topic_with_query_fts,          "topic with FTS query"),
     (test_topic_limit,                   "topic limit"),
     (test_cite_nonexistent_source,       "cite nonexistent source"),
+    # upsert_atoms / list / get / search / edit / delete_atoms / stats
+    (test_upsert_atoms_write_path,         "upsert_atoms write path (upsert → list → get)"),
+    (test_search_finds_draft_atoms,        "search finds draft atoms with include_drafts=True"),
+    (test_edit_sections_roundtrip,         "edit sections roundtrip"),
+    (test_delete_atoms_removes_atom,       "delete_atoms removes atom"),
+    (test_stats_tracks_atom_count,         "stats tracks atom count"),
+    # fold — deterministic knapsack, fully assertable without corpus
+    (test_fold_knapsack_budget_constrained,"fold knapsack budget-constrained"),
+    (test_fold_min_score_filter,           "fold min_score filter"),
+    # suggest / compose — dispatch-shape smoke under no-corpus
+    (test_suggest_dispatch_smoke,          "suggest dispatch smoke (no-corpus)"),
+    (test_compose_dispatch_smoke,          "compose dispatch smoke (no-corpus)"),
+    # error path
+    (test_upsert_atoms_missing_slug_error, "upsert_atoms missing slug -> error"),
 ]
 
 
@@ -430,11 +694,12 @@ def main():
             teardown(proc)
 
     print()
+    total = len(TESTS)
     if failed == 0:
-        print(f"  ALL {len(TESTS)} KNOWLEDGE PACK SMOKE TESTS PASSED")
+        print(f"  ALL {total} KNOWLEDGE PACK SMOKE TESTS PASSED")
         return 0
     else:
-        print(f"  {failed}/{len(TESTS)} TESTS FAILED")
+        print(f"  {failed}/{total} TESTS FAILED")
         return 1
 
 
