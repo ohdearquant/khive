@@ -545,6 +545,15 @@ pub(crate) async fn handle_thread(
 /// same `external_id` already exists in the namespace, the call returns
 /// successfully without creating a duplicate. The check is best-effort
 /// (no database-level unique constraint) and idempotent.
+/// Return `true` if the error is a SQLite UNIQUE constraint violation.
+///
+/// Used to detect duplicate `external_id` collisions on the
+/// `idx_comm_message_external_id` partial unique index without taking a
+/// direct dependency on `rusqlite` in this crate.
+fn is_unique_constraint_violation(e: &RuntimeError) -> bool {
+    e.to_string().contains("UNIQUE constraint")
+}
+
 ///
 /// Thread resolution: when `correlation_external_id` is supplied, the handler
 /// queries for an existing message note whose `external_id` matches that value,
@@ -684,7 +693,7 @@ pub(crate) async fn handle_ingest(
         props["channel_kind"] = json!(kind);
     }
 
-    let note = runtime
+    let note = match runtime
         .create_note(
             token,
             "message",
@@ -694,7 +703,19 @@ pub(crate) async fn handle_ingest(
             Some(props),
             Vec::new(),
         )
-        .await?;
+        .await
+    {
+        Ok(n) => n,
+        Err(e) if is_unique_constraint_violation(&e) => {
+            tracing::debug!("comm.ingest: duplicate blocked by unique index constraint");
+            return Ok(json!({
+                "ok": true,
+                "deduplicated": true,
+                "external_id": p.external_id,
+            }));
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(json!({
         "id": short_id(note.id),

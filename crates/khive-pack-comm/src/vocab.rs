@@ -12,7 +12,9 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// `deleted_at IS NULL` is always present in filtered queries, so the partial
 /// condition is always satisfied and the index is eligible.
 /// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
-/// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+/// Statements are idempotent (`CREATE [UNIQUE] INDEX IF NOT EXISTS`).
+/// The `external_id` index is UNIQUE and PARTIAL (non-null, non-empty values only);
+/// this provides atomic deduplication for ingested channel messages.
 pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
@@ -28,9 +30,11 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
         json_extract(properties, '$.read'), \
         created_at DESC) \
         WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_external_id \
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id \
         ON notes(namespace, kind, json_extract(properties, '$.external_id')) \
-        WHERE deleted_at IS NULL",
+        WHERE deleted_at IS NULL \
+          AND json_extract(properties, '$.external_id') IS NOT NULL \
+          AND json_extract(properties, '$.external_id') != ''",
 ];
 
 pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
