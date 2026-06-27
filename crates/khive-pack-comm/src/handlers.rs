@@ -13,7 +13,9 @@ use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
-use crate::params::{deser, InboxParams, ReadParams, ReplyParams, SendParams, ThreadParams};
+use crate::params::{
+    deser, InboxParams, IngestParams, ReadParams, ReplyParams, SendParams, ThreadParams,
+};
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
 fn validate_actor_label(label: &str, field: &str) -> Result<(), RuntimeError> {
@@ -529,5 +531,156 @@ pub(crate) async fn handle_thread(
         "thread_id": canonical_thread_id,
         "count": count,
         "messages": messages,
+    }))
+}
+
+/// `ingest` — write a single inbound message note from a channel adapter.
+///
+/// This is a `Visibility::Subhandler` verb: it is not accessible via the MCP
+/// wire and is only callable from within the process (e.g. the polling loop in
+/// `khive-mcp`). It is the authoritative write path for all channel-delivered
+/// messages; the polling loop must not bypass it.
+///
+/// Thread resolution: when `correlation_external_id` is supplied, the handler
+/// queries for an existing message note whose `external_id` matches that value,
+/// reads its `thread_id`, and attaches the new note to the same thread.
+///
+/// Deduplication: when `external_id` is supplied, `try_create_note` uses
+/// a verify-after-insert check on the durable unique index on `external_id`.
+/// A confirmed duplicate returns `Ok(None)` without error; only an
+/// external_id collision is treated as dedup; other constraint violations
+/// surface as errors.
+pub(crate) async fn handle_ingest(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    // Note: IngestParams does not use deny_unknown_fields.
+    let p: IngestParams = serde_json::from_value(params)
+        .map_err(|e| RuntimeError::InvalidInput(format!("ingest: bad params: {e}")))?;
+
+    if p.from.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: `from` must not be empty".into(),
+        ));
+    }
+    if p.to.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: `to` must not be empty".into(),
+        ));
+    }
+    if p.content.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: `content` must not be empty".into(),
+        ));
+    }
+
+    let ns = token.namespace().as_str();
+    let store = runtime.notes(token)?;
+
+    // Thread resolution: if correlation_external_id is present, find the message
+    // it refers to and extract its internal thread_id.
+    let resolved_thread_id: Option<String> = if let Some(ref corr) = p.correlation_external_id {
+        if !corr.is_empty() {
+            let corr_filter = NoteFilter {
+                kind: Some("message".to_string()),
+                property_filters: vec![PropertyFilter {
+                    json_path: "$.external_id".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text(corr.clone()),
+                }],
+                ..Default::default()
+            };
+            let corr_page = store
+                .query_notes_filtered(
+                    ns,
+                    &corr_filter,
+                    PageRequest {
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await?;
+            corr_page
+                .items
+                .first()
+                .and_then(|n| n.properties.as_ref())
+                .and_then(|props| props.get("thread_id"))
+                .and_then(Value::as_str)
+                .filter(|s| s.parse::<Uuid>().is_ok())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Determine thread_id: caller-supplied > resolved from correlation > new root.
+    let thread_id: String = p
+        .thread_id
+        .as_deref()
+        .filter(|s| s.parse::<Uuid>().is_ok())
+        .map(|s| s.to_string())
+        .or(resolved_thread_id)
+        .unwrap_or_else(|| Uuid::new_v4().as_hyphenated().to_string());
+
+    let sent_at = p.sent_at.as_deref().unwrap_or("").to_string();
+    let sent_at_value = if sent_at.is_empty() {
+        json!(Utc::now().to_rfc3339())
+    } else {
+        json!(sent_at)
+    };
+
+    let mut props = json!({
+        "from": p.from.trim(),
+        "to": p.to.trim(),
+        "from_actor": p.from.trim(),
+        "to_actor": p.to.trim(),
+        "direction": "inbound",
+        "read": false,
+        "thread_id": thread_id,
+        "sent_at": sent_at_value,
+    });
+    if let Some(ref s) = p.subject {
+        props["subject"] = json!(s);
+    }
+    if let Some(ref ext) = p.external_id {
+        props["external_id"] = json!(ext);
+    }
+    if let Some(ref kind) = p.channel_kind {
+        props["channel_kind"] = json!(kind);
+    }
+
+    let note = match runtime
+        .try_create_note(
+            token,
+            "message",
+            p.subject.as_deref(),
+            p.content.trim(),
+            Some(props),
+        )
+        .await?
+    {
+        Some(n) => n,
+        None => {
+            tracing::debug!(
+                external_id = ?p.external_id,
+                "comm.ingest: duplicate message skipped"
+            );
+            return Ok(json!({
+                "ok": true,
+                "deduplicated": true,
+                "external_id": p.external_id,
+            }));
+        }
+    };
+
+    Ok(json!({
+        "id": short_id(note.id),
+        "full_id": note.id.as_hyphenated().to_string(),
+        "thread_id": thread_id,
+        "external_id": p.external_id,
+        "deduplicated": false,
     }))
 }

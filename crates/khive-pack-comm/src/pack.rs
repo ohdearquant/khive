@@ -90,6 +90,7 @@ impl PackRuntime for CommPack {
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
             "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
+            "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "comm pack does not handle verb {verb:?}"
             ))),
@@ -100,7 +101,7 @@ impl PackRuntime for CommPack {
 #[cfg(test)]
 mod help_tests {
     use super::*;
-    use khive_types::{Pack, VerbCategory};
+    use khive_types::{Pack, VerbCategory, Visibility};
 
     fn find_handler(name: &str) -> &'static HandlerDef {
         CommPack::HANDLERS
@@ -237,5 +238,77 @@ mod help_tests {
             VerbCategory::Assertive,
             "comm.thread must be Assertive"
         );
+        assert_eq!(
+            h("comm.ingest").category,
+            VerbCategory::Declaration,
+            "comm.ingest must be Declaration"
+        );
+    }
+
+    #[test]
+    fn ingest_is_subhandler_not_visible_on_wire() {
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        assert_eq!(
+            h.visibility,
+            Visibility::Subhandler,
+            "comm.ingest must be Visibility::Subhandler — not callable on MCP wire"
+        );
+    }
+
+    #[test]
+    fn ingest_declares_required_namespace_param() {
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        let ns_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .expect("comm.ingest must declare 'namespace' param");
+        assert!(
+            ns_param.required,
+            "comm.ingest namespace param must be required so dispatch forwards it to the handler"
+        );
+    }
+
+    #[test]
+    fn ingest_declares_dedup_and_correlation_params() {
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        assert!(
+            h.params.iter().any(|p| p.name == "external_id"),
+            "comm.ingest must declare external_id param for deduplication"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "correlation_external_id"),
+            "comm.ingest must declare correlation_external_id param for thread resolution"
+        );
+    }
+
+    #[test]
+    fn ingest_declares_required_content_params() {
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        for required_name in &["from", "to", "content"] {
+            let p = h
+                .params
+                .iter()
+                .find(|p| p.name == *required_name)
+                .unwrap_or_else(|| {
+                    panic!("comm.ingest must declare required param '{required_name}'")
+                });
+            assert!(
+                p.required,
+                "comm.ingest param '{required_name}' must be required"
+            );
+        }
     }
 }

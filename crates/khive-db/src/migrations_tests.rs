@@ -27,14 +27,22 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
-    assert_eq!(version, 4, "latest migration version");
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    assert_eq!(
+        version, latest,
+        "run_migrations must reach the latest version"
+    );
 
     let recorded: i64 = conn
         .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 4);
+    assert_eq!(
+        recorded,
+        MIGRATIONS.len() as i64,
+        "ledger row count must equal the number of migrations"
+    );
 }
 
 #[test]
@@ -149,7 +157,161 @@ fn run_migrations_twice_is_idempotent() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(recorded, 4, "no duplicate migration rows on re-run");
+    assert_eq!(
+        recorded,
+        MIGRATIONS.len() as i64,
+        "no duplicate migration rows on re-run"
+    );
+}
+
+// ── V5: external_id unique index tests ──────────────────────────────────────
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+        rusqlite::params![name],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn index_is_unique(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT \"unique\" FROM pragma_index_list('notes') WHERE name=?1",
+        rusqlite::params![name],
+        |row| {
+            let v: i64 = row.get(0)?;
+            Ok(v != 0)
+        },
+    )
+    .unwrap_or(false)
+}
+
+#[test]
+fn v5_creates_unique_external_id_index() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    assert!(
+        index_exists(&conn, "idx_comm_message_external_id"),
+        "V5 must create idx_comm_message_external_id"
+    );
+    assert!(
+        index_is_unique(&conn, "idx_comm_message_external_id"),
+        "idx_comm_message_external_id must be UNIQUE"
+    );
+}
+
+#[test]
+fn v5_duplicate_external_id_insert_rejected() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    let now = chrono::Utc::now().timestamp_micros();
+    // Insert a note with external_id
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+         VALUES ('id-ext-1', 'local', 'message', 'active', 'body', \
+                 json_object('external_id', 'imap:host:1:1'), ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("first insert");
+    // A second note with the same external_id must be rejected by the unique index.
+    let dup = conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+         VALUES ('id-ext-2', 'local', 'message', 'active', 'body2', \
+                 json_object('external_id', 'imap:host:1:1'), ?1, ?1)",
+        rusqlite::params![now],
+    );
+    assert!(dup.is_err(), "duplicate external_id must be rejected");
+}
+
+#[test]
+fn v5_upgrade_from_duplicate_rows_succeeds() {
+    // Simulate a V4-state database that already contains duplicate external_id rows.
+    // Apply only migrations up to V4, insert duplicates, then run V5 and verify:
+    //   - V5 migration completes without error
+    //   - The canonical (earliest) row keeps its external_id
+    //   - Later duplicate rows survive with external_id cleared to NULL
+    let mut conn = open_memory();
+
+    // Apply V1..V4 only.
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    let now = chrono::Utc::now().timestamp_micros();
+    for migration in MIGRATIONS.iter().filter(|m| m.version <= 4) {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![migration.version, migration.name, now],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Insert two notes sharing the same external_id (canonical + duplicate).
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+         VALUES ('canonical-row', 'local', 'message', 'active', 'first', \
+                 json_object('external_id', 'imap:h:9:9'), ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("canonical row");
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+         VALUES ('dup-row', 'local', 'message', 'active', 'second', \
+                 json_object('external_id', 'imap:h:9:9'), ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .expect("duplicate row (allowed before V5 unique index)");
+
+    // Now run V5.
+    let tx = conn.transaction().unwrap();
+    let v5 = MIGRATIONS.iter().find(|m| m.version == 5).unwrap();
+    tx.execute_batch(v5.up)
+        .expect("V5 migration must succeed on a DB with duplicate external_ids");
+    tx.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![v5.version, v5.name, now],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    // Canonical row keeps its external_id.
+    let canonical_ext: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(properties, '$.external_id') FROM notes WHERE id='canonical-row'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        canonical_ext.as_deref(),
+        Some("imap:h:9:9"),
+        "canonical row must retain its external_id"
+    );
+
+    // Duplicate row survives but with external_id cleared.
+    let dup_content: String = conn
+        .query_row("SELECT content FROM notes WHERE id='dup-row'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        dup_content, "second",
+        "duplicate row must survive (not deleted)"
+    );
+
+    let dup_ext: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(properties, '$.external_id') FROM notes WHERE id='dup-row'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        dup_ext.is_none(),
+        "duplicate row must have external_id cleared (got {:?})",
+        dup_ext
+    );
 }
 
 // ── _embedding_models.dim u32 range tests ───────────────────────────────────

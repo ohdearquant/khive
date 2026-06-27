@@ -37,6 +37,48 @@ pub struct MultiBackendRegistry {
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
     let server = build_server(&args)?;
 
+    // Spawn the email channel polling loop when the feature is enabled and the
+    // required environment variables are present. The loop is non-fatal: if
+    // configuration is absent it logs a warning and returns without panicking.
+    #[cfg(feature = "channel-email")]
+    {
+        use khive_channel::ChannelRegistry;
+        use khive_channel_email::EmailChannel;
+        use std::sync::Arc;
+
+        match EmailChannel::from_env() {
+            Ok(email_ch) => {
+                let mut ch_registry = ChannelRegistry::new();
+                ch_registry.register(Arc::new(email_ch));
+                let ch_registry = Arc::new(ch_registry);
+                let verb_reg = server.verb_registry_clone();
+                let ingest_ns = ingest_namespace_from_env();
+                let ingest_ns_clone = ingest_ns.clone();
+                let verb_reg_clone = verb_reg.clone();
+                let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+                    tokio::task::spawn(channel_poll_loop(
+                        ch_registry,
+                        verb_reg_clone,
+                        ingest_ns_clone,
+                    ));
+                    tracing::info!("email channel polling loop started");
+                });
+                if !spawned {
+                    tracing::error!(
+                        namespace = %ingest_ns,
+                        "email channel polling loop NOT started: ingest namespace authorization failed (fail-closed)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "channel-email feature is enabled but configuration is incomplete: {e}; \
+                     email polling is disabled"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon(server).await?;
@@ -60,6 +102,121 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         bind: args.bind.clone(),
     };
     transport.serve(server, &opts).await
+}
+
+/// Resolve the target namespace for ingested channel messages.
+///
+/// Reads `KHIVE_EMAIL_INGEST_NAMESPACE`; falls back to `"local"` when the
+/// variable is unset or blank. Called once at server startup before the poll
+/// loop is spawned.
+#[cfg(feature = "channel-email")]
+fn ingest_namespace_from_env() -> String {
+    std::env::var("KHIVE_EMAIL_INGEST_NAMESPACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Run `on_authorized` only when the ingest namespace passes the preflight check.
+///
+/// Returns `true` when the closure was called (preflight passed), `false`
+/// otherwise.  Tests can inject a counting closure to verify the loop is not
+/// started when preflight fails (ADR-056 §6 fail-closed contract).
+#[cfg(feature = "channel-email")]
+fn run_if_authorized(
+    ns_str: &str,
+    registry: &khive_runtime::VerbRegistry,
+    on_authorized: impl FnOnce(),
+) -> bool {
+    if preflight_ingest_namespace(ns_str, registry) {
+        on_authorized();
+        true
+    } else {
+        false
+    }
+}
+
+/// Validate and authorize the ingest namespace before spawning the poll loop.
+///
+/// Returns `true` when `ns_str` parses to a valid namespace AND the registry
+/// gate permits it.  Returns `false` on any parse failure or authorization
+/// denial, after logging the reason.  The caller must not spawn the poll loop
+/// when this returns `false` (fail-closed, ADR-056 §6).
+#[cfg(feature = "channel-email")]
+fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegistry) -> bool {
+    match khive_runtime::Namespace::parse(ns_str) {
+        Ok(ns) => match registry.authorize_namespace(ns) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    namespace = %ns_str,
+                    error = %e,
+                    "ingest namespace authorization denied; email polling will not start"
+                );
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                namespace = %ns_str,
+                error = %e,
+                "invalid ingest namespace string; email polling will not start"
+            );
+            false
+        }
+    }
+}
+
+/// Background task that polls all registered channels every 5 seconds and
+/// ingests new inbound messages via `comm.ingest`.
+///
+/// Only compiled when the `channel-email` feature is enabled.
+#[cfg(feature = "channel-email")]
+async fn channel_poll_loop(
+    channels: std::sync::Arc<khive_channel::ChannelRegistry>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+) {
+    use chrono::Utc;
+    use serde_json::json;
+
+    let mut last_poll = Utc::now();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let since = last_poll;
+        last_poll = Utc::now();
+
+        for (kind, channel) in channels.iter() {
+            match channel.poll(since).await {
+                Ok(envelopes) => {
+                    for env in envelopes {
+                        let params = json!({
+                            "namespace": ingest_namespace,
+                            "from": env.from,
+                            "to": env.to,
+                            "content": env.content,
+                            "subject": env.subject,
+                            "channel_kind": kind,
+                            "external_id": env.external_id,
+                            "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                            "correlation_external_id": env.correlation_external_id,
+                        });
+                        if let Err(e) = registry.dispatch("comm.ingest", params).await {
+                            tracing::warn!(
+                                channel = kind,
+                                "comm.ingest failed for inbound message: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(channel = kind, "channel poll failed: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
@@ -1731,6 +1888,148 @@ brain_profile = "project-profile"
             "second.db MUST NOT contain MainOnlyEntity (kg is pinned to main.db); \
              got count={second_entity_count}"
         );
+    }
+
+    // --- ingest_namespace_from_env (Fix 4: namespace env var) ---
+
+    #[cfg(feature = "channel-email")]
+    mod ingest_ns_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_defaults_to_local() {
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ingest_namespace_from_env(), "local");
+        }
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_reads_env_var() {
+            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "lambda:mybot");
+            let ns = ingest_namespace_from_env();
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ns, "lambda:mybot");
+        }
+
+        #[test]
+        #[serial]
+        fn ingest_namespace_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_EMAIL_INGEST_NAMESPACE", "  ");
+            let ns = ingest_namespace_from_env();
+            std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
+            assert_eq!(ns, "local", "blank env var must fall back to default");
+        }
+
+        #[test]
+        fn preflight_fails_on_invalid_namespace_string() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build empty registry");
+            // An empty string is not a valid namespace; parse must fail.
+            assert!(
+                !preflight_ingest_namespace("", &registry),
+                "preflight must return false for an invalid namespace string"
+            );
+        }
+
+        #[test]
+        fn preflight_fails_when_gate_denies_namespace() {
+            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
+            use std::fmt;
+
+            #[derive(Debug)]
+            struct AlwaysDenyGate;
+            impl fmt::Display for AlwaysDenyGate {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "AlwaysDenyGate")
+                }
+            }
+            impl Gate for AlwaysDenyGate {
+                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                    Ok(GateDecision::deny("test: always deny"))
+                }
+            }
+
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate));
+            let registry = builder.build().expect("build registry with deny gate");
+            assert!(
+                !preflight_ingest_namespace("local", &registry),
+                "preflight must return false when the gate denies the namespace"
+            );
+        }
+
+        #[test]
+        fn preflight_succeeds_with_allow_gate_and_valid_namespace() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build registry with default allow-all gate");
+            assert!(
+                preflight_ingest_namespace("local", &registry),
+                "preflight must return true for a valid namespace when the gate allows"
+            );
+        }
+
+        // --- spawn-seam tests: verify the loop is NOT started on preflight failure ---
+
+        #[test]
+        fn spawn_not_called_when_gate_denies() {
+            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
+            use std::fmt;
+
+            #[derive(Debug)]
+            struct AlwaysDenyGate2;
+            impl fmt::Display for AlwaysDenyGate2 {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "AlwaysDenyGate2")
+                }
+            }
+            impl Gate for AlwaysDenyGate2 {
+                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                    Ok(GateDecision::deny("spawn seam test: always deny"))
+                }
+            }
+
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate2));
+            let registry = builder.build().expect("build registry with deny gate");
+
+            let mut spawn_count = 0usize;
+            let authorized = run_if_authorized("local", &registry, || {
+                spawn_count += 1;
+            });
+
+            assert!(
+                !authorized,
+                "run_if_authorized must return false when gate denies"
+            );
+            assert_eq!(
+                spawn_count, 0,
+                "spawn must not be called when preflight fails"
+            );
+        }
+
+        #[test]
+        fn spawn_not_called_when_namespace_invalid() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build empty registry");
+
+            let mut spawn_count = 0usize;
+            let authorized = run_if_authorized("", &registry, || {
+                spawn_count += 1;
+            });
+
+            assert!(
+                !authorized,
+                "run_if_authorized must return false for invalid namespace"
+            );
+            assert_eq!(
+                spawn_count, 0,
+                "spawn must not be called when namespace is invalid"
+            );
+        }
     }
 
     // --- should_warn_unattributed predicate ---

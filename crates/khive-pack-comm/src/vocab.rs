@@ -13,6 +13,10 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// condition is always satisfied and the index is eligible.
 /// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
 /// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+///
+/// The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
+/// created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
+/// is the sole durable authority for that index.
 pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
@@ -30,7 +34,7 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
         WHERE deleted_at IS NULL",
 ];
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 5] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -132,6 +136,74 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 5] = [
                 param_type: "integer",
                 required: false,
                 description: "Max messages to return. Default 100, max 500.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.ingest",
+        description: "Ingest an inbound message from a channel adapter. Subhandler — not callable on the MCP wire.",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: true,
+                description: "Target namespace for the ingested message note.",
+            },
+            ParamDef {
+                name: "from",
+                param_type: "string",
+                required: true,
+                description: "Sender address in `channel-kind:addr` form (e.g. `email:alice@example.com`).",
+            },
+            ParamDef {
+                name: "to",
+                param_type: "string",
+                required: true,
+                description: "Recipient address in `channel-kind:addr` form.",
+            },
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: true,
+                description: "Message body text.",
+            },
+            ParamDef {
+                name: "subject",
+                param_type: "string",
+                required: false,
+                description: "Optional subject line.",
+            },
+            ParamDef {
+                name: "thread_id",
+                param_type: "uuid",
+                required: false,
+                description: "Optional internal thread UUID. When absent, a new thread root is created.",
+            },
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: false,
+                description: "Channel kind identifier (e.g. `email`).",
+            },
+            ParamDef {
+                name: "external_id",
+                param_type: "string",
+                required: false,
+                description: "Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.",
+            },
+            ParamDef {
+                name: "sent_at",
+                param_type: "string",
+                required: false,
+                description: "RFC 3339 timestamp of the original message.",
+            },
+            ParamDef {
+                name: "correlation_external_id",
+                param_type: "string",
+                required: false,
+                description: "External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID or In-Reply-To header value).",
             },
         ],
     },

@@ -843,6 +843,33 @@ impl VerbRegistry {
         )))
     }
 
+    /// Check whether the gate permits writes into `ns`.
+    ///
+    /// Performs a gate evaluation with verb `"authorize"` before any background
+    /// loop is spawned (ADR-056 §6).  Returns `Ok(())` when the gate allows the
+    /// namespace, or `Err(RuntimeError::PermissionDenied{..})` when denied.
+    /// Gate errors (implementation failures) are surfaced as
+    /// `RuntimeError::Internal`.
+    pub fn authorize_namespace(&self, ns: Namespace) -> Result<(), RuntimeError> {
+        let actor = match self.actor_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+            _ => ActorRef::anonymous(),
+        };
+        let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
+        match self.gate.check(&req) {
+            Ok(decision) if decision.is_allow() => Ok(()),
+            Ok(GateDecision::Deny { reason }) => Err(RuntimeError::PermissionDenied {
+                verb: "authorize".to_string(),
+                reason,
+            }),
+            Ok(_) => Err(RuntimeError::PermissionDenied {
+                verb: "authorize".to_string(),
+                reason: "gate denied".to_string(),
+            }),
+            Err(e) => Err(RuntimeError::Internal(format!("gate error: {e}"))),
+        }
+    }
+
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// Routes through the gate, then invokes the matching pack handler. When

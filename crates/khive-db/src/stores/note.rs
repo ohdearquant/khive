@@ -341,6 +341,86 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
+        let namespace = note.namespace.clone();
+        let id_str = note.id.to_string();
+        let kind_str = note.kind.to_string();
+        let status_str = note.status.clone();
+        let properties_str = note
+            .properties
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        // Extract external_id (if any) for dedup verification after a zero-row insert.
+        let ext_id_opt: Option<String> = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.get("external_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.with_writer("try_insert_note", move |conn| {
+            let rows = conn.execute(
+                "INSERT OR IGNORE INTO notes \
+                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+                  properties, created_at, updated_at, deleted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    id_str,
+                    namespace,
+                    kind_str,
+                    status_str,
+                    note.name,
+                    note.content,
+                    note.salience,
+                    note.decay_factor,
+                    note.expires_at,
+                    properties_str,
+                    note.created_at,
+                    note.updated_at,
+                    note.deleted_at,
+                ],
+            )?;
+
+            if rows > 0 {
+                return Ok(true);
+            }
+
+            // Zero rows: the INSERT was silently skipped by OR IGNORE.
+            // Only treat this as a dedup hit when a live note with the same
+            // non-empty external_id already exists in this namespace and kind.
+            // Any other ignored constraint (e.g. a PRIMARY KEY collision) must
+            // surface as an error rather than being misreported as a duplicate.
+            if let Some(ref ext_id) = ext_id_opt {
+                let is_dedup: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM notes \
+                     WHERE namespace = ?1 \
+                       AND kind = ?2 \
+                       AND json_extract(properties, '$.external_id') = ?3 \
+                       AND deleted_at IS NULL",
+                    rusqlite::params![namespace, kind_str, ext_id],
+                    |row| row.get(0),
+                )?;
+                if is_dedup {
+                    return Ok(false);
+                }
+            }
+
+            // The INSERT was dropped for a reason other than an external_id
+            // collision.  Surface it as a constraint error.
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some(
+                    "try_insert_note: INSERT ignored for a constraint other than \
+                     external_id dedup; not masking as deduplication"
+                        .to_string(),
+                ),
+            ))
+        })
+        .await
+    }
+
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 

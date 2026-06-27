@@ -32,6 +32,8 @@ members = [
     "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
+    "khive-channel",
+    "khive-channel-email",
 ]
 exclude = ["khive-merge"]
 # khive-merge is forward-deployed v2 infrastructure (ADR-039), not removed or
@@ -56,7 +58,11 @@ inventory = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+async-imap = "0.9"
+async-native-tls = "0.5"
+mail-parser = "0.9"
 rusqlite = { version = "0.33" }
 anyhow = "1.0"
 thiserror = "2.0"
