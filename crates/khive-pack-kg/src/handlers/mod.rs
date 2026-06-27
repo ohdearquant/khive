@@ -13,14 +13,14 @@ mod search;
 mod stats;
 mod update;
 
-pub(crate) use common::canonical_note_kind;
+pub(crate) use common::{canonical_note_kind, parse_relation};
 
 #[cfg(test)]
 pub(crate) use common::{
     ensure_note_kind, normalize_entity_timestamps, normalize_entity_timestamps_array,
-    parse_relation, resolve_kind_spec, tags_match_any, valid_relations_for_entity_pair,
-    validate_weight, walk_timestamps, KindSpec, ListParams, ProposeParams, ReviewParams,
-    SearchParams, UpdateParams, WithdrawParams,
+    resolve_kind_spec, tags_match_any, valid_relations_for_entity_pair, validate_weight,
+    walk_timestamps, KindSpec, ListParams, ProposeParams, ReviewParams, SearchParams, UpdateParams,
+    WithdrawParams,
 };
 
 #[cfg(test)]
