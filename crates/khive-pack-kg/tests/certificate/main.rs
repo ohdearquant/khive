@@ -10,6 +10,3 @@
 
 /// Live endpoint-signature distinctness audit (ADR-076 §D2 Er eliminator).
 mod endpoint_signatures;
-
-/// EdgeRelation::ALL coverage gate — every relation needs a cert or system-role exception.
-mod coverage;

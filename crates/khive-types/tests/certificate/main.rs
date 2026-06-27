@@ -16,3 +16,6 @@ mod harness;
 
 /// Certificate fixtures for the `cites` relation (proposed Tier-1, ADR-076).
 mod cites;
+
+/// Coverage gate: every EdgeRelation must have a cert entry or system-role exception.
+mod coverage;
