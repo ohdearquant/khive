@@ -509,7 +509,11 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             // as the probe itself.
             tracing::info!("killing stale daemon (undecodable response) and respawning");
             match kill_and_respawn(&frame.config_id, &frame.namespace).await {
-                Err(_) => return None,
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "kill_and_respawn failed during stale-daemon recovery; falling back to local dispatch");
+                    return None;
+                }
                 Ok(RecoveryOutcome::Skipped) => {
                     // Under-lock probe confirmed a live matching daemon; forward the
                     // real request once — this is its ONLY dispatch on this path.
