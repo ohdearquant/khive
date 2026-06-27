@@ -53,8 +53,15 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
                 let ch_registry = Arc::new(ch_registry);
                 let verb_reg = server.verb_registry_clone();
                 let ingest_ns = ingest_namespace_from_env();
-                tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg, ingest_ns));
-                tracing::info!("email channel polling loop started");
+                if preflight_ingest_namespace(&ingest_ns, &verb_reg) {
+                    tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg, ingest_ns));
+                    tracing::info!("email channel polling loop started");
+                } else {
+                    tracing::error!(
+                        namespace = %ingest_ns,
+                        "email channel polling loop NOT started: ingest namespace authorization failed (fail-closed)"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -101,6 +108,37 @@ fn ingest_namespace_from_env() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Validate and authorize the ingest namespace before spawning the poll loop.
+///
+/// Returns `true` when `ns_str` parses to a valid namespace AND the registry
+/// gate permits it.  Returns `false` on any parse failure or authorization
+/// denial, after logging the reason.  The caller must not spawn the poll loop
+/// when this returns `false` (fail-closed, ADR-056 §6).
+#[cfg(feature = "channel-email")]
+fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegistry) -> bool {
+    match khive_runtime::Namespace::parse(ns_str) {
+        Ok(ns) => match registry.authorize_namespace(ns) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    namespace = %ns_str,
+                    error = %e,
+                    "ingest namespace authorization denied; email polling will not start"
+                );
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                namespace = %ns_str,
+                error = %e,
+                "invalid ingest namespace string; email polling will not start"
+            );
+            false
+        }
+    }
 }
 
 /// Background task that polls all registered channels every 5 seconds and
@@ -1855,6 +1893,56 @@ brain_profile = "project-profile"
             let ns = ingest_namespace_from_env();
             std::env::remove_var("KHIVE_EMAIL_INGEST_NAMESPACE");
             assert_eq!(ns, "local", "blank env var must fall back to default");
+        }
+
+        #[test]
+        fn preflight_fails_on_invalid_namespace_string() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build empty registry");
+            // An empty string is not a valid namespace; parse must fail.
+            assert!(
+                !preflight_ingest_namespace("", &registry),
+                "preflight must return false for an invalid namespace string"
+            );
+        }
+
+        #[test]
+        fn preflight_fails_when_gate_denies_namespace() {
+            use khive_runtime::{Gate, GateDecision, GateError, GateRequest};
+            use std::fmt;
+
+            #[derive(Debug)]
+            struct AlwaysDenyGate;
+            impl fmt::Display for AlwaysDenyGate {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "AlwaysDenyGate")
+                }
+            }
+            impl Gate for AlwaysDenyGate {
+                fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                    Ok(GateDecision::deny("test: always deny"))
+                }
+            }
+
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.with_gate(std::sync::Arc::new(AlwaysDenyGate));
+            let registry = builder.build().expect("build registry with deny gate");
+            assert!(
+                !preflight_ingest_namespace("local", &registry),
+                "preflight must return false when the gate denies the namespace"
+            );
+        }
+
+        #[test]
+        fn preflight_succeeds_with_allow_gate_and_valid_namespace() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("build registry with default allow-all gate");
+            assert!(
+                preflight_ingest_namespace("local", &registry),
+                "preflight must return true for a valid namespace when the gate allows"
+            );
         }
     }
 
