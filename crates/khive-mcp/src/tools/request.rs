@@ -60,4 +60,27 @@ pub struct RequestParams {
         description = "File path to sink results as JSONL (returns manifest, not raw results)"
     )]
     pub save_to: Option<String>,
+
+    /// Output serialization format for all ops in this request (ADR-078).
+    ///
+    /// - `"json"` (default): compact, lossless JSON.
+    /// - `"auto"`: shape-aware — markdown table for homogeneous record arrays,
+    ///   flat key-value block for single records, compact-JSON fallback.
+    /// - `"table"`: force markdown-table renderer regardless of shape.
+    ///
+    /// Overrides `KHIVE_OUTPUT_FORMAT` and the TOML `default_output_format`.
+    /// When omitted, the server's resolved default (env → toml → builtin `json`) is used.
+    #[serde(default)]
+    #[schemars(description = "Output format: \"json\" (default), \"auto\", or \"table\"")]
+    pub format: Option<String>,
+
+    /// Per-operation output format overrides (ADR-078).
+    ///
+    /// When provided, entries override `format` per op by index.
+    /// `null` entries fall back to the batch-level `format`.
+    ///
+    /// When omitted, all ops use `format`.
+    #[serde(default)]
+    #[schemars(description = "Per-op output format override (optional)")]
+    pub format_per_op: Option<Vec<Option<String>>>,
 }

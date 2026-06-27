@@ -68,7 +68,9 @@ pub use pack::{
     VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
-pub use presentation::{micros_to_iso, present, PresentationMode};
+pub use presentation::{
+    apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
+};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{

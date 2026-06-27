@@ -3561,6 +3561,8 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         })
         .await
         .expect("dispatch must succeed");
@@ -3578,6 +3580,8 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         })
         .await
         .expect("get dispatch must succeed");
@@ -3614,6 +3618,8 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         })
         .await
         .expect("update dispatch must succeed");
@@ -4034,6 +4040,8 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await
             .expect("dispatch must not error at the MCP level");

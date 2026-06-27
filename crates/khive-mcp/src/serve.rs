@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_runtime::{
     config_from_env, run_migrations, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig,
-    StorageBackend, VerbRegistryBuilder,
+    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, PackRegistry,
+    RuntimeConfig, StorageBackend, VerbRegistryBuilder,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -540,7 +540,10 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
                  Set KHIVE_ACTOR or --actor to this lambda's id."
             );
         }
-        return KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"));
+        let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
+        return KhiveMcpServer::new(runtime)
+            .map(|s| s.with_default_output_format(fmt))
+            .map_err(|e| anyhow::anyhow!("{e}"));
     }
 
     // Multi-backend path (ADR-028).
@@ -755,8 +758,10 @@ fn build_server_multi_backend(
         None
     };
 
+    let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
     let server =
-        KhiveMcpServer::from_registry_with_meta(registry, default_namespace.as_str(), &config_id);
+        KhiveMcpServer::from_registry_with_meta(registry, default_namespace.as_str(), &config_id)
+            .with_default_output_format(fmt);
 
     Ok(if let Some(p) = pool {
         server.with_pool(p)
@@ -939,6 +944,34 @@ fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
             .filter(|s| !s.trim().is_empty());
     }
     cfg
+}
+
+/// Resolve the server-level default output format (ADR-078 §2 precedence tier 2-3).
+///
+/// Precedence (highest to lowest — called AFTER CLI tier is handled at request time):
+/// 1. `KHIVE_OUTPUT_FORMAT` env var (tier 2)
+/// 2. `khive_cfg.runtime.default_output_format` from TOML (tier 3)
+/// 3. Builtin `OutputFormat::Json` (tier 4)
+///
+/// Returns the resolved [`OutputFormat`] to wire into the server via
+/// `with_default_output_format`.
+fn apply_env_output_format(toml_default: Option<OutputFormat>) -> OutputFormat {
+    // Env var (tier 2) overrides TOML (tier 3).
+    if let Ok(val) = std::env::var("KHIVE_OUTPUT_FORMAT") {
+        match val.trim() {
+            "json" => return OutputFormat::Json,
+            "auto" => return OutputFormat::Auto,
+            "table" => return OutputFormat::Table,
+            _ => {
+                tracing::warn!(
+                    value = %val,
+                    "KHIVE_OUTPUT_FORMAT has unknown value; falling back to TOML / builtin default"
+                );
+            }
+        }
+    }
+    // TOML default (tier 3) or builtin (tier 4).
+    toml_default.unwrap_or(OutputFormat::Json)
 }
 
 /// Resolve the full config (embedding engines + namespace) from file or env.
@@ -1324,6 +1357,8 @@ brain_profile = "project-profile"
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await
             .expect("kg dispatch must not error");
@@ -1345,6 +1380,8 @@ brain_profile = "project-profile"
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
+                format: None,
+                format_per_op: None,
             })
             .await
             .expect("comm dispatch must not error");
@@ -1495,6 +1532,8 @@ brain_profile = "project-profile"
                         presentation: None,
                         presentation_per_op: None,
                         save_to: None,
+                        format: None,
+                        format_per_op: None,
                     })
                     .await
                     .expect("dispatch must not error");
@@ -1800,6 +1839,8 @@ brain_profile = "project-profile"
                         presentation: None,
                         presentation_per_op: None,
                         save_to: None,
+                        format: None,
+                        format_per_op: None,
                     })
                     .await
                     .expect("dispatch must not error")

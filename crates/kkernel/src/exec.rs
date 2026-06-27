@@ -257,6 +257,8 @@ async fn apply_ops_file(
             presentation: presentation.clone(),
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         };
 
         let raw = server
@@ -409,6 +411,8 @@ async fn run_exec_inline_with_forward(
             config_id: compute_config_id(&cfg, None),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            format: None,
+            format_per_op: None,
         };
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
@@ -428,6 +432,8 @@ async fn run_exec_inline_with_forward(
         presentation,
         presentation_per_op: None,
         save_to: save_file,
+        format: None,
+        format_per_op: None,
     };
 
     let output = server
@@ -630,6 +636,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -677,6 +685,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -991,6 +1001,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             save_to: None,
+            format: None,
+            format_per_op: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
