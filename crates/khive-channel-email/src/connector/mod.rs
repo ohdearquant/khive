@@ -55,13 +55,25 @@ impl std::fmt::Display for MailAddress {
 /// A raw email fetched from the IMAP server before enrichment.
 #[derive(Debug, Clone)]
 pub struct RawEmail {
-    /// IMAP UID (opaque; used for SEEN marking).
+    /// IMAP UID (opaque; used for message identification).
     pub uid: u32,
-    /// RFC 822 Message-ID header value. Used as the dedup external_id.
-    pub message_id: Option<String>,
-    /// Parsed sender address (addr-spec, lowercase).
-    pub from: String,
-    /// All recipient addresses.
+    /// Stable dedup key: `imap:{host}:{uidvalidity}:{uid}`.
+    ///
+    /// Always set by the IMAP connector. Never empty. Used as the primary
+    /// `external_id` in `comm.ingest`; derived from UIDVALIDITY and UID so
+    /// dedup works even when a message has no `Message-ID` header.
+    pub imap_external_id: String,
+    /// All parsed sender addresses from the `From:` header (addr-spec, lowercase).
+    ///
+    /// The authorization check requires exactly one entry matching the configured
+    /// maintainer address. Zero entries or more than one cause the message to be
+    /// rejected as unauthorized before any note is written.
+    pub from_addrs: Vec<String>,
+    /// Parsed address from the `Sender:` header, if present (addr-spec, lowercase).
+    ///
+    /// When present, must also match the configured maintainer address.
+    pub sender_addr: Option<String>,
+    /// All recipient addresses from the `To:` header.
     pub to: Vec<String>,
     /// Subject header value.
     pub subject: String,

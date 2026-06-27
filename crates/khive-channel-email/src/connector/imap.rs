@@ -105,10 +105,13 @@ impl ImapConnector for LiveImap {
     ) -> Result<Vec<RawEmail>, ChannelError> {
         let mut session = self.connect().await?;
 
-        session
+        // SELECT returns the Mailbox struct; uid_validity is the UIDVALIDITY value needed
+        // for stable per-message dedup keys of the form `imap:{host}:{uidvalidity}:{uid}`.
+        let mailbox = session
             .select("INBOX")
             .await
             .map_err(|e| ChannelError::Transport(format!("IMAP SELECT INBOX failed: {e}")))?;
+        let uidvalidity = mailbox.uid_validity.unwrap_or(0);
 
         // Search for messages since the given date.
         let since_str = since.format("%d-%b-%Y").to_string();
@@ -156,7 +159,7 @@ impl ImapConnector for LiveImap {
 
         let mut result = Vec::new();
         for (uid, raw_bytes) in fetched_raw {
-            if let Some(email) = parse_raw_bytes(uid, &raw_bytes) {
+            if let Some(email) = parse_raw_bytes(uid, &raw_bytes, &self.host, uidvalidity) {
                 result.push(email);
             }
         }
@@ -165,16 +168,41 @@ impl ImapConnector for LiveImap {
 }
 
 /// Parse raw RFC 822 bytes into a `RawEmail`.
-pub(crate) fn parse_raw_bytes(uid: u32, raw: &[u8]) -> Option<RawEmail> {
+///
+/// `host` and `uidvalidity` are combined with `uid` to form the stable
+/// `imap_external_id` dedup key. This avoids relying on the `Message-ID`
+/// header, which is optional and could be absent or spoofed.
+pub(crate) fn parse_raw_bytes(
+    uid: u32,
+    raw: &[u8],
+    host: &str,
+    uidvalidity: u32,
+) -> Option<RawEmail> {
     let parser = MessageParser::default();
     let msg = parser.parse(raw)?;
 
-    let from = msg
+    // Stable dedup key: imap:{host}:{uidvalidity}:{uid}.
+    // Always set; never depends on Message-ID.
+    let imap_external_id = format!("imap:{host}:{uidvalidity}:{uid}");
+
+    // Collect all From addresses as addr-specs (display names stripped by mail_parser).
+    let from_addrs: Vec<String> = msg
         .from()
+        .map(|addrs| {
+            addrs
+                .iter()
+                .filter_map(|a| a.address())
+                .map(|s| s.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Sender header (RFC 5322: single mailbox; first entry is the canonical one).
+    let sender_addr: Option<String> = msg
+        .sender()
         .and_then(|a| a.first())
         .and_then(|a| a.address())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
+        .map(|s| s.to_lowercase());
 
     let to: Vec<String> = msg
         .to()
@@ -193,8 +221,6 @@ pub(crate) fn parse_raw_bytes(uid: u32, raw: &[u8]) -> Option<RawEmail> {
         .date()
         .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0));
 
-    let message_id = msg.message_id().map(|s| s.to_string());
-
     let body_text = msg.body_text(0).map(|s| s.to_string());
 
     let body_html = msg.body_html(0).map(|s| s.to_string());
@@ -212,8 +238,9 @@ pub(crate) fn parse_raw_bytes(uid: u32, raw: &[u8]) -> Option<RawEmail> {
 
     Some(RawEmail {
         uid,
-        message_id,
-        from,
+        imap_external_id,
+        from_addrs,
+        sender_addr,
         to,
         subject,
         date,
@@ -279,11 +306,12 @@ mod tests {
         }
     }
 
-    fn make_email(uid: u32, msg_id: &str, from: &str) -> RawEmail {
+    fn make_email(uid: u32, imap_id: &str, from_addr: &str) -> RawEmail {
         RawEmail {
             uid,
-            message_id: Some(msg_id.to_string()),
-            from: from.to_string(),
+            imap_external_id: imap_id.to_string(),
+            from_addrs: vec![from_addr.to_string()],
+            sender_addr: None,
             to: vec!["me@example.com".to_string()],
             subject: "Test".to_string(),
             date: None,
@@ -295,11 +323,16 @@ mod tests {
 
     #[tokio::test]
     async fn mock_imap_returns_emails() {
-        let emails = vec![make_email(1, "<id1@example.com>", "alice@example.com")];
+        let emails = vec![make_email(
+            1,
+            "imap:mail.example.com:12345:1",
+            "alice@example.com",
+        )];
         let fetcher = ImapFetcher::with_connector(MockImap::with_emails(emails));
         let result = fetcher.fetch_since(Utc::now(), 50).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].message_id.as_deref(), Some("<id1@example.com>"));
+        assert_eq!(result[0].imap_external_id, "imap:mail.example.com:12345:1");
+        assert_eq!(result[0].from_addrs, vec!["alice@example.com"]);
     }
 
     #[tokio::test]
@@ -310,13 +343,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_bytes_extracts_all_from_addresses() {
+        // RFC 5322 allows multiple addresses in From.
+        let raw = b"From: alice@example.com, bob@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Multi-From test\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(42, raw, "imap.example.com", 9999).unwrap();
+        assert_eq!(email.imap_external_id, "imap:imap.example.com:9999:42");
+        assert_eq!(email.from_addrs.len(), 2);
+        assert!(email.from_addrs.contains(&"alice@example.com".to_string()));
+        assert!(email.from_addrs.contains(&"bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_raw_bytes_extracts_sender_header() {
+        let raw = b"From: alice@example.com\r\n\
+                    Sender: sender@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Sender test\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(7, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(email.sender_addr.as_deref(), Some("sender@example.com"));
+    }
+
+    #[test]
+    fn parse_raw_bytes_stable_id_without_message_id() {
+        // Message has no Message-ID header; imap_external_id must still be set.
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: No Message-ID\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(3, raw, "imap.example.com", 5555).unwrap();
+        assert_eq!(email.imap_external_id, "imap:imap.example.com:5555:3");
+        assert!(!email.imap_external_id.is_empty());
+    }
+
+    #[test]
     fn raw_email_khive_thread_id_header() {
         let mut headers = HashMap::new();
         headers.insert("x-khive-thread-id".to_string(), "some-uuid".to_string());
         let email = RawEmail {
             uid: 1,
-            message_id: None,
-            from: "a@example.com".to_string(),
+            imap_external_id: "imap:host:1:1".to_string(),
+            from_addrs: vec!["a@example.com".to_string()],
+            sender_addr: None,
             to: vec![],
             subject: String::new(),
             date: None,
@@ -334,8 +408,9 @@ mod tests {
         headers.insert("in-reply-to".to_string(), "<orig@example.com>".to_string());
         let email = RawEmail {
             uid: 2,
-            message_id: None,
-            from: "b@example.com".to_string(),
+            imap_external_id: "imap:host:1:2".to_string(),
+            from_addrs: vec!["b@example.com".to_string()],
+            sender_addr: None,
             to: vec![],
             subject: String::new(),
             date: None,

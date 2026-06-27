@@ -49,27 +49,58 @@ impl EmailChannel {
         Self { config, smtp, imap }
     }
 
-    /// Validate that the sender address matches the configured maintainer.
+    /// Validate that the message sender is authorized.
     ///
-    /// Returns `Err(ChannelError::UnauthorizedSender)` when the addresses differ.
-    fn check_sender(&self, raw_from: &str) -> Result<(), ChannelError> {
-        let parsed = MailAddress::parse(raw_from).ok_or_else(|| {
-            ChannelError::InvalidEnvelope(format!("cannot parse sender address: {raw_from:?}"))
-        })?;
-        if parsed != self.config.maintainer_address {
+    /// Rules:
+    /// - `from_addrs` must contain exactly one entry (multi-From is rejected).
+    /// - That single From address must match the configured maintainer.
+    /// - If `sender_addr` is present, it must also match.
+    ///
+    /// Returns `Err(ChannelError::UnauthorizedSender)` on any violation.
+    /// Error messages intentionally omit the actual addresses to avoid leaking them to logs.
+    fn check_sender(
+        &self,
+        from_addrs: &[String],
+        sender_addr: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        // Exactly one From address is required. Zero or more-than-one is an unauthorized state.
+        if from_addrs.len() != 1 {
             return Err(ChannelError::UnauthorizedSender(format!(
-                "message from {parsed} rejected; expected {}",
-                self.config.maintainer_address
+                "expected exactly 1 From address, got {}",
+                from_addrs.len()
             )));
+        }
+        let from = MailAddress::parse(&from_addrs[0]).ok_or_else(|| {
+            ChannelError::UnauthorizedSender("From field does not contain a valid addr-spec".into())
+        })?;
+        if from != self.config.maintainer_address {
+            return Err(ChannelError::UnauthorizedSender(
+                "From address is not the configured maintainer".into(),
+            ));
+        }
+        // Sender header, when present, must also match the maintainer.
+        if let Some(s) = sender_addr {
+            let sender = MailAddress::parse(s).ok_or_else(|| {
+                ChannelError::UnauthorizedSender(
+                    "Sender field does not contain a valid addr-spec".into(),
+                )
+            })?;
+            if sender != self.config.maintainer_address {
+                return Err(ChannelError::UnauthorizedSender(
+                    "Sender address is not the configured maintainer".into(),
+                ));
+            }
         }
         Ok(())
     }
 
     /// Convert a `RawEmail` to a `ChannelEnvelope`, validating the sender.
     fn to_envelope(&self, email: RawEmail) -> Result<ChannelEnvelope, ChannelError> {
-        self.check_sender(&email.from)?;
+        self.check_sender(&email.from_addrs, email.sender_addr.as_deref())?;
 
-        let from = format!("email:{}", email.from);
+        // Safe: check_sender verified exactly one entry.
+        let from_addr = &email.from_addrs[0];
+        let from = format!("email:{from_addr}");
         let to = email
             .to
             .first()
@@ -84,9 +115,9 @@ impl EmailChannel {
         if let Some(date) = email.date {
             env = env.with_sent_at(date);
         }
-        if let Some(mid) = &email.message_id {
-            env = env.with_external_id(mid.as_str());
-        }
+        // Always set external_id from the stable IMAP-based dedup key. Never derive it
+        // from Message-ID, which is optional and could be absent or absent-by-design.
+        env = env.with_external_id(&email.imap_external_id);
         if let Some(corr) = email.correlation() {
             env = env.with_correlation(corr);
         }
@@ -117,12 +148,13 @@ impl Channel for EmailChannel {
         let raw = self.imap.fetch_since(since, 50).await?;
         let mut envelopes = Vec::new();
         for email in raw {
+            let uid = email.uid;
             match self.to_envelope(email) {
                 Ok(env) => envelopes.push(env),
-                Err(ChannelError::UnauthorizedSender(msg)) => {
-                    warn!("skipping unauthorized message: {msg}");
+                Err(_) => {
+                    // Log only the IMAP UID -- never the sender address or any credentials.
+                    warn!(uid, "skipping message: validation failed");
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(envelopes)
@@ -189,11 +221,29 @@ mod tests {
         }
     }
 
-    fn make_email(from: &str, msg_id: &str) -> RawEmail {
+    /// Build a RawEmail with a single-address From and a stable IMAP external ID.
+    fn make_email(from_addr: &str, imap_id: &str) -> RawEmail {
         RawEmail {
             uid: 1,
-            message_id: Some(msg_id.to_string()),
-            from: from.to_string(),
+            imap_external_id: imap_id.to_string(),
+            from_addrs: vec![from_addr.to_string()],
+            sender_addr: None,
+            to: vec!["me@example.com".to_string()],
+            subject: "Hello".to_string(),
+            date: None,
+            body_text: Some("body text".to_string()),
+            body_html: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    /// Build a RawEmail with an explicit From address list.
+    fn make_email_with_from_addrs(from_addrs: Vec<String>, imap_id: &str) -> RawEmail {
+        RawEmail {
+            uid: 1,
+            imap_external_id: imap_id.to_string(),
+            from_addrs,
+            sender_addr: None,
             to: vec!["me@example.com".to_string()],
             subject: "Hello".to_string(),
             date: None,
@@ -213,47 +263,145 @@ mod tests {
         EmailChannel::with_connectors(config, smtp, imap)
     }
 
+    // --- Basic trait ---
+
     #[test]
     fn kind_is_email() {
         let ch = build_channel("maintainer@example.com", vec![]);
         assert_eq!(ch.kind(), "email");
     }
 
+    // --- Authorization: authorized sender ---
+
     #[tokio::test]
     async fn authorized_sender_produces_envelope() {
         let ch = build_channel(
             "maintainer@example.com",
-            vec![make_email("maintainer@example.com", "<id1@example.com>")],
+            vec![make_email("maintainer@example.com", "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].external_id.as_deref(), Some("<id1@example.com>"));
+        // external_id is now always the stable IMAP key, not Message-ID.
+        assert_eq!(envs[0].external_id.as_deref(), Some("imap:test:0:1"));
         assert_eq!(envs[0].from, "email:maintainer@example.com");
     }
+
+    #[tokio::test]
+    async fn normalized_addr_spec_is_accepted() {
+        // IMAP parsing strips display names before channel.rs sees the address.
+        // from_addrs already contains the bare addr-spec.
+        let ch = build_channel(
+            "maintainer@example.com",
+            vec![make_email("maintainer@example.com", "imap:test:0:1")],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1, "plain addr-spec must be accepted");
+    }
+
+    // --- Authorization: rejected senders (Fix 1) ---
 
     #[tokio::test]
     async fn unauthorized_sender_is_silently_skipped() {
         let ch = build_channel(
             "maintainer@example.com",
-            vec![make_email("attacker@example.com", "<evil@example.com>")],
+            vec![make_email("attacker@example.com", "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(envs.is_empty(), "unauthorized message must be dropped");
+        assert!(envs.is_empty(), "unauthorized From must be dropped");
     }
 
     #[tokio::test]
-    async fn display_name_sender_is_normalized() {
-        // "Alice Maintainer <maintainer@example.com>" should be accepted.
+    async fn multi_from_addresses_rejected() {
+        // RFC 5322 permits multiple From addresses; we treat it as unauthorized.
         let ch = build_channel(
             "maintainer@example.com",
-            vec![make_email(
-                "Alice Maintainer <maintainer@example.com>",
-                "<id2@example.com>",
+            vec![make_email_with_from_addrs(
+                vec![
+                    "maintainer@example.com".to_string(),
+                    "attacker@example.com".to_string(),
+                ],
+                "imap:test:0:1",
             )],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert_eq!(envs.len(), 1, "display-name format must be accepted");
+        assert!(envs.is_empty(), "multi-From message must be rejected");
     }
+
+    #[tokio::test]
+    async fn empty_from_list_rejected() {
+        let ch = build_channel(
+            "maintainer@example.com",
+            vec![make_email_with_from_addrs(vec![], "imap:test:0:1")],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(
+            envs.is_empty(),
+            "message with no From address must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_header_mismatch_rejected() {
+        let mut email = make_email("maintainer@example.com", "imap:test:0:1");
+        // Sender header claims a different mailbox -- reject.
+        email.sender_addr = Some("attacker@example.com".to_string());
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(envs.is_empty(), "Sender mismatch must be rejected");
+    }
+
+    #[tokio::test]
+    async fn sender_header_matching_maintainer_accepted() {
+        let mut email = make_email("maintainer@example.com", "imap:test:0:1");
+        email.sender_addr = Some("maintainer@example.com".to_string());
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1, "matching Sender header must be accepted");
+    }
+
+    #[tokio::test]
+    async fn reply_to_header_is_not_used_for_auth() {
+        // Reply-To is irrelevant for authorization; only From (and optionally Sender) matter.
+        let mut email = make_email("maintainer@example.com", "imap:test:0:1");
+        email
+            .headers
+            .insert("reply-to".to_string(), "attacker@evil.com".to_string());
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(
+            envs.len(),
+            1,
+            "Reply-To must not affect authorization; only From is checked"
+        );
+    }
+
+    // --- Batch isolation (Fix 3) ---
+
+    #[tokio::test]
+    async fn bad_message_in_batch_does_not_abort_poll() {
+        let ch = build_channel(
+            "maintainer@example.com",
+            vec![
+                // First message: unauthorized -- should be skipped.
+                make_email("attacker@example.com", "imap:test:0:1"),
+                // Second message: authorized -- must be returned.
+                make_email("maintainer@example.com", "imap:test:0:2"),
+            ],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(
+            envs.len(),
+            1,
+            "only the authorized message must be returned"
+        );
+        assert_eq!(
+            envs[0].external_id.as_deref(),
+            Some("imap:test:0:2"),
+            "the authorized message must be the one returned"
+        );
+    }
+
+    // --- SMTP send path ---
 
     #[tokio::test]
     async fn send_strips_email_prefix() {
