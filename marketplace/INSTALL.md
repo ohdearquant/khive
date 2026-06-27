@@ -7,7 +7,7 @@ correctly to a running `kkernel mcp` server.
 
 | Plugin | Version | kkernel |
 | ------ | ------- | ------- |
-| khive  | 0.2.8   | ≥ 0.2.4 |
+| khive  | 0.2.11  | ≥ 0.2.4 |
 
 `khive` is a single umbrella plugin — one pattern skill per pack plus the kg stewardship agents,
 all over the one `kkernel mcp` server.
