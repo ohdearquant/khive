@@ -82,7 +82,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-047](ADR-047-knowledge-pack.md)                     | Knowledge Pack — Concept Registration, Citation, and Topic Search                                               |
 | [ADR-048](ADR-048-knowledge-section-profiles.md)         | Knowledge Section Profiles                                                                                      |
 | [ADR-049](ADR-049-khived-daemon.md)                      | khived Daemon — Persistent Warm Runtime over a Unix Socket                                                      |
-| [ADR-050](ADR-050-kg-token-namespace-contract.md)        | KG Token Namespace Contract (Proposed)                                                                          |
+| [ADR-050](ADR-050-kg-token-namespace-contract.md)        | KG Token Namespace Contract (Accepted -- partially superseded by ADR-007 Rev 3)                                 |
 | [ADR-051](ADR-051-section-embeddings-hybrid-compose.md)  | Section-Level Embeddings and Hybrid Compose Scoring (Accepted)                                                  |
 | [ADR-052](ADR-052-ann-production-lifecycle.md)           | ANN Production Lifecycle — SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence (Accepted) |
 | [ADR-053](ADR-053-authorization-gate.md)                 | Authorization Gate — ActorStore, SessionStore, and Cloud-Tier Caller Propagation (Proposed)                     |
@@ -93,11 +93,12 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-058](ADR-058-brain-posterior-read-path.md)          | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking (Proposed)                            |
 | [ADR-059](ADR-059-namespace-write-tiers.md)              | Namespace Write Tiers and Cross-Namespace Link Access Control (Withdrawn — superseded by ADR-007 Rev 2)         |
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)   | Pack-Extensible by-ID Resolution (Accepted)                                                                     |
+| [ADR-062](ADR-062-fts-ann-consolidation.md)              | FTS and ANN Consolidation -- Unified Search Tables (Schema V4) (Accepted)                                       |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)          | Autonomous Merge Pipeline — Gate Wall as Reviewer, Human Gate at Release (Proposed)                             |
 | [ADR-067](ADR-067-write-owner-daemon.md)                 | Write-Owner Daemon — Single-Writer Task and Write Queue (Proposed)                                              |
 | [ADR-068](ADR-068-cloud-multitenancy-topology.md)        | Cloud Multi-Tenancy Topology and Tenant Isolation (Proposed)                                                    |
 | [ADR-069](ADR-069-subject-model.md)                      | Subject Model — Domain-Ontology Ingestion and Map Pipeline (Proposed)                                           |
-| [ADR-073](ADR-073-pack-core-backend-accessor.md)         | Pack Core-Backend Accessor (Proposed)                                                                           |
+| [ADR-073](ADR-073-pack-core-backend-accessor.md)         | Pack Core-Backend Accessor (Accepted)                                                                           |
 
 ## Closed Taxonomies — Quick Reference
 

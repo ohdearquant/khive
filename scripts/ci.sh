@@ -55,6 +55,13 @@ python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
 python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"
 python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 
+echo "=== Vector Smoke (embed/recall path gate) ==="
+# smoke_vector.py self-guards empirically: it spawns kkernel, attempts one
+# memory.remember, and prints "SKIP: ..." + exits 0 when the embedder is not
+# usable (model weights absent or no engine resolves).  GitHub Actions runners
+# that lack the model weights are unaffected.  Set KHIVE_NO_EMBED=1 to bypass.
+python3 "$SCRIPT_DIR/../tests/smoke_vector.py"
+
 echo "=== Contract Suite (khive-contract) ==="
 (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
 

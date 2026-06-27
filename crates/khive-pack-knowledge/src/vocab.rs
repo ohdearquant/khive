@@ -530,3 +530,46 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         ],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_handler(name: &str) -> &'static HandlerDef {
+        KNOWLEDGE_HANDLERS
+            .iter()
+            .find(|h| h.name == name)
+            .unwrap_or_else(|| panic!("handler {name:?} not found in KNOWLEDGE_HANDLERS"))
+    }
+
+    /// knowledge.edit sections param must document the closed section_type enum (10 values) and
+    /// the 80-character content minimum (#160).
+    #[test]
+    fn knowledge_edit_sections_documents_enum_and_content_minimum() {
+        let h = find_handler("knowledge.edit");
+        let sections = h
+            .params
+            .iter()
+            .find(|p| p.name == "sections")
+            .expect("knowledge.edit must have a sections param");
+        assert!(
+            sections.description.contains("80"),
+            "knowledge.edit sections description must document the 80-character content minimum"
+        );
+        // Spot-check the first and last members of the closed enum.
+        assert!(
+            sections.description.contains("overview"),
+            "knowledge.edit sections description must list 'overview' as a valid section_type"
+        );
+        assert!(
+            sections.description.contains("other"),
+            "knowledge.edit sections description must list 'other' as a valid section_type"
+        );
+        // Verify the description calls out the closed-enum nature so callers know unrecognized
+        // values are rejected (not silently coerced).
+        assert!(
+            sections.description.contains("closed enum"),
+            "knowledge.edit sections description must state that section_type is a closed enum"
+        );
+    }
+}

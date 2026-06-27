@@ -780,7 +780,10 @@ impl KhiveRuntime {
                     // to avoid N identical overwrites per note).
                     if model_names.first().map(|n| n.as_str()) == Some(model_name.as_str()) {
                         if let Some(ref ts) = text_store {
-                            let _ = ts.upsert_document(note_fts_document(&note)).await;
+                            if let Err(e) = ts.upsert_document(note_fts_document(&note)).await {
+                                tracing::warn!(id = %id, error = %e,
+                                    "backfill_missing_embeddings: note FTS upsert failed");
+                            }
                         }
                     }
 

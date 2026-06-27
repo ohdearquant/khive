@@ -346,7 +346,10 @@ impl KnowledgePack {
         let mut signals: Vec<(SectionType, FeedbackSignal)> = Vec::with_capacity(raw.len());
         for (key, val) in raw {
             let section_type = SectionType::from_str_loose(key).ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("unknown section_type: {key:?}"))
+                RuntimeError::InvalidInput(format!(
+                    "unknown section_type: {key:?}; valid: {}",
+                    SectionType::NAMES.join(", ")
+                ))
             })?;
             let signal_str = val.as_str().ok_or_else(|| {
                 RuntimeError::InvalidInput(format!("section signal for {key:?} must be a string"))
@@ -469,6 +472,11 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    use khive_runtime::{KhiveRuntime, Namespace, PackRuntime, VerbRegistryBuilder};
+    use serde_json::json;
+
+    use crate::KnowledgePack;
+
     /// Regression: handle_topic's entity lookup must never panic when an entity_id
     /// is absent from the map.
     ///
@@ -499,6 +507,36 @@ mod tests {
             results,
             vec!["present"],
             "absent entity must be dropped silently"
+        );
+    }
+
+    /// Verify that an unknown `section_signals` key produces an error message that
+    /// lists valid section types, not just the bare "unknown section_type" string.
+    #[tokio::test]
+    async fn invalid_section_type_error_lists_valid_values() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = KnowledgePack::new(rt.clone());
+        let registry = VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = pack
+            .dispatch(
+                "knowledge.feedback",
+                json!({ "section_signals": { "not_a_real_section": "useful" } }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(
+            msg.contains("overview"),
+            "error must list valid section types; got: {msg}",
         );
     }
 }

@@ -300,11 +300,7 @@ impl ProposalApplyWorker {
     ) -> Result<Uuid, RuntimeError> {
         let source_id = Uuid::from_u128(source.to_u128());
         let target_id = Uuid::from_u128(target.to_u128());
-        let storage_relation = {
-            let name = relation.as_str();
-            EdgeRelation::from_str(name)
-                .map_err(|_| RuntimeError::InvalidInput(format!("unknown edge relation: {name}")))?
-        };
+        let storage_relation = crate::handlers::parse_relation(relation.as_str())?;
         let edge = self
             .runtime
             .link(

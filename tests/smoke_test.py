@@ -21,6 +21,7 @@ import json
 import subprocess
 import sys
 import os
+from datetime import datetime, timedelta, timezone
 
 BINARY = os.environ.get(
     "KKERNEL_BINARY",
@@ -893,6 +894,317 @@ def epistemic_smoke():
         proc.wait(timeout=5)
 
 
+def brain_smoke():
+    """Optional smoke test for the brain pack -- profile lifecycle, feedback, and bindings."""
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    proc = subprocess.Popen(
+        [
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "brain",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "brain-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # brain.create_profile: create a profile in the inactive state
+        created = call_verb(proc, "brain.create_profile", {"name": "smoke-brain-v1"})
+        assert created.get("created") is True, (
+            f"brain.create_profile must return created=true: {created}"
+        )
+        profile_id = created["profile_id"]
+        print(f"  [brain] brain.create_profile -- {profile_id}")
+
+        # brain.profiles: the new profile must be listed
+        profiles_result = call_verb(proc, "brain.profiles", {})
+        # brain.profiles returns each entry with key "id" (not "profile_id")
+        profile_ids = [p["id"] for p in profiles_result.get("profiles", [])]
+        assert profile_id in profile_ids, (
+            f"created profile must appear in brain.profiles: {profile_ids}"
+        )
+        print(f"  [brain] brain.profiles -- {profiles_result['count']} profile(s)")
+
+        # brain.profile: fetch metadata; a new profile starts as inactive
+        meta = call_verb(proc, "brain.profile", {"profile_id": profile_id})
+        assert meta["lifecycle"] == "inactive", (
+            f"new profile must start in inactive lifecycle: {meta['lifecycle']}"
+        )
+        print(f"  [brain] brain.profile -- lifecycle={meta['lifecycle']}")
+
+        # brain.activate: move the profile from inactive to active
+        activated = call_verb(proc, "brain.activate", {"profile_id": profile_id})
+        assert activated["profile_id"] == profile_id, (
+            f"brain.activate must return the profile_id: {activated}"
+        )
+        print(f"  [brain] brain.activate -- ok")
+
+        # brain.resolve: must resolve a profile for the given consumer kind
+        resolved = call_verb(proc, "brain.resolve", {"consumer_kind": "recall"})
+        assert resolved.get("resolved_profile_id"), (
+            f"brain.resolve must return a resolved_profile_id: {resolved}"
+        )
+        print(f"  [brain] brain.resolve -- {resolved['resolved_profile_id']}")
+
+        # brain.feedback: requires a valid entity as the target; use a real concept entity.
+        # The create response returns the 8-char short id (Agent mode presentation),
+        # so call get() to recover the full 36-char UUID that brain.feedback requires.
+        entity = call_verb(proc, "create", {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "name": "BrainSmokeTarget",
+        })
+        full_entity = call_verb(proc, "get", {"id": entity["id"]})
+        entity_full_id = full_entity["id"]
+        feedback = call_verb(proc, "brain.feedback", {
+            "target_id": entity_full_id,
+            "signal": "useful",
+        })
+        assert feedback.get("emitted") is True, (
+            f"brain.feedback must return emitted=true: {feedback}"
+        )
+        print(f"  [brain] brain.feedback(signal=useful, target={entity_full_id[:8]}...) -- ok")
+
+        # brain.deactivate: move back to inactive before archiving
+        deactivated = call_verb(proc, "brain.deactivate", {"profile_id": profile_id})
+        assert deactivated["profile_id"] == profile_id, (
+            f"brain.deactivate must return the profile_id: {deactivated}"
+        )
+        print(f"  [brain] brain.deactivate -- ok")
+
+        # brain.archive: terminal state (no further lifecycle transitions allowed)
+        archived = call_verb(proc, "brain.archive", {"profile_id": profile_id})
+        assert archived["profile_id"] == profile_id, (
+            f"brain.archive must return the profile_id: {archived}"
+        )
+        print(f"  [brain] brain.archive -- ok")
+
+        # brain.bind / brain.bindings / brain.unbind: use the always-present
+        # balanced-recall-v1 profile (Active by default) for binding coverage
+        bound = call_verb(proc, "brain.bind", {
+            "profile_id": "balanced-recall-v1",
+            "consumer_kind": "recall",
+            "actor": "smoke-actor",
+        })
+        assert bound.get("bound") is True, (
+            f"brain.bind must return bound=true: {bound}"
+        )
+        print(f"  [brain] brain.bind -- ok")
+
+        bindings = call_verb(proc, "brain.bindings", {"profile_id": "balanced-recall-v1"})
+        binding_actors = [b.get("actor") for b in bindings.get("bindings", [])]
+        assert "smoke-actor" in binding_actors, (
+            f"smoke-actor must appear in bindings after brain.bind: {binding_actors}"
+        )
+        print(f"  [brain] brain.bindings -- {bindings['count']} binding(s)")
+
+        unbound = call_verb(proc, "brain.unbind", {
+            "profile_id": "balanced-recall-v1",
+            "actor": "smoke-actor",
+        })
+        assert unbound.get("unbound", 0) >= 1, (
+            f"brain.unbind must remove at least one binding: {unbound}"
+        )
+        print(f"  [brain] brain.unbind -- removed {unbound['unbound']}")
+
+        # Confirm the binding is gone
+        after = call_verb(proc, "brain.bindings", {
+            "profile_id": "balanced-recall-v1",
+            "actor": "smoke-actor",
+        })
+        remaining_actors = [b.get("actor") for b in after.get("bindings", [])]
+        assert "smoke-actor" not in remaining_actors, (
+            f"smoke-actor must be absent after unbind: {remaining_actors}"
+        )
+        print(f"  [brain] brain.bindings post-unbind -- smoke-actor removed")
+
+        print(f"\n  BRAIN PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def comm_smoke():
+    """Optional smoke test for the comm pack -- send, inbox, read, reply, and thread."""
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    proc = subprocess.Popen(
+        [
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "comm",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "comm-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # comm.send: send a message to the local actor so it appears in the inbox.
+        # comm.inbox filters by to_actor matching the caller's actor id ("local" in
+        # the test environment), so the recipient must be "local" for inbox visibility.
+        sent = call_verb(proc, "comm.send", {
+            "to": "local",
+            "subject": "smoke-subject",
+            "content": "smoke comm message",
+        })
+        assert sent.get("full_id"), f"comm.send must return a full_id: {sent}"
+        print(f"  [comm] comm.send -- {sent['full_id'][:8]}...")
+
+        # comm.inbox: the inbound copy of the sent message must be visible
+        inbox_result = call_verb(proc, "comm.inbox", {})
+        messages = inbox_result.get("messages", [])
+        assert len(messages) >= 1, (
+            f"comm.inbox must return at least one message after send: {inbox_result}"
+        )
+        assert any("smoke comm message" in str(m) for m in messages), (
+            f"sent message content must appear in comm.inbox: {messages}"
+        )
+        # Grab the first inbound message's full_id for subsequent operations
+        inbound_full_id = messages[0].get("full_id") or messages[0].get("id")
+        assert inbound_full_id, f"inbox message must have a full_id or id: {messages[0]}"
+        print(f"  [comm] comm.inbox -- {len(messages)} message(s)")
+
+        # comm.read: mark the inbound message as read
+        read_result = call_verb(proc, "comm.read", {"id": inbound_full_id})
+        assert read_result.get("read") is True, (
+            f"comm.read must return read=true: {read_result}"
+        )
+        print(f"  [comm] comm.read -- ok")
+
+        # comm.reply: send a reply threaded on the original inbound message
+        reply = call_verb(proc, "comm.reply", {
+            "id": inbound_full_id,
+            "content": "smoke reply",
+        })
+        assert reply.get("full_id"), f"comm.reply must return a full_id: {reply}"
+        print(f"  [comm] comm.reply -- {reply['full_id'][:8]}...")
+
+        # comm.thread: retrieve the full thread; must contain both messages in order
+        thread = call_verb(proc, "comm.thread", {"id": inbound_full_id})
+        thread_messages = thread.get("messages", [])
+        assert thread.get("count", 0) >= 2, (
+            f"thread must contain at least 2 messages; got count={thread.get('count')}: {thread}"
+        )
+        thread_text = str(thread_messages)
+        assert "smoke comm message" in thread_text, (
+            f"original content must appear in thread: {thread_messages}"
+        )
+        assert "smoke reply" in thread_text, (
+            f"reply content must appear in thread: {thread_messages}"
+        )
+        print(f"  [comm] comm.thread -- {thread['count']} message(s) in thread")
+
+        print(f"\n  COMM PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def schedule_smoke():
+    """Optional smoke test for the schedule pack -- remind, agenda, cancel, and schedule."""
+    future_at = (
+        datetime.now(timezone.utc) + timedelta(days=30)
+    ).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    proc = subprocess.Popen(
+        [
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "schedule",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "schedule-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # schedule.remind: create a time-triggered reminder 30 days in the future
+        remind = call_verb(proc, "schedule.remind", {
+            "content": "smoke reminder",
+            "at": future_at,
+        })
+        assert remind.get("status") == "pending", (
+            f"schedule.remind must return status=pending: {remind}"
+        )
+        remind_full_id = remind["full_id"]
+        print(f"  [schedule] schedule.remind -- {remind_full_id[:8]}... at {future_at[:10]}")
+
+        # schedule.agenda: the reminder must appear in the pending agenda
+        agenda1 = call_verb(proc, "schedule.agenda", {})
+        agenda_ids = [e.get("full_id") for e in agenda1.get("events", [])]
+        assert remind_full_id in agenda_ids, (
+            f"reminder must appear in schedule.agenda after creation: {agenda_ids}"
+        )
+        print(f"  [schedule] schedule.agenda -- {agenda1['count']} pending event(s)")
+
+        # schedule.cancel: cancel the reminder; it must disappear from the pending agenda
+        cancelled = call_verb(proc, "schedule.cancel", {"id": remind_full_id})
+        assert cancelled.get("status") == "cancelled", (
+            f"schedule.cancel must return status=cancelled: {cancelled}"
+        )
+        print(f"  [schedule] schedule.cancel -- ok")
+
+        agenda2 = call_verb(proc, "schedule.agenda", {})
+        agenda_ids2 = [e.get("full_id") for e in agenda2.get("events", [])]
+        assert remind_full_id not in agenda_ids2, (
+            f"cancelled event must not appear in schedule.agenda: {agenda_ids2}"
+        )
+        print(f"  [schedule] schedule.agenda post-cancel -- {agenda2['count']} pending event(s)")
+
+        # schedule.schedule: schedule a future verb dispatch and verify it appears in agenda
+        action = f'schedule.remind(content="scheduled action", at="{future_at}")'
+        scheduled = call_verb(proc, "schedule.schedule", {
+            "action": action,
+            "at": future_at,
+        })
+        assert scheduled.get("status") == "pending", (
+            f"schedule.schedule must return status=pending: {scheduled}"
+        )
+        scheduled_full_id = scheduled["full_id"]
+        print(f"  [schedule] schedule.schedule -- {scheduled_full_id[:8]}...")
+
+        agenda3 = call_verb(proc, "schedule.agenda", {})
+        agenda_ids3 = [e.get("full_id") for e in agenda3.get("events", [])]
+        assert scheduled_full_id in agenda_ids3, (
+            f"scheduled action must appear in schedule.agenda: {agenda_ids3}"
+        )
+        print(f"  [schedule] schedule.agenda post-schedule -- {agenda3['count']} pending event(s)")
+
+        print(f"\n  SCHEDULE PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
 if __name__ == "__main__":
     failed_sections: list[str] = []
 
@@ -927,6 +1239,27 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [epistemic FAIL] {e}")
             failed_sections.append("epistemic")
+
+    if os.environ.get("KHIVE_SMOKE_BRAIN", "1") != "0":
+        try:
+            brain_smoke()
+        except Exception as e:
+            print(f"  [brain FAIL] {e}")
+            failed_sections.append("brain")
+
+    if os.environ.get("KHIVE_SMOKE_COMM", "1") != "0":
+        try:
+            comm_smoke()
+        except Exception as e:
+            print(f"  [comm FAIL] {e}")
+            failed_sections.append("comm")
+
+    if os.environ.get("KHIVE_SMOKE_SCHEDULE", "1") != "0":
+        try:
+            schedule_smoke()
+        except Exception as e:
+            print(f"  [schedule FAIL] {e}")
+            failed_sections.append("schedule")
 
     if failed_sections:
         print(f"\nFAILED sections: {', '.join(failed_sections)}", file=sys.stderr)
