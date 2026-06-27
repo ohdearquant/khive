@@ -55,6 +55,14 @@ python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
 python3 "$SCRIPT_DIR/../tests/smoke_knowledge.py"
 python3 "$SCRIPT_DIR/../tests/smoke_schedule.py"
 
+echo "=== Vector Smoke (embed/recall path gate) ==="
+# smoke_vector.py self-guards: it prints "SKIP: ..." and exits 0 when no
+# embedding model is configured (no KHIVE_EMBEDDING_MODEL env var and no
+# [[engines]] in .khive/config.toml / khive.toml / ~/.khive/config.toml).
+# GitHub Actions runners and contributor machines without a local model are
+# unaffected.  The gate activates automatically when the model is present.
+python3 "$SCRIPT_DIR/../tests/smoke_vector.py"
+
 echo "=== Contract Suite (khive-contract) ==="
 (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
 

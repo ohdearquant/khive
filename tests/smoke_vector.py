@@ -8,6 +8,11 @@ that each paraphrase query returns the correct item at rank-1.
 This gate must pass before any embed-path changes land (#10 multi-engine
 fan-out, #11 knowledge.edit re-embed).
 
+When no embedding model is configured the test prints a clear SKIP line
+and exits 0 so default CI (GitHub Actions runners that lack the model) is
+not broken.  Set KHIVE_EMBEDDING_MODEL or add [[engines]] to
+.khive/config.toml to activate the gate.
+
 Usage:
     uv run python tests/smoke_vector.py
     # or: python3 tests/smoke_vector.py
@@ -27,6 +32,11 @@ BINARY = os.environ.get(
 _INSTALLED = os.path.expanduser("~/.cargo/bin/kkernel")
 if not os.path.exists(BINARY) and os.path.exists(_INSTALLED):
     BINARY = _INSTALLED
+
+# Repository root: two directories above tests/smoke_vector.py.
+# Used to locate .khive/config.toml regardless of the shell working directory
+# (ci.sh cd's into crates/ before invoking Python scripts).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 request_id = 0
 
@@ -81,17 +91,85 @@ def call_verb(proc, name, args):
     return first.get("result")
 
 
+# ── Embed availability detection ─────────────────────────────────────────────
+
+def _config_has_engines(path):
+    """Return True if the file at path contains at least one [[engines]] entry."""
+    try:
+        with open(path) as fh:
+            return "[[engines]]" in fh.read()
+    except OSError:
+        return False
+
+
+def _find_embed_config():
+    """Return the absolute path of the first config file that declares [[engines]], or None.
+
+    Mirrors kkernel's KhiveConfig::load_with_home_fallback resolution order,
+    but roots the project-local search at _REPO_ROOT instead of the process
+    working directory.  This lets the test find the project's .khive/config.toml
+    regardless of which directory ci.sh happened to cd into before spawning Python.
+
+    Resolution order:
+      1. $KHIVE_CONFIG (explicit override)
+      2. <repo_root>/khive.toml          (tier 2 — project root)
+      3. <repo_root>/.khive/config.toml  (tier 3 — project hidden dir)
+      4. ~/.khive/config.toml            (tier 4 — user-global)
+    """
+    explicit = os.environ.get("KHIVE_CONFIG", "")
+    if explicit and _config_has_engines(explicit):
+        return os.path.abspath(explicit)
+
+    for rel in ("khive.toml", ".khive/config.toml"):
+        p = os.path.join(_REPO_ROOT, rel)
+        if _config_has_engines(p):
+            return p
+
+    home_cfg = os.path.expanduser("~/.khive/config.toml")
+    if _config_has_engines(home_cfg):
+        return home_cfg
+
+    return None
+
+
+def embed_available():
+    """Return True if an embedding model is configured for the current environment.
+
+    Checked in priority order:
+      - KHIVE_NO_EMBED set (any truthy value) -> False (explicitly disabled)
+      - KHIVE_EMBEDDING_MODEL set (non-empty)  -> True  (env-var path)
+      - [[engines]] found in config search     -> True  (TOML config path)
+      - nothing found                          -> False (skip the gate)
+    """
+    no_embed = os.environ.get("KHIVE_NO_EMBED", "").strip().lower()
+    if no_embed in ("1", "true", "yes", "on"):
+        return False
+    if os.environ.get("KHIVE_EMBEDDING_MODEL", "").strip():
+        return True
+    return _find_embed_config() is not None
+
+
+# ── Process lifecycle ─────────────────────────────────────────────────────────
+
 def spawn():
-    """Spawn kkernel mcp with an in-memory DB and embedding enabled (no --no-embed)."""
+    """Spawn kkernel mcp with an in-memory DB and embedding enabled.
+
+    Passes --config pointing at the project's .khive/config.toml when found
+    so the test works correctly regardless of the shell working directory.
+    """
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    cmd = [
+        BINARY, "mcp",
+        "--db", ":memory:",
+        "--log", "error",
+        "--pack", "kg",
+        "--pack", "memory",
+    ]
+    cfg = _find_embed_config()
+    if cfg:
+        cmd += ["--config", cfg]
     return subprocess.Popen(
-        [
-            BINARY, "mcp",
-            "--db", ":memory:",
-            "--log", "error",
-            "--pack", "kg",
-            "--pack", "memory",
-        ],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -110,6 +188,8 @@ def init_proc(proc):
     proc.stdin.write((json.dumps(notify) + "\n").encode())
     proc.stdin.flush()
 
+
+# ── Test data ─────────────────────────────────────────────────────────────────
 
 # Three topics chosen to be maximally distinct so ranking is deterministic.
 ITEMS = [
@@ -204,15 +284,15 @@ def test_vector_round_trip_and_recall_at_1():
             rank_1_ids.append(rank_1_id)
             print(
                 f"  [recall@1] {target_key}: "
-                f"rank-1 id={rank_1_id} score={rank_1_score:.3f} — CORRECT"
+                f"rank-1 id={rank_1_id} score={rank_1_score:.3f} -- CORRECT"
             )
 
         # Non-degenerate: the index must not always return the same row.
         assert len(set(rank_1_ids)) > 1, (
             f"All queries returned the same rank-1 id ({rank_1_ids[0]!r}). "
-            f"The index is degenerate — every query hits the same row."
+            f"The index is degenerate -- every query hits the same row."
         )
-        print(f"  [non-degenerate] {len(set(rank_1_ids))} distinct rank-1 ids across {len(QUERIES)} queries — ok")
+        print(f"  [non-degenerate] {len(set(rank_1_ids))} distinct rank-1 ids across {len(QUERIES)} queries -- ok")
 
     finally:
         proc.stdin.close()
@@ -224,6 +304,12 @@ def main():
     if not os.path.exists(BINARY):
         print(f"FAIL: binary not found: {BINARY}")
         return 1
+
+    if not embed_available():
+        print("SKIP: no embedding model configured (KHIVE_EMBEDDING_MODEL not set,")
+        print("  no [[engines]] in khive.toml / .khive/config.toml / ~/.khive/config.toml).")
+        print("  Set KHIVE_EMBEDDING_MODEL or add [[engines]] to .khive/config.toml to enable.")
+        return 0
 
     try:
         test_vector_round_trip_and_recall_at_1()
