@@ -312,10 +312,11 @@ pub trait NoteStore: Send + Sync + 'static {
 
     /// Attempt to insert a note without overwriting an existing row.
     ///
-    /// Uses `INSERT OR IGNORE` semantics: if any unique constraint fires
-    /// (primary key collision or a partial unique index such as the one on
-    /// `external_id`), the row is left unchanged and the method returns `false`.
-    /// Returns `true` when the row was newly written.
+    /// Returns `true` when the row was newly written.  Returns `false` only
+    /// when a live note with the same non-empty `external_id` already exists in
+    /// the same namespace and kind (confirmed dedup hit).  Any other constraint
+    /// violation (e.g. a primary key collision) is surfaced as a `StorageError`
+    /// so that callers do not misinterpret unexpected failures as deduplication.
     async fn try_insert_note(&self, note: Note) -> StorageResult<bool>;
 
     /// Fetch multiple notes by UUID in a single call.

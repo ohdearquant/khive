@@ -357,3 +357,31 @@ async fn test_filtered_invalid_json_path_rejected() {
         "invalid json_path must be rejected before SQL"
     );
 }
+
+// ── try_insert_note dedup-vs-error discrimination ───────────────────────────
+
+/// A PRIMARY KEY collision on a note without external_id must surface as a
+/// StorageError, not be silently misreported as a dedup hit.
+#[tokio::test]
+async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
+    let store = setup_memory_store();
+
+    let mut note = make_note("ns1", "message", "original content");
+    let fixed_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+    note.id = fixed_id;
+    // No external_id on this note.
+
+    let inserted = store
+        .try_insert_note(note.clone())
+        .await
+        .expect("first insert must succeed");
+    assert!(inserted, "first insert must return true");
+
+    // Second attempt with the same UUID triggers a PK collision.
+    // With no external_id to verify against, this must not be reported as dedup.
+    let result = store.try_insert_note(note).await;
+    assert!(
+        result.is_err(),
+        "PK collision without external_id must return StorageError, not Ok(false)"
+    );
+}
