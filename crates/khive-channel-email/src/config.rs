@@ -11,7 +11,9 @@ use khive_channel::ChannelError;
 /// Build via [`EmailChannelConfig::from_env`]. All fields are sourced
 /// exclusively from environment variables; no defaults are provided for
 /// credentials or host names.
-#[derive(Clone, Debug)]
+///
+/// `Debug` output redacts the password field; see the manual `Debug` impl below.
+#[derive(Clone)]
 pub struct EmailChannelConfig {
     /// SMTP relay host (e.g. `smtp.example.com`).
     pub smtp_host: String,
@@ -28,6 +30,20 @@ pub struct EmailChannelConfig {
     /// The single authorized maintainer address. Inbound messages from any other
     /// sender are rejected before ingestion.
     pub maintainer_address: MailAddress,
+}
+
+impl std::fmt::Debug for EmailChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailChannelConfig")
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("maintainer_address", &self.maintainer_address)
+            .finish()
+    }
 }
 
 impl EmailChannelConfig {
@@ -123,5 +139,28 @@ mod tests {
         let result = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST3", 587);
         assert!(result.is_err());
         std::env::remove_var("KHIVE_EMAIL_SMTP_PORT_TEST3");
+    }
+
+    #[test]
+    fn debug_output_does_not_expose_password() {
+        use crate::connector::MailAddress;
+        let config = EmailChannelConfig {
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            username: "user@example.com".to_string(),
+            password: "super-secret-credential-99".to_string(),
+            maintainer_address: MailAddress::parse("user@example.com").unwrap(),
+        };
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("super-secret-credential-99"),
+            "Debug output must not expose the password; got: {debug_output:?}"
+        );
+        assert!(
+            debug_output.contains("<redacted>"),
+            "Debug output must include the redaction marker; got: {debug_output:?}"
+        );
     }
 }
