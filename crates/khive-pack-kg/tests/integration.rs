@@ -7218,3 +7218,181 @@ async fn create_bulk_items_invalid_entity_type_rejects_batch() {
         "entity_type rejection must write nothing; got {listed}"
     );
 }
+
+// ── Proposal lifecycle: changeset application verified in KG ─────────────────
+//
+// The Wave-5 lifecycle tests (propose_review_approve_lifecycle et al.) assert
+// that the proposal status flips to "applied" but do NOT verify the changeset
+// payload was actually executed.  These tests close that gap: after apply, the
+// entity or note named in the changeset must exist in the KG store.
+
+/// Full lifecycle (add_entity changeset): propose → review(approve) → applied.
+///
+/// Covers:
+///  1. propose returns status "open", `id` key present, `proposal_id` absent.
+///  2. review(approve) returns "approved" or "applied".
+///  3. proposal appears in list(kind=proposal, status=applied).
+///  4. (non-vacuous) entity from the changeset EXISTS in the KG — this is the
+///     assertion that catches a silent apply-worker failure even when steps 1-3 pass.
+#[tokio::test]
+async fn proposal_add_entity_changeset_entity_exists_in_kg_after_apply() {
+    let f = pack_with_events();
+
+    // Unique name so the search below is unambiguous in a clean in-memory store.
+    let entity_name = "ProposalApplyEntityTarget_nvk_lifecycle_42";
+
+    // Step 1: propose.
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "add-entity changeset verify",
+                "description": "Verify that the changeset entity lands in the KG after apply",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": { "kind": "concept", "name": entity_name }
+                },
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+
+    let pid = propose["id"].as_str().expect("propose must return id");
+    assert_eq!(
+        propose["status"].as_str(),
+        Some("open"),
+        "propose: initial status must be 'open'; got {propose}"
+    );
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
+
+    // Step 2: review(approve) — "local" actor is exempt from the self-approval guard.
+    let review = f
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("review(approve) must succeed");
+
+    let review_status = review["status"].as_str().unwrap_or("");
+    assert!(
+        review_status == "approved" || review_status == "applied",
+        "review: status must be 'approved' or 'applied'; got {review_status:?}; full: {review}"
+    );
+    assert!(
+        review.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review}"
+    );
+
+    // Step 3: proposal must appear in the applied projection.
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
+        .await
+        .expect("list(kind=proposal, status=applied) must succeed");
+    let items = list.as_array().expect("list must return an array");
+    assert!(
+        items
+            .iter()
+            .any(|v| v["id"].as_str().is_some_and(|id| id == pid)),
+        "proposal {pid} must appear in list(status=applied); items: {list}"
+    );
+
+    // Step 4 (non-vacuous): the entity named in the changeset must exist in the KG.
+    // search(kind="entity") returns a bare array of hits; a non-empty result proves
+    // the apply worker ran and executed the add_entity operation.
+    let search = f
+        .dispatch("search", json!({ "kind": "entity", "query": entity_name }))
+        .await
+        .expect("search(kind=entity) must succeed");
+    let hits = search.as_array().expect("search must return array");
+    assert!(
+        !hits.is_empty(),
+        "entity '{entity_name}' must exist in KG after proposal apply; got empty search result"
+    );
+}
+
+/// Full lifecycle (add_note changeset): propose → review(approve) → applied.
+///
+/// Covers:
+///  1. propose returns status "open", `id` present, `proposal_id` absent.
+///  2. review(approve) returns "approved" or "applied".
+///  3. proposal appears in list(kind=proposal, status=applied).
+///  4. (non-vacuous) note from the changeset EXISTS in the note store — this is
+///     the assertion that catches a silent apply-worker failure for note changesets.
+#[tokio::test]
+async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
+    let f = pack_with_events();
+
+    // Unique content so the search below is unambiguous.
+    let note_content = "ProposalApplyNoteContent_nvk_lifecycle_42";
+
+    // Step 1: propose.
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "add-note changeset verify",
+                "description": "Verify that the changeset note lands in the KG after apply",
+                "changeset": {
+                    "kind": "add_note",
+                    "note": { "kind": "observation", "content": note_content }
+                },
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+
+    let pid = propose["id"].as_str().expect("propose must return id");
+    assert_eq!(
+        propose["status"].as_str(),
+        Some("open"),
+        "propose: initial status must be 'open'; got {propose}"
+    );
+    assert!(
+        propose.get("proposal_id").is_none(),
+        "propose must NOT emit old proposal_id key; got {propose}"
+    );
+
+    // Step 2: review(approve).
+    let review = f
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("review(approve) must succeed");
+
+    let review_status = review["status"].as_str().unwrap_or("");
+    assert!(
+        review_status == "approved" || review_status == "applied",
+        "review: status must be 'approved' or 'applied'; got {review_status:?}; full: {review}"
+    );
+    assert!(
+        review.get("proposal_id").is_none(),
+        "review must NOT emit old proposal_id key; got {review}"
+    );
+
+    // Step 3: proposal must appear in the applied projection.
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
+        .await
+        .expect("list(kind=proposal, status=applied) must succeed");
+    let items = list.as_array().expect("list must return an array");
+    assert!(
+        items
+            .iter()
+            .any(|v| v["id"].as_str().is_some_and(|id| id == pid)),
+        "proposal {pid} must appear in list(status=applied); items: {list}"
+    );
+
+    // Step 4 (non-vacuous): the note from the changeset must exist in the note store.
+    // search(kind="note") with the unique content string as the query returns hits
+    // only if the note was actually written by the apply worker.
+    let search = f
+        .dispatch("search", json!({ "kind": "note", "query": note_content }))
+        .await
+        .expect("search(kind=note) must succeed");
+    let hits = search.as_array().expect("search must return array");
+    assert!(
+        !hits.is_empty(),
+        "note with content '{note_content}' must exist in KG after proposal apply; \
+         got empty search result"
+    );
+}
