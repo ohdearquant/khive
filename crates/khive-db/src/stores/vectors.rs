@@ -356,18 +356,33 @@ impl VectorStore for SqliteVecStore {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let mut affected = 0u64;
             let mut failed = 0u64;
+            let mut first_error = String::new();
 
             for record in &records {
                 if record.vectors.len() != 1 {
+                    if first_error.is_empty() {
+                        first_error =
+                            format!("expected 1 vector per record, got {}", record.vectors.len());
+                    }
                     failed += 1;
                     continue;
                 }
                 let embedding = &record.vectors[0];
                 if embedding.len() != dims {
+                    if first_error.is_empty() {
+                        first_error = format!(
+                            "wrong vector dimension: expected {dims}, got {}",
+                            embedding.len()
+                        );
+                    }
                     failed += 1;
                     continue;
                 }
                 if non_finite_index(embedding).is_some() {
+                    if first_error.is_empty() {
+                        first_error =
+                            "embedding contains non-finite values (NaN or Inf)".to_string();
+                    }
                     failed += 1;
                     continue;
                 }
@@ -410,9 +425,12 @@ impl VectorStore for SqliteVecStore {
                         conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
                         affected += 1;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
                         let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
+                        if first_error.is_empty() {
+                            first_error = e.to_string();
+                        }
                         failed += 1;
                     }
                 }
@@ -424,7 +442,7 @@ impl VectorStore for SqliteVecStore {
                 attempted,
                 affected,
                 failed,
-                first_error: String::new(),
+                first_error,
             })
         })
         .await
@@ -1283,6 +1301,91 @@ mod batch_exists_tests {
             result.is_err(),
             "hyphenated model_key 'all-minilm-l6-v2' must be rejected; \
              the store's table_name would differ from what a hand-rolled sanitizer produces"
+        );
+    }
+}
+
+/// Tests for `first_error` surfacing in `insert_batch`.
+///
+/// These tests use only the pre-SAVEPOINT validation path (wrong vector count
+/// or wrong dimensions) so they do not need the `vectors` feature — no vec0
+/// virtual table is accessed.
+#[cfg(test)]
+mod first_error_tests {
+    use super::*;
+    use khive_storage::types::VectorRecord;
+    use khive_storage::VectorStore;
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    fn make_pool() -> Arc<crate::pool::ConnectionPool> {
+        use crate::pool::{ConnectionPool, PoolConfig};
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        Arc::new(ConnectionPool::new(config).expect("in-memory pool"))
+    }
+
+    /// insert_batch must populate `first_error` when records fail the dimension
+    /// validation check.
+    ///
+    /// Both records have the wrong number of dimensions, so both hit the
+    /// `embedding.len() != dims` guard before any SAVEPOINT or vec0 operation.
+    /// The outer transaction still commits (best-effort batch semantics).
+    ///
+    /// Regression: before the fix, `first_error` was always `String::new()` even
+    /// when `failed > 0`.  This test is RED against the unfixed code and GREEN
+    /// after the fix.
+    #[tokio::test]
+    async fn insert_batch_first_error_populated_on_dimension_mismatch() {
+        let dims = 4usize;
+        let store = SqliteVecStore::new(
+            make_pool(),
+            false,
+            "first_err_vec".into(),
+            "first_err_vec".into(),
+            dims,
+            "ns:test".into(),
+        )
+        .expect("SqliteVecStore::new");
+
+        // Both records have wrong dimensions — they fail the pre-SAVEPOINT
+        // validation and never touch the vec0 virtual table.
+        let summary = store
+            .insert_batch(vec![
+                VectorRecord {
+                    subject_id: Uuid::new_v4(),
+                    kind: SubstrateKind::Entity,
+                    namespace: "ns:test".to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![vec![0.0f32; dims + 1]],
+                    updated_at: chrono::Utc::now(),
+                },
+                VectorRecord {
+                    subject_id: Uuid::new_v4(),
+                    kind: SubstrateKind::Entity,
+                    namespace: "ns:test".to_string(),
+                    field: "body".to_string(),
+                    embedding_model: None,
+                    vectors: vec![vec![0.0f32; dims + 2]],
+                    updated_at: chrono::Utc::now(),
+                },
+            ])
+            .await
+            .expect("insert_batch must return Ok (best-effort semantics)");
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(
+            summary.failed, 2,
+            "both wrong-dims records must be counted as failed"
+        );
+        assert_eq!(summary.affected, 0);
+        assert!(
+            !summary.first_error.is_empty(),
+            "first_error must be populated when failed > 0; \
+             got empty string — the validation error is silently swallowed"
         );
     }
 }

@@ -1174,3 +1174,55 @@ async fn term_stats_missing_term_has_zero_df() {
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].document_frequency, 0);
 }
+
+/// Dropping the FTS5 virtual table makes every per-item INSERT in the batch
+/// fail with a SQLite error.  Each failure is caught by the SAVEPOINT so the
+/// outer transaction still commits and the method returns Ok.
+///
+/// Regression: before the fix, `first_error` was always `String::new()` even
+/// when `failed > 0`.  This test is RED against the unfixed code and GREEN
+/// after the fix.
+#[tokio::test]
+async fn upsert_documents_first_error_populated_on_item_failure() {
+    let table_key = "first_err_fts";
+
+    // Keep a clone of the pool so we can manipulate the schema before the batch.
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        ensure_fts5_schema(writer.conn(), table_key).unwrap();
+    }
+    let store = Fts5TextSearch::new(Arc::clone(&pool), false, table_key.to_string());
+
+    // Drop the FTS5 virtual table (which also removes all its shadow tables).
+    // Every subsequent DELETE/INSERT on the table will fail with "no such table".
+    // Each failure is isolated by a SAVEPOINT, so the outer transaction commits.
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("DROP TABLE fts_{}", table_key))
+            .expect("drop FTS5 virtual table");
+    }
+
+    let docs = vec![
+        make_document(Uuid::new_v4(), "Doc A", "body a"),
+        make_document(Uuid::new_v4(), "Doc B", "body b"),
+    ];
+
+    let summary = store.upsert_documents(docs).await.unwrap();
+
+    assert!(
+        summary.failed > 0,
+        "expected at least one item to fail after the FTS5 table was dropped"
+    );
+    assert!(
+        !summary.first_error.is_empty(),
+        "first_error must describe the failure when failed > 0, \
+         but got an empty string — the error is being silently swallowed"
+    );
+}
