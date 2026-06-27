@@ -82,7 +82,7 @@ pub fn render_format(value: Value, format: OutputFormat, presentation: Presentat
 /// Apply the view-only redundancy-reduction pre-pass (ADR-078 §7) to a value.
 ///
 /// Applies at most ONE pass over the value. This function is the canonical
-/// entry for the pre-pass; the per-record logic lives in [`drop_record`].
+/// entry for the pre-pass; the per-record logic lives in `drop_record`.
 ///
 /// Applied only when `format` ∈ {`auto`, `table`} AND `presentation` ≠ `Verbose`.
 /// Callers are responsible for checking those conditions; this function applies
@@ -275,9 +275,12 @@ fn cell_text(value: &Value) -> String {
     // Escape literal `|` and collapse embedded newlines to a space.
     let escaped = raw.replace('|', "\\|").replace(['\n', '\r'], " ");
 
-    // Truncate to approximately CELL_TRUNCATE characters.
-    if escaped.len() > CELL_TRUNCATE {
-        format!("{}...", &escaped[..CELL_TRUNCATE])
+    // Truncate to approximately CELL_TRUNCATE *characters* (char boundary,
+    // not byte index — slicing on a byte offset can panic on multi-byte chars).
+    let char_count = escaped.chars().count();
+    if char_count > CELL_TRUNCATE {
+        let truncated: String = escaped.chars().take(CELL_TRUNCATE).collect();
+        format!("{truncated}...")
     } else {
         escaped
     }
@@ -1082,6 +1085,35 @@ mod tests {
         assert!(
             !rendered.contains(&long),
             "full long string must not appear in table"
+        );
+    }
+
+    /// Cell truncation must not panic on multi-byte UTF-8 characters (High 3).
+    ///
+    /// A string of 119 ASCII bytes followed by a 3-byte CJK character and more
+    /// text has `len() > 120` but byte index 120 falls inside the CJK char.
+    /// The old byte-slice truncation would panic; char-boundary truncation is safe.
+    #[test]
+    fn cell_text_truncation_is_utf8_safe() {
+        // 119 ASCII 'a' bytes, then CJK char U+4E2D (3 bytes each), then more text.
+        // Total byte length: 119 + 3 * 10 + 5 > 120, but byte 120 is inside a CJK char.
+        let prefix = "a".repeat(119);
+        let suffix = "中".repeat(10); // each '中' is 3 bytes
+        let long_multibyte = format!("{prefix}{suffix}trailing");
+        let v = json!([
+            {"col": long_multibyte.clone()},
+            {"col": "ok"}
+        ]);
+        // Must not panic — this was the bug.
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            rendered.contains("..."),
+            "multibyte cell must be truncated with ..."
+        );
+        // The rendered string must be valid UTF-8 (no partial char slicing).
+        assert!(
+            std::str::from_utf8(rendered.as_bytes()).is_ok(),
+            "rendered output must be valid UTF-8"
         );
     }
 }

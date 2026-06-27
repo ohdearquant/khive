@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use khive_mcp::serve::enforce_strict_actor_mode;
+use khive_mcp::serve::{apply_env_output_format, enforce_strict_actor_mode};
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
@@ -117,6 +117,16 @@ pub struct ExecArgs {
     /// Presentation mode: `agent` (default), `verbose`, or `human`.
     #[arg(long)]
     pub presentation: Option<String>,
+
+    /// Output format for verb results (ADR-078 §2 precedence: this flag >
+    /// `KHIVE_OUTPUT_FORMAT` env var > `[runtime] default_output_format` in
+    /// `khive.toml` > builtin `json`).
+    ///
+    /// Valid values: `json` (compact, lossless — default), `auto` (shape-aware:
+    /// markdown table for record arrays, key-value block for single records),
+    /// `table` (force markdown table).
+    #[arg(long, value_name = "FORMAT")]
+    pub output_format: Option<String>,
 
     /// Verbose output: print per-event progress to stderr.
     #[arg(long, short = 'v')]
@@ -343,7 +353,16 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     match mode {
-        ExecMode::Inline(ops) => run_exec_inline(ops, cfg, args.presentation, args.save_file).await,
+        ExecMode::Inline(ops) => {
+            run_exec_inline(
+                ops,
+                cfg,
+                args.presentation,
+                args.output_format,
+                args.save_file,
+            )
+            .await
+        }
         ExecMode::OpsFile(path) => {
             run_exec_ops_file(path, cfg, args.presentation, args.dry_run).await
         }
@@ -359,13 +378,21 @@ async fn run_exec_inline(
     ops: String,
     cfg: RuntimeConfig,
     presentation: Option<String>,
+    output_format: Option<String>,
     save_file: Option<String>,
 ) -> Result<()> {
     #[cfg(unix)]
-    return run_exec_inline_with_forward(ops, cfg, presentation, save_file, forward_or_spawn_boxed)
-        .await;
+    return run_exec_inline_with_forward(
+        ops,
+        cfg,
+        presentation,
+        output_format,
+        save_file,
+        forward_or_spawn_boxed,
+    )
+    .await;
     #[cfg(not(unix))]
-    return run_exec_inline_with_forward(ops, cfg, presentation, save_file).await;
+    return run_exec_inline_with_forward(ops, cfg, presentation, output_format, save_file).await;
 }
 
 /// Inner implementation of `run_exec_inline`, parameterised over the daemon
@@ -385,6 +412,7 @@ async fn run_exec_inline_with_forward(
     ops: String,
     cfg: RuntimeConfig,
     presentation: Option<String>,
+    output_format: Option<String>,
     save_file: Option<String>,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
@@ -401,6 +429,9 @@ async fn run_exec_inline_with_forward(
     // The daemon path does not support --save-file (the daemon returns a string;
     // we would need to parse it back to apply the sink).  Skip daemon forwarding
     // when --save-file is set so the in-process path handles everything.
+    //
+    // The --output-format CLI flag (ADR-078 tier-1) is forwarded to the daemon as
+    // the per-request `format` field so the daemon applies it at its seam.
     #[cfg(unix)]
     if save_file.is_none() {
         let frame = DaemonRequestFrame {
@@ -411,7 +442,7 @@ async fn run_exec_inline_with_forward(
             config_id: compute_config_id(&cfg, None),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
-            format: None,
+            format: output_format.clone(),
             format_per_op: None,
         };
         if let Some(res) = forward_fn(&frame).await {
@@ -422,17 +453,25 @@ async fn run_exec_inline_with_forward(
     }
 
     // ── in-process fallback ───────────────────────────────────────────────────
+    // Apply the env-var tier (ADR-078 §2 tier-2: KHIVE_OUTPUT_FORMAT) before
+    // building the server, mirroring the serve path.  The CLI flag is then passed
+    // as the per-request `format` field (tier-1), which overrides the server default
+    // at dispatch time.
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Note: enforce_strict_actor_mode was called above before the daemon fast-path;
     // it is not repeated here — the single early check covers both paths.
-    let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let env_fmt = apply_env_output_format(None);
+    let server = KhiveMcpServer::new(rt)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_default_output_format(env_fmt);
 
     let params = RequestParams {
         ops,
         presentation,
         presentation_per_op: None,
         save_to: save_file,
-        format: None,
+        // Tier-1: CLI --output-format overrides the server default (env/builtin).
+        format: output_format,
         format_per_op: None,
     };
 
@@ -733,7 +772,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
 
         // Restore env.
         match prev_strict {
@@ -779,7 +818,7 @@ mod tests {
         };
 
         // The strict gate must pass; the actual dispatch will succeed (stats() is safe).
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -814,7 +853,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -889,6 +928,7 @@ mod tests {
             "stats()".to_string(),
             cfg,
             None,
+            None, // output_format
             None,
             spy_forward_records_call,
         )
@@ -942,6 +982,7 @@ mod tests {
             "stats()".to_string(),
             cfg,
             None,
+            None, // output_format
             None,
             spy_forward_records_call,
         )

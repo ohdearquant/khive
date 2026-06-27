@@ -955,7 +955,7 @@ fn apply_env_brain_profile(mut cfg: RuntimeConfig) -> RuntimeConfig {
 ///
 /// Returns the resolved [`OutputFormat`] to wire into the server via
 /// `with_default_output_format`.
-fn apply_env_output_format(toml_default: Option<OutputFormat>) -> OutputFormat {
+pub fn apply_env_output_format(toml_default: Option<OutputFormat>) -> OutputFormat {
     // Env var (tier 2) overrides TOML (tier 3).
     if let Ok(val) = std::env::var("KHIVE_OUTPUT_FORMAT") {
         match val.trim() {

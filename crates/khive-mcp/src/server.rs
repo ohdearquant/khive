@@ -1232,7 +1232,12 @@ impl KhiveMcpServer {
             };
 
         let result = self
-            .run_parsed(parsed.ops, parsed.mode, presentation, presentation_per_op)
+            .run_parsed(
+                parsed.ops,
+                parsed.mode,
+                presentation,
+                presentation_per_op.clone(),
+            )
             .await;
 
         if let Some(path_str) = save_to {
@@ -1250,6 +1255,7 @@ impl KhiveMcpServer {
             batch_format,
             &format_per_op,
             presentation,
+            &presentation_per_op,
         ))
     }
 }
@@ -1291,20 +1297,23 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///
 /// For each op entry in `results`:
 /// - If `ok=false` (error entry): always compact JSON, never reformatted (§8.2).
-/// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format), apply
-///   `render_format` to the `result` payload, embed the rendered string as
-///   `Value::String` back into the entry.
+/// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format) and
+///   per-op presentation (presentation_per_op[i] → batch presentation), apply
+///   `render_format` to the `result` payload with the effective presentation so
+///   that `presentation_per_op=["verbose"]` correctly skips the redundancy-drop
+///   pre-pass (ADR-078 §7 + §8.4).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// When the result value is not a compound batch envelope (single-op fast path),
-/// the whole value is rendered with `batch_format`.
+/// the whole value is rendered with `batch_format` and `presentation`.
 fn render_result(
     value: serde_json::Value,
     batch_format: OutputFormat,
     format_per_op: &Option<Vec<Option<OutputFormat>>>,
     presentation: PresentationMode,
+    presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
 ) -> String {
-    // Fast path: if format is json, just compact-serialize and return.
+    // Fast path: if format is json and no per-op overrides, compact-serialize and return.
     if batch_format == OutputFormat::Json && format_per_op.is_none() {
         return serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
     }
@@ -1320,6 +1329,13 @@ fn render_result(
                     .and_then(|x| *x)
                     .unwrap_or(batch_format);
 
+                // Resolve per-op presentation: per-op entry overrides batch default.
+                let effective_presentation = presentation_per_op
+                    .as_ref()
+                    .and_then(|v| v.get(i))
+                    .and_then(|o| *o)
+                    .unwrap_or(presentation);
+
                 // Error entries are never reformatted (§8.2).
                 let is_ok = entry
                     .get("ok")
@@ -1330,9 +1346,11 @@ fn render_result(
                     continue;
                 }
 
-                // For successful entries, render the `result` sub-value.
+                // For successful entries, render the `result` sub-value with the
+                // effective presentation so verbose ops skip the redundancy drop.
                 if let Some(result_val) = entry.get("result") {
-                    let rendered = render_format(result_val.clone(), per_op_fmt, presentation);
+                    let rendered =
+                        render_format(result_val.clone(), per_op_fmt, effective_presentation);
                     // Replace `result` with the rendered string.
                     let mut new_entry = entry.clone();
                     if let serde_json::Value::Object(ref mut emap) = new_entry {
@@ -1352,7 +1370,7 @@ fn render_result(
         }
     }
 
-    // Single-op or unknown shape: render the whole value with batch_format.
+    // Single-op or unknown shape: render the whole value with batch_format and presentation.
     render_format(value, batch_format, presentation)
 }
 
