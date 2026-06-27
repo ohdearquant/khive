@@ -233,29 +233,28 @@ Params:
 | `sent_at`      | string | no       | RFC 3339; defaults to now.                                                                                                                   |
 
 The handler writes exactly one `message` note with `direction=inbound` into the namespace from
-the `namespace` param. Before writing, the handler queries
-`json_extract(properties,'$.external_id')` for a match; if found, it returns early with no
-write (mandatory primary dedup; see §10).
+the `namespace` param. Deduplication is atomic: the handler calls `try_create_note`, which uses
+`INSERT OR IGNORE` against the durable unique index `idx_comm_message_external_id` (see §11).
+A duplicate `external_id` results in zero rows written and a `{"ok": true, "deduplicated": true}`
+response; no error is returned.
 
-#### 5b. The ingest loop and thread_id resolution
+Thread resolution: when `correlation_external_id` is supplied, the handler queries for an
+existing message note whose `external_id` matches that value, reads its `thread_id`, and
+attaches the new note to the same thread. When no match is found, the new note becomes a new
+thread root.
 
-The background polling loop runs in `kkernel`. For each returned `ChannelEnvelope`:
+#### 5b. The ingest loop
 
-**Step 1 -- Dedup check (mandatory primary)**: query notes where `kind = 'message'` and
-`json_extract(properties, '$.external_id') = envelope.external_id`. If a match exists, skip
-this envelope and move to the next. Do not dispatch.
+The background polling loop runs in `kkernel`. For each returned `ChannelEnvelope`, it
+forwards `external_id` and `correlation_external_id` from the envelope directly to
+`comm.ingest` without pre-screening or pre-resolution:
 
-**Step 2 -- Thread resolution**: if `correlation_external_id` is `Some(ext_id)`, query notes
-where `kind = 'message'` and `json_extract(properties, '$.external_id') = ext_id`. If found,
-read that note's `properties.thread_id` (a 36-char UUID written by the original outbound
-dispatch). This UUID is the `thread_id` param for `comm.ingest`. If not found, omit `thread_id`
-(the ingest note becomes a new thread root).
+**Dispatch**: call `verb_registry.dispatch("comm.ingest", params_json)` with `external_id` and
+`correlation_external_id` included when present. The gate fires at the dispatch seam.
+`comm.ingest` performs both dedup (via `INSERT OR IGNORE`) and thread resolution internally.
 
-**Step 3 -- Dispatch**: call `verb_registry.dispatch("comm.ingest", params_json)`. The gate
-fires at `pack.rs:678`. The handler's internal dedup check fires again before the write (step 1
-is an optimization; the handler check is the authoritative guard).
-
-Steps 1 and 2 use the `idx_comm_message_external_id` index (§11).
+There is no pre-dispatch dedup or thread-resolution step in the loop itself; those operations
+belong entirely to the `comm.ingest` handler.
 
 #### 5c. Outbound path and `external_id` write-back (DEFERRED -- not implemented in v1)
 
@@ -293,10 +292,10 @@ token obtained from `KhiveRuntime::authorize` is never consumed by `dispatch` an
 as a per-dispatch credential.
 
 **Startup pre-flight (gate check only):** At startup, before the polling task is spawned, the
-binary calls `KhiveRuntime::authorize(ingest_namespace)` once as a pre-flight check. If the
-configured gate denies the ingest namespace, the binary logs an error and does not start the
-polling loop (fail-fast before any polling begins). With the default `AllowAllGate`, this always
-succeeds. The token returned by `authorize` is discarded after the check.
+binary calls `VerbRegistry::authorize_namespace(ingest_namespace)` once as a pre-flight check.
+If the configured gate denies the ingest namespace, the binary logs an error and does not start
+the polling loop (fail-closed before any polling begins). With the default `AllowAllGate`, this
+always succeeds.
 
 **Per-dispatch namespace:** Every `comm.ingest` dispatch call includes `"namespace":
 "<target_agent_namespace>"` in its params. The registry extracts this at dispatch time
@@ -372,10 +371,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_message_external_id
 
 The index is PARTIAL UNIQUE: the `WHERE` clause excludes rows with a null or empty
 `external_id`, so notes without an external id (ordinary local messages) are unaffected.
-The uniqueness constraint enforces dedup atomically at insert time; the handler detects a
-UNIQUE constraint violation and returns `{"ok": true, "deduplicated": true}` without error.
-Applied via `CREATE UNIQUE INDEX IF NOT EXISTS` at boot, idempotently, requiring no migration
-file.
+The uniqueness constraint enforces dedup atomically at insert time; the handler uses
+`INSERT OR IGNORE` so a duplicate `external_id` results in zero rows written and a
+`{"ok": true, "deduplicated": true}` response without error.
+Applied by schema migration V5 (`005-unique-comm-external-id.sql`), which first drops any
+pre-existing non-unique index of the same name before creating the UNIQUE variant. This
+migration is required; it cannot be applied idempotently at boot via `IF NOT EXISTS` because
+a prior non-unique index of the same name would silently survive the boot-time check.
 
 ### 12. Rate limiting
 
@@ -494,9 +496,10 @@ acceptable. See §14.
 - `comm.inbox`, `comm.read`, `comm.reply`, and `comm.thread` are unchanged for agents.
 - A new `comm.ingest` `Visibility::Subhandler` verb is added to `khive-pack-comm` (`vocab.rs`
   - handler dispatch). It is not visible on the MCP wire.
-- `COMM_SCHEMA_PLAN_STMTS` gains a fourth entry: a PARTIAL UNIQUE index
-  `idx_comm_message_external_id` that enforces dedup atomically at insert time. Applied
-  idempotently at boot via `CREATE UNIQUE INDEX IF NOT EXISTS`. No migration file required.
+- `COMM_SCHEMA_PLAN_STMTS` has three entries (inbox, thread, and to-actor indexes). The
+  `idx_comm_message_external_id` PARTIAL UNIQUE index is NOT in the pack schema plan; it is
+  created by schema migration V5 (`005-unique-comm-external-id.sql`), which is the sole durable
+  authority. Dedup is atomic via `INSERT OR IGNORE` in `KhiveRuntime::try_create_note`.
 - The polling loop runs in `kkernel` as a `tokio::task`, holding `Arc<VerbRegistry>` and
   `Arc<ChannelRegistry>` (no `NamespaceToken` -- `dispatch` mints its own per call). It is
   cancelled on shutdown.

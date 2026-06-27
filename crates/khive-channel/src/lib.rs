@@ -29,7 +29,14 @@ pub struct ChannelEnvelope {
     pub subject: Option<String>,
     /// RFC 3339 timestamp of when the message was originally sent or received.
     pub sent_at: Option<DateTime<Utc>>,
-    /// External deduplication key (e.g. RFC 822 Message-ID for email).
+    /// External deduplication key.
+    ///
+    /// For IMAP email the format is `imap:{host}:{uidvalidity}:{uid}` (e.g.
+    /// `imap:mail.example.com:1234567:42`).  This key is derived from the IMAP
+    /// UIDVALIDITY and UID values, not from the RFC 822 `Message-ID` header.
+    /// Adapters must not populate this field when UIDVALIDITY or UID is absent
+    /// or zero; `comm.ingest` performs atomic dedup against the unique index on
+    /// this field.
     pub external_id: Option<String>,
     /// External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID header
     /// or In-Reply-To header value for email). The handler resolves this to an internal UUID.
@@ -127,9 +134,11 @@ pub trait Channel: Send + Sync + 'static {
 
     /// Poll for new inbound messages since `since`.
     ///
-    /// Returns envelopes ready to be ingested. Callers are responsible for
-    /// deduplication via `external_id`; adapters should apply a best-effort
-    /// server-side filter on `since` to avoid fetching large backlogs.
+    /// Returns envelopes ready to be forwarded to `comm.ingest`.  Deduplication
+    /// is performed by `comm.ingest` via `INSERT OR IGNORE` against the
+    /// `idx_comm_message_external_id` unique index; adapters do not need to
+    /// deduplicate themselves.  Adapters should apply a best-effort server-side
+    /// filter on `since` to avoid fetching large backlogs.
     async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError>;
 }
 
