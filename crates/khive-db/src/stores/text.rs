@@ -395,6 +395,7 @@ impl TextSearch for Fts5TextSearch {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let mut affected = 0u64;
             let mut failed = 0u64;
+            let mut first_error = String::new();
 
             for doc in &documents {
                 conn.execute_batch("SAVEPOINT fts_upsert_doc")?;
@@ -428,9 +429,12 @@ impl TextSearch for Fts5TextSearch {
                         conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc")?;
                         affected += 1;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc");
                         let _ = conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc");
+                        if first_error.is_empty() {
+                            first_error = e.to_string();
+                        }
                         failed += 1;
                     }
                 }
@@ -442,7 +446,7 @@ impl TextSearch for Fts5TextSearch {
                 attempted,
                 affected,
                 failed,
-                first_error: String::new(),
+                first_error,
             })
         })
         .await
