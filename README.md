@@ -131,8 +131,8 @@ stays under 250µs and the index scales sublinearly as the corpus grows from 100
 | 1M      | 0.9521    | 171µs | 216µs | 234µs | 320.8s |
 
 Query latency grows about 2.4x while the corpus grows 10x, so the search path is sublinear in
-corpus size over this range. Build cost is linear in the number of vectors and is paid once at
-index construction.
+corpus size over this range. Index build is a one-time cost paid at construction; it grows
+super-linearly here (about 29x build time for the 10x corpus).
 
 The speedups over exhaustive search implied by these latencies (89x at 100K, 153x at 316K, 341x
 at 1M) are computed against a back-derived brute-force baseline rather than a directly measured
