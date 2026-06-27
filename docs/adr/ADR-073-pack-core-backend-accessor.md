@@ -403,7 +403,7 @@ semantics.
 - [ADR-017](ADR-017-pack-standard.md) — `PackRuntime` trait; `dispatch` signature
 - [ADR-028](ADR-028-pack-scoped-backends.md) — pack-scoped backends; per-pack runtime instances
 - [ADR-029](ADR-029-substrate-coordinator.md) — cross-backend coordination; SubstrateCoordinator
-- [ADR-071](ADR-071-backend-pluggable-runtime.md) — proposed polystore boundary restoration; forward-compatibility constraint documented in §"Relationship to ADR-071"
+- ADR-071 (draft, not yet authored) — proposed polystore boundary restoration; forward-compatibility constraint documented in §"Relationship to ADR-071"
 - `crates/khive-runtime/src/runtime.rs` — `KhiveRuntime` struct definition (line 31)
 - `crates/khive-mcp/src/serve.rs` — `build_registry_for_multi_backend` (line 110)
 - `crates/khive-runtime/src/operations.rs` — `create_note` path (line 1887)
