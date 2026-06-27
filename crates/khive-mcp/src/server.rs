@@ -392,6 +392,15 @@ impl KhiveMcpServer {
         self
     }
 
+    /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
+    ///
+    /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
+    /// registry shares the same packs and dispatch state as the server.
+    #[cfg(feature = "channel-email")]
+    pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
+        self.registry.clone()
+    }
+
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
     ///
     /// Returns `Some(result)` when the coordinator handled the op (caller should skip

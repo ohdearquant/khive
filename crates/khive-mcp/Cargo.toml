@@ -36,12 +36,18 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
+chrono = { workspace = true }
 lattice-embed = { workspace = true, optional = true }
+khive-channel = { version = "0.2.11", path = "../khive-channel", optional = true }
+khive-channel-email = { version = "0.2.11", path = "../khive-channel-email", optional = true }
 
 [features]
 # bench-embedder: inject deterministic FNV-1a hash embedder into the serve path.
 # Bench-only — never enabled in release/publish builds.
 bench-embedder = ["lattice-embed"]
+# channel-email: enable the SMTP/IMAP email polling loop.
+# Requires KHIVE_EMAIL_* environment variables at runtime; does nothing when unset.
+channel-email = ["khive-channel", "khive-channel-email"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -37,6 +37,33 @@ pub struct MultiBackendRegistry {
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
     let server = build_server(&args)?;
 
+    // Spawn the email channel polling loop when the feature is enabled and the
+    // required environment variables are present. The loop is non-fatal: if
+    // configuration is absent it logs a warning and returns without panicking.
+    #[cfg(feature = "channel-email")]
+    {
+        use khive_channel::ChannelRegistry;
+        use khive_channel_email::EmailChannel;
+        use std::sync::Arc;
+
+        match EmailChannel::from_env() {
+            Ok(email_ch) => {
+                let mut ch_registry = ChannelRegistry::new();
+                ch_registry.register(Arc::new(email_ch));
+                let ch_registry = Arc::new(ch_registry);
+                let verb_reg = server.verb_registry_clone();
+                tokio::task::spawn(channel_poll_loop(ch_registry, verb_reg));
+                tracing::info!("email channel polling loop started");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "channel-email feature is enabled but configuration is incomplete: {e}; \
+                     email polling is disabled"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon(server).await?;
@@ -60,6 +87,57 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         bind: args.bind.clone(),
     };
     transport.serve(server, &opts).await
+}
+
+/// Background task that polls all registered channels every 5 seconds and
+/// ingests new inbound messages via `comm.ingest`.
+///
+/// Only compiled when the `channel-email` feature is enabled.
+#[cfg(feature = "channel-email")]
+async fn channel_poll_loop(
+    channels: std::sync::Arc<khive_channel::ChannelRegistry>,
+    registry: khive_runtime::VerbRegistry,
+) {
+    use chrono::Utc;
+    use serde_json::json;
+
+    let mut last_poll = Utc::now();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let since = last_poll;
+        last_poll = Utc::now();
+
+        for (kind, channel) in channels.iter() {
+            match channel.poll(since).await {
+                Ok(envelopes) => {
+                    for env in envelopes {
+                        let params = json!({
+                            "namespace": "local",
+                            "from": env.from,
+                            "to": env.to,
+                            "content": env.content,
+                            "subject": env.subject,
+                            "channel_kind": kind,
+                            "external_id": env.external_id,
+                            "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                            "correlation_external_id": env.correlation_external_id,
+                        });
+                        if let Err(e) = registry.dispatch("comm.ingest", params).await {
+                            tracing::warn!(
+                                channel = kind,
+                                "comm.ingest failed for inbound message: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(channel = kind, "channel poll failed: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
