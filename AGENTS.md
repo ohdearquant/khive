@@ -248,6 +248,48 @@ The two forms cannot be combined in one `request`, and the JSON op form does not
 Mixing `,` and `|` at the top level of one `request` is rejected, as is `$prev` inside the JSON op
 form. Use the function-call form shown above for chaining.
 
+### Output format
+
+The `request` envelope accepts a `format` parameter that controls how the response is serialized
+([ADR-078](docs/adr/ADR-078-output-format-shape-aware-rendering.md)):
+
+| Value   | Description                                                                                                                                                                                      | Default for                                                        |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `json`  | Compact JSON (`serde_json::to_string`). Lossless, parseable. The redundancy-drop in Agent presentation mode (properties dedup, `namespace=local` elision) already removes most duplicated bytes. | **all surfaces** (MCP `request`, `kkernel exec`, CLI, CI, scripts) |
+| `auto`  | Shape-aware: markdown table for record arrays, flat key-value block for single records, compact JSON fallback. Lossy view (cells truncated ~120 chars).                                          | (opt-in)                                                           |
+| `table` | Force markdown table regardless of shape. Lossy view.                                                                                                                                            | (opt-in)                                                           |
+
+The format axis is `Json | Auto | Table` (three values). YAML was measured and dropped: minimal-YAML
+costs ~11-17% more tokens than compact JSON for record arrays, so it never beats the default.
+
+```text
+# Default is compact json everywhere — parseable, lossless, $prev-safe
+request(ops="gtd.tasks(limit=10)")
+
+# Opt into a markdown table when an agent is reading (not parsing) the output
+request(ops="gtd.tasks(limit=10)", format="auto")
+```
+
+`format=json` (the default) is the machine contract: any caller that chains `$prev`, parses the
+response, or runs in a test harness gets it for free. `format=auto`/`table` are an opt-in token-lean
+_view_ for agents reading rather than parsing — they truncate long cells and are not round-trippable.
+In a compounded request (batch/chain) the format applies **per-op** to each op's `result`; the
+`results`/`summary` envelope stays compact JSON, and error entries are never reformatted. The
+per-op override is `format_per_op` (mirrors `presentation_per_op`). Verbs whose policy is
+AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`) are exempt from
+the redundancy-drop even under `auto`/`table`, so agents still get their full output.
+
+**Precedence** (ADR-078 §2, highest to lowest):
+
+1. Per-call `format` on the `request` envelope, or `kkernel exec --output-format <json|auto|table>`
+2. `KHIVE_OUTPUT_FORMAT` env var
+3. `[runtime] default_output_format` in `khive.toml`
+4. Builtin `json`
+
+A fleet that wants the lean view everywhere sets `[runtime] default_output_format = "auto"` once;
+product/cloud surfaces leave the default `json`. Unknown values (e.g. `yaml`) warn and fall back to
+the next tier. `kkernel exec` honors all four tiers, including the TOML tier on its in-process path.
+
 ### Notes vs entities
 
 - **Entities** = things in the world: concepts, papers, people, projects, datasets, orgs,
