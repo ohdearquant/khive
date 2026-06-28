@@ -157,6 +157,35 @@ pub(crate) async fn wait_for_ann(
 pub(crate) const ANN_WARM_WAIT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const ANN_WARM_WAIT_POLL_MS: u64 = 50;
 
+// ── Test-only seam: override the ANN warm-wait timeout ───────────────────────
+//
+// Zero means use the production default (ANN_WARM_WAIT_TIMEOUT_MS).
+// Tests set this to a small value (e.g. 50 ms) to avoid blocking the test
+// suite while still exercising the full degrade code path.
+static ANN_WARM_WAIT_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the effective ANN warm-wait timeout in milliseconds.
+///
+/// In production this always equals `ANN_WARM_WAIT_TIMEOUT_MS`.  During
+/// tests the value may be overridden via `set_warm_wait_timeout_override_ms`
+/// to avoid a 5-second stall per test run.
+pub(crate) fn warm_wait_timeout_ms() -> u64 {
+    let o = ANN_WARM_WAIT_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if o > 0 {
+        o
+    } else {
+        ANN_WARM_WAIT_TIMEOUT_MS
+    }
+}
+
+/// Set the ANN warm-wait timeout override for tests.  Pass `0` to restore the
+/// production default (`ANN_WARM_WAIT_TIMEOUT_MS`).
+#[cfg(test)]
+pub(crate) fn set_warm_wait_timeout_override_ms(ms: u64) {
+    ANN_WARM_WAIT_TIMEOUT_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl AnnBridge {
     pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         if dim == 0 {

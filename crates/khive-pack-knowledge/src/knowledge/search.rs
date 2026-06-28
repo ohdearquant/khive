@@ -1038,19 +1038,19 @@ impl KnowledgeHandlers {
             // cold-start race where the ANN is loading and the first query silently
             // returns ok:true,total:0 when FTS also finds nothing.
             //
-            // Test coverage note: the warming-Err branch here is exercised by the
-            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
-            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
-            // test is not feasible from the external tests/ directory because
-            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
-            // requires internal access.  The integration tests in tests/fixes.rs
-            // cover the non-warming hot-path and the empty-corpus guard instead.
+            // Test coverage note: the warming-Err branch here is exercised by
+            // both the mechanism-unit tests in vamana::tests and the handler-level
+            // degrade regression tests in knowledge::ann_degrade_tests.  The handler
+            // tests call this function directly with a pre-warmed SharedAnn, using
+            // the pub(crate) seams simulate_warming_in_flight and
+            // set_warm_wait_timeout_override_ms (50 ms override avoids a 5 s stall
+            // in CI while still exercising every line in the degrade branch).
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
                 if vamana::wait_for_ann(
                     ann,
                     &key,
-                    vamana::ANN_WARM_WAIT_TIMEOUT_MS,
+                    vamana::warm_wait_timeout_ms(),
                     vamana::ANN_WARM_WAIT_POLL_MS,
                 )
                 .await
@@ -1176,19 +1176,15 @@ impl KnowledgeHandlers {
             // prevents a race between the daemon warm-start and the first incoming
             // query from producing a silent ok:true,total:0 result.
             //
-            // Test coverage note: the warming-Err branch here is exercised by the
-            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
-            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
-            // test is not feasible from the external tests/ directory because
-            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
-            // requires internal access.  The integration tests in tests/fixes.rs
-            // cover the non-warming hot-path and the empty-corpus guard instead.
+            // Test coverage note: same degrade regression coverage as the `search`
+            // handler above — see knowledge::ann_degrade_tests for the handler-level
+            // tests that exercise this branch directly with a pre-warmed SharedAnn.
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
                 if vamana::wait_for_ann(
                     ann,
                     &key,
-                    vamana::ANN_WARM_WAIT_TIMEOUT_MS,
+                    vamana::warm_wait_timeout_ms(),
                     vamana::ANN_WARM_WAIT_POLL_MS,
                 )
                 .await
