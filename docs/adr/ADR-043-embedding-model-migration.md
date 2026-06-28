@@ -469,3 +469,29 @@ match cmd {
 - ADR-031 §D3 — `[[engines]]` schema, `vec_<engine>` table naming, `EngineConfig`
 - ADR-032 §3 — `EventKind` enum (extended here with four new variants)
 - ADR-033 §1 — `RecallConfig.fallback_during_migration` (added here)
+- [ADR-071](ADR-071-backend-pluggable-runtime.md) — `EmbeddingModelRecord` type change (see Amendment A1 below).
+
+## Amendment A1: `EmbeddingModelRecord` replaces `khive_db::EmbeddingModelRegistryRecord` (ADR-071, 2026-06-25)
+
+ADR-043 §Implementation specifies:
+
+> "`_embedding_models` schema: `khive-db` migrations and backend registry helpers; runtime
+> exposes read access via `KhiveRuntime::list_embedding_models`."
+
+The current shipped implementation returns `Vec<khive_db::EmbeddingModelRegistryRecord>` from
+`list_embedding_models`. `EmbeddingModelRegistryRecord` is a concrete `khive-db` struct,
+which leaks a backend-specific type into the runtime's public API.
+
+ADR-071 §5 introduces a runtime-owned type, `EmbeddingModelRecord`, in
+`crates/khive-runtime/src/embedding.rs`. `KhiveRuntime::list_embedding_models` returns
+`RuntimeResult<Vec<EmbeddingModelRecord>>` after this change.
+
+`EmbeddingModelRecord` carries the same fields as `EmbeddingModelRegistryRecord`. The
+conversion is a one-to-one field mapping done at the `khive-db` query boundary. Callers
+of `list_embedding_models` (the `kkernel engine list` and `kkernel engine status` subcommands)
+update their import from `khive_db::EmbeddingModelRegistryRecord` to
+`khive_runtime::EmbeddingModelRecord`.
+
+The `_embedding_models` table schema, migration versions V14/V16/V17, the registry query
+logic, and all other ADR-043 mechanics are unchanged. Only the return type of the one public
+API method changes.

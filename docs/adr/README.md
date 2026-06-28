@@ -98,6 +98,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-067](ADR-067-write-owner-daemon.md)                     | Write-Owner Daemon — Single-Writer Task and Write Queue (Proposed)                                              |
 | [ADR-068](ADR-068-cloud-multitenancy-topology.md)            | Cloud Multi-Tenancy Topology and Tenant Isolation (Proposed)                                                    |
 | [ADR-069](ADR-069-subject-model.md)                          | Subject Model — Domain-Ontology Ingestion and Map Pipeline (Proposed)                                           |
+| [ADR-071](ADR-071-backend-pluggable-runtime.md)              | Backend-Pluggable Runtime — Polystore Restoration (Accepted)                                                    |
 | [ADR-072](ADR-072-subject-ontologyspec-as-data.md)           | Subject OntologySpec as Runtime Data — Verbless Verticals and Pack Retirement (Proposed)                        |
 | [ADR-073](ADR-073-pack-core-backend-accessor.md)             | Pack Core-Backend Accessor (Accepted)                                                                           |
 | [ADR-074](ADR-074-graph-aware-recall.md)                     | Graph-Aware Recall — Graph-Proximity Signal in Memory Retrieval (Proposed)                                      |

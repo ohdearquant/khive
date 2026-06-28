@@ -572,3 +572,47 @@ the codebase's migration set is global, but applied state is per-file.
   changes (rows in existing `notes` table).
 - ADR-017: Pack Standard — `SchemaPlan` trait for pack-auxiliary tables.
 - ADR-017: Pack Standard (§EDGE_RULES) — endpoint rules don't require migrations.
+- ADR-071: Backend-Pluggable Runtime — `BackendMigrator` trait (see Amendment A1 below).
+
+## Amendment A1: `BackendMigrator` trait (ADR-071, 2026-06-25)
+
+ADR-071 introduces a `BackendMigrator` trait in `khive-storage` that the runtime boot path
+calls instead of the current direct `run_migrations(conn: &mut rusqlite::Connection)` call.
+
+The amendment to ADR-015 is narrow: the direct `run_migrations(conn)` call documented in
+§Implementation (`crates/khive-runtime/src/runtime.rs`) is replaced by the `BackendMigrator`
+trait, defined in `khive-storage`. The startup contract is unchanged from §Decision — the
+MCP binary does not apply migrations at startup. Per ADR-071 §2, boot dispatches by backend
+kind: a **file-backed** runtime calls `BackendMigrator::current_version()` and fails fast
+with a diagnostic pointing at `kkernel db migrate` when the persisted version is behind the
+codebase expectation; it does not call `migrate()`. `BackendMigrator::migrate()` is reserved
+for the `kkernel db migrate` operator command and for **in-memory/ephemeral** backends, whose
+`boot()` applies all migrations automatically (there is no operator to invoke `kkernel db
+migrate` for an ephemeral database).
+
+`khive-db` provides `SqliteMigrator`, which implements `BackendMigrator` by wrapping the
+existing `run_migrations` function. The `VersionedMigration` struct, the migration array,
+the `_schema_migrations` table, the `.sql` file convention, and all other ADR-015 mechanics
+are unchanged. Only the call site in the runtime moves from a direct `rusqlite::Connection`
+call to the trait method.
+
+This change removes `rusqlite` from `khive-runtime`'s production dependency tree, restoring
+the boundary specified in ADR-005 and ADR-009.
+
+The `BackendMigrator` trait:
+
+```rust
+// crates/khive-storage/src/migrations.rs
+pub trait BackendMigrator: Send + Sync {
+    /// Apply all pending migrations idempotently.
+    /// Returns the schema version after applying.
+    fn migrate(&self) -> StorageResult<u32>;
+
+    /// Return the current persisted schema version without migrating.
+    fn current_version(&self) -> StorageResult<u32>;
+}
+```
+
+`SqliteMigrator` in `khive-db` implements this trait over a `ConnectionPool`. Alternate
+backends implement it over their own connection types. The runtime holds
+`Arc<dyn BackendMigrator>` in its `BackendHandle` (ADR-071 §1).
