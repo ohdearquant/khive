@@ -36,6 +36,7 @@ khive-storage = { version = "0.2.11", path = "../khive-storage" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "knowledge_bench"
