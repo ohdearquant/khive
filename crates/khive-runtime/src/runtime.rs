@@ -275,6 +275,12 @@ impl KhiveRuntime {
         &self.backend
     }
 
+    /// Return the directory containing the backend's database file, or `None`
+    /// for an in-memory backend.
+    pub fn backend_data_dir(&self) -> Option<std::path::PathBuf> {
+        self.backend.data_dir()
+    }
+
     // ---- Store accessors (token-scoped) ----
 
     /// Get an EntityStore scoped to the token's namespace.
@@ -848,6 +854,56 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn backend_data_dir_returns_none_for_memory_backend() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        assert!(rt.backend_data_dir().is_none());
+    }
+
+    #[test]
+    fn backend_data_dir_returns_parent_dir_for_file_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let config = RuntimeConfig {
+            db_path: Some(path),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let rt = KhiveRuntime::new(config).expect("file runtime");
+        let data_dir = rt
+            .backend_data_dir()
+            .expect("file backend must return Some");
+        assert_eq!(data_dir, dir.path());
+    }
+
+    #[test]
+    fn backend_data_dir_returns_none_for_from_backend_with_memory() {
+        let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let rt = KhiveRuntime::from_backend(backend, config);
+        assert!(rt.backend_data_dir().is_none());
     }
 
     #[test]

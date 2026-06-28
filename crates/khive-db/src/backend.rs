@@ -18,6 +18,7 @@ use crate::stores::{entity, event, graph, note, sparse, text, vectors};
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    path: Option<std::path::PathBuf>,
 }
 
 impl StorageBackend {
@@ -28,14 +29,16 @@ impl StorageBackend {
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
+        let resolved = path.as_ref().to_path_buf();
         let config = PoolConfig {
-            path: Some(path.as_ref().to_path_buf()),
+            path: Some(resolved.clone()),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(config)?;
         Ok(Self {
             pool: Arc::new(pool),
             is_file_backed: true,
+            path: Some(resolved),
         })
     }
 
@@ -50,8 +53,9 @@ impl StorageBackend {
     /// does not create a new file.
     pub fn sqlite_read_only(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
+        let resolved = path.as_ref().to_path_buf();
         let config = PoolConfig {
-            path: Some(path.as_ref().to_path_buf()),
+            path: Some(resolved.clone()),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(config)?;
@@ -68,6 +72,7 @@ impl StorageBackend {
         Ok(Self {
             pool: Arc::new(pool),
             is_file_backed: true,
+            path: Some(resolved),
         })
     }
 
@@ -86,6 +91,7 @@ impl StorageBackend {
         Ok(Self {
             pool: Arc::new(pool),
             is_file_backed: false,
+            path: None,
         })
     }
 
@@ -546,6 +552,12 @@ impl StorageBackend {
         self.is_file_backed
     }
 
+    /// Return the directory containing the backend's database file, or `None`
+    /// for an in-memory backend.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        self.path.as_ref()?.parent().map(|p| p.to_path_buf())
+    }
+
     /// Access the underlying pool (escape hatch).
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
@@ -575,6 +587,21 @@ mod tests {
         let backend = StorageBackend::sqlite(&path).expect("file backend should create");
         assert!(backend.is_file_backed());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn data_dir_returns_none_for_memory_backend() {
+        let backend = StorageBackend::memory().expect("memory backend");
+        assert!(backend.data_dir().is_none());
+    }
+
+    #[test]
+    fn data_dir_returns_parent_dir_for_file_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let backend = StorageBackend::sqlite(&path).expect("file backend");
+        let got = backend.data_dir().expect("file backend must return Some");
+        assert_eq!(got, dir.path());
     }
 
     #[tokio::test]
