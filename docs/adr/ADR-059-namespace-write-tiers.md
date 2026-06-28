@@ -17,7 +17,7 @@ The ADR number 059 is burned — this file is preserved as a record of the withd
 **Withdrawn**: 2026-06-16 (superseded by ADR-007 Rev 2)
 **Depends on**:
 
-- ADR-007 (Namespace contract — attribution-only, OSS vs cloud axes; now Rev 3)
+- ADR-007 (Namespace contract — attribution-only, attribution vs isolation axes; now Rev 3)
 - ADR-017 (Pack standard — pack-extensible edge endpoints)
 - ADR-018 (Authorization gate — single dispatch-site enforcement)
 - ADR-046 (Event-sourced proposals — the mutation path for subagents)
@@ -69,13 +69,13 @@ here:
 
 This ADR defines a **visibility boundary for cooperating agents running on the same SQLite
 database**. Agents that honor the token contract cannot access records outside their visible
-set. This is sufficient for the multi-lambda cooperative use case in an OSS single-machine
+set. This is sufficient for the multi-lambda cooperative use case in a single-machine
 deployment.
 
 This ADR does NOT establish a **security boundary against a hostile local actor**. Any process
 with filesystem access to the SQLite file can read or write records directly. Authentication
 against an independent authority, row-level encryption, and mTLS caller propagation are
-cloud-tier concerns addressed in ADR-053 and its successors. The phrase "access control" in
+multi-actor isolation concerns addressed in ADR-053 and its successors. The phrase "access control" in
 this document always refers to the visibility-boundary sense, never to hardened security.
 
 ---
@@ -109,7 +109,7 @@ Two actor kinds are recognized for namespace write-tier enforcement. They map di
 | Lambda   | `"lambda"`            | Standing orchestrators (leo, khive, lionagi) |
 | Subagent | `"subagent"`          | Ephemeral task-runners spawned by a lambda   |
 
-The `"anonymous"` kind (the current OSS default) is treated as a lambda for backward
+The `"anonymous"` kind (the current default) is treated as a lambda for backward
 compatibility: unauthenticated local sessions retain full write access. A future ADR may
 tighten this once `[actor] kind` is declared in `khive.toml`.
 
@@ -167,7 +167,7 @@ Construction invariant: the primary `namespace` is always in both `visible` and 
 
 `ActorConfig.kind` is resolved at token-mint time and stored in `ActorRef.kind` within the
 token. The runtime reads `token.actor().kind` to enforce propose-only for subagents. The
-field already exists (`khive-gate/src/actor.rs:14`); this ADR defines its OSS values and
+field already exists (`khive-gate/src/actor.rs:14`); this ADR defines its values and
 enforcement semantics.
 
 ### 5. Write Enforcement
@@ -405,11 +405,12 @@ pollutes the cooperative KG and exposes operator context to every cooperating ag
 Add a `owner_kind` column to every substrate table. Storage queries enforce ownership. Or use
 SQLite ATTACH to give each namespace a separate file with filesystem-level permissions.
 
-Rejected for OSS scope: this requires schema changes to all three substrate tables (entities,
+Rejected: this requires schema changes to all three substrate tables (entities,
 notes, edges), adds storage-layer coupling, and still provides no hardened security against
 a process with filesystem access. The visibility-boundary model is sufficient for cooperative
-agents and does not need storage-layer enforcement in OSS. Cloud-tier isolation uses
-per-tenant database files (ADR-028 routing) rather than row-level ownership.
+agents and does not need storage-layer enforcement in single-actor deployments.
+Isolation in multi-actor deployments uses per-actor database files
+(ADR-028 routing) rather than row-level ownership.
 
 ---
 

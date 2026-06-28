@@ -46,7 +46,7 @@ primitives (`kkernel sync`, `kkernel export`, `kkernel import`, `kkernel validat
 `kkernel db migrate`, etc.). The split:
 
 - **`khive`** — git workflows, file scaffolding, hook installation, user CLI ergonomics,
-  network pack install, and (future) hosted product features.
+  network pack install, and (future) operator-facing product features.
 - **`kkernel`** — storage, validation primitives, pack registry, coordinator, MCP server,
   schema migrations. Pure Rust; no Deno or product UX.
 

@@ -85,7 +85,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-050](ADR-050-kg-token-namespace-contract.md)            | KG Token Namespace Contract (Accepted -- partially superseded by ADR-007 Rev 3)                                 |
 | [ADR-051](ADR-051-section-embeddings-hybrid-compose.md)      | Section-Level Embeddings and Hybrid Compose Scoring (Accepted)                                                  |
 | [ADR-052](ADR-052-ann-production-lifecycle.md)               | ANN Production Lifecycle — SQ8 Quantization, Tombstone Delete, Consolidation, Crash-Safe Persistence (Accepted) |
-| [ADR-053](ADR-053-authorization-gate.md)                     | Authorization Gate — ActorStore, SessionStore, and Cloud-Tier Caller Propagation (Proposed)                     |
+| [ADR-053](ADR-053-authorization-gate.md)                     | Authorization Gate — ActorStore, SessionStore, and Caller Propagation (Proposed)                                |
 | [ADR-054](ADR-054-ann-build-strategy-scaling-limits.md)      | ANN Build Strategy and Scaling Limits (Proposed)                                                                |
 | [ADR-055](ADR-055-epistemic-edge-relations.md)               | Epistemic Edge Relations — `supports` and `refutes` (Accepted)                                                  |
 | [ADR-056](ADR-056-channel-transport-layer.md)                | Channel Transport Layer — `khive-channel` and External Messaging Adapters (Proposed)                            |
@@ -96,7 +96,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-062](ADR-062-fts-ann-consolidation.md)                  | FTS and ANN Consolidation -- Unified Search Tables (Schema V4) (Accepted)                                       |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)              | Autonomous Merge Pipeline — Gate Wall as Reviewer, Human Gate at Release (Proposed)                             |
 | [ADR-067](ADR-067-write-owner-daemon.md)                     | Write-Owner Daemon — Single-Writer Task and Write Queue (Proposed)                                              |
-| [ADR-068](ADR-068-cloud-multitenancy-topology.md)            | Cloud Multi-Tenancy Topology and Tenant Isolation (Proposed)                                                    |
+| [ADR-068](ADR-068-process-isolation-topology.md)             | Per-Process Isolation Topology (Proposed)                                                                       |
 | [ADR-069](ADR-069-subject-model.md)                          | Subject Model — Domain-Ontology Ingestion and Map Pipeline (Proposed)                                           |
 | [ADR-071](ADR-071-backend-pluggable-runtime.md)              | Backend-Pluggable Runtime — Polystore Restoration (Accepted)                                                    |
 | [ADR-072](ADR-072-subject-ontologyspec-as-data.md)           | Subject OntologySpec as Runtime Data — Verbless Verticals and Pack Retirement (Proposed)                        |

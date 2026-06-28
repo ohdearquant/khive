@@ -12,26 +12,26 @@ writes one vector per atom into the default embedder's vector store, and search
 ranks atoms by TF-IDF with an atom-level embedding rerank.
 
 `knowledge_sections` has carried an unused `embedding BLOB` column since its
-introduction. The pre-OSS engine (`engine_v1`) had a real section-level vector
+introduction. An earlier engine (`engine_v1`) had a real section-level vector
 path — `EmbeddedEngine::search_sections` (per-section cosine with fusion-strategy
 dispatch) consumed by compose for token-budget section selection. That path was
-**not ported** to the OSS pack: the column is never populated and never read, and
+**not ported** to the current pack: the column is never populated and never read, and
 compose scores sections by static weights only (`section_type + edge + quality`).
 The `retrieval` objective weight that was meant to carry section similarity is
 defined but unapplied. This is a regression, not merely an un-run backfill.
 
-A pre-OSS implementation spec defines the intended design — breadcrumb-enriched
+An earlier implementation spec defines the intended design — breadcrumb-enriched
 section embedding text, hash-incremental backfill, and a hybrid compose score —
 tracked for the read side in issue #6.
 
 ## Decision
 
-Restore section-level embeddings and hybrid compose, adapted to the OSS schema.
+Restore section-level embeddings and hybrid compose, adapted to the current schema.
 
 ### Storage — reuse the existing column, single-model
 
 The spec proposed a **separate** `section_embeddings` table (its engine_v1 target
-lacked a per-section table and wanted multi-model rows). The OSS schema already
+lacked a per-section table and wanted multi-model rows). The current schema already
 makes that choice differently: `knowledge_sections` **is** the per-section table,
 with a built-in `embedding BLOB` column, `content_hash`, `sort_order` (the section
 index), `heading`, `section_type`, and `tokens`. We therefore populate the

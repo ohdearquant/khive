@@ -12,8 +12,8 @@ the future gateway, FFI for embedded callers) can invoke any verb on any namespa
 For personal-local deployments this is fine. For:
 
 - **Multi-tenant deployments** — one khive process serving multiple users or agents
-- **Compliance workloads** — SOC 2, FedRAMP, financial regulators requiring "who did
-  what" auditability
+- **Deployments with auditability requirements** — any scenario where operators need a record
+  of which principals performed which actions
 - **Public services** — exposed via HTTP gateway with authenticated principals
 
 …the absence of gating is a deal-breaker.
@@ -22,8 +22,8 @@ The system must satisfy:
 
 1. **Pluggable policy.** No hardcoded auth logic. Each deployment plugs in its policy
    engine — Rego, capability-based, OAuth-scope-based, or custom.
-2. **OSS-compatible defaults.** A permissive default (`AllowAllGate`) is the boot
-   default for the OSS distribution; nothing changes for personal-local users.
+2. **Permissive defaults.** A permissive default (`AllowAllGate`) is the boot
+   default; nothing changes for personal-local users.
 3. **Hard enforcement from day 1.** `Deny` decisions block dispatch — no advisory
    phase, no "log-and-allow" mode. The gate is authoritative.
 4. **Structured audit trail.** Every gate consultation produces a queryable record:
@@ -32,9 +32,8 @@ The system must satisfy:
 5. **Fail-open on infrastructure errors.** A misconfigured Rego policy must not take
    down the whole server. Gate-infrastructure failures log a warning and proceed; only
    explicit `Deny` decisions block.
-6. **License clean.** The default impl lives in Apache-2.0 OSS. Downstream impls
-   (LionGate, custom backends) ship under their own licenses without forcing OSS
-   coupling.
+6. **License clean.** The default impl lives in Apache-2.0. Custom Gate backends
+   ship under their own licenses without any coupling to this crate's license.
 
 ## Decision
 
@@ -85,7 +84,7 @@ The JSON projection of `GateRequest` is the **public contract**. Field names
 (`input.actor.kind`, `input.namespace`, `input.verb`, etc.) are what policies receive
 as input. Changing a field name is a breaking change requiring an ADR amendment.
 
-### `AllowAllGate`: the OSS default
+### `AllowAllGate`: the default gate
 
 ```rust
 // crates/khive-gate/src/lib.rs
@@ -103,8 +102,8 @@ impl Gate for AllowAllGate {
 who do not explicitly configure a policy backend see no change from earlier khive
 behavior — every verb is allowed.
 
-The OSS documentation warns loudly that `AllowAllGate` is a footgun in multi-user or
-hosted contexts. Hosted deployments configure `RegoGate` or a custom backend before
+The documentation warns that `AllowAllGate` is a footgun in multi-user or
+networked contexts. Deployments serving multiple users should configure `RegoGate` or a custom backend before
 serving traffic.
 
 ### `RegoGate`: canonical policy backend in `khive-gate-rego`
@@ -167,7 +166,7 @@ decision := {"decision": "deny", "reason": "anonymous callers cannot write"} if 
 ```
 
 `khive-gate-rego` is a sibling crate, not a feature flag on `khive-gate`. Operators add
-the dependency to opt in. Consumers that don't need Rego (e.g., the OSS personal-local
+the dependency to opt in. Consumers that don't need Rego (e.g., a personal-local
 binary) don't compile regorus at all.
 
 Rego is the policy language because OPA (Open Policy Agent) is the cross-industry
@@ -468,7 +467,7 @@ mode would mean another phase of "we'll enforce later" — and "later" has a way
 arriving.
 
 Hard enforcement is the honest behavior: if a policy says Deny, we deny. The
-`AllowAllGate` default preserves OSS personal-local behavior; deployments that
+`AllowAllGate` default preserves personal-local behavior; deployments that
 configure a policy backend get the policy they configured. No magic.
 
 ### Why fail-open on gate Err?
@@ -492,8 +491,8 @@ structured log fields; no extra infrastructure needed. Audit events fire through
 tracing even when the EventStore is not configured (personal-local deployments).
 
 EventStore persistence is for deployments that need queryable, persistent audit logs
-— SOC 2 compliance, incident retrospectives, "what happened on day X" investigations.
-SQL/GQL queries over the `events` table answer those questions directly.
+— incident retrospectives, "what happened on day X" investigations, and any auditability
+requirement. SQL/GQL queries over the `events` table answer those questions directly.
 
 Both sinks are independent. Neither replaces the other.
 
@@ -518,7 +517,7 @@ is observability about that decision, not part of the decision itself.
 This is the standard split between control plane (the decision) and observability
 plane (the record of the decision). Failures in observability don't affect control.
 
-### Why Rego as the canonical OSS backend?
+### Why Rego as the canonical policy backend?
 
 OPA (Open Policy Agent) is the established cross-industry policy language. Rego
 policies are used in Kubernetes admission, Envoy auth, Istio, AWS Cedar (near-peer),
@@ -531,7 +530,7 @@ would re-litigate every decision OPA already made.
 
 ### Why `Gate::impl_name`?
 
-When multiple gates wrap each other (e.g., `LionGate<RegoGate>`), the audit event
+When multiple gates wrap each other (e.g., `OuterGate<RegoGate>`), the audit event
 needs to identify which gate produced the decision. `impl_name` is a stable string
 per gate type. Default returns the Rust type name; specific impls override for
 clarity.
@@ -562,7 +561,7 @@ care; alert pipelines do.
 
 - Pluggable policy engine. Deployments configure Rego, capability-based, OAuth-scope,
   or custom backends without modifying khive core.
-- OSS default is zero-config (`AllowAllGate`). Personal-local users see no behavior
+- Default is zero-config (`AllowAllGate`). Personal-local users see no behavior
   change.
 - Hard enforcement from day 1. Deny means deny; no "we'll enforce later" debt.
 - Structured audit trail. Tracing for log aggregators, EventStore for persistent
@@ -582,7 +581,7 @@ care; alert pipelines do.
   Mitigated: bench-driven; switch to compiled-policy or engine pool when contention
   becomes measurable.
 - `AllowAllGate` is a footgun in multi-user environments. The default exists for
-  personal use, but operators who forget to configure a policy in a hosted deployment
+  personal use, but operators who forget to configure a policy in a networked deployment
   have no protection.
   Mitigated: documentation emphasis; future "strict mode" config flag that requires
   an explicit non-default gate.
@@ -598,7 +597,7 @@ care; alert pipelines do.
 - `AuditEvent` adds ~80 LOC to `khive-gate` for a public-contract type. Reasonable.
 - The two-sink design means operators choose which they want. Both fire when both are
   configured.
-- Personal-local OSS use is unchanged: `AllowAllGate` allows everything, audit fires
+- Personal-local use is unchanged: `AllowAllGate` allows everything, audit fires
   through tracing, no `EventStore` configuration needed.
 
 ## Implementation

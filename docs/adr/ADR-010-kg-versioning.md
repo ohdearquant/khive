@@ -198,7 +198,7 @@ Data classes that may appear in NDJSON snapshots:
 | Edge properties   | `dependency_kind`, `weight`      | Low                                           |
 | Edge topology     | Which entities are linked        | Medium (reveals research structure)           |
 
-For hosted deployments:
+For multi-user deployments:
 
 - Private git repositories only. Do not push NDJSON snapshots to public repos.
 - Consider content encryption at the NDJSON layer before git commit if the deployment
@@ -260,7 +260,7 @@ part of the federated commit identity. `KgArchive` remains a clean single-backen
 ### Why GitHub for social (not khive-native)?
 
 Building fork/PR/review/CI infrastructure is years of work. GitHub already provides it.
-khive's competitive advantage is semantic understanding of graph changes, not a
+khive's contribution is semantic understanding of graph changes, not a
 collaboration platform. Semantic enrichment (diff visualization, conflict explanation,
 validation reports) adds value on top of GitHub without replacing it.
 

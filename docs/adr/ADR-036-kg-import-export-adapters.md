@@ -417,7 +417,7 @@ investment before usage patterns are confirmed.
 
 | Alternative                                              | Why rejected                                                                        |
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| NDJSON only — require users to convert externally        | Onboarding friction blocks the OSS research use case                                |
+| NDJSON only — require users to convert externally        | Onboarding friction blocks the research use case                                    |
 | Universal import via LLM ("paste your data, AI maps it") | Non-deterministic; slow; hard to audit; out of scope for core CLI                   |
 | Plugin-based adapters (user-installable format plugins)  | Plugin API surface maintenance deferred; start with built-in adapters               |
 | Always require a mapping file                            | High friction for obvious column-name cases; users abandon onboarding               |

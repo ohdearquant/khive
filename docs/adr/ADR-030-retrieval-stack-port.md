@@ -13,7 +13,7 @@ ANN well for v1 scale"). Both deferrals were correct at the time.
 
 Two conditions have changed:
 
-1. **A mature internal retrieval stack exists** (`khive-internal/platform/retrieval/`):
+1. **A mature retrieval stack was already implemented** (internal path `platform/retrieval/`):
    ~29K LOC, 5000+ LOC of tests, HNSW with INT8 two-phase quantized search,
    BM25 keyword index, RRF/weighted/union fusion, checkpointing, persistence,
    graph-aware retrieval, deterministic i64 fixed-point scoring throughout (ADR-006),
@@ -41,7 +41,7 @@ not foundational.
 
 ## Decision
 
-Port `khive-internal/platform/retrieval/` into the OSS workspace as `khive-retrieval`.
+Port the internal retrieval stack (`platform/retrieval/`) into the workspace as `khive-retrieval`.
 Use `lattice-embed` (ADR-011) as the SIMD and quantization foundation. The retrieval
 crates ship, but `khive-db` still contains sqlite-vec VectorStore compatibility in current
 code; sqlite-vec retirement remains a separate implementation issue. Deliver in-process
@@ -71,7 +71,7 @@ khive/crates/
   khive-fold           — Fold / Objective / Anchor / Selector (ADR-024, unchanged)
   khive-score          — DeterministicScore, RRF math (ADR-006, unchanged)
   khive-db             — SQLite backend; still includes sqlite-vec VectorStore compatibility
-  khive-retrieval      — ported retrieval primitives from khive-internal/platform/retrieval/
+  khive-retrieval      — retrieval primitives ported from the internal platform/retrieval/
     hnsw/              — HNSW index, INT8 two-phase quantized search
     bm25/              — BM25 keyword index
     fusion/            — RRF / Weighted / Union / VectorOnly strategies
@@ -95,9 +95,9 @@ khive/proofs/
 
 ### Dependency rewiring
 
-The internal crate's dependencies map to OSS equivalents as follows:
+The internal crate's dependencies map to workspace equivalents as follows:
 
-| khive-internal            | khive-oss (this port)                       |
+| Internal crate            | khive equivalent                            |
 | ------------------------- | ------------------------------------------- |
 | `foundation/score`        | `khive-score`                               |
 | `foundation/embed`        | `lattice-embed` (the strategic switch)      |
@@ -145,12 +145,12 @@ shipped code. The retrieval crates (`khive-retrieval`, `khive-hnsw`, `khive-vama
 ship alongside it; they do not replace or remove the sqlite-vec dependency from `khive-db`.
 
 Retiring sqlite-vec from `khive-db` — routing `VectorStore` impls through `HnswIndex`,
-providing an OSS migration path (`kkernel migrate-vectors` or auto-detect-and-rebuild) —
+providing a migration path (`kkernel migrate-vectors` or auto-detect-and-rebuild) —
 is a separate future implementation issue, not completed by this port.
 
 ### Formal proofs
 
-Proof files relocate from `khive-internal` to `khive/proofs/Retrieval/` and
+Proof files relocate from the internal implementation to `khive/proofs/Retrieval/` and
 `khive/proofs/Scoring/`. Each file is self-contained: no runtime-dependency assumptions
 in theorem statements. The proofs characterize the algorithms, not the implementation.
 
@@ -166,8 +166,7 @@ a header comment citing the theorem:
 `lake build` is wired into CI so proofs do not drift from code.
 
 This gives khive-retrieval a property no production vector retrieval system has:
-machine-checked correctness for core search algorithms. Downstream consumers — whether
-OSS projects, commercial products, or internal tooling — can depend on this crate without
+machine-checked correctness for core search algorithms. Downstream consumers can depend on this crate without
 inheriting any deployment-specific assumptions.
 
 ### RuVector — opt-in adapter packs only
@@ -176,30 +175,29 @@ RuVector provides techniques the internal stack does not have. Each becomes a fo
 adapter pack that wires the RuVector primitive into a khive verb. None are required for
 default operation.
 
-| Capability                                | Source                           | Default |
-| ----------------------------------------- | -------------------------------- | ------- |
-| HNSW vector index                         | khive-retrieval (verified)       | yes     |
-| BM25 keyword index                        | khive-retrieval (verified)       | yes     |
-| RRF / Weighted / Union fusion             | khive-retrieval (verified)       | yes     |
-| Distance kernels (AVX-512 VNNI, NEON)     | `lattice-embed::simd`            | yes     |
-| Quantization tiering (Hot/Warm/Cold)      | `lattice-embed::simd::tier`      | yes     |
-| HNSW checkpoint + persistence             | khive-retrieval                  | yes     |
-| Graph-aware retrieval                     | khive-retrieval                  | yes     |
-| ColBERT multi-vector late interaction     | RuVector adapter pack (deferred) | no      |
-| Matryoshka adaptive-dimension retrieval   | RuVector adapter pack (deferred) | no      |
-| Conformal prediction (uncertainty bounds) | RuVector adapter pack (deferred) | no      |
-| Spectral coherence metrics                | RuVector adapter pack (deferred) | no      |
-| DiskANN out-of-core (cloud scale)         | RuVector adapter pack (deferred) | no      |
+| Capability                                    | Source                           | Default |
+| --------------------------------------------- | -------------------------------- | ------- |
+| HNSW vector index                             | khive-retrieval (verified)       | yes     |
+| BM25 keyword index                            | khive-retrieval (verified)       | yes     |
+| RRF / Weighted / Union fusion                 | khive-retrieval (verified)       | yes     |
+| Distance kernels (AVX-512 VNNI, NEON)         | `lattice-embed::simd`            | yes     |
+| Quantization tiering (Hot/Warm/Cold)          | `lattice-embed::simd::tier`      | yes     |
+| HNSW checkpoint + persistence                 | khive-retrieval                  | yes     |
+| Graph-aware retrieval                         | khive-retrieval                  | yes     |
+| ColBERT multi-vector late interaction         | RuVector adapter pack (deferred) | no      |
+| Matryoshka adaptive-dimension retrieval       | RuVector adapter pack (deferred) | no      |
+| Conformal prediction (uncertainty bounds)     | RuVector adapter pack (deferred) | no      |
+| Spectral coherence metrics                    | RuVector adapter pack (deferred) | no      |
+| DiskANN out-of-core (large-scale deployments) | RuVector adapter pack (deferred) | no      |
 
 Adapter packs are deferred until a concrete verb-surface use case justifies one. The
 default install does not depend on RuVector.
 
 ### Feature flags
 
-The port inherits the internal crate's feature flag structure, rationalized for OSS.
-`khive-retrieval` ships with `default = []` — no features are on by default. This is
-intentional for a public crate: consumers opt into exactly the capability surface they
-need.
+The port inherits the internal crate's feature flag structure. `khive-retrieval` ships
+with `default = []` — no features are on by default. Consumers opt into exactly the
+capability surface they need.
 
 `lattice-embed` is an **unconditional** (non-optional) dependency of `khive-retrieval`:
 its core types (`EmbeddingModel`, `EmbeddingService`, `EmbedError`) are always available
@@ -214,7 +212,7 @@ for consumers that supply their own embedding service.
 | `persist`          | off     | Index persistence to disk                                                                         |
 | `embed`            | off     | Native `lattice-embed` model implementations (`NativeEmbeddingService`, `CachedEmbeddingService`) |
 | `storage-adapters` | off     | `StorageVectorSearch`, `StorageKeywordSearch`; also enables sqlite-vec via `khive-db/vectors`     |
-| `policy`           | off     | Gate integration (khive-gate); opt-in until OSS gate story is complete                            |
+| `policy`           | off     | Gate integration (khive-gate); opt-in until gate story is complete                                |
 
 ## Rationale
 
@@ -239,16 +237,16 @@ Two reasons, each sufficient on its own:
 1. **Correctness assurance.** Determinism, complexity bounds, and ranking properties are
    machine-checked. A retrieval system you can prove things about is qualitatively
    different from one you can only test.
-2. **Market differentiation.** No production vector database — Pinecone, Qdrant,
-   Weaviate, pgvector, RuVector — ships formal proofs of its core algorithms. khive-oss
-   does. This is observable in technical due diligence.
+2. **Verifiable correctness.** No production vector database — Pinecone, Qdrant,
+   Weaviate, pgvector, RuVector — ships formal proofs of its core algorithms. khive
+   does. This is a verifiable, concrete property of the implementation.
 
 ### Why RuVector at all
 
 Collaboration value and access to research-grade techniques we do not have. ColBERT,
 Matryoshka, conformal prediction, and spectral coherence are real and useful. Adapter
 packs let us offer these techniques without compromising the verified core. RuVector's
-author benefits from khive-oss as an adoption story; khive-oss benefits from technique
+author benefits from khive as an adoption story; khive benefits from technique
 access without full implementation overhead.
 
 ### Why the ported HNSW is the preferred path over sqlite-vec
@@ -288,7 +286,7 @@ suite, and its own dependency surface (lattice-embed).
 
 - Vector retrieval at production scale: HNSW with INT8 two-phase quantized search.
 - Deterministic ranking across all platforms: i64 fixed-point throughout (ADR-006).
-- 146 formal Lean4 proofs ship with the OSS release as a unique correctness differentiator.
+- 146 formal Lean4 proofs ship with the release as a unique correctness differentiator.
 - `lattice-embed` SIMD investment is reused, not duplicated.
 - `VectorStore` trait (ADR-005) does its job: implementation replaces without interface change.
 - `FusionStrategy` and composition pattern from ADR-012 are unchanged; pack handlers need no updates.
@@ -298,7 +296,7 @@ suite, and its own dependency surface (lattice-embed).
 
 - 2-3 weeks of focused porting work. Mitigated: the internal code is mature and well-tested;
   the port is mechanical except for dependency rewiring.
-- One-time migration for any OSS deployments with sqlite-vec data will be required when
+- One-time migration for any deployments with sqlite-vec data will be required when
   sqlite-vec retirement ships. Mitigated: the `HnswIndex::rebuild` path is well-tested;
   migration is planned as a single CLI command or startup path. Retirement itself is deferred
   follow-up work (see the "sqlite-vec retirement (deferred)" section above).
@@ -316,7 +314,7 @@ suite, and its own dependency surface (lattice-embed).
 
 ### Phase 1 — Code port
 
-1. Create `crates/khive-retrieval/` from `khive-internal/platform/retrieval/`.
+1. Create `crates/khive-retrieval/` from the internal `platform/retrieval/`.
 2. Rewire dependencies per the mapping table above.
 3. Replace `foundation::embed` calls with `lattice-embed`.
 4. **Deferred follow-up**: Retire `sqlite-vec` from `khive-db` by routing `VectorStore`
@@ -328,7 +326,7 @@ suite, and its own dependency surface (lattice-embed).
 
 ### Phase 2 — Proof relocation
 
-1. Move proof files from `khive-internal` to `khive/proofs/Retrieval/` and
+1. Move proof files from the internal implementation to `khive/proofs/Retrieval/` and
    `khive/proofs/Scoring/`.
 2. Author `proofs/README.md` indexing theorems to Rust modules.
 3. Add proof-correspondence header comments to Rust source files.
@@ -337,7 +335,7 @@ suite, and its own dependency surface (lattice-embed).
 ### Phase 3 — Brain primitives (ADR-032)
 
 Port `Anchor`, `Selector`, and `CandidateRanker` cognitive primitives. Behavioral
-monitoring service stays out of OSS.
+monitoring service is deferred.
 
 ### Phase 4 — Multi-engine composition (ADR-031)
 
@@ -355,14 +353,14 @@ wraps.
 
 1. **Migration UX**: auto-detect-and-rebuild on startup vs. explicit `kkernel migrate-vectors`
    subcommand. Both are safe; auto is friendlier; explicit is auditable. Decided during
-   Phase 1 based on the expected OSS deployment pattern.
+   Phase 1 based on the expected deployment pattern.
 
-2. **HnswConfig defaults**: the internal stack ships multiple presets. Pick one default
-   for OSS; expose others through `SearchConfig::preset()` variants. Defer until we have
+2. **HnswConfig defaults**: the internal stack ships multiple presets. Pick one default;
+   expose others through `SearchConfig::preset()` variants. Defer until we have
    usage data from early adopters.
 
 3. **Feature-flag rationalization**: decide whether `policy` becomes default-on when
-   `khive-gate` lands a concrete OSS policy story, or stays opt-in permanently. Reassess
+   `khive-gate` lands a concrete policy story, or stays opt-in permanently. Reassess
    at Phase 3.
 
 ## References
@@ -375,5 +373,5 @@ wraps.
 - [ADR-029](ADR-029-substrate-coordinator.md) — SubstrateCoordinator sits above this port for cross-backend fan-out
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — multi-engine fusion composes over khive-retrieval
 - [ADR-032](ADR-032-brain-profile-orchestration.md) — brain profiles consume ranked candidates from this port
-- Internal source ported: `khive-internal/platform/retrieval/`
+- Internal source ported from: internal `platform/retrieval/`
 - SIMD / quantization foundation: `lattice/crates/embed/`

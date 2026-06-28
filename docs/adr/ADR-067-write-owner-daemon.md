@@ -12,12 +12,12 @@
 
 ### Deployment model (scope boundary)
 
-The cloud storage model is SQLite-per-tenant with one daemon process per tenant. Each tenant's
-database is a separate file with a separate connection pool and a separate writer Mutex. The
-wedge described below is therefore contained to a single tenant: multiple concurrent agents
-belonging to the same tenant share one process and one pool. This ADR solves
-"one tenant, N concurrent agents, no wedge" and does not address cross-tenant scaling
-(that is the per-process topology concern, addressed separately).
+The deployment model addressed here is: one process serves one actor or a small set of
+cooperating agents sharing a single database file. That process has one connection pool and one
+writer Mutex. The wedge described below is therefore contained to a single process: multiple
+concurrent agents sharing one daemon process and one pool. This ADR solves
+"one process, N concurrent agents, no wedge" and does not address multi-process coordination
+(that is the per-process topology concern, addressed in ADR-068).
 
 ### The WAL-starvation wedge
 
@@ -551,10 +551,10 @@ Postgres transaction semantics (`SET TRANSACTION ISOLATION LEVEL`), `tsvector`-b
 `TextSearch`, and `pgvector`-backed `VectorStore`.
 
 This is the measure-first escape hatch: if the write-queue redesign (this ADR) plus the WAL
-checkpoint discipline (Slice 1) do not achieve the throughput target under realistic tenant
+checkpoint discipline (Slice 1) do not achieve the throughput target under realistic concurrent
 load, the Postgres backend is the next escalation point. It is deferred because it is a
 multi-week effort (estimated 3 to 5 weeks for a feature-complete backend) and the per-process
-tenant topology already eliminates the cross-tenant scaling problem that Postgres would
+isolation topology already eliminates the cross-process scaling problem that Postgres would
 primarily solve.
 
 ### Alternative 4: Serialize at the HTTP gateway layer
@@ -646,8 +646,8 @@ being the stable owner of write connections.
 Estimated effort: 1 to 2 weeks once Slice 2 is stable.
 
 **Slice 4 (deferred, separate ADR): Postgres backend**. Decoupled from Slices 1 through 3 and
-can proceed in parallel after the Postgres ADR is accepted. Unblocks the multi-tenant escape
-hatch if Slice 2 does not meet the throughput target at scale.
+can proceed in parallel after the Postgres ADR is accepted. Unblocks the multi-process
+scale path if Slice 2 does not meet the throughput target at scale.
 
 ---
 
@@ -655,8 +655,8 @@ hatch if Slice 2 does not meet the throughput target at scale.
 
 The following are explicitly excluded from this ADR:
 
-- **Multi-tenant isolation**: the per-process tenant topology is the solution; this ADR is
-  intra-tenant only.
+- **Multi-process isolation**: the per-process topology (ADR-068) is the solution; this ADR
+  addresses intra-process write coordination only.
 - **HTTP gateway layer**: not shipped; the write-queue is inside the daemon.
 - **Postgres backend**: covered by a future ADR once measure-first evidence is collected.
 - **Cross-op atomicity for `--ops-file`**: follow-up ADR after Slice 2 is stable.

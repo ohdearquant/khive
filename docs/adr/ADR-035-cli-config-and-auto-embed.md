@@ -158,9 +158,8 @@ config docs (`docs/khive-config-example.toml`).
 | Authorization gate | `--gate`          | `KHIVE_GATE`             | `runtime.gate`            | `allow-all`       |
 | Brain profile      | `--brain-profile` | `KHIVE_BRAIN_PROFILE`    | `runtime.brain_profile`   | `None`            |
 
-Note: `recall(min_score)` has **no floor by default** on small tenants (per khive-remote MCP
-server docs). Operators should set `KHIVE_RECALL_MIN_SCORE=0.5` (or similar) in production
-deployments.
+Note: `recall(min_score)` has **no floor by default**. Operators serving larger corpora should
+set `KHIVE_RECALL_MIN_SCORE=0.5` (or similar) in production deployments.
 
 ### Brain profile configuration
 

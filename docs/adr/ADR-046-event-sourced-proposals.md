@@ -209,7 +209,7 @@ allow if {
 }
 ```
 
-The OSS default (AllowAllGate) allows both paths — single-developer deployments
+The default gate (AllowAllGate) allows both paths — single-developer deployments
 rarely need the proposal review gate. Multi-actor deployments configure ADR-018
 to force agents through proposals. This ADR does NOT mandate gating; it provides
 the mechanism, ADR-018 provides the policy.
@@ -361,7 +361,7 @@ against the policy. Deny → emits `ProposalApplied` with
 `Failed { error: "denied by policy: ..." }` and the proposal lands in
 status='approved' but unapplied — a deployment-config issue the operator
 resolves by adjusting the policy. Production deployments configuring ADR-018
-Rego policies should include this actor class explicitly. The OSS default
+Rego policies should include this actor class explicitly. The default gate
 (AllowAllGate) permits it transparently.
 
 ### 6. Approval threshold
@@ -433,7 +433,7 @@ verbs and the apply worker each have policy hooks:
   `namespace`. Default: any actor. Operators may restrict to specific roles.
 - `propose-apply` worker: the worker emits `ActorRef { kind: "system", id: "propose-apply" }`
   as its actor identity. The authorization gate evaluates this identity against
-  the active policy; with the OSS default (AllowAllGate) it is permitted
+  the active policy; with the default gate (AllowAllGate) it is permitted
   transparently. A dedicated `system:propose-apply` policy rule is future work;
   production deployments requiring explicit cross-namespace injection prevention
   should add a rego rule for this actor class when configuring ADR-018.
@@ -475,9 +475,9 @@ one reviewer in the room is friction without payoff. M-of-N is a policy
 deployments enable when they need it — the threshold is a config knob, not a
 v1 hardcoded rule.
 
-### Why `allow_self_approve = true` is the OSS default
+### Why `allow_self_approve = true` is the default
 
-The OSS deployment model is predominantly single-developer. Defaulting to
+The default deployment model is predominantly single-developer. Defaulting to
 `allow_self_approve = false` would make the proposal flow unusable out-of-box
 for solo developers — there is no second actor to approve. The safer posture
 (`allow_self_approve = false`, `approval_threshold = 2`) is a deliberate
@@ -574,7 +574,7 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 - `ProposalChangeset` is a closed enum — every new change shape requires an
   amendment. This is the cost of validation-at-create-time.
 - Operators must configure approval policy per-pack for multi-actor
-  deployments; OSS default (`approval_threshold=1, allow_self_approve=true`)
+  deployments; the default (`approval_threshold=1, allow_self_approve=true`)
   prioritizes single-developer ergonomics over review enforcement. Multi-actor
   deployments must explicitly tighten this.
 

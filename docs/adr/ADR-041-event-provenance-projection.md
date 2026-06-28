@@ -614,7 +614,7 @@ files own this behavior. Consumers that need event observations read the shipped
    Deferred — the SQL JOIN over `event_observations` + `events.kind` covers it without
    a view.
 
-4. **Multi-tenant isolation**. The `event_observations` table inherits namespace
+4. **Namespace isolation**. The `event_observations` table inherits namespace
    isolation via the JOIN to `events.namespace`. No `namespace` column on the
    projection itself; correct by construction but worth noting in the implementation
    comment.

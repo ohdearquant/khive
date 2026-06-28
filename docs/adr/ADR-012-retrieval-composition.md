@@ -441,7 +441,7 @@ one backend, the coordinator handles the multi-backend case.
 
 **Superseded by ADR-030.** The original reasoning held at ~1,500 LOC. ADR-030 ports
 ~29K LOC of verified retrieval code (HNSW, BM25, hybrid search, formal Lean4 proofs)
-from `khive-internal` into a dedicated `khive-retrieval` crate. At that scale the crate
+from an earlier internal implementation into a dedicated `khive-retrieval` crate. At that scale the crate
 split is not premature — it isolates a distinct algorithmic concern with its own proof
 tree, benchmark suite, and dependency surface (`lattice-embed`). ADR-012 is now the
 **composition layer above** `khive-retrieval`, not the owner of retrieval primitives.

@@ -291,9 +291,9 @@ This separation is architectural, not just a configuration flag. The gate enforc
 layer exists only in the agent binary. `kkernel` runs verbs without gating because
 operator commands should not be artificially constrained by agent safety policy.
 
-**Deployment constraint**: In hosted deployments, `kkernel` must not be accessible
-from network-exposed contexts. The hosted product ships `khive-mcp` (the agent binary)
-only. `kkernel` is an operator tool for local or infrastructure-tier use.
+**Deployment constraint**: In network-exposed deployments, `kkernel` must not be accessible
+from network-exposed contexts. Only `khive-mcp` (the agent binary) should be exposed.
+`kkernel` is an operator tool for local or infrastructure-tier use.
 
 ## Transport Boundary
 

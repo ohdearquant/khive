@@ -156,7 +156,7 @@ ruvector-core HNSW + ColBERT mode:
 khive-db single-vector mode:
   backend_hints = null  (cosine/dot, no aggregation needed)
 
-khive-internal hand-rolled recall:
+khive hand-rolled recall:
   backend_hints = {"decay_lambda": 0.05, "salience_weight": 0.7, ...}
 
 future:
@@ -287,7 +287,7 @@ level — that locks every backend into ruvector's vocabulary.
 
 `backend_hints: Option<serde_json::Value>` is the open extension point. Each backend
 documents what hints it accepts. ruvector-core's HNSW+ColBERT documents `{"scoring":
-"max_sim"|...}`. khive-internal's hand-rolled recall documents its own knobs. Future
+"max_sim"|...}`. khive's hand-rolled recall documents its own knobs. Future
 backends document theirs.
 
 The cost is type-level looseness — hints are JSON, not strongly-typed enums. This is
@@ -350,7 +350,7 @@ per process and is bounded by model weight size (small for MiniLM, larger for BG
 
 - Cross-encoder reranking is deferred until lattice ships a rerank crate.
 - Remote-API embedding (OpenAI, Cohere) is supported by adding a model variant to lattice-embed, not by changing the khive architecture.
-- The embedder is a process-level singleton; multi-tenant deployments share weights across tenants. This is correct for a Rust binary — there's nothing tenant-specific about the model itself.
+- The embedder is a process-level singleton; when a process serves multiple actors, the model weights are shared across all actors. This is correct for a Rust binary — there is nothing actor-specific about the model itself.
 
 ## Implementation
 

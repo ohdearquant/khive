@@ -19,7 +19,7 @@ fan-out + weighted RRF), ADR-091 (runtime-layer composition + SparseStore + memo
 
 ## Context
 
-khive-internal implemented multi-engine embedding: N peer models run concurrently, each with
+An earlier implementation delivered multi-engine embedding: N peer models run concurrently, each with
 its own HNSW index, every write embedding with all N models, every query fusing per-engine
 rankings via weighted RRF. `deploy/engine.toml` was the canonical config; per-engine
 normalization parameters (`noise_floor`, `max_similarity`, `threshold`) were tuned during the
@@ -27,7 +27,7 @@ normalization parameters (`noise_floor`, `max_similarity`, `threshold`) were tun
 no single embedding model dominates across languages and corpus types — multilingual and
 paraphrase-heavy corpora require peer engines.
 
-The open-core port regressed this to single-model:
+The current release regressed this to single-model:
 
 ```rust
 // crates/khive-runtime/src/runtime.rs (regression site)
@@ -41,13 +41,13 @@ pub struct KhiveRuntime {
 ```
 
 This is a regression against a design property that had been tuned and retained through every
-khive-internal refactor. The next step was recorded explicitly after the 2026-03-26 event:
+the earlier refactor. The next step was recorded explicitly after the 2026-03-26 event:
 "Multi-index architecture: engine.toml + code supports `Vec<EmbedModelConfig>`. Add Qwen3 as
-peer after HNSW namespace split." The open-core port erased this without an ADR.
+peer after HNSW namespace split." The current release erased this without an ADR.
 
 ### What "multi-engine" means
 
-Distinct from multi-tenant (namespace isolation per ADR-007) and distinct from model migration
+Distinct from multi-actor namespace isolation (per ADR-007) and distinct from model migration
 (single model, swap atomically). Multi-engine means:
 
 - N peer embedding services run concurrently in the same process
@@ -64,7 +64,7 @@ Distinct from multi-tenant (namespace isolation per ADR-007) and distinct from m
 A model is an `EmbeddingModel` variant — a specific weights file with a specific
 dimensionality. An engine is a complete embedding service: trait implementation, model handle,
 cache, concurrency policy, provider semantics (local inference vs. HTTP API). Two engines can
-implement the same model (local BGE vs. hosted BGE); one engine can serve only one model (each
+implement the same model (local BGE vs. remote BGE); one engine can serve only one model (each
 `Embedder` instance is pinned, per D1 below). The ADR uses "engine" as the substitutable unit
 and failure-isolation boundary.
 
@@ -144,8 +144,8 @@ pub trait Embedder: Send + Sync {
 Three invariants:
 
 1. **One model per instance.** An `Embedder` is pinned to a single (model_id, dim). N peer
-   engines = N `Embedder` instances. This matches khive-internal's
-   `NativeEmbeddingService::with_model(model)` pattern.
+   engines = N `Embedder` instances. This matches the
+   `NativeEmbeddingService::with_model(model)` pattern from the prior implementation.
 2. **Provider-agnostic.** `lattice-embed` is one implementation; `OpenAiEmbedder`,
    `CohereEmbedder`, or custom providers implement the same trait without modifying
    `khive-runtime` or `khive-db`.
@@ -225,8 +225,8 @@ This gives:
 
 Engine failure semantics: `embed_query_all` returns a partial list when one engine errors.
 If at least one engine succeeds, the search proceeds with the available engines. If all
-engines fail, the request fails. This is the khive-internal behavior (availability over
-strict consistency). A future `embed_query_all_strict()` variant may be added for operators
+engines fail, the request fails. This follows the prior availability-over-strict-consistency
+behavior. A future `embed_query_all_strict()` variant may be added for operators
 who need all-or-nothing behavior.
 
 ### D3 — `[[engines]]` TOML schema, vector table naming, single-engine fallback
@@ -308,7 +308,7 @@ key bridge; behavior is unchanged.
 
 HNSW indexes are dimension-fixed (a 384d node and a 1024d node cannot share a graph).
 Per-(model, dim) table sharding is for correctness, not optimization — it is the INV-1
-invariant from khive-internal's `foundation/embed/DESIGN.md`.
+invariant from `foundation/embed/DESIGN.md`.
 
 **Migration shim for `vec_default`**: deployments predating this ADR have data in a
 `vec_default` table. At first startup post-D3:
@@ -463,7 +463,7 @@ async fn handle_remember(args):
 - `max_similarity`: cap for normalization — brings disparate engines onto a comparable scale.
 - `threshold`: per-engine minimum score to enter the fusion stage.
 
-These parameters were tuned empirically in khive-internal. v1 inherits those defaults;
+These parameters were tuned empirically in the earlier implementation. v1 inherits those defaults;
 per-corpus retuning is operator responsibility.
 
 **Weighted RRF rationale**: per-engine weight encodes relative quality for the deployment's
@@ -614,7 +614,7 @@ signals via RRF.
 
 ### A. Keep single-model, defer multi-engine
 
-The current regression in the open-core port is the result of exactly this. Multi-engine
+The current regression in the current release is the result of exactly this. Multi-engine
 had shipped, had been tuned, and was required for multilingual quality. Deferring again would
 require a third ADR to restore it later. Rejected.
 
@@ -670,7 +670,7 @@ Rejected: silent merge surprises break the project-as-invariant principle.
 ### Positive
 
 - Multi-engine quality restored — peer engines, weighted RRF, per-engine normalization,
-  matching khive-internal's tuned shape
+  matching the prior tuned shape
 - Provider-agnostic — `Embedder` trait admits OpenAI, Cohere, custom implementations
   without modifying `khive-runtime` or `khive-db`
 - Memory efficiency — engine instances loaded once, shared across packs via Arc + filter
@@ -683,7 +683,7 @@ Rejected: silent merge surprises break the project-as-invariant principle.
 - Backward compatibility — single-engine fallback + `vec_default` rename preserves existing
   deployments
 - Calibration knobs preserved — `noise_floor` / `max_similarity` / `threshold` / `weight`
-  match the tuned khive-internal schema verbatim
+  match the prior tuned schema
 - Sparse retrieval path added — `SparseStore` trait extends the storage surface for
   semantic-with-lexical-bias recall alongside dense and FTS5
 - Recall verb surface extended — `memory.recall_*` dotted verbs expose retrieval strategy
@@ -699,7 +699,7 @@ Rejected: silent merge surprises break the project-as-invariant principle.
   embed; migration touches each consuming verb handler, but the change is mechanical
 - `khive-embed` adds a new crate — one more `Cargo.toml` and publish step
 - Configuration burden — operators learn `[[engines]]` array and calibration parameters;
-  mitigated by single-engine fallback and pre-tuned defaults inherited from khive-internal
+  mitigated by single-engine fallback and pre-tuned defaults inherited from the earlier implementation
 - Pack handler complexity grows ~50 LOC per recall/search verb for the fan-out loop
 
 ### Neutral
@@ -772,12 +772,12 @@ existing single-engine deployments see no behavior change.
   pattern from D5
 - [ADR-035](ADR-035-cli-config-and-auto-embed.md) — project-vs-user TOML override semantics
   that D3 extends
-- khive-internal `deploy/engine.toml` — canonical multi-engine schema being restored
-- khive-internal `foundation/embed/DESIGN.md` — INV-1..INV-8 invariants; per-(model, dim)
+- `deploy/engine.toml` — canonical multi-engine schema being restored
+- `foundation/embed/DESIGN.md` — INV-1..INV-8 invariants; per-(model, dim)
   table sharding rationale; asymmetric retrieval prefix invariant
-- khive-internal `apps/cli/src/server/unified.rs:414-664` — `resolve_embed_models`,
+- `apps/cli/src/server/unified.rs:414-664` — `resolve_embed_models`,
   historical multi-engine wiring; D2 pattern source
-- khive-internal summary `summary_20260326_165542_recall_overhaul_multi_index_architecture.md`
+- `summary_20260326_165542_recall_overhaul_multi_index_architecture.md`
 
 ---
 
@@ -785,7 +785,7 @@ existing single-engine deployments see no behavior change.
 
 ### Motivation
 
-The open-core port had no config-file path for engine registration. Operators had to set env
+The current release had no config-file path for engine registration. Operators had to set env
 vars:
 
 ```
