@@ -2,7 +2,10 @@
 
 **Status**: accepted\
 **Date**: 2026-05-22\
-**Authors**: Ocean, lambda:khive
+**Authors**: Ocean, lambda:khive\
+**Amended by**: [ADR-076](ADR-076-relation-calculability-and-system-role.md) — `part_of` is a
+distinct relation, not the "inverse of `contains`"; the two coincide in some domains and diverge
+in others, and neither is derived from the other.
 
 ## Context
 
@@ -34,7 +37,7 @@ classification ambiguity.
 | Relation      | Direction          | When                                             |
 | ------------- | ------------------ | ------------------------------------------------ |
 | `contains`    | parent → child     | Crate contains module, system contains component |
-| `part_of`     | child → parent     | Inverse of `contains`                            |
+| `part_of`     | child → parent     | Member/constitution; distinct from `contains`    |
 | `instance_of` | specific → general | One is a case of the other (GPT-4 → Transformer) |
 
 ### Category 2: Derivation (intellectual lineage)
@@ -136,8 +139,10 @@ snapshot -[derived_from]-> project
 - Relations not in this list are forbidden.
 - If a relationship doesn't fit, it's either an entity property or it doesn't belong in
   the graph.
-- Inverse relations are NOT created automatically. Use `part_of` explicitly if you need the
-  inverse of `contains`. Query with `direction=in` for logical inverses.
+- Inverse relations are NOT created automatically. `part_of` is a distinct relation, not the
+  converse of `contains` (see [ADR-076](ADR-076-relation-calculability-and-system-role.md));
+  assert it explicitly when constitution holds. Query with `direction=in` for direction-aware
+  traversal of a single relation.
 - Edge weight: `1.0` = definitional, `0.7-0.9` = strong, `0.4-0.6` = plausible,
   `<0.4` = speculative.
 
@@ -316,7 +321,8 @@ These are additive — the base contract is unchanged. Semantics:
 - `Org depends_on Org` — one org depends on another (e.g. subsidiary dependency)
 - `Org enables Org` — one org enables another (e.g. incubator → startup)
 - `Org contains Org` — org hierarchy (e.g. parent company contains subsidiary)
-- `Org part_of Org` — inverse of contains; subsidiary is part of parent
+- `Org part_of Org` — subsidiary is part of parent (here it coincides with `contains`; the two
+  remain distinct relations, not converses — see ADR-076)
 - `Org precedes Org` — temporal ordering without replacement (predecessor org)
 
 ## Edge Metadata
