@@ -101,6 +101,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-072](ADR-072-subject-ontologyspec-as-data.md)        | Subject OntologySpec as Runtime Data — Verbless Verticals and Pack Retirement (Proposed)                        |
 | [ADR-073](ADR-073-pack-core-backend-accessor.md)          | Pack Core-Backend Accessor (Accepted)                                                                           |
 | [ADR-074](ADR-074-graph-aware-recall.md)                  | Graph-Aware Recall — Graph-Proximity Signal in Memory Retrieval (Proposed)                                      |
+| [ADR-075](ADR-075-owl-rdf-interoperability.md)            | OWL/RDF Interoperability — Publishing the khive Vocabulary and Aligning with External Ontologies (Draft)        |
 | [ADR-078](ADR-078-output-format-shape-aware-rendering.md) | Output Format and Shape-Aware Rendering (Proposed)                                                              |
 
 ## Closed Taxonomies — Quick Reference
