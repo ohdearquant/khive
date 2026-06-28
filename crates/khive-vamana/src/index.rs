@@ -476,7 +476,7 @@ impl VamanaIndex {
     /// (v1 format) or [`VamanaIndex::save_atomic`] (v2 segmented format).
     ///
     /// The format is detected from `metadata.bin`'s magic: a v2 commit takes the raw
-    /// segment path ([`Self::load_v2_raw`]); a legacy v1 metadata blob takes the path
+    /// segment path (`load_v2_raw`); a legacy v1 metadata blob takes the path
     /// below. Neither path rebuilds — a corrupt, torn, or absent index returns an error,
     /// leaving the recovery decision to the caller (see [`Self::load_or_build`]).
     pub fn load(path: &Path) -> Result<Self> {
@@ -2666,7 +2666,7 @@ pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprin
 /// when deciding whether a persisted index matches the live corpus.
 ///
 /// The hash is computed over the raw little-endian f32 bytes of `vectors` with
-/// no header or padding (matching [`write_vectors`] which stores exactly
+/// no header or padding (matching `write_vectors` which stores exactly
 /// `cast_slice(vectors)`). It is order-sensitive: reordering vectors produces
 /// a different digest.
 ///
