@@ -151,6 +151,17 @@ impl Drop for TimeoutOverrideReset {
     }
 }
 
+/// Serializes the two timeout-override tests. Both mutate the process-global
+/// `ANN_WARM_WAIT_TIMEOUT_OVERRIDE_MS`, and `TimeoutOverrideReset` clears it on
+/// drop. Under Cargo's parallel test runner, one test's reset could otherwise
+/// fire while the other is mid-flight, dropping it back to the 5s production
+/// timeout (a latency-order-dependent slow run). `tokio::sync::Mutex` is
+/// await-safe (no `clippy::await_holding_lock`) and does not poison on panic,
+/// so a failing test still releases the lock. Each test declares the guard
+/// before `TimeoutOverrideReset`, so on exit the reset (override -> 0) runs
+/// first and the lock releases only after, handing a clean state to the next.
+static TIMEOUT_OVERRIDE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── P1a: suggest sets ann_unavailable when warming times out ─────────────────
 
 /// `suggest` must set `ann_unavailable: true` when:
@@ -164,6 +175,7 @@ impl Drop for TimeoutOverrideReset {
 ///    by running `knowledge.index` before the handler call).
 #[tokio::test]
 async fn suggest_sets_ann_unavailable_when_warming_times_out() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
     vamana::set_warm_wait_timeout_override_ms(50);
     let _reset = TimeoutOverrideReset;
 
@@ -227,6 +239,7 @@ async fn suggest_sets_ann_unavailable_when_warming_times_out() {
 /// response, placing `ann_unavailable` in `result["data"]["ann_unavailable"]`.
 #[tokio::test]
 async fn compose_propagates_ann_unavailable_in_auto_mode() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
     vamana::set_warm_wait_timeout_override_ms(50);
     let _reset = TimeoutOverrideReset;
 
