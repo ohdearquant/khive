@@ -236,22 +236,9 @@ impl KnowledgeHandlers {
                 Ok(bridge) => {
                     ann_count = Some(bridge.num_vectors());
                     let model_name = runtime.default_embedder_name();
-                    match vamana::compute_fingerprint(runtime, token, model_name).await {
-                        Some(fp) => {
-                            if let Err(e) =
-                                vamana::persist_snapshot(runtime, &ns, model_name, &bridge, fp)
-                                    .await
-                            {
-                                tracing::error!(error = %e, "failed to persist Vamana snapshot");
-                                ann_failed = true;
-                            }
-                        }
-                        None => {
-                            tracing::warn!(
-                                "failed to compute corpus fingerprint; Vamana snapshot will not be persisted"
-                            );
-                            ann_failed = true;
-                        }
+                    if let Err(e) = vamana::persist_ann_v2(runtime, &ns, model_name, &bridge) {
+                        tracing::error!(error = %e, "failed to persist v2 Vamana segments");
+                        ann_failed = true;
                     }
                     let n = bridge.num_vectors();
                     let key = vamana::AnnKey::new(&ns, model_name);

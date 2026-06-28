@@ -11,10 +11,12 @@
 //! Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search
 //! results can be fused with FTS5 candidates via RRF.
 //!
-//! Persistence: `ensure_ann_for_model` loads a validated snapshot from `retrieval_snapshots`
-//! on first access; stale/missing snapshots trigger a full rebuild + re-persist.
-//! `kkernel reindex` actively invalidates snapshots after re-embedding (second
-//! line of staleness defence).
+//! Persistence (ADR-079): v2 binary segments are written to `data_dir/ann/<hex>/`
+//! on every cold-start rebuild or explicit reindex.  `ensure_ann_for_model` checks
+//! the v2 segment directory first (content-hash gated), falling back to legacy v1
+//! JSON rows in `retrieval_snapshots` for in-place upgrades, then rebuilds from the
+//! full sqlite-vec corpus on cache-miss.  `kkernel reindex` re-persists v2 segments
+//! and calls `invalidate_snapshot` to clean up stale v1 rows.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +24,8 @@ use std::sync::Arc;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_vamana::{
-    read_commit_fingerprint, CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot,
+    corpus_content_hash, read_commit_fingerprint, CorpusFingerprint, VamanaConfig, VamanaIndex,
+    VamanaSnapshot,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -199,17 +202,6 @@ impl AnnBridge {
 
     pub fn num_vectors(&self) -> usize {
         self.index.num_vectors()
-    }
-
-    pub fn to_vamana_snapshot(
-        &self,
-        namespace: &str,
-        model: &str,
-        fingerprint: CorpusFingerprint,
-    ) -> Result<VamanaSnapshot, khive_vamana::VamanaError> {
-        let external_ids: Vec<String> = self.id_map.iter().map(|id| id.to_string()).collect();
-        self.index
-            .to_snapshot(namespace, model, fingerprint, external_ids)
     }
 
     pub fn from_vamana_snapshot(snapshot: VamanaSnapshot) -> Result<Self, String> {
@@ -423,6 +415,40 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
     format!("{namespace}::vamana::{model}")
 }
 
+/// Filesystem directory for v2 Vamana segment files for a given `(ns, model)` pair.
+///
+/// Returns `Some(data_dir/ann/<hex>)` where `<hex>` is the lowercase hex encoding of
+/// the bytes of `snapshot_key(ns, model)`. Hex encoding is injective, filesystem-safe,
+/// and reversible via `decode_ann_dir_name`. Returns `None` for in-memory backends.
+fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path::PathBuf> {
+    let data_dir = rt.backend_data_dir()?;
+    let key = snapshot_key(ns, model);
+    let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
+    Some(data_dir.join("ann").join(hex))
+}
+
+/// Decode a hex-encoded ann directory name back to `(namespace, model)`.
+///
+/// Reverses the encoding done by `ann_segment_dir`: hex-decodes `name` to bytes,
+/// interprets them as UTF-8, then splits on `"::vamana::"`. Returns `None` on bad
+/// hex, non-UTF-8 bytes, a missing separator, or empty namespace/model parts.
+fn decode_ann_dir_name(name: &str) -> Option<(String, String)> {
+    if !name.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(name.len() / 2);
+    for i in (0..name.len()).step_by(2) {
+        let byte = u8::from_str_radix(&name[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    let key = String::from_utf8(bytes).ok()?;
+    let (ns, model) = key.split_once("::vamana::")?;
+    if ns.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((ns.to_string(), model.to_string()))
+}
+
 /// Model-key sanitization — must match `khive_runtime::sanitize_key`.
 pub(crate) fn sanitize_model_key(s: &str) -> String {
     s.chars()
@@ -430,78 +456,22 @@ pub(crate) fn sanitize_model_key(s: &str) -> String {
         .collect()
 }
 
-/// Create `retrieval_snapshots` if it does not exist yet.
-async fn ensure_snapshot_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute_script(
-        r#"
-        CREATE TABLE IF NOT EXISTS retrieval_snapshots (
-            namespace   TEXT NOT NULL,
-            index_type  TEXT NOT NULL,
-            snapshot    BLOB NOT NULL,
-            created_at  INTEGER NOT NULL,
-            PRIMARY KEY (namespace, index_type)
-        );
-        CREATE INDEX IF NOT EXISTS idx_retrieval_snapshots_namespace
-            ON retrieval_snapshots(namespace);
-        "#
-        .into(),
-    )
-    .await
-    .map_err(|e| RuntimeError::Internal(e.to_string()))
-}
-
-/// Persist `bridge` as a Vamana snapshot under `{namespace}::vamana::{model}`.
-pub(crate) async fn persist_snapshot(
+/// Persist `bridge` as v2 Vamana segments under `data_dir/ann/<hex>/`.
+///
+/// Resolves the segment directory via `ann_segment_dir`. Returns `Ok(())` when the
+/// backend is in-memory (no `data_dir`) — skipping persistence is not an error.
+/// `save_atomic` computes and stamps the `content_hash` internally; callers do not
+/// need to supply a `CorpusFingerprint`.
+pub(crate) fn persist_ann_v2(
     rt: &KhiveRuntime,
-    namespace: &str,
+    ns: &str,
     model: &str,
     bridge: &AnnBridge,
-    fingerprint: CorpusFingerprint,
-) -> Result<(), RuntimeError> {
-    if let Err(e) = ensure_snapshot_schema(rt).await {
-        tracing::warn!(error = %e, "failed to create retrieval_snapshots schema");
-        return Err(e);
+) -> Result<(), String> {
+    match ann_segment_dir(rt, ns, model) {
+        Some(dir) => bridge.save_atomic(&dir),
+        None => Ok(()), // in-memory backend — no filesystem, skip silently
     }
-
-    let snapshot = bridge
-        .to_vamana_snapshot(namespace, model, fingerprint)
-        .map_err(|e| RuntimeError::Internal(format!("to_snapshot: {e}")))?;
-
-    let blob = serde_json::to_vec(&snapshot)
-        .map_err(|e| RuntimeError::Internal(format!("snapshot serialize: {e}")))?;
-
-    let key = snapshot_key(namespace, model);
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute(SqlStatement {
-        sql: "INSERT OR REPLACE INTO retrieval_snapshots \
-              (namespace, index_type, snapshot, created_at) VALUES (?1, ?2, ?3, ?4)"
-            .into(),
-        params: vec![
-            SqlValue::Text(key),
-            SqlValue::Text("vamana".into()),
-            SqlValue::Blob(blob),
-            SqlValue::Integer(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as i64,
-            ),
-        ],
-        label: Some("persist_vamana_snapshot".into()),
-    })
-    .await
-    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-
-    Ok(())
 }
 
 /// Try to load a Vamana snapshot for `namespace`+`model` from `retrieval_snapshots`.
@@ -549,14 +519,18 @@ pub(crate) async fn compute_fingerprint(
     })
 }
 
-/// Scan the sqlite-vec table and build a fresh `AnnBridge`.
+/// Scan the sqlite-vec corpus for `model` and return raw (un-normalized) flat
+/// vectors alongside the ordered UUID id-map.
 ///
-/// Returns `None` when there are no vectors or the model is not configured.
-pub(crate) async fn load_and_build_from_vector_store(
+/// Rows are fetched `ORDER BY subject_id` so the mapping is deterministic.
+/// Returns `Ok(None)` when the model is not configured, the table is empty, or
+/// no rows pass the byte-length validity check.  The caller derives `dims` as
+/// `flat.len() / id_map.len()`.
+async fn scan_corpus_raw(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     model: &str,
-) -> Result<Option<AnnBridge>, RuntimeError> {
+) -> Result<Option<(Vec<f32>, Vec<Uuid>)>, RuntimeError> {
     let store = match rt.vectors_for_model(token, model) {
         Ok(s) => s,
         Err(_) => return Ok(None),
@@ -633,9 +607,47 @@ pub(crate) async fn load_and_build_from_vector_store(
         return Ok(None);
     }
 
+    Ok(Some((flat, id_map)))
+}
+
+/// Scan the sqlite-vec table and build a fresh `AnnBridge`.
+///
+/// Returns `None` when there are no vectors or the model is not configured.
+pub(crate) async fn load_and_build_from_vector_store(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+) -> Result<Option<AnnBridge>, RuntimeError> {
+    let Some((flat, id_map)) = scan_corpus_raw(rt, token, model).await? else {
+        return Ok(None);
+    };
+    let dims = flat.len() / id_map.len();
     AnnBridge::build(flat, dims, id_map)
         .map(Some)
         .map_err(RuntimeError::Internal)
+}
+
+/// Hash the live corpus as it would appear inside a freshly built `AnnBridge`.
+///
+/// Scans the sqlite-vec corpus, L2-normalizes each vector in place (matching
+/// `AnnBridge::build` which calls `l2_normalize` exactly once per row), then
+/// passes the normalized flat buffer through `corpus_content_hash`.  Returns
+/// `None` when the corpus is empty or the model is not configured.
+///
+/// INVARIANT: normalize ONCE here, never re-normalize an already-normalized
+/// buffer.  Calling this on a buffer that has already been normalized produces a
+/// non-idempotent hash and causes always-stale comparisons.
+async fn live_content_hash(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+) -> Option<[u8; 32]> {
+    let (mut flat, id_map) = scan_corpus_raw(rt, token, model).await.ok()??;
+    let dims = flat.len() / id_map.len();
+    for row in flat.chunks_exact_mut(dims) {
+        l2_normalize(row);
+    }
+    Some(corpus_content_hash(&flat))
 }
 
 /// Delete all Vamana snapshots for `namespace` from `retrieval_snapshots`.
@@ -716,6 +728,38 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
         };
         ensure_ann_for_model(rt, &token, ann, model).await;
     }
+
+    // Enumerate v2 segment directories in `data_dir/ann/` and warm any keys not
+    // already loaded by the v1 DB pass above.
+    let ann_root = match rt.backend_data_dir() {
+        Some(d) => d.join("ann"),
+        None => return,
+    };
+    let read_dir = match std::fs::read_dir(&ann_root) {
+        Ok(rd) => rd,
+        Err(_) => return, // no ann/ dir yet — nothing to warm
+    };
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let hex = name.to_string_lossy();
+        let Some((ns_str, model)) = decode_ann_dir_name(hex.as_ref()) else {
+            continue;
+        };
+        let ns = match Namespace::parse(&ns_str) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let token = match rt.authorize(ns) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Guard: skip if already loaded by the v1 pass.
+        let key = AnnKey::new(&ns_str, &model);
+        if ann.indexes.read().await.contains_key(&key) {
+            continue;
+        }
+        ensure_ann_for_model(rt, &token, ann, &model).await;
+    }
 }
 
 /// Fire-once per-key background warm. Returns immediately. If the key is already
@@ -753,10 +797,21 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     });
 }
 
-/// Lazy warm-load for a specific `model`. If the `{namespace, model}` key is
-/// already in the cache, return immediately. Otherwise attempt to restore from a
-/// valid snapshot; on miss/stale/corrupt, rebuild from the full sqlite-vec corpus
-/// and persist the new snapshot. Write failures are logged and do not block search.
+/// Lazy warm-load for a specific `model`.
+///
+/// Load order (first hit wins):
+///
+/// 1. **Fast path** — already in the in-memory cache; return immediately.
+/// 2. **v2 segment path** — if a `data_dir/ann/<hex>/` directory exists with a
+///    valid `metadata.bin`, compare its `content_hash` against a freshly computed
+///    `live_content_hash`.  On match, load the Vamana binary segments directly via
+///    `AnnBridge::load` (O(load), no rebuild).  On mismatch, fall through.
+/// 3. **v1 JSON snapshot path** — try `retrieval_snapshots`; on hit, validate
+///    the `CorpusFingerprint` (count + dims) and restore from JSON.  On miss /
+///    stale / corrupt, fall through.
+/// 4. **Rebuild fallthrough** — scan the full sqlite-vec corpus, build the index
+///    from scratch, and atomically write a v2 segment directory so the next daemon
+///    restart can use path 2.  Write failures are logged and do not block search.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -769,44 +824,96 @@ pub(crate) async fn ensure_ann_for_model(
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, model);
 
-    // Fast path: already loaded.
+    // 1. Fast path: already loaded.
     if ann.indexes.read().await.contains_key(&key) {
         return;
     }
 
-    // Try snapshot warm-load.
+    // 2. v2 segment path.
+    if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
+        match read_commit_fingerprint(&seg_dir) {
+            Ok(Some(persisted)) => {
+                // Cheap count+dims gate before hashing the full corpus.
+                let current_fp = compute_fingerprint(rt, token, model).await;
+                let count_dims_ok = current_fp.is_some_and(|fp| {
+                    fp.vector_count == persisted.vector_count
+                        && fp.dimensions as u64 == persisted.dimensions
+                });
+                if count_dims_ok {
+                    // Full content-hash check (normalizes corpus once).
+                    if let Some(live_hash) = live_content_hash(rt, token, model).await {
+                        if live_hash == persisted.content_hash {
+                            match AnnBridge::load(&seg_dir) {
+                                Ok(bridge) => {
+                                    ann.indexes.write().await.entry(key).or_insert(bridge);
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        dir = %seg_dir.display(),
+                                        "v2 segment load failed; falling through to rebuild"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                namespace = %ns,
+                                model = %model,
+                                "stale v2 segment (content-hash mismatch); rebuilding"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        namespace = %ns,
+                        model = %model,
+                        "stale v2 segment (count/dims mismatch); rebuilding"
+                    );
+                }
+            }
+            Ok(None) => {
+                // No v2 segments yet (or torn write) — fall through to v1 / rebuild.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dir = %seg_dir.display(),
+                    "error reading v2 segment fingerprint; falling through"
+                );
+            }
+        }
+    }
+
+    // 3. v1 JSON snapshot path (backwards-compat transition).
     if let Some(snapshot) = try_load_snapshot(rt, &ns, model).await {
         let current_fp = compute_fingerprint(rt, token, model).await;
         if let Some(fp) = current_fp {
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_vamana_snapshot(snapshot) {
                     Ok(bridge) => {
-                        // Re-check under write lock to avoid TOCTOU.
                         ann.indexes.write().await.entry(key).or_insert(bridge);
                         return;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "corrupt Vamana snapshot; rebuilding");
+                        tracing::warn!(error = %e, "corrupt Vamana v1 snapshot; rebuilding");
                     }
                 }
             } else {
                 tracing::info!(
                     namespace = %ns,
                     model = %model,
-                    "stale Vamana snapshot rejected (fingerprint mismatch); rebuilding"
+                    "stale Vamana v1 snapshot (fingerprint mismatch); rebuilding"
                 );
             }
         }
     }
 
-    // Snapshot absent, stale, or corrupt — rebuild from vector store.
+    // 4. Rebuild fallthrough — build from vector store and persist v2 segments.
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
-            let fp = compute_fingerprint(rt, token, model).await;
-            if let Some(fingerprint) = fp {
-                if let Err(e) = persist_snapshot(rt, &ns, model, &bridge, fingerprint).await {
-                    tracing::error!(error = %e, "failed to persist Vamana snapshot after rebuild");
-                }
+            if let Err(e) = persist_ann_v2(rt, &ns, model, &bridge) {
+                tracing::error!(error = %e, "failed to persist v2 Vamana segment after rebuild");
             }
             ann.indexes.write().await.entry(key).or_insert(bridge);
         }
@@ -1212,6 +1319,263 @@ mod tests {
         assert!(
             err.contains("magic"),
             "error must mention magic mismatch, got: {err}"
+        );
+    }
+
+    // ── slice 1b-ii-a: warm-path tests (ADR-079) ─────────────────────────────
+
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use tempfile::TempDir;
+
+    const WARM_TEST_MODEL: &str = "ann-test-model";
+    const WARM_DIMS: usize = 4;
+
+    struct ConstVecService;
+
+    #[async_trait]
+    impl EmbeddingService for ConstVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; WARM_DIMS]).collect())
+        }
+
+        fn supports_model(&self, _: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "const-vec"
+        }
+    }
+
+    struct TestEmbedderProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for TestEmbedderProvider {
+        fn name(&self) -> &str {
+            WARM_TEST_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            WARM_DIMS
+        }
+
+        async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ConstVecService))
+        }
+    }
+
+    fn file_rt_with_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("file-backed runtime");
+        rt.register_embedder(TestEmbedderProvider);
+        rt
+    }
+
+    /// Seed `n` distinct rows into the vec0 table for `WARM_TEST_MODEL`.
+    ///
+    /// Calls `rt.vectors_for_model` first so the virtual table is created, then
+    /// inserts raw f32 LE blobs directly via SQL.
+    async fn seed_warm_corpus(rt: &KhiveRuntime, token: &NamespaceToken, n: usize) {
+        let _store = rt
+            .vectors_for_model(token, WARM_TEST_MODEL)
+            .expect("vec store");
+        let model_key = sanitize_model_key(WARM_TEST_MODEL);
+        let table = format!("vec_{model_key}");
+        let ns = token.namespace().as_str().to_owned();
+        let sql = rt.sql();
+        let mut w = sql.writer().await.expect("writer");
+        for i in 0..n {
+            let id = Uuid::new_v4();
+            let mut v = [0.0_f32; WARM_DIMS];
+            v[i % WARM_DIMS] = 1.0;
+            let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            w.execute(SqlStatement {
+                sql: format!(
+                    "INSERT INTO {table} \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                ),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Text("concept".to_string()),
+                    SqlValue::Text("knowledge.atom".to_string()),
+                    SqlValue::Text(WARM_TEST_MODEL.to_string()),
+                    SqlValue::Blob(bytes),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert corpus row");
+        }
+    }
+
+    /// `ann_segment_dir` encodes a round-trippable hex key that `decode_ann_dir_name` reverses.
+    #[tokio::test]
+    async fn ann_segment_dir_encode_decode_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL)
+            .expect("file backend must return Some(seg_dir)");
+
+        let dir_name = seg_dir
+            .file_name()
+            .expect("seg_dir must have a basename")
+            .to_string_lossy()
+            .into_owned();
+
+        let (decoded_ns, decoded_model) =
+            decode_ann_dir_name(&dir_name).expect("decode must succeed for a valid encode");
+        assert_eq!(decoded_ns, "local");
+        assert_eq!(decoded_model, WARM_TEST_MODEL);
+
+        // Parent directory is `data_dir/ann/`.
+        let parent = seg_dir.parent().expect("seg_dir must have a parent");
+        assert_eq!(
+            parent.file_name().unwrap().to_string_lossy(),
+            "ann",
+            "seg_dir parent must be named 'ann'"
+        );
+    }
+
+    /// `ensure_ann_for_model` must not panic on an in-memory runtime (no data_dir).
+    #[tokio::test]
+    async fn ensure_ann_no_data_dir_does_not_panic() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ann = new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // No data_dir → v2 path skipped. No corpus → no rebuild. Must complete silently.
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "no index should be loaded when corpus is empty and model is unknown"
+        );
+    }
+
+    /// Cold-start build persists v2 segments; a second call restores from disk.
+    ///
+    /// Also gates the normalize-once invariant: `live_content_hash` must equal the
+    /// persisted commit hash, proving the Hot branch can fire without double-normalization.
+    #[tokio::test]
+    async fn ensure_ann_round_trip_hot() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        // Cold-start: rebuild from corpus, persist v2 segments.
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "first call must build the ANN index"
+        );
+
+        // Normalize-once invariant: the live corpus hash must equal the persisted
+        // commit hash.  A double-normalize bug produces always-stale hashes here.
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL)
+            .expect("file backend must have a seg_dir");
+        assert!(
+            seg_dir.join("metadata.bin").exists(),
+            "first call must persist v2 segments (metadata.bin missing)"
+        );
+        let persisted = read_commit_fingerprint(&seg_dir)
+            .expect("read_commit_fingerprint must not err")
+            .expect("metadata.bin must carry a v2 fingerprint");
+        let live = live_content_hash(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("live_content_hash must return Some for a seeded corpus");
+        assert_eq!(
+            live, persisted.content_hash,
+            "live_content_hash must equal persisted content_hash (normalize-once invariant)"
+        );
+
+        // Hot path: load from persisted v2 segments without rebuilding.
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        assert!(
+            ann2.indexes.read().await.contains_key(&key),
+            "second call must restore the ANN index from v2 segments"
+        );
+    }
+
+    /// After a corpus mutation the persisted v2 segment is stale and triggers a rebuild.
+    ///
+    /// Proves the stale branch is actually exercised (not silently falling through to rebuild),
+    /// and that the rebuild re-persists v2 segments matching the mutated corpus.
+    #[tokio::test]
+    async fn ensure_ann_stale_rebuild() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        // Initial build: persist v2 segments.
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(ann.indexes.read().await.contains_key(&key), "initial build");
+
+        // Mutate corpus: add one more row.
+        seed_warm_corpus(&rt, &token, 1).await;
+
+        // Gate: after mutation, live hash must DIFFER from persisted — proves the stale
+        // branch will fire (not silently succeed with the same hash).
+        let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL)
+            .expect("file backend must have a seg_dir");
+        let persisted_before = read_commit_fingerprint(&seg_dir)
+            .expect("read_commit_fingerprint must not err")
+            .expect("v2 fingerprint must be present after initial build");
+        let live_after_mutation = live_content_hash(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("live_content_hash must return Some");
+        assert_ne!(
+            live_after_mutation, persisted_before.content_hash,
+            "mutation must make live hash differ from persisted (stale-branch pre-condition)"
+        );
+
+        // Fresh SharedAnn: stale v2 detected → rebuild from corpus.
+        let ann2 = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
+        assert!(
+            ann2.indexes.read().await.contains_key(&key),
+            "must rebuild the index after corpus mutation (stale v2 segment rejected)"
+        );
+
+        // Rebuild must re-persist v2 segments matching the mutated (5-row) corpus.
+        let persisted_after = read_commit_fingerprint(&seg_dir)
+            .expect("read_commit_fingerprint after rebuild must not err")
+            .expect("v2 fingerprint must be present after rebuild");
+        let live_final = live_content_hash(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("live_content_hash must return Some after rebuild");
+        assert_eq!(
+            live_final, persisted_after.content_hash,
+            "rebuild must re-persist v2 matching the mutated corpus"
+        );
+        assert_eq!(
+            persisted_after.vector_count, 5,
+            "re-persisted segment must reflect the 5-row corpus (4 initial + 1 mutation)"
         );
     }
 }
