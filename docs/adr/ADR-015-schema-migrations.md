@@ -579,9 +579,16 @@ the codebase's migration set is global, but applied state is per-file.
 ADR-071 introduces a `BackendMigrator` trait in `khive-storage` that the runtime boot path
 calls instead of the current direct `run_migrations(conn: &mut rusqlite::Connection)` call.
 
-The amendment to ADR-015 is narrow: the migration entry point documented in §Implementation
-(`crates/khive-runtime/src/runtime.rs` calling `run_migrations`) is replaced by a call to
-`BackendMigrator::migrate()`, where `BackendMigrator` is a trait defined in `khive-storage`.
+The amendment to ADR-015 is narrow: the direct `run_migrations(conn)` call documented in
+§Implementation (`crates/khive-runtime/src/runtime.rs`) is replaced by the `BackendMigrator`
+trait, defined in `khive-storage`. The startup contract is unchanged from §Decision — the
+MCP binary does not apply migrations at startup. Per ADR-071 §2, boot dispatches by backend
+kind: a **file-backed** runtime calls `BackendMigrator::current_version()` and fails fast
+with a diagnostic pointing at `kkernel db migrate` when the persisted version is behind the
+codebase expectation; it does not call `migrate()`. `BackendMigrator::migrate()` is reserved
+for the `kkernel db migrate` operator command and for **in-memory/ephemeral** backends, whose
+`boot()` applies all migrations automatically (there is no operator to invoke `kkernel db
+migrate` for an ephemeral database).
 
 `khive-db` provides `SqliteMigrator`, which implements `BackendMigrator` by wrapping the
 existing `run_migrations` function. The `VersionedMigration` struct, the migration array,
