@@ -110,6 +110,29 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
     rt
 }
 
+/// File-backed variant. Required by tests that exercise v2 ANN persistence:
+/// `knowledge.index(rebuild_ann=true)` only writes v2 segments when the backend
+/// has a `data_dir`. An in-memory runtime has none, and ADR-079 removed the v1
+/// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
+fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(db_path),
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("file-backed runtime");
+    rt.register_embedder(FakeDimProvider);
+    rt
+}
+
 fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
@@ -265,7 +288,12 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 /// must load that snapshot so `search_loaded` returns `Some` (index is in memory).
 #[tokio::test]
 async fn warm_known_snapshots_loads_persisted_snapshot() {
-    let rt = rt_with_fake_embedder();
+    // File-backed runtime so knowledge.index(rebuild_ann=true) persists v2 ANN
+    // segments to data_dir/ann/<hex>; warm_known_snapshots then enumerates and
+    // loads them. (In-memory has no data_dir, and ADR-079 removed the v1 write
+    // path, so nothing would be persisted to warm.)
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rt = file_rt_with_fake_embedder(dir.path().join("test.db"));
     let registry = build_registry(&rt);
 
     // Seed two atoms so Vamana has enough vectors to build a non-trivial index.
