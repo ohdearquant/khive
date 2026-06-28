@@ -536,8 +536,11 @@ To:
 
 ```rust
 pub struct KhiveRuntime {
-    handle:    BackendHandle,
-    embedders: Arc<EmbedderRegistry>,
+    handle:      BackendHandle,
+    /// `None` when bound to main; `Some(main_handle)` for secondary backends.
+    /// See ADR-073 for the core-backend accessor contract.
+    core_handle: Option<BackendHandle>,
+    embedders:   Arc<EmbedderRegistry>,
 }
 
 impl KhiveRuntime {
@@ -549,6 +552,13 @@ impl KhiveRuntime {
 
     /// In-memory backend for tests.
     pub fn memory() -> Result<Self, RuntimeError>;
+
+    /// Return a runtime handle bound to the main (shared-graph) backend. See ADR-073 §2.
+    pub fn core(&self) -> KhiveRuntime;
+
+    /// Wire this runtime as a secondary-backend runtime pointing at `main_handle`.
+    /// Called by the boot path for non-main pack runtimes. See ADR-073 §3-4.
+    pub fn with_core_handle(self, main_handle: BackendHandle) -> Self;
 }
 ```
 
@@ -559,12 +569,19 @@ specific capability handles through `BackendHandle` instead.
 
 The boot sequence constructs a `BackendHandle` per pack (via `BackendHandle::from_sqlite`
 for the SQLite boot path) instead of an `Arc<StorageBackend>`. `KhiveRuntime::from_handle`
-replaces `KhiveRuntime::from_backend` at the pack-instantiation step:
+replaces `KhiveRuntime::from_backend` at the pack-instantiation step. For non-main packs,
+`with_core_handle` wires the main backend accessor per ADR-073 §4:
 
 ```rust
-let backend = backends.get(&pack_cfg.backend)?.clone();
-let handle   = BackendHandle::from_sqlite(backend);
-let runtime  = KhiveRuntime::from_handle(handle, engines);
+let backend     = backends.get(&pack_cfg.backend)?.clone();
+let handle      = BackendHandle::from_sqlite(backend);
+let main_handle = BackendHandle::from_sqlite(main_backend.clone());
+let runtime     = KhiveRuntime::from_handle(handle, engines);
+let runtime     = if pack_cfg.backend != BackendId::MAIN {
+    runtime.with_core_handle(main_handle)
+} else {
+    runtime
+};
 ```
 
 All other ADR-028 mechanics (TOML shape, 1:1 pack-to-backend assignment, schema collision

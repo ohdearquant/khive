@@ -1,9 +1,11 @@
 # ADR-071: Backend-Pluggable Runtime — Polystore Restoration
 
-**Status**: proposed
+**Status**: Accepted
 **Date**: 2026-06-25
+**Ratified**: 2026-06-28
 **Authors**: Ocean, lambda:khive
 **Depends on**:
+
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits
 - [ADR-009](ADR-009-backend-architecture.md) — Backend Architecture
 - [ADR-015](ADR-015-schema-migrations.md) — Schema Migrations
@@ -31,15 +33,15 @@ found that the current `khive-runtime` crate violates both specifications. The b
 not incremental erosion — it has been present since the initial commit (`16d75d9a`). Seven
 gaps were identified, ordered by severity:
 
-| Gap | Description |
-|-----|-------------|
-| G1 | `KhiveRuntime` holds `Arc<StorageBackend>` (the concrete SQLite wrapper), not a trait handle |
-| G2 | `run_migrations` takes `rusqlite::Connection` directly; no backend-neutral migration path exists |
-| G3 | `curation.rs` and `operations.rs` call `backend.pool_arc().writer().transaction(conn: &rusqlite::Connection)` — bypassing every trait |
-| G4 | `RuntimeError::Sqlite` is typed as `#[from] khive_db::SqliteError`, coupling the public error enum to the SQLite backend |
-| G5 | `list_embedding_models` returns `Vec<khive_db::EmbeddingModelRegistryRecord>` — a concrete `khive-db` type in the public API |
-| G6 | `khive-retrieval` takes `khive-db` as an unconditional production dependency |
-| G7 | `VectorStore::capabilities()` default returns `VectorIndexKind::SqliteVec` and `max_dimensions: Some(8192)`, embedding SQLite constraints into the backend-neutral trait |
+| Gap | Description                                                                                                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| G1  | `KhiveRuntime` holds `Arc<StorageBackend>` (the concrete SQLite wrapper), not a trait handle                                                                             |
+| G2  | `run_migrations` takes `rusqlite::Connection` directly; no backend-neutral migration path exists                                                                         |
+| G3  | `curation.rs` and `operations.rs` call `backend.pool_arc().writer().transaction(conn: &rusqlite::Connection)` — bypassing every trait                                    |
+| G4  | `RuntimeError::Sqlite` is typed as `#[from] khive_db::SqliteError`, coupling the public error enum to the SQLite backend                                                 |
+| G5  | `list_embedding_models` returns `Vec<khive_db::EmbeddingModelRegistryRecord>` — a concrete `khive-db` type in the public API                                             |
+| G6  | `khive-retrieval` takes `khive-db` as an unconditional production dependency                                                                                             |
+| G7  | `VectorStore::capabilities()` default returns `VectorIndexKind::SqliteVec` and `max_dimensions: Some(8192)`, embedding SQLite constraints into the backend-neutral trait |
 
 The consequence of G1 is that the entire trait layer in `khive-storage` is structurally
 correct but architecturally isolated: all actual data paths go through the concrete backend
@@ -61,13 +63,26 @@ This ADR decides how to close all seven gaps and restore the polystore boundary.
 ```rust
 // crates/khive-runtime/src/backend_handle.rs
 pub struct BackendHandle {
-    entity:    Arc<dyn EntityStore>,
-    note:      Arc<dyn NoteStore>,
-    graph:     Arc<dyn GraphStore>,
-    event:     Arc<dyn EventStore>,
-    vector:    Arc<dyn VectorStore>,
-    text:      Arc<dyn TextSearch>,
-    sql:       Arc<dyn SqlAccess>,
+    // Required core: every backend stores entities and notes, exposes the graph and
+    // event surfaces the runtime's core write/projection paths depend on, provides raw
+    // SQL access, and carries a migrator.
+    entity:   Arc<dyn EntityStore>,
+    note:     Arc<dyn NoteStore>,
+    graph:    Arc<dyn GraphStore>,
+    event:    Arc<dyn EventStore>,
+    sql:      Arc<dyn SqlAccess>,
+    /// Required on every handle. An in-memory or ephemeral backend provides a migrator
+    /// whose `migrate()` applies all migrations automatically and whose
+    /// `current_version()` returns the latest schema version.
+    migrator: Arc<dyn BackendMigrator>,
+    // Optional retrieval tier: a backend that does not provide semantic/lexical search
+    // (e.g. a session-only or secondary backend that delegates shared-graph reads to the
+    // main backend via `core()`) leaves these `None`. The matching accessors return
+    // `Option`; the runtime validates presence per operation and fails with a clear
+    // diagnostic if an op needs a tier the bound backend does not provide.
+    vector:   Option<Arc<dyn VectorStore>>,
+    sparse:   Option<Arc<dyn SparseStore>>,
+    text:     Option<Arc<dyn TextSearch>>,
 }
 
 impl BackendHandle {
@@ -75,14 +90,18 @@ impl BackendHandle {
     pub fn from_sqlite(backend: Arc<StorageBackend>) -> Self { ... }
 
     /// Construct from explicit trait objects (alternate backends, tests).
+    /// Pass `None` for any retrieval-tier slot (`vector`, `sparse`, `text`) the backend
+    /// does not provide; the required-core slots are mandatory.
     pub fn from_parts(
-        entity: Arc<dyn EntityStore>,
-        note:   Arc<dyn NoteStore>,
-        graph:  Arc<dyn GraphStore>,
-        event:  Arc<dyn EventStore>,
-        vector: Arc<dyn VectorStore>,
-        text:   Arc<dyn TextSearch>,
-        sql:    Arc<dyn SqlAccess>,
+        entity:   Arc<dyn EntityStore>,
+        note:     Arc<dyn NoteStore>,
+        graph:    Arc<dyn GraphStore>,
+        event:    Arc<dyn EventStore>,
+        sql:      Arc<dyn SqlAccess>,
+        migrator: Arc<dyn BackendMigrator>,
+        vector:   Option<Arc<dyn VectorStore>>,
+        sparse:   Option<Arc<dyn SparseStore>>,
+        text:     Option<Arc<dyn TextSearch>>,
     ) -> Self { ... }
 }
 ```
@@ -94,14 +113,29 @@ It is produced by the boot path and is the only way to construct a `KhiveRuntime
 
 ```rust
 pub struct KhiveRuntime {
-    handle:    BackendHandle,
-    embedders: Arc<EmbedderRegistry>,
+    handle:      BackendHandle,
+    /// `None` when this runtime is bound to the main (shared-graph) backend.
+    /// `Some(main_handle)` when bound to a secondary backend; `core()` returns
+    /// a runtime backed by the main handle. See ADR-073 §2 for the full contract.
+    core_handle: Option<BackendHandle>,
+    embedders:   Arc<EmbedderRegistry>,
 }
 ```
 
 `backend: Arc<StorageBackend>` is removed. `KhiveRuntime::backend()` is removed. Code that
-reached through `backend()` must use the specific trait accessor on `BackendHandle` instead
-(e.g., `handle.sql()`, `handle.vector()`).
+reached through `backend()` must use the specific trait accessor on `BackendHandle` instead.
+The required-core accessors (`entity()`, `note()`, `graph()`, `event()`, `sql()`,
+`migrator()`) return the handle directly; the retrieval-tier accessors (`vector()`,
+`sparse()`, `text()`) return `Option<&Arc<dyn _>>`. A runtime operation that needs a
+retrieval tier the bound backend does not provide fails with a clear diagnostic naming the
+missing capability rather than panicking. The SQLite backend fills every slot, so this is
+the common path; the `Option` exists for partial backends.
+
+`core_handle` preserves the ADR-073 accessor contract. `KhiveRuntime::core()` returns a
+handle bound to the main backend; `with_core_handle(BackendHandle)` is the boot-path
+wiring call for secondary-backend runtimes. Phase 4 updates the field type from
+`Option<Arc<StorageBackend>>` (the ADR-073 pre-Phase-4 form) to `Option<BackendHandle>`;
+the `core()` accessor semantics are unchanged.
 
 ### 2. Migration dispatch — `BackendMigrator` trait
 
@@ -124,8 +158,18 @@ pub trait BackendMigrator: Send + Sync {
 ```
 
 `khive-db` provides a `SqliteMigrator` that wraps `run_migrations` and implements this trait.
-The `BackendHandle` includes an `Arc<dyn BackendMigrator>`, and `KhiveRuntime::boot()`
-calls `handle.migrator().migrate()` instead of `run_migrations()` directly.
+The `BackendHandle` includes an `Arc<dyn BackendMigrator>` in its `migrator` slot (see §1).
+
+Migration dispatch at boot follows ADR-015 §Decision — the MCP binary does not apply
+migrations at startup:
+
+- **File-backed runtimes**: `KhiveRuntime::boot()` calls
+  `handle.migrator().current_version()` and fails fast with a diagnostic pointing at
+  `kkernel db migrate` if the schema version is behind the codebase expectation.
+  `migrate()` is not called at MCP startup; it is reserved for `kkernel db migrate`.
+- **In-memory and ephemeral backends**: `boot()` calls `handle.migrator().migrate()` to
+  apply all migrations automatically. There is no operator to invoke `kkernel db migrate`
+  for an ephemeral database, and the migration cost is negligible against an empty store.
 
 The runtime crate's dependency on `rusqlite` is removed when this gap closes. Only
 `khive-db` depends on `rusqlite`.
@@ -284,11 +328,18 @@ for the sqlite-vec backend; it just must not appear in the trait default.
 ### Why `BackendHandle` over a single `Arc<dyn Backend>` supertrait
 
 A supertrait that extends all eight capability traits forces every backend implementation
-to implement all eight. An alternate backend that handles only `EntityStore` and
-`NoteStore` (e.g., a Redis session backend) would be forced to provide stub implementations
-for `VectorStore`, `TextSearch`, etc. `BackendHandle` holds individual `Arc<dyn Trait>`
-handles, allowing each slot to be filled independently. A minimal backend fills only the
-slots it supports; `KhiveRuntime` accessors return the trait reference the caller needs.
+to implement all eight. An alternate backend that provides the relational core but no
+semantic or lexical search (e.g., a secondary session backend that delegates shared-graph
+reads to the main backend via `core()`) would be forced to provide stub implementations of
+`VectorStore`, `SparseStore`, and `TextSearch`. `BackendHandle` holds individual handles
+and splits them into a required core (`entity`, `note`, `graph`, `event`, `sql`, `migrator`
+— the slots every khive backend must supply because the runtime's core write, projection,
+and migration paths depend on them) and an optional retrieval tier (`vector`, `sparse`,
+`text` — `Option` slots). A backend that omits the retrieval tier leaves those slots `None`
+rather than stubbing them; the matching accessors return `Option`, and a runtime operation
+that requires an absent tier fails with a diagnostic naming the missing capability. This is
+the seam the cloud session-store decision relies on: cloud plugs in its own backend without
+modifying `runtime.core()` and without implementing search traits it does not use.
 
 ### Why not just feature-gate `khive-db` out of `khive-runtime`
 
@@ -331,6 +382,17 @@ ADR-028's deferred `[[backends]]` boot path already anticipates `KhiveRuntime::f
 ADR-071 amends that to `KhiveRuntime::from_handle(BackendHandle, ...)`. The `BackendHandle::from_sqlite(Arc<StorageBackend>)` constructor preserves the SQLite fast path. The `[[backends]]` declarative boot sequence ADR-028 §8 describes constructs a `BackendHandle` per pack rather than an `Arc<StorageBackend>`.
 
 ADR-028 is amended (see below) to reference ADR-071 as the seam that `[[backends]]` plugs into.
+
+### Relationship to ADR-073
+
+ADR-073 (accepted) adds `core_handle: Option<BackendHandle>` to `KhiveRuntime` and the
+`core()` / `with_core_handle` accessor API that lets a secondary-backend pack write
+shared-graph notes to the main backend. Phase 4 of this ADR must preserve that contract:
+the `core_backend: Option<Arc<StorageBackend>>` field introduced by ADR-073 becomes
+`core_handle: Option<BackendHandle>` when the `BackendHandle` seam lands. The
+`BackendHandle::from_sqlite(Arc<StorageBackend>)` shim provides the mechanical upgrade
+path at the boot-path call site. ADR-073 §6 ("Relationship to ADR-071") records this
+as the accepted sequencing constraint.
 
 ### Relationship to ADR-005 and ADR-009
 
@@ -434,6 +496,11 @@ Add `BackendHandle` type in `crates/khive-runtime/src/backend_handle.rs`. Replac
 
 Phases 2 and 3 must land before Phase 4. After Phase 4, `khive-runtime/Cargo.toml`
 drops `rusqlite` and `khive-db` as production dependencies.
+
+Phase 4 also updates the `core_backend: Option<Arc<StorageBackend>>` field (ADR-073) to
+`core_handle: Option<BackendHandle>`, with a corresponding mechanical update to
+`with_core_handle` and the boot-path wiring in `build_registry_for_multi_backend`.
+The `core()` accessor semantics (ADR-073 §2) are preserved unchanged.
 
 Estimated scope: 3 files, ~100 LOC change.
 
