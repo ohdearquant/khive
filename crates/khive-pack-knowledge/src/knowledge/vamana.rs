@@ -433,13 +433,15 @@ fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path
 /// interprets them as UTF-8, then splits on `"::vamana::"`. Returns `None` on bad
 /// hex, non-UTF-8 bytes, a missing separator, or empty namespace/model parts.
 fn decode_ann_dir_name(name: &str) -> Option<(String, String)> {
-    if !name.len().is_multiple_of(2) {
+    let raw = name.as_bytes();
+    if !raw.len().is_multiple_of(2) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(name.len() / 2);
-    for i in (0..name.len()).step_by(2) {
-        let byte = u8::from_str_radix(&name[i..i + 2], 16).ok()?;
-        bytes.push(byte);
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        bytes.push((hi * 16 + lo) as u8);
     }
     let key = String::from_utf8(bytes).ok()?;
     let (ns, model) = key.split_once("::vamana::")?;
@@ -688,23 +690,24 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
 /// Each unique namespace+model pair gets its own keyed slot; all snapshots are
 /// loaded, not just the first one.
 pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
-    let sql = rt.sql();
-    let mut reader = match sql.reader().await {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    let rows = match reader
-        .query_all(SqlStatement {
-            sql: "SELECT DISTINCT namespace FROM retrieval_snapshots WHERE namespace LIKE ?1"
-                .into(),
-            params: vec![SqlValue::Text("%::vamana::%".into())],
-            label: None,
-        })
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return,
+    // v1 legacy pass: warm namespaces recorded in retrieval_snapshots, if that
+    // table exists. On a v2-only database it will not, so a query error must fall
+    // through to the v2 segment enumeration below rather than abort the warm pass.
+    let rows = {
+        let sql = rt.sql();
+        match sql.reader().await {
+            Ok(mut reader) => reader
+                .query_all(SqlStatement {
+                    sql:
+                        "SELECT DISTINCT namespace FROM retrieval_snapshots WHERE namespace LIKE ?1"
+                            .into(),
+                    params: vec![SqlValue::Text("%::vamana::%".into())],
+                    label: None,
+                })
+                .await
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     };
 
     for row in &rows {
@@ -1510,12 +1513,27 @@ mod tests {
             "live_content_hash must equal persisted content_hash (normalize-once invariant)"
         );
 
-        // Hot path: load from persisted v2 segments without rebuilding.
+        // Hot path: load from persisted v2 segments without rebuilding. A rebuild
+        // would call save_atomic and rewrite metadata.bin (new inode); a true Hot
+        // load via AnnBridge::load never writes. Asserting the inode is unchanged
+        // proves the second call took the v2 Hot branch, not a silent rebuild.
+        use std::os::unix::fs::MetadataExt;
+        let meta_path = seg_dir.join("metadata.bin");
+        let ino_before = std::fs::metadata(&meta_path)
+            .expect("metadata.bin must exist after first build")
+            .ino();
         let ann2 = new_shared();
         ensure_ann_for_model(&rt, &token, &ann2, WARM_TEST_MODEL).await;
         assert!(
             ann2.indexes.read().await.contains_key(&key),
             "second call must restore the ANN index from v2 segments"
+        );
+        let ino_after = std::fs::metadata(&meta_path)
+            .expect("metadata.bin must still exist")
+            .ino();
+        assert_eq!(
+            ino_before, ino_after,
+            "second call must NOT rewrite metadata.bin — proves the v2 Hot load path, not a rebuild"
         );
     }
 
