@@ -10,7 +10,8 @@ pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
 pub use index::{
-    CorpusFingerprint, VamanaIndex, VamanaIndexSnapshot, VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT,
+    corpus_content_hash, read_commit_fingerprint, CorpusFingerprint, PersistedFingerprint,
+    VamanaIndex, VamanaIndexSnapshot, VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT,
     VAMANA_SNAPSHOT_VERSION,
 };
 

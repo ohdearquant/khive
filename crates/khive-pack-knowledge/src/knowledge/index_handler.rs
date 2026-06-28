@@ -96,10 +96,6 @@ impl KnowledgeHandlers {
             cb(0, total as u64);
         }
 
-        let mut ann_vectors: Vec<f32> = Vec::new();
-        let mut ann_ids: Vec<uuid::Uuid> = Vec::new();
-        let mut ann_dim: usize = 0;
-
         for chunk in atoms.chunks(batch_size) {
             let mut staged: Vec<(uuid::Uuid, String)> = Vec::with_capacity(chunk.len());
             for atom in chunk {
@@ -190,21 +186,6 @@ impl KnowledgeHandlers {
                 }
             }
 
-            if rebuild_ann {
-                for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
-                    if !chunk_ok[i] {
-                        continue;
-                    }
-                    if ann_dim == 0 {
-                        ann_dim = emb.len();
-                    }
-                    if emb.len() == ann_dim {
-                        ann_ids.push(*id);
-                        ann_vectors.extend_from_slice(emb);
-                    }
-                }
-            }
-
             indexed += chunk_ok.iter().filter(|ok| **ok).count();
 
             if let Some(cb) = on_progress {
@@ -221,43 +202,27 @@ impl KnowledgeHandlers {
         let mut ann_count: Option<usize> = None;
         let mut ann_failed = false;
         let is_full_corpus = p.ids.is_none();
-        if rebuild_ann && is_full_corpus && !ann_vectors.is_empty() && ann_dim > 0 {
-            let n_vecs = ann_ids.len();
-            tracing::info!(
-                vectors = n_vecs,
-                dim = ann_dim,
-                "building Vamana ANN index…"
-            );
+        if rebuild_ann && is_full_corpus && indexed > 0 {
             if let Some(cb) = on_progress {
                 cb(total as u64, total as u64);
             }
-            eprintln!("\n  building Vamana ANN ({n_vecs} vectors, dim={ann_dim})…");
-            match vamana::AnnBridge::build(ann_vectors, ann_dim, ann_ids) {
-                Ok(bridge) => {
-                    ann_count = Some(bridge.num_vectors());
-                    let model_name = runtime.default_embedder_name();
-                    match vamana::compute_fingerprint(runtime, token, model_name).await {
-                        Some(fp) => {
-                            if let Err(e) =
-                                vamana::persist_snapshot(runtime, &ns, model_name, &bridge, fp)
-                                    .await
-                            {
-                                tracing::error!(error = %e, "failed to persist Vamana snapshot");
-                                ann_failed = true;
-                            }
-                        }
-                        None => {
-                            tracing::warn!(
-                                "failed to compute corpus fingerprint; Vamana snapshot will not be persisted"
-                            );
-                            ann_failed = true;
-                        }
-                    }
+            let model_name = runtime.default_embedder_name();
+            // Build from the shared corpus scan (ORDER BY subject_id) so the persisted
+            // v2 content_hash matches the warm-path live_content_hash. Building from
+            // atom-iteration order persists a hash the warm path always reads as stale.
+            match vamana::load_and_build_from_vector_store(runtime, token, model_name).await {
+                Ok(Some(bridge)) => {
                     let n = bridge.num_vectors();
+                    ann_count = Some(n);
+                    if let Err(e) = vamana::persist_ann_v2(runtime, &ns, model_name, &bridge) {
+                        tracing::error!(error = %e, "failed to persist v2 Vamana segments");
+                        ann_failed = true;
+                    }
                     let key = vamana::AnnKey::new(&ns, model_name);
                     vamana::insert_ann_if_absent(ann, key, bridge).await;
                     eprintln!("  Vamana ANN built ({n} vectors)");
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Vamana ANN index");
                     eprintln!("  Vamana ANN build failed: {e}");
