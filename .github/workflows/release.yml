@@ -1,6 +1,13 @@
 name: Release
 
-# Triggered by a version tag push (e.g. v0.2.0).
+# Triggered ONLY by manual workflow_dispatch from `main` (see #222). A version
+# tag push does NOT publish: an old `v*` tag checks out an older release.yml whose
+# SemVer gate predates #216, so tag-triggered publishing is an ungated path. Making
+# main-dispatch the sole publisher means "the workflow that publishes" always equals
+# "the gate-carrying workflow on main". The `publish` environment's ref allowlist is
+# restricted to `main` (scripts/apply-autonomous-merge.sh), so even if an old tag's
+# old workflow runs, its publish job cannot deploy.
+#
 # Builds Rust binaries per-platform, publishes each khive-kernel-{platform}
 # npm subpackage, then publishes the umbrella khive package.
 #
@@ -24,9 +31,6 @@ name: Release
 # install the previous khive version unchanged.
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -147,11 +151,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # A manual workflow_dispatch can select any ref. Only `main` is allowed to
-      # cut a manual release, so the SemVer gate that runs is always main's
-      # current one — never an older ref whose release.yml predates this gate.
-      # Tag pushes (push event) are unaffected: a v* tag's own checked-out
-      # workflow carries the gate. publish-all depends on this job, so a blocked
-      # dispatch never reaches a publish step.
+      # cut a release, so the SemVer gate that runs is always main's current one —
+      # never an older ref whose release.yml predates this gate. Tag pushes no
+      # longer trigger this workflow at all (the push.tags trigger was removed in
+      # #222), so workflow_dispatch from main is the sole publish path. publish-all
+      # depends on this job, so a blocked dispatch never reaches a publish step.
       - name: Guard — manual dispatch only from main
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
         run: |
@@ -197,15 +201,12 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      # Extract the version from the git tag (strip leading "v").
-      # Passed via env var to avoid shell-interpolation issues in node -e (MIN-3).
+      # Version comes from the required workflow_dispatch input (tag-push publishing
+      # was removed in #222). Passed via env var to avoid shell-interpolation issues
+      # in node -e (MIN-3).
       - name: Extract version
         run: |
-          if [[ -n "${{ inputs.version }}" ]]; then
-            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
-          else
-            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
-          fi
+          echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
 
       # Download all six platform artifacts into their respective directories.
       - name: Download all platform artifacts
