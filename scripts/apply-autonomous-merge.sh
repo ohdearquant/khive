@@ -329,6 +329,27 @@ assert_branch_policy() {
     <<<"${policies}" >/dev/null
 }
 
+# Delete every deployment-branch policy that is not exactly `main:branch`. GitHub
+# stores these as persistent allowlist rows, so an older setup that created a
+# `v*:tag` row leaves the tag-publish path open until that row is DELETED — merely
+# no longer creating it is not enough (#222). Fatal on any delete failure so a
+# surviving row aborts the activation rather than silently leaving the allowlist
+# wider than `main`.
+prune_non_main_branch_policies() {
+  local existing pid pname ptype
+  existing="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" 2>/dev/null || echo '{}')"
+  while IFS=$'\t' read -r pid pname ptype; do
+    [[ -z "${pid}" ]] && continue
+    if [[ "${pname}" == "main" && ( "${ptype}" == "branch" || "${ptype}" == "null" ) ]]; then
+      continue
+    fi
+    echo "[release-gate] removing non-main deployment policy '${pname}' (${ptype}, id ${pid})."
+    gh api --method DELETE \
+      "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies/${pid}" >/dev/null \
+      || { echo "ABORT: failed to delete deployment policy '${pname}' (${ptype}, id ${pid})." >&2; exit 1; }
+  done < <(jq -r '.branch_policies[]? | [(.id|tostring), .name, (.type // "null")] | @tsv' <<<"${existing}")
+}
+
 step_release_gate() {
   echo "[STEP release-gate] Creating '${ENVIRONMENT}' environment with a required reviewer."
   # Don't clobber an already-hardened environment. The env 404s before first
@@ -337,8 +358,8 @@ step_release_gate() {
   if gh api "repos/${REPO}/environments/${ENVIRONMENT}" >/dev/null 2>&1; then
     if [[ "${FORCE:-false}" != "true" ]]; then
       echo "ABORT: '${ENVIRONMENT}' environment already exists." >&2
-      echo "Re-applying would replace its reviewers and branch policy with this" >&2
-      echo "script's defaults. Set FORCE=true to overwrite intentionally." >&2
+      echo "Re-applying would replace its reviewers and prune its branch policy to" >&2
+      echo "main-only — removing any stale 'v*' tag row (#222). Set FORCE=true to do so." >&2
       exit 1
     fi
     echo "[release-gate] FORCE=true — overwriting the existing '${ENVIRONMENT}' environment."
@@ -359,18 +380,28 @@ step_release_gate() {
   if [[ "${DRY_RUN}" != "false" ]]; then
     echo "[DRY RUN] PUT repos/${REPO}/environments/${ENVIRONMENT} (required reviewer: ${admin_login}, id ${admin_id})"
     echo "${body}" | jq .
+    echo "[DRY RUN] DELETE any non-main deployment-branch policy (e.g. an existing 'v*' tag row)"
     echo "[DRY RUN] POST deployment-branch-policies: branch 'main'"
   else
     echo "${body}" | gh api --method PUT "repos/${REPO}/environments/${ENVIRONMENT}" --input - >/dev/null
+    # Prune any pre-existing non-`main` policy FIRST. GitHub stores deployment
+    # policies as persistent allowlist rows, so an older setup's `v*:tag` row
+    # survives until it is affirmatively deleted — not creating it is not enough
+    # to close the tag-publish hole (#222).
+    prune_non_main_branch_policies
     # Define the ref allowlist. post_branch_policy is fatal on any non-duplicate
     # failure, so a dropped policy aborts the activation instead of silently
     # widening the allowlist.
     post_branch_policy 'main' 'branch'
-    # Read back and prove the policy is actually present before declaring success.
-    local policies
+    # Read back and prove `main` is present AND is the ONLY policy before declaring
+    # success — a lingering non-main row (e.g. `v*`) would keep the hole open.
+    local policies policy_count
     policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies")"
     assert_branch_policy "${policies}" 'main' 'branch' \
       || { echo "ABORT: 'main' branch policy missing after apply." >&2; exit 1; }
+    policy_count="$(jq -r '[.branch_policies[]?] | length' <<<"${policies}")"
+    [[ "${policy_count}" == "1" ]] \
+      || { echo "ABORT: publish allowlist has ${policy_count} policies after apply, expected exactly 1 (main:branch); a non-main ref can still deploy." >&2; exit 1; }
     echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main only)."
   fi
 }
@@ -416,6 +447,15 @@ preflight_autonomy() {
     assert_branch_policy "${policies}" "${pname}" "${ptype}" \
       || { echo "ABORT: '${ENVIRONMENT}' missing deployment policy ${pname} (${ptype}) — run STEP=release-gate first." >&2; exit 1; }
   done
+  # `main` present is necessary but not sufficient: a lingering non-main row (e.g.
+  # a `v*` tag from an older setup) would still let a tag deploy. Require the
+  # allowlist to be EXACTLY main:branch — fail closed otherwise (#222).
+  local policy_count
+  policy_count="$(jq -r '[.branch_policies[]?] | length' <<<"${policies}")"
+  if [[ "${policy_count}" != "1" ]]; then
+    echo "ABORT: '${ENVIRONMENT}' allowlist has ${policy_count} policies, expected exactly main:branch — a non-main ref (e.g. a v* tag) can still deploy. Run STEP=release-gate (FORCE=true) to prune." >&2
+    exit 1
+  fi
   echo "Preflight OK: wall is up (all contexts required), release gate has ${reviewers} reviewer(s), ref allowlist = main only."
 }
 
