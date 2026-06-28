@@ -99,10 +99,12 @@ fn cv_cited_by_is_rejected_as_converse_of_cites() {
 
 /// Check: are the `cites` pairs equal to `derived_from` restricted to document→document?
 ///
-/// Positive graph: survey_2024 cites foundation_2010 (both document-kind);
-/// no derived_from edge exists.
-/// `cites` = {(survey_2024, foundation_2010)}, restricted derived_from = {}.
-/// Different → Passes.
+/// Positive graph: survey_2024 cites foundation_2010; survey_2024 also has a real
+/// derived_from edge to prior_survey_2023 (a document→document derivation, NOT a citation).
+/// restricted derived_from = {(survey_2024, prior_survey_2023)} — non-empty.
+/// cites = {(survey_2024, foundation_2010)} ≠ restricted derived_from → Passes non-vacuously:
+/// encoding citation as endpoint-restricted derived_from would yield the wrong pair set
+/// (prior_survey_2023 is the derivation source; foundation_2010 is the cited intellectual source).
 fn er_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
     let r = all_pairs(graph, "cites");
     let cheaper: BTreeSet<(String, String)> = graph
@@ -136,8 +138,12 @@ const ER: Fixture = Fixture {
     cheaper_encoding: "derived_from restricted to document-to-document pairs",
     graph: &[
         ("survey_2024", "cites", "foundation_2010"),
+        // Real doc→doc derived_from edge: survey was derived from a prior survey,
+        // but it CITES foundation_2010 as the intellectual source — different pairs.
+        ("survey_2024", "derived_from", "prior_survey_2023"),
         ("survey_2024", "kind", "document"),
         ("foundation_2010", "kind", "document"),
+        ("prior_survey_2023", "kind", "document"),
     ],
     query: "what does survey_2024 reference?",
     check: er_check,
@@ -203,9 +209,12 @@ fn er_doc_version_of_is_rejected_as_endpoint_restricted_precedes() {
 
 /// Check: are `cites` pairs equal to `introduced_by` ∩ `attr:role:citation`?
 ///
-/// Positive graph: tr_7 cites rfc_2119; concept_must introduced_by rfc_2119.
-/// `cites` = {(tr_7, rfc_2119)}, introduced_by ∩ attr:role:citation = {}.
-/// Different → Passes.
+/// Positive graph: tr_7 cites rfc_2119; concept_must introduced_by rfc_2119 AND
+/// concept_must attr:role:citation rfc_2119 (the attribute-qualified subset is non-empty).
+/// introduced_by ∩ attr:role:citation = {(concept_must, rfc_2119)} — non-empty.
+/// cites = {(tr_7, rfc_2119)} ≠ attr-qualified subset → Passes non-vacuously:
+/// encoding citations as attr-qualified introduced_by would mislabel concept_must→rfc_2119
+/// as a citation while missing the actual citation tr_7→rfc_2119 — different subjects.
 fn at_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
     let r = all_pairs(graph, "cites");
     let base = all_pairs(graph, "introduced_by");
@@ -229,7 +238,11 @@ const AT: Fixture = Fixture {
     cheaper_encoding: "introduced_by + metadata {role: 'citation'} on document-to-document pair",
     graph: &[
         ("tr_7", "cites", "rfc_2119"),
+        // concept_must was introduced_by rfc_2119 WITH a citation-role attribute — so the
+        // attr-qualified subset is non-empty: {(concept_must, rfc_2119)}.  This ≠ cites:
+        // introducing a concept and citing a document are different subjects and relations.
         ("concept_must", "introduced_by", "rfc_2119"),
+        ("concept_must", "attr:role:citation", "rfc_2119"),
     ],
     query: "what does tr_7 cite?",
     check: at_check,
@@ -286,8 +299,12 @@ fn at_strongly_supports_is_rejected_as_attribute_qualified_supports() {
 
 /// Check: do `cites` and `counter_cites` form a polarity partition of `supports`?
 ///
-/// Positive graph: paper_a cites paper_b (neutral reference, no counter_cites or supports).
-/// union = {(paper_a, paper_b)}, base (supports) = {}. union ≠ base → Passes.
+/// Positive graph: paper_a cites paper_b (neutral reference); paper_a also supports
+/// claim_c (polarity machinery is present and active — supports is non-empty).
+/// union (cites ∪ counter_cites) = {(paper_a, paper_b)}, base (supports) = {(paper_a, claim_c)}.
+/// union ≠ base → Passes non-vacuously: a citation is a neutral document reference that
+/// cannot be recovered as one polarity of the epistemic `supports` relation — citations
+/// and epistemic stances address different objects (documents vs. claims).
 fn po_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
     let r = all_pairs(graph, "cites");
     let opposite = all_pairs(graph, "counter_cites");
@@ -310,7 +327,13 @@ fn po_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
 const PO: Fixture = Fixture {
     eliminator: "Po",
     cheaper_encoding: "supports or refutes with a polarity attribute (assesses + polarity)",
-    graph: &[("paper_a", "cites", "paper_b")],
+    graph: &[
+        ("paper_a", "cites", "paper_b"),
+        // supports edge present and active — polarity machinery is non-empty.
+        // paper_a supports claim_c (a specific claim), while citing paper_b (the document).
+        // Partition union {(paper_a, paper_b)} ≠ supports {(paper_a, claim_c)}.
+        ("paper_a", "supports", "claim_c"),
+    ],
     query: "what is the epistemic stance of paper_a toward paper_b?",
     check: po_check,
 };
@@ -473,9 +496,13 @@ fn ch_builds_on_concept_from_is_rejected_as_property_chain() {
 
 /// Check: are `cites` pairs equal to the derived_from transitive closure from each source?
 ///
-/// Positive graph: thesis_2024 cites landmark_1972; no derived_from edges.
-/// `cites` = {(thesis_2024, landmark_1972)}, derived_from reachability = {}.
-/// Different → Passes.
+/// Positive graph: thesis_2024 cites landmark_1972; thesis_2024 also has a derived_from
+/// chain to interim_2020 and (transitively) base_2018 — reachability view is non-empty.
+/// cites = {(thesis_2024, landmark_1972)}, derived_from reachability from thesis_2024
+/// = {(thesis_2024, interim_2020), (thesis_2024, base_2018)} — non-empty.
+/// cites ≠ reachability → Passes non-vacuously: a citation is a direct reference to an
+/// intellectual source, not the transitive provenance chain of the citing document's own
+/// derivation — encoding citations as reachability would yield entirely wrong pairs.
 fn mv_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
     let r = all_pairs(graph, "cites");
     let sources: BTreeSet<String> = r.iter().map(|(s, _)| s.clone()).collect();
@@ -503,7 +530,14 @@ fn mv_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
 const MV: Fixture = Fixture {
     eliminator: "Mv",
     cheaper_encoding: "materialized reachability view over derived_from paths",
-    graph: &[("thesis_2024", "cites", "landmark_1972")],
+    graph: &[
+        ("thesis_2024", "cites", "landmark_1972"),
+        // Real derived_from chain: thesis derived from interim_2020, which derived from base_2018.
+        // Reachability from thesis_2024 = {interim_2020, base_2018} — non-empty.
+        // cites targets landmark_1972; reachability targets {interim_2020, base_2018}: wrong pairs.
+        ("thesis_2024", "derived_from", "interim_2020"),
+        ("interim_2020", "derived_from", "base_2018"),
+    ],
     query: "what is reachable from thesis_2024 via derived_from?",
     check: mv_check,
 };

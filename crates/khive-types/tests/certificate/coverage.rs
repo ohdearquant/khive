@@ -280,6 +280,53 @@ fn certified_relations_pass_full_certificate() {
     }
 }
 
+/// The set of relations with a `SurvivesAll` disposition equals exactly the 15 grandfathered
+/// base relations (ADR-002, grandfathered at ADR-076 adoption).
+///
+/// A non-grandfathered relation added to `SYSTEM_ROLE_EXCEPTIONS` with `SurvivesAll` would
+/// silently skip the certificate fixture path without any check running.  This assertion
+/// makes such an addition mechanically visible: any new `SurvivesAll` entry must appear in
+/// this closed list, which forces a reviewer to update the assertion rather than just appending
+/// a struct literal.  Non-grandfathered relations must go through the certificate admission
+/// path (CERTIFIED_RELATIONS) or declare `FailsEliminator` naming the eliminator and the
+/// system-role justification.
+#[test]
+fn survives_all_disposition_is_exactly_the_15_grandfathered_base_relations() {
+    const EXPECTED: &[&str] = &[
+        "annotates",
+        "competes_with",
+        "composed_with",
+        "contains",
+        "depends_on",
+        "derived_from",
+        "enables",
+        "extends",
+        "implements",
+        "instance_of",
+        "introduced_by",
+        "part_of",
+        "precedes",
+        "supersedes",
+        "variant_of",
+    ];
+
+    let mut actual: Vec<&str> = SYSTEM_ROLE_EXCEPTIONS
+        .iter()
+        .filter(|e| matches!(e.disposition, CertDisposition::SurvivesAll))
+        .map(|e| e.relation)
+        .collect();
+    actual.sort_unstable();
+
+    assert_eq!(
+        actual, EXPECTED,
+        "the set of relations with SurvivesAll disposition must equal exactly the 15 \
+         grandfathered ADR-002 base relations; adding a new SurvivesAll entry requires \
+         updating this closed list — non-grandfathered relations must go through the \
+         certificate admission path (CERTIFIED_RELATIONS) or declare FailsEliminator \
+         with a valid family code and a non-empty kept_because justification"
+    );
+}
+
 /// Every relation in EdgeRelation::ALL must appear in CERTIFIED_RELATIONS or
 /// SYSTEM_ROLE_EXCEPTIONS.
 ///

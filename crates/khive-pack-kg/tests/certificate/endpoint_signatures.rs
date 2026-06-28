@@ -117,6 +117,24 @@ fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_d3_ratified_co
     );
 }
 
+/// Guard: `D3_RATIFIED_COLLISIONS` is a closed list containing exactly the one ratified case.
+///
+/// Any append to this list to suppress a new collision is mechanically blocked — this
+/// equality assertion must be updated, which forces reviewer attention.  Resolve new
+/// collisions via the certificate admission path (CERTIFIED_RELATIONS in coverage.rs) or
+/// a `FailsEliminator` disposition in SYSTEM_ROLE_EXCEPTIONS — not by expanding this list.
+#[test]
+fn d3_ratified_collisions_is_exactly_refutes_supports() {
+    assert_eq!(
+        D3_RATIFIED_COLLISIONS,
+        &[("refutes", "supports")],
+        "D3_RATIFIED_COLLISIONS must contain exactly the one ADR-076 §D3 ratified case \
+         (\"refutes\", \"supports\"); silencing a new collision by appending here bypasses \
+         the Er-eliminator analysis gate — resolve via the certificate admission path or a \
+         FailsEliminator disposition in SYSTEM_ROLE_EXCEPTIONS instead"
+    );
+}
+
 /// The `supports`/`refutes` identical-signature collision is present and intentional.
 ///
 /// Documents the ADR-076 §D3 finding: `supports` and `refutes` share a base
