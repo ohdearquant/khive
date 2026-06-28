@@ -125,6 +125,9 @@ mod tests {
 
     /// Regression: the KG_EDGE_RULES array has exactly the expected relations.
     ///
+    /// This is a deliberate-change tripwire over the live KG_EDGE_RULES, complementing
+    /// the ADR-076 §D2 non-redundancy certificate in the certificate test suite.
+    ///
     /// A change to the set of relations that get pack-level endpoint extensions
     /// should be a deliberate, reviewed decision — not an accidental side effect.
     #[test]

@@ -1,15 +1,25 @@
-//! Endpoint-signature distinguishability audit using live rules.
+//! Endpoint-signature distinguishability audit — supplementary Er tripwire.
 //!
-//! ADR-076 §D2 requires that two distinct relations not share an identical
-//! endpoint-pair signature. This module builds signatures from the ACTUAL live
-//! base endpoint contract (`khive_runtime::operations::base_entity_endpoint_rules`)
-//! and the ACTUAL live KG pack rules (`<KgPack as Pack>::EDGE_RULES`). If either
-//! changes, this test immediately reflects the current state — no manual snapshot
-//! to keep in sync.
+//! This module is a SUPPLEMENTARY redundancy signal, not the Er-eliminator
+//! arbiter.  ADR-076 §D2's Er eliminator is defeated by a concrete fixture (a
+//! small graph + a query where the endpoint-restricted cheaper encoding gives a
+//! wrong answer).  Identical endpoint signatures are a SIGNAL that Er analysis
+//! is warranted — they are not proof of redundancy, because two relations may
+//! share a signature yet diverge in semantics for reasons a fixture can expose.
+//! `contains`/`part_of` (ADR-076 §D4) are the canonical example of distinct
+//! relations that happen to share endpoint pairs in some domains.
 //!
-//! Known exception (ADR-076 §D3): `supports` and `refutes` share an identical
-//! base endpoint signature. They are kept by declared system role (ADR-055),
-//! not by the certificate. The tests assert this is the ONLY exception.
+//! When this test flags a collision, the resolution is one of:
+//!   1. A passing Er fixture in the relation's certificate entry
+//!      (CERTIFIED_RELATIONS in coverage.rs), or
+//!   2. A declared system-role exception in SYSTEM_ROLE_EXCEPTIONS (coverage.rs)
+//!      with a `FailsEliminator` disposition naming the justification.
+//! Do NOT resolve a new collision by appending to D3_RATIFIED_COLLISIONS here —
+//! that list is closed to the ADR-076 §D3 ratified case only.
+//!
+//! Known ratified collision (ADR-076 §D3): `supports` and `refutes` share an
+//! identical base endpoint signature.  They are kept by declared system role
+//! (ADR-055).  This test asserts theirs is the ONLY ratified collision.
 
 use khive_pack_kg::KgPack;
 use khive_runtime::operations::base_entity_endpoint_rules;
@@ -42,16 +52,26 @@ fn signatures(triples: &[(String, String, String)]) -> Vec<(String, Vec<(String,
         .collect()
 }
 
-/// Identical endpoint signatures are a redundancy signal (ADR-076 §D2 Er eliminator).
+/// Signature collisions that are ratified by ADR-076 §D3 and require no further action.
 ///
-/// The ONLY permitted exception is the `supports`/`refutes` pair, which is kept
-/// by declared system role (ADR-055) per ADR-076 §D3. Any other pair of relations
-/// sharing a signature is an unaudited collision that must be resolved before new
-/// relations ship.
+/// This list is CLOSED.  It contains exactly the collisions that ADR-076 §D3
+/// explicitly records as "kept by system role despite failing the Po eliminator."
+/// A new collision discovered by the test below must NOT be resolved by appending
+/// here — resolve it via the certificate (CERTIFIED_RELATIONS) or a
+/// SYSTEM_ROLE_EXCEPTIONS entry with a FailsEliminator disposition (coverage.rs).
+const D3_RATIFIED_COLLISIONS: &[(&str, &str)] = &[("refutes", "supports")];
+
+/// Endpoint-signature collision tripwire (supplementary Er signal, ADR-076 §D2).
+///
+/// Flags any pair of distinct relations that share an identical (source, target)
+/// endpoint-pair set.  A collision is a redundancy SIGNAL that requires Er
+/// analysis — it is not proof of redundancy.  Resolve a new collision via the
+/// certificate admission path or a system-role exception in coverage.rs, not by
+/// expanding D3_RATIFIED_COLLISIONS.
 ///
 /// Uses the real live rules from khive-runtime and khive-pack-kg — not copies.
 #[test]
-fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_known_exceptions() {
+fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_d3_ratified_collisions() {
     // Collect live base entity endpoint rules from khive-runtime.
     let mut all_triples: Vec<(String, String, String)> = base_entity_endpoint_rules()
         .iter()
@@ -69,9 +89,6 @@ fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_known_exceptio
 
     let sigs = signatures(&all_triples);
 
-    // Pairs whose identical signature is ratified by ADR-076 §D3.
-    const KNOWN_EXCEPTIONS: &[(&str, &str)] = &[("refutes", "supports")];
-
     let mut collisions: Vec<(String, String)> = vec![];
     for i in 0..sigs.len() {
         for j in (i + 1)..sigs.len() {
@@ -81,7 +98,7 @@ fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_known_exceptio
                 let mut pair = [rel_a.as_str(), rel_b.as_str()];
                 pair.sort_unstable();
                 let normalised = (pair[0], pair[1]);
-                if !KNOWN_EXCEPTIONS.contains(&normalised) {
+                if !D3_RATIFIED_COLLISIONS.contains(&normalised) {
                     collisions.push((rel_a.clone(), rel_b.clone()));
                 }
             }
@@ -91,17 +108,20 @@ fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_known_exceptio
     assert!(
         collisions.is_empty(),
         "endpoint-signature collision(s) detected — two distinct relations share an \
-         identical (source, target) pair set, a redundancy signal under ADR-076 §D2 \
-         Er eliminator. Resolve each or add a ratified system-role exception to \
-         KNOWN_EXCEPTIONS:\n{collisions:#?}"
+         identical (source, target) pair set, an Er-eliminator signal per ADR-076 §D2. \
+         This test is a supplementary tripwire; resolve each collision via the \
+         ADR-076 admission paths: add a passing Er fixture to CERTIFIED_RELATIONS, or \
+         add a SystemRoleException with a FailsEliminator disposition in coverage.rs. \
+         Do NOT append to D3_RATIFIED_COLLISIONS — that list is closed to the \
+         ADR-076 §D3 ratified case only.\n{collisions:#?}"
     );
 }
 
-/// The `supports`/`refutes` identical-signature exception is present and intentional.
+/// The `supports`/`refutes` identical-signature collision is present and intentional.
 ///
 /// Documents the ADR-076 §D3 finding: `supports` and `refutes` share a base
-/// endpoint signature yet are kept by declared system role (ADR-055). This test
-/// asserts the exception is real — any future rule change that accidentally
+/// endpoint signature yet are kept by declared system role (ADR-055).  This test
+/// asserts the collision is real — any future rule change that accidentally
 /// eliminates the shared signature gets a failing snapshot to investigate.
 #[test]
 fn supports_refutes_have_identical_base_signatures_adr076_d3() {
