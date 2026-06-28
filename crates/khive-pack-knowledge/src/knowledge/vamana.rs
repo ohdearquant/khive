@@ -149,6 +149,14 @@ pub(crate) async fn wait_for_ann(
     }
 }
 
+/// Bounded wait for a background ANN warm to complete before a search degrades
+/// to FTS-only results. A valid-snapshot cold load on a large corpus can exceed
+/// the previous 3s; 5s covers the snapshot deserialize while still bounding the
+/// first post-restart query. On timeout the search degrades to FTS-only — it
+/// never errors (issue #322).
+pub(crate) const ANN_WARM_WAIT_TIMEOUT_MS: u64 = 5_000;
+pub(crate) const ANN_WARM_WAIT_POLL_MS: u64 = 50;
+
 impl AnnBridge {
     pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         if dim == 0 {
@@ -529,7 +537,19 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
+        let key = AnnKey::new(ns_str, model);
+        {
+            let mut warming = warming_guard(&ann.warming);
+            if warming.contains(&key) {
+                continue; // another path is already warming this key
+            }
+            warming.insert(key.clone());
+        }
         ensure_ann_for_model(rt, &token, ann, model).await;
+        let loaded = ann.indexes.read().await.contains_key(&key);
+        if !loaded {
+            warming_guard(&ann.warming).remove(&key);
+        }
     }
 }
 
@@ -895,6 +915,78 @@ mod tests {
         assert!(
             !is_warming_not_loaded(&ann, &key),
             "is_warming_not_loaded must not panic on poisoned Mutex"
+        );
+    }
+
+    // ── warm-path-unification (Change D) invariants ───────────────────────────
+
+    #[tokio::test]
+    async fn warm_path_key_in_warming_set_before_and_after_successful_load() {
+        // Verifies the warm-path-unification protocol introduced for warm_known_snapshots:
+        // (1) key is registered in warming BEFORE the load attempt,
+        // (2) after a successful load, key is in both warming AND indexes,
+        //     so is_warming_not_loaded returns false (warm complete, not in flight).
+        // (3) during (1)→(2), is_warming_not_loaded returns true — a concurrent query
+        //     that arrives mid-warm correctly identifies the in-flight state.
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-unify-model");
+
+        // Step 1: register key in warming (mirrors new warm_known_snapshots pre-warm step).
+        {
+            let mut warming = warming_guard(&ann.warming);
+            warming.insert(key.clone());
+        }
+        assert!(
+            is_warming_not_loaded(&ann, &key),
+            "key in warming but not indexes must report warming in flight"
+        );
+
+        // Step 2: simulate successful ensure_ann_for_model (bridge inserted into indexes).
+        let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build bridge for warm-path test");
+        insert_ann_if_absent(&ann, key.clone(), bridge).await;
+
+        // Step 3: key now in both warming and indexes → warm is complete, not in-flight.
+        assert!(
+            !is_warming_not_loaded(&ann, &key),
+            "key in both warming and indexes must not report warming in flight"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "index must be present after successful build"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_path_failed_load_removes_key_from_warming_set() {
+        // Verifies that when warm_known_snapshots fails to load an index (e.g. no corpus
+        // vectors), the key is removed from the warming set, allowing a later search
+        // to trigger a fresh load attempt.
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-unify-fail-model");
+
+        // Pre-warm step: insert key into warming (mirrors new warm_known_snapshots code).
+        warming_guard(&ann.warming).insert(key.clone());
+        assert!(
+            is_warming_not_loaded(&ann, &key),
+            "pre-condition: key must show as warming in flight"
+        );
+
+        // Load failed — no bridge inserted. Cleanup step removes key from warming.
+        let loaded = ann.indexes.read().await.contains_key(&key);
+        if !loaded {
+            warming_guard(&ann.warming).remove(&key);
+        }
+
+        // After cleanup, key is in neither set → is_warming_not_loaded = false.
+        // A subsequent search can now trigger a fresh load attempt.
+        assert!(
+            !is_warming_not_loaded(&ann, &key),
+            "after failed-load cleanup, warming must not show in-flight"
+        );
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "index must remain absent after failed load"
         );
     }
 }
