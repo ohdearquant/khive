@@ -346,33 +346,32 @@ step_release_gate() {
   local admin_id admin_login body
   admin_id="$(gh api user --jq .id)"
   admin_login="$(gh api user --jq .login)"
-  # Restrict which refs may deploy to the publish environment to `main` and `v*`
-  # release tags. This is the structural half of the workflow_dispatch hole fix:
-  # a manual release dispatched from an arbitrary feature branch cannot deploy
-  # here. (release.yml adds the matching workflow-level guard refusing manual
-  # dispatch from any ref but main.) custom_branch_policies=true means the named
-  # policies POSTed below are the allowlist.
+  # Restrict which refs may deploy to the publish environment to `main` ONLY.
+  # This is the structural half of the tag-publish hole fix (#222): release.yml
+  # publishes solely via workflow_dispatch from main (no push.tags trigger), and
+  # its workflow-level guard refuses manual dispatch from any ref but main. With
+  # the allowlist pinned to `main`, even an OLD `v*` tag whose checked-out
+  # release.yml predates the SemVer gate cannot deploy here — the publish job's
+  # environment ref (the tag) is not in the allowlist. custom_branch_policies=true
+  # means the named policy POSTed below is the allowlist.
   body="$(jq -n --argjson id "${admin_id}" \
     '{wait_timer:0, reviewers:[{type:"User", id:$id}], deployment_branch_policy:{protected_branches:false, custom_branch_policies:true}}')"
   if [[ "${DRY_RUN}" != "false" ]]; then
     echo "[DRY RUN] PUT repos/${REPO}/environments/${ENVIRONMENT} (required reviewer: ${admin_login}, id ${admin_id})"
     echo "${body}" | jq .
-    echo "[DRY RUN] POST deployment-branch-policies: tag 'v*', branch 'main'"
+    echo "[DRY RUN] POST deployment-branch-policies: branch 'main'"
   else
     echo "${body}" | gh api --method PUT "repos/${REPO}/environments/${ENVIRONMENT}" --input - >/dev/null
     # Define the ref allowlist. post_branch_policy is fatal on any non-duplicate
     # failure, so a dropped policy aborts the activation instead of silently
     # widening the allowlist.
-    post_branch_policy 'v*' 'tag'
     post_branch_policy 'main' 'branch'
-    # Read back and prove both policies are actually present before declaring success.
+    # Read back and prove the policy is actually present before declaring success.
     local policies
     policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies")"
     assert_branch_policy "${policies}" 'main' 'branch' \
       || { echo "ABORT: 'main' branch policy missing after apply." >&2; exit 1; }
-    assert_branch_policy "${policies}" 'v*' 'tag' \
-      || { echo "ABORT: 'v*' tag policy missing after apply." >&2; exit 1; }
-    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main, v* tags)."
+    echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main only)."
   fi
 }
 
@@ -412,12 +411,12 @@ preflight_autonomy() {
   fi
   local policies spec pname ptype
   policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" 2>/dev/null || echo '{}')"
-  for spec in "main:branch" "v*:tag"; do
+  for spec in "main:branch"; do
     pname="${spec%%:*}"; ptype="${spec##*:}"
     assert_branch_policy "${policies}" "${pname}" "${ptype}" \
       || { echo "ABORT: '${ENVIRONMENT}' missing deployment policy ${pname} (${ptype}) — run STEP=release-gate first." >&2; exit 1; }
   done
-  echo "Preflight OK: wall is up (all contexts required), release gate has ${reviewers} reviewer(s), ref allowlist = main + v* tags."
+  echo "Preflight OK: wall is up (all contexts required), release gate has ${reviewers} reviewer(s), ref allowlist = main only."
 }
 
 step_autonomy() {
