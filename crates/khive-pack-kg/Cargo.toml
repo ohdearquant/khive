@@ -33,6 +33,10 @@ khive-pack-formal = { version = "0.2.11", path = "../khive-pack-formal" }
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "certificate"
+path = "tests/certificate/main.rs"
+
 [[bench]]
 name = "kg_bench"
 harness = false
