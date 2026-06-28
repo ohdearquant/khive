@@ -47,6 +47,18 @@ pub struct CorpusFingerprint {
     pub dimensions: u32,
 }
 
+/// Persisted commit fingerprint readable without loading the graph or vectors.
+///
+/// Returned by [`read_commit_fingerprint`] for warm-path classification by
+/// callers that need to decide Hot/Stale/Cold without triggering a full graph
+/// restore or rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedFingerprint {
+    pub vector_count: u64,
+    pub dimensions: u64,
+    pub content_hash: [u8; 32],
+}
+
 /// Raw deserialization target for [`VamanaIndexSnapshot`].
 #[derive(Deserialize)]
 struct VamanaIndexSnapshotRaw {
@@ -2566,6 +2578,58 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     })
 }
 
+/// Read the v2 commit fingerprint from a persisted segment directory without
+/// loading the graph or vectors.
+///
+/// `path` is the segment directory; this function joins `metadata.bin`
+/// internally, matching the convention used by [`VamanaIndex::load`] and
+/// [`VamanaIndex::load_or_build`].
+///
+/// Returns `Ok(None)` when:
+/// - `path/metadata.bin` is absent (clean first run)
+/// - the record does not begin with the KHVVAMG2 magic (v1 format or
+///   unrelated file)
+/// - the record is too short or otherwise cannot be parsed (torn write)
+///
+/// In the `None` cases the caller should treat the segment as Cold and proceed
+/// to build. Returns `Err` only for unexpected IO failures (not `NotFound`).
+pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprint>> {
+    let metadata_path = path.join("metadata.bin");
+    let bytes = match fs::read(&metadata_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.len() < 8 || &bytes[..8] != V2_COMMIT_MAGIC {
+        return Ok(None);
+    }
+    match parse_v2_commit(&bytes) {
+        Ok(commit) => Ok(Some(PersistedFingerprint {
+            vector_count: commit.fingerprint.vector_count,
+            dimensions: commit.fingerprint.dimensions,
+            content_hash: commit.fingerprint.content_hash,
+        })),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Canonical content hash over a flat corpus slice.
+///
+/// This is identical to the hash stored by [`VamanaIndex::save_atomic`] in
+/// the v2 commit fingerprint and compared by [`VamanaIndex::load_or_build`]
+/// when deciding whether a persisted index matches the live corpus.
+///
+/// The hash is computed over the raw little-endian f32 bytes of `vectors` with
+/// no header or padding (matching [`write_vectors`] which stores exactly
+/// `cast_slice(vectors)`). It is order-sensitive: reordering vectors produces
+/// a different digest.
+///
+/// Callers must pass the same normalized, row-major flat vectors they pass (or
+/// would pass) to [`VamanaIndex::build`]. This function does not normalize.
+pub fn corpus_content_hash(vectors: &[f32]) -> [u8; 32] {
+    *blake3::hash(cast_slice(vectors)).as_bytes()
+}
+
 // INLINE TEST JUSTIFICATION: Tests in this module exercise private helpers
 // (`exact_search`, `write_metadata`, `read_metadata`, `write_graph`, `read_graph`,
 // `mmap_vectors`) and the internal `VectorStorage` enum that cannot be accessed
@@ -3967,5 +4031,77 @@ mod tests {
             "SQ8 RobustPrune must match f32 variant; got sq8={sq8_result:?} vs f32={f32_result:?} \
              — restoring `_sq8_d2` as predicate RHS makes this test RED"
         );
+    }
+
+    // ---- read_commit_fingerprint + corpus_content_hash tests ----
+
+    #[test]
+    fn read_commit_fingerprint_matches_save_atomic() {
+        // Build a small index from normalized vectors, save it, then verify
+        // that read_commit_fingerprint returns a fingerprint whose content_hash
+        // matches corpus_content_hash over the same input vectors.
+        let vectors = rand_unit_vectors(10, 4, 42);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        idx.save_atomic(dir.path()).unwrap();
+
+        let fp = read_commit_fingerprint(dir.path())
+            .expect("IO error")
+            .expect("expected Some fingerprint after save_atomic");
+
+        assert_eq!(fp.vector_count, 10u64, "vector_count mismatch");
+        assert_eq!(fp.dimensions, 4u64, "dimensions mismatch");
+        assert_eq!(
+            fp.content_hash,
+            corpus_content_hash(&vectors),
+            "content_hash must equal corpus_content_hash over the same normalized vectors"
+        );
+    }
+
+    #[test]
+    fn read_commit_fingerprint_absent_dir_returns_none() {
+        // A directory with no metadata.bin must return Ok(None), not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let result = read_commit_fingerprint(dir.path()).expect("unexpected IO error");
+        assert!(result.is_none(), "expected None for empty directory");
+    }
+
+    #[test]
+    fn read_commit_fingerprint_v1_magic_returns_none() {
+        // A metadata.bin with the v1 KHVVAMM1 magic (no v2 commit record) must
+        // return Ok(None) rather than an error.
+        let dir = tempfile::tempdir().unwrap();
+        // Write a metadata.bin whose first 8 bytes are the v1 magic (not KHVVAMG2).
+        let mut fake_meta = b"KHVVAMM1".to_vec();
+        // Pad to a plausible length so any length check doesn't short-circuit first.
+        fake_meta.extend_from_slice(&[0u8; 48]);
+        fs::write(dir.path().join("metadata.bin"), &fake_meta).unwrap();
+
+        let result = read_commit_fingerprint(dir.path()).expect("unexpected IO error");
+        assert!(result.is_none(), "expected None for v1 magic metadata.bin");
+    }
+
+    #[test]
+    fn corpus_content_hash_deterministic_and_order_sensitive() {
+        let vectors = rand_unit_vectors(8, 4, 77);
+
+        // Same input always produces the same digest.
+        let h1 = corpus_content_hash(&vectors);
+        let h2 = corpus_content_hash(&vectors);
+        assert_eq!(h1, h2, "corpus_content_hash must be deterministic");
+
+        // Reordering vectors (swap first and last row) must produce a different digest.
+        let dim = 4;
+        let mut reordered = vectors.clone();
+        let n = reordered.len() / dim;
+        // Swap row 0 and row n-1.
+        for d in 0..dim {
+            reordered.swap(d, (n - 1) * dim + d);
+        }
+        let h3 = corpus_content_hash(&reordered);
+        assert_ne!(h1, h3, "corpus_content_hash must be order-sensitive");
     }
 }
