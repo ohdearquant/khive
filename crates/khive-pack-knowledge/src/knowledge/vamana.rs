@@ -1596,4 +1596,49 @@ mod tests {
             "re-persisted segment must reflect the 5-row corpus (4 initial + 1 mutation)"
         );
     }
+
+    /// `warm_known_snapshots` must warm v2 segments even when the legacy
+    /// `retrieval_snapshots` table is absent (the v1 query errors). Pre-fix it
+    /// early-returned on that error and never reached the filesystem segment
+    /// enumeration, so v2-only databases never warmed at daemon startup.
+    #[tokio::test]
+    async fn warm_known_snapshots_v2_only_no_legacy_table() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        // Setup: build + persist v2 segments to data_dir/ann/<hex>/.
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "setup: first ensure must persist v2 segments"
+        );
+
+        // Force the worst case the fix targets: the v1 table is absent, so the
+        // legacy query errors. Pre-fix, that error aborted the whole warm pass.
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: "DROP TABLE IF EXISTS retrieval_snapshots".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("drop retrieval_snapshots");
+        }
+
+        // Cold cache + warm: the v2 filesystem enumeration must still warm the
+        // key despite the v1 query error.
+        let ann_fresh = new_shared();
+        warm_known_snapshots(&rt, &ann_fresh).await;
+        assert!(
+            ann_fresh.indexes.read().await.contains_key(&key),
+            "warm_known_snapshots must warm v2 segments when retrieval_snapshots is absent \
+             (regression: a v1 query error must not abort the v2 filesystem pass)"
+        );
+    }
 }
