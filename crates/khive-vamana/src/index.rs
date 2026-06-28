@@ -472,9 +472,21 @@ impl VamanaIndex {
         Ok(())
     }
 
-    /// Load an index from a directory previously written by [`VamanaIndex::save`].
+    /// Load an index from a directory previously written by [`VamanaIndex::save`]
+    /// (v1 format) or [`VamanaIndex::save_atomic`] (v2 segmented format).
+    ///
+    /// The format is detected from `metadata.bin`'s magic: a v2 commit takes the raw
+    /// segment path ([`Self::load_v2_raw`]); a legacy v1 metadata blob takes the path
+    /// below. Neither path rebuilds — a corrupt, torn, or absent index returns an error,
+    /// leaving the recovery decision to the caller (see [`Self::load_or_build`]).
     pub fn load(path: &Path) -> Result<Self> {
-        let meta = read_metadata(&path.join("metadata.bin"))?;
+        let metadata_path = path.join("metadata.bin");
+        let head = fs::read(&metadata_path)?;
+        if head.len() >= 8 && &head[..8] == V2_COMMIT_MAGIC {
+            return Self::load_v2_raw(path);
+        }
+
+        let meta = read_metadata(&metadata_path)?;
         let config = VamanaConfig {
             dimensions: meta.dimensions,
             max_degree: meta.max_degree,
@@ -833,6 +845,40 @@ impl VamanaIndex {
             index.save_atomic(path)?;
             Ok(index)
         }
+    }
+
+    /// Load a committed v2 index from `path` without a corpus and without rebuilding.
+    ///
+    /// Verifies the v2 commit magic, parses the commit record, reads and checksum-verifies
+    /// all three segments against the commit fingerprint, then restores the index (graph +
+    /// lifecycle) via [`Self::load_v2_fast`]. Returns an `InvalidFormat` error if `path`
+    /// holds no valid v2 commit — absent, v1-format, torn, checksum mismatch, or an
+    /// inconsistent lifecycle segment. Unlike [`Self::load_or_build`] it never rebuilds;
+    /// callers that hold a corpus decide whether to fall back. [`Self::load`] surfaces the
+    /// error directly.
+    fn load_v2_raw(path: &Path) -> Result<Self> {
+        let metadata_bytes = fs::read(path.join("metadata.bin"))?;
+        if metadata_bytes.len() < 8 || &metadata_bytes[..8] != V2_COMMIT_MAGIC {
+            return Err(VamanaError::invalid_format(
+                "metadata.bin is not a v2 commit".into(),
+            ));
+        }
+        let commit = parse_v2_commit(&metadata_bytes)?;
+
+        let vectors_data = fs::read(path.join("vectors.bin"))?;
+        let graph_data = fs::read(path.join("graph.bin"))?;
+        let lifecycle_data = fs::read(path.join("lifecycle.bin"))?;
+
+        if *blake3::hash(&vectors_data).as_bytes() != commit.vectors_hash
+            || *blake3::hash(&graph_data).as_bytes() != commit.graph_hash
+            || *blake3::hash(&lifecycle_data).as_bytes() != commit.lifecycle_hash
+        {
+            return Err(VamanaError::invalid_format(
+                "v2 segment checksum mismatch".into(),
+            ));
+        }
+
+        Self::load_v2_fast(path, &lifecycle_data)
     }
 
     /// Load all v2 segments from `path` and restore lifecycle state from `lifecycle_data`.
@@ -4103,5 +4149,95 @@ mod tests {
         }
         let h3 = corpus_content_hash(&reordered);
         assert_ne!(h1, h3, "corpus_content_hash must be order-sensitive");
+    }
+
+    // ---- VamanaIndex::load v2-aware dispatch (load_v2_raw) tests ----
+
+    #[test]
+    fn load_reads_v2_segments_after_save_atomic() {
+        // load() must detect the v2 commit magic and raw-load the segments with no
+        // corpus and no rebuild, preserving search results.
+        let vectors = rand_unit_vectors(40, 8, 21);
+        let cfg = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let original = VamanaIndex::build(&vectors, cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        original.save_atomic(dir.path()).unwrap();
+
+        let loaded = VamanaIndex::load(dir.path()).expect("load must read v2 segments");
+        assert_eq!(loaded.num_vectors(), original.num_vectors());
+
+        let query = rand_unit_vectors(1, 8, 321);
+        assert_eq!(
+            original.search(&query, 5).unwrap(),
+            loaded.search(&query, 5).unwrap(),
+            "v2 raw load must preserve search results"
+        );
+    }
+
+    #[test]
+    fn load_v2_matches_load_or_build_fast_path() {
+        // The raw load() path and load_or_build()'s fast path must agree when the
+        // corpus matches the committed segments.
+        let vectors = rand_unit_vectors(30, 8, 55);
+        let cfg = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let original = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        original.save_atomic(dir.path()).unwrap();
+
+        let via_load = VamanaIndex::load(dir.path()).unwrap();
+        let via_lob = VamanaIndex::load_or_build(dir.path(), &vectors, cfg).unwrap();
+
+        let query = rand_unit_vectors(1, 8, 999);
+        assert_eq!(
+            via_load.search(&query, 5).unwrap(),
+            via_lob.search(&query, 5).unwrap(),
+            "raw load and load_or_build fast path must produce identical results"
+        );
+    }
+
+    #[test]
+    fn load_v2_rejects_torn_segment() {
+        // A checksum mismatch on any segment must error (load never rebuilds).
+        let vectors = rand_unit_vectors(20, 4, 8);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        idx.save_atomic(dir.path()).unwrap();
+
+        // Flip one body byte of graph.bin; segment length is unchanged so only the
+        // blake3 checksum gate can catch it.
+        let mut gdata = fs::read(dir.path().join("graph.bin")).unwrap();
+        gdata[8] ^= 0xFF;
+        fs::write(dir.path().join("graph.bin"), &gdata).unwrap();
+
+        assert!(matches!(
+            VamanaIndex::load(dir.path()),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn load_v2_rejects_missing_segment() {
+        // A v2 commit whose backing segment is gone must error, not rebuild.
+        let vectors = rand_unit_vectors(20, 4, 9);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        idx.save_atomic(dir.path()).unwrap();
+
+        fs::remove_file(dir.path().join("lifecycle.bin")).unwrap();
+        assert!(
+            VamanaIndex::load(dir.path()).is_err(),
+            "load must fail when a v2 segment is missing"
+        );
     }
 }
