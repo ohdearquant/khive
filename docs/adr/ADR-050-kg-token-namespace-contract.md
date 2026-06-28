@@ -91,7 +91,7 @@ divergent namespace contracts and leaks routing policy into pack construction.
 The existing behavior continues to force all KG entity/edge writes into
 `RuntimeConfig::default_namespace` regardless of the dispatched token. Rejected because:
 
-- It violates authenticated tenant namespaces, causing cross-tenant bleed.
+- It violates per-actor namespace attribution, causing cross-actor namespace bleed.
 - It contradicts ADR-007's own explicit-namespace rule (`ADR-007:389`).
 - It places policy inside the pack rather than at the authenticated dispatch boundary.
 
@@ -215,7 +215,7 @@ the caller token under ADR-050."
 
 **Benefits**:
 
-- Eliminates cross-tenant bleed in multi-tenant deployments.
+- Eliminates cross-actor namespace bleed in multi-actor deployments.
 - Aligns KG pack with the typed `NamespaceToken` contract established at the registry boundary.
 - Reduces pack coupling (hidden `RuntimeConfig` dependency removed).
 - Unblocks explicit-namespace callers to use the namespace they specify.

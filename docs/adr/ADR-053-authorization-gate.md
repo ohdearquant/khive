@@ -128,6 +128,7 @@ handing off to `VerbRegistry::dispatch`:
 transport (MCP stdio / HTTP)
   -> auth      ActorStore::resolve(token) -> ActorRef     (who is calling)
   -> session   SessionStore::resolve(token) -> ActorRef   (for connection-oriented transports)
+  -> accounting  record the operation for usage tracking  (no-op in embedded deployments)
   -> gate      Gate::check(&gate_req)                     (via VerbRegistry::dispatch, unchanged)
   -> dispatch  pack handler                               (record-level namespace check still applies)
 ```
@@ -200,9 +201,10 @@ resolved identity through. Both pieces are required.
 ### 4. TenantGate — multi-actor deployments
 
 An operator-supplied `TenantGate` (a custom crate behind the Apache-2.0 `Gate` trait) uses the
-resolved `ActorRef` to enforce per-verb ACLs. Because it implements the existing `Gate` trait
-with its existing `check(&self, req: &GateRequest) -> Result<GateDecision, GateError>`
-signature, swapping `AllowAllGate` for `TenantGate` changes no pack and no handler.
+resolved `ActorRef` to enforce per-verb ACLs and feed the usage accounting stage. Because it
+implements the existing `Gate` trait with its existing
+`check(&self, req: &GateRequest) -> Result<GateDecision, GateError>` signature, swapping
+`AllowAllGate` for `TenantGate` changes no pack and no handler.
 
 ### Invariants (unchanged from ADR-018)
 

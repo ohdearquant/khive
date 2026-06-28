@@ -175,20 +175,20 @@ RuVector provides techniques the internal stack does not have. Each becomes a fo
 adapter pack that wires the RuVector primitive into a khive verb. None are required for
 default operation.
 
-| Capability                                | Source                           | Default |
-| ----------------------------------------- | -------------------------------- | ------- |
-| HNSW vector index                         | khive-retrieval (verified)       | yes     |
-| BM25 keyword index                        | khive-retrieval (verified)       | yes     |
-| RRF / Weighted / Union fusion             | khive-retrieval (verified)       | yes     |
-| Distance kernels (AVX-512 VNNI, NEON)     | `lattice-embed::simd`            | yes     |
-| Quantization tiering (Hot/Warm/Cold)      | `lattice-embed::simd::tier`      | yes     |
-| HNSW checkpoint + persistence             | khive-retrieval                  | yes     |
-| Graph-aware retrieval                     | khive-retrieval                  | yes     |
-| ColBERT multi-vector late interaction     | RuVector adapter pack (deferred) | no      |
-| Matryoshka adaptive-dimension retrieval   | RuVector adapter pack (deferred) | no      |
-| Conformal prediction (uncertainty bounds) | RuVector adapter pack (deferred) | no      |
-| Spectral coherence metrics                | RuVector adapter pack (deferred) | no      |
-| DiskANN out-of-core (large-scale deployments) | RuVector adapter pack (deferred) | no  |
+| Capability                                    | Source                           | Default |
+| --------------------------------------------- | -------------------------------- | ------- |
+| HNSW vector index                             | khive-retrieval (verified)       | yes     |
+| BM25 keyword index                            | khive-retrieval (verified)       | yes     |
+| RRF / Weighted / Union fusion                 | khive-retrieval (verified)       | yes     |
+| Distance kernels (AVX-512 VNNI, NEON)         | `lattice-embed::simd`            | yes     |
+| Quantization tiering (Hot/Warm/Cold)          | `lattice-embed::simd::tier`      | yes     |
+| HNSW checkpoint + persistence                 | khive-retrieval                  | yes     |
+| Graph-aware retrieval                         | khive-retrieval                  | yes     |
+| ColBERT multi-vector late interaction         | RuVector adapter pack (deferred) | no      |
+| Matryoshka adaptive-dimension retrieval       | RuVector adapter pack (deferred) | no      |
+| Conformal prediction (uncertainty bounds)     | RuVector adapter pack (deferred) | no      |
+| Spectral coherence metrics                    | RuVector adapter pack (deferred) | no      |
+| DiskANN out-of-core (large-scale deployments) | RuVector adapter pack (deferred) | no      |
 
 Adapter packs are deferred until a concrete verb-surface use case justifies one. The
 default install does not depend on RuVector.
@@ -237,9 +237,9 @@ Two reasons, each sufficient on its own:
 1. **Correctness assurance.** Determinism, complexity bounds, and ranking properties are
    machine-checked. A retrieval system you can prove things about is qualitatively
    different from one you can only test.
-2. **Market differentiation.** No production vector database — Pinecone, Qdrant,
+2. **Verifiable correctness.** No production vector database — Pinecone, Qdrant,
    Weaviate, pgvector, RuVector — ships formal proofs of its core algorithms. khive
-   does. This is observable in technical due diligence.
+   does. This is a verifiable, concrete property of the implementation.
 
 ### Why RuVector at all
 

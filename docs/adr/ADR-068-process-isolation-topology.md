@@ -367,7 +367,7 @@ the row level.
   recall at 1M vectors on production workloads).
 
 Postgres is the correct path when the RAM cost of simultaneously warm Vamana indexes exceeds
-the available aggregate RAM. Operators should monitor per-process RSS and plan migration accordingly.
+the available aggregate RAM. The normative trigger formula is defined in the Consequences section below.
 
 ### Shared-process with gate-based auth-context threading
 
@@ -411,6 +411,35 @@ another (namespace not authenticated by the transport) without reducing implemen
    have been assigned the actor's label or quarantined before process launch.
 6. Process startup exit code is zero (strict-mode check passed).
 
+### Memory and ANN warm-state
+
+Each actor process carries one warm Vamana index (ADR-049 daemon model). RAM consumption
+scales linearly with the number of simultaneously warm processes. For actors with large
+knowledge corpora, the index restore cost (ADR-049 §"cold start") applies once at process
+launch, not per-request. Idle actors with no active process incur no RAM cost.
+
+### Postgres trigger (normative)
+
+The Postgres migration path activates when the following condition is met in production metrics:
+
+```
+active_warm_processes * p95_rss_per_warm_vamana_index > fleet_ram_budget * 0.70
+```
+
+where:
+
+- `active_warm_processes`: count of actor processes with a loaded Vamana index, measured from
+  process-level RSS metrics in the fleet monitoring system.
+- `p95_rss_per_warm_vamana_index`: the 95th-percentile per-process RSS increment attributable
+  to a warm Vamana index, measured by comparing RSS of idle-process and index-loaded-process
+  samples over a rolling 7-day window.
+- `fleet_ram_budget`: total available fleet RAM as reported by the infrastructure provider.
+- `0.70`: safety factor (30% headroom). Adjust only via an ADR amendment.
+
+Decision owner: lambda:khive. Review artifact: a filed ADR amendment with the measured metric
+values, a 7-day trend chart, and a proposed migration timeline. No Postgres migration may begin
+without that artifact.
+
 ### WAL and write concurrency
 
 Per-actor SQLite files give each actor an independent write mutex and independent WAL
@@ -419,7 +448,7 @@ Cross-actor write parallelism is free because writes go to independent files.
 
 ### Migration path to Postgres
 
-When per-process RAM cost becomes a constraint:
+When the Postgres trigger fires:
 
 1. Build `crates/khive-db-postgres` implementing all eight storage traits.
 2. Migrate `KhiveRuntime` away from `Arc<StorageBackend>` to a trait-object backend handle
@@ -441,14 +470,15 @@ per-actor SQLite files remain readable as an archival export format.
 
 ## Consequences summary
 
-| Aspect                   | v1 (this ADR)                             | Future (Postgres path)                        |
-| ------------------------ | ----------------------------------------- | --------------------------------------------- |
-| Isolation                | Physical: separate process + file         | Logical: RLS + TenantGate                     |
-| Actor threading to gate  | Not required                              | Required (ADR-018 amendment)                  |
-| AllowAllGate suitability | Appropriate (one actor per process)       | Footgun; TenantGate required                  |
-| #199 resolution          | Enforced by mandatory strict-mode startup | TenantGate enforces inbox scope               |
-| #199 legacy EqOrMissing  | No-op on fresh actor DBs; migration step  | Strict equality filter + quarantine pass      |
-| #200 resolution          | Enforced by mandatory strict-mode startup | Correct attribution from auth layer           |
-| #13 status               | Not required for v1                       | Requires full ADR-018 amendment               |
-| RAM cost                 | Linear with warm actor processes          | Constant (pgvector, no in-process ANN)        |
-| Implementation cost      | Low: supervisor config + strict-mode PR   | High: new crate, runtime API migration, DDL   |
+| Aspect                   | v1 (this ADR)                             | Future (Postgres path)                          |
+| ------------------------ | ----------------------------------------- | ----------------------------------------------- |
+| Isolation                | Physical: separate process + file         | Logical: RLS + TenantGate                       |
+| Actor threading to gate  | Not required                              | Required (ADR-018 amendment)                    |
+| AllowAllGate suitability | Appropriate (one actor per process)       | Footgun; TenantGate required                    |
+| #199 resolution          | Enforced by mandatory strict-mode startup | TenantGate enforces inbox scope                 |
+| #199 legacy EqOrMissing  | No-op on fresh actor DBs; migration step  | Strict equality filter + quarantine pass        |
+| #200 resolution          | Enforced by mandatory strict-mode startup | Correct attribution from auth layer             |
+| #13 status               | Not required for v1                       | Requires full ADR-018 amendment                 |
+| RAM cost                 | Linear with warm actor processes          | Constant (pgvector, no in-process ANN)          |
+| Implementation cost      | Low: supervisor config + strict-mode PR   | High: new crate, runtime API migration, DDL     |
+| Postgres trigger         | N/A                                       | active_warm_processes * p95_rss > budget * 0.70 |

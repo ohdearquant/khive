@@ -471,16 +471,16 @@ standard `delete(id)` path.
 
 ## Alternatives Considered
 
-| Alternative                                      | Why rejected                                                                                                                                               |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Embed comm in GTD (`message` as a task variant)  | Conflates communication with task lifecycle; `inbox` semantics are mailbox-oriented, not GTD-lifecycle-oriented; pollutes the GTD verb set                 |
-| Use `event` as the schedule note kind            | Terminology collision with substrate `Event` observable (ADR-004); confuses pack-level API readers                                                         |
-| Real-time comm delivery via pubsub               | Hard infrastructure dependency in the binary; incompatible with single-process deployment; agent-scale interaction does not require sub-second delivery    |
-| In-process trigger loop in the schedule pack     | Couples pack to runtime threading model; prevents use in single-turn call mode; execution environment varies                                               |
-| Declarative pack format (ADR-023) for both packs | Both packs require verb handlers with business logic; declarative format applies to vocabulary-only packs                                                  |
-| Single combined `commsched` pack                 | Domain cohesion: communication and scheduling are independent concerns; callers that need only comm pay no schedule cost                                   |
-| `schedule` payloads run with elevated privileges | Privilege escalation via stored payload; auth gate must apply at dispatch time with the creator's credentials                                              |
-| Auxiliary tables for message indexing in v1      | FTS5 + partial expression index on `properties` fields is sufficient at personal/agent scale; auxiliary tables deferred until benchmarked need             |
+| Alternative                                      | Why rejected                                                                                                                                            |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Embed comm in GTD (`message` as a task variant)  | Conflates communication with task lifecycle; `inbox` semantics are mailbox-oriented, not GTD-lifecycle-oriented; pollutes the GTD verb set              |
+| Use `event` as the schedule note kind            | Terminology collision with substrate `Event` observable (ADR-004); confuses pack-level API readers                                                      |
+| Real-time comm delivery via pubsub               | Hard infrastructure dependency in the binary; incompatible with single-process deployment; agent-scale interaction does not require sub-second delivery |
+| In-process trigger loop in the schedule pack     | Couples pack to runtime threading model; prevents use in single-turn call mode; execution environment varies                                            |
+| Declarative pack format (ADR-023) for both packs | Both packs require verb handlers with business logic; declarative format applies to vocabulary-only packs                                               |
+| Single combined `commsched` pack                 | Domain cohesion: communication and scheduling are independent concerns; callers that need only comm pay no schedule cost                                |
+| `schedule` payloads run with elevated privileges | Privilege escalation via stored payload; auth gate must apply at dispatch time with the creator's credentials                                           |
+| Auxiliary tables for message indexing in v1      | FTS5 + partial expression index on `properties` fields is sufficient at personal/agent scale; auxiliary tables deferred until benchmarked need          |
 
 ## Consequences
 

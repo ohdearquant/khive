@@ -13,12 +13,11 @@
 ### Deployment model (scope boundary)
 
 The deployment model addressed here is: one process serves one actor or a small set of
-cooperating agents sharing a single database file. Each actor's database is a separate file
-with a separate connection pool and a separate writer Mutex. The wedge described below is
-therefore contained to a single process: multiple concurrent agents sharing one daemon process
-and one pool. This ADR solves "one process, N concurrent agents, no wedge" and does not
-address multi-process coordination (that is the per-process topology concern, addressed in
-ADR-068).
+cooperating agents sharing a single database file. That process has one connection pool and one
+writer Mutex. The wedge described below is therefore contained to a single process: multiple
+concurrent agents sharing one daemon process and one pool. This ADR solves
+"one process, N concurrent agents, no wedge" and does not address multi-process coordination
+(that is the per-process topology concern, addressed in ADR-068).
 
 ### The WAL-starvation wedge
 
@@ -552,10 +551,10 @@ Postgres transaction semantics (`SET TRANSACTION ISOLATION LEVEL`), `tsvector`-b
 `TextSearch`, and `pgvector`-backed `VectorStore`.
 
 This is the measure-first escape hatch: if the write-queue redesign (this ADR) plus the WAL
-checkpoint discipline (Slice 1) do not achieve the throughput target under realistic tenant
+checkpoint discipline (Slice 1) do not achieve the throughput target under realistic concurrent
 load, the Postgres backend is the next escalation point. It is deferred because it is a
 multi-week effort (estimated 3 to 5 weeks for a feature-complete backend) and the per-process
-tenant topology already eliminates the cross-tenant scaling problem that Postgres would
+isolation topology already eliminates the cross-process scaling problem that Postgres would
 primarily solve.
 
 ### Alternative 4: Serialize at the HTTP gateway layer

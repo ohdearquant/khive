@@ -260,7 +260,7 @@ part of the federated commit identity. `KgArchive` remains a clean single-backen
 ### Why GitHub for social (not khive-native)?
 
 Building fork/PR/review/CI infrastructure is years of work. GitHub already provides it.
-khive's competitive advantage is semantic understanding of graph changes, not a
+khive's contribution is semantic understanding of graph changes, not a
 collaboration platform. Semantic enrichment (diff visualization, conflict explanation,
 validation reports) adds value on top of GitHub without replacing it.
 
