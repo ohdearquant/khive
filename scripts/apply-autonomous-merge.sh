@@ -337,7 +337,10 @@ assert_branch_policy() {
 # wider than `main`.
 prune_non_main_branch_policies() {
   local existing pid pname ptype
-  existing="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" 2>/dev/null || echo '{}')"
+  # per_page=100 (the API max) so realistic allowlists fetch in one page. The
+  # endpoint is paginated; anything beyond 100 is caught fail-closed by the
+  # callers' authoritative total_count==1 assertion after this prune runs.
+  existing="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies?per_page=100" 2>/dev/null || echo '{}')"
   while IFS=$'\t' read -r pid pname ptype; do
     [[ -z "${pid}" ]] && continue
     if [[ "${pname}" == "main" && ( "${ptype}" == "branch" || "${ptype}" == "null" ) ]]; then
@@ -396,10 +399,13 @@ step_release_gate() {
     # Read back and prove `main` is present AND is the ONLY policy before declaring
     # success — a lingering non-main row (e.g. `v*`) would keep the hole open.
     local policies policy_count
-    policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies")"
+    policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies?per_page=100")"
     assert_branch_policy "${policies}" 'main' 'branch' \
       || { echo "ABORT: 'main' branch policy missing after apply." >&2; exit 1; }
-    policy_count="$(jq -r '[.branch_policies[]?] | length' <<<"${policies}")"
+    # Count via the API's authoritative total_count: the endpoint is paginated, so a
+    # page-local array length could read 1 while a non-main row hides on a later page.
+    # total_count spans every page; fall back to the array length only if it is absent.
+    policy_count="$(jq -r '.total_count // ([.branch_policies[]?] | length)' <<<"${policies}")"
     [[ "${policy_count}" == "1" ]] \
       || { echo "ABORT: publish allowlist has ${policy_count} policies after apply, expected exactly 1 (main:branch); a non-main ref can still deploy." >&2; exit 1; }
     echo "Environment '${ENVIRONMENT}' configured (required reviewer: ${admin_login}; refs: main only)."
@@ -441,7 +447,7 @@ preflight_autonomy() {
     exit 1
   fi
   local policies spec pname ptype
-  policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies" 2>/dev/null || echo '{}')"
+  policies="$(gh api "repos/${REPO}/environments/${ENVIRONMENT}/deployment-branch-policies?per_page=100" 2>/dev/null || echo '{}')"
   for spec in "main:branch"; do
     pname="${spec%%:*}"; ptype="${spec##*:}"
     assert_branch_policy "${policies}" "${pname}" "${ptype}" \
@@ -449,9 +455,11 @@ preflight_autonomy() {
   done
   # `main` present is necessary but not sufficient: a lingering non-main row (e.g.
   # a `v*` tag from an older setup) would still let a tag deploy. Require the
-  # allowlist to be EXACTLY main:branch — fail closed otherwise (#222).
+  # allowlist to be EXACTLY main:branch — fail closed otherwise (#222). The endpoint
+  # is paginated, so count via the authoritative total_count (a page-local array
+  # length could read 1 while a non-main row hides on a later page).
   local policy_count
-  policy_count="$(jq -r '[.branch_policies[]?] | length' <<<"${policies}")"
+  policy_count="$(jq -r '.total_count // ([.branch_policies[]?] | length)' <<<"${policies}")"
   if [[ "${policy_count}" != "1" ]]; then
     echo "ABORT: '${ENVIRONMENT}' allowlist has ${policy_count} policies, expected exactly main:branch — a non-main ref (e.g. a v* tag) can still deploy. Run STEP=release-gate (FORCE=true) to prune." >&2
     exit 1
