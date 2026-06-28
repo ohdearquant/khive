@@ -143,17 +143,17 @@ The gate-defining path routing in section 3 documents this risk and the structur
 
 Merging to `main` is not a release. Publishing is a separate step, gated on human approval.
 
-`release.yml` triggers on a `v*` tag push and on `workflow_dispatch`. It builds platform
-binaries and publishes the npm packages; the crates.io library publish is the separate
+`release.yml` triggers only on `workflow_dispatch` (the `v*` tag-push trigger was removed in
+#222). It builds platform binaries and publishes the npm packages; the crates.io library publish is the separate
 `scripts/publish.sh` (`make publish`) path. The npm publish job (`publish-all`) runs in a GitHub
 **Environment** named `publish`. That environment carries a **required reviewer** protection
 rule listing the maintainer. GitHub pauses the workflow at every job targeting `publish` and
 waits for an authorized reviewer to approve the deployment before any publish step executes.
 
-This means: an automated or accidental tag push reaches the publish step only after a human
-explicitly approves the deployment in the GitHub UI. The environment gate is enforced by GitHub
-natively, not by workflow logic. Even if `release.yml` is modified in a PR, the modification
-does not take effect on `main` until the PR merges and a human cuts a release tag, at which
+This means: any dispatch that reaches the publish step does so only after a human explicitly
+approves the deployment in the GitHub UI. The environment gate is enforced by GitHub natively,
+not by workflow logic. Even if `release.yml` is modified in a PR, the modification does not take
+effect until the PR merges to `main` and a maintainer dispatches a release from `main`, at which
 point the environment gate intercepts the publish job.
 
 The npm token is scoped to the `publish` environment's secrets and is not accessible to any job
@@ -163,21 +163,21 @@ trunk delivery and npm publication. The crates.io library publish does not run i
 token, so reaching crates.io already requires a human with publish rights invoking the command by
 hand — no CI path, autonomous or otherwise, holds a crates.io token.
 
-`release.yml` also accepts `workflow_dispatch` for manual releases. The workflow refuses a manual
-dispatch from any ref other than `main`, so a dispatched release always runs `main`'s current
-SemVer gate. A `v*` tag push runs that tag's own checked-out workflow: a tag cut from a gated
-commit — the normal case, since releases are cut from `main` HEAD — carries the gate, but a tag
-deliberately cut at a pre-gate commit would run an ungated workflow. The `publish` environment's
-deployment-branch policy restricts deployments to `main` and `v*` tags, which blocks dispatch from
-arbitrary branches but does not by itself prove a `v*` tag points at a gated commit.
+`workflow_dispatch` from `main` is the sole publish trigger. The workflow refuses a dispatch from
+any ref other than `main`, so every dispatched release runs `main`'s current SemVer gate. Tag
+pushes no longer trigger the workflow at all (the `push: tags: v*` trigger was removed in #222),
+closing the prior gap where a tag deliberately cut at a pre-gate commit could run an ungated
+workflow. The `publish` environment's deployment-branch policy is pinned to `main` only: the apply
+step prunes any non-`main` policy and asserts the allowlist contains exactly one entry (`main`), so
+no other ref can deploy.
 
 The universal backstop for every publish path is therefore the `publish` environment's required
 reviewer (above): no npm version reaches the registry without a human approving that specific
 deployment. The SemVer gate is automated defense-in-depth layered on top of that human gate, not a
 replacement for it. The autonomous-merge safety invariant — _nothing publishes without human
-approval_ — holds on every path. Closing the old-tag SemVer gap structurally (making
-`main`-dispatch the only publish trigger) is tracked as a follow-up, not required for the
-invariant.
+approval_ — holds on every path. The old-tag SemVer gap is now closed structurally:
+`main`-dispatch is the only publish trigger (#222), so both the human required-reviewer gate and
+the automated SemVer gate run on `main`'s current workflow for every release.
 
 The release path also enforces API-surface stability — the relocation of the former per-PR SemVer
 check. `release.yml` runs a `SemVer gate (release)` job (pinned `cargo-semver-checks`) that
