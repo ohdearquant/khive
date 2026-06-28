@@ -411,6 +411,14 @@ another (namespace not authenticated by the transport) without reducing implemen
    have been assigned the actor's label or quarantined before process launch.
 6. Process startup exit code is zero (strict-mode check passed).
 
+### Process lifecycle (normative, supervisor runtime obligation)
+
+Beyond the startup checklist, the supervisor monitors each isolated actor process's health for
+the lifetime of the process and restarts any process that crashes. Process isolation makes a
+crash actor-local: one actor process failing does not affect any other actor's process or data.
+On restart, the supervisor reuses the same `(KHIVE_ACTOR, KHIVE_DB)` pair and re-runs the startup
+checklist before returning the process to service.
+
 ### Memory and ANN warm-state
 
 Each actor process carries one warm Vamana index (ADR-049 daemon model). RAM consumption
