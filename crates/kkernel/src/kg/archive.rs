@@ -41,6 +41,7 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
         db_path: Some(args.db.clone()),
         default_namespace: ns.clone(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..Default::default()
     };
     let runtime = KhiveRuntime::new(config)?;
@@ -85,6 +86,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         db_path: Some(args.db.clone()),
         default_namespace: ns.clone(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..Default::default()
     };
     let runtime = KhiveRuntime::new(config)?;
