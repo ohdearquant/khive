@@ -3951,3 +3951,226 @@ async fn feedback_accepts_short_prefix_target_id() {
     assert_eq!(result["emitted"], json!(true), "emitted must be true");
     assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
 }
+
+// ── brain.assign_adapter_slot tests ──────────────────────────────────────────
+
+/// Register a fake adapter entity in the DB the same way brain.register_adapter would.
+async fn register_adapter_entity(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    adapter_id: &str,
+    content_hash: &str,
+) {
+    rt.create_entity(
+        token,
+        "artifact",
+        Some("adapter"),
+        adapter_id,
+        None,
+        Some(json!({"content_hash": content_hash, "base_model_revision": "base-v1"})),
+        vec![],
+    )
+    .await
+    .expect("register adapter entity");
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_happy_path() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    register_adapter_entity(&rt, &token, "lora-A", "hash-abc").await;
+
+    let result = pack
+        .dispatch(
+            "brain.assign_adapter_slot",
+            json!({"profile_id": "p1", "adapter_id": "lora-A", "slot": 0}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("assign_adapter_slot must succeed");
+
+    assert_eq!(result["assigned"], json!(true));
+    assert_eq!(result["profile_id"], json!("p1"));
+    assert_eq!(result["adapter_id"], json!("lora-A"));
+    assert_eq!(result["slot"], json!(0));
+
+    // Verify the record is present in state with the looked-up content_hash.
+    let state = pack.state.lock().unwrap();
+    let entries = state
+        .adapter_set
+        .get("p1")
+        .expect("profile p1 must have entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].adapter_id, "lora-A");
+    assert_eq!(entries[0].slot, 0);
+    assert_eq!(entries[0].content_hash, "hash-abc");
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_rejects_slot_out_of_bounds() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    register_adapter_entity(&rt, &token, "lora-B", "hash-def").await;
+
+    let err = pack
+        .dispatch(
+            "brain.assign_adapter_slot",
+            json!({"profile_id": "p1", "adapter_id": "lora-B", "slot": 4}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap_err();
+
+    if let RuntimeError::InvalidInput(msg) = &err {
+        assert!(
+            msg.contains("out of range") || msg.contains("ADAPTER_SLOTS"),
+            "expected slot bound message, got: {msg}"
+        );
+    } else {
+        panic!("expected InvalidInput, got {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_rejects_unregistered_adapter() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    // No entity created — adapter is not registered.
+    let err = pack
+        .dispatch(
+            "brain.assign_adapter_slot",
+            json!({"profile_id": "p1", "adapter_id": "ghost-adapter", "slot": 1}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap_err();
+
+    if let RuntimeError::InvalidInput(msg) = &err {
+        assert!(
+            msg.contains("not registered") || msg.contains("ghost-adapter"),
+            "expected not-registered message, got: {msg}"
+        );
+    } else {
+        panic!("expected InvalidInput, got {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_collision_replace() {
+    // Slot reuse by a different adapter evicts the old occupant.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    register_adapter_entity(&rt, &token, "lora-X", "hash-x").await;
+    register_adapter_entity(&rt, &token, "lora-Y", "hash-y").await;
+
+    // Assign lora-X to slot 2.
+    pack.dispatch(
+        "brain.assign_adapter_slot",
+        json!({"profile_id": "p1", "adapter_id": "lora-X", "slot": 2}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("first assign must succeed");
+
+    // Reassign slot 2 to lora-Y — should evict lora-X.
+    pack.dispatch(
+        "brain.assign_adapter_slot",
+        json!({"profile_id": "p1", "adapter_id": "lora-Y", "slot": 2}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("replace assign must succeed");
+
+    let state = pack.state.lock().unwrap();
+    let entries = state.adapter_set.get("p1").expect("must have entries");
+    assert_eq!(entries.len(), 1, "only one record per slot");
+    assert_eq!(entries[0].adapter_id, "lora-Y");
+    assert_eq!(entries[0].slot, 2);
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_collision_move() {
+    // Same adapter reassigned to a new slot; no duplicate record.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    register_adapter_entity(&rt, &token, "lora-M", "hash-m").await;
+
+    // Assign lora-M to slot 0.
+    pack.dispatch(
+        "brain.assign_adapter_slot",
+        json!({"profile_id": "p1", "adapter_id": "lora-M", "slot": 0}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("initial assign must succeed");
+
+    // Move lora-M to slot 3.
+    pack.dispatch(
+        "brain.assign_adapter_slot",
+        json!({"profile_id": "p1", "adapter_id": "lora-M", "slot": 3}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("move assign must succeed");
+
+    let state = pack.state.lock().unwrap();
+    let entries = state.adapter_set.get("p1").expect("must have entries");
+    assert_eq!(entries.len(), 1, "no duplicate after move");
+    assert_eq!(entries[0].adapter_id, "lora-M");
+    assert_eq!(entries[0].slot, 3, "adapter must now be at slot 3");
+}
+
+#[tokio::test]
+async fn test_assign_adapter_slot_collision_idempotent() {
+    // Exact (profile_id, adapter_id, slot) match is a no-op.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    register_adapter_entity(&rt, &token, "lora-I", "hash-i").await;
+
+    // Assign once.
+    pack.dispatch(
+        "brain.assign_adapter_slot",
+        json!({"profile_id": "p1", "adapter_id": "lora-I", "slot": 1}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("first assign must succeed");
+
+    // Assign again with identical params — idempotent.
+    let result = pack
+        .dispatch(
+            "brain.assign_adapter_slot",
+            json!({"profile_id": "p1", "adapter_id": "lora-I", "slot": 1}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("idempotent assign must not error");
+
+    assert_eq!(result["assigned"], json!(true));
+
+    let state = pack.state.lock().unwrap();
+    let entries = state.adapter_set.get("p1").expect("must have entries");
+    assert_eq!(entries.len(), 1, "no duplicate on idempotent call");
+    assert_eq!(entries[0].slot, 1);
+}

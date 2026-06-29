@@ -13,15 +13,22 @@ use khive_runtime::{
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
+use khive_storage::EntityFilter;
 use khive_types::HandlerDef;
 
 use crate::event::interpret;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 use khive_brain_core::{
-    ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
-    DEFAULT_ESS_CAP,
+    AdapterRecord, ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState,
+    SectionType, DEFAULT_ESS_CAP,
 };
+
+// ── Adapter slot bound ────────────────────────────────────────────────────────
+
+/// Number of adapter slots available per profile.
+/// Must equal the lattice-router gate width.
+const ADAPTER_SLOTS: u32 = 4;
 
 // ── Handler table ─────────────────────────────────────────────────────────────
 
@@ -357,6 +364,32 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "object",
                 required: false,
                 description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "brain.assign_adapter_slot",
+        description: "Assign a registered adapter to a gate output slot in a profile",
+        visibility: khive_types::Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            khive_types::ParamDef {
+                name: "profile_id",
+                param_type: "string",
+                required: true,
+                description: "Profile ID to update.",
+            },
+            khive_types::ParamDef {
+                name: "adapter_id",
+                param_type: "string",
+                required: true,
+                description: "Adapter identifier (must be registered via brain.register_adapter).",
+            },
+            khive_types::ParamDef {
+                name: "slot",
+                param_type: "integer",
+                required: true,
+                description: "Gate output slot index. Must be < 4 (= ADAPTER_SLOTS).",
             },
         ],
     },
@@ -1348,6 +1381,111 @@ impl BrainPack {
             "description": description,
         }))
     }
+
+    // ── brain.assign_adapter_slot ─────────────────────────────────────────
+
+    pub(crate) async fn handle_assign_adapter_slot(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AssignAdapterSlotParams {
+            profile_id: String,
+            adapter_id: String,
+            slot: u32,
+        }
+        let p: AssignAdapterSlotParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        // Validate slot bound.
+        if p.slot >= ADAPTER_SLOTS {
+            return Err(RuntimeError::InvalidInput(format!(
+                "slot {} is out of range; must be < {} (ADAPTER_SLOTS)",
+                p.slot, ADAPTER_SLOTS,
+            )));
+        }
+
+        // Look up the registered adapter entity persisted by brain.register_adapter.
+        // Adapter entities: kind=artifact, entity_type=adapter, name=adapter_id.
+        let filter = EntityFilter {
+            kinds: vec!["artifact".to_owned()],
+            entity_types: vec!["adapter".to_owned()],
+            name_prefix: Some(p.adapter_id.clone()),
+            ..Default::default()
+        };
+        let page = self
+            .runtime
+            .entities(token)?
+            .query_entities(
+                token.namespace().as_str(),
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await?;
+        let adapter_entity = page
+            .items
+            .into_iter()
+            .find(|e| e.name == p.adapter_id)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "adapter {:?} is not registered; call brain.register_adapter first",
+                    p.adapter_id
+                ))
+            })?;
+        let content_hash = adapter_entity
+            .properties
+            .as_ref()
+            .and_then(|props| props.get("content_hash"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "adapter {:?} entity is missing content_hash property",
+                    p.adapter_id
+                ))
+            })?
+            .to_owned();
+
+        // Apply collision semantics on adapter_set[profile_id].
+        // Invariant: at most one record per slot and per adapter_id within a profile.
+        let mut state = self.state.lock().unwrap();
+        let entries = state.adapter_set.entry(p.profile_id.clone()).or_default();
+
+        // Idempotent: exact (adapter_id, slot) already present.
+        if entries
+            .iter()
+            .any(|r| r.adapter_id == p.adapter_id && r.slot == p.slot)
+        {
+            return Ok(json!({
+                "assigned": true,
+                "profile_id": p.profile_id,
+                "adapter_id": p.adapter_id,
+                "slot": p.slot,
+            }));
+        }
+
+        // Evict any existing occupant of the target slot.
+        entries.retain(|r| r.slot != p.slot);
+        // Move: remove the same adapter from any prior slot.
+        entries.retain(|r| r.adapter_id != p.adapter_id);
+        // Insert the new record.
+        entries.push(AdapterRecord {
+            adapter_id: p.adapter_id.clone(),
+            slot: p.slot,
+            content_hash,
+        });
+
+        Ok(json!({
+            "assigned": true,
+            "profile_id": p.profile_id,
+            "adapter_id": p.adapter_id,
+            "slot": p.slot,
+        }))
+    }
 }
 
 // ── brain.auto_feedback helpers ───────────────────────────────────────────────
@@ -1492,6 +1630,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.bind" => self.handle_bind(params).await,
             "brain.unbind" => self.handle_unbind(params).await,
             "brain.create_profile" => self.handle_create_profile(params).await,
+            "brain.assign_adapter_slot" => self.handle_assign_adapter_slot(token, params).await,
             // Legacy
             "brain.emit" => self.handle_emit(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
