@@ -612,6 +612,8 @@ mod tests {
     fn isolated_server(db_path: &str) -> KhiveMcpServer {
         let cfg = RuntimeConfig {
             db_path: Some(PathBuf::from(db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
