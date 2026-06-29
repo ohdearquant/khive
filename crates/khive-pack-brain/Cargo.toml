@@ -18,11 +18,15 @@ khive-fold = { version = "0.2.11", path = "../khive-fold" }
 khive-storage = { version = "0.2.11", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
+lattice-fann = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+lattice-router = ["dep:lattice-fann"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

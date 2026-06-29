@@ -918,6 +918,12 @@ impl BrainPack {
 
         {
             let signal = interpret(&event);
+            #[cfg(feature = "lattice-router")]
+            {
+                let context = build_context_vector();
+                let routed = route_via_fann(&context);
+                eprintln!("[brain] lattice-router routed weights: {routed:?}");
+            }
             let mut state = self.state.lock().unwrap();
             let serving_profile = serving_profile_owned.as_str();
 
@@ -1350,6 +1356,48 @@ impl BrainPack {
     }
 }
 
+// ── lattice-router seam (#345 M1) ────────────────────────────────────────────
+
+/// Context-vector dimension for the lattice-fann router seam (#345 M1).
+/// DIM = BalancedRecallState (3 posteriors x {mean, ess} = 6)
+///     + SectionPosteriorState (10 posterior means = 10) = 16.
+/// M1 placeholder: returns a fixed zero vector; real feature extraction is M2.
+#[cfg(feature = "lattice-router")]
+const ROUTER_CONTEXT_DIM: usize = 16;
+
+#[cfg(feature = "lattice-router")]
+fn build_context_vector() -> [f32; ROUTER_CONTEXT_DIM] {
+    [0.0; ROUTER_CONTEXT_DIM]
+}
+
+/// M1 seam: links lattice-fann and produces routed mixture weights.
+/// The real engine `route(context_vector, available_adapters)` (lattice mixture-runtime,
+/// #343) swaps in here when shipped; M1 proves the dependency links and the seam runs.
+#[cfg(feature = "lattice-router")]
+fn route_via_fann(context: &[f32]) -> Vec<f32> {
+    use lattice_fann::{Activation, NetworkBuilder};
+    const ADAPTER_SLOTS: usize = 4;
+    let mut network = match NetworkBuilder::new()
+        .input(ROUTER_CONTEXT_DIM)
+        .hidden(8, Activation::ReLU)
+        .output(ADAPTER_SLOTS, Activation::Softmax)
+        .build()
+    {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[brain] lattice-router: network build failed (non-fatal): {e}");
+            return Vec::new();
+        }
+    };
+    match network.forward(context) {
+        Ok(weights) => weights.to_vec(),
+        Err(e) => {
+            eprintln!("[brain] lattice-router: forward failed (non-fatal): {e}");
+            Vec::new()
+        }
+    }
+}
+
 // ── brain.auto_feedback helpers ───────────────────────────────────────────────
 
 /// Resolve an `id` from `memory.recall` output to a full UUID.
@@ -1498,5 +1546,22 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
                 "brain pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+#[cfg(all(test, feature = "lattice-router"))]
+mod router_tests {
+    use super::*;
+
+    #[test]
+    fn route_via_fann_emits_normalized_mixture() {
+        let ctx = build_context_vector();
+        let weights = route_via_fann(&ctx);
+        assert_eq!(weights.len(), 4);
+        let sum: f32 = weights.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "softmax weights must sum to ~1, got {sum}"
+        );
     }
 }
