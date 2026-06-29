@@ -18,6 +18,8 @@ use khive_types::HandlerDef;
 use crate::event::interpret;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
+#[cfg(feature = "lattice-router")]
+use khive_brain_core::BetaPosterior;
 use khive_brain_core::{
     ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
     DEFAULT_ESS_CAP,
@@ -916,14 +918,22 @@ impl BrainPack {
             .unwrap_or("balanced-recall-v1")
             .to_string();
 
+        // Posteriors snapshotted while the lock is held; routing runs after the lock drops
+        // so the mutex scope is not widened across fann inference.
+        // Declared uninitialized: definitely assigned inside the lock scope below (in
+        // the feature-on build the cfg block always executes, so the compiler can verify
+        // definite initialization without a dead initial-value assignment).
+        #[cfg(feature = "lattice-router")]
+        #[allow(clippy::type_complexity)]
+        let router_inputs: Option<(
+            BetaPosterior,
+            BetaPosterior,
+            BetaPosterior,
+            Option<std::collections::HashMap<SectionType, BetaPosterior>>,
+        )>;
+
         {
             let signal = interpret(&event);
-            #[cfg(feature = "lattice-router")]
-            {
-                let context = build_context_vector();
-                let routed = route_via_fann(&context);
-                eprintln!("[brain] lattice-router routed weights: {routed:?}");
-            }
             let mut state = self.state.lock().unwrap();
             let serving_profile = serving_profile_owned.as_str();
 
@@ -950,6 +960,46 @@ impl BrainPack {
             if let Some(section_state) = state.section_states.get_mut(serving_profile) {
                 section_state.apply_signal(&signal);
             }
+
+            // Snapshot posteriors for lattice-router while the lock is still held.
+            // BetaPosterior is two f64s — cloning is cheap.
+            #[cfg(feature = "lattice-router")]
+            {
+                let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
+                    (
+                        state.balanced_recall.relevance.clone(),
+                        state.balanced_recall.salience.clone(),
+                        state.balanced_recall.temporal.clone(),
+                    )
+                } else if let Some(ps) = state.profile_states.get(serving_profile) {
+                    (
+                        ps.relevance.clone(),
+                        ps.salience.clone(),
+                        ps.temporal.clone(),
+                    )
+                } else {
+                    (
+                        state.balanced_recall.relevance.clone(),
+                        state.balanced_recall.salience.clone(),
+                        state.balanced_recall.temporal.clone(),
+                    )
+                };
+                let sec = state
+                    .section_states
+                    .get(serving_profile)
+                    .map(|ss| ss.posteriors.clone());
+                router_inputs = Some((rel, sal, temp, sec));
+            }
+        }
+
+        // lattice-router: build the context vector from snapshotted posteriors and forward
+        // through the fann network. Lock is already released here.
+        // Consumption of routed weights lands with the engine route() seam (#343) and the
+        // compose value-gate (#346); no per-event stdout/stderr spam.
+        #[cfg(feature = "lattice-router")]
+        if let Some((rel, sal, temp, sec)) = router_inputs {
+            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
+            let _routed = route_via_fann(&ctx);
         }
 
         // Persist feedback to brain_event_log; batch-upsert snapshot when dirty threshold reached.
@@ -1356,18 +1406,53 @@ impl BrainPack {
     }
 }
 
-// ── lattice-router seam (#345 M1) ────────────────────────────────────────────
+// ── lattice-router seam (#345 M1 / #352 M2) ──────────────────────────────────
 
-/// Context-vector dimension for the lattice-fann router seam (#345 M1).
-/// DIM = BalancedRecallState (3 posteriors x {mean, ess} = 6)
-///     + SectionPosteriorState (10 posterior means = 10) = 16.
-/// M1 placeholder: returns a fixed zero vector; real feature extraction is M2.
+/// Context-vector dimension for the lattice-fann router seam.
+/// Layout:
+///   [0..2]  = relevance  {mean, ess}
+///   [2..4]  = salience   {mean, ess}
+///   [4..6]  = temporal   {mean, ess}
+///   [6..16] = 10 section posterior means in `SectionType::all()` order
 #[cfg(feature = "lattice-router")]
 const ROUTER_CONTEXT_DIM: usize = 16;
 
+/// Build a 16-element context vector from live brain posteriors.
+///
+/// ESS values are stored as raw f32 casts.  Normalization is deferred to the
+/// engine `route()` seam (#343) once the network is trained; documenting the
+/// omission here so it is not forgotten.
+///
+/// When `sections` is `None` the 10 section slots are filled from
+/// `SectionPosteriorState::default_priors()` means — deterministically neutral,
+/// never arbitrary zeros.
 #[cfg(feature = "lattice-router")]
-fn build_context_vector() -> [f32; ROUTER_CONTEXT_DIM] {
-    [0.0; ROUTER_CONTEXT_DIM]
+fn build_context_vector(
+    relevance: &BetaPosterior,
+    salience: &BetaPosterior,
+    temporal: &BetaPosterior,
+    sections: Option<&std::collections::HashMap<SectionType, BetaPosterior>>,
+) -> [f32; ROUTER_CONTEXT_DIM] {
+    let mut v = [0.0f32; ROUTER_CONTEXT_DIM];
+    v[0] = relevance.mean() as f32;
+    v[1] = relevance.effective_sample_size() as f32;
+    v[2] = salience.mean() as f32;
+    v[3] = salience.effective_sample_size() as f32;
+    v[4] = temporal.mean() as f32;
+    v[5] = temporal.effective_sample_size() as f32;
+    // Section slots: deterministic ordering via SectionType::all().
+    let default_priors;
+    let posteriors: &std::collections::HashMap<SectionType, BetaPosterior> = match sections {
+        Some(map) => map,
+        None => {
+            default_priors = SectionPosteriorState::default_priors();
+            &default_priors
+        }
+    };
+    for (i, st) in SectionType::all().iter().enumerate() {
+        v[6 + i] = posteriors.get(st).map_or(0.5, |p| p.mean()) as f32;
+    }
+    v
 }
 
 /// M1 seam: links lattice-fann and produces routed mixture weights.
@@ -1555,7 +1640,10 @@ mod router_tests {
 
     #[test]
     fn route_via_fann_emits_normalized_mixture() {
-        let ctx = build_context_vector();
+        let rel = BetaPosterior::new(7.0, 3.0);
+        let sal = BetaPosterior::new(2.0, 8.0);
+        let temp = BetaPosterior::new(1.0, 9.0);
+        let ctx = build_context_vector(&rel, &sal, &temp, None);
         let weights = route_via_fann(&ctx);
         assert_eq!(weights.len(), 4);
         let sum: f32 = weights.iter().sum();
@@ -1563,5 +1651,61 @@ mod router_tests {
             (sum - 1.0).abs() < 1e-3,
             "softmax weights must sum to ~1, got {sum}"
         );
+    }
+
+    #[test]
+    fn context_vector_reflects_posterior_state() {
+        // High-relevance state.
+        let rel_high = BetaPosterior::new(90.0, 10.0);
+        let sal = BetaPosterior::new(2.0, 8.0);
+        let temp = BetaPosterior::new(1.0, 9.0);
+        let v_high = build_context_vector(&rel_high, &sal, &temp, None);
+
+        // Low-relevance state.
+        let rel_low = BetaPosterior::new(1.0, 9.0);
+        let v_low = build_context_vector(&rel_low, &sal, &temp, None);
+
+        // Vectors must differ.
+        assert_ne!(
+            v_high, v_low,
+            "context vectors must differ for different posteriors"
+        );
+
+        // Dimension must be 16.
+        assert_eq!(v_high.len(), ROUTER_CONTEXT_DIM);
+        assert_eq!(v_low.len(), ROUTER_CONTEXT_DIM);
+
+        // Slot 0 = relevance mean; slot 1 = relevance ESS — verify they mirror the input.
+        assert!(
+            (v_high[0] - rel_high.mean() as f32).abs() < 1e-5,
+            "slot 0 must equal relevance mean (high); got {}",
+            v_high[0]
+        );
+        assert!(
+            (v_high[1] - rel_high.effective_sample_size() as f32).abs() < 1e-5,
+            "slot 1 must equal relevance ESS; got {}",
+            v_high[1]
+        );
+        assert!(
+            (v_low[0] - rel_low.mean() as f32).abs() < 1e-5,
+            "slot 0 must equal relevance mean (low); got {}",
+            v_low[0]
+        );
+
+        // Slot 0 must differ substantially between high and low states.
+        assert!(
+            (v_high[0] - v_low[0]).abs() > 0.5,
+            "relevance mean slot must differ by >0.5; high={} low={}",
+            v_high[0],
+            v_low[0]
+        );
+
+        // Section slots [6..16] filled from default priors when sections=None — never zero.
+        for (i, &val) in v_high.iter().enumerate().skip(6) {
+            assert!(
+                val > 0.0,
+                "section slot {i} must be non-zero (default priors); got {val}",
+            );
+        }
     }
 }
