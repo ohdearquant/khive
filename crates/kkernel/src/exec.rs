@@ -444,6 +444,9 @@ async fn run_exec_inline_with_forward(
             probe_only: false,
             format: output_format.clone(),
             format_per_op: None,
+            // `kkernel exec` is a trusted operator surface: subhandler verbs are
+            // allowed. Only the agent-facing MCP `request` tool sets this true.
+            from_wire: false,
         };
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
