@@ -63,20 +63,26 @@ async fn pack_metadata_matches_trait_consts() {
     let rt = file_rt(dir.path().join("meta.db"));
     let registry = build_registry(rt);
 
-    let verbs: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
-    assert!(
-        verbs.contains(&"session.store"),
-        "session.store not in verbs"
-    );
-    assert!(verbs.contains(&"session.list"), "session.list not in verbs");
-    assert!(
-        verbs.contains(&"session.resume"),
-        "session.resume not in verbs"
-    );
-    assert!(
-        verbs.contains(&"session.export"),
-        "session.export not in verbs"
-    );
+    // The four session verbs are registered as internal subhandlers, not on
+    // the agent-facing MCP surface, so they are absent from all_verbs() (which
+    // is Visibility::Verb only) but report true from is_subhandler_verb and
+    // remain dispatchable through the runtime registry directly.
+    let surface: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
+    for verb in [
+        "session.store",
+        "session.list",
+        "session.get",
+        "session.export",
+    ] {
+        assert!(
+            !surface.contains(&verb),
+            "{verb} must NOT be on the agent-facing verb surface (subhandler)"
+        );
+        assert!(
+            registry.is_subhandler_verb(verb),
+            "{verb} must be registered as an internal subhandler"
+        );
+    }
 
     assert!(
         registry.all_note_kinds().contains(&"session"),
@@ -364,7 +370,7 @@ async fn list_offset_pagination() {
     );
 }
 
-// ── session.resume tests ──────────────────────────────────────────────────────
+// ── session.get tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn resume_returns_full_record() {
@@ -376,7 +382,7 @@ async fn resume_returns_full_record() {
     let id = stored["id"].as_str().expect("id present").to_string();
 
     let resumed = registry
-        .dispatch("session.resume", json!({"id": id}))
+        .dispatch("session.get", json!({"id": id}))
         .await
         .expect("resume ok");
 
@@ -394,7 +400,7 @@ async fn resume_not_found_returns_error() {
 
     let err = registry
         .dispatch(
-            "session.resume",
+            "session.get",
             json!({"id": "00000000-0000-0000-0000-000000000001"}),
         )
         .await;
@@ -408,7 +414,7 @@ async fn resume_invalid_uuid_returns_error() {
     let registry = build_registry(rt);
 
     let err = registry
-        .dispatch("session.resume", json!({"id": "not-a-uuid"}))
+        .dispatch("session.get", json!({"id": "not-a-uuid"}))
         .await;
     assert!(err.is_err(), "invalid UUID must return error");
 }
@@ -430,7 +436,7 @@ async fn resume_soft_deleted_returns_error() {
         .await
         .expect("soft-delete ok");
 
-    let err = registry.dispatch("session.resume", json!({"id": id})).await;
+    let err = registry.dispatch("session.get", json!({"id": id})).await;
     assert!(
         err.is_err(),
         "resume of a soft-deleted session must return an error"

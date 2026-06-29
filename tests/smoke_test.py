@@ -192,12 +192,17 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads all 7 production packs, so verbs() returns exactly 67
-        # user-facing MCP-callable verbs (count what verbs() returns, not internal
-        # dispatch arms). Update this number when the pack set or verb surface
-        # changes; a silent drift here is the bug this assertion exists to catch.
+        # unset) loads 8 production packs (kg, gtd, memory, brain, comm, schedule,
+        # knowledge, session), so verbs() returns exactly 67 user-facing
+        # MCP-callable verbs (count what verbs() returns, not internal dispatch
+        # arms). The session pack is loaded for the background daemon mirror but
+        # contributes 0 agent-facing verbs — its four handlers are internal
+        # subhandlers (Visibility::Subhandler), excluded from the verbs() surface.
+        # Update this number when the pack set or verb surface changes; a silent
+        # drift here is the bug this assertion exists to catch.
         assert verbs_result["total"] == 67, (
-            f"expected 67 user-facing verbs from the 7 default packs, "
+            f"expected 67 user-facing verbs from the 8 default packs "
+            f"(session contributes 0 — its verbs are internal subhandlers), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

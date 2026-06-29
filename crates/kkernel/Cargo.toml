@@ -27,6 +27,7 @@ khive-pack-comm = { version = "0.2.11", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.2.11", path = "../khive-pack-schedule" }
 khive-pack-formal = { version = "0.2.11", path = "../khive-pack-formal" }
 khive-pack-knowledge = { version = "0.2.11", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.2.11", path = "../khive-pack-session" }
 khive-request = { version = "0.2.11", path = "../khive-request" }
 tokio = { workspace = true }
 async-trait = { workspace = true }

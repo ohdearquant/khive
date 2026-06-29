@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
 use crate::{handlers, SessionPack, SESSION_HANDLERS};
@@ -55,6 +55,24 @@ impl PackRuntime for SessionPack {
 
     fn requires(&self) -> &'static [&'static str] {
         <SessionPack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "session",
+            statements: &crate::SESSION_SCHEMA_PLAN_STMTS,
+        }
+    }
+
+    async fn warm(&self) {
+        let config = crate::mirror::MirrorConfig::from_env();
+        if !config.enabled {
+            return;
+        }
+        let runtime = self.runtime().clone();
+        tokio::spawn(async move {
+            crate::mirror::run_mirror_service(runtime, config).await;
+        });
     }
 
     async fn dispatch(
