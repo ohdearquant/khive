@@ -4,7 +4,7 @@ check:
 	cd crates && cargo check --workspace
 
 clippy:
-	cd crates && cargo clippy --workspace -- -D warnings
+	cd crates && cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 test:
 	cd crates && cargo test --workspace

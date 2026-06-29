@@ -1014,7 +1014,7 @@ mod tests {
 
         // At least 2 buckets (today and yesterday within 7 days).
         assert!(
-            rates.len() >= 1,
+            !rates.is_empty(),
             "expected at least 1 day bucket, got {:?}",
             rates
         );
