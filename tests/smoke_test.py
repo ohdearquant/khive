@@ -193,16 +193,16 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 8 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session), so verbs() returns exactly 67 user-facing
+        # knowledge, session), so verbs() returns exactly 68 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack is loaded for the background daemon mirror but
         # contributes 0 agent-facing verbs — its three handlers (store/list/get)
         # are internal subhandlers (Visibility::Subhandler), excluded from the
-        # verbs() surface.
+        # verbs() surface; brain.register_adapter (#354) adds the 68th.
         # Update this number when the pack set or verb surface changes; a silent
         # drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 67, (
-            f"expected 67 user-facing verbs from the 8 default packs "
+        assert verbs_result["total"] == 68, (
+            f"expected 68 user-facing verbs from the 8 default packs "
             f"(session contributes 0 — its verbs are internal subhandlers), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
