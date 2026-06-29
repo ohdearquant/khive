@@ -15,3 +15,6 @@ mod sections;
 pub(crate) mod sections_index;
 pub(crate) mod util;
 pub(crate) struct KnowledgeHandlers;
+
+#[cfg(test)]
+mod ann_degrade_tests;

@@ -1028,6 +1028,7 @@ impl KnowledgeHandlers {
         // Trigger background warm — never block search on the ANN rebuild.
         vamana::ensure_ann_background(runtime, token, ann);
 
+        let mut ann_unavailable = false;
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             let ann_k = fetch_limit.max(20);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
@@ -1037,23 +1038,28 @@ impl KnowledgeHandlers {
             // cold-start race where the ANN is loading and the first query silently
             // returns ok:true,total:0 when FTS also finds nothing.
             //
-            // Test coverage note: the warming-Err branch here is exercised by the
-            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
-            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
-            // test is not feasible from the external tests/ directory because
-            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
-            // requires internal access.  The integration tests in tests/fixes.rs
-            // cover the non-warming hot-path and the empty-corpus guard instead.
+            // Test coverage note: the warming-Err branch here is exercised by
+            // both the mechanism-unit tests in vamana::tests and the handler-level
+            // degrade regression tests in knowledge::ann_degrade_tests.  The handler
+            // tests call this function directly with a pre-warmed SharedAnn, using
+            // the pub(crate) seams simulate_warming_in_flight and
+            // set_warm_wait_timeout_override_ms (50 ms override avoids a 5 s stall
+            // in CI while still exercising every line in the degrade branch).
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
-                const WARM_TIMEOUT_MS: u64 = 3_000;
-                const WARM_POLL_MS: u64 = 50;
-                if vamana::wait_for_ann(ann, &key, WARM_TIMEOUT_MS, WARM_POLL_MS).await {
+                if vamana::wait_for_ann(
+                    ann,
+                    &key,
+                    vamana::warm_wait_timeout_ms(),
+                    vamana::ANN_WARM_WAIT_POLL_MS,
+                )
+                .await
+                {
                     ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
                 } else {
                     // Still not ready: if FTS already found results, those are
-                    // valid partial hits — return them.  Only surface the warming
-                    // error when FTS is also empty and the corpus is non-empty.
+                    // valid partial hits — return them.  Only set ann_unavailable
+                    // when FTS is also empty and the corpus is non-empty (issue #322).
                     if hits.is_empty() {
                         let model = runtime.default_embedder_name();
                         let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
@@ -1061,10 +1067,7 @@ impl KnowledgeHandlers {
                             .map(|fp| fp.vector_count > 0)
                             .unwrap_or(false);
                         if corpus_non_empty {
-                            return Err(RuntimeError::Internal(
-                                "ANN index is warming after daemon restart — retry in a few seconds"
-                                    .into(),
-                            ));
+                            ann_unavailable = true;
                         }
                     }
                 }
@@ -1111,7 +1114,11 @@ impl KnowledgeHandlers {
             .collect();
         let count = results.len();
 
-        Ok(json!({ "results": results, "total": count }))
+        let mut out = json!({ "results": results, "total": count });
+        if ann_unavailable {
+            out["ann_unavailable"] = json!(true);
+        }
+        Ok(out)
     }
 
     pub(crate) async fn suggest(
@@ -1155,6 +1162,7 @@ impl KnowledgeHandlers {
         let mut hits = search_core(&ctx, &raw_query).await?;
 
         vamana::ensure_ann_background(runtime, token, ann);
+        let mut ann_unavailable = false;
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
             // limit*3 would return mostly atoms that all get dropped after type filtering.
@@ -1168,25 +1176,26 @@ impl KnowledgeHandlers {
             // prevents a race between the daemon warm-start and the first incoming
             // query from producing a silent ok:true,total:0 result.
             //
-            // Test coverage note: the warming-Err branch here is exercised by the
-            // mechanism-unit tests in vamana::tests (is_warming_not_loaded /
-            // wait_for_ann / simulate_warming_in_flight).  An end-to-end integration
-            // test is not feasible from the external tests/ directory because
-            // simulate_warming_in_flight is pub(crate) — forcing the in-flight state
-            // requires internal access.  The integration tests in tests/fixes.rs
-            // cover the non-warming hot-path and the empty-corpus guard instead.
+            // Test coverage note: same degrade regression coverage as the `search`
+            // handler above — see knowledge::ann_degrade_tests for the handler-level
+            // tests that exercise this branch directly with a pre-warmed SharedAnn.
             let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
             if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
-                const WARM_TIMEOUT_MS: u64 = 3_000;
-                const WARM_POLL_MS: u64 = 50;
-                if vamana::wait_for_ann(ann, &key, WARM_TIMEOUT_MS, WARM_POLL_MS).await {
+                if vamana::wait_for_ann(
+                    ann,
+                    &key,
+                    vamana::warm_wait_timeout_ms(),
+                    vamana::ANN_WARM_WAIT_POLL_MS,
+                )
+                .await
+                {
                     ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
                 } else {
                     // Still not ready after the wait.  If FTS already collected
                     // non-empty hits, return those partial results rather than
-                    // erroring — mirrors the same guard in `search`.  Only surface
-                    // the warming error when FTS is also empty and the corpus is
-                    // non-empty (a genuinely misleading silent-zero case).
+                    // erroring — mirrors the same guard in `search`.  Only set
+                    // ann_unavailable when FTS is also empty and the corpus is
+                    // non-empty (a genuinely misleading silent-zero case) (issue #322).
                     if hits.is_empty() {
                         let model = runtime.default_embedder_name();
                         let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
@@ -1194,10 +1203,7 @@ impl KnowledgeHandlers {
                             .map(|fp| fp.vector_count > 0)
                             .unwrap_or(false);
                         if corpus_non_empty {
-                            return Err(RuntimeError::Internal(
-                                "ANN index is warming after daemon restart — retry in a few seconds"
-                                    .into(),
-                            ));
+                            ann_unavailable = true;
                         }
                     }
                 }
@@ -1228,7 +1234,11 @@ impl KnowledgeHandlers {
             .collect();
         let count = results.len();
 
-        Ok(json!({ "results": results, "total": count }))
+        let mut out = json!({ "results": results, "total": count });
+        if ann_unavailable {
+            out["ann_unavailable"] = json!(true);
+        }
+        Ok(out)
     }
 
     pub(crate) async fn compose(
@@ -1258,6 +1268,7 @@ impl KnowledgeHandlers {
             .collect();
 
         let is_auto = domain_ids.is_empty() && atom_ids.is_empty();
+        let mut suggest_ann_unavailable = false;
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
             if word_count < 10 {
@@ -1278,7 +1289,13 @@ impl KnowledgeHandlers {
             )
             .await
             {
-                Ok(v) => v,
+                Ok(v) => {
+                    suggest_ann_unavailable = v
+                        .get("ann_unavailable")
+                        .and_then(|f| f.as_bool())
+                        .unwrap_or(false);
+                    v
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "auto-compose: internal suggest failed, returning empty");
                     return Ok(json!({
@@ -1302,16 +1319,17 @@ impl KnowledgeHandlers {
                 }
             }
             if domain_ids.is_empty() {
-                return Ok(json!({
-                    "status": "ok",
-                    "data": {
-                        "query": raw_query,
-                        "markdown": "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
-                        "domains": [],
-                        "atoms": [],
-                        "count": 0,
-                    },
-                }));
+                let mut data = json!({
+                    "query": raw_query,
+                    "markdown": "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
+                    "domains": [],
+                    "atoms": [],
+                    "count": 0,
+                });
+                if suggest_ann_unavailable {
+                    data["ann_unavailable"] = json!(true);
+                }
+                return Ok(json!({ "status": "ok", "data": data }));
             }
         }
 
@@ -1542,6 +1560,9 @@ impl KnowledgeHandlers {
         if explain && !section_json.is_empty() {
             data["sections"] = json!(section_json);
             data["section_count"] = json!(section_json.len());
+        }
+        if suggest_ann_unavailable {
+            data["ann_unavailable"] = json!(true);
         }
 
         Ok(json!({
