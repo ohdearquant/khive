@@ -104,11 +104,22 @@ The knowledge-pack bridge persists and restores through the ADR-052 v2 path:
   checksums last) is ADR-052 §3 and is inherited unchanged.
 
 **Storage location.** v2 segments are filesystem files (`save_atomic(path)`), not a SQLite BLOB.
-They live under a per-(namespace, model) directory beside the backend's data file:
+They live under a single per-(namespace, model) directory beside the backend's data file, named by
+the lowercase-hex encoding of the snapshot key `"{namespace}::vamana::{model}"` — one directory per
+pair, decoded by the warm-path filesystem enumeration:
 
 ```
-<backend_data_dir>/ann/<namespace>/<sanitized_model>/{vectors.seg, adjacency.seg, lifecycle.seg, metadata.bin}
+<backend_data_dir>/ann/<hex(namespace::vamana::model)>/
+    {metadata.bin, graph.bin, vectors.bin, lifecycle.bin, external_ids.bin}
 ```
+
+The four Vamana segment files are ADR-052's crash-safe commit set, inherited unchanged: `metadata.bin`
+is the commit record (written last, via tmp-then-rename), alongside `graph.bin`, `vectors.bin`, and
+`lifecycle.bin` (tombstones, free slots, reverse adjacency, and the consolidation counter).
+`external_ids.bin` is the id-map sidecar the in-process index needs to translate ANN ordinals back to
+record UUIDs; it is written after the segment commit and stamped with the v2 commit `content_hash`. On
+warm it is rejected if its hash does not match the commit (a torn segment/sidecar pair, from a crash
+between the two writes) or if its UUID count does not match the loaded vector count.
 
 `<backend_data_dir>` resolves from the pack's assigned backend (ADR-028) and, in the cloud
 write-owner model, from the per-tenant database directory (ADR-067) — so ANN segments are
