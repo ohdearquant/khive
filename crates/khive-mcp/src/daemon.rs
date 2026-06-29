@@ -699,6 +699,22 @@ mod tests {
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
     }
 
+    /// Server whose pack set includes `brain`, which registers
+    /// `Visibility::Subhandler` verbs (`brain.state`, …). Used to exercise the
+    /// wire visibility gate through the daemon round-trip.
+    fn make_subhandler_test_server() -> crate::server::KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("braintest").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "brain".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
+    }
+
     fn clear_daemon_env() {
         std::env::remove_var("KHIVE_SOCKET");
         std::env::remove_var("KHIVE_PID");
@@ -1110,6 +1126,110 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         clear_daemon_env();
+    }
+
+    // ── daemon-forward wire-origin gate (security regression) ────────────────
+    //
+    // The agent-facing MCP `request` tool sets `from_wire=true` on its daemon
+    // frame; the daemon must HONOR that bit so the subhandler visibility gate
+    // fires after the socket round-trip, not only on the local-fallback path.
+    // The local-fallback tests (in tests/integration.rs) run with the daemon
+    // disabled and would stay green even if the MCP frame were flipped to
+    // `from_wire=false` — which would open an agent-reachable subhandler bypass
+    // on every daemon-backed deployment. This pins the round-trip seam.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_round_trip_honors_from_wire_for_subhandlers() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let reference = make_subhandler_test_server();
+        let config_id = reference.config_id().to_string();
+        let daemon_server = reference.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let frame = |from_wire: bool| DaemonRequestFrame {
+            ops: "brain.state()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "braintest".to_string(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire,
+        };
+
+        // (a) from_wire=true → daemon applies the wire visibility gate:
+        // `brain.state` is a Subhandler and must be blocked after the round-trip.
+        let resp_wire = exchange(&sock, &frame(true)).await;
+        assert!(
+            resp_wire.ok,
+            "dispatch itself must succeed (the op carries the gate error); error={:?}",
+            resp_wire.error
+        );
+        let body_wire: serde_json::Value =
+            serde_json::from_str(resp_wire.result.as_deref().expect("wire result body"))
+                .expect("decode wire result json");
+        let first_wire = &body_wire["results"][0];
+        assert_eq!(
+            first_wire["ok"], false,
+            "from_wire=true subhandler must be blocked through the daemon: {first_wire}"
+        );
+        let err_wire = first_wire["error"].as_str().unwrap_or("");
+        assert!(
+            err_wire.contains("permission denied") || err_wire.contains("subhandler"),
+            "daemon-forward wire path must surface the subhandler gate error; got: {err_wire}"
+        );
+
+        // (b) from_wire=false (operator frame, e.g. `kkernel exec`) → the same
+        // Subhandler verb must be REACHED, not gated.
+        let resp_op = exchange(&sock, &frame(false)).await;
+        let body_op: serde_json::Value =
+            serde_json::from_str(resp_op.result.as_deref().expect("operator result body"))
+                .expect("decode operator result json");
+        let first_op = &body_op["results"][0];
+        let err_op = first_op["error"].as_str().unwrap_or("");
+        assert!(
+            !err_op.contains("permission denied") && !err_op.contains("subhandler"),
+            "operator frame must NOT gate the subhandler through the daemon: {first_op}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    // The agent-facing `request` tool must stamp `from_wire=true` on its daemon
+    // forward-frame. Without this, a daemon-backed MCP request would dispatch
+    // with `from_wire=false` and silently reopen the agent subhandler bypass
+    // (codex #369 Medium). Pinned at the frame-builder seam so the daemon
+    // round-trip test above (which proves the daemon HONORS the bit) is paired
+    // with proof that the tool SETS it.
+    #[test]
+    fn wire_request_frame_sets_from_wire_true() {
+        let server = make_subhandler_test_server();
+        let params = RequestParams {
+            ops: "brain.state()".to_string(),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&params);
+        assert!(
+            frame.from_wire,
+            "request tool must set from_wire=true on the daemon forward-frame"
+        );
+        assert_eq!(frame.ops, "brain.state()");
+        assert_eq!(frame.namespace, "braintest");
     }
 
     // ── new-client + old-daemon regression (fix for #98 BLOCKER) ─────────────

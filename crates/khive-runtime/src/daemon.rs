@@ -244,8 +244,10 @@ pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Re
 
 /// Transport-agnostic dispatch interface for the daemon server.
 ///
-/// The MCP crate implements this by wrapping `dispatch_request_local`; any
-/// future transport can do the same.
+/// The MCP crate implements this by dispatching through the shared request body
+/// while honoring [`DaemonRequestFrame::from_wire`] (so subhandler visibility is
+/// gated by request origin, not by transport); any future transport can do the
+/// same.
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// Dispatch a verb-DSL request string and return the rendered result.

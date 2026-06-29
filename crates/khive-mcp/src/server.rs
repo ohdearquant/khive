@@ -1157,20 +1157,7 @@ result (e.g. create then link with the new entity's id)."#)]
         // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
         #[cfg(unix)]
         {
-            let frame = khive_runtime::DaemonRequestFrame {
-                ops: p.ops.clone(),
-                presentation: p.presentation.clone(),
-                presentation_per_op: p.presentation_per_op.clone(),
-                namespace: self.default_namespace.clone(),
-                config_id: self.config_id.clone(),
-                protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
-                probe_only: false,
-                format: p.format.clone(),
-                format_per_op: p.format_per_op.clone(),
-                // This is the agent-facing MCP wire surface: enforce verb
-                // visibility whether the request runs on the daemon or locally.
-                from_wire: true,
-            };
+            let frame = self.wire_daemon_frame(&p);
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;
             }
@@ -1180,6 +1167,29 @@ result (e.g. create then link with the new entity's id)."#)]
 }
 
 impl KhiveMcpServer {
+    /// Build the daemon forward-frame for an agent-facing `request` tool call.
+    ///
+    /// `from_wire` is unconditionally `true`: this is the agent wire surface, so
+    /// `Visibility::Subhandler` verbs must be rejected whether the request runs
+    /// on the warm daemon or via the local fallback. Keeping the bit in one
+    /// named, unit-tested place stops the daemon-forward path from silently
+    /// diverging from `dispatch_request_wire`.
+    #[cfg(unix)]
+    pub(crate) fn wire_daemon_frame(&self, p: &RequestParams) -> khive_runtime::DaemonRequestFrame {
+        khive_runtime::DaemonRequestFrame {
+            ops: p.ops.clone(),
+            presentation: p.presentation.clone(),
+            presentation_per_op: p.presentation_per_op.clone(),
+            namespace: self.default_namespace.clone(),
+            config_id: self.config_id.clone(),
+            protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
+            probe_only: false,
+            format: p.format.clone(),
+            format_per_op: p.format_per_op.clone(),
+            from_wire: true,
+        }
+    }
+
     /// Parse and dispatch a request against this server's own registry.
     ///
     /// This is the canonical **operator** dispatch path: subhandler verbs are
