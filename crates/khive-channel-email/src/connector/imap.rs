@@ -16,6 +16,8 @@ use mail_parser::MessageParser;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::instrument;
 
+use crate::oauth::{TokenProvider, XOAuth2Authenticator};
+
 use super::RawEmail;
 
 /// IMAP session type using TLS over a compat-wrapped tokio stream.
@@ -35,15 +37,27 @@ pub(crate) trait ImapConnector: Send + Sync + 'static {
     ) -> Result<Vec<RawEmail>, ChannelError>;
 }
 
+/// IMAP authentication configuration (basic or OAuth2 XOAUTH2).
+enum ImapAuthConfig {
+    /// Standard IMAP LOGIN with username and password.
+    Basic { username: String, password: String },
+    /// IMAP AUTHENTICATE XOAUTH2 with a bearer token fetched from the provider.
+    OAuth {
+        /// Mailbox address used as the `user=` field in the XOAUTH2 SASL string.
+        mailbox: String,
+        token_provider: Arc<TokenProvider>,
+    },
+}
+
 /// Production IMAP connector backed by `async-imap` with native TLS.
 pub(crate) struct LiveImap {
     host: String,
     port: u16,
-    username: String,
-    password: String,
+    auth: ImapAuthConfig,
 }
 
 impl LiveImap {
+    /// Create a connector using basic IMAP LOGIN credentials.
     pub(crate) fn new(
         host: impl Into<String>,
         port: u16,
@@ -53,8 +67,32 @@ impl LiveImap {
         Self {
             host: host.into(),
             port,
-            username: username.into(),
-            password: password.into(),
+            auth: ImapAuthConfig::Basic {
+                username: username.into(),
+                password: password.into(),
+            },
+        }
+    }
+
+    /// Create a connector using XOAUTH2 (Exchange Online app-only flow).
+    ///
+    /// `mailbox` is the address used in the SASL `user=` field.
+    /// async-imap 0.9's `Client::authenticate("XOAUTH2", authenticator)` is used;
+    /// the authenticator's `process()` returns the raw SASL bytes which async-imap
+    /// base64-encodes before sending.
+    pub(crate) fn new_oauth(
+        host: impl Into<String>,
+        port: u16,
+        mailbox: impl Into<String>,
+        token_provider: Arc<TokenProvider>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            auth: ImapAuthConfig::OAuth {
+                mailbox: mailbox.into(),
+                token_provider,
+            },
         }
     }
 
@@ -68,7 +106,7 @@ impl LiveImap {
         .map_err(|_| ChannelError::Transport("IMAP TCP connect timed out (10s)".into()))?
         .map_err(|e| ChannelError::Transport(format!("IMAP TCP connect failed: {e}")))?;
 
-        // Wrap with compat layer so async-native-tls (which uses futures-io) can use the stream.
+        // Wrap with compat layer so async-native-tls (futures-io) can use the stream.
         let tcp_compat = tcp.compat();
 
         // TLS handshake with 15s timeout.
@@ -81,15 +119,41 @@ impl LiveImap {
         .map_err(|_| ChannelError::Auth("IMAP TLS handshake timed out (15s)".into()))?
         .map_err(|e| ChannelError::Auth(format!("IMAP TLS handshake failed: {e}")))?;
 
-        // IMAP login with 15s timeout.
         let client = async_imap::Client::new(tls_stream);
-        let session: ImapSession = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.login(&self.username, &self.password),
-        )
-        .await
-        .map_err(|_| ChannelError::Auth("IMAP login timed out (15s)".into()))?
-        .map_err(|(e, _)| ChannelError::Auth(format!("IMAP login failed: {e}")))?;
+
+        // Authenticate with 15s timeout, dispatching on auth mode.
+        let session: ImapSession = match &self.auth {
+            ImapAuthConfig::Basic { username, password } => {
+                tokio::time::timeout(Duration::from_secs(15), client.login(username, password))
+                    .await
+                    .map_err(|_| ChannelError::Auth("IMAP login timed out (15s)".into()))?
+                    .map_err(|(e, _)| ChannelError::Auth(format!("IMAP login failed: {e}")))?
+            }
+            ImapAuthConfig::OAuth {
+                mailbox,
+                token_provider,
+            } => {
+                // Fetch (or return cached) bearer token before the IMAP handshake.
+                // XOAuth2Authenticator::process returns the raw SASL bytes;
+                // async-imap 0.9 base64-encodes them in do_auth_handshake (client.rs:282).
+                let token = token_provider.get_token().await?;
+                let authenticator = XOAuth2Authenticator {
+                    mailbox: mailbox.clone(),
+                    token,
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    client.authenticate("XOAUTH2", authenticator),
+                )
+                .await
+                .map_err(|_| {
+                    ChannelError::Auth("IMAP XOAUTH2 authenticate timed out (15s)".into())
+                })?
+                .map_err(|(e, _)| {
+                    ChannelError::Auth(format!("IMAP XOAUTH2 authenticate failed: {e}"))
+                })?
+            }
+        };
 
         Ok(session)
     }
@@ -300,10 +364,22 @@ pub struct ImapFetcher {
 }
 
 impl ImapFetcher {
-    /// Create a production fetcher backed by `async-imap`.
+    /// Create a production fetcher using basic IMAP LOGIN credentials.
     pub fn new(host: impl Into<String>, port: u16, username: &str, password: &str) -> Self {
         Self {
             inner: Arc::new(LiveImap::new(host, port, username, password)),
+        }
+    }
+
+    /// Create a production fetcher using XOAUTH2 (Exchange Online app-only flow).
+    pub fn new_oauth(
+        host: impl Into<String>,
+        port: u16,
+        mailbox: impl Into<String>,
+        token_provider: Arc<TokenProvider>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LiveImap::new_oauth(host, port, mailbox, token_provider)),
         }
     }
 
