@@ -699,4 +699,107 @@ mod tests {
             "after skewing, formalism {formalism_tuned:.4} must outweigh og {og_tuned:.4}"
         );
     }
+
+    /// Regression for #346 Tier-2: `resolve_compose_type_weights` must read weights
+    /// from a namespace-bound brain profile when one is registered via `brain.bind`.
+    ///
+    /// This test exercises `load_profile_type_weights` dispatching `brain.profile`
+    /// across the pack boundary — the code path that had zero coverage after the
+    /// Tier-3 test was added.
+    ///
+    /// Setup: register a brain profile with `seed_priors` that INVERT the default
+    /// ordering (formalism high, operational_guidance low), bind it for
+    /// `namespace="local"` + `consumer_kind="recall"`, then call
+    /// `resolve_compose_type_weights` with a registry that has `BrainPack` wired.
+    ///
+    /// With Tier 1 absent (`brain_profile=None`) and a real binding in Tier 2,
+    /// the method must return the bound profile's weights — formalism dominant.
+    /// If `load_profile_type_weights` returned `None` or mis-extracted, Tier 2
+    /// falls through to Tier 3/default and operational_guidance dominates → FAIL.
+    #[tokio::test]
+    async fn resolve_compose_type_weights_reads_bound_profile_weights_at_tier2() {
+        use khive_pack_brain::BrainPack;
+        use khive_pack_kg::KgPack;
+
+        // Build a registry with both brain and kg packs (brain REQUIRES kg).
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        // Create a profile with inverted seed_priors:
+        //   formalism:           Beta(8, 1) → mean ≈ 0.889
+        //     (default prior:               α=1.5, β=4.0 → mean ≈ 0.273)
+        //   operational_guidance: Beta(1, 8) → mean ≈ 0.111
+        //     (default prior:               α=6.0, β=1.5 → mean ≈ 0.8)
+        // ESS = alpha + beta = 9 ≤ DEFAULT_ESS_CAP (100.0) ✓
+        registry
+            .dispatch(
+                "brain.create_profile",
+                json!({
+                    "name": "recall-tuned-v1",
+                    "consumer_kind": "recall",
+                    "seed_priors": {
+                        "section_posteriors": {
+                            "formalism": {"alpha": 8.0, "beta": 1.0},
+                            "operational_guidance": {"alpha": 1.0, "beta": 8.0}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("create_profile with skewed seed_priors");
+
+        // Activate so the profile leaves the Inactive state (matches proper usage).
+        registry
+            .dispatch("brain.activate", json!({"profile_id": "recall-tuned-v1"}))
+            .await
+            .expect("activate recall-tuned-v1");
+
+        // Bind for namespace="local", consumer_kind="recall".
+        // `knowledge_resolve_namespace_profile` dispatches:
+        //   brain.resolve(namespace="local", consumer_kind="recall")
+        // which must find this binding with matched_binding=true.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "recall-tuned-v1",
+                    "namespace": "local",
+                    "consumer_kind": "recall"
+                }),
+            )
+            .await
+            .expect("bind recall-tuned-v1 for namespace=local");
+
+        // KnowledgePack with brain_profile=None → Tier 1 is skipped.
+        let pack = KnowledgePack::new(rt.clone());
+
+        // Tier 2 fires: brain.resolve returns matched_binding=true,
+        // load_profile_type_weights dispatches brain.profile and extracts the
+        // precomputed `weight` field from section_posteriors.
+        // brain.profile always calls derive_deterministic_weights() — no Thompson
+        // sampling, no epoch dependency — so results are deterministic from seed_priors.
+        let weights = pack.resolve_compose_type_weights(&registry, &token).await;
+
+        let formalism_w = *weights
+            .get("formalism")
+            .expect("formalism weight must be present");
+        let og_w = *weights
+            .get("operational_guidance")
+            .expect("operational_guidance weight must be present");
+
+        // seed_priors: formalism Beta(8,1) mean≈0.889 >> og Beta(1,8) mean≈0.111.
+        // Default priors have the opposite ordering: og α=6,β=1.5 >> formalism α=1.5,β=4.
+        // If load_profile_type_weights broke or Tier 2 fell through to Tier 3/default,
+        // og would dominate — this assertion FAILS (genuine RED→GREEN guard).
+        assert!(
+            formalism_w > og_w,
+            "Tier-2 bound-profile: formalism {formalism_w:.4} must exceed og {og_w:.4}; \
+             ordering reflects seed_priors (formalism β(8,1) >> og β(1,8)), \
+             not default priors where og α=6,β=1.5 dominates"
+        );
+    }
 }
