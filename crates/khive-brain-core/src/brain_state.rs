@@ -26,6 +26,8 @@ pub struct BrainState {
     pub profile_states: HashMap<String, BalancedRecallState>,
     pub bindings: Vec<ProfileBinding>,
     pub section_states: HashMap<String, SectionPosteriorState>,
+    pub router_state: HashMap<String, RouterStateBlob>,
+    pub adapter_set: HashMap<String, Vec<AdapterRecord>>,
 }
 
 impl BrainState {
@@ -42,6 +44,8 @@ impl BrainState {
             profile_states: HashMap::new(),
             bindings: Vec::new(),
             section_states: HashMap::new(),
+            router_state: HashMap::new(),
+            adapter_set: HashMap::new(),
         }
     }
 
@@ -63,6 +67,8 @@ impl BrainState {
             profile_states: extra,
             bindings: self.bindings.clone(),
             section_states,
+            router_state: self.router_state.clone(),
+            adapter_set: self.adapter_set.clone(),
         }
     }
 
@@ -87,6 +93,8 @@ impl BrainState {
             profile_states: extra,
             bindings: snapshot.bindings,
             section_states,
+            router_state: snapshot.router_state,
+            adapter_set: snapshot.adapter_set,
         }
     }
 
@@ -205,6 +213,25 @@ impl BrainState {
 
 // ── Snapshot ────────────────────────────────────────────────────────────────
 
+/// Opaque envelope for gate-engine router weights. Brain stores and
+/// round-trips the bytes without parsing them; the gate engine owns
+/// the internal layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouterStateBlob {
+    pub schema_version: u32,
+    /// Raw serialized gate weights. Treated as opaque bytes by brain.
+    pub gate_bytes: Vec<u8>,
+}
+
+/// Brain-native integrity record for a single LoRA adapter slot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdapterRecord {
+    pub adapter_id: String,
+    pub slot: u32,
+    /// Content hash of the adapter checkpoint, for integrity verification.
+    pub content_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainStateSnapshot {
     pub profiles: HashMap<String, ProfileRecord>,
@@ -214,6 +241,10 @@ pub struct BrainStateSnapshot {
     pub bindings: Vec<ProfileBinding>,
     #[serde(default)]
     pub section_states: HashMap<String, SectionPosteriorSnapshot>,
+    #[serde(default)]
+    pub router_state: HashMap<String, RouterStateBlob>,
+    #[serde(default)]
+    pub adapter_set: HashMap<String, Vec<AdapterRecord>>,
 }
 
 /// Validate all BetaPosterior values in a snapshot.
@@ -348,6 +379,8 @@ mod tests {
             profile_states: HashMap::new(),
             bindings: Vec::new(),
             section_states: HashMap::new(),
+            router_state: HashMap::new(),
+            adapter_set: HashMap::new(),
         };
         state_a.profiles.insert(p_early.id.clone(), p_early.clone());
         state_a.profiles.insert(p_later.id.clone(), p_later.clone());
@@ -358,6 +391,8 @@ mod tests {
             profile_states: HashMap::new(),
             bindings: Vec::new(),
             section_states: HashMap::new(),
+            router_state: HashMap::new(),
+            adapter_set: HashMap::new(),
         };
         // Insert in the opposite order.
         state_b.profiles.insert(p_later.id.clone(), p_later.clone());
@@ -370,5 +405,77 @@ mod tests {
         let id_b = result_b.map(|p| p.id.clone());
         assert_eq!(id_a, Some("alpha".to_owned()));
         assert_eq!(id_a, id_b, "fallback resolution must be deterministic");
+    }
+
+    /// `router_state` and `adapter_set` survive a `to_snapshot` / `from_snapshot`
+    /// round-trip byte-for-byte.
+    ///
+    /// This is a fail-before/pass-after test: it would fail if either conversion
+    /// dropped the new fields.
+    #[test]
+    fn router_state_and_adapter_set_round_trip() {
+        let mut state = BrainState::new(8);
+
+        let blob = RouterStateBlob {
+            schema_version: 1,
+            gate_bytes: vec![1, 2, 3],
+        };
+        state
+            .router_state
+            .insert("profile-x".to_owned(), blob.clone());
+
+        let record = AdapterRecord {
+            adapter_id: "lora-42".to_owned(),
+            slot: 0,
+            content_hash: "abc123".to_owned(),
+        };
+        state
+            .adapter_set
+            .insert("profile-x".to_owned(), vec![record.clone()]);
+
+        let snapshot = state.to_snapshot();
+        let restored = BrainState::from_snapshot(snapshot, 8);
+
+        assert_eq!(
+            restored.router_state.get("profile-x"),
+            Some(&blob),
+            "router_state must survive round-trip"
+        );
+        assert_eq!(
+            restored.adapter_set.get("profile-x"),
+            Some(&vec![record]),
+            "adapter_set must survive round-trip"
+        );
+    }
+
+    /// Deserializing a `BrainStateSnapshot` JSON that omits `router_state` and
+    /// `adapter_set` must succeed and yield empty maps (no migration required).
+    ///
+    /// The test serializes a fresh snapshot, strips both keys from the JSON
+    /// object, then re-deserializes — proving that `#[serde(default)]` is wired
+    /// correctly.
+    #[test]
+    fn snapshot_missing_router_and_adapter_fields_defaults_to_empty() {
+        let state = BrainState::new(8);
+        let snapshot = state.to_snapshot();
+
+        let mut value: serde_json::Value =
+            serde_json::to_value(&snapshot).expect("serialize snapshot");
+
+        let obj = value.as_object_mut().expect("snapshot is a JSON object");
+        obj.remove("router_state");
+        obj.remove("adapter_set");
+
+        let restored: BrainStateSnapshot =
+            serde_json::from_value(value).expect("deserialize old-format snapshot");
+
+        assert!(
+            restored.router_state.is_empty(),
+            "router_state must default to empty map when absent from JSON"
+        );
+        assert!(
+            restored.adapter_set.is_empty(),
+            "adapter_set must default to empty map when absent from JSON"
+        );
     }
 }

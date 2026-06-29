@@ -587,6 +587,8 @@ pub async fn ensure_loaded(
                             )
                         })
                         .collect(),
+                    router_state: current_state.router_state.clone(),
+                    adapter_set: current_state.adapter_set.clone(),
                 };
                 // Release the state guard before mutating the tracker (save-restore
                 // path) so the re-acquire below cannot deadlock.
