@@ -49,6 +49,12 @@ pub(crate) async fn handle_list(
     };
 
     // Fetch a wide window to cover offset + limit + filtering headroom.
+    // `list_notes` already returns rows ORDER BY created_at DESC, so the
+    // window pulls the newest records first. The +500 is a headroom allowance
+    // for in-memory agent_id/since filtering: if a caller has a very sparse
+    // agent_id distribution and total session count exceeds (offset+limit+500),
+    // the result may be silently incomplete. This is acceptable for M1 session
+    // volumes; M2 will add a server-side filter parameter.
     let window = (offset as u32)
         .saturating_add(limit as u32)
         .saturating_add(500);
@@ -56,8 +62,9 @@ pub(crate) async fn handle_list(
         .list_notes(token, Some("session"), window, 0)
         .await?;
 
-    // Filter, sort newest-first, then paginate.
-    let mut filtered: Vec<&khive_storage::note::Note> = notes
+    // Filter in-memory, then paginate. No re-sort needed: list_notes returns
+    // rows ORDER BY created_at DESC and in-memory filtering preserves that order.
+    let filtered: Vec<&khive_storage::note::Note> = notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
         .filter(|n| match p.agent_id.as_deref() {
@@ -75,8 +82,6 @@ pub(crate) async fn handle_list(
             Some(since) => n.created_at >= since,
         })
         .collect();
-
-    filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     let result: Vec<Value> = filtered
         .into_iter()
