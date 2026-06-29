@@ -139,7 +139,9 @@ impl PackRuntime for KnowledgePack {
                 KnowledgeHandlers::suggest(&self.runtime, token, params, &self.ann).await
             }
             "knowledge.compose" => {
-                KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann).await
+                let type_weights = self.resolve_compose_type_weights(registry, token).await;
+                KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann, type_weights)
+                    .await
             }
             "knowledge.edit" => {
                 KnowledgeHandlers::edit(&self.runtime, token, params, &self.ann).await

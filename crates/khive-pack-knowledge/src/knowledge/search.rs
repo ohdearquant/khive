@@ -1246,6 +1246,7 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
         ann: &vamana::SharedAnn,
+        type_weights: HashMap<String, f32>,
     ) -> Result<Value, RuntimeError> {
         let p: ComposeParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -1430,13 +1431,6 @@ impl KnowledgeHandlers {
                     };
                     (id, score)
                 })
-                .collect();
-
-            let section_state = khive_brain_core::SectionPosteriorState::default();
-            let type_weights: HashMap<String, f32> = section_state
-                .deterministic_weights()
-                .into_iter()
-                .map(|(st, w)| (st.as_str().to_string(), w as f32))
                 .collect();
 
             let q_emb = runtime.embed_query(&raw_query).await.ok();
