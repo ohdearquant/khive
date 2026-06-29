@@ -9,15 +9,16 @@ use crate::{GateDecision, GateError, GateRequest};
 /// Implementations live downstream:
 /// - `AllowAllGate` (this crate) — permissive default
 /// - `RegoGate` (Apache-2.0 sibling crate `khive-gate-rego`) — regorus-backed Rego eval
-/// - `LionGate<G>` (khive-cloud, BUSL) — wraps any `Gate` with lion-core
-///   capability witnesses for verifiable enforcement.
+///
+/// Downstream crates may provide additional implementations, including wrappers
+/// that compose another `Gate` to add stronger enforcement guarantees.
 pub trait Gate: Send + Sync + std::fmt::Debug {
     /// Evaluates the authorization policy for `req` and returns a decision.
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 
     /// Short name of this backend — surfaced in audit events so downstream
-    /// tooling can tell `RegoGate` results apart from `LionGate<RegoGate>`
-    /// results without parsing the type.
+    /// tooling can tell results from different gate implementations apart
+    /// (including a wrapper from the gate it wraps) without parsing the type.
     ///
     /// Defaults to `std::any::type_name::<Self>()`.
     fn impl_name(&self) -> &'static str {
