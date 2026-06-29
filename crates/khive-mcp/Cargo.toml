@@ -22,6 +22,7 @@ khive-pack-brain = { version = "0.2.11", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.2.11", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.2.11", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.2.11", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.2.11", path = "../khive-pack-session" }
 uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }
