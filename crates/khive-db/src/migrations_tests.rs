@@ -275,6 +275,16 @@ fn v5_upgrade_from_duplicate_rows_succeeds() {
     .unwrap();
     tx.commit().unwrap();
 
+    // V5 must have created the unique index.
+    assert!(
+        index_exists(&conn, "idx_comm_message_external_id"),
+        "V5 must create idx_comm_message_external_id"
+    );
+    assert!(
+        index_is_unique(&conn, "idx_comm_message_external_id"),
+        "idx_comm_message_external_id must be UNIQUE after V5 upgrade"
+    );
+
     // Canonical row keeps its external_id.
     let canonical_ext: Option<String> = conn
         .query_row(

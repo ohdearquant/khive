@@ -31,7 +31,7 @@ cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS
 cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --lib --bins -- $NOSTUB_LINTS
 
 echo "=== Clippy ==="
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "=== Tests ==="
 cargo test --workspace
