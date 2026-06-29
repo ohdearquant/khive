@@ -76,8 +76,11 @@ Full `gtd.transition` allowed transitions:
 `waiting` | `someday` → next | active | done | cancelled;
 `done` and `cancelled` are terminal.
 
-`gtd.transition` returns `{id, full_id, title, priority, assignee, from, to, transitioned, is_terminal}`.
-`transitioned: true` confirms the change; `is_terminal: true` when the task reaches `done` or `cancelled`.
+`gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,
+from, to, is_terminal, title, priority, assignee, due}` — `is_terminal: true` when the task reaches
+`done` or `cancelled`. On an idempotent no-op (the task is already in the requested status): `{transitioned:
+false, id, full_id, from, to, note: "already in target status"}` — the task fields (`title`, `priority`,
+`assignee`, `due`, `is_terminal`) are omitted. Branch on `transitioned` before reading those fields.
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
