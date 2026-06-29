@@ -49,9 +49,12 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 | `verbs`     | List all registered verbs on this server         | Discovery — see what's available                         |
 
 `get`, `update`, `delete` are by-ID — they auto-detect whether the record is an entity, note, or
-edge. The `id` parameter accepts either a full UUID or a short hex prefix of at least 8 hex
-characters; shorter strings fall through to a name lookup. `create`, `list`, `search` require
-`kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
+edge. The `id` parameter is resolved in three steps: (1) a full UUID (36-char dashed or 32-char
+plain hex) is parsed directly; (2) otherwise an 8-or-more hex-character string enters a short-ID
+prefix lookup, but in practice only the exact 8-char compact ID returned by write verbs resolves,
+because stored UUIDs carry a dash at position 9, so a 9+ pure-hex string never matches; (3) anything
+else falls through to an exact, case-insensitive entity-name lookup. `create`, `list`, `search`
+require `kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
 [ADR-022](docs/adr/ADR-022-events-query-surface.md)).
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
@@ -72,6 +75,12 @@ Full `gtd.transition` allowed transitions:
 `active` → next | waiting | done | cancelled;
 `waiting` | `someday` → next | active | done | cancelled;
 `done` and `cancelled` are terminal.
+
+`gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,
+from, to, is_terminal, title, priority, assignee, due}` — `is_terminal: true` when the task reaches
+`done` or `cancelled`. On an idempotent no-op (the task is already in the requested status): `{transitioned:
+false, id, full_id, from, to, note: "already in target status"}` — the task fields (`title`, `priority`,
+`assignee`, `due`, `is_terminal`) are omitted. Branch on `transitioned` before reading those fields.
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
@@ -110,7 +119,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | ------------- | -------------------------------------- | ---------------------------------------- |
 | `comm.send`   | Send a message (optionally threaded)   | Inter-agent or inter-namespace messaging |
 | `comm.inbox`  | List inbound messages                  | Check what's waiting                     |
-| `comm.read`   | Mark a message as read                 | Acknowledge receipt                      |
+| `comm.read`   | Mark an **inbound** message as read    | Acknowledge receipt (recipient action)   |
 | `comm.reply`  | Reply to a message (threading linkage) | Respond in-thread                        |
 | `comm.thread` | Retrieve full conversation thread      | Read the whole conversation              |
 
@@ -120,6 +129,11 @@ chars) — triage without a `get` per message. Delivery is actor-addressed: `com
 stamps `from_actor` from the server's configured actor and lands in `x`'s inbox, and `comm.inbox`
 returns only messages addressed to you. Set that actor via `--actor` / `KHIVE_ACTOR`; an unset actor
 sends and reads as the shared `"local"` party line.
+
+**`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
+(sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
+marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
+or `comm.thread`.
 
 ### Schedule pack — 4 verbs (`schedule.` prefix)
 
@@ -394,22 +408,22 @@ probably a property on the entity, not an edge.
 
 These are the KG pack verbs. Other packs are documented in their verb tables above.
 
-| Tool        | Fields                                                                                                                                                                                                                                           | Example                                                      |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; entity_type, description, properties, tags, salience, annotates                                                                                | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
-| `get`       | **id** — full UUID or short hex prefix (minimum 8 hex characters)                                                                                                                                                                                | `{"id":"<uuid>"}`                                            |
-| `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, tags, source_id, target_id, relations, min_weight, max_weight, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read | `{"kind":"entity","entity_kind":"concept","tags":["ml"]}`    |
-| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge)                                                                                                                                                             | `{"id":"<uuid>","description":"Updated desc"}`               |
-| `delete`    | **id** (UUID); hard (default: false)                                                                                                                                                                                                             | `{"id":"<uuid>","hard":true}`                                |
-| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union). Returns `{kept_id, removed_id, edges_rewired, …}` — no top-level `id` field. Chain as `merge(...) \| link(source_id=$prev.kept_id, …)`, **not** `$prev.id`.                | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
-| `search`    | **kind** (entity\|note), **query** (text); entity_kind, entity_type, note_kind, tags, include_superseded (note), properties (entity post-filter), min_score, limit                                                                               | `{"kind":"entity","query":"attention mechanism"}`            |
-| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0)                                                                                                                                                                                     | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
-| `neighbors` | **node_id**; direction (out\|in\|both), relations, min_weight, limit; `include_entity_type` (bool, default false — when true each neighbor carries its `entity_type` subtype field)                                                              | `{"node_id":"<uuid>","direction":"both"}`                    |
-| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots; `include_properties` (bool, default false — when true each path node carries its entity `properties` map)                                                                 | `{"roots":["<uuid>"],"max_depth":2}`                         |
-| `query`     | **query** (GQL or SPARQL string) — **read-only**: write-shaped input (SPARQL `INSERT`/`DELETE`/`LOAD`, GQL/Cypher `CREATE`/`DELETE`/`SET`/`MERGE`) is rejected; use `create`, `update`, `link`, `merge`, `delete` to mutate                      | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
-| `propose`   | **kind** (entity\|note\|edge), fields for the proposed change. Returns `{id, status, proposer, title}`. Chain as `propose(...) \| review(id=$prev.id, …)`, **not** `$prev.proposal_id`. Use JSON form for nested `changeset` objects.            | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
-| `review`    | **id** (proposal UUID), **decision** (approve\|reject\|comment\|request_changes); comment                                                                                                                                                        | `{"id":"<uuid>","decision":"approve"}`                       |
-| `withdraw`  | **id** (proposal UUID)                                                                                                                                                                                                                           | `{"id":"<uuid>"}`                                            |
+| Tool        | Fields                                                                                                                                                                                                                                                                                                                                                                                                                | Example                                                      |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; entity_type, description, properties, tags, salience, annotates                                                                                                                                                                                                                                                     | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
+| `get`       | **id** — full UUID, the exact 8-char compact ID returned by a write verb, or (fallback) an exact entity name. A 9+ pure-hex prefix does not resolve; see the by-ID resolution note above                                                                                                                                                                                                                              | `{"id":"<uuid>"}`                                            |
+| `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, tags, source_id, target_id, relations, min_weight, max_weight, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read                                                                                                                                                                      | `{"kind":"entity","entity_kind":"concept","tags":["ml"]}`    |
+| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge)                                                                                                                                                                                                                                                                                                                                  | `{"id":"<uuid>","description":"Updated desc"}`               |
+| `delete`    | **id** (UUID); hard (default: false)                                                                                                                                                                                                                                                                                                                                                                                  | `{"id":"<uuid>","hard":true}`                                |
+| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union). Returns `{kept_id, removed_id, edges_rewired, …}` — no top-level `id` field. Chain as `merge(...) \| link(source_id=$prev.kept_id, …)`, **not** `$prev.id`.                                                                                                                                                                                     | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
+| `search`    | **kind** (entity\|note), **query** (text); entity_kind, entity_type, note_kind, tags, include_superseded (note), properties (entity post-filter), min_score, limit                                                                                                                                                                                                                                                    | `{"kind":"entity","query":"attention mechanism"}`            |
+| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0)                                                                                                                                                                                                                                                                                                                                                          | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
+| `neighbors` | **node_id**; direction (out\|in\|both), relations, min_weight, limit; `include_entity_type` (bool, default false — when true each neighbor carries its `entity_type` subtype field)                                                                                                                                                                                                                                   | `{"node_id":"<uuid>","direction":"both"}`                    |
+| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots; `include_properties` (bool, default false — when true each path node carries its entity `properties` map)                                                                                                                                                                                                                                      | `{"roots":["<uuid>"],"max_depth":2}`                         |
+| `query`     | **query** (GQL or SPARQL string) — **read-only**: write-shaped input (SPARQL `INSERT`/`DELETE`/`LOAD`, GQL/Cypher `CREATE`/`DELETE`/`SET`/`MERGE`) is rejected; use `create`, `update`, `link`, `merge`, `delete` to mutate                                                                                                                                                                                           | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
+| `propose`   | **kind** (entity\|note\|edge), fields for the proposed change. Returns `{id, status, proposer, title}`. Chain as `propose(...) \| review(id=$prev.id, …)`, **not** `$prev.proposal_id`. Nested objects (e.g. `changeset`) are expressible in the function-call DSL using quoted JSON-style keys (`changeset={"kind":"update_entity",...}`); unquoted JS-style keys are rejected. The full JSON batch form also works. | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
+| `review`    | **id** (proposal UUID), **decision** (approve\|reject\|comment\|request_changes); comment. Returns `{decision, id, reviewer, status}` (status = new proposal status)                                                                                                                                                                                                                                                  | `{"id":"<uuid>","decision":"approve"}`                       |
+| `withdraw`  | **id** (proposal UUID). Returns `{by, id, status}` with `status: "withdrawn"`                                                                                                                                                                                                                                                                                                                                         | `{"id":"<uuid>"}`                                            |
 
 ### When to use which retrieval verb
 
