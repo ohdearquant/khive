@@ -4049,3 +4049,166 @@ async fn register_adapter_reject_mismatching_revision() {
         "#354: rejected registration must not persist an artifact entity"
     );
 }
+
+// ── Router section-state regression tests (require lattice-router feature) ───
+//
+// These tests lock down the live handler path: section_signals sent to a
+// serving profile must seed a section posterior entry on first contact and
+// push the relevant posterior mean away from the default prior.  Without the
+// entry-seeding fix, `balanced-recall-v1` silently dropped section_signals
+// because it had no `section_states` entry, leaving the router context vector
+// frozen at static priors.
+
+#[cfg(feature = "lattice-router")]
+mod router_section_tests {
+    use super::*;
+    use khive_brain_core::{SectionPosteriorState, SectionType};
+
+    #[tokio::test]
+    async fn feedback_section_signals_seeds_balanced_recall_section_state() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // Before any feedback: `balanced-recall-v1` must NOT have a section_states
+        // entry — that is the precondition the fix corrects.
+        {
+            let state = pack.state.lock().unwrap();
+            assert!(
+                !state.section_states.contains_key("balanced-recall-v1"),
+                "section_states must not contain balanced-recall-v1 before first feedback"
+            );
+        }
+
+        // Fire feedback with section_signals; no `served_by_profile_id` defaults
+        // to `balanced-recall-v1`.
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "section_signals": {
+                    "operational_guidance": "useful"
+                }
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("feedback must succeed");
+
+        // After feedback:
+        // (a) balanced-recall-v1 must now have a section_states entry.
+        // (b) The entry must be COMPLETE — all SectionType slots present.
+        // (c) The OperationalGuidance posterior mean must have moved above the
+        //     default prior (useful signal → alpha++).
+        let state = pack.state.lock().unwrap();
+        let ss = state
+            .section_states
+            .get("balanced-recall-v1")
+            .expect("balanced-recall-v1 must have a section_states entry after first feedback");
+
+        assert_eq!(
+            ss.posteriors.len(),
+            SectionType::all().len(),
+            "section state must contain all {} SectionType slots after seeding",
+            SectionType::all().len()
+        );
+
+        let default_og_mean = SectionPosteriorState::default_priors()
+            .get(&SectionType::OperationalGuidance)
+            .expect("default_priors must include OperationalGuidance")
+            .mean();
+        let live_og_mean = ss
+            .posteriors
+            .get(&SectionType::OperationalGuidance)
+            .expect("OperationalGuidance must be present after seeding")
+            .mean();
+
+        assert!(
+            live_og_mean > default_og_mean,
+            "OperationalGuidance mean must increase after useful signal; \
+             default={default_og_mean:.4} live={live_og_mean:.4}"
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_section_signals_updates_custom_profile_with_seeded_priors() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // Create a custom profile with a high-alpha seed prior for Formalism.
+        // This verifies that the seeding path (create_profile) and the live
+        // feedback path are consistent: the seeded section state is preserved
+        // and further updated by feedback.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "test-section-custom",
+                "description": "custom profile for router section-posterior regression",
+                "consumer_kind": "recall",
+                "seed_priors": {
+                    "section_posteriors": {
+                        "formalism": {"alpha": 8.0, "beta": 2.0}
+                    }
+                }
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("brain.create_profile must succeed");
+
+        // Record the Formalism mean from the seeded state before any feedback.
+        let formalism_seeded_mean = {
+            let state = pack.state.lock().unwrap();
+            state
+                .section_states
+                .get("test-section-custom")
+                .expect("test-section-custom must have section_states after create_profile")
+                .posteriors
+                .get(&SectionType::Formalism)
+                .expect("Formalism must be present in seeded state")
+                .mean()
+        };
+
+        // Fire feedback targeting the custom profile with a useful Formalism signal.
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "served_by_profile_id": "test-section-custom",
+                "section_signals": {
+                    "formalism": "useful"
+                }
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("feedback to custom profile must succeed");
+
+        // The Formalism posterior mean must have increased from its seeded value.
+        let formalism_live_mean = {
+            let state = pack.state.lock().unwrap();
+            state
+                .section_states
+                .get("test-section-custom")
+                .expect("test-section-custom must still have section_states after feedback")
+                .posteriors
+                .get(&SectionType::Formalism)
+                .expect("Formalism must still be present after feedback")
+                .mean()
+        };
+
+        assert!(
+            formalism_live_mean > formalism_seeded_mean,
+            "Formalism posterior mean must increase after useful signal; \
+             seeded={formalism_seeded_mean:.4} live={formalism_live_mean:.4}"
+        );
+    }
+}

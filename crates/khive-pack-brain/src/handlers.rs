@@ -996,7 +996,33 @@ impl BrainPack {
                 sync_balanced_recall_record(&mut state);
             }
 
-            if let Some(section_state) = state.section_states.get_mut(serving_profile) {
+            // Ensure the serving profile has a section posterior entry.  The
+            // default `balanced-recall-v1` profile is never pre-inserted by
+            // `handle_create_profile`, so the first feedback event must seed it
+            // here using `SectionPosteriorState::new()` — which initialises from
+            // the full `default_priors()` map, not static 0.5 values.
+            // For an existing but incomplete entry (snapshot produced before a new
+            // SectionType variant was added) backfill missing slots from
+            // `default_priors()` so that `apply_signal` and the router-context
+            // snapshot both see a complete, prior-anchored posterior map.
+            {
+                let section_state = state
+                    .section_states
+                    .entry(serving_profile_owned.clone())
+                    .or_default();
+                let defaults = SectionPosteriorState::default_priors();
+                for st in SectionType::all() {
+                    if let Some(prior) = defaults.get(st) {
+                        section_state
+                            .posteriors
+                            .entry(*st)
+                            .or_insert_with(|| prior.clone());
+                        section_state
+                            .priors
+                            .entry(*st)
+                            .or_insert_with(|| prior.clone());
+                    }
+                }
                 section_state.apply_signal(&signal);
             }
 
@@ -1541,16 +1567,18 @@ fn build_context_vector(
     v[4] = temporal.mean() as f32;
     v[5] = temporal.effective_sample_size() as f32;
     // Section slots: deterministic ordering via SectionType::all().
-    let default_priors;
-    let posteriors: &std::collections::HashMap<SectionType, BetaPosterior> = match sections {
-        Some(map) => map,
-        None => {
-            default_priors = SectionPosteriorState::default_priors();
-            &default_priors
-        }
-    };
+    // Pre-compute default priors unconditionally so that slots absent from a
+    // caller-supplied partial map fall back to the configured prior mean, not
+    // an arbitrary 0.5 that would disagree with the seeded posteriors.
+    let default_priors = SectionPosteriorState::default_priors();
+    let posteriors: &std::collections::HashMap<SectionType, BetaPosterior> =
+        sections.unwrap_or(&default_priors);
     for (i, st) in SectionType::all().iter().enumerate() {
-        v[6 + i] = posteriors.get(st).map_or(0.5, |p| p.mean()) as f32;
+        let mean = posteriors
+            .get(st)
+            .or_else(|| default_priors.get(st))
+            .map_or(0.5, |p| p.mean());
+        v[6 + i] = mean as f32;
     }
     v
 }
@@ -1808,5 +1836,45 @@ mod router_tests {
                 "section slot {i} must be non-zero (default priors); got {val}",
             );
         }
+    }
+
+    /// Regression gate: a `Some(map)` that omits one SectionType must fill the
+    /// missing slot from the default prior mean, never from the bare value 0.5.
+    ///
+    /// Formalism has `BetaPosterior(1.5, 4.0)` → mean ≈ 0.273, which differs
+    /// from 0.5 by more than 0.1 and is easy to distinguish.
+    #[test]
+    fn build_context_vector_uses_prior_mean_for_missing_section_slot() {
+        // Build a partial posteriors map that intentionally omits Formalism.
+        let mut partial = SectionPosteriorState::default_priors();
+        partial.remove(&SectionType::Formalism);
+        assert!(
+            !partial.contains_key(&SectionType::Formalism),
+            "Formalism must be absent from the test map before calling the helper"
+        );
+
+        let neutral = BetaPosterior::new(2.0, 2.0);
+        let v = build_context_vector(&neutral, &neutral, &neutral, Some(&partial));
+
+        let formalism_idx = SectionType::all()
+            .iter()
+            .position(|st| *st == SectionType::Formalism)
+            .expect("Formalism must be in SectionType::all()");
+        let slot_val = v[6 + formalism_idx];
+
+        let prior_mean = SectionPosteriorState::default_priors()
+            .get(&SectionType::Formalism)
+            .expect("default_priors must include Formalism")
+            .mean() as f32;
+
+        assert!(
+            (slot_val - prior_mean).abs() < 1e-5,
+            "missing Formalism slot must use prior mean ({prior_mean:.4}), not bare 0.5; \
+             got {slot_val:.4}"
+        );
+        assert!(
+            (slot_val - 0.5_f32).abs() > 0.1,
+            "slot must NOT fall back to the bare 0.5 value; got {slot_val:.4}"
+        );
     }
 }
