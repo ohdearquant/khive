@@ -272,6 +272,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     let token = rt.authorize(Namespace::local()).expect("authorize");
     // Auto-mode requires ≥10 words; no domain_ids/atom_ids.
+    // type_weights are not reached on the ANN-degrade path (returns before section scoring).
     let result = KnowledgeHandlers::compose(
         &rt,
         &token,
@@ -279,6 +280,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
             "query": "machine learning neural network transformer attention architecture multi head self attention"
         }),
         &ann,
+        std::collections::HashMap::new(),
     )
     .await
     .expect("compose must not Err");
