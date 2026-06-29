@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
 use crate::{handlers, SessionPack, SESSION_HANDLERS};
@@ -57,6 +57,24 @@ impl PackRuntime for SessionPack {
         <SessionPack as Pack>::REQUIRES
     }
 
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "session",
+            statements: &crate::SESSION_SCHEMA_PLAN_STMTS,
+        }
+    }
+
+    async fn warm(&self) {
+        let config = crate::mirror::MirrorConfig::from_env();
+        if !config.enabled {
+            return;
+        }
+        let runtime = self.runtime().clone();
+        tokio::spawn(async move {
+            crate::mirror::run_mirror_service(runtime, config).await;
+        });
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
@@ -68,8 +86,7 @@ impl PackRuntime for SessionPack {
         match verb {
             "session.store" => handlers::store::handle_store(rt, token, params).await,
             "session.list" => handlers::list::handle_list(rt, token, params).await,
-            "session.resume" => handlers::resume::handle_resume(rt, token, params).await,
-            "session.export" => handlers::export::handle_export(rt, token, params).await,
+            "session.get" => handlers::get::handle_get(rt, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "session pack does not handle verb {verb:?}"
             ))),

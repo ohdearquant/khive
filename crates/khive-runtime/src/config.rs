@@ -304,6 +304,7 @@ impl Default for RuntimeConfig {
                     "comm",
                     "schedule",
                     "knowledge",
+                    "session",
                 ]
                 .into_iter()
                 .map(String::from)

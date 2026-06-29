@@ -63,20 +63,21 @@ async fn pack_metadata_matches_trait_consts() {
     let rt = file_rt(dir.path().join("meta.db"));
     let registry = build_registry(rt);
 
-    let verbs: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
-    assert!(
-        verbs.contains(&"session.store"),
-        "session.store not in verbs"
-    );
-    assert!(verbs.contains(&"session.list"), "session.list not in verbs");
-    assert!(
-        verbs.contains(&"session.resume"),
-        "session.resume not in verbs"
-    );
-    assert!(
-        verbs.contains(&"session.export"),
-        "session.export not in verbs"
-    );
+    // The three session verbs are registered as internal subhandlers, not on
+    // the agent-facing MCP surface, so they are absent from all_verbs() (which
+    // is Visibility::Verb only) but report true from is_subhandler_verb and
+    // remain dispatchable through the runtime registry directly.
+    let surface: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
+    for verb in ["session.store", "session.list", "session.get"] {
+        assert!(
+            !surface.contains(&verb),
+            "{verb} must NOT be on the agent-facing verb surface (subhandler)"
+        );
+        assert!(
+            registry.is_subhandler_verb(verb),
+            "{verb} must be registered as an internal subhandler"
+        );
+    }
 
     assert!(
         registry.all_note_kinds().contains(&"session"),
@@ -321,10 +322,53 @@ async fn list_since_invalid_format_returns_error() {
     assert!(err.is_err(), "invalid since must return error");
 }
 
-// ── session.resume tests ──────────────────────────────────────────────────────
+// ── session.list offset pagination ───────────────────────────────────────────
 
 #[tokio::test]
-async fn resume_returns_full_record() {
+async fn list_offset_pagination() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_offset.db"));
+    let registry = build_registry(rt);
+
+    // Store 5 sessions with small delays to produce distinct created_at values.
+    for i in 0..5 {
+        store_session(&registry, &format!("session {i}")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Retrieve the full newest-first list.
+    let all = registry
+        .dispatch("session.list", json!({"limit": 5}))
+        .await
+        .expect("full list ok");
+    let all_arr = all.as_array().expect("all array");
+    assert_eq!(all_arr.len(), 5, "expected 5 sessions");
+
+    // offset=2 limit=2 must return all[2] and all[3] in order.
+    let paged = registry
+        .dispatch("session.list", json!({"offset": 2, "limit": 2}))
+        .await
+        .expect("paged list ok");
+    let paged_arr = paged.as_array().expect("paged array");
+    assert_eq!(
+        paged_arr.len(),
+        2,
+        "expected exactly 2 items with offset=2 limit=2"
+    );
+    assert_eq!(
+        paged_arr[0]["id"], all_arr[2]["id"],
+        "offset=2 first item must match all[2]"
+    );
+    assert_eq!(
+        paged_arr[1]["id"], all_arr[3]["id"],
+        "offset=2 second item must match all[3]"
+    );
+}
+
+// ── session.get tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_returns_full_record() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume.db"));
     let registry = build_registry(rt);
@@ -333,7 +377,7 @@ async fn resume_returns_full_record() {
     let id = stored["id"].as_str().expect("id present").to_string();
 
     let resumed = registry
-        .dispatch("session.resume", json!({"id": id}))
+        .dispatch("session.get", json!({"id": id}))
         .await
         .expect("resume ok");
 
@@ -344,14 +388,14 @@ async fn resume_returns_full_record() {
 }
 
 #[tokio::test]
-async fn resume_not_found_returns_error() {
+async fn get_not_found_returns_error() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume_404.db"));
     let registry = build_registry(rt);
 
     let err = registry
         .dispatch(
-            "session.resume",
+            "session.get",
             json!({"id": "00000000-0000-0000-0000-000000000001"}),
         )
         .await;
@@ -359,102 +403,37 @@ async fn resume_not_found_returns_error() {
 }
 
 #[tokio::test]
-async fn resume_invalid_uuid_returns_error() {
+async fn get_invalid_uuid_returns_error() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume_bad_id.db"));
     let registry = build_registry(rt);
 
     let err = registry
-        .dispatch("session.resume", json!({"id": "not-a-uuid"}))
+        .dispatch("session.get", json!({"id": "not-a-uuid"}))
         .await;
     assert!(err.is_err(), "invalid UUID must return error");
 }
 
-// ── session.export tests ──────────────────────────────────────────────────────
+// ── soft-delete regression: get ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn export_json_format_returns_full_envelope() {
+async fn get_soft_deleted_returns_error() {
     let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_json.db"));
+    let rt = file_rt(dir.path().join("resume_soft_del.db"));
     let registry = build_registry(rt);
 
-    let stored = store_session(&registry, "exportable content").await;
+    let stored = store_session(&registry, "soft-delete me").await;
     let id = stored["id"].as_str().expect("id present").to_string();
 
-    let exported = registry
-        .dispatch("session.export", json!({"id": id}))
+    // Soft-delete the session note via the KG delete verb.
+    registry
+        .dispatch("delete", json!({"id": id, "kind": "session"}))
         .await
-        .expect("export json ok");
+        .expect("soft-delete ok");
 
-    assert_eq!(exported["id"], id);
-    assert_eq!(exported["kind"], "session");
-    assert_eq!(exported["content"], "exportable content");
-}
-
-#[tokio::test]
-async fn export_text_format_returns_content_string() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_text.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "text-only content").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let exported = registry
-        .dispatch("session.export", json!({"id": id, "format": "text"}))
-        .await
-        .expect("export text ok");
-
-    assert_eq!(
-        exported.as_str().expect("text format returns string"),
-        "text-only content"
+    let err = registry.dispatch("session.get", json!({"id": id})).await;
+    assert!(
+        err.is_err(),
+        "resume of a soft-deleted session must return an error"
     );
-}
-
-#[tokio::test]
-async fn export_explicit_json_format() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_json_explicit.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "json explicit").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let exported = registry
-        .dispatch("session.export", json!({"id": id, "format": "json"}))
-        .await
-        .expect("export json explicit ok");
-
-    assert!(exported.is_object(), "json format must return object");
-    assert_eq!(exported["content"], "json explicit");
-}
-
-#[tokio::test]
-async fn export_invalid_format_returns_error() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_bad_fmt.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "x").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let err = registry
-        .dispatch("session.export", json!({"id": id, "format": "yaml"}))
-        .await;
-    assert!(err.is_err(), "invalid format must return error");
-}
-
-#[tokio::test]
-async fn export_not_found_returns_error() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_404.db"));
-    let registry = build_registry(rt);
-
-    let err = registry
-        .dispatch(
-            "session.export",
-            json!({"id": "00000000-0000-0000-0000-000000000002"}),
-        )
-        .await;
-    assert!(err.is_err(), "missing session must return error");
 }

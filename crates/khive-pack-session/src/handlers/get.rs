@@ -1,4 +1,4 @@
-//! `session.resume` — fetch a single session record by UUID.
+//! `session.get` — fetch a single session record by UUID.
 
 use std::str::FromStr;
 
@@ -12,7 +12,7 @@ use super::{deser, render_session_full};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResumeParams {
+struct GetParams {
     id: String,
 }
 
@@ -21,15 +21,15 @@ struct ResumeParams {
 /// Returns the full Note record (`id`, `kind`, `content`, `properties`,
 /// `tags`, `created_at`). Returns `NotFound` if the session does not exist
 /// or has been soft-deleted.
-pub(crate) async fn handle_resume(
+pub(crate) async fn handle_get(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let p: ResumeParams = deser(params)?;
+    let p: GetParams = deser(params)?;
 
     let uuid = Uuid::from_str(&p.id).map_err(|_| {
-        RuntimeError::InvalidInput(format!("session.resume: id must be a UUID; got {:?}", p.id))
+        RuntimeError::InvalidInput(format!("session.get: id must be a UUID; got {:?}", p.id))
     })?;
 
     let note = runtime
@@ -41,7 +41,7 @@ pub(crate) async fn handle_resume(
 
     if note.kind != "session" {
         return Err(RuntimeError::InvalidInput(format!(
-            "session.resume: expected kind=\"session\", got {:?}",
+            "session.get: expected kind=\"session\", got {:?}",
             note.kind
         )));
     }

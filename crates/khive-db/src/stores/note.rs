@@ -295,6 +295,11 @@ fn build_note_filter_where(
         }
     }
 
+    if let Some(min_ts) = filter.min_created_at {
+        params.push(Box::new(min_ts));
+        conditions.push(format!("created_at >= ?{}", params.len()));
+    }
+
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 

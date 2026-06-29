@@ -275,6 +275,9 @@ pub struct NoteFilter {
     /// caller-supplied `namespace` parameter is used (backward-compatible).
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// Restrict to notes where `created_at >= min_created_at` (microseconds epoch).
+    /// `None` applies no lower-bound constraint.
+    pub min_created_at: Option<i64>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.
