@@ -502,6 +502,8 @@ mod tests {
         let cfg = RuntimeConfig {
             db_path: Some(std::path::PathBuf::from(db_path)),
             default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
