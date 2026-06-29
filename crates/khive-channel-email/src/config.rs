@@ -111,10 +111,14 @@ impl EmailChannelConfig {
         let imap_host = require_env("KHIVE_EMAIL_IMAP_HOST")?;
         let imap_port = optional_port("KHIVE_EMAIL_IMAP_PORT", 993)?;
         let username = require_env("KHIVE_EMAIL_USERNAME")?;
+        validate_sasl_string(&username, "KHIVE_EMAIL_USERNAME")?;
 
         let mailbox = match std::env::var("KHIVE_EMAIL_MAILBOX") {
-            Ok(v) if !v.is_empty() => v,
-            _ => username.clone(),
+            Ok(v) if !v.is_empty() => {
+                validate_sasl_string(&v, "KHIVE_EMAIL_MAILBOX")?;
+                v
+            }
+            _ => username.clone(), // already validated above
         };
 
         let auth = build_auth()?;
@@ -200,9 +204,83 @@ fn optional_port(key: &str, default: u16) -> Result<u16, ChannelError> {
     }
 }
 
+/// Validate a string for use in the XOAUTH2 SASL `user=` field.
+///
+/// Rejects:
+/// - empty strings
+/// - strings without `@` (i.e. not an RFC 5322 addr-spec)
+/// - any ASCII control character (U+0000–U+001F, U+007F), including the
+///   `\x01` delimiter used in the SASL payload and the `\r\n` terminators
+///   used in IMAP/SMTP line framing
+///
+/// Called at config construction time so control characters can never reach
+/// the XOAUTH2 SASL payload builder or the IMAP/SMTP connectors.
+fn validate_sasl_string(value: &str, field_name: &str) -> Result<(), ChannelError> {
+    if value.is_empty() {
+        return Err(ChannelError::Config(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+    if !value.contains('@') {
+        return Err(ChannelError::Config(format!(
+            "{field_name} must be a valid email address (no '@' found)"
+        )));
+    }
+    if value.chars().any(|c| matches!(c, '\x00'..='\x1f' | '\x7f')) {
+        return Err(ChannelError::Config(format!(
+            "{field_name} contains disallowed control characters"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // ── Env-mutation serialization (Finding 3) ────────────────────────────────
+    //
+    // Environment variables are process-global state.  Tests that set or remove
+    // them must not run concurrently or they observe each other's mutations.
+    //
+    // Strategy: a crate-local `ENV_MUTEX` serialises every env-mutating test.
+    // An `EnvSnapshot` captures prior values at test entry and restores them
+    // on drop — even if the test panics — so the mutex lock always releases
+    // with a clean env.
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII snapshot of environment variables.  On drop, each variable is
+    /// restored to its value at capture time (or removed if it was absent).
+    struct EnvSnapshot {
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvSnapshot {
+        fn capture(keys: &[&str]) -> Self {
+            Self {
+                vars: keys
+                    .iter()
+                    .map(|k| (k.to_string(), std::env::var(k).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (k, v) in &self.vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    // ── Pure-function tests (no env mutation) ─────────────────────────────────
 
     #[test]
     fn missing_required_env_returns_error() {
@@ -214,32 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn optional_port_uses_default_when_absent() {
-        std::env::remove_var("KHIVE_EMAIL_SMTP_PORT_TEST");
-        let port = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST", 587).unwrap();
-        assert_eq!(port, 587);
-    }
-
-    #[test]
-    fn optional_port_parses_set_value() {
-        std::env::set_var("KHIVE_EMAIL_SMTP_PORT_TEST2", "465");
-        let port = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST2", 587).unwrap();
-        assert_eq!(port, 465);
-        std::env::remove_var("KHIVE_EMAIL_SMTP_PORT_TEST2");
-    }
-
-    #[test]
-    fn optional_port_rejects_invalid_value() {
-        std::env::set_var("KHIVE_EMAIL_SMTP_PORT_TEST3", "notaport");
-        let result = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST3", 587);
-        assert!(result.is_err());
-        std::env::remove_var("KHIVE_EMAIL_SMTP_PORT_TEST3");
-    }
-
-    #[test]
     fn debug_output_does_not_expose_password() {
         let auth = EmailAuth::Basic {
-            password: "super-secret-credential-99".to_string(),
+            password: "super-secret-credential-99".to_string(), // gitleaks:allow
         };
         let debug_output = format!("{auth:?}");
         assert!(
@@ -257,7 +312,7 @@ mod tests {
         let auth = EmailAuth::OAuth {
             tenant_id: "fake-tenant".to_string(),
             client_id: "fake-client-id".to_string(),
-            client_secret: "ultra-secret-client-secret-99".to_string(),
+            client_secret: "ultra-secret-client-secret-99".to_string(), // gitleaks:allow
         };
         let debug_output = format!("{auth:?}");
         assert!(
@@ -279,25 +334,88 @@ mod tests {
         );
     }
 
-    // ── build_auth tests ────────────────────────────────────────────────────
+    // ── Finding 2: validate_sasl_string ──────────────────────────────────────
+
+    #[test]
+    fn validate_sasl_string_rejects_control_char_in_mailbox() {
+        // \x01 is the XOAUTH2 SASL delimiter and must be rejected.
+        let err = validate_sasl_string("user\x01@example.com", "mailbox").unwrap_err();
+        assert!(
+            err.to_string().contains("control characters"),
+            "expected control-char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_sasl_string_rejects_crlf_in_mailbox() {
+        let err = validate_sasl_string("user@example.com\r\n", "mailbox").unwrap_err();
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn validate_sasl_string_rejects_missing_at_sign() {
+        let err = validate_sasl_string("notanemail", "username").unwrap_err();
+        assert!(err.to_string().contains("'@'"));
+    }
+
+    #[test]
+    fn validate_sasl_string_rejects_empty() {
+        let err = validate_sasl_string("", "username").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn validate_sasl_string_accepts_valid_email() {
+        assert!(validate_sasl_string("leo@khive.ai", "username").is_ok());
+    }
+
+    // ── optional_port tests (env-mutating — serialized with ENV_MUTEX) ────────
+
+    #[test]
+    fn optional_port_uses_default_when_absent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&["KHIVE_EMAIL_SMTP_PORT_TEST_DEFAULT"]);
+        std::env::remove_var("KHIVE_EMAIL_SMTP_PORT_TEST_DEFAULT");
+        let port = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST_DEFAULT", 587).unwrap();
+        assert_eq!(port, 587);
+    }
+
+    #[test]
+    fn optional_port_parses_set_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&["KHIVE_EMAIL_SMTP_PORT_TEST2"]);
+        std::env::set_var("KHIVE_EMAIL_SMTP_PORT_TEST2", "465");
+        let port = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST2", 587).unwrap();
+        assert_eq!(port, 465);
+    }
+
+    #[test]
+    fn optional_port_rejects_invalid_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&["KHIVE_EMAIL_SMTP_PORT_TEST3"]);
+        std::env::set_var("KHIVE_EMAIL_SMTP_PORT_TEST3", "notaport");
+        let result = optional_port("KHIVE_EMAIL_SMTP_PORT_TEST3", 587);
+        assert!(result.is_err());
+    }
+
+    // ── build_auth tests (env-mutating — serialized with ENV_MUTEX) ───────────
+
+    const TID: &str = "KHIVE_EMAIL_OAUTH_TENANT_ID";
+    const CID: &str = "KHIVE_EMAIL_OAUTH_CLIENT_ID";
+    const CS: &str = "KHIVE_EMAIL_OAUTH_CLIENT_SECRET";
+    const PW: &str = "KHIVE_EMAIL_PASSWORD";
 
     /// Temporarily set all three OAuth vars and confirm OAuth variant is returned.
     #[test]
     fn build_auth_oauth_all_vars_present() {
-        // Isolate with unique suffix.
-        const TID: &str = "KHIVE_EMAIL_OAUTH_TENANT_ID";
-        const CID: &str = "KHIVE_EMAIL_OAUTH_CLIENT_ID";
-        const CS: &str = "KHIVE_EMAIL_OAUTH_CLIENT_SECRET";
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&[TID, CID, CS]);
 
         std::env::set_var(TID, "fake-tenant");
         std::env::set_var(CID, "fake-client-id");
-        std::env::set_var(CS, "fake-secret");
+        std::env::set_var(CS, "fake-secret"); // gitleaks:allow
 
         let result = build_auth();
-
-        std::env::remove_var(TID);
-        std::env::remove_var(CID);
-        std::env::remove_var(CS);
 
         let auth = result.expect("all three OAuth vars set must succeed");
         assert!(
@@ -309,21 +427,17 @@ mod tests {
     /// Only tenant_id and client_id present (no secret) → clear error.
     #[test]
     fn build_auth_partial_oauth_returns_error() {
-        const TID: &str = "KHIVE_EMAIL_OAUTH_TENANT_ID";
-        const CID: &str = "KHIVE_EMAIL_OAUTH_CLIENT_ID";
-        const CS: &str = "KHIVE_EMAIL_OAUTH_CLIENT_SECRET";
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&[TID, CID, CS, PW]);
 
         std::env::set_var(TID, "fake-tenant");
         std::env::set_var(CID, "fake-client-id");
         std::env::remove_var(CS);
         // Ensure KHIVE_EMAIL_PASSWORD is also absent so we land in the partial
         // branch regardless.
-        std::env::remove_var("KHIVE_EMAIL_PASSWORD");
+        std::env::remove_var(PW);
 
         let result = build_auth();
-
-        std::env::remove_var(TID);
-        std::env::remove_var(CID);
 
         assert!(result.is_err(), "partial OAuth config must return an error");
         let msg = result.unwrap_err().to_string();
@@ -336,10 +450,8 @@ mod tests {
     /// No OAuth vars and KHIVE_EMAIL_PASSWORD set → Basic variant.
     #[test]
     fn build_auth_basic_no_oauth_vars() {
-        const TID: &str = "KHIVE_EMAIL_OAUTH_TENANT_ID";
-        const CID: &str = "KHIVE_EMAIL_OAUTH_CLIENT_ID";
-        const CS: &str = "KHIVE_EMAIL_OAUTH_CLIENT_SECRET";
-        const PW: &str = "KHIVE_EMAIL_PASSWORD";
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&[TID, CID, CS, PW]);
 
         std::env::remove_var(TID);
         std::env::remove_var(CID);
@@ -347,8 +459,6 @@ mod tests {
         std::env::set_var(PW, "test-password");
 
         let result = build_auth();
-
-        std::env::remove_var(PW);
 
         let auth = result.expect("no OAuth vars + password must succeed");
         assert!(

@@ -11,6 +11,53 @@ use base64::Engine as _;
 use khive_channel::ChannelError;
 use tokio::sync::Mutex;
 
+// ──────────────────────────── OAuth error-body sanitization (Finding 1)
+
+/// Allowlisted OAuth 2.0 error codes from RFC 6749 §5.2 and Microsoft AADSTS.
+///
+/// Any code from the token endpoint that is not in this list is replaced with
+/// the opaque indicator `"oauth_error"`.  The raw response body is **never**
+/// interpolated into a returned error — it may contain credential echoes,
+/// HTML, proxy injection text, or CRLF sequences usable for log forging.
+const ALLOWED_OAUTH_ERROR_CODES: &[&str] = &[
+    "access_denied",
+    "consent_required",
+    "interaction_required",
+    "invalid_client",
+    "invalid_grant",
+    "invalid_request",
+    "invalid_scope",
+    "login_required",
+    "server_error",
+    "slow_down",
+    "temporarily_unavailable",
+    "unauthorized_client",
+    "unsupported_grant_type",
+];
+
+/// Extract and allowlist an OAuth error code from a JSON error response body.
+///
+/// Parses the standardized `error` field from the response JSON.  If the field
+/// is present and its value appears in [`ALLOWED_OAUTH_ERROR_CODES`], that
+/// static string slice is returned.  Otherwise `"oauth_error"` is returned as
+/// an opaque, safe indicator.
+///
+/// The raw `body` string is **never** returned or interpolated.
+fn sanitize_oauth_error(body: &str) -> &'static str {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(code) = val.get("error").and_then(|v| v.as_str()) {
+            if let Some(allowed) = ALLOWED_OAUTH_ERROR_CODES
+                .iter()
+                .copied()
+                .find(|&c| c == code)
+            {
+                return allowed;
+            }
+        }
+    }
+    "oauth_error"
+}
+
 // ──────────────────────────────────────────────────── XOAUTH2 SASL helpers
 
 /// Return the XOAUTH2 SASL payload as a standard base64 string.
@@ -116,6 +163,47 @@ impl TokenProvider {
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+    /// Providers may omit this field; when present it must equal `"Bearer"`
+    /// (case-insensitive).  Required by `validate_token_response`.
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+/// Validate a freshly-deserialized token response before caching it.
+///
+/// Fails closed: rejects an empty `access_token`, control characters in the
+/// token string (which would corrupt the XOAUTH2 SASL payload), a zero
+/// `expires_in`, and a `token_type` that is not `"Bearer"` when the field is
+/// present.
+fn validate_token_response(resp: &TokenResponse) -> Result<(), ChannelError> {
+    if resp.access_token.is_empty() {
+        return Err(ChannelError::Auth(
+            "OAuth2 token response: access_token is empty".to_string(),
+        ));
+    }
+    if resp
+        .access_token
+        .chars()
+        .any(|c| matches!(c, '\x00'..='\x1f' | '\x7f'))
+    {
+        return Err(ChannelError::Auth(
+            "OAuth2 token response: access_token contains disallowed control characters"
+                .to_string(),
+        ));
+    }
+    if resp.expires_in == 0 {
+        return Err(ChannelError::Auth(
+            "OAuth2 token response: expires_in must be positive".to_string(),
+        ));
+    }
+    if let Some(ref tt) = resp.token_type {
+        if !tt.eq_ignore_ascii_case("bearer") {
+            return Err(ChannelError::Auth(
+                "OAuth2 token response: token_type is not Bearer".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch an app-only OAuth2 token from Microsoft's v2 client-credentials endpoint.
@@ -145,16 +233,23 @@ async fn fetch_token(
         .map_err(|e| ChannelError::Auth(format!("OAuth2 token request failed: {e}")))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        // Read the body to extract a standardised error code; the raw body is
+        // intentionally discarded — it may contain credential echoes, HTML, or
+        // CRLF sequences usable for log injection.
+        let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
+        let error_code = sanitize_oauth_error(&body);
         return Err(ChannelError::Auth(format!(
-            "OAuth2 token endpoint returned {status}: {body}"
+            "OAuth2 token endpoint returned HTTP {status}: {error_code}"
         )));
     }
 
-    resp.json::<TokenResponse>()
+    let token_resp = resp
+        .json::<TokenResponse>()
         .await
-        .map_err(|e| ChannelError::Auth(format!("OAuth2 token response parse failed: {e}")))
+        .map_err(|e| ChannelError::Auth(format!("OAuth2 token response parse failed: {e}")))?;
+    validate_token_response(&token_resp)?;
+    Ok(token_resp)
 }
 
 // ───────────────────────────────────────────────────────────── tests
@@ -190,7 +285,7 @@ mod tests {
     fn authenticator_process_returns_raw_bytes() {
         let mut auth = XOAuth2Authenticator {
             mailbox: "m@x.io".to_string(),
-            token: "fake-token".to_string(),
+            token: "fake-token".to_string(), // gitleaks:allow
         };
         let raw = auth.process(&[]);
         // Must be the raw (NOT base64) SASL string.
@@ -207,5 +302,142 @@ mod tests {
             raw, decoded,
             "process() bytes must equal decode(xoauth2_sasl())"
         );
+    }
+
+    // ── Finding 1 regression: sanitize_oauth_error must not leak the body ────
+
+    /// A token-endpoint error body containing credential-shaped strings, a CRLF
+    /// sequence, and bearer-looking text must produce a sanitized indicator that
+    /// contains none of those strings.
+    #[test]
+    fn sanitize_oauth_error_does_not_leak_body() {
+        // Craft a body that looks like a real AADSTS error but also embeds strings
+        // that must never appear in an error message returned to callers.
+        let body = concat!(
+            r#"{"error":"invalid_client","error_description":"AADSTS70011\r\n"#,
+            r#"Authorization: Bearer leaked_bearer","access_token":"leaked_token_abc","#,
+            r#""client_secret":"leaked_secret_xyz","token_type":"Bearer"}"#
+        );
+        let code = sanitize_oauth_error(body);
+
+        // The returned code must come from the static allowlist only.
+        assert!(
+            !code.contains("access_token"),
+            "must not contain 'access_token': {code:?}"
+        );
+        assert!(
+            !code.contains("leaked_token_abc"),
+            "must not contain token value: {code:?}"
+        );
+        assert!(
+            !code.contains("client_secret"),
+            "must not contain 'client_secret': {code:?}"
+        );
+        assert!(
+            !code.contains("leaked_secret_xyz"),
+            "must not contain secret value: {code:?}"
+        );
+        assert!(!code.contains("\r\n"), "must not contain CRLF: {code:?}");
+        assert!(
+            !code.contains("leaked_bearer"),
+            "must not contain bearer-shaped text: {code:?}"
+        );
+        // The standardised error code is recognized and returned verbatim.
+        assert_eq!(code, "invalid_client");
+    }
+
+    /// An error code that is not in the allowlist must be replaced with the
+    /// opaque indicator, preventing injection of arbitrary strings.
+    #[test]
+    fn sanitize_oauth_error_rejects_unknown_codes() {
+        let xss_body = r#"{"error":"<script>alert(1)</script>"}"#;
+        assert_eq!(
+            sanitize_oauth_error(xss_body),
+            "oauth_error",
+            "unknown/dangerous error code must fall back to 'oauth_error'"
+        );
+
+        let long_body = format!(r#"{{"error":"{}"}}"#, "x".repeat(512));
+        assert_eq!(
+            sanitize_oauth_error(&long_body),
+            "oauth_error",
+            "overlong error code must fall back to 'oauth_error'"
+        );
+    }
+
+    /// A body that is not valid JSON must produce the opaque indicator.
+    #[test]
+    fn sanitize_oauth_error_handles_non_json_body() {
+        assert_eq!(
+            sanitize_oauth_error("<html>502 Bad Gateway</html>"),
+            "oauth_error"
+        );
+        assert_eq!(sanitize_oauth_error(""), "oauth_error");
+    }
+
+    // ── Finding 2: validate_token_response rejects dangerous token values ────
+
+    /// A token that contains a control character (\x01 is the XOAUTH2 delimiter)
+    /// must be rejected before being cached or used in a SASL payload.
+    #[test]
+    fn validate_token_response_rejects_control_char_in_access_token() {
+        let resp = TokenResponse {
+            access_token: "valid_prefix\x01injected".to_string(),
+            expires_in: 3600,
+            token_type: Some("Bearer".to_string()),
+        };
+        let err = validate_token_response(&resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control characters"),
+            "error must mention control characters: {msg}"
+        );
+    }
+
+    /// An empty access_token must be rejected.
+    #[test]
+    fn validate_token_response_rejects_empty_access_token() {
+        let resp = TokenResponse {
+            access_token: String::new(),
+            expires_in: 3600,
+            token_type: None,
+        };
+        let err = validate_token_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    /// expires_in == 0 must be rejected.
+    #[test]
+    fn validate_token_response_rejects_zero_expires_in() {
+        let resp = TokenResponse {
+            access_token: "valid_token_abc".to_string(), // gitleaks:allow
+            expires_in: 0,
+            token_type: None,
+        };
+        let err = validate_token_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("positive"));
+    }
+
+    /// A non-Bearer token_type must be rejected when the field is present.
+    #[test]
+    fn validate_token_response_rejects_non_bearer_token_type() {
+        let resp = TokenResponse {
+            access_token: "valid_token_abc".to_string(), // gitleaks:allow
+            expires_in: 3600,
+            token_type: Some("mac".to_string()),
+        };
+        let err = validate_token_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("Bearer"));
+    }
+
+    /// A well-formed response (Bearer, positive expires_in, clean token) must pass.
+    #[test]
+    fn validate_token_response_accepts_valid_response() {
+        let resp = TokenResponse {
+            access_token: "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            expires_in: 3600,
+            token_type: Some("Bearer".to_string()),
+        };
+        assert!(validate_token_response(&resp).is_ok());
     }
 }
