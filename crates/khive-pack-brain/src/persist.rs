@@ -489,7 +489,9 @@ pub async fn ensure_loaded(
                     .and_then(|v| v.as_str())
                     .unwrap_or("balanced-recall-v1");
 
-                if let Some(section_state) = bs.section_states.get_mut(serving_profile) {
+                {
+                    let section_state =
+                        crate::ensure_section_state_seeded(&mut bs.section_states, serving_profile);
                     section_state.apply_signal(&signal);
                 }
             }

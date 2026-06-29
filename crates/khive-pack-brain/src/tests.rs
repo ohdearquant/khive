@@ -4211,4 +4211,112 @@ mod router_section_tests {
              seeded={formalism_seeded_mean:.4} live={formalism_live_mean:.4}"
         );
     }
+
+    // ── Replay regression: section posteriors seeded on snapshot reload ────────
+    //
+    // Regression gate for the persisted event-replay path (persist.rs).
+    //
+    // Before the fix, the replay loop used `if let Some(..) = section_states.get_mut(..)`
+    // which silently dropped section signals whenever the snapshot had no entry for the
+    // serving profile.  After a restart the live state then diverged from the event log.
+    //
+    // This test constructs the divergence scenario explicitly:
+    //   1. Write a snapshot with empty section_states to the DB (simulates a snapshot
+    //      from before section_states was introduced, or before the first feedback).
+    //   2. Append a brain.feedback event with section_signals after the snapshot timestamp
+    //      so the replay loop will pick it up.
+    //   3. Create a fresh BrainPack over the same runtime (no pre-loaded state) and
+    //      trigger ensure_loaded via a dispatch.
+    //   4. Assert that the replayed state has all SectionType slots seeded AND that the
+    //      signalled section's posterior mean moved above the default prior.
+
+    #[tokio::test]
+    async fn replay_seeds_section_posteriors_for_missing_profile() {
+        use khive_brain_core::BrainState;
+        use khive_storage::event::Event as StorageEvent;
+        use khive_types::{EventKind, SubstrateKind};
+        use uuid::Uuid;
+
+        let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+        let namespace = token.namespace().as_str();
+
+        // Build and persist a snapshot with empty section_states at time T0.
+        // BrainState::new() leaves section_states empty, which is the condition
+        // that triggered the silent-drop bug in the old replay path.
+        let snapshot = BrainState::new(crate::ENTITY_CACHE_CAPACITY).to_snapshot();
+        let t0_us: i64 = 1_000;
+        crate::persist::upsert_snapshot(rt.sql().as_ref(), namespace, &snapshot, t0_us)
+            .await
+            .expect("upsert snapshot");
+
+        // Append a brain.feedback event with section_signals at time T1 > T0.
+        // The full Event struct is serialized to JSON (same wire format as
+        // persist_after_feedback writes during a live dispatch).
+        let mut ev = StorageEvent::new(
+            namespace,
+            "brain.feedback",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        ev.target_id = Some(Uuid::new_v4());
+        ev.payload = serde_json::json!({
+            "signal": "useful",
+            "section_signals": {"operational_guidance": "useful"},
+        });
+        let event_value = serde_json::to_value(&ev).expect("serialize event");
+        let t1_us: i64 = t0_us + 1_000;
+        crate::persist::append_brain_event(
+            rt.sql().as_ref(),
+            namespace,
+            "balanced-recall-v1",
+            "brain.feedback",
+            &event_value,
+            t1_us,
+        )
+        .await
+        .expect("append brain event");
+
+        // Fresh BrainPack with no pre-loaded state — ensure_loaded will do the
+        // snapshot load + event replay on the first dispatch.
+        let pack2 = crate::BrainPack::new(rt.clone());
+        let registry = empty_registry();
+        pack2
+            .dispatch("brain.profiles", serde_json::json!({}), &registry, &token)
+            .await
+            .expect("brain.profiles dispatch after replay");
+
+        // Verify that the replay path (now using ensure_section_state_seeded)
+        // produced a fully-seeded entry for balanced-recall-v1.
+        let state = pack2.state.lock().unwrap();
+        let ss = state
+            .section_states
+            .get("balanced-recall-v1")
+            .expect("balanced-recall-v1 must have a section_states entry after replay seeding");
+
+        assert_eq!(
+            ss.posteriors.len(),
+            SectionType::all().len(),
+            "replay must seed all {} SectionType slots; got {}",
+            SectionType::all().len(),
+            ss.posteriors.len()
+        );
+
+        let default_og_mean = SectionPosteriorState::default_priors()
+            .get(&SectionType::OperationalGuidance)
+            .expect("default_priors must include OperationalGuidance")
+            .mean();
+        let replayed_og_mean = ss
+            .posteriors
+            .get(&SectionType::OperationalGuidance)
+            .expect("OperationalGuidance must be present after replay seeding")
+            .mean();
+
+        assert!(
+            replayed_og_mean > default_og_mean,
+            "OperationalGuidance mean must increase after useful replay signal; \
+             default={default_og_mean:.4} replayed={replayed_og_mean:.4}"
+        );
+    }
 }

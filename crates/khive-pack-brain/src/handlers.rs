@@ -996,33 +996,13 @@ impl BrainPack {
                 sync_balanced_recall_record(&mut state);
             }
 
-            // Ensure the serving profile has a section posterior entry.  The
-            // default `balanced-recall-v1` profile is never pre-inserted by
-            // `handle_create_profile`, so the first feedback event must seed it
-            // here using `SectionPosteriorState::new()` — which initialises from
-            // the full `default_priors()` map, not static 0.5 values.
-            // For an existing but incomplete entry (snapshot produced before a new
-            // SectionType variant was added) backfill missing slots from
-            // `default_priors()` so that `apply_signal` and the router-context
-            // snapshot both see a complete, prior-anchored posterior map.
+            // Seed and backfill section posteriors, then apply the signal.
+            // Shared contract with the replay path — see `ensure_section_state_seeded`.
             {
-                let section_state = state
-                    .section_states
-                    .entry(serving_profile_owned.clone())
-                    .or_default();
-                let defaults = SectionPosteriorState::default_priors();
-                for st in SectionType::all() {
-                    if let Some(prior) = defaults.get(st) {
-                        section_state
-                            .posteriors
-                            .entry(*st)
-                            .or_insert_with(|| prior.clone());
-                        section_state
-                            .priors
-                            .entry(*st)
-                            .or_insert_with(|| prior.clone());
-                    }
-                }
+                let section_state = crate::ensure_section_state_seeded(
+                    &mut state.section_states,
+                    &serving_profile_owned,
+                );
                 section_state.apply_signal(&signal);
             }
 
