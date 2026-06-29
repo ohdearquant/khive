@@ -63,17 +63,12 @@ async fn pack_metadata_matches_trait_consts() {
     let rt = file_rt(dir.path().join("meta.db"));
     let registry = build_registry(rt);
 
-    // The four session verbs are registered as internal subhandlers, not on
+    // The three session verbs are registered as internal subhandlers, not on
     // the agent-facing MCP surface, so they are absent from all_verbs() (which
     // is Visibility::Verb only) but report true from is_subhandler_verb and
     // remain dispatchable through the runtime registry directly.
     let surface: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
-    for verb in [
-        "session.store",
-        "session.list",
-        "session.get",
-        "session.export",
-    ] {
+    for verb in ["session.store", "session.list", "session.get"] {
         assert!(
             !surface.contains(&verb),
             "{verb} must NOT be on the agent-facing verb surface (subhandler)"
@@ -373,7 +368,7 @@ async fn list_offset_pagination() {
 // ── session.get tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn resume_returns_full_record() {
+async fn get_returns_full_record() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume.db"));
     let registry = build_registry(rt);
@@ -393,7 +388,7 @@ async fn resume_returns_full_record() {
 }
 
 #[tokio::test]
-async fn resume_not_found_returns_error() {
+async fn get_not_found_returns_error() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume_404.db"));
     let registry = build_registry(rt);
@@ -408,7 +403,7 @@ async fn resume_not_found_returns_error() {
 }
 
 #[tokio::test]
-async fn resume_invalid_uuid_returns_error() {
+async fn get_invalid_uuid_returns_error() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume_bad_id.db"));
     let registry = build_registry(rt);
@@ -419,10 +414,10 @@ async fn resume_invalid_uuid_returns_error() {
     assert!(err.is_err(), "invalid UUID must return error");
 }
 
-// ── soft-delete regression: resume ───────────────────────────────────────────
+// ── soft-delete regression: get ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn resume_soft_deleted_returns_error() {
+async fn get_soft_deleted_returns_error() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("resume_soft_del.db"));
     let registry = build_registry(rt);
@@ -441,117 +436,4 @@ async fn resume_soft_deleted_returns_error() {
         err.is_err(),
         "resume of a soft-deleted session must return an error"
     );
-}
-
-// ── soft-delete regression: export ───────────────────────────────────────────
-
-#[tokio::test]
-async fn export_soft_deleted_returns_error() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_soft_del.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "export-delete me").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    // Soft-delete the session note via the KG delete verb.
-    registry
-        .dispatch("delete", json!({"id": id, "kind": "session"}))
-        .await
-        .expect("soft-delete ok");
-
-    let err = registry.dispatch("session.export", json!({"id": id})).await;
-    assert!(
-        err.is_err(),
-        "export of a soft-deleted session must return an error"
-    );
-}
-
-// ── session.export tests ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn export_json_format_returns_full_envelope() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_json.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "exportable content").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let exported = registry
-        .dispatch("session.export", json!({"id": id}))
-        .await
-        .expect("export json ok");
-
-    assert_eq!(exported["id"], id);
-    assert_eq!(exported["kind"], "session");
-    assert_eq!(exported["content"], "exportable content");
-}
-
-#[tokio::test]
-async fn export_text_format_returns_content_string() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_text.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "text-only content").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let exported = registry
-        .dispatch("session.export", json!({"id": id, "format": "text"}))
-        .await
-        .expect("export text ok");
-
-    assert_eq!(
-        exported.as_str().expect("text format returns string"),
-        "text-only content"
-    );
-}
-
-#[tokio::test]
-async fn export_explicit_json_format() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_json_explicit.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "json explicit").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let exported = registry
-        .dispatch("session.export", json!({"id": id, "format": "json"}))
-        .await
-        .expect("export json explicit ok");
-
-    assert!(exported.is_object(), "json format must return object");
-    assert_eq!(exported["content"], "json explicit");
-}
-
-#[tokio::test]
-async fn export_invalid_format_returns_error() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_bad_fmt.db"));
-    let registry = build_registry(rt);
-
-    let stored = store_session(&registry, "x").await;
-    let id = stored["id"].as_str().expect("id present").to_string();
-
-    let err = registry
-        .dispatch("session.export", json!({"id": id, "format": "yaml"}))
-        .await;
-    assert!(err.is_err(), "invalid format must return error");
-}
-
-#[tokio::test]
-async fn export_not_found_returns_error() {
-    let dir = TempDir::new().expect("tempdir");
-    let rt = file_rt(dir.path().join("export_404.db"));
-    let registry = build_registry(rt);
-
-    let err = registry
-        .dispatch(
-            "session.export",
-            json!({"id": "00000000-0000-0000-0000-000000000002"}),
-        )
-        .await;
-    assert!(err.is_err(), "missing session must return error");
 }

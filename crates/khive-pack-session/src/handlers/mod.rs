@@ -1,8 +1,11 @@
 //! Verb handlers for the session pack, one file per verb.
 
+// Serialization is not a dispatchable verb (no `HandlerDef` entry); `handle_export`
+// is a forward-deployed in-process helper, kept until the export call site lands.
+#[allow(dead_code)]
 pub(crate) mod export;
+pub(crate) mod get;
 pub(crate) mod list;
-pub(crate) mod resume;
 pub(crate) mod store;
 
 use khive_runtime::{micros_to_iso, RuntimeError};
@@ -31,7 +34,7 @@ pub(crate) fn render_session_summary(note: &Note) -> Value {
     })
 }
 
-/// Full session envelope for store, resume, and export responses.
+/// Full session envelope for store, get, and export responses.
 pub(crate) fn render_session_full(note: &Note) -> Value {
     let props = note.properties.clone().unwrap_or_else(|| json!({}));
     let agent_id = props.get("agent_id").cloned().unwrap_or(Value::Null);

@@ -3,10 +3,8 @@
 //! Every function here is deterministic and side-effect-free so the unit tests
 //! can run without any runtime or DB setup.
 
-use std::sync::LazyLock;
-
 use chrono::DateTime;
-use regex::Regex;
+use khive_runtime::secret_gate;
 use serde_json::Value;
 
 /// A single parsed event from a CC session JSONL file.
@@ -36,32 +34,6 @@ pub struct ParsedEvent {
     pub git_branch: Option<String>,
     /// `slug` if present.
     pub slug: Option<String>,
-}
-
-/// Compiled secret-masking pattern (built once, reused for every line).
-///
-/// Order matters: longer/more-specific prefixes first to avoid partial matches.
-///
-/// Note: regular string literal (not raw) so that `\<newline><whitespace>` is a
-/// Rust string-continuation (stripping the newline and leading whitespace).
-/// A raw `r"..."` string would make those backslashes literal regex characters.
-static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        "sk-ant-[A-Za-z0-9_-]+\
-         |sk-[A-Za-z0-9]{20,}\
-         |github_pat_[A-Za-z0-9_]+\
-         |ghp_[A-Za-z0-9]+\
-         |gho_[A-Za-z0-9]+\
-         |AKIA[0-9A-Z]{16}\
-         |xox[baprs]-[A-Za-z0-9-]+\
-         |AIza[0-9A-Za-z_-]{35}",
-    )
-    .expect("secret regex is valid")
-});
-
-/// Replace all recognized secret token shapes with `***MASKED***`.
-fn mask_secrets(s: &str) -> String {
-    SECRET_RE.replace_all(s, "***MASKED***").into_owned()
 }
 
 /// Parse one CC JSONL line.
@@ -135,9 +107,11 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
         }
     };
 
-    // Apply masking to raw line and to the extracted text.
-    let raw = mask_secrets(trimmed);
-    let text = text.map(|t| mask_secrets(&t));
+    // Apply masking to the raw line and the extracted text, reusing the
+    // canonical write-time secret detector (khive-runtime) — never a second,
+    // weaker masker.
+    let raw = secret_gate::mask_secrets(trimmed).into_owned();
+    let text = text.map(|t| secret_gate::mask_secrets(&t).into_owned());
 
     Some(ParsedEvent {
         uuid,

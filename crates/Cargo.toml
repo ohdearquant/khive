@@ -58,7 +58,6 @@ categories = ["database", "command-line-utilities"]
 inventory = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-regex = "1"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }

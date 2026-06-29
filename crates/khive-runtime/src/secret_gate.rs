@@ -123,17 +123,106 @@ fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 
+/// Marker substituted for a detected secret span by [`mask_secrets`].
+const REDACTION_MARKER: &str = "***MASKED***";
+
+/// Return the LEFTMOST secret in `text` as `(matched_slice, detector)`.
+///
+/// The matched slice borrows from `text`, so the caller can recover its byte
+/// span via pointer arithmetic — this is what lets [`mask_secrets`] redact in
+/// place while [`scan`] only needs the masked excerpt.
+///
+/// "Leftmost" (smallest start offset), NOT first-by-detector-priority, is the
+/// load-bearing contract: [`mask_secrets`] copies the text *before* each match
+/// verbatim, so a non-leftmost match would leak an earlier secret detected by a
+/// lower-priority detector (e.g. an `sk-ant-` key sitting to the left of a
+/// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
+fn scan_match(text: &str) -> Option<(&str, &'static str)> {
+    let base = text.as_ptr() as usize;
+    // Layer 1: known prefix / shape patterns (already leftmost across detectors).
+    let mut best = check_known_patterns(text);
+    // Layer 2: entropy heuristic on long tokens near trigger words — kept only
+    // if it sits to the left of the best known match.
+    keep_leftmost(&mut best, check_entropy_heuristic(text), base);
+    best
+}
+
+/// Replace `best` with `cand` when `cand` starts earlier in the original text
+/// (`base` is the start address of that text). On a tie the incumbent wins, so
+/// callers offer more-specific detectors first. This is what makes
+/// [`check_known_patterns`] and [`scan_match`] return the leftmost secret span
+/// rather than the first detector that happens to match anywhere.
+fn keep_leftmost<'a>(
+    best: &mut Option<(&'a str, &'static str)>,
+    cand: Option<(&'a str, &'static str)>,
+    base: usize,
+) {
+    if let Some((slice, name)) = cand {
+        let start = slice.as_ptr() as usize - base;
+        let replace = match *best {
+            Some((incumbent, _)) => start < (incumbent.as_ptr() as usize - base),
+            None => true,
+        };
+        if replace {
+            *best = Some((slice, name));
+        }
+    }
+}
+
 /// Return the first `SecretMatch` found in `text`, or `None`.
 fn scan(text: &str) -> Option<SecretMatch> {
-    // Layer 1: known prefix / shape patterns (no allocation per check).
-    if let Some(m) = check_known_patterns(text) {
-        return Some(m);
+    scan_match(text).map(|(slice, detector)| build_match(detector, slice))
+}
+
+/// Redact every detected secret span in `text`, replacing each with
+/// `***MASKED***`.
+///
+/// This is the masking counterpart to [`check`]: where `check` hard-blocks a
+/// write on the first match, `mask_secrets` is for content that must be STORED
+/// with credentials stripped (the session mirror). A transcript line cannot be
+/// rejected wholesale, so each credential span is replaced in place while the
+/// surrounding prose is preserved. It reuses the SAME canonical detector set as
+/// `check`/`scan`, so callers must never maintain a second, weaker masker.
+///
+/// Returns `Cow::Borrowed` when no secret is present (the common case), avoiding
+/// an allocation. Detection runs left to right; after a span is redacted the
+/// scan resumes past it, so a high-entropy value whose only trigger word sat to
+/// the left of an earlier-redacted secret may be missed. The known-prefix
+/// detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
+/// Stripe, …) are context-free and unaffected.
+pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
+    if scan_match(text).is_none() {
+        return std::borrow::Cow::Borrowed(text);
     }
-    // Layer 2: entropy heuristic on long tokens near trigger words.
-    if let Some(m) = check_entropy_heuristic(text) {
-        return Some(m);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        match scan_match(rest) {
+            Some((sub, _detector)) => {
+                let start = sub.as_ptr() as usize - rest.as_ptr() as usize;
+                // The prefix detectors return whitespace-delimited tokens, so a
+                // credential glued to structural punctuation (JSON quotes/braces,
+                // sentence commas) carries that trailing punctuation into the
+                // match. Trim a conservative trailing set that can never be part
+                // of a credential, so redacting does not consume surrounding JSON
+                // or prose structure. `=` `/` `+` `.` `-` `_` are intentionally
+                // NOT trimmed — they are valid base64/JWT/key characters.
+                let core_len = sub
+                    .trim_end_matches(['"', '\'', '`', '}', ']', ')', ',', ';'])
+                    .len();
+                let end = start + core_len.max(1);
+                out.push_str(&rest[..start]);
+                out.push_str(REDACTION_MARKER);
+                cursor += end;
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
     }
-    None
+    std::borrow::Cow::Owned(out)
 }
 
 // ─── Layer 1: known patterns ─────────────────────────────────────────────────
@@ -179,19 +268,29 @@ const PREFIX_DETECTORS: &[(&str, &str, usize)] = &[
 const SK_SAFE_PREFIXES: &[&str] = &["sk-learn", "sk-image", "sk-lego", "sk-base", "sk-misc"];
 
 /// Shape-based patterns checked with custom logic.
-fn check_known_patterns(text: &str) -> Option<SecretMatch> {
+///
+/// Returns the LEFTMOST match across every detector (see [`keep_leftmost`]). The
+/// detectors are still offered in priority order, so two detectors that match at
+/// the SAME offset (e.g. bare `sk-` and the more-specific `sk-ant-`) resolve to
+/// the first-offered one.
+fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
+    let base = text.as_ptr() as usize;
+    let mut best: Option<(&str, &'static str)> = None;
+
     // --- Prefix patterns ---
     for &(name, needle, min_len) in PREFIX_DETECTORS {
-        if let Some(m) = find_prefix_token(text, needle, min_len) {
-            return Some(build_match(name, m));
-        }
+        keep_leftmost(
+            &mut best,
+            find_prefix_token(text, needle, min_len).map(|m| (m, name)),
+            base,
+        );
     }
 
     // --- Bare `sk-` (after all more-specific sk- detectors above) ---
     // Require length ≥ 30 AND exclude known safe scikit/library compound words.
     if let Some(token) = find_prefix_token(text, "sk-", 30) {
         if !SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe)) {
-            return Some(build_match("openai-api-key", token));
+            keep_leftmost(&mut best, Some((token, "openai-api-key")), base);
         }
     }
 
@@ -211,7 +310,7 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
             let payload = extract_token(&text[payload_start..]);
             if payload.len() >= 4 {
                 let candidate = &text[pos..payload_start + payload.len()];
-                return Some(build_match("fly-token", candidate));
+                keep_leftmost(&mut best, Some((candidate, "fly-token")), base);
             }
         }
     }
@@ -233,22 +332,22 @@ fn check_known_patterns(text: &str) -> Option<SecretMatch> {
                 })
                 .unwrap_or(text.len());
             let excerpt = &text[pos..block_end];
-            return Some(build_match("pem-private-key", excerpt));
+            keep_leftmost(&mut best, Some((excerpt, "pem-private-key")), base);
         }
     }
 
     // --- JWT triple: eyJ...eyJ...eyJ (header.payload.signature) ---
     // A JWT starts with "eyJ" (base64url of `{"`) and has exactly two dots.
-    if let Some(m) = find_jwt(text) {
-        return Some(build_match("jwt", m));
-    }
+    keep_leftmost(&mut best, find_jwt(text).map(|m| (m, "jwt")), base);
 
     // --- URL userinfo: scheme://user:pass@host ---
-    if let Some(m) = find_url_userinfo(text) {
-        return Some(build_match("url-userinfo", m));
-    }
+    keep_leftmost(
+        &mut best,
+        find_url_userinfo(text).map(|m| (m, "url-userinfo")),
+        base,
+    );
 
-    None
+    best
 }
 
 /// Locate the first token in `text` that starts with `needle` and has a
@@ -407,7 +506,7 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
-fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
+fn check_entropy_heuristic(text: &str) -> Option<(&str, &'static str)> {
     // Tokenize into maximal ASCII non-whitespace runs, recording each run's byte
     // offset.  Non-ASCII characters are delimiters (alongside ASCII whitespace):
     // real base64/hex/base64url credentials are ASCII, so splitting on non-ASCII
@@ -471,7 +570,7 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
         // and are already allowed via the `!near_trigger && is_pure_hex` path.
         const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
         if near_trigger && is_pure_hex(token) && HEX_CREDENTIAL_LENGTHS.contains(&token.len()) {
-            return Some(build_match("hex-credential-token", token));
+            return Some((token, "hex-credential-token"));
         }
 
         let entropy = shannon_entropy(token.as_bytes());
@@ -481,7 +580,7 @@ fn check_entropy_heuristic(text: &str) -> Option<SecretMatch> {
 
         // High-entropy token in trigger context — flag it.
         if near_trigger {
-            return Some(build_match("high-entropy-token", token));
+            return Some((token, "high-entropy-token"));
         }
     }
     None
@@ -1849,5 +1948,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── mask_secrets: in-place redaction reusing the canonical detector ───────
+
+    #[test]
+    fn mask_secrets_borrows_clean_text() {
+        let clean = "The FlashAttention paper introduces IO-aware tiling.";
+        let masked = mask_secrets(clean);
+        assert!(
+            matches!(masked, std::borrow::Cow::Borrowed(_)),
+            "clean text must not allocate"
+        );
+        assert_eq!(masked, clean);
+    }
+
+    #[test]
+    fn mask_secrets_redacts_shapes_the_old_mirror_regex_missed() {
+        // These are exactly the detectors the session mirror's local regex did
+        // NOT cover — the Critical finding driving the move to this shared masker.
+        let cases = [
+            "key: sk-proj-FAKEKEY00000000000000000000000000000000", // gitleaks:allow
+            "cred ASIAFAKEKEY00000000000",                          // gitleaks:allow
+            "stripe sk_live_FAKESTRIPE0000000000000",               // gitleaks:allow
+            "db postgresql://dbuser:S3cr3tP4ss@db.example.com/db",  // gitleaks:allow
+        ];
+        for c in &cases {
+            let masked = mask_secrets(c);
+            assert!(
+                masked.contains(REDACTION_MARKER),
+                "must redact: {c:?} -> {masked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_secrets_redacts_every_span_and_keeps_prose() {
+        let line =
+            "first sk-ant-api03-AAAAAAAAAAAAAAA then ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end";
+        let masked = mask_secrets(line);
+        assert!(
+            !masked.contains("sk-ant-api03") && !masked.contains("ghp_AAAA"),
+            "no secret may survive: {masked}"
+        );
+        assert_eq!(
+            masked.matches(REDACTION_MARKER).count(),
+            2,
+            "both secrets must be redacted: {masked}"
+        );
+        assert!(masked.starts_with("first "), "prose preserved: {masked}");
+        assert!(masked.ends_with(" end"), "prose preserved: {masked}");
+    }
+
+    #[test]
+    fn mask_secrets_output_passes_check() {
+        // The masked output must itself be clean — no credential left for the
+        // write-time gate to catch.
+        let line = "token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and AKIAFAKEKEY1234567890";
+        let masked = mask_secrets(line).into_owned();
+        assert!(
+            check(&masked).is_ok(),
+            "masked output must pass the gate: {masked}"
+        );
+    }
+
+    #[test]
+    fn mask_secrets_redacts_entropy_secret_left_of_known_secret() {
+        // Cross-layer leftmost regression: a Layer-2 entropy secret sits to the
+        // LEFT of a Layer-1 known-prefix secret. A scan that short-circuits on
+        // the first known match (or returns first-by-detector-priority) would
+        // redact `ghp_…` and copy the entropy token before it verbatim — leaking
+        // it. `scan_match` must fold both layers through leftmost selection.
+        let line =
+            "secret=Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM and ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // gitleaks:allow
+        let masked = mask_secrets(line).into_owned();
+        assert!(
+            !masked.contains("Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM") && !masked.contains("ghp_AAAA"),
+            "neither the entropy secret nor the known secret may survive: {masked}"
+        );
+        assert_eq!(
+            masked.matches(REDACTION_MARKER).count(),
+            2,
+            "both secrets must be redacted exactly once: {masked}"
+        );
+        assert!(
+            check(&masked).is_ok(),
+            "masked output must pass the gate: {masked}"
+        );
     }
 }

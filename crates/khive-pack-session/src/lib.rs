@@ -1,8 +1,10 @@
 //! khive-pack-session — session storage pack for the khive runtime.
 //!
-//! Registers the `session` note kind and four internal subhandlers:
-//! `session.store`, `session.list`, `session.get`, `session.export`
+//! Registers the `session` note kind and three internal subhandlers:
+//! `session.store`, `session.list`, `session.get`
 //! (operator-only this milestone — see `vocab::SESSION_HANDLERS`).
+//! Serialization (`handlers::export::handle_export`) is an in-process helper,
+//! not a dispatchable verb.
 //!
 //! The pack's active feature is a background mirror service (`warm` hook) that
 //! live-tails Claude Code session JSONL transcripts into the pack's auxiliary

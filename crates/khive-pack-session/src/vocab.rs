@@ -45,19 +45,22 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
 
 /// Handler table for the session pack.
 ///
-/// All four verbs are `Visibility::Subhandler` (operator-only, NOT on the
+/// All three verbs are `Visibility::Subhandler` (operator-only, NOT on the
 /// agent-facing MCP `request` surface) for this milestone. The session pack's
 /// only active feature is the background daemon mirror (the `warm()` hook),
 /// which runs independent of verb visibility. The read/query layer
-/// (store/list/get/export) is deferred — it stays dispatchable via the runtime
-/// and `kkernel call` but is withheld from the agent surface until the
+/// (store/list/get) is deferred — it stays dispatchable via the runtime and
+/// `kkernel call` but is withheld from the agent surface until the
 /// session-continuity query UX is designed. Flip to `Visibility::Verb` to
 /// expose (and bump the smoke-test verb count accordingly).
 ///
+/// Serialization is NOT a verb: `handle_export` is an internal helper called
+/// in-process, not dispatched through the DSL, so it has no `HandlerDef` entry.
+///
 /// Speech-act categories follow ADR-025:
 ///   - `session.store` is a Directive (requests storage of content).
-///   - `session.list`, `session.get`, `session.export` are Assertive (retrieve state).
-pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
+///   - `session.list`, `session.get` are Assertive (retrieve state).
+pub(crate) static SESSION_HANDLERS: [HandlerDef; 3] = [
     HandlerDef {
         name: "session.store",
         description: "Store a session record (transcript, context snapshot, or accumulated agent state)",
@@ -133,26 +136,6 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 param_type: "uuid",
                 required: true,
                 description: "Session UUID.",
-            },
-        ],
-    },
-    HandlerDef {
-        name: "session.export",
-        description: "Serialize a session record for downstream use",
-        visibility: Visibility::Subhandler,
-        category: VerbCategory::Assertive,
-        params: &[
-            ParamDef {
-                name: "id",
-                param_type: "uuid",
-                required: true,
-                description: "Session UUID.",
-            },
-            ParamDef {
-                name: "format",
-                param_type: "string",
-                required: false,
-                description: "Export format: \"json\" (default) returns the full Note envelope; \"text\" returns content only.",
             },
         ],
     },

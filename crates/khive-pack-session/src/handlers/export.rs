@@ -1,4 +1,9 @@
-//! `session.export` — serialize a session record for downstream use.
+//! Session serialization — an in-process helper, NOT a dispatchable verb.
+//!
+//! `handle_export` serializes a session record for downstream use. It is called
+//! directly in-process (no `HandlerDef`, no DSL dispatch arm): serialization is
+//! a function, not a speech act. Forward-deployed until the in-process call site
+//! lands; `#[allow(dead_code)]` on the module re-export covers the interim.
 
 use std::str::FromStr;
 

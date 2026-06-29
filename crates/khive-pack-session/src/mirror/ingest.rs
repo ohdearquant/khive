@@ -126,17 +126,19 @@ pub async fn mirror_file(
             now_us
         };
 
-        // ── sessions upsert ───────────────────────────────────────────────────
+        // ── sessions row: create-only ─────────────────────────────────────────
+        //
+        // First sight of a session creates the row (first_seen_at = last_seen_at =
+        // this event's timestamp). Replays are a cheap no-op (`DO NOTHING`), so a
+        // pass that inserts no new messages writes no session metadata at all —
+        // strict replay idempotency. `last_seen_at` is advanced below, but only
+        // when a genuinely new message lands.
         tx.execute(SqlStatement {
             sql: "INSERT INTO sessions \
                   (id, provider_session_id, source, cwd, git_branch, slug, \
                    message_count, first_seen_at, last_seen_at, namespace) \
                   VALUES(?1, ?1, 'claude_code', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
-                  ON CONFLICT(id) DO UPDATE SET \
-                    last_seen_at=excluded.last_seen_at, \
-                    cwd=COALESCE(excluded.cwd, sessions.cwd), \
-                    git_branch=COALESCE(excluded.git_branch, sessions.git_branch), \
-                    slug=COALESCE(excluded.slug, sessions.slug)"
+                  ON CONFLICT(id) DO NOTHING"
                 .into(),
             params: vec![
                 SqlValue::Text(ev.session_id.clone()),
@@ -154,10 +156,10 @@ pub async fn mirror_file(
                     .unwrap_or(SqlValue::Null),
                 SqlValue::Integer(created_at),
             ],
-            label: Some("session_mirror_upsert_session".into()),
+            label: Some("session_mirror_create_session".into()),
         })
         .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror_file: session upsert: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("mirror_file: session create: {e}")))?;
 
         // ── session_messages insert (idempotent) ──────────────────────────────
         let affected = tx
@@ -194,33 +196,74 @@ pub async fn mirror_file(
             .await
             .map_err(|e| RuntimeError::Internal(format!("mirror_file: message insert: {e}")))?;
 
+        // ── advance session metadata ONLY when a new message landed ────────────
+        //
+        // Keeps `last_seen_at` monotonic (`MAX`) so a timestamp-missing replay
+        // (whose `created_at` fell back to `now_us`) cannot move it forward, and
+        // backfills metadata that may have been NULL at create time. A pure
+        // replay (`affected == 0`) touches nothing.
+        if affected > 0 {
+            tx.execute(SqlStatement {
+                sql: "UPDATE sessions SET \
+                        last_seen_at=MAX(last_seen_at, ?2), \
+                        cwd=COALESCE(cwd, ?3), \
+                        git_branch=COALESCE(git_branch, ?4), \
+                        slug=COALESCE(slug, ?5) \
+                      WHERE id=?1"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ev.session_id.clone()),
+                    SqlValue::Integer(created_at),
+                    ev.cwd
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                    ev.git_branch
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                    ev.slug
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                ],
+                label: Some("session_mirror_touch_session".into()),
+            })
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("mirror_file: session touch: {e}")))?;
+        }
+
         inserted += affected;
         last_session_id = Some(ev.session_id.clone());
     }
 
     // ── refresh message_count for each distinct session ───────────────────────
     //
-    // In practice one JSONL file maps to one session_id, but we refresh
-    // every session_id we touched to stay correct even if that changes.
-    let mut seen_sessions: Vec<String> = events
-        .iter()
-        .map(|e| e.session_id.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    seen_sessions.sort(); // deterministic order for tests
+    // In practice one JSONL file maps to one session_id, but we refresh every
+    // session_id we touched to stay correct even if that changes. Skipped
+    // entirely on a pure replay (`inserted == 0`): the counts cannot have
+    // changed, so writing them would be needless churn.
+    if inserted > 0 {
+        let mut seen_sessions: Vec<String> = events
+            .iter()
+            .map(|e| e.session_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        seen_sessions.sort(); // deterministic order for tests
 
-    for sid in &seen_sessions {
-        tx.execute(SqlStatement {
-            sql: "UPDATE sessions SET message_count=\
-                  (SELECT COUNT(*) FROM session_messages WHERE session_id=?1) \
-                  WHERE id=?1"
-                .into(),
-            params: vec![SqlValue::Text(sid.clone())],
-            label: Some("session_mirror_refresh_count".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror_file: count refresh: {e}")))?;
+        for sid in &seen_sessions {
+            tx.execute(SqlStatement {
+                sql: "UPDATE sessions SET message_count=\
+                      (SELECT COUNT(*) FROM session_messages WHERE session_id=?1) \
+                      WHERE id=?1"
+                    .into(),
+                params: vec![SqlValue::Text(sid.clone())],
+                label: Some("session_mirror_refresh_count".into()),
+            })
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("mirror_file: count refresh: {e}")))?;
+        }
     }
 
     // ── cursor upsert ─────────────────────────────────────────────────────────
@@ -410,6 +453,31 @@ mod tests {
         )
     }
 
+    /// A user line with NO `timestamp` field — `created_at` falls back to `now_us`.
+    fn user_line_no_ts(uuid: &str, session_id: &str, text: &str) -> String {
+        format!(
+            r#"{{"uuid":"{uuid}","sessionId":"{session_id}","type":"user","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    /// Retrieve the stored `last_seen_at` for a session id.
+    async fn last_seen_at(rt: &KhiveRuntime, session_id: &str) -> Option<i64> {
+        let sql = rt.sql();
+        let mut r = sql.reader().await.expect("reader");
+        let row = r
+            .query_row(SqlStatement {
+                sql: "SELECT last_seen_at FROM sessions WHERE id=?1".into(),
+                params: vec![SqlValue::Text(session_id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("last_seen query")?;
+        match row.columns.first().map(|c| &c.value) {
+            Some(SqlValue::Integer(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn test_mirror_three_lines_and_idempotency() {
         let (rt, _dir) = setup().await;
@@ -527,6 +595,36 @@ mod tests {
         // Incremental: call from first call's new_offset; the second line is the dup.
         let s3 = mirror_file(&rt, &path, s1.new_offset).await.unwrap();
         assert_eq!(s3.inserted, 0, "incremental dup must also insert 0");
+    }
+
+    #[tokio::test]
+    async fn test_replay_does_not_mutate_session_metadata() {
+        // Regression for the replay-idempotency finding: a timestamp-missing
+        // event's `created_at` falls back to `now_us`, which differs between
+        // calls. A pure replay (0 new messages) must NOT advance `last_seen_at`
+        // or otherwise touch the session row.
+        let (rt, _dir) = setup().await;
+
+        let line = user_line_no_ts("uuid-nts", "sess-NTS", "no timestamp here");
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        writeln!(file, "{line}").unwrap();
+        let path = file.path().to_path_buf();
+
+        let s1 = mirror_file(&rt, &path, 0).await.unwrap();
+        assert_eq!(s1.inserted, 1);
+        let seen_after_first = last_seen_at(&rt, "sess-NTS")
+            .await
+            .expect("session row exists");
+
+        // Replay from offset 0: re-scans the same line, inserts 0, and must
+        // leave last_seen_at byte-identical even though now_us has advanced.
+        let s2 = mirror_file(&rt, &path, 0).await.unwrap();
+        assert_eq!(s2.inserted, 0, "replay must insert 0 rows");
+        let seen_after_replay = last_seen_at(&rt, "sess-NTS").await.unwrap();
+        assert_eq!(
+            seen_after_first, seen_after_replay,
+            "replay must not advance last_seen_at for a timestamp-missing event"
+        );
     }
 
     #[tokio::test]

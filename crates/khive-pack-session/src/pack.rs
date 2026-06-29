@@ -86,8 +86,7 @@ impl PackRuntime for SessionPack {
         match verb {
             "session.store" => handlers::store::handle_store(rt, token, params).await,
             "session.list" => handlers::list::handle_list(rt, token, params).await,
-            "session.get" => handlers::resume::handle_resume(rt, token, params).await,
-            "session.export" => handlers::export::handle_export(rt, token, params).await,
+            "session.get" => handlers::get::handle_get(rt, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "session pack does not handle verb {verb:?}"
             ))),
