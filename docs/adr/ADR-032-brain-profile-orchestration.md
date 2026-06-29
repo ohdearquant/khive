@@ -709,6 +709,72 @@ variants they knew about; new bindings get the new variant. Renaming on the latt
 side without coordinating with khive is the failure mode lattice ADR-008's "Risks"
 section calls out; this enum is khive's defence against it.
 
+#### 6.4 Router-state persistence (`router_state` + `adapter_set`)
+
+Amendment (2026-06-29): the adaptive-brain router (issue #343) overlays a per-profile
+gate network on the Bayesian posteriors — a learned mixing function that, given a
+profile's posterior context vector (issue #352), routes over a set of registered
+micro-LoRA adapters. Two pieces of that router must survive a process restart alongside
+the posteriors: the gate's own learned state, and the set of adapters the gate may mix.
+Both attach to `BrainStateSnapshot` (and its live mirror `BrainState`, §2) as additive,
+per-profile fields. The namespace snapshot is persisted as a JSON blob
+(`brain_profile_snapshots.snapshot_json`, §6.1), so each new field carries
+`#[serde(default)]` and every pre-existing snapshot deserializes unchanged with empty
+maps. No schema migration is required.
+
+```rust
+pub struct BrainStateSnapshot {
+    // ... existing fields (profiles, balanced_recall, profile_states, bindings, section_states) ...
+    #[serde(default)]
+    pub router_state: HashMap<String, RouterStateBlob>,    // key = profile_id
+    #[serde(default)]
+    pub adapter_set: HashMap<String, Vec<AdapterRecord>>,  // key = profile_id
+}
+
+pub struct RouterStateBlob {
+    pub schema_version: u32,
+    pub gate_bytes: Vec<u8>,   // opaque to brain; owned/(de)serialized by the gate engine
+}
+
+pub struct AdapterRecord {
+    pub adapter_id: String,
+    pub slot: u32,
+    pub content_hash: String,
+}
+```
+
+Both maps are keyed by `profile_id`, the same key space as `profile_states` and
+`section_states`. A profile with no continual-learning state simply has no `router_state`
+entry — absence, not a sentinel. The per-profile shape is required, not cosmetic: the
+gate is resolved per serving profile, so a single shared blob could not serve two
+profiles whose gates have diverged.
+
+`gate_bytes` is opaque to brain. The gate network's internal layout — its weights, and
+the diagonal Fisher information and replay buffer an EWC-style continual-learning update
+needs — is owned and (de)serialized by the engine that trains the gate (lattice), not by
+brain. Brain stores the byte string verbatim and never parses it. `schema_version` is the
+engine's own envelope version: the engine may evolve its blob format and bump the version
+without a brain ADR or a lockstep release, because brain only ever stores and returns
+whatever bytes and version it was handed. This is a one-schema, two-consumers contract:
+
+- Write side (brain): on snapshot, brain serializes the engine-provided `gate_bytes`
+  verbatim into the profile's `router_state` entry and populates `adapter_set` from the
+  records written by `register_adapter` (issue #354). Brain never inspects `gate_bytes`.
+- Read side (engine restore): `brain.profile` returns `router_state.gate_bytes` untouched;
+  the engine deserializes its own format (gate weights + Fisher + replay) from the blob and
+  restores its router. Brain never parses it.
+
+`AdapterRecord`, by contrast, is brain-native: brain owns adapter identity (`adapter_id`),
+the gate-output `slot` it occupies, and the `content_hash` integrity tag that
+`register_adapter` validates against the active base-model revision (issue #354). The
+adapter's weights live in the artifact/export layer, not in the snapshot.
+
+The boundary stays clean in both directions: brain owns the registry and the posterior
+state; the engine owns the gate's learned internals; the snapshot is the single serialized
+surface that carries both across a restart. If brain-side introspection of the gate
+internals is ever wanted, promoting `gate_bytes` to typed fields is a non-breaking
+additive change (further `#[serde(default)]` fields), so starting opaque costs nothing.
+
 ### 7. Snapshot and delta substrate
 
 Profile state persists via `ruvector-snapshot::SnapshotManager` with delta encoding for
