@@ -1951,6 +1951,44 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The operator path (`dispatch_request_local`, the path `kkernel exec` uses)
+/// must NOT gate subhandler verbs. The visibility gate is wire-only
+/// (`from_wire`): agents cannot reach subhandlers via the MCP `request` tool,
+/// but operators invoke them directly. This is the invariant that regressed
+/// when the gate lived in the shared dispatch — every handler had to be
+/// promoted to `Verb` to stay reachable, which is exactly what we are undoing.
+#[tokio::test]
+async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
+    use khive_mcp::tools::request::RequestParams;
+
+    let server = make_brain_server();
+
+    for verb in &["brain.state", "brain.config", "brain.events"] {
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!("{verb}()"),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("operator dispatch must not RPC-fail");
+        let body: Value = serde_json::from_str(&raw)?;
+        let first = &body["results"][0];
+        let err = first["error"].as_str().unwrap_or("");
+        // The gate must NOT have fired: its signature message must be absent.
+        // The handler may still succeed (ok=true) or fail for its own reasons,
+        // but it must have been *reached*, not blocked at the visibility gate.
+        assert!(
+            !err.contains("internal subhandler") && !err.contains("permission denied"),
+            "operator path must NOT gate subhandler {verb:?}: {first}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65536);

@@ -40,7 +40,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Version history:
 ///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`);
 ///       added `probe_only` request field + probe-ack sentinel shape in response
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -155,6 +155,20 @@ pub struct DaemonRequestFrame {
     /// Per-operation output format overrides (ADR-078).
     #[serde(default)]
     pub format_per_op: Option<Vec<Option<String>>>,
+    /// Whether this request originated from the agent-facing MCP `request`
+    /// tool (the wire surface). When `true`, the daemon enforces verb
+    /// visibility — `Visibility::Subhandler` verbs are rejected because agents
+    /// must not invoke internal subhandlers. When `false` (the default, and the
+    /// only value any operator path sends), subhandlers are allowed: `kkernel
+    /// exec` and other in-process callers are trusted operator surfaces.
+    ///
+    /// This is the origin discriminator, not a daemon-vs-local one: operator
+    /// requests flow through the daemon by default too, so the gate cannot key
+    /// on transport. Pre-versioning clients omit this field (deserializes to
+    /// `false` → ungated), which is safe: the only way to reach the gated wire
+    /// surface is the MCP `request` tool, which always sets it explicitly.
+    #[serde(default)]
+    pub from_wire: bool,
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -235,6 +249,11 @@ pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Re
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// Dispatch a verb-DSL request string and return the rendered result.
+    ///
+    /// `from_wire` carries the origin discriminator from
+    /// [`DaemonRequestFrame::from_wire`]: when `true`, the implementor enforces
+    /// verb visibility (rejects `Visibility::Subhandler` verbs); when `false`,
+    /// the request is from a trusted operator surface and subhandlers pass.
     async fn dispatch(
         &self,
         ops: String,
@@ -242,6 +261,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         presentation_per_op: Option<Vec<Option<String>>>,
         format: Option<String>,
         format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
     ) -> Result<String, String>;
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
@@ -352,6 +372,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 frame.presentation_per_op,
                 frame.format,
                 frame.format_per_op,
+                frame.from_wire,
             )
             .await
         {

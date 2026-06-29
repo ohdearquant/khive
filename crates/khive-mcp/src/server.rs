@@ -497,6 +497,7 @@ impl KhiveMcpServer {
         &self,
         op: ParsedOp,
         prev_result: Option<&Value>,
+        from_wire: bool,
     ) -> Result<Value, (String, Value)> {
         let ParsedOp { tool, args } = op;
 
@@ -590,14 +591,14 @@ impl KhiveMcpServer {
         let args_value = Value::Object(resolved);
 
         // Subhandler verbs are operator-only — block them at the MCP wire
-        // boundary. Internal callers that call VerbRegistry::dispatch directly
-        // are not affected. Exception: `help=true` is short-circuited in
+        // boundary (`from_wire`), never on the operator path (`kkernel exec`,
+        // in-process callers). Exception: `help=true` is short-circuited in
         // VerbRegistry::dispatch before reaching the pack, so introspection works.
         let is_help = args_value
             .get("help")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !is_help && self.registry.is_subhandler_verb(&tool) {
+        if from_wire && !is_help && self.registry.is_subhandler_verb(&tool) {
             return Err((
                 tool.clone(),
                 json!(format!(
@@ -651,6 +652,7 @@ impl KhiveMcpServer {
         mode: ExecutionMode,
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
+        from_wire: bool,
     ) -> Value {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -752,7 +754,8 @@ impl KhiveMcpServer {
                         }
                         let args_value = Value::Object(resolved);
 
-                        // Block subhandler verbs at the MCP wire boundary.
+                        // Block subhandler verbs at the MCP wire boundary
+                        // (`from_wire`) only — operator paths pass through.
                         // Exception: help=true is short-circuited in
                         // VerbRegistry::dispatch before the pack, so
                         // introspection passes through.
@@ -760,7 +763,7 @@ impl KhiveMcpServer {
                             .get("help")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
-                        if !is_help && registry.is_subhandler_verb(&tool) {
+                        if from_wire && !is_help && registry.is_subhandler_verb(&tool) {
                             return json!({
                                 "ok": false,
                                 "tool": tool,
@@ -851,7 +854,7 @@ impl KhiveMcpServer {
                     } else {
                         op_mode
                     };
-                    match self.dispatch_op(op, prev_result.as_ref()).await {
+                    match self.dispatch_op(op, prev_result.as_ref(), from_wire).await {
                         Ok(result_obj) => {
                             // Extract canonical result for $prev (pre-presentation).
                             prev_result = result_obj.get("result").cloned();
@@ -1164,22 +1167,43 @@ result (e.g. create then link with the new entity's id)."#)]
                 probe_only: false,
                 format: p.format.clone(),
                 format_per_op: p.format_per_op.clone(),
+                // This is the agent-facing MCP wire surface: enforce verb
+                // visibility whether the request runs on the daemon or locally.
+                from_wire: true,
             };
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;
             }
         }
-        self.dispatch_request_local(p).await
+        self.dispatch_request_wire(p).await
     }
 }
 
 impl KhiveMcpServer {
     /// Parse and dispatch a request against this server's own registry.
     ///
-    /// This is the canonical dispatch path. The stdio `request` tool calls it
-    /// only as a fallback; the daemon calls it directly (never through the tool
-    /// wrapper), so there is no risk of a daemon forwarding to itself.
+    /// This is the canonical **operator** dispatch path: subhandler verbs are
+    /// allowed. `kkernel exec`, in-process callers, and tests use this. The
+    /// agent-facing MCP wire surface goes through `dispatch_request_wire`
+    /// (or sets `from_wire` on the daemon frame), which enforces verb visibility.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
+        self.dispatch_request_inner(p, false).await
+    }
+
+    /// Wire-surface dispatch: same as [`Self::dispatch_request_local`] but
+    /// enforces verb visibility (`Visibility::Subhandler` verbs are rejected).
+    /// Used by the stdio `request` tool's local-fallback path.
+    pub(crate) async fn dispatch_request_wire(&self, p: RequestParams) -> Result<String, McpError> {
+        self.dispatch_request_inner(p, true).await
+    }
+
+    /// Shared body for both dispatch surfaces. `from_wire` decides whether the
+    /// subhandler-visibility gate fires (see [`run_parsed`](Self::run_parsed)).
+    pub(crate) async fn dispatch_request_inner(
+        &self,
+        p: RequestParams,
+        from_wire: bool,
+    ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
@@ -1237,6 +1261,7 @@ impl KhiveMcpServer {
                 parsed.mode,
                 presentation,
                 presentation_per_op.clone(),
+                from_wire,
             )
             .await;
 

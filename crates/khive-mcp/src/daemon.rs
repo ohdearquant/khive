@@ -71,6 +71,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         presentation_per_op: Option<Vec<Option<String>>>,
         format: Option<String>,
         format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
     ) -> Result<String, String> {
         let params = RequestParams {
             ops,
@@ -80,7 +81,9 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             format,
             format_per_op,
         };
-        self.dispatch_request_local(params)
+        // Honor the frame's origin: a wire-origin request enforces verb
+        // visibility even when served by the daemon; an operator request does not.
+        self.dispatch_request_inner(params, from_wire)
             .await
             .map_err(|e| e.message.to_string())
     }
@@ -387,6 +390,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         probe_only: true,
         format: None,
         format_per_op: None,
+        from_wire: false,
     };
     let deadline = std::time::Duration::from_millis(timeout_ms);
     match tokio::time::timeout(deadline, try_forward_inner(&probe)).await {
@@ -950,6 +954,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
@@ -993,6 +998,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let resp = exchange(&sock, &req).await;
         assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
@@ -1031,6 +1037,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let resp_other = exchange(&sock, &other).await;
         assert!(resp_other.namespace_mismatch);
@@ -1048,6 +1055,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let resp_cfg = exchange(&sock, &mismatched_config).await;
         assert!(
@@ -1068,6 +1076,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
@@ -1196,6 +1205,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -1299,6 +1309,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         // Call try_forward_inner directly to assert the discriminant.
@@ -1536,6 +1547,7 @@ mod tests {
             _presentation_per_op: Option<Vec<Option<String>>>,
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
         ) -> Result<String, String> {
             // Return a string whose serialized DaemonResponseFrame JSON length
             // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
@@ -1600,6 +1612,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -1700,6 +1713,7 @@ mod tests {
             _presentation_per_op: Option<Vec<Option<String>>>,
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
         ) -> Result<String, String> {
             DAEMON_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("{\"ok\":true,\"counted\":true}".to_string())
@@ -1814,6 +1828,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
         let fwd = try_forward_inner(&real_frame).await;
         assert!(
@@ -1958,6 +1973,7 @@ mod tests {
             _presentation_per_op: Option<Vec<Option<String>>>,
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
         ) -> Result<String, String> {
             Err("forced dispatch error: verb returned an error for testing".to_string())
         }
@@ -2010,6 +2026,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -2103,6 +2120,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         let outcome = try_forward_inner(&frame).await;
@@ -2178,6 +2196,7 @@ mod tests {
             probe_only: false,
             format: None,
             format_per_op: None,
+            from_wire: false,
         };
 
         let outcome = try_forward_inner(&frame).await;
