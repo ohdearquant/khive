@@ -1297,6 +1297,7 @@ brain_profile = "project-profile"
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::parse("local").expect("ns"),
             embedding_model: None,
+            additional_embedding_models: vec![],
             packs: vec!["kg".to_string(), "comm".to_string()],
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
