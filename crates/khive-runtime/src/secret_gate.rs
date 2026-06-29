@@ -138,12 +138,26 @@ const REDACTION_MARKER: &str = "***MASKED***";
 /// lower-priority detector (e.g. an `sk-ant-` key sitting to the left of a
 /// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
 fn scan_match(text: &str) -> Option<(&str, &'static str)> {
+    scan_from(text, 0)
+}
+
+/// Like [`scan_match`], but only returns secrets whose span starts at or after
+/// `from`, while still evaluating Layer-2 trigger context against the FULL
+/// `text`. [`mask_secrets`] calls this with an advancing `from` so that an
+/// entropy token is detected even when its only trigger word sits to the left of
+/// an already-redacted earlier secret. Layer-1 known patterns are context-free,
+/// so scanning the `&text[from..]` suffix is equivalent; offsets recovered via
+/// pointer arithmetic against the original `text` base stay absolute.
+fn scan_from(text: &str, from: usize) -> Option<(&str, &'static str)> {
     let base = text.as_ptr() as usize;
-    // Layer 1: known prefix / shape patterns (already leftmost across detectors).
-    let mut best = check_known_patterns(text);
-    // Layer 2: entropy heuristic on long tokens near trigger words — kept only
-    // if it sits to the left of the best known match.
-    keep_leftmost(&mut best, check_entropy_heuristic(text), base);
+    // Layer 1: known prefix / shape patterns. Context-free → suffix scan; the
+    // returned slice still borrows from the same allocation, so its absolute
+    // offset is `slice.as_ptr() - base`.
+    let mut best = check_known_patterns(&text[from..]);
+    // Layer 2: entropy heuristic on long tokens near trigger words. Evaluated
+    // over the full text (so left-of-`from` trigger words count) but only tokens
+    // at offset >= from are returned; kept only if left of the best known match.
+    keep_leftmost(&mut best, check_entropy_heuristic(text, from), base);
     best
 }
 
@@ -185,22 +199,25 @@ fn scan(text: &str) -> Option<SecretMatch> {
 /// `check`/`scan`, so callers must never maintain a second, weaker masker.
 ///
 /// Returns `Cow::Borrowed` when no secret is present (the common case), avoiding
-/// an allocation. Detection runs left to right; after a span is redacted the
-/// scan resumes past it, so a high-entropy value whose only trigger word sat to
-/// the left of an earlier-redacted secret may be missed. The known-prefix
-/// detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
-/// Stripe, …) are context-free and unaffected.
+/// an allocation. Spans are discovered left to right against the ORIGINAL text
+/// via `scan_from`: each scan advances a `from` cursor past the previous span
+/// but always evaluates trigger context over the full input. This closes the
+/// entropy-context gap — a high-entropy value whose only trigger word sits to
+/// the left of an earlier-redacted secret is still detected, because the trigger
+/// window is never sliced away. The known-prefix detectors (real API keys:
+/// `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub, Stripe, …) are context-free and
+/// matched the same way.
 pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
-    if scan_match(text).is_none() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        match scan_match(rest) {
+    let base = text.as_ptr() as usize;
+    // Collect every secret span (absolute byte offsets into `text`) before
+    // writing any output, so trigger-context detection always sees the original
+    // string rather than the suffix after the previous redaction.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0;
+    while from < text.len() {
+        match scan_from(text, from) {
             Some((sub, _detector)) => {
-                let start = sub.as_ptr() as usize - rest.as_ptr() as usize;
+                let start = sub.as_ptr() as usize - base;
                 // The prefix detectors return whitespace-delimited tokens, so a
                 // credential glued to structural punctuation (JSON quotes/braces,
                 // sentence commas) carries that trailing punctuation into the
@@ -212,16 +229,28 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
                     .trim_end_matches(['"', '\'', '`', '}', ']', ')', ',', ';'])
                     .len();
                 let end = start + core_len.max(1);
-                out.push_str(&rest[..start]);
-                out.push_str(REDACTION_MARKER);
-                cursor += end;
+                spans.push((start, end));
+                // `scan_from` only returns matches with start >= from, and `end`
+                // is strictly greater than `start`, so `from` strictly advances.
+                from = end;
             }
-            None => {
-                out.push_str(rest);
-                break;
-            }
+            None => break,
         }
     }
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        // Spans are non-overlapping and ascending (each starts at/after the prior
+        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
+        let start = start.max(cursor);
+        out.push_str(&text[cursor..start]);
+        out.push_str(REDACTION_MARKER);
+        cursor = end.max(cursor);
+    }
+    out.push_str(&text[cursor..]);
     std::borrow::Cow::Owned(out)
 }
 
@@ -236,9 +265,15 @@ const PREFIX_DETECTORS: &[(&str, &str, usize)] = &[
     // AWS
     ("aws-access-key-id", "AKIA", 20),
     ("aws-access-key-id", "ASIA", 20),
-    // GitHub personal-access tokens
+    // GitHub tokens: personal-access (ghp_), OAuth (gho_), GitHub App
+    // user-to-server (ghu_), server-to-server (ghs_), refresh (ghr_), and the
+    // fine-grained PAT (github_pat_). All but github_pat_ share the gh*_ + 36+
+    // base62 shape.
     ("github-token", "ghp_", 36),
     ("github-token", "gho_", 36),
+    ("github-token", "ghu_", 36),
+    ("github-token", "ghs_", 36),
+    ("github-token", "ghr_", 36),
     ("github-token", "github_pat_", 20),
     // OpenAI
     ("openai-api-key", "sk-proj-", 40),
@@ -506,7 +541,11 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
-fn check_entropy_heuristic(text: &str) -> Option<(&str, &'static str)> {
+/// `from` restricts which tokens may be RETURNED (only those starting at or
+/// after `from`), but the trigger-context window is still computed over the full
+/// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
+/// losing a trigger word that sat to the left of it.
+fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static str)> {
     // Tokenize into maximal ASCII non-whitespace runs, recording each run's byte
     // offset.  Non-ASCII characters are delimiters (alongside ASCII whitespace):
     // real base64/hex/base64url credentials are ASCII, so splitting on non-ASCII
@@ -526,6 +565,12 @@ fn check_entropy_heuristic(text: &str) -> Option<(&str, &'static str)> {
     for &(tok_offset, raw_token) in &tokens {
         // Strip common delimiters that wrap the actual value.
         let token = strip_delimiters(raw_token);
+        // Only RETURN tokens at or after `from` (already-redacted spans lie
+        // before it); the trigger window below still spans the full text.
+        let token_offset = token.as_ptr() as usize - text.as_ptr() as usize;
+        if token_offset < from {
+            continue;
+        }
         if token.len() < MIN_ENTROPY_LEN {
             continue;
         }
@@ -695,6 +740,9 @@ fn is_base64_content_hash(token: &str) -> bool {
         "xoxs-",
         "ghp_",
         "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
         "github_pat_",
         "AKIA",
         "ASIA",
@@ -2025,6 +2073,66 @@ mod tests {
         assert!(
             !masked.contains("Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM") && !masked.contains("ghp_AAAA"),
             "neither the entropy secret nor the known secret may survive: {masked}"
+        );
+        assert_eq!(
+            masked.matches(REDACTION_MARKER).count(),
+            2,
+            "both secrets must be redacted exactly once: {masked}"
+        );
+        assert!(
+            check(&masked).is_ok(),
+            "masked output must pass the gate: {masked}"
+        );
+    }
+
+    #[test]
+    fn github_app_token_families_are_masked() {
+        // codex #368 round-2 [Critical]: ghu_ (user-to-server), ghs_
+        // (server-to-server), and ghr_ (refresh) GitHub App tokens are real
+        // credential families that previously bypassed the prefix detector and
+        // leaked through the mirror. They are context-free — no trigger word
+        // needed.
+        let cases = [
+            "ghu_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // gitleaks:allow
+            "ghs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",  // gitleaks:allow
+            "ghr_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",  // gitleaks:allow
+        ];
+        for token in &cases {
+            assert!(
+                check(token).is_err(),
+                "gate must hard-block GitHub App token {token}"
+            );
+            let line = format!("auth: {token} trailing");
+            let masked = mask_secrets(&line).into_owned();
+            assert!(
+                !masked.contains(token),
+                "GitHub App token must not survive masking: {masked}"
+            );
+            assert!(
+                check(&masked).is_ok(),
+                "masked output must pass the gate: {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_secrets_redacts_entropy_token_whose_trigger_is_left_of_earlier_secret() {
+        // codex #368 round-2 [Critical]: the entropy detector only fires near a
+        // trigger word. When the trigger (`api_key`) sits to the LEFT of an
+        // earlier known-prefix secret (`ghp_…`), a masker that rescans only the
+        // suffix after each redaction loses that context and leaks the later
+        // high-entropy token. Spans must be discovered against the ORIGINAL text.
+        let line =
+            "api_key ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"; // gitleaks:allow
+        let masked = mask_secrets(line).into_owned();
+        assert!(
+            !masked.contains("ghp_AAAA"),
+            "the known secret must be redacted: {masked}"
+        );
+        assert!(
+            !masked.contains("Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"),
+            "the later entropy token must be redacted even though its trigger \
+             word sits left of the earlier redaction: {masked}"
         );
         assert_eq!(
             masked.matches(REDACTION_MARKER).count(),

@@ -196,8 +196,9 @@ def main():
         # knowledge, session), so verbs() returns exactly 67 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack is loaded for the background daemon mirror but
-        # contributes 0 agent-facing verbs — its four handlers are internal
-        # subhandlers (Visibility::Subhandler), excluded from the verbs() surface.
+        # contributes 0 agent-facing verbs — its three handlers (store/list/get)
+        # are internal subhandlers (Visibility::Subhandler), excluded from the
+        # verbs() surface.
         # Update this number when the pack set or verb surface changes; a silent
         # drift here is the bug this assertion exists to catch.
         assert verbs_result["total"] == 67, (
