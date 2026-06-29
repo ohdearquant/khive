@@ -23,6 +23,12 @@ use khive_brain_core::{
     DEFAULT_ESS_CAP,
 };
 
+// ── Adapter revision sentinel ─────────────────────────────────────────────────
+
+/// Base model revision that registered adapters must target; overridable via
+/// KHIVE_BRAIN_BASE_MODEL_REVISION so both accept and reject paths are testable.
+pub(crate) const DEFAULT_BASE_MODEL_REVISION: &str = "base-v0";
+
 // ── Handler table ─────────────────────────────────────────────────────────────
 
 /// Brain pack verb surface. Visibility::Verb = exposed on the MCP `request` tool.
@@ -357,6 +363,39 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "object",
                 required: false,
                 description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "brain.register_adapter",
+        description: "Register an adapter integrity record so the router only composes \
+            adapters matching the active base model revision",
+        visibility: khive_types::Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            khive_types::ParamDef {
+                name: "adapter_id",
+                param_type: "string",
+                required: true,
+                description: "Stable identifier for the adapter (used as the entity name).",
+            },
+            khive_types::ParamDef {
+                name: "content_hash",
+                param_type: "string",
+                required: true,
+                description: "Content hash of the adapter weights for integrity verification.",
+            },
+            khive_types::ParamDef {
+                name: "base_model_revision",
+                param_type: "string",
+                required: true,
+                description: "Base model revision the adapter was trained against. Must match the active revision or registration is rejected.",
+            },
+            khive_types::ParamDef {
+                name: "metadata",
+                param_type: "object",
+                required: false,
+                description: "Optional additional metadata merged into entity properties.",
             },
         ],
     },
@@ -1354,6 +1393,67 @@ impl BrainPack {
             "description": description,
         }))
     }
+
+    // ── brain.register_adapter ────────────────────────────────────────────
+
+    pub(crate) async fn handle_register_adapter(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RegisterAdapterParams {
+            adapter_id: String,
+            content_hash: String,
+            base_model_revision: String,
+            metadata: Option<serde_json::Value>,
+        }
+        let p: RegisterAdapterParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let active_revision = std::env::var("KHIVE_BRAIN_BASE_MODEL_REVISION")
+            .unwrap_or_else(|_| DEFAULT_BASE_MODEL_REVISION.to_string());
+
+        if p.base_model_revision != active_revision {
+            return Err(RuntimeError::InvalidInput(format!(
+                "base_model_revision mismatch: expected {:?}, got {:?}",
+                active_revision, p.base_model_revision
+            )));
+        }
+
+        let mut props = serde_json::json!({
+            "content_hash": p.content_hash,
+            "base_model_revision": p.base_model_revision,
+        });
+        if let Some(serde_json::Value::Object(meta)) = p.metadata {
+            let props_obj = props.as_object_mut().unwrap();
+            for (k, v) in meta {
+                if k != "content_hash" && k != "base_model_revision" {
+                    props_obj.insert(k, v);
+                }
+            }
+        }
+
+        self.runtime
+            .create_entity(
+                token,
+                "artifact",
+                Some("adapter"),
+                &p.adapter_id,
+                None,
+                Some(props),
+                vec![],
+            )
+            .await?;
+
+        Ok(json!({
+            "registered": true,
+            "adapter_id": p.adapter_id,
+            "content_hash": p.content_hash,
+            "base_model_revision": p.base_model_revision,
+        }))
+    }
 }
 
 // ── lattice-router seam (#345 M1) ────────────────────────────────────────────
@@ -1540,6 +1640,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.bind" => self.handle_bind(params).await,
             "brain.unbind" => self.handle_unbind(params).await,
             "brain.create_profile" => self.handle_create_profile(params).await,
+            "brain.register_adapter" => self.handle_register_adapter(token, params).await,
             // Legacy
             "brain.emit" => self.handle_emit(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(

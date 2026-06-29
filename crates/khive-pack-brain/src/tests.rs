@@ -3951,3 +3951,101 @@ async fn feedback_accepts_short_prefix_target_id() {
     assert_eq!(result["emitted"], json!(true), "emitted must be true");
     assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
 }
+
+// ── #354: brain.register_adapter ─────────────────────────────────────────────
+
+// ACCEPT: matching base_model_revision registers the adapter and persists the artifact.
+#[tokio::test]
+async fn register_adapter_accept_matching_revision() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let active_rev = std::env::var("KHIVE_BRAIN_BASE_MODEL_REVISION")
+        .unwrap_or_else(|_| crate::handlers::DEFAULT_BASE_MODEL_REVISION.to_string());
+
+    let result = pack
+        .dispatch(
+            "brain.register_adapter",
+            json!({
+                "adapter_id": "lora-v1",
+                "content_hash": "sha256:abcd1234",
+                "base_model_revision": active_rev,
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("register_adapter with matching revision must succeed");
+
+    assert_eq!(result["registered"], json!(true), "registered must be true");
+    assert_eq!(result["adapter_id"], json!("lora-v1"));
+    assert_eq!(result["content_hash"], json!("sha256:abcd1234"));
+    assert_eq!(result["base_model_revision"], json!(active_rev));
+
+    // Verify the artifact entity was actually persisted.
+    let entities = rt
+        .list_entities(&token, Some("artifact"), Some("adapter"), 10, 0)
+        .await
+        .expect("list_entities must succeed");
+    let found = entities.iter().any(|e| e.name == "lora-v1");
+    assert!(
+        found,
+        "artifact entity 'lora-v1' must exist after successful registration"
+    );
+    let entity = entities.iter().find(|e| e.name == "lora-v1").unwrap();
+    let props = entity
+        .properties
+        .as_ref()
+        .expect("entity must have properties");
+    assert_eq!(
+        props["content_hash"],
+        json!("sha256:abcd1234"),
+        "content_hash must be stored in entity properties"
+    );
+}
+
+// REJECT: mismatching base_model_revision returns an error and does not persist.
+#[tokio::test]
+async fn register_adapter_reject_mismatching_revision() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let err = pack
+        .dispatch(
+            "brain.register_adapter",
+            json!({
+                "adapter_id": "lora-bad",
+                "content_hash": "sha256:deadbeef",
+                "base_model_revision": "wrong-revision-xyz",
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap_err();
+
+    if let RuntimeError::InvalidInput(msg) = &err {
+        assert!(
+            msg.contains("mismatch") || msg.contains("expected"),
+            "#354: rejection message must name the mismatch; got: {msg}"
+        );
+        assert!(
+            msg.contains("wrong-revision-xyz") || msg.contains("base_model_revision"),
+            "#354: rejection message must name the supplied revision; got: {msg}"
+        );
+    } else {
+        panic!("#354: mismatching revision must return InvalidInput, got {err:?}");
+    }
+
+    // No artifact entity must have been persisted.
+    let entities = rt
+        .list_entities(&token, Some("artifact"), Some("adapter"), 10, 0)
+        .await
+        .expect("list_entities must succeed");
+    assert!(
+        !entities.iter().any(|e| e.name == "lora-bad"),
+        "#354: rejected registration must not persist an artifact entity"
+    );
+}
