@@ -27,6 +27,7 @@ members = [
     "khive-pack-formal",
     "khive-pack-template",
     "khive-pack-knowledge",
+    "khive-pack-session",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
