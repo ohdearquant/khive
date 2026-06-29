@@ -7,7 +7,7 @@ use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 /// All four verbs have `Visibility::Verb` (agent-facing MCP surface).
 /// Speech-act categories follow ADR-025:
 ///   - `session.store` is a Directive (requests storage of content).
-///   - `session.list`, `session.resume`, `session.export` are Assertive (retrieve state).
+///   - `session.list`, `session.get`, `session.export` are Assertive (retrieve state).
 pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
         name: "session.store",
@@ -74,7 +74,7 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "session.resume",
+        name: "session.get",
         description: "Fetch a single session record by UUID for replay or context injection",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,

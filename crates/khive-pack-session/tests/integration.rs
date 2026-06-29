@@ -321,6 +321,49 @@ async fn list_since_invalid_format_returns_error() {
     assert!(err.is_err(), "invalid since must return error");
 }
 
+// ── session.list offset pagination ───────────────────────────────────────────
+
+#[tokio::test]
+async fn list_offset_pagination() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_offset.db"));
+    let registry = build_registry(rt);
+
+    // Store 5 sessions with small delays to produce distinct created_at values.
+    for i in 0..5 {
+        store_session(&registry, &format!("session {i}")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Retrieve the full newest-first list.
+    let all = registry
+        .dispatch("session.list", json!({"limit": 5}))
+        .await
+        .expect("full list ok");
+    let all_arr = all.as_array().expect("all array");
+    assert_eq!(all_arr.len(), 5, "expected 5 sessions");
+
+    // offset=2 limit=2 must return all[2] and all[3] in order.
+    let paged = registry
+        .dispatch("session.list", json!({"offset": 2, "limit": 2}))
+        .await
+        .expect("paged list ok");
+    let paged_arr = paged.as_array().expect("paged array");
+    assert_eq!(
+        paged_arr.len(),
+        2,
+        "expected exactly 2 items with offset=2 limit=2"
+    );
+    assert_eq!(
+        paged_arr[0]["id"], all_arr[2]["id"],
+        "offset=2 first item must match all[2]"
+    );
+    assert_eq!(
+        paged_arr[1]["id"], all_arr[3]["id"],
+        "offset=2 second item must match all[3]"
+    );
+}
+
 // ── session.resume tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -368,6 +411,54 @@ async fn resume_invalid_uuid_returns_error() {
         .dispatch("session.resume", json!({"id": "not-a-uuid"}))
         .await;
     assert!(err.is_err(), "invalid UUID must return error");
+}
+
+// ── soft-delete regression: resume ───────────────────────────────────────────
+
+#[tokio::test]
+async fn resume_soft_deleted_returns_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("resume_soft_del.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "soft-delete me").await;
+    let id = stored["id"].as_str().expect("id present").to_string();
+
+    // Soft-delete the session note via the KG delete verb.
+    registry
+        .dispatch("delete", json!({"id": id, "kind": "session"}))
+        .await
+        .expect("soft-delete ok");
+
+    let err = registry.dispatch("session.resume", json!({"id": id})).await;
+    assert!(
+        err.is_err(),
+        "resume of a soft-deleted session must return an error"
+    );
+}
+
+// ── soft-delete regression: export ───────────────────────────────────────────
+
+#[tokio::test]
+async fn export_soft_deleted_returns_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("export_soft_del.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "export-delete me").await;
+    let id = stored["id"].as_str().expect("id present").to_string();
+
+    // Soft-delete the session note via the KG delete verb.
+    registry
+        .dispatch("delete", json!({"id": id, "kind": "session"}))
+        .await
+        .expect("soft-delete ok");
+
+    let err = registry.dispatch("session.export", json!({"id": id})).await;
+    assert!(
+        err.is_err(),
+        "export of a soft-deleted session must return an error"
+    );
 }
 
 // ── session.export tests ──────────────────────────────────────────────────────
