@@ -271,10 +271,20 @@ fn extract_text(content: Option<&Value>) -> Option<String> {
 }
 
 /// Extract a display string from a single content block.
+///
+/// Handled block types:
+/// - `"text"` — Claude Code plain text block.
+/// - `"input_text"` / `"output_text"` — Codex user and assistant text blocks.
+/// - `"tool_use"` — tool invocation (name + input JSON, truncated to 500 chars).
+/// - `"tool_result"` — tool output (content string, truncated to 500 chars).
 fn extract_block(block: &Value) -> Option<String> {
     let map = block.as_object()?;
     match map.get("type")?.as_str()? {
-        "text" => map.get("text").and_then(|v| v.as_str()).map(str::to_string),
+        // Claude Code text block and Codex user/assistant text blocks all carry
+        // their display text in a "text" field — same extraction logic.
+        "text" | "input_text" | "output_text" => {
+            map.get("text").and_then(|v| v.as_str()).map(str::to_string)
+        }
         "tool_use" => {
             let name = map
                 .get("name")
@@ -458,10 +468,17 @@ mod tests {
 
     const CDX_SID: &str = "cdx-session-0001-0001-0001-000000000001";
 
-    /// Build a Codex response_item/message line with text content.
-    fn codex_msg(role: &str, text: &str) -> String {
+    /// Build a Codex user message line using the real `input_text` block shape.
+    fn codex_user_msg(text: &str) -> String {
         format!(
-            r#"{{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{{"type":"message","role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            r#"{{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// Build a Codex assistant message line using the real `output_text` block shape.
+    fn codex_asst_msg(text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#
         )
     }
 
@@ -472,7 +489,7 @@ mod tests {
         )
     }
 
-    /// Build a Codex response_item with a structured content block (tool_use).
+    /// Build a Codex response_item with a tool_use block (no text block).
     fn codex_tool_use_msg() -> String {
         r#"{"type":"response_item","timestamp":"2026-06-30T09:01:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"tool_use","name":"bash","input":{"command":"cargo test"}}]}}"#.to_string()
     }
@@ -519,24 +536,30 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_user_message() {
-        let line = codex_msg("user", "Hello Codex");
+    fn test_codex_user_message_input_text_block() {
+        // Regression for Finding 1: real Codex user messages use `input_text` blocks.
+        let line = codex_user_msg("Hello Codex");
         let ev = parse_codex_line(&line, CDX_SID, 128).expect("user message should parse");
         assert_eq!(ev.session_id, CDX_SID);
         assert_eq!(ev.msg_type, "response_item");
         assert_eq!(ev.role.as_deref(), Some("user"));
-        let text = ev.text.expect("text must be present");
+        // text must NOT be None — this was the NULL bug.
+        let text = ev.text.expect("text must be non-NULL for input_text block");
         assert_eq!(text, "Hello Codex");
-        // Synthetic uuid encodes the offset.
         assert_eq!(ev.uuid, format!("{CDX_SID}:128"));
     }
 
     #[test]
-    fn test_codex_assistant_message() {
-        let line = codex_msg("assistant", "Hello from assistant");
+    fn test_codex_assistant_message_output_text_block() {
+        // Regression for Finding 1: real Codex assistant messages use `output_text` blocks.
+        let line = codex_asst_msg("Hello from assistant");
         let ev = parse_codex_line(&line, CDX_SID, 256).expect("assistant message should parse");
         assert_eq!(ev.role.as_deref(), Some("assistant"));
-        assert_eq!(ev.text.as_deref(), Some("Hello from assistant"));
+        // text must NOT be None.
+        let text = ev
+            .text
+            .expect("text must be non-NULL for output_text block");
+        assert_eq!(text, "Hello from assistant");
         assert_eq!(ev.uuid, format!("{CDX_SID}:256"));
     }
 
@@ -552,9 +575,9 @@ mod tests {
 
     #[test]
     fn test_codex_text_truncated_at_500_chars() {
-        // Build a 600-character text body.
+        // input_text block with 600-char body — must be truncated.
         let long_text = "x".repeat(600);
-        let line = codex_msg("user", &long_text);
+        let line = codex_user_msg(&long_text);
         let ev = parse_codex_line(&line, CDX_SID, 0).expect("should parse");
         let text = ev.text.expect("text must be present");
         // char count must be ≤ 501 (500 + the '…' ellipsis char).
@@ -568,8 +591,9 @@ mod tests {
 
     #[test]
     fn test_codex_secret_masked_in_text_and_raw() {
+        // input_text block carrying a secret — masking must apply to both text and raw.
         let secret = "sk-ant-api03-AAABBBCCCDDDEEEFFFGGG-XXXXX";
-        let line = codex_msg("user", secret);
+        let line = codex_user_msg(secret);
         let ev = parse_codex_line(&line, CDX_SID, 0).expect("should parse");
         let text = ev.text.expect("text present");
         assert!(!text.contains(secret), "secret must not appear in text");
@@ -588,7 +612,7 @@ mod tests {
     fn test_codex_synthetic_uuid_stable_across_calls() {
         // The same line at the same offset must produce the same uuid regardless
         // of how many times it is called (deterministic, no random component).
-        let line = codex_msg("user", "consistency");
+        let line = codex_user_msg("consistency");
         let ev1 = parse_codex_line(&line, CDX_SID, 999).unwrap();
         let ev2 = parse_codex_line(&line, CDX_SID, 999).unwrap();
         assert_eq!(ev1.uuid, ev2.uuid);
@@ -600,5 +624,14 @@ mod tests {
         // A response_item where payload.type != "message" must be skipped.
         let line = r#"{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{"type":"tool_call","name":"some_tool"}}"#;
         assert!(parse_codex_line(line, CDX_SID, 0).is_none());
+    }
+
+    #[test]
+    fn test_cc_text_block_still_works() {
+        // Regression guard: adding input_text/output_text must not break the
+        // existing CC "text" block handling.
+        let line = r#"{"uuid":"cc-t1","sessionId":"cc-sess","type":"assistant","timestamp":"2026-06-30T09:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"CC still works"}]}}"#;
+        let ev = parse_cc_line(line).expect("CC text block must parse");
+        assert_eq!(ev.text.as_deref(), Some("CC still works"));
     }
 }

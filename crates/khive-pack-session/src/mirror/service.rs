@@ -343,26 +343,77 @@ fn scan_codex_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>
 /// Extract the session UUID from a Codex filename of the form
 /// `rollout-<timestamp>-<uuid>.jsonl`.
 ///
-/// Returns `None` for files whose name does not match the pattern.
+/// Returns `None` for files whose name does not match the expected pattern or
+/// whose derived candidate is not a valid UUID.  Files whose stem looks like
+/// `rollout-2025-11-11T08-32-36` (no UUID suffix) are rejected here and
+/// silently skipped by the caller.
 fn extract_codex_session_id(path: &std::path::Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    // Expected: "rollout-<ts>-<uuid>" where uuid is the last hyphen-delimited
-    // group of 5 fields (standard UUID: 8-4-4-4-12).
     if !stem.starts_with("rollout-") {
         return None;
     }
-    // A standard UUID has 5 parts (8-4-4-4-12), so 4 hyphens = 4 separators.
-    // The stem format is: rollout-<ISO-ts>-<8>-<4>-<4>-<4>-<12>
-    // Easier: find the last 5 hyphen-separated segments and join them.
+    // A standard UUID has 5 hyphen-delimited groups (8-4-4-4-12).
+    // Split the stem and take the last 5 segments as the UUID candidate.
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 6 {
         return None;
     }
-    // UUID = last 5 segments.
-    let uuid = parts[parts.len() - 5..].join("-");
-    // Basic sanity: a UUID has exactly 4 hyphens.
-    if uuid.matches('-').count() != 4 {
-        return None;
+    let candidate = parts[parts.len() - 5..].join("-");
+    // Validate structurally: reject timestamp-shaped junk like "2025-11-11T08-32-36"
+    // that also happens to have 4 hyphens.  uuid::Uuid::parse_str enforces the
+    // 8-4-4-4-12 hex-character layout.
+    match uuid::Uuid::parse_str(&candidate) {
+        Ok(_) => Some(candidate),
+        Err(_) => {
+            tracing::debug!(
+                path = %path.display(),
+                candidate,
+                "session mirror: codex filename did not yield a valid UUID — skipping"
+            );
+            None
+        }
     }
-    Some(uuid)
+}
+
+#[cfg(test)]
+mod codex_filename_tests {
+    use super::extract_codex_session_id;
+    use std::path::Path;
+
+    #[test]
+    fn real_codex_filename_yields_uuid() {
+        let path =
+            Path::new("rollout-2025-11-11T08-32-36-019a731e-4a58-71b1-a71f-a8d2f9782113.jsonl");
+        assert_eq!(
+            extract_codex_session_id(path).as_deref(),
+            Some("019a731e-4a58-71b1-a71f-a8d2f9782113")
+        );
+    }
+
+    #[test]
+    fn timestamp_only_stem_is_rejected() {
+        // Regression for Finding 2: a stem with no UUID suffix has 4 hyphens
+        // in its trailing segments and must NOT be accepted as a session id.
+        let path = Path::new("rollout-2025-11-11T08-32-36.jsonl");
+        assert_eq!(extract_codex_session_id(path), None);
+    }
+
+    #[test]
+    fn invalid_hex_suffix_is_rejected() {
+        let path =
+            Path::new("rollout-2025-11-11T08-32-36-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.jsonl");
+        assert_eq!(extract_codex_session_id(path), None);
+    }
+
+    #[test]
+    fn too_short_suffix_is_rejected() {
+        let path = Path::new("rollout-2025-11-11T08-32-36-aaaa-bbbb-cccc-dddd.jsonl");
+        assert_eq!(extract_codex_session_id(path), None);
+    }
+
+    #[test]
+    fn non_rollout_filename_is_rejected() {
+        let path = Path::new("not-a-rollout-file.jsonl");
+        assert_eq!(extract_codex_session_id(path), None);
+    }
 }
