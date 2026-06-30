@@ -719,10 +719,17 @@ mod tests {
 
     // ── Codex source integration tests ────────────────────────────────────────
 
-    /// Build a minimal Codex response_item/message line.
+    /// Build a minimal Codex response_item/message line. Block type mirrors the
+    /// real shape: `input_text` for user messages, `output_text` for assistant
+    /// messages (the generic `text` type does not occur in real Codex transcripts).
     fn codex_message_line(role: &str, text: &str) -> String {
+        let block_type = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
         format!(
-            r#"{{"type":"response_item","timestamp":"2026-06-30T08:00:00Z","payload":{{"type":"message","role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            r#"{{"type":"response_item","timestamp":"2026-06-30T08:00:00Z","payload":{{"type":"message","role":"{role}","content":[{{"type":"{block_type}","text":"{text}"}}]}}}}"#
         )
     }
 
@@ -788,6 +795,43 @@ mod tests {
 
         // All 3 message rows are stored.
         assert_eq!(count_rows(&rt, "session_messages").await, 3);
+
+        // The two response_item/message rows carry their real input_text/
+        // output_text content through to session_messages.text — not just a
+        // row count, but the actual extracted string for each role.
+        let mut r2 = sql.reader().await.expect("reader");
+        let rows = r2
+            .query_all(SqlStatement {
+                sql: "SELECT role, text FROM session_messages \
+                      WHERE session_id=?1 AND role IS NOT NULL ORDER BY seq"
+                    .into(),
+                params: vec![SqlValue::Text(session_id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("query ok");
+        let texts: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| {
+                let role = match row.get("role") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => panic!("unexpected role value: {other:?}"),
+                };
+                let text = match row.get("text") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => panic!("unexpected text value: {other:?}"),
+                };
+                (role, text)
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("user".to_string(), "Hello from Codex".to_string()),
+                ("assistant".to_string(), "Hello back from Codex".to_string()),
+            ],
+            "input_text/output_text blocks must round-trip to session_messages.text by role"
+        );
     }
 
     #[tokio::test]
