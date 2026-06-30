@@ -18,18 +18,34 @@ use std::time::Duration;
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::ingest;
+use super::ingest::{self, MirrorSource};
+
+/// A discovered JSONL file together with its source type and (for Codex) the
+/// session UUID derived from the filename.
+struct DiscoveredFile {
+    path: PathBuf,
+    source: MirrorSource,
+    /// Set for `MirrorSource::Codex`; `None` for `MirrorSource::ClaudeCode`.
+    session_id: Option<String>,
+}
 
 /// Configuration for the mirror service.
 ///
 /// Loaded from environment variables at daemon boot via `MirrorConfig::from_env`.
 pub struct MirrorConfig {
-    /// Whether the mirror service is enabled (default: false — opt-in).
+    /// Whether the Claude Code transcript mirror is enabled (default: false — opt-in).
     pub enabled: bool,
     /// Root directory that contains `<project-slug>/<session-uuid>.jsonl` files.
     ///
     /// Defaults to `$HOME/.claude/projects`.
     pub projects_dir: PathBuf,
+    /// Whether the Codex CLI transcript mirror is enabled (default: false — opt-in,
+    /// independent of `enabled`).
+    pub codex_enabled: bool,
+    /// Root directory that contains `YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` files.
+    ///
+    /// Defaults to `$HOME/.codex/sessions`.
+    pub codex_sessions_dir: PathBuf,
     /// How long to sleep between polling ticks (default: 2 seconds).
     pub poll_interval: Duration,
     /// When true (default), existing files are mirrored from byte offset 0.
@@ -40,23 +56,32 @@ pub struct MirrorConfig {
 impl MirrorConfig {
     /// Build config from environment variables, falling back to safe defaults.
     ///
-    /// | Variable                  | Default                   |
-    /// |---------------------------|---------------------------|
-    /// | `KHIVE_MIRROR_ENABLED`    | `false`                   |
-    /// | `KHIVE_MIRROR_PROJECTS_DIR` | `$HOME/.claude/projects` |
-    /// | `KHIVE_MIRROR_POLL_SECS`  | `2`                       |
-    /// | `KHIVE_MIRROR_BACKFILL`   | `true`                    |
+    /// | Variable                       | Default                        |
+    /// |--------------------------------|--------------------------------|
+    /// | `KHIVE_MIRROR_ENABLED`         | `false`                        |
+    /// | `KHIVE_MIRROR_PROJECTS_DIR`    | `$HOME/.claude/projects`       |
+    /// | `KHIVE_MIRROR_CODEX_ENABLED`   | `false`                        |
+    /// | `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`        |
+    /// | `KHIVE_MIRROR_POLL_SECS`       | `2`                            |
+    /// | `KHIVE_MIRROR_BACKFILL`        | `true`                         |
     pub fn from_env() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+
         let enabled = std::env::var("KHIVE_MIRROR_ENABLED")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
         let projects_dir = std::env::var("KHIVE_MIRROR_PROJECTS_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-                PathBuf::from(home).join(".claude").join("projects")
-            });
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".claude").join("projects"));
+
+        let codex_enabled = std::env::var("KHIVE_MIRROR_CODEX_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let codex_sessions_dir = std::env::var("KHIVE_MIRROR_CODEX_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".codex").join("sessions"));
 
         let poll_secs = std::env::var("KHIVE_MIRROR_POLL_SECS")
             .ok()
@@ -70,6 +95,8 @@ impl MirrorConfig {
         Self {
             enabled,
             projects_dir,
+            codex_enabled,
+            codex_sessions_dir,
             poll_interval: Duration::from_secs(poll_secs),
             backfill,
         }
@@ -81,12 +108,18 @@ impl MirrorConfig {
 /// Seed state from the `session_mirror_cursor` table at startup, then loop:
 /// stat each discovered file, tail any new bytes, sleep.
 ///
+/// Claude Code and Codex mirrors are independent: each is enabled by its own
+/// flag and scanned separately each tick.
+///
 /// Per-file errors are logged with `tracing::warn!` and do NOT stop the loop.
 pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
     tracing::info!(
         projects_dir = %config.projects_dir.display(),
+        codex_sessions_dir = %config.codex_sessions_dir.display(),
         poll_interval_ms = config.poll_interval.as_millis(),
         backfill = config.backfill,
+        cc_enabled = config.enabled,
+        codex_enabled = config.codex_enabled,
         "session mirror service starting"
     );
 
@@ -100,30 +133,47 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
     };
 
     loop {
-        let files = scan_jsonl_files(&config.projects_dir);
+        // Collect all files to process this tick.
+        let mut discovered: Vec<DiscoveredFile> = Vec::new();
 
+        if config.enabled {
+            for path in scan_cc_jsonl_files(&config.projects_dir) {
+                discovered.push(DiscoveredFile {
+                    path,
+                    source: MirrorSource::ClaudeCode,
+                    session_id: None,
+                });
+            }
+        }
+
+        if config.codex_enabled {
+            for item in scan_codex_jsonl_files(&config.codex_sessions_dir) {
+                discovered.push(item);
+            }
+        }
+
+        let total_tracked = discovered.len();
         let mut files_mirrored: u64 = 0;
         let mut rows_inserted: u64 = 0;
 
-        for path in &files {
+        for item in &discovered {
             // Seed offset for newly discovered files.
-            if !offsets.contains_key(path) {
+            if !offsets.contains_key(&item.path) {
                 let start = if config.backfill {
                     0
                 } else {
-                    // Skip existing content — start at current EOF.
-                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                    std::fs::metadata(&item.path).map(|m| m.len()).unwrap_or(0)
                 };
-                offsets.insert(path.clone(), start);
+                offsets.insert(item.path.clone(), start);
             }
 
-            let offset = *offsets.get(path).unwrap_or(&0);
+            let offset = *offsets.get(&item.path).unwrap_or(&0);
 
             // Fast path: skip if file hasn't grown.
-            let file_len = match std::fs::metadata(path).map(|m| m.len()) {
+            let file_len = match std::fs::metadata(&item.path).map(|m| m.len()) {
                 Ok(len) => len,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "session mirror: stat failed");
+                    tracing::warn!(path = %item.path.display(), error = %e, "session mirror: stat failed");
                     continue;
                 }
             };
@@ -133,14 +183,23 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
 
             // Tail the new bytes.
-            match ingest::mirror_file(&runtime, path, offset).await {
+            match ingest::mirror_file(
+                &runtime,
+                &item.path,
+                offset,
+                item.source,
+                item.session_id.as_deref(),
+            )
+            .await
+            {
                 Ok(stats) => {
-                    offsets.insert(path.clone(), stats.new_offset);
+                    offsets.insert(item.path.clone(), stats.new_offset);
                     if stats.inserted > 0 || stats.new_offset > offset {
                         files_mirrored += 1;
                         rows_inserted += stats.inserted;
                         tracing::debug!(
-                            path = %path.display(),
+                            path = %item.path.display(),
+                            source = ?item.source,
                             inserted = stats.inserted,
                             scanned = stats.scanned,
                             new_offset = stats.new_offset,
@@ -150,7 +209,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        path = %path.display(),
+                        path = %item.path.display(),
                         error = %e,
                         "session mirror: per-file error (skipping)"
                     );
@@ -162,11 +221,11 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             tracing::info!(
                 files_mirrored,
                 rows_inserted,
-                total_tracked = files.len(),
+                total_tracked,
                 "session mirror tick"
             );
         } else {
-            tracing::debug!(total_tracked = files.len(), "session mirror: quiet tick");
+            tracing::debug!(total_tracked, "session mirror: quiet tick");
         }
 
         tokio::time::sleep(config.poll_interval).await;
@@ -216,11 +275,11 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
     }
 }
 
-/// Recursively scan `projects_dir` for `*.jsonl` files one level deep.
+/// Scan `projects_dir` for Claude Code `*.jsonl` files one level deep.
 ///
 /// Expects the layout: `<projects_dir>/<project-slug>/<session-uuid>.jsonl`.
 /// Silently skips unreadable subdirectories.
-fn scan_jsonl_files(projects_dir: &std::path::Path) -> Vec<PathBuf> {
+fn scan_cc_jsonl_files(projects_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     let Ok(top_entries) = std::fs::read_dir(projects_dir) else {
@@ -244,4 +303,66 @@ fn scan_jsonl_files(projects_dir: &std::path::Path) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Recursively scan `sessions_dir` for Codex `rollout-*.jsonl` files.
+///
+/// Expects the date-nested layout:
+/// `<sessions_dir>/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`.
+/// The session UUID is parsed from the filename stem.
+/// Silently skips unreadable directories or filenames that do not match the
+/// expected `rollout-…-<uuid>` pattern.
+fn scan_codex_jsonl_files(sessions_dir: &std::path::Path) -> Vec<DiscoveredFile> {
+    let mut files = Vec::new();
+    scan_codex_dir_recursive(sessions_dir, &mut files);
+    files
+}
+
+/// Recursive helper for `scan_codex_jsonl_files`.
+fn scan_codex_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_codex_dir_recursive(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Some(session_id) = extract_codex_session_id(&path) {
+                out.push(DiscoveredFile {
+                    path,
+                    source: MirrorSource::Codex,
+                    session_id: Some(session_id),
+                });
+            }
+        }
+    }
+}
+
+/// Extract the session UUID from a Codex filename of the form
+/// `rollout-<timestamp>-<uuid>.jsonl`.
+///
+/// Returns `None` for files whose name does not match the pattern.
+fn extract_codex_session_id(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    // Expected: "rollout-<ts>-<uuid>" where uuid is the last hyphen-delimited
+    // group of 5 fields (standard UUID: 8-4-4-4-12).
+    if !stem.starts_with("rollout-") {
+        return None;
+    }
+    // A standard UUID has 5 parts (8-4-4-4-12), so 4 hyphens = 4 separators.
+    // The stem format is: rollout-<ISO-ts>-<8>-<4>-<4>-<4>-<12>
+    // Easier: find the last 5 hyphen-separated segments and join them.
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    // UUID = last 5 segments.
+    let uuid = parts[parts.len() - 5..].join("-");
+    // Basic sanity: a UUID has exactly 4 hyphens.
+    if uuid.matches('-').count() != 4 {
+        return None;
+    }
+    Some(uuid)
 }

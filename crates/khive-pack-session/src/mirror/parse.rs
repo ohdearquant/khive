@@ -1,4 +1,4 @@
-//! Pure CC JSONL line parser — no I/O, heavily unit-tested.
+//! JSONL line parsers for Claude Code and Codex CLI session transcripts.
 //!
 //! Every function here is deterministic and side-effect-free so the unit tests
 //! can run without any runtime or DB setup.
@@ -7,18 +7,22 @@ use chrono::DateTime;
 use khive_runtime::secret_gate;
 use serde_json::Value;
 
-/// A single parsed event from a CC session JSONL file.
+/// A single parsed event, source-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedEvent {
-    /// CC event UUID (the primary key for idempotency).
+    /// Event UUID — the primary key for idempotency.
+    ///
+    /// For Claude Code events this is the top-level `uuid` field.
+    /// For Codex events (which carry no per-message uuid) this is synthesised
+    /// as `"{session_id}:{abs_byte_offset}"`.
     pub uuid: String,
-    /// CC session UUID (`sessionId` field).
+    /// Session UUID.
     pub session_id: String,
     /// Parent event UUID if present.
     pub parent_uuid: Option<String>,
     /// Whether this event is on a sidechain.
     pub is_sidechain: bool,
-    /// `message.role` when present.
+    /// `message.role` (CC) or `payload.role` (Codex) when present.
     pub role: Option<String>,
     /// Top-level `type` field.
     pub msg_type: String,
@@ -30,13 +34,13 @@ pub struct ParsedEvent {
     pub created_at_micros: i64,
     /// `cwd` if present.
     pub cwd: Option<String>,
-    /// `gitBranch` if present.
+    /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present.
     pub git_branch: Option<String>,
-    /// `slug` if present.
+    /// `slug` if present (CC-only; Codex files carry no slug concept).
     pub slug: Option<String>,
 }
 
-/// Parse one CC JSONL line.
+/// Parse one Claude Code JSONL line.
 ///
 /// Returns `None` for:
 /// - blank or whitespace-only lines
@@ -127,6 +131,125 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
         git_branch,
         slug,
     })
+}
+
+/// Parse one Codex CLI JSONL line.
+///
+/// `session_id` must be derived from the filename before calling this function
+/// (e.g. from `rollout-<timestamp>-<uuid>.jsonl`).  `abs_byte_offset` is the
+/// file byte offset of the **start** of this line; it is embedded in the
+/// synthesised event UUID so that `INSERT OR IGNORE` on `session_messages.id`
+/// is idempotent across re-tails of an append-only file.
+///
+/// Returns `None` for:
+/// - blank or whitespace-only lines
+/// - lines that are not valid JSON objects
+/// - lines whose top-level `type` is `"event_msg"` — these are duplicate
+///   event-stream representations of messages and must not be double-stored
+/// - any other line type that carries no useful message content
+///
+/// The returned `raw` and `text` fields have secrets masked.
+pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> Option<ParsedEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let obj: Value = serde_json::from_str(trimmed).ok()?;
+    let map = obj.as_object()?;
+
+    let line_type = map.get("type")?.as_str()?;
+
+    // event_msg lines are duplicate event-stream representations — skip them.
+    if line_type == "event_msg" {
+        return None;
+    }
+
+    let created_at_micros = map
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.timestamp_micros())
+        .unwrap_or(0);
+
+    match line_type {
+        "session_meta" => {
+            // session_meta carries cwd and git metadata; the session UUID in
+            // payload.id should match the filename-derived session_id, but we
+            // do NOT use it as the event id — use the synthesised offset key so
+            // the message row is unique and idempotent.
+            let payload = map.get("payload").and_then(|v| v.as_object());
+
+            let cwd = payload
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            let git_branch = payload
+                .and_then(|p| p.get("git"))
+                .and_then(|g| g.as_object())
+                .and_then(|g| g.get("branch"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            let uuid = format!("{session_id}:{abs_byte_offset}");
+            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+
+            Some(ParsedEvent {
+                uuid,
+                session_id: session_id.to_string(),
+                parent_uuid: None,
+                is_sidechain: false,
+                role: None,
+                msg_type: "session_meta".to_string(),
+                text: None,
+                raw,
+                created_at_micros,
+                cwd,
+                git_branch,
+                slug: None,
+            })
+        }
+        "response_item" => {
+            let payload = map.get("payload").and_then(|v| v.as_object())?;
+
+            // Only ingest message items; skip tool_call, completion, etc.
+            if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+                return None;
+            }
+
+            let role = payload
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            let text = extract_text(payload.get("content"));
+            let text = text.map(|t| {
+                let masked = secret_gate::mask_secrets(&t).into_owned();
+                truncate(&masked, 500)
+            });
+
+            let uuid = format!("{session_id}:{abs_byte_offset}");
+            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+
+            Some(ParsedEvent {
+                uuid,
+                session_id: session_id.to_string(),
+                parent_uuid: None,
+                is_sidechain: false,
+                role,
+                msg_type: "response_item".to_string(),
+                text,
+                raw,
+                created_at_micros,
+                cwd: None,
+                git_branch: None,
+                slug: None,
+            })
+        }
+        // Unknown line types are silently skipped.
+        _ => None,
+    }
 }
 
 /// Extract a display-friendly text string from a message `content` value.
@@ -329,5 +452,153 @@ mod tests {
         let line = make_line("side-uuid", "sess-side", "user", r#","isSidechain":true"#);
         let ev = parse_cc_line(&line).unwrap();
         assert!(ev.is_sidechain);
+    }
+
+    // ── parse_codex_line tests ─────────────────────────────────────────────────
+
+    const CDX_SID: &str = "cdx-session-0001-0001-0001-000000000001";
+
+    /// Build a Codex response_item/message line with text content.
+    fn codex_msg(role: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{{"type":"message","role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// Build a Codex session_meta line.
+    fn codex_meta(cwd: &str, branch: &str) -> String {
+        format!(
+            r#"{{"type":"session_meta","timestamp":"2026-06-30T09:00:00Z","payload":{{"id":"{CDX_SID}","cwd":"{cwd}","git":{{"branch":"{branch}","commit_hash":"abc123","repository_url":"https://github.com/example/repo"}}}}}}"#
+        )
+    }
+
+    /// Build a Codex response_item with a structured content block (tool_use).
+    fn codex_tool_use_msg() -> String {
+        r#"{"type":"response_item","timestamp":"2026-06-30T09:01:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"tool_use","name":"bash","input":{"command":"cargo test"}}]}}"#.to_string()
+    }
+
+    /// Build a Codex event_msg line (duplicate; must be skipped).
+    fn codex_event_msg() -> String {
+        r#"{"type":"event_msg","timestamp":"2026-06-30T09:00:00Z","payload":{"type":"user_message","content":"duplicate"}}"#.to_string()
+    }
+
+    #[test]
+    fn test_codex_blank_returns_none() {
+        assert!(parse_codex_line("", CDX_SID, 0).is_none());
+        assert!(parse_codex_line("   ", CDX_SID, 0).is_none());
+    }
+
+    #[test]
+    fn test_codex_event_msg_skipped() {
+        let line = codex_event_msg();
+        assert!(
+            parse_codex_line(&line, CDX_SID, 42).is_none(),
+            "event_msg must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_codex_unknown_type_skipped() {
+        let line = r#"{"type":"some_other_event","timestamp":"2026-06-30T09:00:00Z","payload":{}}"#;
+        assert!(parse_codex_line(line, CDX_SID, 0).is_none());
+    }
+
+    #[test]
+    fn test_codex_session_meta_produces_event() {
+        let line = codex_meta("/workspace/proj", "main");
+        let ev = parse_codex_line(&line, CDX_SID, 0).expect("session_meta should parse");
+        assert_eq!(ev.session_id, CDX_SID);
+        assert_eq!(ev.msg_type, "session_meta");
+        assert_eq!(ev.cwd.as_deref(), Some("/workspace/proj"));
+        assert_eq!(ev.git_branch.as_deref(), Some("main"));
+        assert!(ev.role.is_none());
+        assert!(ev.text.is_none());
+        // Synthetic uuid: "{session_id}:{offset}".
+        assert_eq!(ev.uuid, format!("{CDX_SID}:0"));
+        assert!(ev.created_at_micros > 0);
+    }
+
+    #[test]
+    fn test_codex_user_message() {
+        let line = codex_msg("user", "Hello Codex");
+        let ev = parse_codex_line(&line, CDX_SID, 128).expect("user message should parse");
+        assert_eq!(ev.session_id, CDX_SID);
+        assert_eq!(ev.msg_type, "response_item");
+        assert_eq!(ev.role.as_deref(), Some("user"));
+        let text = ev.text.expect("text must be present");
+        assert_eq!(text, "Hello Codex");
+        // Synthetic uuid encodes the offset.
+        assert_eq!(ev.uuid, format!("{CDX_SID}:128"));
+    }
+
+    #[test]
+    fn test_codex_assistant_message() {
+        let line = codex_msg("assistant", "Hello from assistant");
+        let ev = parse_codex_line(&line, CDX_SID, 256).expect("assistant message should parse");
+        assert_eq!(ev.role.as_deref(), Some("assistant"));
+        assert_eq!(ev.text.as_deref(), Some("Hello from assistant"));
+        assert_eq!(ev.uuid, format!("{CDX_SID}:256"));
+    }
+
+    #[test]
+    fn test_codex_tool_use_block_extracted() {
+        let line = codex_tool_use_msg();
+        let ev = parse_codex_line(&line, CDX_SID, 512).expect("tool_use message should parse");
+        assert_eq!(ev.role.as_deref(), Some("assistant"));
+        let text = ev.text.expect("text must be present");
+        assert!(text.contains("[tool_use: bash]"), "text: {text}");
+        assert!(text.contains("cargo test"), "text: {text}");
+    }
+
+    #[test]
+    fn test_codex_text_truncated_at_500_chars() {
+        // Build a 600-character text body.
+        let long_text = "x".repeat(600);
+        let line = codex_msg("user", &long_text);
+        let ev = parse_codex_line(&line, CDX_SID, 0).expect("should parse");
+        let text = ev.text.expect("text must be present");
+        // char count must be ≤ 501 (500 + the '…' ellipsis char).
+        assert!(
+            text.chars().count() <= 501,
+            "text must be truncated: len={}",
+            text.chars().count()
+        );
+        assert!(text.ends_with('…'), "truncated text must end with ellipsis");
+    }
+
+    #[test]
+    fn test_codex_secret_masked_in_text_and_raw() {
+        let secret = "sk-ant-api03-AAABBBCCCDDDEEEFFFGGG-XXXXX";
+        let line = codex_msg("user", secret);
+        let ev = parse_codex_line(&line, CDX_SID, 0).expect("should parse");
+        let text = ev.text.expect("text present");
+        assert!(!text.contains(secret), "secret must not appear in text");
+        assert!(
+            text.contains("***MASKED***"),
+            "MASKED marker must appear in text"
+        );
+        assert!(!ev.raw.contains(secret), "secret must not appear in raw");
+        assert!(
+            ev.raw.contains("***MASKED***"),
+            "MASKED marker must appear in raw"
+        );
+    }
+
+    #[test]
+    fn test_codex_synthetic_uuid_stable_across_calls() {
+        // The same line at the same offset must produce the same uuid regardless
+        // of how many times it is called (deterministic, no random component).
+        let line = codex_msg("user", "consistency");
+        let ev1 = parse_codex_line(&line, CDX_SID, 999).unwrap();
+        let ev2 = parse_codex_line(&line, CDX_SID, 999).unwrap();
+        assert_eq!(ev1.uuid, ev2.uuid);
+        assert_eq!(ev1.uuid, format!("{CDX_SID}:999"));
+    }
+
+    #[test]
+    fn test_codex_response_item_non_message_payload_skipped() {
+        // A response_item where payload.type != "message" must be skipped.
+        let line = r#"{"type":"response_item","timestamp":"2026-06-30T09:00:00Z","payload":{"type":"tool_call","name":"some_tool"}}"#;
+        assert!(parse_codex_line(line, CDX_SID, 0).is_none());
     }
 }
