@@ -50,7 +50,8 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
             Ok(email_ch) => {
                 let email_ch = Arc::new(email_ch);
                 let mut ch_registry = ChannelRegistry::new();
-                ch_registry.register(Arc::clone(&email_ch));
+                let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+                ch_registry.register(dyn_ch);
                 let ch_registry = Arc::new(ch_registry);
                 let verb_reg = server.verb_registry_clone();
                 let ingest_ns = ingest_namespace_from_env();
@@ -292,7 +293,7 @@ async fn channel_outbox_loop(
     allowlist: Vec<String>,
 ) {
     use chrono::Utc;
-    use khive_channel::ChannelEnvelope;
+    use khive_channel::{Channel, ChannelEnvelope};
     use serde_json::json;
 
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
@@ -300,12 +301,16 @@ async fn channel_outbox_loop(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        // Query outbound messages via the registry (list with direction=outbound filter).
-        // No StartsWith FilterOp exists; we filter email: prefix in Rust.
+        // Query outbound messages via the registry. The note `list` handler applies
+        // the `direction` filter server-side (scanning up to its internal cap) and
+        // returns a bare JSON array of full note objects. There is no `delivered_at`
+        // or recipient-prefix filter, so the `email:` prefix and the
+        // already-delivered check are applied per-note below.
         let list_params = json!({
             "namespace": ingest_namespace,
             "kind": "message",
-            "limit": 100,
+            "direction": "outbound",
+            "limit": 200,
         });
         let list_result = match registry.dispatch("list", list_params).await {
             Ok(r) => r,
@@ -315,7 +320,7 @@ async fn channel_outbox_loop(
             }
         };
 
-        let notes = match list_result.get("items").and_then(|v| v.as_array()) {
+        let notes = match list_result.as_array() {
             Some(arr) => arr.clone(),
             None => continue,
         };
