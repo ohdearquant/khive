@@ -48,25 +48,48 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
         match EmailChannel::from_env() {
             Ok(email_ch) => {
+                let email_ch = Arc::new(email_ch);
                 let mut ch_registry = ChannelRegistry::new();
-                ch_registry.register(Arc::new(email_ch));
+                ch_registry.register(Arc::clone(&email_ch));
                 let ch_registry = Arc::new(ch_registry);
                 let verb_reg = server.verb_registry_clone();
                 let ingest_ns = ingest_namespace_from_env();
+                let default_actor = default_inbound_actor_from_env();
+                let mut allowlist = allowed_recipients_from_env();
+                if allowlist.is_empty() {
+                    allowlist.push(email_ch.maintainer_address().to_string());
+                }
+                let mailbox = email_ch.mailbox().to_string();
+
                 let ingest_ns_clone = ingest_ns.clone();
-                let verb_reg_clone = verb_reg.clone();
+                let default_actor_clone = default_actor.clone();
+                let verb_reg_poll = verb_reg.clone();
+                let verb_reg_outbox = verb_reg.clone();
+                let ingest_ns_outbox = ingest_ns.clone();
+                let allowlist_clone = allowlist.clone();
+                let mailbox_clone = mailbox.clone();
+                let email_ch_clone = Arc::clone(&email_ch);
+
                 let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                     tokio::task::spawn(channel_poll_loop(
                         ch_registry,
-                        verb_reg_clone,
+                        verb_reg_poll,
                         ingest_ns_clone,
+                        default_actor_clone,
                     ));
-                    tracing::info!("email channel polling loop started");
+                    tokio::task::spawn(channel_outbox_loop(
+                        email_ch_clone,
+                        verb_reg_outbox,
+                        ingest_ns_outbox,
+                        mailbox_clone,
+                        allowlist_clone,
+                    ));
+                    tracing::info!("email channel polling and outbox loops started");
                 });
                 if !spawned {
                     tracing::error!(
                         namespace = %ingest_ns,
-                        "email channel polling loop NOT started: ingest namespace authorization failed (fail-closed)"
+                        "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
                     );
                 }
             }
@@ -115,6 +138,37 @@ fn ingest_namespace_from_env() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
+///
+/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"lambda:leo"` when the
+/// variable is unset or blank. Called once at server startup alongside
+/// `ingest_namespace_from_env`.
+#[cfg(feature = "channel-email")]
+fn default_inbound_actor_from_env() -> String {
+    std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "lambda:leo".to_string())
+}
+
+/// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
+///
+/// Returns a `Vec` of trimmed, non-empty address strings. When the env var is
+/// unset or blank the returned vec is empty; callers should fall back to the
+/// channel maintainer address in that case.
+#[cfg(feature = "channel-email")]
+fn allowed_recipients_from_env() -> Vec<String> {
+    std::env::var("KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Run `on_authorized` only when the ingest namespace passes the preflight check.
@@ -176,6 +230,7 @@ async fn channel_poll_loop(
     channels: std::sync::Arc<khive_channel::ChannelRegistry>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
+    default_inbound_actor: String,
 ) {
     use chrono::Utc;
     use serde_json::json;
@@ -202,6 +257,7 @@ async fn channel_poll_loop(
                             "external_id": env.external_id,
                             "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id,
+                            "default_inbound_actor": default_inbound_actor,
                         });
                         if let Err(e) = registry.dispatch("comm.ingest", params).await {
                             tracing::warn!(
@@ -213,6 +269,194 @@ async fn channel_poll_loop(
                 }
                 Err(e) => {
                     tracing::warn!(channel = kind, "channel poll failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Background task that delivers undelivered outbound email notes every 5 seconds.
+///
+/// Implements AT-LEAST-ONCE delivery: the `external_id` (= RFC 822 Message-ID) is
+/// persisted to the note BEFORE sending. A crash between the SMTP success and the
+/// `delivered_at` write causes a duplicate send on restart; the duplicate carries
+/// the same Message-ID so receiving MTAs typically collapse it.
+///
+/// Only compiled when the `channel-email` feature is enabled.
+#[cfg(feature = "channel-email")]
+async fn channel_outbox_loop(
+    email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
+    registry: khive_runtime::VerbRegistry,
+    ingest_namespace: String,
+    mailbox: String,
+    allowlist: Vec<String>,
+) {
+    use chrono::Utc;
+    use khive_channel::ChannelEnvelope;
+    use serde_json::json;
+
+    let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Query outbound messages via the registry (list with direction=outbound filter).
+        // No StartsWith FilterOp exists; we filter email: prefix in Rust.
+        let list_params = json!({
+            "namespace": ingest_namespace,
+            "kind": "message",
+            "limit": 100,
+        });
+        let list_result = match registry.dispatch("list", list_params).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "outbox loop: list failed");
+                continue;
+            }
+        };
+
+        let notes = match list_result.get("items").and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        for note_val in notes {
+            let props = match note_val.get("properties") {
+                Some(serde_json::Value::Object(m)) => m.clone(),
+                _ => continue,
+            };
+
+            // Only outbound direction.
+            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
+                continue;
+            }
+
+            // Only email-addressed notes.
+            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
+                Some(a) if a.starts_with("email:") => a.to_string(),
+                _ => continue,
+            };
+
+            // Skip already-delivered notes.
+            if props.get("delivered_at").is_some() {
+                continue;
+            }
+
+            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+
+            let recipient = to_actor
+                .strip_prefix("email:")
+                .unwrap_or(to_actor.as_str())
+                .to_string();
+
+            // Allowlist check.
+            if !allowlist.is_empty() && !allowlist.contains(&recipient) {
+                tracing::warn!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    "outbox loop: recipient not in allowlist; skipping"
+                );
+                continue;
+            }
+
+            let subject = props
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no subject)")
+                .to_string();
+
+            let content = match note_val.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+
+            let thread_id = props
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Mint-before-send: derive or reuse the Message-ID.
+            let message_id = match props.get("external_id").and_then(|v| v.as_str()) {
+                Some(eid) if !eid.is_empty() => eid.to_string(),
+                _ => {
+                    let mid = format!("<{note_id}@{domain}>");
+                    // Persist the claimed external_id before sending.
+                    let claim_result = registry
+                        .dispatch(
+                            "update",
+                            json!({
+                                "namespace": ingest_namespace,
+                                "id": note_id,
+                                "properties": { "external_id": mid.clone() },
+                            }),
+                        )
+                        .await;
+                    if let Err(e) = claim_result {
+                        tracing::warn!(
+                            note_id = %note_id,
+                            error = %e,
+                            "outbox loop: failed to claim external_id; skipping"
+                        );
+                        continue;
+                    }
+                    mid
+                }
+            };
+
+            // Build and send the envelope.
+            let mut env = ChannelEnvelope::new(
+                format!("email:{mailbox}"),
+                format!("email:{recipient}"),
+                content,
+            )
+            .with_subject(subject)
+            .with_message_id(message_id.clone());
+
+            if let Some(tid) = thread_id {
+                env = env.with_correlation(tid);
+            }
+
+            match email_channel.send(env).await {
+                Ok(()) => {
+                    let delivered_at = Utc::now().to_rfc3339();
+                    let mark_result = registry
+                        .dispatch(
+                            "update",
+                            json!({
+                                "namespace": ingest_namespace,
+                                "id": note_id,
+                                "properties": { "delivered_at": delivered_at },
+                            }),
+                        )
+                        .await;
+                    match mark_result {
+                        Ok(_) => {
+                            tracing::info!(
+                                note_id = %note_id,
+                                recipient = %recipient,
+                                message_id = %message_id,
+                                "outbox loop: delivered"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                note_id = %note_id,
+                                error = %e,
+                                "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        recipient = %recipient,
+                        error = %e,
+                        "outbox loop: send failed; will retry next cycle"
+                    );
                 }
             }
         }

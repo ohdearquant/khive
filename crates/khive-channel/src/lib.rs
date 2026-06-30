@@ -43,6 +43,10 @@ pub struct ChannelEnvelope {
     pub correlation_external_id: Option<String>,
     /// Arbitrary transport-specific key-value metadata.
     pub metadata: HashMap<String, String>,
+    /// RFC 822 Message-ID to set on the outbound email (including angle brackets,
+    /// e.g. `<uuid@domain>`). `None` on inbound envelopes and when the transport
+    /// should auto-generate the identifier.
+    pub message_id: Option<String>,
 }
 
 impl ChannelEnvelope {
@@ -57,6 +61,7 @@ impl ChannelEnvelope {
             external_id: None,
             correlation_external_id: None,
             metadata: HashMap::new(),
+            message_id: None,
         }
     }
 
@@ -81,6 +86,12 @@ impl ChannelEnvelope {
     /// Attach a correlation key for thread resolution.
     pub fn with_correlation(mut self, correlation: impl Into<String>) -> Self {
         self.correlation_external_id = Some(correlation.into());
+        self
+    }
+
+    /// Attach an RFC 822 Message-ID (including angle brackets) to set on the outbound email.
+    pub fn with_message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = Some(id.into());
         self
     }
 }
@@ -230,7 +241,8 @@ mod tests {
             .with_subject("Test")
             .with_sent_at(ts)
             .with_external_id("<msg1@example.com>")
-            .with_correlation("correlation-uuid");
+            .with_correlation("correlation-uuid")
+            .with_message_id("<abc123@example.com>");
 
         assert_eq!(env.from, "email:a@example.com");
         assert_eq!(env.to, "email:b@example.com");
@@ -242,6 +254,7 @@ mod tests {
             env.correlation_external_id.as_deref(),
             Some("correlation-uuid")
         );
+        assert_eq!(env.message_id.as_deref(), Some("<abc123@example.com>"));
     }
 
     #[test]

@@ -83,6 +83,10 @@ pub(crate) struct IngestParams {
     /// External correlation key for thread resolution (e.g. X-Khive-Thread-ID or In-Reply-To value).
     #[serde(default)]
     pub correlation_external_id: Option<String>,
+    /// Actor to route to when no correlation resolves a prior sender (e.g. `"lambda:leo"`).
+    /// When absent and no correlation match is found, falls back to `p.to.trim()`.
+    #[serde(default)]
+    pub default_inbound_actor: Option<String>,
 }
 
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {

@@ -578,9 +578,10 @@ pub(crate) async fn handle_ingest(
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
 
-    // Thread resolution: if correlation_external_id is present, find the message
-    // it refers to and extract its internal thread_id.
-    let resolved_thread_id: Option<String> = if let Some(ref corr) = p.correlation_external_id {
+    // Thread resolution: if correlation_external_id is present, find the message it refers to
+    // and extract both its internal thread_id and the from_actor of the original sender so that
+    // replies route back to the actor who sent the original, not to the raw email address.
+    let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
         if !corr.is_empty() {
             let corr_filter = NoteFilter {
                 kind: Some("message".to_string()),
@@ -601,14 +602,20 @@ pub(crate) async fn handle_ingest(
                     },
                 )
                 .await?;
-            corr_page
-                .items
-                .first()
-                .and_then(|n| n.properties.as_ref())
-                .and_then(|props| props.get("thread_id"))
-                .and_then(Value::as_str)
-                .filter(|s| s.parse::<Uuid>().is_ok())
-                .map(|s| s.to_string())
+            corr_page.items.first().and_then(|n| {
+                let props = n.properties.as_ref()?;
+                let thread_id = props
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| s.parse::<Uuid>().is_ok())
+                    .map(|s| s.to_string())?;
+                let from_actor = props
+                    .get("from_actor")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Some((thread_id, from_actor))
+            })
         } else {
             None
         }
@@ -622,8 +629,25 @@ pub(crate) async fn handle_ingest(
         .as_deref()
         .filter(|s| s.parse::<Uuid>().is_ok())
         .map(|s| s.to_string())
-        .or(resolved_thread_id)
+        .or_else(|| resolved.as_ref().map(|(tid, _)| tid.clone()))
         .unwrap_or_else(|| Uuid::new_v4().as_hyphenated().to_string());
+
+    // Determine to_actor with 3-tier priority:
+    // 1. from_actor of the correlated original (route reply back to the sending actor)
+    // 2. caller-supplied default_inbound_actor (fresh email landing actor)
+    // 3. p.to.trim() (back-compat: raw recipient address)
+    let to_actor = resolved
+        .as_ref()
+        .map(|(_, fa)| fa.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            p.default_inbound_actor
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| p.to.trim().to_string());
 
     let sent_at = p.sent_at.as_deref().unwrap_or("").to_string();
     let sent_at_value = if sent_at.is_empty() {
@@ -636,7 +660,7 @@ pub(crate) async fn handle_ingest(
         "from": p.from.trim(),
         "to": p.to.trim(),
         "from_actor": p.from.trim(),
-        "to_actor": p.to.trim(),
+        "to_actor": to_actor,
         "direction": "inbound",
         "read": false,
         "thread_id": thread_id,

@@ -3,6 +3,34 @@
 //! Provides `EmailChannel`, which implements the `Channel` trait from
 //! `khive-channel`. Configure exclusively via environment variables; no
 //! filesystem config is read.
+//!
+//! ## Connection variables
+//!
+//! | Variable | Required | Default | Description |
+//! |---|---|---|---|
+//! | `KHIVE_EMAIL_SMTP_HOST` | yes | — | SMTP relay host |
+//! | `KHIVE_EMAIL_SMTP_PORT` | no | `587` | SMTP port (STARTTLS) |
+//! | `KHIVE_EMAIL_IMAP_HOST` | yes | — | IMAP server host |
+//! | `KHIVE_EMAIL_IMAP_PORT` | no | `993` | IMAP port (TLS) |
+//! | `KHIVE_EMAIL_USERNAME` | yes | — | SMTP/IMAP login username (email address) |
+//! | `KHIVE_EMAIL_MAILBOX` | no | same as username | Mailbox used as sender address |
+//! | `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes | — | Single authorized maintainer address |
+//!
+//! ## Auth variables
+//!
+//! **Basic auth**: set `KHIVE_EMAIL_PASSWORD`.
+//!
+//! **OAuth (Exchange Online)**: set all three of
+//! `KHIVE_EMAIL_OAUTH_TENANT_ID`, `KHIVE_EMAIL_OAUTH_CLIENT_ID`,
+//! `KHIVE_EMAIL_OAUTH_CLIENT_SECRET`. A partial set is rejected at startup.
+//!
+//! ## MCP outbox and routing variables (read by `khive-mcp`)
+//!
+//! | Variable | Default | Description |
+//! |---|---|---|
+//! | `KHIVE_EMAIL_DEFAULT_ACTOR` | `lambda:leo` | Actor that receives fresh inbound email (no In-Reply-To match) |
+//! | `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` | maintainer address | Comma-separated allowlist of recipient addresses the outbox loop may deliver to; defaults to the single maintainer address |
+//! | `KHIVE_EMAIL_INGEST_NAMESPACE` | `local` | Namespace used when persisting inbound and outbound messages |
 
 pub mod channel;
 pub mod config;

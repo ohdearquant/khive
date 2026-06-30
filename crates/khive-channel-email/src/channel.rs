@@ -73,6 +73,22 @@ impl EmailChannel {
         Ok(Self { config, smtp, imap })
     }
 
+    /// The configured mailbox address (e.g. `leo@khive.ai`).
+    ///
+    /// Used by the outbox delivery loop to derive the sender address and
+    /// the domain component of the RFC 822 Message-ID header.
+    pub fn mailbox(&self) -> &str {
+        &self.config.mailbox
+    }
+
+    /// The configured maintainer address as a string.
+    ///
+    /// Used by the outbox delivery loop to build the default allowlist when
+    /// `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` is not set.
+    pub fn maintainer_address(&self) -> &str {
+        self.config.maintainer_address.as_str()
+    }
+
     /// Build from pre-constructed connectors (for testing).
     #[cfg(test)]
     pub(crate) fn with_connectors(
@@ -171,10 +187,11 @@ impl Channel for EmailChannel {
         let to = strip_kind_prefix(&envelope.to, "email");
         let subject = envelope.subject.as_deref().unwrap_or("(no subject)");
         let thread_id = envelope.correlation_external_id.as_deref();
+        let message_id = envelope.message_id.as_deref();
 
         debug!(from, to, subject, "email send");
         self.smtp
-            .send(from, to, subject, &envelope.content, thread_id)
+            .send(from, to, subject, &envelope.content, thread_id, message_id)
             .await
     }
 
@@ -238,6 +255,7 @@ mod tests {
             _subject: &str,
             _body: &str,
             _tid: Option<&str>,
+            _message_id: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push(format!("{from}->{to}"));
             Ok(())
