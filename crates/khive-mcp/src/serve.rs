@@ -276,6 +276,20 @@ async fn channel_poll_loop(
     }
 }
 
+/// True if a note's `delivered_at` property marks it as already delivered.
+///
+/// Must match the `list` query predicate's null handling (`list.rs`): a
+/// present-but-null `delivered_at` is undelivered, not delivered. Checking
+/// `.is_some()` alone would treat an explicit null (e.g. left by a curation
+/// `update`) as delivered and strand the note in the outbox forever.
+#[cfg(feature = "channel-email")]
+fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
+    props
+        .get("delivered_at")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
+
 /// Background task that delivers undelivered outbound email notes every 5 seconds.
 ///
 /// Implements AT-LEAST-ONCE delivery: the `external_id` (= RFC 822 Message-ID) is
@@ -346,7 +360,7 @@ async fn channel_outbox_loop(
             };
 
             // Defensive: skip already-delivered notes in case the query filter missed any.
-            if props.get("delivered_at").is_some() {
+            if note_already_delivered(&props) {
                 continue;
             }
 
@@ -2494,5 +2508,37 @@ brain_profile = "project-profile"
             "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
              (no party-line risk even without actor)"
         );
+    }
+
+    // --- note_already_delivered: outbox defensive-guard regression (round-2 finding 1) ---
+
+    #[cfg(feature = "channel-email")]
+    mod outbox_delivered_guard_tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn missing_delivered_at_is_undelivered() {
+            let props = json!({}).as_object().unwrap().clone();
+            assert!(!note_already_delivered(&props));
+        }
+
+        #[test]
+        fn explicit_null_delivered_at_is_undelivered() {
+            // Regression: a note with delivered_at explicitly set to null (e.g. via a
+            // curation `update`) must be treated as undelivered, matching the query
+            // predicate in list.rs — not skipped forever by `.is_some()`.
+            let props = json!({ "delivered_at": null }).as_object().unwrap().clone();
+            assert!(!note_already_delivered(&props));
+        }
+
+        #[test]
+        fn present_non_null_delivered_at_is_delivered() {
+            let props = json!({ "delivered_at": "2026-06-30T12:00:00Z" })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(note_already_delivered(&props));
+        }
     }
 }

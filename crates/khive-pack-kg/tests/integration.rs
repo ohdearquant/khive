@@ -7403,7 +7403,11 @@ async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
 // the 200 most-recent notes and applied the delivered_at check in Rust — so an
 // old undelivered note was permanently stranded behind the delivered ones.
 // After the fix, the query layer filters on delivered=false BEFORE applying the
-// 200-note page, so undelivered notes are always reachable.
+// 200-note page, so undelivered notes are reachable past the old 200-row strand.
+// This does NOT make the scan unbounded: `list` still caps total rows scanned at
+// MAX_SCAN_TOTAL (10_000, see list.rs), so an undelivered note older than 10,000
+// newer message rows is still unreachable. Tracked as a follow-up to push the
+// `delivered` filter into the storage-level NoteFilter/SQL path.
 
 #[tokio::test]
 async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
