@@ -142,6 +142,32 @@ Save.
 > A per-mailbox change can take a few minutes to propagate, so retry once; if it
 > persists, security defaults is the first thing to check.
 
+#### Finding and disabling security defaults
+
+The security-defaults toggle is buried, and direct deep-links to it tend to
+404. The reliable path:
+
+1. Sign in at [entra.microsoft.com](https://entra.microsoft.com) as an
+   administrator.
+2. In the left nav, **Entra ID → Overview**, then open the **Properties** tab.
+   (If the search bar is faster, type "security defaults" and pick the
+   **Properties** result — the section lives at the bottom of that page.)
+3. Scroll to the **Security defaults** section at the bottom. It shows the
+   current state ("Your organization is protected by security defaults" when
+   enabled).
+4. Click **Manage security defaults**. A panel opens on the right with a single
+   dropdown.
+5. Set the dropdown to **Disabled**, click **Save**, and choose a reason when
+   prompted (for example, "My organization is using Conditional Access" or
+   "Other").
+
+The change takes effect within a minute or two; re-test the SMTP send after.
+
+> Disabling security defaults removes tenant-wide **enforced** MFA. On a
+> single-admin tenant, turn MFA back on for the admin account manually
+> afterward (an Authenticator-app method on the account), so disabling the
+> blanket enforcement does not leave the admin login unprotected.
+
 ### 3. Register the application's service principal in Exchange
 
 Run once; the service principal is shared by send and receive.
