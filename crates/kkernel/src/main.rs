@@ -195,8 +195,28 @@ enum BackendCommand {
     },
 }
 
+/// Load `~/.khive/.env` into the process environment if present.
+///
+/// khive reads all configuration from process env (`std::env::var`), so this
+/// makes `~/.khive/.env` the canonical config home — credentials set there
+/// reach the daemon however it is spawned. Real environment variables win over
+/// the file (dotenvy does not override what is already set), and a missing file
+/// is not an error.
+fn load_khive_dotenv() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::path::Path::new(&home).join(".khive/.env");
+    match dotenvy::from_path(&path) {
+        Ok(()) => {}
+        Err(e) if e.not_found() => {}
+        Err(e) => eprintln!("warning: failed to load {}: {e}", path.display()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_khive_dotenv();
     let args = Args::parse();
     init_tracing(&args.log);
 
