@@ -157,13 +157,15 @@ impl KgPack {
                     || p.direction.is_some()
                     || p.from.is_some()
                     || p.to.is_some()
-                    || p.read.is_some();
+                    || p.read.is_some()
+                    || p.delivered.is_some();
 
                 let thread_id_filter = p.thread_id.as_deref();
                 let direction_filter = p.direction.as_deref();
                 let from_filter = p.from.as_deref();
                 let to_filter = p.to.as_deref();
                 let read_filter = p.read;
+                let delivered_filter = p.delivered;
 
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
@@ -240,6 +242,15 @@ impl KgPack {
                                         .and_then(Value::as_bool)
                                         .unwrap_or(false);
                                     if stored != wanted_read {
+                                        return false;
+                                    }
+                                }
+                                if let Some(wanted_delivered) = delivered_filter {
+                                    let is_delivered = props
+                                        .and_then(|p| p.get("delivered_at"))
+                                        .map(|v| !v.is_null())
+                                        .unwrap_or(false);
+                                    if is_delivered != wanted_delivered {
                                         return false;
                                     }
                                 }

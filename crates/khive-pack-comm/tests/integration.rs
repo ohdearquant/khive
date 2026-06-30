@@ -3956,3 +3956,241 @@ async fn i199_anonymous_inbox_sees_local_messages() {
          got count={count}"
     );
 }
+
+// --- ingest routing tests (actor routing via default_inbound_actor + correlation) ---
+
+/// Helper: ingest a message note and return the stored props.
+async fn ingest_and_get_props(
+    registry: &VerbRegistry,
+    rt: &KhiveRuntime,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let result = registry
+        .dispatch("comm.ingest", params)
+        .await
+        .expect("ingest succeeds");
+    assert!(
+        !result
+            .get("deduplicated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "message must not be deduplicated in routing tests"
+    );
+    let full_id = result["full_id"].as_str().expect("full_id present");
+    let uuid = full_id.parse::<uuid::Uuid>().expect("valid UUID");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let note = store
+        .get_note(uuid)
+        .await
+        .expect("get_note ok")
+        .expect("note exists");
+    note.properties.expect("note has properties")
+}
+
+/// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive
+/// → ingested note to_actor=lambda:khive.
+#[tokio::test]
+async fn ingest_routing_reply_routes_to_original_sender() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    // Plant an outbound message that looks like one lambda:khive sent.
+    // We use comm.send to write the note, then read its external_id back.
+    // We need a note with properties.external_id set so correlation resolution can find it.
+    // Directly insert via the runtime store to control all fields.
+    let outbound_external_id = "<sent-msg-001@khive.ai>";
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let thread_uuid = uuid::Uuid::new_v4();
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "original outbound".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:leo@khive.ai",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                "external_id": outbound_external_id,
+                "thread_id": thread_uuid.as_hyphenated().to_string(),
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    // Ingest a reply whose correlation_external_id matches the outbound note's external_id.
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:leo@khive.ai",
+            "content": "this is a reply",
+            "correlation_external_id": outbound_external_id,
+            "external_id": "imap:mail:1:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "reply must route to the original sender's actor; got props={props}"
+    );
+}
+
+/// (b) Fresh message, no correlation, default_inbound_actor=lambda:leo → to_actor=lambda:leo.
+#[tokio::test]
+async fn ingest_routing_fresh_message_uses_default_actor() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:leo@khive.ai",
+            "content": "hello from a stranger",
+            "external_id": "imap:mail:1:2",
+            "default_inbound_actor": "lambda:leo",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:leo"),
+        "fresh message must route to default_inbound_actor; got props={props}"
+    );
+}
+
+/// (c) No correlation, no default_inbound_actor → to_actor=p.to (back-compat).
+#[tokio::test]
+async fn ingest_routing_no_default_falls_back_to_to_field() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:leo@khive.ai",
+            "content": "back-compat message",
+            "external_id": "imap:mail:1:3",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("email:leo@khive.ai"),
+        "no default actor: to_actor must fall back to p.to; got props={props}"
+    );
+}
+
+// ── Finding 2: X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
+//
+// When our own outbound email carries X-Khive-Thread-ID = <thread_uuid>, a reply
+// that preserves that header arrives with correlation_external_id = <thread_uuid>.
+// The existing pass-1 (external_id match) finds nothing because thread_uuid ≠
+// the note's external_id (which is a Message-ID).  The new pass-2 matches
+// $.thread_id on an outbound note to recover from_actor and route the reply
+// back to the original sender's actor.
+
+/// (d) Reply correlating via thread-UUID (X-Khive-Thread-ID fallback) routes to
+/// the original sender's actor even when no external_id match exists.
+#[tokio::test]
+async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+
+    // Plant an outbound message note directly (simulates one we already sent).
+    // Properties: external_id is a standard Message-ID; thread_id is the internal UUID.
+    // from_actor is the actor we expect the reply to route back to.
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    {
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "original outbound via thread".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:leo@khive.ai",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                // external_id is a real Message-ID — NOT the thread_uuid.
+                "external_id": "<original-message-id@khive.ai>",
+                "thread_id": thread_uuid,
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    // Ingest a reply whose correlation_external_id is the thread_uuid (X-Khive-Thread-ID).
+    // Pass-1 (external_id match) will find nothing because thread_uuid ≠ external_id.
+    // Pass-2 (thread_id match on outbound) must recover from_actor=lambda:khive.
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:leo@khive.ai",
+            "content": "this is a reply via X-Khive-Thread-ID",
+            "correlation_external_id": thread_uuid,
+            "external_id": "imap:mail:thread-uuid-reply:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "Finding 2: reply correlating via thread-UUID must route to lambda:khive \
+         (original sender's actor); got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "Finding 2: ingested reply must be attached to the original thread_id; \
+         got props={props}"
+    );
+}

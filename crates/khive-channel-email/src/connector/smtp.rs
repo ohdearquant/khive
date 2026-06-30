@@ -65,6 +65,7 @@ pub(crate) trait SmtpConnector: Send + Sync + 'static {
         subject: &str,
         body: &str,
         thread_id_header: Option<&str>,
+        message_id: Option<&str>,
     ) -> Result<(), ChannelError>;
 }
 
@@ -120,6 +121,7 @@ impl SmtpConnector for LettreSmtp {
         subject: &str,
         body: &str,
         thread_id_header: Option<&str>,
+        message_id: Option<&str>,
     ) -> Result<(), ChannelError> {
         let from_mb: Mailbox = from.parse().map_err(|e| {
             ChannelError::InvalidEnvelope(format!("invalid from address {from:?}: {e}"))
@@ -136,6 +138,10 @@ impl SmtpConnector for LettreSmtp {
 
         if let Some(tid) = thread_id_header {
             builder = builder.header(XKhiveThreadId(tid.to_string()));
+        }
+
+        if let Some(mid) = message_id {
+            builder = builder.message_id(Some(mid.to_string()));
         }
 
         let msg = builder
@@ -214,7 +220,11 @@ impl SmtpSender {
         }
     }
 
-    /// Deliver an outbound message. `thread_id` is attached as `X-Khive-Thread-ID`.
+    /// Deliver an outbound message.
+    ///
+    /// `thread_id` is attached as `X-Khive-Thread-ID`. `message_id` is set as the
+    /// RFC 822 `Message-ID` header verbatim (caller must include angle brackets);
+    /// pass `None` to let lettre auto-generate.
     pub async fn send(
         &self,
         from: &str,
@@ -222,8 +232,11 @@ impl SmtpSender {
         subject: &str,
         body: &str,
         thread_id: Option<&str>,
+        message_id: Option<&str>,
     ) -> Result<(), ChannelError> {
-        self.inner.deliver(from, to, subject, body, thread_id).await
+        self.inner
+            .deliver(from, to, subject, body, thread_id, message_id)
+            .await
     }
 }
 
@@ -253,6 +266,7 @@ mod tests {
             subject: &str,
             _body: &str,
             _thread_id_header: Option<&str>,
+            _message_id: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push((
                 from.to_string(),
@@ -275,6 +289,7 @@ mod tests {
                 "to@example.com",
                 "Hello",
                 "body text",
+                None,
                 None,
             )
             .await
@@ -302,6 +317,7 @@ mod tests {
                 _subject: &str,
                 _body: &str,
                 thread_id_header: Option<&str>,
+                _message_id: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.headers
                     .lock()
@@ -317,11 +333,64 @@ mod tests {
         });
 
         sender
-            .send("a@example.com", "b@example.com", "s", "b", Some("tid-abc"))
+            .send(
+                "a@example.com",
+                "b@example.com",
+                "s",
+                "b",
+                Some("tid-abc"),
+                None,
+            )
             .await
             .unwrap();
 
         let captured = headers.lock().unwrap();
         assert_eq!(captured[0].as_deref(), Some("tid-abc"));
+    }
+
+    #[tokio::test]
+    async fn smtp_sender_passes_message_id() {
+        struct CapturingSmtp {
+            captured: Arc<Mutex<Vec<Option<String>>>>,
+        }
+
+        #[async_trait]
+        impl SmtpConnector for CapturingSmtp {
+            async fn deliver(
+                &self,
+                _from: &str,
+                _to: &str,
+                _subject: &str,
+                _body: &str,
+                _thread_id_header: Option<&str>,
+                message_id: Option<&str>,
+            ) -> Result<(), ChannelError> {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push(message_id.map(|s| s.to_string()));
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sender = SmtpSender::with_connector(CapturingSmtp {
+            captured: captured.clone(),
+        });
+
+        sender
+            .send(
+                "a@example.com",
+                "b@example.com",
+                "s",
+                "b",
+                None,
+                Some("<abc123@example.com>"),
+            )
+            .await
+            .unwrap();
+
+        let vals = captured.lock().unwrap();
+        assert_eq!(vals[0].as_deref(), Some("<abc123@example.com>"));
     }
 }

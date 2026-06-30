@@ -257,6 +257,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 required: false,
                 description: "Filter messages by read status (kind=\"message\" only): true = read, false = unread.",
             },
+            ParamDef {
+                name: "delivered",
+                param_type: "bool",
+                required: false,
+                description: "Filter messages by delivery status (kind=\"message\" only): true = delivered, false = undelivered (missing or null delivered_at).",
+            },
         ],
     },
     // Assertive: returns aggregate substrate counts (#280)
