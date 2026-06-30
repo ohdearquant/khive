@@ -73,6 +73,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
+dotenvy = "0.15"
 lattice-embed = "0.3.0"
 lattice-fann = "0.4.0"
 parking_lot = "0.12"

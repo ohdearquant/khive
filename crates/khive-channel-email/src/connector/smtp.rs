@@ -142,9 +142,18 @@ impl SmtpConnector for LettreSmtp {
             .body(body.to_string())
             .map_err(|e| ChannelError::InvalidEnvelope(format!("failed to build message: {e}")))?;
 
-        let relay_builder = AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
-            .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?
-            .port(self.port);
+        // Port 465 is implicit TLS (SMTPS, TLS-on-connect); 587 and everything
+        // else use STARTTLS (connect in plaintext, upgrade after EHLO). Exchange
+        // Online's SMTP AUTH submission endpoint is 587/STARTTLS. Using implicit
+        // TLS on a STARTTLS port makes rustls read the plaintext `220` greeting as
+        // a TLS record and fail with `InvalidContentType`.
+        let relay_builder = if self.port == 465 {
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host)
+        }
+        .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?
+        .port(self.port);
 
         let transport = match &self.auth {
             SmtpAuthConfig::Basic(creds) => relay_builder.credentials(creds.clone()).build(),
