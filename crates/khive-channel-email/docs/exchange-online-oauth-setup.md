@@ -124,19 +124,23 @@ Save.
 > independently block SMTP AUTH, both above the per-mailbox override:
 >
 > 1. **Security defaults** (Entra → Overview → Properties → Manage security
->    defaults). When enabled, security defaults blocks legacy authentication
->    protocols, and Microsoft classifies SMTP, IMAP, and POP3 as legacy
->    protocols — so it blocks SMTP AUTH even when the client uses modern
->    auth/OAuth. Disabling it requires the Conditional Access Administrator role;
->    the supported replacement is a Conditional Access policy (Entra ID P1).
->    Diagnostic: security defaults also blocks the device-code flow, so if
->    `Connect-ExchangeOnline -Device` in step 1 succeeded, security defaults is
->    already off and is not your cause.
+>    defaults). This is the most common cause and it sits *above* the per-mailbox
+>    setting. Microsoft's own statement: "If security defaults is enabled in your
+>    organization, SMTP AUTH is already disabled in Exchange Online. To use SMTP
+>    AUTH, you need to disable security defaults." The per-mailbox `$false` only
+>    overrides the organization `Set-TransportConfig` setting, not security
+>    defaults, so an error that still says "disabled for the Tenant" after a
+>    verified per-mailbox enable points here. Disabling security defaults needs
+>    the Conditional Access Administrator (or Global Administrator) role and turns
+>    off tenant-wide enforced MFA and legacy-auth blocking; the supported
+>    replacement is a Conditional Access policy (Entra ID P1). Treat it as a
+>    security-posture decision, not a config tweak.
 > 2. An **authentication policy** that disables basic auth for SMTP also blocks
->    the protocol.
+>    the protocol "even if you enable the settings outlined in this article."
+>    Check with `Get-AuthenticationPolicy`.
 >
-> The per-mailbox change can take a few minutes to propagate; retry before
-> investigating tenant policy.
+> A per-mailbox change can take a few minutes to propagate, so retry once; if it
+> persists, security defaults is the first thing to check.
 
 ### 3. Register the application's service principal in Exchange
 
