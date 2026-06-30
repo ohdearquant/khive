@@ -5,7 +5,7 @@ use std::path::Path;
 use super::types::{HookCommand, HookStatus, InitArgs};
 use anyhow::{bail, Context, Result};
 
-const DEFAULT_KHIVE_TOML: &str = r#"# .khive/khive.toml — project KG configuration
+const DEFAULT_CONFIG_TOML: &str = r#"# .khive/config.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
 
 [[backends]]
@@ -44,7 +44,7 @@ include = ["name", "description"]
 strict = true
 "#;
 
-const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\n!khive.toml\n";
+const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\n!config.toml\n";
 
 const PRE_COMMIT_HOOK: &str = r#"#!/usr/bin/env bash
 # .khive/kg/hooks/pre-commit
@@ -105,9 +105,9 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
             .with_context(|| format!("write {}", gitignore.display()))?;
     }
 
-    let toml_path = khive_dir.join("khive.toml");
+    let toml_path = khive_dir.join("config.toml");
     if !toml_path.exists() {
-        std::fs::write(&toml_path, DEFAULT_KHIVE_TOML)
+        std::fs::write(&toml_path, DEFAULT_CONFIG_TOML)
             .with_context(|| format!("write {}", toml_path.display()))?;
         println!("  Initialized {}", toml_path.display());
     } else {
@@ -251,7 +251,7 @@ mod tests {
 
         assert!(tmp.path().join(".khive/kg/entities.ndjson").exists());
         assert!(tmp.path().join(".khive/kg/edges.ndjson").exists());
-        assert!(tmp.path().join(".khive/khive.toml").exists());
+        assert!(tmp.path().join(".khive/config.toml").exists());
         assert!(tmp.path().join(".khive/kg/hooks/pre-commit").exists());
     }
 
@@ -259,7 +259,7 @@ mod tests {
     fn init_does_not_overwrite_existing_toml() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".khive")).unwrap();
-        let toml_path = tmp.path().join(".khive/khive.toml");
+        let toml_path = tmp.path().join(".khive/config.toml");
         std::fs::write(&toml_path, "# custom\n").unwrap();
 
         let args = InitArgs {

@@ -3530,7 +3530,7 @@ async fn t_anonymous_actor_inbox_filters_addressed_messages() {
     );
 }
 
-/// TOML wiring: actor.id in khive.toml flows into RuntimeConfig.actor_id.
+/// TOML wiring: actor.id in config.toml flows into RuntimeConfig.actor_id.
 #[test]
 fn t_actor_id_wires_from_toml_into_runtime_config() {
     use khive_runtime::{runtime_config_from_khive_config, RuntimeConfig};

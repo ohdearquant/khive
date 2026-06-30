@@ -65,7 +65,7 @@ Requires a background health-check loop and a `BackendHealthMap`. Entry point: `
 
 When only one backend is registered, every D1–D6 mechanism degenerates to its trivial identity:
 no fan-out, no cross-backend routing, no health map misses. Multi-backend complexity is opt-in
-via `khive.toml` (ADR-028).
+via `config.toml` (ADR-028).
 
 ## Invariants
 

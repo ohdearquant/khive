@@ -175,7 +175,7 @@ pub enum BackendKind {
 
 /// Configuration for a named storage backend.
 ///
-/// Corresponds to a `[[backends]]` entry in `khive.toml`.
+/// Corresponds to a `[[backends]]` entry in `config.toml`.
 /// When no `[[backends]]` section is present, a single implicit `main` backend
 /// is synthesised from the existing `--db` / `KHIVE_DB` / default-path resolution.
 /// All packs fall back to `main` when their name is absent from `[packs]`.
@@ -210,7 +210,7 @@ pub struct BackendConfig {
 
 /// Per-pack backend assignment.
 ///
-/// Corresponds to a `[packs.<pack-name>]` entry in `khive.toml`.
+/// Corresponds to a `[packs.<pack-name>]` entry in `config.toml`.
 /// Packs whose name is absent from `[packs]` fall back to the `main` backend.
 ///
 /// ```toml
@@ -223,7 +223,7 @@ pub struct PackConfig {
     pub backend: String,
 }
 
-/// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
+/// Top-level khive configuration loaded from `config.toml`.
 ///
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
@@ -269,7 +269,7 @@ pub struct KhiveConfig {
     pub packs: std::collections::HashMap<String, PackConfig>,
 }
 
-/// `[runtime]` section in `khive.toml`.
+/// `[runtime]` section in `config.toml`.
 ///
 /// Carries runtime knobs that mirror the CLI flag / env var tier.
 /// All fields are optional; absent keys fall through to env vars or built-in
@@ -333,9 +333,8 @@ impl KhiveConfig {
     /// Load config with the full resolution order:
     ///
     /// 1. Explicit `path` (from `--config` / `KHIVE_CONFIG`)
-    /// 2. `./khive.toml` (project-local, project root)
-    /// 3. `./.khive/config.toml` (project-local, hidden dir)
-    /// 4. `~/.khive/config.toml` (user-global)
+    /// 2. `./.khive/config.toml` (project-local, hidden dir)
+    /// 3. `~/.khive/config.toml` (user-global)
     ///
     /// Returns the first file found, or `Ok(None)` when none exist.
     /// Parse errors are propagated immediately — a malformed config is always
@@ -352,33 +351,26 @@ impl KhiveConfig {
         Self::load_with_roots(&project_root, home_root.as_deref())
     }
 
-    /// Testable inner search: tiers 2-4, given explicit roots instead of
+    /// Testable inner search: tiers 2-3, given explicit roots instead of
     /// reading `cwd` and `HOME` from process state.
     ///
-    /// - Tier 2: `<project_root>/khive.toml`
-    /// - Tier 3: `<project_root>/.khive/config.toml`
-    /// - Tier 4: `<home_root>/.khive/config.toml` (skipped when `None`)
+    /// - Tier 2: `<project_root>/.khive/config.toml`
+    /// - Tier 3: `<home_root>/.khive/config.toml` (skipped when `None`)
     pub(crate) fn load_with_roots(
         project_root: &Path,
         home_root: Option<&Path>,
     ) -> Result<Option<Self>, ConfigError> {
-        // Tier 2: project root khive.toml.
-        let tier2 = project_root.join("khive.toml");
+        // Tier 2: project-local hidden dir.
+        let tier2 = project_root.join(".khive/config.toml");
         if tier2.exists() {
             return Self::load(Some(&tier2));
         }
 
-        // Tier 3: project-local hidden dir.
-        let tier3 = project_root.join(".khive/config.toml");
-        if tier3.exists() {
-            return Self::load(Some(&tier3));
-        }
-
-        // Tier 4: user-global ~/.khive/config.toml.
+        // Tier 3: user-global ~/.khive/config.toml.
         if let Some(home) = home_root {
-            let tier4 = home.join(".khive/config.toml");
-            if tier4.exists() {
-                return Self::load(Some(&tier4));
+            let tier3 = home.join(".khive/config.toml");
+            if tier3.exists() {
+                return Self::load(Some(&tier3));
             }
         }
 
@@ -1064,22 +1056,16 @@ id = "lambda:"
         );
     }
 
-    // 20. load_with_roots: khive.toml (tier 2) wins over .khive/config.toml (tier 3).
+    // 20. load_with_roots: .khive/config.toml (tier 2) is found at the project root
+    //     when present.
     #[test]
-    fn test_load_with_home_fallback_project_root_over_hidden() {
+    fn test_load_with_roots_project_config_found_when_present() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Write .khive/config.toml (tier 3).
+        // Write .khive/config.toml (tier 2).
         std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
         std::fs::write(
             dir.path().join(".khive/config.toml"),
-            "[actor]\nid = \"lambda:hidden\"\n",
-        )
-        .unwrap();
-
-        // Write khive.toml (tier 2) — should win.
-        std::fs::write(
-            dir.path().join("khive.toml"),
             "[actor]\nid = \"lambda:project-root\"\n",
         )
         .unwrap();
@@ -1090,34 +1076,36 @@ id = "lambda:"
         assert_eq!(
             cfg.actor.id.as_deref(),
             Some("lambda:project-root"),
-            "khive.toml (tier 2) must win over .khive/config.toml (tier 3)"
+            ".khive/config.toml (tier 2) must be found at the project root when present"
         );
     }
 
-    // 21. load_with_roots: .khive/config.toml (tier 3) wins when khive.toml absent.
+    // 21. load_with_roots: ~/.khive/config.toml (tier 3) is the home fallback when
+    //     no project config exists.
     #[test]
-    fn test_load_with_home_fallback_hidden_over_absent_root() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_load_with_roots_home_fallback_when_project_absent() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
 
-        std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
-            dir.path().join(".khive/config.toml"),
+            home_dir.path().join(".khive/config.toml"),
             "[actor]\nid = \"lambda:hidden-config\"\n",
         )
         .unwrap();
-        // No khive.toml.
+        // No project-level config.
 
-        let cfg = KhiveConfig::load_with_roots(dir.path(), None)
+        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()))
             .expect("no error expected")
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
             Some("lambda:hidden-config"),
-            ".khive/config.toml (tier 3) must be found when khive.toml is absent"
+            "~/.khive/config.toml (tier 3) must be the home fallback when no project config exists"
         );
     }
 
-    // 22. load_with_roots: ~/.khive/config.toml (tier 4) found when project files absent.
+    // 22. load_with_roots: ~/.khive/config.toml (tier 3) found when project files absent.
     #[test]
     fn test_load_with_roots_home_tier_found() {
         let project_dir = tempfile::tempdir().unwrap();
@@ -1137,7 +1125,7 @@ id = "lambda:"
         assert_eq!(
             cfg.actor.id.as_deref(),
             Some("lambda:user-global"),
-            "~/.khive/config.toml (tier 4) must be found when project files absent"
+            "~/.khive/config.toml (tier 3) must be found when project files absent"
         );
     }
 
@@ -1169,7 +1157,7 @@ id = "lambda:"
         assert_eq!(
             cfg.actor.id.as_deref(),
             Some("lambda:project-wins"),
-            "project .khive/config.toml (tier 3) must win over ~/.khive/config.toml (tier 4)"
+            "project .khive/config.toml (tier 2) must win over ~/.khive/config.toml (tier 3)"
         );
     }
 

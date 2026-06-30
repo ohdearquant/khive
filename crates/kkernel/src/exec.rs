@@ -120,7 +120,7 @@ pub struct ExecArgs {
 
     /// Output format for verb results (ADR-078 §2 precedence: this flag >
     /// `KHIVE_OUTPUT_FORMAT` env var > `[runtime] default_output_format` in
-    /// `khive.toml` > builtin `json`).
+    /// `config.toml` > builtin `json`).
     ///
     /// Valid values: `json` (compact, lossless — default), `auto` (shape-aware:
     /// markdown table for record arrays, key-value block for single records),

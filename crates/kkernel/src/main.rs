@@ -172,7 +172,7 @@ enum PackCommand {
 
 /// Backend admin commands.
 ///
-/// In the full multi-backend deployment, `kkernel backend list` reads `khive.toml`
+/// In the full multi-backend deployment, `kkernel backend list` reads `config.toml`
 /// and enumerates all configured `[[backends]]` entries. In the current v1 implementation,
 /// it lists the single default backend constructed from `RuntimeConfig::default()`.
 #[derive(Subcommand, Debug)]
@@ -500,7 +500,7 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
 
 fn cmd_backend(cmd: BackendCommand) -> Result<()> {
     // v1: enumerate backends from RuntimeConfig defaults.
-    // Full multi-backend implementation reads khive.toml; this ships
+    // Full multi-backend implementation reads config.toml; this ships
     // the CLI surface so tooling can already call `kkernel backend list`.
     let default_config = RuntimeConfig::default();
     let default_id = default_config.backend_id.clone();

@@ -15,9 +15,9 @@
 
 ### ADR-009 / ADR-028: Multi-backend configuration
 
-- `BackendRegistry` holds registered backends. Constructed at boot from `khive.toml`.
+- `BackendRegistry` holds registered backends. Constructed at boot from `config.toml`.
 - `kkernel backend list` and `kkernel backend info` expose the registry to operators.
-- Current v1 implementation exposes a single default backend. Full `khive.toml`-driven
+- Current v1 implementation exposes a single default backend. Full `config.toml`-driven
   multi-backend enumeration is deferred to a follow-up milestone.
 
 ### ADR-010 / ADR-020: VCS and sync
@@ -70,7 +70,7 @@
 
 - `kkernel kg validate` runs three built-in structural checks (duplicate UUIDs, sort
   order, referential integrity) plus configurable rules from `rules.toml`.
-- `kkernel kg init` creates `.khive/kg/` and writes `khive.toml` with defaults.
+- `kkernel kg init` creates `.khive/kg/` and writes `config.toml` with defaults.
 - See `docs/kg-rules.md` for the rule TOML format.
 
 ### ADR-036 / ADR-037: KG status and fetch/sync alias

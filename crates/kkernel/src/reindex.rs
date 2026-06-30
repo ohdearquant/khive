@@ -141,7 +141,7 @@ pub struct ReindexArgs {
     /// embedding engines and actor namespace are resolved from it with the same
     /// precedence as `kkernel mcp`, so reindex writes vectors for the SAME
     /// engine set the MCP server serves recall from. Absent → home-fallback
-    /// search (./khive.toml, ./.khive/config.toml, ~/.khive/config.toml).
+    /// search (./.khive/config.toml, ~/.khive/config.toml).
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -1331,7 +1331,7 @@ mod tests {
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let config_path = dir.path().join("khive.toml");
+        let config_path = dir.path().join("config.toml");
         let mut f = std::fs::File::create(&config_path).expect("create config");
         f.write_all(b"[actor]\nid = \"lambda:prod\"\n")
             .expect("write config");

@@ -13,7 +13,7 @@ pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
     Validate(ValidateArgs),
 
-    /// Initialize `.khive/kg/` and write `.khive/khive.toml` with defaults.
+    /// Initialize `.khive/kg/` and write `.khive/config.toml` with defaults.
     Init(InitArgs),
 
     /// Fetch a remote KG archive into `.khive/kg/remotes/<remote>/`.

@@ -591,7 +591,7 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
 
 /// Open backends, run migrations, build per-pack runtimes, register packs.
 ///
-/// Called only when `[[backends]]` is non-empty in `khive.toml`.
+/// Called only when `[[backends]]` is non-empty in `config.toml`.
 fn build_server_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -1050,7 +1050,7 @@ mod tests {
     use std::io::Write;
 
     fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("khive.toml");
+        let path = dir.join("config.toml");
         let mut f = std::fs::File::create(&path).expect("create config file");
         f.write_all(body.as_bytes()).expect("write config");
         path

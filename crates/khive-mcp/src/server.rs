@@ -384,7 +384,7 @@ impl KhiveMcpServer {
     ///
     /// Called after construction to wire in the format resolved from
     /// `KHIVE_OUTPUT_FORMAT` or `[runtime] default_output_format` in
-    /// `khive.toml`. Per-request `format` fields override this at dispatch time.
+    /// `config.toml`. Per-request `format` fields override this at dispatch time.
     pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
         self.default_output_format = fmt;
         self

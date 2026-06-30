@@ -24,7 +24,7 @@ pub struct Args {
     /// Precedence (highest to lowest):
     ///   1. --actor (this flag)
     ///   2. --namespace / KHIVE_NAMESPACE (legacy alias)
-    ///   3. \[actor\] id in config file (--config / KHIVE_CONFIG / khive.toml / ~/.khive/config.toml)
+    ///   3. \[actor\] id in config file (--config / KHIVE_CONFIG / .khive/config.toml / ~/.khive/config.toml)
     ///   4. Default: "local"
     #[arg(long, env = "KHIVE_ACTOR")]
     pub actor: Option<String>,
@@ -56,9 +56,8 @@ pub struct Args {
     /// sets the default namespace (overridden by --actor).
     ///
     /// Default search order when this flag is absent:
-    ///   1. ./khive.toml
-    ///   2. ./.khive/config.toml
-    ///   3. ~/.khive/config.toml
+    ///   1. ./.khive/config.toml
+    ///   2. ~/.khive/config.toml
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -88,7 +87,7 @@ pub struct Args {
     ///
     /// Precedence (highest to lowest):
     ///   1. --brain-profile (this flag)
-    ///   2. \[runtime\] brain_profile in project khive.toml / global ~/.khive/config.toml
+    ///   2. \[runtime\] brain_profile in project .khive/config.toml / global ~/.khive/config.toml
     ///   3. KHIVE_BRAIN_PROFILE env var
     ///   4. Namespace-bound profile (resolved at feedback time via brain.resolve)
     ///   5. Pack-local global tuning prior

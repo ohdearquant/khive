@@ -148,7 +148,7 @@ impl KhiveRuntime {
     /// Construct a runtime from an already-opened backend.
     ///
     /// This is the preferred constructor for multi-backend deployments. The caller
-    /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
+    /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `config.toml`,
     /// then constructs a `KhiveRuntime` per pack using this method.
     ///
     /// The returned runtime has `db_path = None` and `embedding_model = None`; all

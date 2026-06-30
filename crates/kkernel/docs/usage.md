@@ -113,7 +113,7 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 
 **Config resolution.** Engines, db path, and config file are resolved with the
 **same precedence as `kkernel mcp`** — config-file `[[engines]]` (via `--config`
-/ `KHIVE_CONFIG` / `./khive.toml` / `./.khive/config.toml` / `~/.khive/config.toml`)
+/ `KHIVE_CONFIG` / `./.khive/config.toml` / `~/.khive/config.toml`)
 win over the `KHIVE_EMBEDDING_MODEL` env vars and over `RuntimeConfig` defaults.
 This guarantees reindex writes vectors for the SAME engine set the MCP server
 serves recall from. `--namespace` is the explicit per-namespace target and

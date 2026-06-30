@@ -197,7 +197,7 @@ pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Deprecated: use [`crate::KhiveRuntime::from_backend`] instead. The boot path
-    /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
+    /// constructs backends from `config.toml` (`AppConfig`) and passes them to
     /// `from_backend`. Direct `db_path` usage persists only in tests.
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
@@ -228,14 +228,14 @@ pub struct RuntimeConfig {
     pub packs: Vec<String>,
     /// Identifies this runtime's backend in a multi-backend deployment.
     ///
-    /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
+    /// Set by the boot path when constructing per-pack runtimes from `config.toml`.
     /// Single-backend deployments use the default `BackendId::MAIN`.
     pub backend_id: BackendId,
     /// Brain profile to use for `memory.feedback` / `knowledge.feedback` and
     /// recall-time score boosting (ADR-035 §Brain profile configuration).
     ///
     /// Resolution order (highest to lowest, ADR-035): CLI flag, then
-    /// `runtime.brain_profile` in project/global `khive.toml`, then the
+    /// `runtime.brain_profile` in project/global `config.toml`, then the
     /// `KHIVE_BRAIN_PROFILE` env var as fallback default. Callers must keep
     /// env OUT of the base config they pass in (see `khive-mcp` serve.rs).
     /// 1. `--brain-profile` CLI flag (explicit only)
@@ -248,11 +248,11 @@ pub struct RuntimeConfig {
     /// `['local'] ∪ visible_namespaces`. Writes remain pinned to `'local'`.
     /// An explicit `namespace=` request param is a precise single-namespace
     /// escape and is not widened. Populated from `actor.visible_namespaces`
-    /// in `khive.toml`.
+    /// in `config.toml`.
     pub visible_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
-    /// in `khive.toml`. Empty by default — cross-namespace delivery denied
+    /// in `config.toml`. Empty by default — cross-namespace delivery denied
     /// unless explicitly declared. The comm handler uses an ordinary
     /// `NamespaceToken` (minted via `with_namespace`) in an append-only manner;
     /// the token itself is NOT type-enforced write-only. The recipient-side
@@ -260,7 +260,7 @@ pub struct RuntimeConfig {
     /// a future cloud-path authorization ADR (not yet written).
     pub allowed_outbound_namespaces: Vec<Namespace>,
     /// Configured actor identity label (ADR-057). Populated from `[actor] id` in
-    /// `khive.toml`. When `Some`, `authorize()` mints tokens carrying this actor
+    /// `config.toml`. When `Some`, `authorize()` mints tokens carrying this actor
     /// label so that `comm.inbox` filters by `to_actor` instead of falling back to
     /// the party-line "local" behavior. When `None` (default), tokens carry
     /// `ActorRef::anonymous()` and inbox shows all inbound messages.

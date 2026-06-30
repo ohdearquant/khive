@@ -158,7 +158,7 @@ pub(crate) async fn dual_write_message(
                     reason: format!(
                         "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
                          add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
-                         the sender's khive.toml to enable delivery"
+                         the sender's .khive/config.toml to enable delivery"
                     ),
                 });
             }

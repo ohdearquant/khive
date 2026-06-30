@@ -87,7 +87,7 @@ pub(crate) async fn handle_send(
             "comm.send: unattributed caller (actor.id not configured) sending to a specific \
              actor label; from_actor will be stamped 'local', corrupting attribution and \
              reply-thread routing in multi-actor deployments. \
-             Set [actor] id in khive.toml to fix (issue #200)."
+             Set [actor] id in .khive/config.toml to fix (issue #200)."
         );
     }
 
