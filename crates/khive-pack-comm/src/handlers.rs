@@ -581,8 +581,14 @@ pub(crate) async fn handle_ingest(
     // Thread resolution: if correlation_external_id is present, find the message it refers to
     // and extract both its internal thread_id and the from_actor of the original sender so that
     // replies route back to the actor who sent the original, not to the raw email address.
+    //
+    // Two-query fallback: `corr` may be either a Message-ID (matched via $.external_id) from
+    // a human webmail In-Reply-To header, OR a thread UUID (matched via $.thread_id) from
+    // a preserved X-Khive-Thread-ID header on our own outbound emails.  We try external_id
+    // first (preserves the In-Reply-To path); if that misses we fall back to thread_id.
     let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
         if !corr.is_empty() {
+            // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
             let corr_filter = NoteFilter {
                 kind: Some("message".to_string()),
                 property_filters: vec![PropertyFilter {
@@ -602,7 +608,7 @@ pub(crate) async fn handle_ingest(
                     },
                 )
                 .await?;
-            corr_page.items.first().and_then(|n| {
+            let pass1 = corr_page.items.first().and_then(|n| {
                 let props = n.properties.as_ref()?;
                 let thread_id = props
                     .get("thread_id")
@@ -615,7 +621,51 @@ pub(crate) async fn handle_ingest(
                     .unwrap_or("")
                     .to_string();
                 Some((thread_id, from_actor))
-            })
+            });
+
+            if pass1.is_some() {
+                pass1
+            } else if corr.parse::<Uuid>().is_ok() {
+                // Pass 2: `corr` is a UUID — may be a thread UUID from X-Khive-Thread-ID.
+                // Match against $.thread_id on an outbound note to recover from_actor.
+                let thread_filter = NoteFilter {
+                    kind: Some("message".to_string()),
+                    property_filters: vec![
+                        PropertyFilter {
+                            json_path: "$.thread_id".to_string(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text(corr.clone()),
+                        },
+                        PropertyFilter {
+                            json_path: "$.direction".to_string(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text("outbound".to_string()),
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let thread_page = store
+                    .query_notes_filtered(
+                        ns,
+                        &thread_filter,
+                        PageRequest {
+                            limit: 1,
+                            offset: 0,
+                        },
+                    )
+                    .await?;
+                thread_page.items.first().and_then(|n| {
+                    let props = n.properties.as_ref()?;
+                    let from_actor = props
+                        .get("from_actor")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some((corr.clone(), from_actor))
+                })
+            } else {
+                None
+            }
         } else {
             None
         }

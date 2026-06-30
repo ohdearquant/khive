@@ -7396,3 +7396,144 @@ async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
          got empty search result"
     );
 }
+
+// ── Finding 1: delivered filter must reach past 200 delivered notes ────────────
+//
+// Regression: before the fix, list(kind=message, direction=outbound) fetched
+// the 200 most-recent notes and applied the delivered_at check in Rust — so an
+// old undelivered note was permanently stranded behind the delivered ones.
+// After the fix, the query layer filters on delivered=false BEFORE applying the
+// 200-note page, so undelivered notes are always reachable.
+
+#[tokio::test]
+async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    // Write the OLD undelivered note first (smallest created_at → sorted last by DB).
+    let old_undelivered = rt
+        .create_note(
+            &token,
+            "message",
+            None,
+            "the old undelivered note",
+            None,
+            Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:leo@khive.ai",
+                "to": "email:user@example.com",
+                "to_actor": "email:user@example.com",
+            })),
+            vec![],
+        )
+        .await
+        .expect("create old undelivered note");
+    let old_id = old_undelivered.id.as_hyphenated().to_string();
+
+    // Write 210 NEWER delivered notes (these sort before the old one in DESC order).
+    let store = rt.notes(&token).expect("note store");
+    for i in 0..210u32 {
+        let note = Note::new("local", "message", format!("delivered {i}")).with_properties(
+            serde_json::json!({
+                "direction": "outbound",
+                "from": "email:leo@khive.ai",
+                "to": "email:user@example.com",
+                "to_actor": "email:user@example.com",
+                "delivered_at": "2026-01-01T00:00:00Z",
+            }),
+        );
+        store
+            .upsert_note(note)
+            .await
+            .expect("upsert delivered note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    // delivered=false must return the old undelivered note (not strand it behind 210 delivered).
+    // Use kind="note" (the generic substrate level) so the test registry (KgPack-only) can
+    // resolve the kind without needing CommPack's "message" granular registration.
+    let result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({
+                "kind": "note",
+                "direction": "outbound",
+                "delivered": false,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("list(delivered=false) must succeed");
+
+    let items = result.as_array().expect("list returns array");
+    assert_eq!(
+        items.len(),
+        1,
+        "Finding 1: list(delivered=false) must find the 1 undelivered note past 210 delivered; \
+         got {} items",
+        items.len()
+    );
+    let returned_id = items[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(
+        returned_id, old_id,
+        "Finding 1: returned note id={returned_id} must equal the undelivered note id={old_id}"
+    );
+
+    // delivered=true must return only delivered notes.
+    // Note: the note list handler caps at 200 per page, so with 210 delivered notes
+    // we request 200 (the cap) and expect 200 — all of them must have delivered_at.
+    let delivered_result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({
+                "kind": "note",
+                "direction": "outbound",
+                "delivered": true,
+                "limit": 200,
+            }),
+        )
+        .await
+        .expect("list(delivered=true) must succeed");
+    let delivered_items = delivered_result.as_array().expect("array");
+    assert_eq!(
+        delivered_items.len(),
+        200,
+        "Finding 1: list(delivered=true) must return 200 delivered notes (page cap); \
+         got {}",
+        delivered_items.len()
+    );
+    for item in delivered_items {
+        let da = item
+            .get("properties")
+            .and_then(|p| p.get("delivered_at"))
+            .and_then(|v| v.as_str());
+        assert!(
+            da.is_some(),
+            "Finding 1: list(delivered=true) items must all have delivered_at; got {item}"
+        );
+    }
+
+    // Absent delivered param must return the page cap worth of notes (back-compat — no extra filter).
+    let all_result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({
+                "kind": "note",
+                "direction": "outbound",
+                "limit": 200,
+            }),
+        )
+        .await
+        .expect("list(no delivered filter) must succeed");
+    let all_items = all_result.as_array().expect("array");
+    assert_eq!(
+        all_items.len(),
+        200,
+        "Finding 1: list(no delivered filter) must return 200 notes (page cap of 211 total); \
+         got {}",
+        all_items.len()
+    );
+}

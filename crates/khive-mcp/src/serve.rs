@@ -310,6 +310,7 @@ async fn channel_outbox_loop(
             "namespace": ingest_namespace,
             "kind": "message",
             "direction": "outbound",
+            "delivered": false,
             "limit": 200,
         });
         let list_result = match registry.dispatch("list", list_params).await {
@@ -331,7 +332,9 @@ async fn channel_outbox_loop(
                 _ => continue,
             };
 
-            // Only outbound direction.
+            // Only outbound direction. The `delivered=false` filter on the list query
+            // ensures only undelivered notes are returned; this check is a cheap
+            // defensive guard for any note that slips through.
             if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
                 continue;
             }
@@ -342,7 +345,7 @@ async fn channel_outbox_loop(
                 _ => continue,
             };
 
-            // Skip already-delivered notes.
+            // Defensive: skip already-delivered notes in case the query filter missed any.
             if props.get("delivered_at").is_some() {
                 continue;
             }

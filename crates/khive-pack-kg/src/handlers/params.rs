@@ -67,6 +67,8 @@ pub(crate) struct ListParams {
     pub(crate) from: Option<String>,
     pub(crate) to: Option<String>,
     pub(crate) read: Option<bool>,
+    #[serde(default)]
+    pub(crate) delivered: Option<bool>,
     pub(crate) verb: Option<String>,
     pub(crate) verbs: Option<Vec<String>>,
     pub(crate) outcome: Option<String>,
