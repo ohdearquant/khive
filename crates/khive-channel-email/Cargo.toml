@@ -26,6 +26,8 @@ async-imap = { workspace = true }
 async-native-tls = { workspace = true }
 mail-parser = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

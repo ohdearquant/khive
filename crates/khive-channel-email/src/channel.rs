@@ -1,14 +1,17 @@
 //! `EmailChannel` — implements the `Channel` trait for email transport.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use khive_channel::{Channel, ChannelEnvelope, ChannelError};
 use tracing::{debug, warn};
 
-use crate::config::EmailChannelConfig;
+use crate::config::{EmailAuth, EmailChannelConfig};
 use crate::connector::imap::ImapFetcher;
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
+use crate::oauth::TokenProvider;
 
 /// Email channel adapter implementing `Channel` via SMTP + IMAP.
 ///
@@ -24,18 +27,49 @@ impl EmailChannel {
     /// Build from environment variables. Fails if any required env var is absent.
     pub fn from_env() -> Result<Self, ChannelError> {
         let config = EmailChannelConfig::from_env()?;
-        let smtp = SmtpSender::new(
-            &config.smtp_host,
-            config.smtp_port,
-            &config.username,
-            &config.password,
-        );
-        let imap = ImapFetcher::new(
-            &config.imap_host,
-            config.imap_port,
-            &config.username,
-            &config.password,
-        );
+
+        let (smtp, imap) = match &config.auth {
+            EmailAuth::Basic { password } => {
+                let smtp = SmtpSender::new(
+                    &config.smtp_host,
+                    config.smtp_port,
+                    &config.username,
+                    password,
+                );
+                let imap = ImapFetcher::new(
+                    &config.imap_host,
+                    config.imap_port,
+                    &config.username,
+                    password,
+                );
+                (smtp, imap)
+            }
+            EmailAuth::OAuth {
+                tenant_id,
+                client_id,
+                client_secret,
+            } => {
+                let token_provider = Arc::new(TokenProvider::new(
+                    tenant_id.clone(),
+                    client_id.clone(),
+                    client_secret.clone(),
+                ));
+                let smtp = SmtpSender::new_oauth(
+                    &config.smtp_host,
+                    config.smtp_port,
+                    &config.mailbox,
+                    Arc::clone(&token_provider),
+                );
+                let imap = ImapFetcher::new_oauth(
+                    &config.imap_host,
+                    config.imap_port,
+                    &config.mailbox,
+                    Arc::clone(&token_provider),
+                );
+                (smtp, imap)
+            }
+        };
+
         Ok(Self { config, smtp, imap })
     }
 
@@ -170,6 +204,7 @@ fn strip_kind_prefix<'a>(addr: &'a str, kind: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EmailAuth;
     use crate::connector::imap::{ImapConnector, ImapFetcher};
     use crate::connector::smtp::{SmtpConnector, SmtpSender};
     use std::collections::HashMap;
@@ -182,7 +217,10 @@ mod tests {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            mailbox: "user@example.com".to_string(),
+            auth: EmailAuth::Basic {
+                password: "secret".to_string(),
+            },
             maintainer_address: MailAddress::parse(maintainer).unwrap(),
         }
     }

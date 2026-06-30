@@ -51,6 +51,8 @@ lattice-embed = { workspace = true }
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
+# Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
+channel-email = ["khive-mcp/channel-email"]
 
 [[bin]]
 name = "kkernel"

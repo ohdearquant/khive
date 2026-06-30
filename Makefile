@@ -54,8 +54,8 @@ bench-1m-ci:
 	bash scripts/bench_1m.sh --ci
 
 local:
-	@echo "==> Building kkernel (release)..."
-	@cd crates && cargo build --release -p kkernel
+	@echo "==> Building kkernel (release, channel-email)..."
+	@cd crates && cargo build --release -p kkernel --features channel-email
 	@SRC=crates/target/release/kkernel; \
 	DEST=$$HOME/.cargo/bin/kkernel; \
 	if [ ! -f "$$SRC" ]; then echo "==> ERROR: build artifact $$SRC missing"; exit 1; fi; \

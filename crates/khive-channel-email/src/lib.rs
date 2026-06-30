@@ -7,6 +7,7 @@
 pub mod channel;
 pub mod config;
 pub mod connector;
+pub(crate) mod oauth;
 
 pub use channel::EmailChannel;
 pub use config::EmailChannelConfig;

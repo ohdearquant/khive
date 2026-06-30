@@ -10,10 +10,12 @@ use async_trait::async_trait;
 use khive_channel::ChannelError;
 use lettre::{
     message::{header::ContentType, Mailbox},
-    transport::smtp::authentication::Credentials,
+    transport::smtp::authentication::{Credentials, Mechanism},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use tracing::instrument;
+
+use crate::oauth::TokenProvider;
 
 /// Custom MIME header for khive thread correlation.
 ///
@@ -39,6 +41,18 @@ impl lettre::message::header::Header for XKhiveThreadId {
     }
 }
 
+/// SMTP authentication configuration (basic or OAuth2 XOAUTH2).
+enum SmtpAuthConfig {
+    /// Standard username + password credentials.
+    Basic(Credentials),
+    /// OAuth2 XOAUTH2: fetch a bearer token from the provider at send time.
+    OAuth {
+        /// Mailbox address used as the `user=` field in the XOAUTH2 SASL string.
+        mailbox: String,
+        token_provider: Arc<TokenProvider>,
+    },
+}
+
 /// Internal trait for the SMTP send operation.
 ///
 /// Allows unit tests to swap in a mock without a live SMTP server.
@@ -58,15 +72,40 @@ pub(crate) trait SmtpConnector: Send + Sync + 'static {
 pub(crate) struct LettreSmtp {
     host: String,
     port: u16,
-    creds: Credentials,
+    auth: SmtpAuthConfig,
 }
 
 impl LettreSmtp {
+    /// Create a connector using basic username/password credentials.
     pub(crate) fn new(host: impl Into<String>, port: u16, username: &str, password: &str) -> Self {
         Self {
             host: host.into(),
             port,
-            creds: Credentials::new(username.to_string(), password.to_string()),
+            auth: SmtpAuthConfig::Basic(Credentials::new(
+                username.to_string(),
+                password.to_string(),
+            )),
+        }
+    }
+
+    /// Create a connector using XOAUTH2 (Microsoft Exchange Online app-only flow).
+    ///
+    /// `mailbox` is the address used in the SASL `user=` field.
+    /// lettre's `Mechanism::Xoauth2` computes `user=<mailbox>\x01auth=Bearer
+    /// <token>\x01\x01` internally from `Credentials::new(mailbox, access_token)`.
+    pub(crate) fn new_oauth(
+        host: impl Into<String>,
+        port: u16,
+        mailbox: impl Into<String>,
+        token_provider: Arc<TokenProvider>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            auth: SmtpAuthConfig::OAuth {
+                mailbox: mailbox.into(),
+                token_provider,
+            },
         }
     }
 }
@@ -103,11 +142,26 @@ impl SmtpConnector for LettreSmtp {
             .body(body.to_string())
             .map_err(|e| ChannelError::InvalidEnvelope(format!("failed to build message: {e}")))?;
 
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
+        let relay_builder = AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
             .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?
-            .credentials(self.creds.clone())
-            .port(self.port)
-            .build();
+            .port(self.port);
+
+        let transport = match &self.auth {
+            SmtpAuthConfig::Basic(creds) => relay_builder.credentials(creds.clone()).build(),
+            SmtpAuthConfig::OAuth {
+                mailbox,
+                token_provider,
+            } => {
+                // Fetch (or return cached) bearer token, then wire it into lettre.
+                // lettre's Mechanism::Xoauth2 builds the SASL string internally from
+                // Credentials::new(mailbox, access_token).
+                let token = token_provider.get_token().await?;
+                relay_builder
+                    .credentials(Credentials::new(mailbox.clone(), token))
+                    .authentication(vec![Mechanism::Xoauth2])
+                    .build()
+            }
+        };
 
         transport
             .send(msg)
@@ -124,10 +178,22 @@ pub struct SmtpSender {
 }
 
 impl SmtpSender {
-    /// Create a production sender backed by lettre.
+    /// Create a production sender using basic username/password auth.
     pub fn new(host: impl Into<String>, port: u16, username: &str, password: &str) -> Self {
         Self {
             inner: Arc::new(LettreSmtp::new(host, port, username, password)),
+        }
+    }
+
+    /// Create a production sender using XOAUTH2 (Exchange Online app-only flow).
+    pub fn new_oauth(
+        host: impl Into<String>,
+        port: u16,
+        mailbox: impl Into<String>,
+        token_provider: Arc<TokenProvider>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LettreSmtp::new_oauth(host, port, mailbox, token_provider)),
         }
     }
 
