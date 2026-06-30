@@ -11,6 +11,40 @@ mod pack;
 pub(crate) use pack::sync_balanced_recall_record;
 pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 
+use std::collections::HashMap;
+
+use khive_brain_core::{SectionPosteriorState, SectionType};
+
+/// Ensure `profile_id` has a fully-seeded `SectionPosteriorState` in `section_states`.
+///
+/// Gets-or-inserts the profile entry via `entry(..).or_default()`, then backfills any
+/// missing `posteriors`/`priors` slots from `SectionPosteriorState::default_priors()`
+/// across all `SectionType::all()` variants.
+///
+/// Used by both the live `brain.feedback` handler and the persisted event-replay path
+/// so that section signals are applied identically regardless of whether the loaded
+/// snapshot predates section_states or a new `SectionType` variant was added after it.
+pub(crate) fn ensure_section_state_seeded<'a>(
+    section_states: &'a mut HashMap<String, SectionPosteriorState>,
+    profile_id: &str,
+) -> &'a mut SectionPosteriorState {
+    let section_state = section_states.entry(profile_id.to_owned()).or_default();
+    let defaults = SectionPosteriorState::default_priors();
+    for st in SectionType::all() {
+        if let Some(prior) = defaults.get(st) {
+            section_state
+                .posteriors
+                .entry(*st)
+                .or_insert_with(|| prior.clone());
+            section_state
+                .priors
+                .entry(*st)
+                .or_insert_with(|| prior.clone());
+        }
+    }
+    section_state
+}
+
 /// Validate a `section_signals` JSON value before any state mutation.
 ///
 /// Enforces the section fold contract (ADR-048): keys must be known `SectionType`
