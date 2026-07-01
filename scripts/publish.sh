@@ -63,6 +63,7 @@ CRATES=(
     khive-vcs-adapters
     khive-vcs
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
+    khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
     khive-pack-gtd
     khive-brain-core
@@ -71,7 +72,6 @@ CRATES=(
     khive-pack-comm
     khive-pack-schedule
     khive-pack-knowledge
-    khive-pack-formal    # needs khive-runtime + khive-types (both above); consumed by kkernel
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-template
     khive-channel        # no khive-* deps; transport abstraction
