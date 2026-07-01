@@ -584,3 +584,59 @@ impl MemoryPack {
         to_json(&results)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    use crate::MemoryPack;
+
+    /// #388 regression: the `memory.recall` verb must not hard-fail on a query
+    /// containing FTS5 metacharacters like `$` (e.g. the DSL doc query `$prev.id`).
+    /// `sanitize_fts5_query` (khive-db) now strips `$`, but this exercises the
+    /// full verb-dispatch path end to end: `collect_recall_text_hits`
+    /// (khive-pack-memory) degrades to an empty candidate set on any residual FTS
+    /// error instead of aborting the recall, and the in-memory runtime here has no
+    /// embedder registered, so the vector leg trivially contributes zero hits —
+    /// isolating the assertion to the FTS leg's fail-open behavior.
+    #[tokio::test]
+    async fn recall_with_dollar_sign_query_does_not_error() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "use $prev.id to chain calls",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "$prev.id",
+                    "limit": 10
+                }),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "#388 memory.recall must not hard-fail on a '$'-bearing query, got: {:?}",
+            result.err()
+        );
+    }
+}

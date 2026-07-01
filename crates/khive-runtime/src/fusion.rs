@@ -148,7 +148,12 @@ impl KhiveRuntime {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let ns = token.namespace().as_str().to_owned();
-        let text_hits = self
+        // Fail-open on the FTS leg only (#388): sanitize_fts5_query already strips
+        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors at
+        // runtime (anything sanitization misses), degrade to vector-only fusion
+        // instead of aborting the whole hybrid search. Errors from any other leg
+        // (vector search) still propagate normally.
+        let text_hits = match self
             .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
@@ -160,7 +165,18 @@ impl KhiveRuntime {
                 top_k: candidates,
                 snippet_chars: 200,
             })
-            .await?;
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    query = %query_text,
+                    "hybrid_search_with_strategy: FTS leg failed, degrading to vector-only fusion"
+                );
+                Vec::new()
+            }
+        };
 
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
@@ -406,5 +422,36 @@ mod tests {
             let back: FusionStrategy = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(strategy, back, "roundtrip failed for {json}");
         }
+    }
+
+    // 10. #388 regression: hybrid_search_with_strategy must not hard-fail on a query
+    // containing FTS5 metacharacters like `$`. sanitize_fts5_query (khive-db) strips
+    // `$`, but this exercises the runtime-level fail-open: if the FTS leg ever errors,
+    // the call degrades to vector-only fusion instead of propagating the error.
+    #[tokio::test]
+    async fn hybrid_search_with_strategy_dollar_sign_query_does_not_error() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "DSL docs",
+            Some("use $prev.id to chain calls"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .hybrid_search_with_strategy(&tok, "$prev.id", None, FusionStrategy::default(), 10)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "#388 hybrid_search_with_strategy must not hard-fail on a '$'-bearing query, got: {:?}",
+            result.err()
+        );
     }
 }

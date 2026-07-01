@@ -571,7 +571,12 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        let hits = if fts_gather.enabled {
+        // Fail-open on the FTS leg only (#388): sanitize_fts5_query already strips
+        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors at
+        // runtime (anything sanitization misses), degrade to an empty candidate set
+        // instead of aborting the whole memory.recall (the vector leg runs
+        // independently in collect_recall_candidates and still contributes).
+        let fts_result: Result<Vec<TextSearchHit>, RuntimeError> = if fts_gather.enabled {
             crate::text_gather::collect_text_hits(
                 searcher.as_ref(),
                 query,
@@ -582,9 +587,9 @@ impl MemoryPack {
                 fts_gather,
                 &terms,
             )
-            .await?
+            .await
         } else {
-            let mut h = searcher
+            searcher
                 .search(TextSearchRequest {
                     query: terms.join(" "),
                     mode: TextQueryMode::AnyTerm,
@@ -596,10 +601,24 @@ impl MemoryPack {
                     top_k: candidate_limit,
                     snippet_chars: snippet_policy.snippet_chars(),
                 })
-                .await?;
-            h.sort_by_key(|h| h.rank);
-            h.truncate(candidate_limit as usize);
-            h
+                .await
+                .map_err(RuntimeError::from)
+        };
+
+        let hits = match fts_result {
+            Ok(mut h) => {
+                h.sort_by_key(|h| h.rank);
+                h.truncate(candidate_limit as usize);
+                h
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    query = %query,
+                    "collect_recall_text_hits: FTS leg failed, degrading to vector-only recall"
+                );
+                Vec::new()
+            }
         };
 
         if prof {

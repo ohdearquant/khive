@@ -196,8 +196,11 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 /// 1. **Replace** grouping/separator chars with spaces so adjacent tokens are
 ///    not merged. This prevents `NEAR(smile,5)` from becoming `NEARsmile5`.
 ///    Chars replaced with space: `(`, `)`, `,`
-/// 2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added):
-///    `*`, `"`, `+`, `-`, `:`, `^`, `.`, `~`, `!`, `\0`, control characters
+/// 2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added;
+///    issue #388: `$` added — FTS5's MATCH-expression parser treats a bareword
+///    starting with, containing, or consisting solely of `$` as a syntax
+///    error regardless of tokenizer, e.g. the DSL-doc query `$prev.id`):
+///    `*`, `"`, `+`, `-`, `:`, `^`, `.`, `~`, `!`, `$`, `\0`, control characters
 ///
 /// After character processing, split on whitespace and remove FTS5 keyword
 /// tokens: AND, OR, NOT, NEAR.
@@ -221,12 +224,15 @@ fn sanitize_fts5_query(query: &str) -> String {
     // Pass 2: remove remaining FTS5 special chars and control characters.
     // Single quote (apostrophe) is included because FTS5 Plain-mode queries treat
     // it as a string-literal delimiter causing "syntax error near '''".
+    // Dollar sign is included (#388) because FTS5's MATCH parser rejects it
+    // unconditionally — `syntax error near "$"` — wherever it appears in the
+    // expression, e.g. "$prev.id" (a common agent query for DSL docs).
     let sanitized: String = spaced
         .chars()
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '\0'
+                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '$' | '\0'
             ) && !c.is_control()
         })
         .collect();
