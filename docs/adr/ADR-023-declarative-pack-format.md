@@ -112,7 +112,7 @@ The kkernel CLI exposes the **full** handler surface via the verb-DSL `exec` sub
 kkernel exec 'memory.recall(query="...")'                      # Verb       — also on MCP
 kkernel exec 'memory.recall_embed(query="...")'                 # Subhandler — admin only
 kkernel exec 'memory.recall_fuse(query="...", limit=5)'         # Subhandler — admin only
-kkernel exec 'memory.recall_score(candidate_id="...")'          # Subhandler — admin only
+kkernel exec 'memory.recall_score(rrf=0.4, salience=0.8, decay_factor=0.02, age_days=7)'  # Subhandler — admin only
 ```
 
 The same handler is reachable as `memory.recall` from MCP and as
