@@ -344,7 +344,7 @@ pub enum PresentationMode {
     /// fields truncated to 3 significant figures.
     #[default]
     Agent,
-    /// Full canonical shape. Default for `kkernel call` and CI/scripted callers.
+    /// Full canonical shape. Default for `kkernel exec` and CI/scripted callers.
     ///
     /// No transformation — handler output passes through as-is.
     Verbose,

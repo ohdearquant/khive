@@ -452,14 +452,14 @@ verbs and the apply worker each have policy hooks:
 
 ### 10. CLI / MCP surface summary
 
-| Surface                                                        | Action                                                    | How                                    |
-| -------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------- |
-| MCP `propose(...)`                                             | Create a proposal                                         | Verb                                   |
-| MCP `review(id, decision, comment?)`                           | Cast a review                                             | Verb                                   |
-| MCP `withdraw(id, rationale?)`                                 | Withdraw a proposal (proposer-only)                       | Verb                                   |
-| MCP `list(kind=proposal, status="open")`                       | Browse open proposals                                     | Lists from `proposals_open` projection |
-| MCP `get(id=<proposal_id>)`                                    | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
-| CLI `kkernel call kg proposal_cleanup --older-than <duration>` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
+| Surface                                                           | Action                                                    | How                                    |
+| ----------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------- |
+| MCP `propose(...)`                                                | Create a proposal                                         | Verb                                   |
+| MCP `review(id, decision, comment?)`                              | Cast a review                                             | Verb                                   |
+| MCP `withdraw(id, rationale?)`                                    | Withdraw a proposal (proposer-only)                       | Verb                                   |
+| MCP `list(kind=proposal, status="open")`                          | Browse open proposals                                     | Lists from `proposals_open` projection |
+| MCP `get(id=<proposal_id>)`                                       | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
+| CLI `kkernel exec 'kg.proposal_cleanup(older_than="<duration>")'` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
 
 `list(kind=proposal)` dispatches to a new `kg.list_proposals` handler under
 the kg pack — it queries `proposals_open` directly, supports the standard

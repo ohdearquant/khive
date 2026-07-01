@@ -113,7 +113,7 @@ one per engine, in deterministic order (engine_id ASC). Single-engine deployment
 return a one-element list — the shape is uniform regardless of engine count. It is
 `Internal` because agents have no reason to see the raw embedding vectors (token
 waste); operators inspecting an engine use
-`kkernel call memory recall_embed query="..."`.
+`kkernel exec 'memory.recall_embed(query="...")'`.
 
 The `memory.recall_score` handler returns a score breakdown per result:
 

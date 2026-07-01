@@ -19,7 +19,7 @@ use crate::edge::EdgeRelation;
 pub enum Visibility {
     /// Externally invokable via MCP `request` tool.
     Verb,
-    /// Internal — operator-only via `kkernel call <pack> <handler>`.
+    /// Internal — operator-only via `kkernel exec '<pack>.<handler>(...)'`.
     Subhandler,
 }
 

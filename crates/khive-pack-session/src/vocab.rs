@@ -50,7 +50,7 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
 /// only active feature is the background daemon mirror (the `warm()` hook),
 /// which runs independent of verb visibility. The read/query layer
 /// (store/list/get) is deferred — it stays dispatchable via the runtime and
-/// `kkernel call` but is withheld from the agent surface until the
+/// `kkernel exec` but is withheld from the agent surface until the
 /// session-continuity query UX is designed. Flip to `Visibility::Verb` to
 /// expose (and bump the smoke-test verb count accordingly).
 ///
