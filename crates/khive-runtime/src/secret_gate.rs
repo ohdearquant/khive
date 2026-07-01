@@ -22,12 +22,22 @@
 //!    apikey, api_key, access_key, private_key).  The word `token` alone is NOT
 //!    a trigger to avoid blocking `tokenizer_*`, `token_count`, etc.
 //!
-//! Allowlist (false-positive suppression):
-//! - Pure hex strings (sha256, git SHA) — passed unconditionally.
-//! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed.
+//! Allowlist (false-positive suppression) — **all of the following are
+//! prose-context exemptions, not unconditional passes: a credential trigger
+//! word in the surrounding window always dominates.** A UUID or a
+//! sha-prefixed content hash sitting directly beside "api_key"/"secret"/"auth"
+//! is exactly as ambiguous as any other high-entropy candidate and falls
+//! through to explicit detection instead of being silently allowed. A corpus
+//! replay of ~19k real notes and docs measured exactly one benign token newly
+//! blocked under this rule (an internal task UUID field incidentally
+//! co-occurring with the word "auth") — accepted as a small, traced tradeoff
+//! rather than leaving the allowlists unconditionally bypassable.
+//! - Pure hex strings (sha256, git SHA) — passed when not near a trigger.
+//! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
 //! - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI
-//!   hashes, npm lockfile integrity) — passed when not preceded by a known-vendor
-//!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
+//!   hashes, npm lockfile integrity) — passed when not near a trigger and not
+//!   preceded by a known-vendor prefix.  Bare base64 tokens without the
+//!   `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
 //! - Non-ASCII characters (CJK prose, accented text, emoji) act as token
@@ -621,16 +631,12 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // `token` is ASCII here (non-ASCII was split out at tokenization), so
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
-        // UUID and sha-prefixed base64 content hashes (SRI / npm lockfile) are
-        // unconditionally allowlisted: their forms are unambiguous regardless of
-        // surrounding context.
-        if is_uuid_canonical(token) || is_base64_content_hash(token) {
-            continue;
-        }
-
-        // Compute the trigger window before deciding whether to allowlist hex
-        // tokens.  A pure-hex token near a credential trigger word cannot be
-        // safely assumed to be a non-secret hash and must be entropy-checked.
+        // Compute the trigger window BEFORE any shape-based allowlist decision.
+        // Every allowlist below (UUID, base64 content-hash, pure-hex) is a
+        // prose-context exemption, not an unconditional one: a credential
+        // trigger word dominates shape allowlists, because attacker-suppliable
+        // shapes (a UUID, a sha-prefixed hash) are exactly as ambiguous near a
+        // trigger word as any other high-entropy candidate.
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
@@ -639,6 +645,32 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let near_trigger = TRIGGER_WORDS.iter().any(|tw| low_window.contains(tw))
             || has_standalone_token(&low_window)
             || has_token_assignment(&low_window);
+
+        // UUID canonical form and sha-prefixed base64 content hashes (SRI /
+        // npm lockfile integrity) are allowlisted only outside trigger
+        // context. Near a trigger, both shapes fall through to detection
+        // below instead of being silently passed.
+        //
+        // A UUID's own character entropy cannot be relied on to catch it once
+        // it falls through: hex digits cap at log2(16) = 4.0 bits/char, which
+        // never reaches ENTROPY_THRESHOLD (4.5) regardless of token length.
+        // The explicit checks immediately below are what actually block a
+        // UUID-shaped or hash-shaped token in trigger context; letting it run
+        // into the generic entropy computation at the bottom of this loop
+        // would silently readmit it. A corpus replay of ~19k real notes/docs
+        // measured exactly one benign token (an internal task `area_id` UUID
+        // co-occurring with the word "auth" inside `authorized_write`) newly
+        // blocked by this rule — an accepted false positive, not a systemic
+        // regression.
+        if near_trigger && is_uuid_canonical(token) {
+            return Some((token, "uuid-near-trigger"));
+        }
+        if near_trigger && is_base64_content_hash(token) {
+            return Some((token, "content-hash-near-trigger"));
+        }
+        if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
+            continue;
+        }
 
         // Pure hex tokens (git SHA, checksum digests) are allowlisted only when
         // they are NOT near a credential trigger.
@@ -1616,14 +1648,18 @@ mod tests {
     // ── False-positive: SRI / tokenizer hash metadata ────────────────────────
 
     #[test]
-    fn allows_sri_hash() {
-        // SRI hash as used in HTML integrity attributes (sha384, base64-encoded).
-        // Placed near the word "key" to test the entropy heuristic allowlist.
+    fn blocks_sri_hash_near_key_word_accepted_fp() {
+        // SRI hash as used in HTML integrity attributes (sha384, base64-encoded),
+        // placed directly beside the trigger word "key". The content-hash
+        // allowlist is a prose-context exemption, not unconditional: near a
+        // credential trigger, a sha-prefixed hash falls through to the explicit
+        // near-trigger content-hash detector like any other high-entropy
+        // candidate. This is an accepted false positive on a real but rare
+        // shape (an integrity hash literally next to the word "key").
         let line = "integrity key: sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC";
         assert!(
-            scan(line).is_none(),
-            "SRI hash must pass; fired: {:?}",
-            scan(line)
+            scan(line).is_some(),
+            "SRI hash near trigger word 'key' must now be blocked (accepted FP); passed unexpectedly"
         );
     }
 
@@ -2713,6 +2749,82 @@ mod tests {
             check(content).is_err(),
             "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
              round-4; got {:?}",
+            scan(content)
+        );
+    }
+
+    // ── UUID / content-hash allowlists are prose-context only ───────────────
+
+    #[test]
+    fn blocks_uuid_directly_labeled_as_api_key() {
+        let content = "api_key 550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_err(),
+            "UUID-shaped token labeled api_key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha256_content_hash_labeled_as_secret() {
+        let content = "secret sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash labeled secret must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha384_content_hash_labeled_as_api_key() {
+        let content =
+            "api_key sha384-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        assert!(
+            check(content).is_err(),
+            "sha384-prefixed hash labeled api_key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha512_content_hash_labeled_as_auth() {
+        let content = "auth sha512-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUV";
+        assert!(
+            check(content).is_err(),
+            "sha512-prefixed hash labeled auth must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_uuid_with_no_trigger_within_window() {
+        // Common benign shape: a UUID (e.g. an internal record id) with no
+        // credential trigger word anywhere in the surrounding window stays
+        // allowed — the allowlist still applies outside trigger context.
+        let content =
+            "task 550e8400-e29b-41d4-a716-446655440000 was created and assigned to the team";
+        assert!(
+            check(content).is_ok(),
+            "UUID with no nearby trigger word must stay allowed; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_internal_area_id_uuid_near_auth_substring() {
+        // Measured corpus regression (1 of ~19,300 real notes/docs replayed):
+        // an internal task `area_id` UUID field that happens to sit within
+        // the trigger window of the substring "auth" inside
+        // `authorized_write_requires_dominance` elsewhere in the same note.
+        // This is a deliberate, accepted false positive — the allowlist no
+        // longer distinguishes this from a UUID-shaped credential directly
+        // labeled by a trigger word, and no additional signal separates the
+        // two without reintroducing an attacker-suppliable shape check.
+        let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: internal area_id UUID near 'authorized_write' substring \
+             is now blocked; got {:?}",
             scan(content)
         );
     }
