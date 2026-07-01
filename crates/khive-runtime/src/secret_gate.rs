@@ -1032,11 +1032,20 @@ fn strip_delimiters(s: &str) -> &str {
 ///
 /// Strips `{}()[]"'.,;` from both ends (repeatedly, since JSON nests one
 /// wrapper inside another), then — if an internal `=` or `:` remains after
-/// that — takes the substring after the LAST such separator (the
+/// that — takes the substring after the FIRST such separator (the
 /// value/label side of `key=value` or `"key":value`) and strips wrappers
 /// from that remainder too. Falls back to the wrapper-stripped whole token
 /// when there is no internal separator, or when splitting on it would
 /// produce an empty remainder.
+///
+/// Splits on the FIRST separator rather than the last: a base64/base64url
+/// value can itself end in `=` padding, which — for a padded content hash —
+/// IS the last `=` in the token. Splitting on the last separator would land
+/// on the padding boundary instead of the assignment boundary, handing back
+/// the whole `key=value` string (still containing the label) rather than
+/// the bare value. The first separator is always the true key/value or
+/// JSON-label boundary, since neither a UUID nor a base64 value can contain
+/// `=`/`:` before that point.
 fn extract_value_candidate(token: &str) -> &str {
     fn strip_wrappers(s: &str) -> &str {
         s.trim_matches(|c: char| {
@@ -1054,7 +1063,7 @@ fn extract_value_candidate(token: &str) -> &str {
         }
         cur = next;
     }
-    if let Some(pos) = cur.rfind(['=', ':']) {
+    if let Some(pos) = cur.find(['=', ':']) {
         let after = strip_wrappers(&cur[pos + 1..]);
         if !after.is_empty() {
             return after;
@@ -2979,6 +2988,34 @@ mod tests {
             check(content).is_ok(),
             "UUID wrapped in parens with no trigger word nearby must stay allowed; \
              got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_glued_to_assignment_with_trailing_period() {
+        // A padded base64 value ends in its own `=`, which is also the last
+        // `=` in the whole token — splitting on the LAST separator would land
+        // on the padding boundary instead of the assignment boundary and
+        // hand back `secret=sha256-...=` (still containing the label) rather
+        // than the bare hash. extract_value_candidate must split on the
+        // FIRST separator to recover the padded value correctly.
+        let content = "secret=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded sha256 hash glued via '=' with a trailing period must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_in_json_object() {
+        let content = "{\"secret\":\"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}";
+        assert!(
+            check(content).is_err(),
+            "padded sha256 hash in a JSON-ish object near a trigger key must be \
+             blocked; got {:?}",
             scan(content)
         );
     }
