@@ -1,7 +1,7 @@
 {
   "name": "khive",
   "description": "khive for AI agents — knowledge graph, GTD, memory, inter-agent comm, scheduling, and domain knowledge over one MCP server. One pattern skill per pack, plus the kg stewardship agents.",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"

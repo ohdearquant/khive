@@ -11,9 +11,9 @@ categories.workspace = true
 description = "SQLite storage backend: entities, edges, notes, events, FTS5, sqlite-vec vectors."
 
 [dependencies]
-khive-storage = { version = "0.2.11", path = "../khive-storage" }
-khive-score = { version = "0.2.11", path = "../khive-score" }
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.2.12", path = "../khive-storage" }
+khive-score = { version = "0.2.12", path = "../khive-score" }
+khive-types = { version = "0.2.12", path = "../khive-types", features = ["serde"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
@@ -32,8 +32,8 @@ sqlite-vec = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
-khive-storage = { version = "0.2.11", path = "../khive-storage" }
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.2.12", path = "../khive-storage" }
+khive-types = { version = "0.2.12", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }

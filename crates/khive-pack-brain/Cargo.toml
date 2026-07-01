@@ -11,11 +11,11 @@ categories.workspace = true
 description = "Brain pack — profile-oriented orchestration via Fold + Objective (ADR-032)"
 
 [dependencies]
-khive-brain-core = { version = "0.2.11", path = "../khive-brain-core" }
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
-khive-fold = { version = "0.2.11", path = "../khive-fold" }
-khive-storage = { version = "0.2.11", path = "../khive-storage" }
+khive-brain-core = { version = "0.2.12", path = "../khive-brain-core" }
+khive-types = { version = "0.2.12", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.12", path = "../khive-runtime" }
+khive-fold = { version = "0.2.12", path = "../khive-fold" }
+khive-storage = { version = "0.2.12", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 lattice-fann = { workspace = true, optional = true }
@@ -30,7 +30,7 @@ lattice-router = ["dep:lattice-fann"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-khive-pack-kg = { version = "0.2.11", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.2.12", path = "../khive-pack-kg" }
 criterion = { workspace = true }
 
 [[bench]]

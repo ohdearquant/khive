@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-01
+
+### Added
+
+- Email channel transport (ADR-056): SMTP/IMAP adapter, app-only OAuth2
+  (XOAUTH2) authentication, an outbound delivery loop with `Message-ID` and
+  reply-to-actor routing, and an inbound round-trip (greeting, maintainer
+  match, reply correlation).
+- Session pack `khive-pack-session` (ADR-080): OSS session storage with a live
+  daemon mirror of Claude Code sessions and Codex CLI transcript mirroring.
+- Brain router seam: feature-gated lattice-fann router (M1), a
+  `brain.register_adapter` integrity verb, `build_context_vector` reading live
+  posteriors, and `router_state`/`adapter_set` snapshot persistence.
+- ANN persistence (ADR-079): persist and warm-load v2 ANN segments so the
+  daemon warm window is bounded by load cost rather than a full rebuild; ANN
+  warming degrades to FTS-only instead of erroring.
+- Output-format axis (ADR-078): `OutputFormat` (`json` / `auto` / `table`) with
+  shape-aware rendering, orthogonal to presentation mode.
+- Batch `create_many` for bulk entity creation; optional `entity_type` on
+  `neighbors` and properties on `traverse`; property/tag filters on note search.
+- Pack core-backend accessor (ADR-073) and a `SubstrateCoordinator`
+  cross-backend link with federated search (ADR-029 Phase 2).
+
+### Changed
+
+- `kkernel exec` now defaults to `Verbose` presentation per ADR-045 §2 (the
+  scripted / operator surface); the MCP `request` tool keeps the `Agent`
+  default.
+- Subhandler verbs are gated by wire origin rather than globally.
+- Traverse performance: a recursive-CTE join-order fix yields a large speedup,
+  and graph-traversal queries are batched to remove N+1 lookups.
+- Namespace model (ADR-007 Rev 6): attribution-only namespaces, a per-actor
+  episodic memory carve-out, and namespace-blind by-ID storage.
+
+### Fixed
+
+- `knowledge`: `compose` reads resolved section posteriors; recall never
+  returns a silent empty result while the ANN index is warming; a poisoned
+  warming mutex is recovered instead of aborting the server.
+- `retrieval`: property/tag predicates are pushed below result truncation.
+- `runtime`: char-boundary-safe secret gate (no UTF-8/CJK panic); the
+  configured actor is threaded into the gate request.
+- `comm`: actor-addressed delivery (ADR-057) fixes cross-actor messaging; an
+  anonymous inbox read leak is closed.
+- `mcp`: the embedding-env warning fires only when a `[[engines]]` block
+  overrides the `KHIVE_EMBEDDING_MODEL` / `KHIVE_ADDITIONAL_EMBEDDING_MODELS`
+  pair, not when that pair is the applied fallback.
+- Storage hardening: WAL-checkpoint discipline, BM25 poisoned-lock recovery,
+  and `expires_at` honored in recall with `memory.prune` / `memory.vacuum`.
+
+### Docs
+
+- Per-crate READMEs, a crate-README template, and a full configuration
+  reference.
+- Stale `kkernel call` references replaced with `kkernel exec`.
+- New and updated ADRs: 067/068 (cloud topology), 069/072 (Subject model), 073,
+  074, 075, 076 (relation-set calculability), 078, 079, and 080.
+
 ## [0.2.11] - 2026-06-13
 
 ### Fixed

@@ -11,10 +11,10 @@ categories.workspace = true
 description = "Session verb pack — store/list/get over the notes substrate (ADR-080)"
 
 [dependencies]
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
+khive-types = { version = "0.2.12", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.12", path = "../khive-runtime" }
 inventory = { workspace = true }
-khive-storage = { version = "0.2.11", path = "../khive-storage" }
+khive-storage = { version = "0.2.12", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,5 +25,5 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.2.11", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.2.12", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
