@@ -119,7 +119,30 @@ impl LiveImap {
         .map_err(|_| ChannelError::Auth("IMAP TLS handshake timed out (15s)".into()))?
         .map_err(|e| ChannelError::Auth(format!("IMAP TLS handshake failed: {e}")))?;
 
-        let client = async_imap::Client::new(tls_stream);
+        let mut client = async_imap::Client::new(tls_stream);
+
+        // Consume the server greeting before issuing any command. `Client::new`
+        // (unlike `async_imap::connect`) does not read it, and an unconsumed
+        // greeting desyncs the response parser: the first command's reply reads
+        // the `* OK ...` greeting instead of its own tagged response, then blocks
+        // waiting for a reply that never arrives (surfaces as the auth timeout).
+        // Direct-TLS on 993 always sends a greeting (unlike STARTTLS on 143).
+        match tokio::time::timeout(Duration::from_secs(15), client.read_response())
+            .await
+            .map_err(|_| ChannelError::Transport("IMAP greeting read timed out (15s)".into()))?
+        {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                return Err(ChannelError::Transport(format!(
+                    "IMAP greeting read failed: {e}"
+                )));
+            }
+            None => {
+                return Err(ChannelError::Transport(
+                    "IMAP connection closed before greeting".into(),
+                ));
+            }
+        }
 
         // Authenticate with 15s timeout, dispatching on auth mode.
         let session: ImapSession = match &self.auth {
