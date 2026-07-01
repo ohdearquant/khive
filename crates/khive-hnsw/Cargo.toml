@@ -11,9 +11,9 @@ categories.workspace = true
 description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 quantized two-phase search"
 
 [dependencies]
-khive-score = { version = "0.2.11", path = "../khive-score" }
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
-khive-fold = { version = "0.2.11", path = "../khive-fold", optional = true }
+khive-score = { version = "0.3.0", path = "../khive-score" }
+khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+khive-fold = { version = "0.3.0", path = "../khive-fold", optional = true }
 lattice-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

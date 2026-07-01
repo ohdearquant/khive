@@ -11,11 +11,11 @@ categories.workspace = true
 description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search for research knowledge graphs"
 
 [dependencies]
-khive-types = { version = "0.2.11", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
-khive-query = { version = "0.2.11", path = "../khive-query" }
+khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
+khive-query = { version = "0.3.0", path = "../khive-query" }
 inventory = { workspace = true }
-khive-storage = { version = "0.2.11", path = "../khive-storage" }
+khive-storage = { version = "0.3.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
@@ -27,7 +27,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
-khive-pack-formal = { version = "0.2.11", path = "../khive-pack-formal" }
+khive-pack-formal = { version = "0.3.0", path = "../khive-pack-formal" }
 
 [[test]]
 name = "integration"

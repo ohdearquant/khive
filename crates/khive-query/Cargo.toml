@@ -11,7 +11,7 @@ categories.workspace = true
 description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
 
 [dependencies]
-khive-types = { version = "0.2.11", path = "../khive-types" }
+khive-types = { version = "0.3.0", path = "../khive-types" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

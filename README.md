@@ -285,7 +285,7 @@ Deno 2.x (for the TypeScript CLI layer — optional)
 
 ## Status
 
-**v0.2.11 — published on [crates.io](https://crates.io/crates/khive-mcp).** 67 verbs across 7
+**v0.3.0 — published on [crates.io](https://crates.io/crates/khive-mcp).** 67 verbs across 7
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
 embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
