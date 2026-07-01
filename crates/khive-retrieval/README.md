@@ -53,8 +53,12 @@ to RRF if a `Weighted` strategy's weight count doesn't match the source count;
 | `embed`            | Native `lattice-embed` embedding service re-exports                                                 |
 | `native-rerank`    | Cross-encoder reranking — deferred pending `khive-inference` port                                   |
 
-None of these are enabled by default; the base crate stays lightweight and pulls
-in `rusqlite`/`khive-storage`/native embedding only on request.
+None of these features are enabled by default. The base crate is not
+dependency-free, though: it already depends on `khive-db` (which pulls in
+`khive-storage` and `rusqlite`) and on `lattice-embed` for native embedding. The
+features above gate additional surface — policy filtering, HNSW/BM25 checkpoint
+and persistence, storage-backed search adapters, and cross-encoder reranking —
+not the core storage or embedding stack.
 
 `SearchConfig` (vector-only/keyword-only/hybrid-balanced presets) and
 `SearchPolicy`/`ClearanceLevel` (with `filter_by_policy`/`filter_by_predicate`)

@@ -76,9 +76,11 @@
 #
 # The [[engines]] array registers the embedding models available at runtime,
 # replacing the legacy two-tier env-var pair (KHIVE_EMBEDDING_MODEL +
-# KHIVE_ADDITIONAL_EMBEDDING_MODELS — see the env reference at the end). When this
-# array is present it wins; when it is absent the env-var path is the backward-
-# compatible fallback.
+# KHIVE_ADDITIONAL_EMBEDDING_MODELS — see the env reference at the end). The
+# env-var pair is the backward-compatible fallback ONLY when no config file is
+# loaded at all. Once any config file is found, those env vars are ignored — a
+# config file with no [[engines]] uses the built-in default engine, it does NOT
+# fall back to the env pair.
 
 # Exactly one [[engines]] entry must set `default = true`.
 # That engine becomes the primary embedding model used for entity indexing
@@ -187,7 +189,7 @@ fusion_weight = 0.5
 #   KHIVE_OUTPUT_FORMAT=json     Output format json|auto|table (ADR-078). Tier 2 — above
 #                                [runtime] default_output_format, below the per-request `format`.
 #
-# ── Embedding engines (env fallback — used only when [[engines]] is absent) ──────
+# ── Embedding engines (env fallback — used only when NO config file is loaded) ───
 #   KHIVE_EMBEDDING_MODEL=all-minilm-l6-v2
 #                                Primary model. Becomes the default=true engine.
 #   KHIVE_ADDITIONAL_EMBEDDING_MODELS=paraphrase-multilingual-minilm-l12-v2,bge-small-en-v1.5
@@ -258,6 +260,8 @@ fusion_weight = 0.5
 #   KHIVE_RECALL_FTS_GATHER_LIMIT=        Explicit row cap for rank_subset mode (> 0). Default: derived.
 #   KHIVE_RECALL_FTS_CJK_BYPASS=true      CJK queries bypass term-K selection. Accepts 1/true/0/false.
 #   KHIVE_RECALL_PROFILE=1                Emit per-stage recall timing JSON to stderr (presence = on).
+#   ANN_OVERFETCH_MAX_ROUNDS=3           Max ANN over-fetch retry rounds when post-filtering drops
+#                                        candidates below the requested limit (un-prefixed; pack `memory`).
 #
 # ── Index build / brain (advanced) ───────────────────────────────────────────────
 #   KHIVE_BUILD_BATCH=1024                Vamana graph-build batch size (minimum 1).

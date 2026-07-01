@@ -76,17 +76,18 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` auto-registers this pack (along with `gtd`, `memory`, `comm`,
-`schedule`) by default; `KHIVE_PACKS` / `--pack` select a subset.
+`khive-mcp` loads a default set of eight packs — `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session` — with `kg` always present;
+`KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
 
-`khive-pack-kg` sits at the top of the storage stack — `khive-types` →
-`khive-score` → `khive-storage` → `khive-db` → `khive-query` → `khive-runtime`
-→ **`khive-pack-kg`** → `khive-mcp`. Every other pack in this workspace
-(`khive-pack-gtd`, `khive-pack-memory`, `khive-pack-comm`,
-`khive-pack-schedule`) declares `REQUIRES = ["kg"]` and is registered alongside
-it. Governing ADRs:
+`khive-pack-kg` depends directly on `khive-types`, `khive-runtime`,
+`khive-query`, and `khive-storage`, and is registered into the pack runtime that
+`khive-mcp` serves. Every other pack in this workspace declares
+`REQUIRES = ["kg"]` — `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, plus `formal` and `template` — so each depends on `kg` being loaded.
+Governing ADRs:
 [ADR-001](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-001-entity-kind-taxonomy.md) (entity kinds),
 [ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md) (edge relations),
 [ADR-013](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-013-note-kind-taxonomy.md) (note kinds),

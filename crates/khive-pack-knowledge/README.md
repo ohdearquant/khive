@@ -29,10 +29,16 @@ rerank, and composed into markdown briefings under a token budget.
 
 This crate is not called directly as a Rust library — it registers `KnowledgePack`
 with the runtime's `inventory`-based pack registry and dispatches its 19 verbs
-through the MCP `request` DSL (or `kkernel call`). A caller issues:
+through the MCP `request` DSL (or `kkernel exec`). A caller issues:
 
 ```text
 request(ops="knowledge.search(query=\"block-max wand posting list pruning\", limit=10)")
+```
+
+The same DSL runs from the shell without an MCP client via `kkernel exec`:
+
+```bash
+kkernel exec 'knowledge.search(query="block-max wand posting list pruning", limit=10)'
 ```
 
 or, to build a fresh corpus and immediately reference it:

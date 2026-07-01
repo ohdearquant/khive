@@ -73,10 +73,11 @@ let restored = VamanaIndex::load_or_build(
 
 ## Where this sits
 
-`khive-vamana` is the production ANN index used directly by the knowledge pack's
-vector bridge and by `khive-retrieval`'s hybrid searcher. It depends only on
-`khive-quant` plus `rayon`/`memmap2`/`bytemuck`/`blake3` for build parallelism and
-persistence — no dependency on `khive-hnsw`, `khive-fusion`, or `khive-score`.
+`khive-vamana` is the production ANN index used directly by the knowledge and
+memory packs' vector bridges (`khive-pack-knowledge`, `khive-pack-memory`). It
+depends only on `khive-quant` plus `rayon`/`memmap2`/`bytemuck`/`blake3` for build
+parallelism and persistence — no dependency on `khive-hnsw`, `khive-fusion`, or
+`khive-score`.
 
 Governing ADRs:
 [ADR-054](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-054-ann-build-strategy-scaling-limits.md)
