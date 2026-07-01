@@ -42,6 +42,18 @@
 //!   non-ASCII-alphanumeric char (CJK, accented text, emoji) as a token
 //!   boundary, so a known-prefix secret is caught whether the adjacent
 //!   non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
+//! - Structured identifiers: a token that decomposes into two or more maximal
+//!   alphanumeric runs separated by `/`, `-`, `_`, or `.`, where every run is
+//!   letters-then-digits or pure digits, at most 24 chars long, with a low
+//!   case-transition density, is treated as a file path, branch name, or
+//!   similar identifier and skips the entropy check regardless of trigger
+//!   context.  This covers content like `fable-ops/ADR-DRAFT-adr079.md` or
+//!   `.khive/workspaces/20260701/adr079/PACKET.md`, which is otherwise
+//!   indistinguishable from a high-entropy secret once glued into one
+//!   whitespace token.  Random base64/base62 secrets do not decompose this
+//!   way: their case and digit placement is effectively uniform rather than
+//!   word-shaped, so a hyphenated or underscored secret still fails this
+//!   check and remains subject to the entropy heuristic below.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -618,6 +630,17 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             return Some((token, "hex-credential-token"));
         }
 
+        // Structured identifiers (file paths, branch names, ADR/doc slugs,
+        // snake_case identifiers) are exempted regardless of trigger context
+        // — see the module doc and `is_structured_identifier`. This must come
+        // after the UUID/content-hash allowlist and the hex-credential-token
+        // check above (neither of which it weakens) and before the entropy
+        // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
+        // on Shannon entropy alone.
+        if is_structured_identifier(token) {
+            continue;
+        }
+
         let entropy = shannon_entropy(token.as_bytes());
         if entropy < ENTROPY_THRESHOLD {
             continue;
@@ -781,6 +804,96 @@ fn is_base64_content_hash(token: &str) -> bool {
     stripped
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_')
+}
+
+/// Structural separators that both gate entry into (rule 1) and decompose
+/// (rule 2) a token for [`is_structured_identifier`].
+const STRUCTURAL_SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
+
+/// Largest length a single path/branch/identifier segment (a "run" between
+/// separators) may have and still be considered word-shaped.
+const MAX_RUN_LEN: usize = 24;
+
+/// Runs whose letter portion is at or below this length skip the
+/// case-transition-density check: density is not a meaningful signal on very
+/// short runs (e.g. `R1`, `v2`, `ADR`).
+const DENSITY_EXEMPT_LETTER_LEN: usize = 4;
+
+/// Maximum case-transition density (transitions divided by letter_count - 1)
+/// a run's letter portion may have and still be considered word-shaped.
+const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
+
+/// Returns `true` when `token` is shaped like a file path, branch name, or
+/// other structured identifier rather than a high-entropy secret.
+///
+/// A structured identifier decomposes into two or more maximal
+/// ASCII-alphanumeric "runs" separated by `/`, `-`, `_`, or `.`, where every
+/// run is word-shaped: letters-then-digits (`adr079`, `slices234`, `R1`) or
+/// pure digits (`20260701`), at most [`MAX_RUN_LEN`] chars, with a low
+/// case-transition density in the letter portion. Random base64/base62
+/// secrets glued between separators reliably fail this shape check: their
+/// case and digit placement is essentially uniform rather than word-like, so
+/// a run either exceeds the length cap or mixes case too densely to pass.
+///
+/// This exemption applies unconditionally (regardless of trigger-word
+/// context) — see the call site in [`check_entropy_heuristic`].
+fn is_structured_identifier(token: &str) -> bool {
+    if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
+        return false;
+    }
+    let runs: Vec<&str> = token
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|r| !r.is_empty())
+        .collect();
+    runs.len() >= 2 && runs.iter().all(|run| is_word_shaped_run(run))
+}
+
+/// A single run (segment between structural separators) is word-shaped when
+/// it matches `[A-Za-z]+[0-9]*` or `[0-9]+`, is at most [`MAX_RUN_LEN`] chars,
+/// and (for the letters-then-digits form) its letter portion has a low
+/// case-transition density.
+fn is_word_shaped_run(run: &str) -> bool {
+    if run.is_empty() || run.len() > MAX_RUN_LEN {
+        return false;
+    }
+    let bytes = run.as_bytes();
+    if bytes.iter().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let letter_end = bytes
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(bytes.len());
+    // A run that does not start with a letter, and is not pure digits (ruled
+    // out above), mixes digits and letters in a shape other than
+    // letters-then-digits — not word-shaped.
+    if letter_end == 0 {
+        return false;
+    }
+    // Everything after the leading letters must be digits only (no further
+    // letters), else the run is not the `[A-Za-z]+[0-9]*` shape.
+    if !bytes[letter_end..].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    case_transition_density_ok(&run[..letter_end])
+}
+
+/// `true` when the case-transition density of `letters` (an all-ASCII-letter
+/// string) is at or below [`MAX_CASE_TRANSITION_DENSITY`]. A transition is an
+/// adjacent letter pair where one side is uppercase and the other is not.
+/// Runs with few enough letters pass automatically (see
+/// [`DENSITY_EXEMPT_LETTER_LEN`]) since density is noisy on short strings.
+fn case_transition_density_ok(letters: &str) -> bool {
+    let chars: Vec<char> = letters.chars().collect();
+    if chars.len() <= DENSITY_EXEMPT_LETTER_LEN {
+        return true;
+    }
+    let transitions = chars
+        .windows(2)
+        .filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase())
+        .count();
+    let density = transitions as f64 / (chars.len() - 1) as f64;
+    density <= MAX_CASE_TRANSITION_DENSITY
 }
 
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
@@ -2143,5 +2256,153 @@ mod tests {
             check(&masked).is_ok(),
             "masked output must pass the gate: {masked}"
         );
+    }
+
+    // ── Structured-identifier exemption: file paths / branch names ──────────
+    //
+    // Root cause (production false positives, 2026-07-01): the entropy
+    // heuristic tokenizes on whitespace, so a full file path is one long
+    // token; trigger detection is substring-based, so "auth"/"key" match
+    // inside ordinary words; and mixed-case+digit+punctuation paths
+    // legitimately exceed the Shannon-entropy threshold. Each case below is
+    // embedded near a trigger word to prove the exemption applies in trigger
+    // context, not just in isolation.
+
+    #[test]
+    fn allows_file_path_near_secret_word() {
+        let content =
+            "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
+        assert!(
+            check(content).is_ok(),
+            "structured file path near 'secret' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_workspace_path_near_key_word() {
+        let content = "key: see .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        assert!(
+            check(content).is_ok(),
+            "workspace path near 'key' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_short_run_path_near_auth_word() {
+        let content =
+            "auth work saved at .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_ok(),
+            "path with a short 'R1' run near 'auth' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_branch_and_review_filename_near_key_word() {
+        let content = "branch feat-session-codex-mirror pushed, see codex_review_pr335_round2.md for the key findings";
+        assert!(
+            check(content).is_ok(),
+            "branch name and review filename near 'key' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_adr_doc_path_near_password_word() {
+        let content = "password reset doc: docs/adr/ADR-055-epistemic-edge-relations.md";
+        assert!(
+            check(content).is_ok(),
+            "ADR doc path near 'password' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_source_file_path_near_credential_word() {
+        let content = "credential handling code crates/khive-pack-session/src/mirror/ingest.rs";
+        assert!(
+            check(content).is_ok(),
+            "source file path near 'credential' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_long_snake_case_identifier_near_key_word() {
+        let content = "api key handling lives in check_entropy_heuristic_impl";
+        assert!(
+            check(content).is_ok(),
+            "snake_case identifier near 'key' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    // ── Structured-identifier exemption: catch-suite regression ─────────────
+
+    #[test]
+    fn hyphenated_random_secret_is_not_a_structured_identifier() {
+        // Same token as `blocks_bare_base64url_43chars_near_key`: hyphenated
+        // but not word-shaped. The second run exceeds the 24-char run cap,
+        // and the first run's case-transition density (~0.42) exceeds the
+        // 0.3 threshold on its own, so this must not be exempted and the
+        // existing catch-suite test must keep blocking it.
+        assert!(!is_structured_identifier(
+            "wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123"
+        ));
+        let line = "api key wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123";
+        assert!(
+            scan(line).is_some(),
+            "hyphenated random secret must still be blocked; got: {:?}",
+            scan(line)
+        );
+    }
+
+    // ── Structured-identifier exemption: direct unit tests ───────────────────
+
+    #[test]
+    fn structured_identifier_true_for_repro_paths() {
+        let paths = [
+            "fable-ops/ADR-DRAFT-adr079-slices234.md",
+            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
+            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+            "codex_review_pr335_round2.md",
+            "docs/adr/ADR-055-epistemic-edge-relations.md",
+            "crates/khive-pack-session/src/mirror/ingest.rs",
+            "check_entropy_heuristic_impl",
+        ];
+        for p in paths {
+            assert!(
+                is_structured_identifier(p),
+                "expected structured identifier: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_identifier_false_without_separator() {
+        // No `/`, `-`, `_`, or `.` present — fails rule 1 outright.
+        assert!(!is_structured_identifier(
+            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"
+        ));
+    }
+
+    #[test]
+    fn structured_identifier_false_for_leetspeak_digit_interleaving() {
+        // Digits interleaved with letters within a run (not a trailing digit
+        // suffix) fail the `[A-Za-z]+[0-9]*` / `[0-9]+` shape check.
+        assert!(!is_structured_identifier("S3cr3t-P4ssw0rd-t0ken-here!"));
+    }
+
+    #[test]
+    fn structured_identifier_false_for_run_over_length_cap() {
+        // A 26-char single alphabetic run between separators fails the
+        // 24-char per-run length cap even though it is otherwise trivially
+        // word-shaped (uniform lowercase, zero case transitions).
+        let long_run = "a".repeat(26);
+        let token = format!("prefix-{long_run}-suffix");
+        assert!(!is_structured_identifier(&token));
     }
 }
