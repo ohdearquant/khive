@@ -73,7 +73,7 @@ impl EmailChannel {
         Ok(Self { config, smtp, imap })
     }
 
-    /// The configured mailbox address (e.g. `leo@khive.ai`).
+    /// The configured mailbox address (e.g. `mailbox@example.com`).
     ///
     /// Used by the outbox delivery loop to derive the sender address and
     /// the domain component of the RFC 822 Message-ID header.
@@ -86,7 +86,8 @@ impl EmailChannel {
     /// Used by the outbox delivery loop to build the default allowlist when
     /// `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` is not set.
     pub fn maintainer_address(&self) -> &str {
-        self.config.maintainer_address.as_str()
+        // Primary maintainer: from_env guarantees `maintainer_addresses` is non-empty.
+        self.config.maintainer_addresses[0].as_str()
     }
 
     /// Build from pre-constructed connectors (for testing).
@@ -103,8 +104,9 @@ impl EmailChannel {
     ///
     /// Rules:
     /// - `from_addrs` must contain exactly one entry (multi-From is rejected).
-    /// - That single From address must match the configured maintainer.
-    /// - If `sender_addr` is present, it must also match.
+    /// - That single From address must match one of the authorized maintainers
+    ///   (Gmail-aware: dots/`+tag`/`googlemail.com` are insignificant for Gmail).
+    /// - If `sender_addr` is present, it must also match an authorized maintainer.
     ///
     /// Returns `Err(ChannelError::UnauthorizedSender)` on any violation.
     /// Error messages intentionally omit the actual addresses to avoid leaking them to logs.
@@ -123,21 +125,31 @@ impl EmailChannel {
         let from = MailAddress::parse(&from_addrs[0]).ok_or_else(|| {
             ChannelError::UnauthorizedSender("From field does not contain a valid addr-spec".into())
         })?;
-        if from != self.config.maintainer_address {
+        if !self
+            .config
+            .maintainer_addresses
+            .iter()
+            .any(|m| m.matches(&from))
+        {
             return Err(ChannelError::UnauthorizedSender(
-                "From address is not the configured maintainer".into(),
+                "From address is not an authorized maintainer".into(),
             ));
         }
-        // Sender header, when present, must also match the maintainer.
+        // Sender header, when present, must also match an authorized maintainer.
         if let Some(s) = sender_addr {
             let sender = MailAddress::parse(s).ok_or_else(|| {
                 ChannelError::UnauthorizedSender(
                     "Sender field does not contain a valid addr-spec".into(),
                 )
             })?;
-            if sender != self.config.maintainer_address {
+            if !self
+                .config
+                .maintainer_addresses
+                .iter()
+                .any(|m| m.matches(&sender))
+            {
                 return Err(ChannelError::UnauthorizedSender(
-                    "Sender address is not the configured maintainer".into(),
+                    "Sender address is not an authorized maintainer".into(),
                 ));
             }
         }
@@ -155,7 +167,7 @@ impl EmailChannel {
             .to
             .first()
             .map(|a| format!("email:{a}"))
-            .unwrap_or_else(|| format!("email:{}", self.config.maintainer_address));
+            .unwrap_or_else(|| format!("email:{}", self.maintainer_address()));
 
         let mut env = ChannelEnvelope::new(from, to, email.best_body());
 
@@ -202,9 +214,11 @@ impl Channel for EmailChannel {
             let uid = email.uid;
             match self.to_envelope(email) {
                 Ok(env) => envelopes.push(env),
-                Err(_) => {
-                    // Log only the IMAP UID -- never the sender address or any credentials.
-                    warn!(uid, "skipping message: validation failed");
+                Err(e) => {
+                    // Log the IMAP UID and the (address-free) error reason so a rejected
+                    // inbound is observable in the daemon log. ChannelError messages are
+                    // constructed without addresses or credentials, so `%e` is log-safe.
+                    warn!(uid, error = %e, "skipping message: validation failed");
                 }
             }
         }
@@ -238,7 +252,7 @@ mod tests {
             auth: EmailAuth::Basic {
                 password: "secret".to_string(),
             },
-            maintainer_address: MailAddress::parse(maintainer).unwrap(),
+            maintainer_addresses: vec![MailAddress::parse(maintainer).unwrap()],
         }
     }
 
@@ -310,13 +324,25 @@ mod tests {
     }
 
     fn build_channel(maintainer: &str, emails: Vec<RawEmail>) -> EmailChannel {
-        let config = make_config(maintainer);
+        build_channel_from(make_config(maintainer), emails)
+    }
+
+    fn build_channel_from(config: EmailChannelConfig, emails: Vec<RawEmail>) -> EmailChannel {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let smtp = SmtpSender::with_connector(RecordingSmtp {
             calls: calls.clone(),
         });
         let imap = ImapFetcher::with_connector(FixedImap { emails });
         EmailChannel::with_connectors(config, smtp, imap)
+    }
+
+    fn make_config_multi(maintainers: &[&str]) -> EmailChannelConfig {
+        let mut config = make_config(maintainers[0]);
+        config.maintainer_addresses = maintainers
+            .iter()
+            .map(|m| MailAddress::parse(m).unwrap())
+            .collect();
+        config
     }
 
     // --- Basic trait ---
@@ -364,6 +390,51 @@ mod tests {
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert!(envs.is_empty(), "unauthorized From must be dropped");
+    }
+
+    #[tokio::test]
+    async fn gmail_dot_variants_authorize_against_dotted_maintainer() {
+        // Maintainer configured with a dotted Gmail; the client may deliver the
+        // dotless canonical form, a googlemail alias, or a +tag. All are the same
+        // Gmail mailbox and must authorize.
+        for from in [
+            "samrivera@gmail.com",
+            "sam.rivera@gmail.com",
+            "samrivera@googlemail.com",
+            "sam.rivera+khive@gmail.com",
+        ] {
+            let ch = build_channel(
+                "sam.rivera@gmail.com",
+                vec![make_email(from, "imap:test:0:1")],
+            );
+            let envs = ch.poll(Utc::now()).await.unwrap();
+            assert_eq!(envs.len(), 1, "gmail variant {from} must authorize");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_gmail_dots_remain_significant() {
+        // Dot-insensitivity is a Gmail-only rule; other providers treat dots as
+        // significant, so a dotted variant of a non-Gmail maintainer is rejected.
+        let ch = build_channel(
+            "sam.rivera@outlook.com",
+            vec![make_email("samrivera@outlook.com", "imap:test:0:1")],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(envs.is_empty(), "non-gmail dot-variant must NOT authorize");
+    }
+
+    #[tokio::test]
+    async fn allowlist_authorizes_any_configured_maintainer() {
+        // Multiple maintainers (e.g. a Gmail and an Outlook) may be registered;
+        // a From matching any entry authorizes.
+        let config = make_config_multi(&["primary@gmail.com", "second@outlook.com"]);
+        let ch = build_channel_from(
+            config,
+            vec![make_email("second@outlook.com", "imap:test:0:1")],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1, "any allowlisted maintainer must authorize");
     }
 
     #[tokio::test]

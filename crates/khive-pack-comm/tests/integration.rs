@@ -4021,7 +4021,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
             expires_at: None,
             properties: Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
@@ -4042,7 +4042,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         &rt,
         serde_json::json!({
             "from": "email:user@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "this is a reply",
             "correlation_external_id": outbound_external_id,
             "external_id": "imap:mail:1:1",
@@ -4058,6 +4058,83 @@ async fn ingest_routing_reply_routes_to_original_sender() {
     );
 }
 
+/// (a2) Regression: outbound stores its Message-ID in wire form `<id@domain>`, but an
+/// inbound `In-Reply-To` is delivered bracket-free (`id@domain`) because `mail_parser`
+/// strips the angle brackets. Pass-1 must still correlate the reply back to the original
+/// sender. Before the bracket-toggle fix this fell through to `default_inbound_actor`
+/// (lambda:leo) with a fresh thread — the exact failure seen on the live round-trip.
+#[tokio::test]
+async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    // Outbound note stores the Message-ID WITH angle brackets (wire form).
+    let outbound_external_id = "<sent-msg-002@khive.ai>";
+    // Inbound In-Reply-To arrives WITHOUT brackets (mail_parser strips them).
+    let inbound_correlation = "sent-msg-002@khive.ai";
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "original outbound".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:mailbox@example.com",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                "external_id": outbound_external_id,
+                "thread_id": thread_uuid,
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "this is a bracket-free reply",
+            "correlation_external_id": inbound_correlation,
+            "external_id": "imap:mail:2:1",
+            "default_inbound_actor": "lambda:leo",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "bracket-free In-Reply-To must correlate to the bracketed outbound external_id \
+         and route to the original sender, not default_inbound_actor; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "correlated reply must attach to the original thread, not a fresh root; \
+         got props={props}"
+    );
+}
+
 /// (b) Fresh message, no correlation, default_inbound_actor=lambda:leo → to_actor=lambda:leo.
 #[tokio::test]
 async fn ingest_routing_fresh_message_uses_default_actor() {
@@ -4068,7 +4145,7 @@ async fn ingest_routing_fresh_message_uses_default_actor() {
         &rt,
         serde_json::json!({
             "from": "email:stranger@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "hello from a stranger",
             "external_id": "imap:mail:1:2",
             "default_inbound_actor": "lambda:leo",
@@ -4094,7 +4171,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
         &rt,
         serde_json::json!({
             "from": "email:stranger@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "back-compat message",
             "external_id": "imap:mail:1:3",
             "namespace": "local",
@@ -4104,7 +4181,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
 
     assert_eq!(
         props["to_actor"].as_str(),
-        Some("email:leo@khive.ai"),
+        Some("email:mailbox@example.com"),
         "no default actor: to_actor must fall back to p.to; got props={props}"
     );
 }
@@ -4148,7 +4225,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
             expires_at: None,
             properties: Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
@@ -4172,7 +4249,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         &rt,
         serde_json::json!({
             "from": "email:user@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "this is a reply via X-Khive-Thread-ID",
             "correlation_external_id": thread_uuid,
             "external_id": "imap:mail:thread-uuid-reply:1",

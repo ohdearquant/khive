@@ -589,39 +589,50 @@ pub(crate) async fn handle_ingest(
     let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
-            let corr_filter = NoteFilter {
-                kind: Some("message".to_string()),
-                property_filters: vec![PropertyFilter {
-                    json_path: "$.external_id".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text(corr.clone()),
-                }],
-                ..Default::default()
-            };
-            let corr_page = store
-                .query_notes_filtered(
-                    ns,
-                    &corr_filter,
-                    PageRequest {
-                        limit: 1,
-                        offset: 0,
-                    },
-                )
-                .await?;
-            let pass1 = corr_page.items.first().and_then(|n| {
-                let props = n.properties.as_ref()?;
-                let thread_id = props
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .filter(|s| s.parse::<Uuid>().is_ok())
-                    .map(|s| s.to_string())?;
-                let from_actor = props
-                    .get("from_actor")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                Some((thread_id, from_actor))
-            });
+            // Our own outbound mail stores its Message-ID in wire form `<id@domain>`
+            // (angle brackets included), while `mail_parser` strips the brackets from an
+            // inbound `In-Reply-To`, yielding `id@domain`. Match the correlation key as
+            // received and in its bracket-toggled form so `<id>` and `id` correlate either
+            // way; the exact form is tried first.
+            let mut pass1 = None;
+            for candidate in message_id_match_candidates(corr) {
+                let corr_filter = NoteFilter {
+                    kind: Some("message".to_string()),
+                    property_filters: vec![PropertyFilter {
+                        json_path: "$.external_id".to_string(),
+                        op: FilterOp::Eq,
+                        value: SqlValue::Text(candidate),
+                    }],
+                    ..Default::default()
+                };
+                let corr_page = store
+                    .query_notes_filtered(
+                        ns,
+                        &corr_filter,
+                        PageRequest {
+                            limit: 1,
+                            offset: 0,
+                        },
+                    )
+                    .await?;
+                pass1 = corr_page.items.first().and_then(|n| {
+                    let props = n.properties.as_ref()?;
+                    let thread_id = props
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| s.parse::<Uuid>().is_ok())
+                        .map(|s| s.to_string())?;
+                    let from_actor = props
+                        .get("from_actor")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some((thread_id, from_actor))
+                });
+                if pass1.is_some() {
+                    break;
+                }
+            }
 
             if pass1.is_some() {
                 pass1
@@ -757,4 +768,55 @@ pub(crate) async fn handle_ingest(
         "external_id": p.external_id,
         "deduplicated": false,
     }))
+}
+
+/// Candidate `$.external_id` values to match an inbound correlation key against.
+///
+/// Outbound mail stores its Message-ID in wire form `<id@domain>` (angle brackets
+/// included); `mail_parser` strips those brackets from an inbound `In-Reply-To`,
+/// yielding `id@domain`. To correlate a reply back to the sending actor we must
+/// match either representation, so this returns the key as received plus its
+/// bracket-toggled variant, exact form first.
+fn message_id_match_candidates(corr: &str) -> Vec<String> {
+    let bare = corr
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(corr);
+    if bare == corr {
+        vec![corr.to_string(), format!("<{corr}>")]
+    } else {
+        vec![corr.to_string(), bare.to_string()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_id_match_candidates;
+
+    #[test]
+    fn candidates_bare_input_adds_bracketed_form() {
+        // A bracket-free correlation key (as delivered by mail_parser) must also
+        // try the wire form so it matches an outbound `<id@domain>` external_id.
+        assert_eq!(
+            message_id_match_candidates("sent-msg@khive.ai"),
+            vec![
+                "sent-msg@khive.ai".to_string(),
+                "<sent-msg@khive.ai>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn candidates_bracketed_input_adds_bare_form() {
+        // Reverse direction: a bracketed correlation key must also try the bare
+        // form so it matches a stored bracket-free external_id. Guards the `else`
+        // branch, which no ingest test exercises directly.
+        assert_eq!(
+            message_id_match_candidates("<sent-msg@khive.ai>"),
+            vec![
+                "<sent-msg@khive.ai>".to_string(),
+                "sent-msg@khive.ai".to_string(),
+            ],
+        );
+    }
 }

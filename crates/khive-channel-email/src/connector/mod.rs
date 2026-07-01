@@ -44,6 +44,34 @@ impl MailAddress {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Authorization-equality against another address, applying Gmail's address
+    /// canonicalization: for `gmail.com`/`googlemail.com` addresses, dots and a
+    /// `+tag` suffix in the local part are insignificant and the two domains are
+    /// equivalent (they route to the same mailbox). Non-Gmail domains compare by
+    /// exact (already-lowercased) addr-spec, where dots ARE significant.
+    ///
+    /// This exists because clients such as Gmail emit the account's canonical
+    /// From (often dotless) which need not string-match a dotted address a human
+    /// configured. Exact equality would silently reject the maintainer's own mail.
+    pub fn matches(&self, other: &MailAddress) -> bool {
+        self.canonical() == other.canonical()
+    }
+
+    /// Canonical form used by [`matches`](Self::matches). Only Gmail addresses
+    /// are rewritten; every other domain is returned as its stored addr-spec.
+    fn canonical(&self) -> String {
+        let Some((local, domain)) = self.0.split_once('@') else {
+            return self.0.clone();
+        };
+        if domain == "gmail.com" || domain == "googlemail.com" {
+            let base = local.split('+').next().unwrap_or(local);
+            let dotless: String = base.chars().filter(|c| *c != '.').collect();
+            format!("{dotless}@gmail.com")
+        } else {
+            self.0.clone()
+        }
+    }
 }
 
 impl std::fmt::Display for MailAddress {
