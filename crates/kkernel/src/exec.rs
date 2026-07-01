@@ -114,8 +114,14 @@ pub struct ExecArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Presentation mode: `agent` (default), `verbose`, or `human`.
-    #[arg(long)]
+    /// Presentation mode: `verbose` (default), `agent`, or `human`.
+    ///
+    /// ADR-045 §2 selection rules: the `kkernel exec` CLI surface (a trusted
+    /// operator / scripted-caller path) defaults to `Verbose` — the full
+    /// canonical shape — unlike the MCP `request` tool, which defaults to
+    /// `Agent` for token efficiency. Pass `--presentation agent` to opt into
+    /// the trimmed shape, or `--presentation human` for pretty terminal output.
+    #[arg(long, default_value = "verbose")]
     pub presentation: Option<String>,
 
     /// Output format for verb results (ADR-078 §2 precedence: this flag >
@@ -596,6 +602,30 @@ mod tests {
         let args = ExecArgs::parse_from(["exec", "stats()"]);
         assert_eq!(args.ops.as_deref(), Some("stats()"));
         assert!(!args.pending_events);
+    }
+
+    // ── ADR-045 §2: `kkernel exec` CLI surface defaults to Verbose ────────────
+
+    #[test]
+    fn presentation_defaults_to_verbose_when_flag_omitted() {
+        // ADR-045 §2 selection rules: `kkernel exec` (a scripted/operator
+        // surface) defaults to Verbose, unlike the MCP `request` tool (which
+        // defaults to Agent at the envelope layer — see
+        // `khive_mcp::server::parse_presentation_mode`, unchanged by this test).
+        let args = ExecArgs::parse_from(["exec", "stats()"]);
+        assert_eq!(args.presentation.as_deref(), Some("verbose"));
+    }
+
+    #[test]
+    fn presentation_agent_flag_still_selects_agent() {
+        let args = ExecArgs::parse_from(["exec", "stats()", "--presentation", "agent"]);
+        assert_eq!(args.presentation.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn presentation_human_flag_still_selects_human() {
+        let args = ExecArgs::parse_from(["exec", "stats()", "--presentation", "human"]);
+        assert_eq!(args.presentation.as_deref(), Some("human"));
     }
 
     #[test]
