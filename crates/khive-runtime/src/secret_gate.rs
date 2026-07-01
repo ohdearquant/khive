@@ -57,23 +57,34 @@
 //!   way: their case and digit placement is effectively uniform rather than
 //!   word-shaped, so a hyphenated or underscored secret still fails this
 //!   check and remains subject to the entropy heuristic below.
-//!   Outside an explicit credential trigger context this exemption applies on
-//!   shape alone.  In trigger context (near `key`, `secret`, `api_key`, …) two
-//!   additional signals are both required, because a separator-delimited,
-//!   word-shaped run structure alone does not rule out an unprefixed
-//!   high-entropy credential (e.g. an AWS Secret Access Key has no vendor
-//!   prefix for Layer 1 to catch, and its base64-ish alphabet can coincidentally
-//!   decompose into lowercase-only or digit-suffixed runs): (1) at least two of
-//!   the token's runs must look like real path/doc conventions (a digit-bearing
-//!   run — dates, ADR/slice numbers — or a short ≤3-char run — extensions,
-//!   revision markers like `R1`), and (2) the Shannon entropy of the token's
-//!   ASCII letters alone (digits and punctuation stripped, then concatenated)
-//!   must stay below a stricter threshold — real paths reuse a small, skewed
-//!   vocabulary across segments, so this measure does not move when a suffix
-//!   like `.md` or a digit run is appended to a random credential, unlike a
-//!   single-signal check keyed off the token's tail.  See
-//!   `has_low_entropy_run_signal`, `has_low_average_run_letter_entropy`, and the call
-//!   site in `check_entropy_heuristic`.
+//!
+//!   **This exemption applies ONLY outside an explicit credential trigger
+//!   context (round-4 decision).** Two narrower attempts to keep some form of
+//!   this exemption alive inside `near_trigger` context were tried and both
+//!   defeated: a trailing file-extension check (`.md`/`.rs`; codex round-2
+//!   Critical — appending an extension to any random credential re-enabled
+//!   the exemption), and a dual-signal check requiring both a run-shape count
+//!   and an average per-run letters-only Shannon entropy below a threshold
+//!   (codex round-3 Critical — an attacker who splits a credential into short
+//!   runs, or pads it with extra short/digit-bearing runs, drives the
+//!   reported entropy for every run toward `log2(run_len)`, which ordinary
+//!   short English path segments already sit at or near; e.g. a 9-char
+//!   all-distinct-letter run and the word `relations` are numerically
+//!   identical Shannon entropy). Because the attacker fully controls where
+//!   the token's separators fall, no aggregation (mean, max, or otherwise)
+//!   over per-run or whole-token letters-only entropy can be made sound —
+//!   the measure only sees a character-frequency histogram, never word
+//!   semantics, so it cannot be pinned to reject "chopped credential" while
+//!   admitting "real short word" at the same run length. Rather than ship
+//!   another attacker-suppliable signal, the exemption is dropped entirely in
+//!   trigger context: near a trigger word, a structured-identifier-shaped
+//!   token falls through to the entropy heuristic like any other token. This
+//!   is an accepted false-positive tradeoff on a small number of genuine
+//!   paths/doc-slugs that happen to sit near a trigger word AND read above
+//!   the entropy threshold on their own — see
+//!   `accepted_false_positive_adr_draft_path_near_trigger` and its siblings
+//!   for the specific repro cases this now blocks, and the call site in
+//!   `check_entropy_heuristic`.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -658,47 +669,29 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
         // on Shannon entropy alone.
         //
-        // In an explicit credential context (`near_trigger`), word-shaped runs
-        // alone are NOT sufficient: an unprefixed high-entropy credential (e.g.
-        // an AWS Secret Access Key, which has no vendor prefix for Layer 1 to
-        // catch) can itself be separator-delimited with lowercase-only or
-        // digit-suffixed runs, satisfying `is_structured_identifier` by
-        // accident. A prior fix required the token to additionally end in a
-        // file-extension segment (`.md`, `.rs`, …) — but that signal is itself
-        // attacker-suppliable: appending three characters (`.md`) to ANY
-        // random separator-delimited credential re-enables the exemption
-        // (codex round-2 Critical). Suffixing one more shape signal (e.g. a
-        // digit-bearing run) is equally suppliable when the attacker fully
-        // controls the token, so the fix cannot be "add another single
-        // positive flag" — it must be a measure that resists dilution by
-        // appending a short suffix. Require BOTH:
-        //   1. `has_low_entropy_run_signal`: at least 2 of the token's runs
-        //      look like real path/doc conventions (a run containing a digit
-        //      — dates, ADR/slice numbers — or a short ≤3-char run — file
-        //      extensions, revision markers like `R1`). A single suffixed run
-        //      only ever adds ONE such run, so a bare credential needs at
-        //      least two independent path-shaped segments already present.
-        //   2. `letters_only_entropy` (Shannon entropy over the token's ASCII
-        //      letters alone, digits and punctuation removed) is below
-        //      [`LETTERS_ONLY_ENTROPY_THRESHOLD`]. Real path/doc segments
-        //      reuse a small, skewed vocabulary (`khive`, `adr`, `md`, `rs`,
-        //      repeated words across segments), so the letters-only entropy
-        //      of the WHOLE token stays low even after concatenating every
-        //      segment. A random base64/base62 credential's letters are
-        //      near-uniformly distributed regardless of how it is chopped up
-        //      by separators or which suffix is appended, so this measure
-        //      does not move when an attacker tacks on `.md` or a digit run —
-        //      unlike the single-token-length extension check it replaces.
-        // Verified empirically against all 7 original FP repro strings (see
-        // `structured_identifier_repro_paths_pass_narrowed_exemption`) and
-        // against the codex round-2 bypass strings plus their digit-run
-        // variants (see `blocks_codex_round2_extension_suffix_bypass`).
-        // Outside trigger context the exemption is unchanged (word-shape
-        // alone is enough).
-        if is_structured_identifier(token)
-            && (!near_trigger
-                || (has_low_entropy_run_signal(token) && has_low_average_run_letter_entropy(token)))
-        {
+        // Round-4 decision (codex round-3 Critical): this exemption applies
+        // ONLY outside an explicit credential trigger context. Two prior
+        // attempts to narrow it for `near_trigger` instead of dropping it
+        // — a trailing file-extension check (round 1→2 bypass) and a
+        // dual-signal run-shape + average-per-run-letter-entropy check
+        // (round 2→3 bypass) — were both defeated, because every variant
+        // measured Shannon entropy over an attacker-CHOSEN run boundary, and
+        // entropy over a run of length `k` has a hard ceiling of `log2(k)`
+        // that ordinary short English words already sit at or near: a 9-char
+        // all-distinct-letter run (`relations`) and a 9-char chunk chopped
+        // out of a random credential are numerically IDENTICAL Shannon
+        // entropy, because the measure only sees the character-frequency
+        // histogram, never word semantics. An attacker who controls the
+        // token can always pick run lengths that drive per-run entropy at or
+        // below whatever a genuine short path segment reads at — no
+        // aggregation function (mean, max, or otherwise) over that
+        // attacker-chosen-boundary measure is sound. In trigger context,
+        // therefore, `is_structured_identifier` grants NO exemption: the
+        // token falls through to the entropy heuristic below unconditionally.
+        // This is an accepted false-positive tradeoff — see
+        // `accepted_false_positive_adr_draft_path_near_trigger` and its two
+        // sibling tests for the specific repro paths this now blocks.
+        if !near_trigger && is_structured_identifier(token) {
             continue;
         }
 
@@ -900,9 +893,8 @@ const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
 ///
 /// Outside credential-trigger context this shape check alone is sufficient to
 /// exempt a token from the entropy heuristic. In trigger context the caller
-/// additionally requires both [`has_low_entropy_run_signal`] and
-/// [`has_low_average_run_letter_entropy`] — see the call site in
-/// [`check_entropy_heuristic`].
+/// grants NO exemption at all — see the round-4 decision in the module doc
+/// comment and the call site in [`check_entropy_heuristic`].
 fn is_structured_identifier(token: &str) -> bool {
     if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
         return false;
@@ -912,106 +904,6 @@ fn is_structured_identifier(token: &str) -> bool {
         .filter(|r| !r.is_empty())
         .collect();
     runs.len() >= 2 && runs.iter().all(|run| is_word_shaped_run(run))
-}
-
-/// Minimum count of "path-shaped" runs (see below) a token must contain,
-/// in addition to [`is_structured_identifier`], to be exempted from the
-/// entropy heuristic inside credential-trigger context.
-const MIN_LOW_ENTROPY_RUNS: usize = 2;
-
-/// Longest run still considered "short" (extension-like, e.g. `md`, `rs`,
-/// `R1`) for the purposes of [`has_low_entropy_run_signal`].
-const SHORT_RUN_LEN: usize = 3;
-
-/// Returns `true` when `token` (already confirmed [`is_structured_identifier`])
-/// contains at least [`MIN_LOW_ENTROPY_RUNS`] runs that look like real
-/// path/doc-naming conventions rather than an arbitrary split of a random
-/// credential: a run containing an ASCII digit (dates, ADR/slice numbers) or
-/// a short run (`<= SHORT_RUN_LEN` chars — file extensions, revision markers
-/// like `R1`).
-///
-/// This alone is NOT a safe exemption signal — a single suffixed run (e.g.
-/// appending `.md` or a trailing digit block to a bare credential) can
-/// satisfy it cheaply — so [`check_entropy_heuristic`] additionally requires
-/// [`has_low_average_run_letter_entropy`], which resists dilution by a short
-/// suffix. Requiring >= 2 such runs still raises the bar over the single
-/// extension check it replaces: a bare credential must coincidentally (or by
-/// construction) contain two independent path-shaped segments, not one.
-fn has_low_entropy_run_signal(token: &str) -> bool {
-    let runs: Vec<&str> = token
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|r| !r.is_empty())
-        .collect();
-    let count = runs
-        .iter()
-        .filter(|run| run.len() <= SHORT_RUN_LEN || run.bytes().any(|b| b.is_ascii_digit()))
-        .count();
-    count >= MIN_LOW_ENTROPY_RUNS
-}
-
-/// Shortest run considered for the per-run letter-entropy average in
-/// [`has_low_average_run_letter_entropy`]. Runs shorter than this (short
-/// extensions, `R1`-style revision markers, pure digits) are excluded from
-/// the average — their letter entropy is dominated by sample-size noise, not
-/// signal, and they are already covered by [`has_low_entropy_run_signal`].
-const MIN_RUN_LEN_FOR_ENTROPY_AVERAGE: usize = 4;
-
-/// Threshold (bits per character) for the AVERAGE, across a token's
-/// qualifying runs, of each run's OWN letters-only Shannon entropy — see
-/// [`has_low_average_run_letter_entropy`]. Measured empirically: every
-/// original FP-repro path averaged <= 2.4825, while every probed bypass
-/// variant (bare, digit-suffixed, extension-suffixed, and short-run-padded)
-/// averaged >= 3.0244 — a comfortable margin either side of this threshold.
-const AVG_RUN_LETTER_ENTROPY_THRESHOLD: f64 = 2.8;
-
-/// Returns `true` when the AVERAGE letters-only Shannon entropy of `token`'s
-/// individual runs (each run's own alphabetic characters, entropy computed
-/// per run then averaged across runs `>= MIN_RUN_LEN_FOR_ENTROPY_AVERAGE`
-/// chars) is below [`AVG_RUN_LETTER_ENTROPY_THRESHOLD`].
-///
-/// This is the signal that survives the codex round-2 bypass. A whole-token
-/// letters-concatenation entropy (the naive alternative) is fooled by digit
-/// interleaving: stripping digits from a 50-char mixed alphanumeric secret
-/// leaves a short, small-sample letter run whose Shannon entropy reads low
-/// purely from sample-size noise, not because the secret is genuinely
-/// low-entropy — this let a pre-existing digit-mixed adversarial catch-suite
-/// test slip through during development of this fix. Measuring each run's
-/// entropy independently, on its own scale, and averaging avoids that
-/// dilution: a real path's word segments (`khive`, `workspaces`, `epistemic`,
-/// `relations`, …) each individually show natural-language letter skew, while
-/// a random base64/base62 run shows near-uniform letter distribution
-/// regardless of how many short/digit runs are appended around it — so
-/// suffixing `.md`, a digit run, or several short filler runs does not pull
-/// the average down enough to cross the threshold.
-fn has_low_average_run_letter_entropy(token: &str) -> bool {
-    let runs: Vec<&str> = token
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|r| !r.is_empty())
-        .collect();
-    let entropies: Vec<f64> = runs
-        .iter()
-        .filter(|r| {
-            r.len() >= MIN_RUN_LEN_FOR_ENTROPY_AVERAGE && r.bytes().any(|b| b.is_ascii_alphabetic())
-        })
-        .map(|r| {
-            let letters: Vec<u8> = r.bytes().filter(|b| b.is_ascii_alphabetic()).collect();
-            shannon_entropy(&letters)
-        })
-        .collect();
-    if entropies.is_empty() {
-        // No qualifying run to measure: every run is either short
-        // (`< MIN_RUN_LEN_FOR_ENTROPY_AVERAGE`) or pure digit. A token built
-        // entirely from short letter+digit runs (e.g. `Zk1-Qp2-Lr3-…`) can
-        // still be high-entropy overall while every individual run dodges
-        // this measure — there is nothing here to certify as low-entropy, so
-        // this signal does NOT pass by default. All 7 original FP-repro
-        // strings have >= 4 qualifying runs (see
-        // `structured_identifier_repro_paths_pass_narrowed_exemption`), so
-        // failing closed here does not regress them.
-        return false;
-    }
-    let avg = entropies.iter().sum::<f64>() / entropies.len() as f64;
-    avg < AVG_RUN_LETTER_ENTROPY_THRESHOLD
 }
 
 /// A single run (segment between structural separators) is word-shaped when
@@ -2430,38 +2322,55 @@ mod tests {
     // heuristic tokenizes on whitespace, so a full file path is one long
     // token; trigger detection is substring-based, so "auth"/"key" match
     // inside ordinary words; and mixed-case+digit+punctuation paths
-    // legitimately exceed the Shannon-entropy threshold. Each case below is
-    // embedded near a trigger word to prove the exemption applies in trigger
-    // context, not just in isolation.
+    // legitimately exceed the Shannon-entropy threshold. The exemption
+    // originally applied in trigger context too, but round-4 (see the module
+    // doc comment) dropped it there entirely — no sound signal separates a
+    // real path from an attacker-chopped/padded credential once Shannon
+    // entropy is the only measure and the attacker controls run boundaries.
+    // The three cases below are accepted false positives post round-4: their
+    // own full-token entropy exceeds ENTROPY_THRESHOLD, so they now block
+    // near a trigger word (see `accepted_false_positive_*` for the
+    // authoritative "must block" assertions; kept here renamed to document
+    // the flip rather than silently deleted).
 
     #[test]
-    fn allows_file_path_near_secret_word() {
+    fn blocks_file_path_near_secret_word_accepted_fp_round4() {
+        // Was `allows_file_path_near_secret_word` pre round-4 (structured-
+        // identifier exemption applied in trigger context). Full-token
+        // entropy 4.5994 > ENTROPY_THRESHOLD (4.5) — now an accepted FP.
         let content =
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
         assert!(
-            check(content).is_ok(),
-            "structured file path near 'secret' must not be blocked; fired: {:?}",
+            check(content).is_err(),
+            "accepted FP post round-4: structured file path near 'secret' is now \
+             blocked; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn allows_workspace_path_near_key_word() {
+    fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
+        // Was `allows_workspace_path_near_key_word` pre round-4. Full-token
+        // entropy 4.7938 > 4.5 — now an accepted FP.
         let content = "key: see .khive/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
-            check(content).is_ok(),
-            "workspace path near 'key' must not be blocked; fired: {:?}",
+            check(content).is_err(),
+            "accepted FP post round-4: workspace path near 'key' is now blocked; \
+             got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn allows_short_run_path_near_auth_word() {
+    fn blocks_short_run_path_near_auth_word_accepted_fp_round4() {
+        // Was `allows_short_run_path_near_auth_word` pre round-4. Full-token
+        // entropy 4.5955 > 4.5 — now an accepted FP.
         let content =
             "auth work saved at .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
-            check(content).is_ok(),
-            "path with a short 'R1' run near 'auth' must not be blocked; fired: {:?}",
+            check(content).is_err(),
+            "accepted FP post round-4: path with a short 'R1' run near 'auth' is \
+             now blocked; got {:?}",
             scan(content)
         );
     }
@@ -2572,20 +2481,31 @@ mod tests {
         assert!(!is_structured_identifier(&token));
     }
 
-    // ── Codex Critical: narrow structured-identifier exemption in trigger
-    //    context to path-shaped tokens (extension-bearing) ──────────────────
+    // ── Round-4 decision: drop the structured-identifier exemption entirely
+    //    in trigger context (codex round-3 Critical) ─────────────────────────
     //
-    // The structured-identifier exemption was unconditional, so a prefixless
-    // high-entropy credential that happens to be separator-delimited with
-    // word-shaped runs (e.g. an AWS Secret Access Key: 40 chars, base64-ish
-    // alphabet including `/`, no vendor prefix for Layer 1 to catch) bypassed
-    // the entropy detector even in an explicit credential context.
+    // Two narrower fixes were tried in trigger context and both defeated:
+    //   round 1: required a trailing file-extension run       -> bypassed by
+    //            appending `.md`/`.rs` to any random credential (round-2).
+    //   round 2: required >= 2 path-shaped runs AND average
+    //            per-run letters-only entropy below a threshold -> bypassed
+    //            by padding with extra short/digit runs (dilutes the mean) or
+    //            by splitting the credential itself into short runs (drives
+    //            every run's own entropy toward its length ceiling,
+    //            log2(run_len), which real short path words already sit at)
+    //            (round-3).
+    // Root cause: Shannon entropy over an attacker-chosen run boundary cannot
+    // distinguish "distinct letters that spell an English word" from
+    // "distinct letters chosen adversarially" — both hit the same
+    // log2(length) ceiling. No aggregation is sound. The exemption is now
+    // dropped unconditionally in trigger context: a structured-identifier
+    // shaped token near a trigger word is entropy-checked like any other
+    // token, with 3 known false positives accepted (see
+    // `accepted_false_positive_*` below).
 
     #[test]
     fn blocks_codex_repro_secret_access_key_bypass() {
-        // The exact bypass string from the codex Critical finding: four
-        // lowercase-only runs joined by `/`, entropy 4.6531 > 4.5 threshold,
-        // near the `secret`/`access_key` triggers, no extension segment.
+        // The exact bypass string from the codex round-1 Critical finding.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk";
         assert!(
             check(content).is_err(),
@@ -2609,10 +2529,7 @@ mod tests {
     fn blocks_adversarial_digit_and_word_mixed_token_near_api_key() {
         // A mix of pure-digit runs and letters-then-digits runs (both
         // individually word-shaped) whose combined alphabet diversity crosses
-        // the entropy threshold. Pure-digit runs alone cap out at
-        // log2(10)~=3.32 bits/char, so a purely digit-segmented token can
-        // never reach ENTROPY_THRESHOLD on its own; mixing in lowercase runs
-        // is what makes this case realistic and adversarial.
+        // the entropy threshold.
         let content = "api_key attaycofrsm827/festwqjhc493/8261947350/qwikjzx982";
         assert!(
             check(content).is_err(),
@@ -2623,8 +2540,6 @@ mod tests {
 
     #[test]
     fn blocks_adversarial_token_assignment_separator_delimited_secret() {
-        // `token=` assignment form with a lowercase-only separator-delimited
-        // high-entropy value.
         let content = "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk";
         assert!(
             check(content).is_err(),
@@ -2635,31 +2550,9 @@ mod tests {
     }
 
     #[test]
-    fn allows_extension_bearing_path_near_api_key_positive_control() {
-        // Positive control: the narrowed exemption must still allow a real
-        // file path (extension-bearing) near an explicit trigger word.
-        let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
-        assert!(
-            check(content).is_ok(),
-            "extension-bearing path near 'api_key' must still be allowed; fired: {:?}",
-            scan(content)
-        );
-    }
-
-    // ── Codex round-2 Critical: extension-suffix bypass ─────────────────────
-    //
-    // The round-1 fix required the token to end in a file-extension segment
-    // when near_trigger, but that signal is itself attacker-suppliable:
-    // appending `.md` (or `.rs`) to the EXACT round-1 bypass string re-enables
-    // the exemption. The round-2 fix replaces the single suffix check with two
-    // signals that both resist a short-suffix attack: >= 2 path-shaped runs
-    // (`has_low_entropy_run_signal`) AND low letters-only entropy across the
-    // whole token (`has_low_average_run_letter_entropy`).
-
-    #[test]
     fn blocks_codex_round2_extension_suffix_bypass_secret_access_key() {
-        // The exact round-1 bypass string with `.md` appended — this is what
-        // slipped through the extension-based exemption in round 1.
+        // The round-1 bypass string with `.md` appended — this is what
+        // slipped through the round-1 extension-based exemption.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
             check(content).is_err(),
@@ -2680,8 +2573,6 @@ mod tests {
 
     #[test]
     fn blocks_round1_bypass_strings_still_without_extension() {
-        // The original round-1 bypass strings (no extension) must remain
-        // blocked — the round-2 fix must not regress round-1.
         let cases = [
             "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk",
             "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk",
@@ -2697,10 +2588,6 @@ mod tests {
 
     #[test]
     fn blocks_digit_run_suffix_bypass_attempt() {
-        // Adversarial: instead of a file extension, suffix a digit-bearing run
-        // (the OTHER half of `has_low_entropy_run_signal`) to try to manufacture
-        // a second path-shaped run cheaply. `has_low_average_run_letter_entropy` must
-        // still reject it since the letters-only alphabet stays uniform.
         let cases = [
             "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk2024",
             "secret_access_key abcdefghij2024/klmnopqrst/uvwxyzabcd/efghijk.md",
@@ -2715,116 +2602,118 @@ mod tests {
     }
 
     #[test]
-    fn has_low_entropy_run_signal_true_for_real_paths() {
-        // Full, multi-segment paths decompose into >= 2 short/digit-bearing
-        // runs (dates, ADR/slice numbers, extensions).
-        assert!(has_low_entropy_run_signal("ADR-DRAFT-adr079-slices234.md"));
-        assert!(has_low_entropy_run_signal(
-            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md"
-        ));
-    }
-
-    #[test]
-    fn has_low_entropy_run_signal_false_for_isolated_short_filenames() {
-        // An isolated bare filename (no directory segments, no date/number
-        // run) has at most one qualifying run — its own extension — so it
-        // does NOT clear this signal alone. It still gets exempted outside
-        // trigger context via `is_structured_identifier` shape alone; this
-        // signal only gates the ADDITIONAL trigger-context requirement.
-        assert!(!has_low_entropy_run_signal("ingest.rs"));
-        assert!(!has_low_entropy_run_signal("PACKET.md"));
-        assert!(!has_low_entropy_run_signal("Cargo.toml"));
-    }
-
-    #[test]
-    fn has_low_entropy_run_signal_false_for_bare_bypass() {
-        // The bare round-1 bypass has zero digit-bearing or short runs.
-        assert!(!has_low_entropy_run_signal(
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk"
-        ));
-    }
-
-    #[test]
-    fn has_low_entropy_run_signal_false_for_single_extension_suffix() {
-        // A SINGLE suffixed extension run (the round-1 bypass shape) does
-        // NOT clear this gate: `has_low_entropy_run_signal` requires >= 2
-        // short/digit-bearing runs, and appending `.md` to the bare bypass
-        // only produces one (the extension itself) — the four random
-        // separator-delimited runs stay long and letter-only, so they don't
-        // qualify. This is WHY the round-1 single-signal extension override
-        // was insufficient on its own (it used extension-presence, not run
-        // count) — the round-2 fix requires both this signal AND
-        // `has_low_average_run_letter_entropy`, neither of which the
-        // extension-suffixed bypass clears.
-        assert!(!has_low_entropy_run_signal(
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md"
-        ));
-        assert!(!has_low_average_run_letter_entropy(
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md"
-        ));
-    }
-
-    #[test]
-    fn has_low_average_run_letter_entropy_true_for_real_paths() {
-        let paths = [
-            "fable-ops/ADR-DRAFT-adr079-slices234.md",
-            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
-            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
-            "codex_review_pr335_round2.md",
-            "docs/adr/ADR-055-epistemic-edge-relations.md",
-            "crates/khive-pack-session/src/mirror/ingest.rs",
-            "check_entropy_heuristic_impl",
-        ];
-        for p in paths {
-            assert!(
-                has_low_average_run_letter_entropy(p),
-                "{p} must have low letters-only entropy"
-            );
-        }
-    }
-
-    #[test]
-    fn has_low_average_run_letter_entropy_false_for_bypass_variants() {
+    fn blocks_round3_padding_run_bypass_attempts() {
+        // Codex round-3 Critical repro: a low-entropy padding run (`aaaa`)
+        // inserted before short/digit-shaped runs used to drag the round-2
+        // AVERAGE per-run letters-only entropy below its threshold while
+        // `has_low_entropy_run_signal` was satisfied by the trailing
+        // `R1`/extension runs. With the exemption dropped entirely, these
+        // must be blocked purely on full-token entropy, same as any other
+        // near-trigger high-entropy token.
         let cases = [
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk",
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md",
-            "zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk",
-            "zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk.rs",
-            "abcdefghij/klmnopqrst/uvwxyzabcd/efghijk2024",
-            "abcdefghij2024/klmnopqrst/uvwxyzabcd/efghijk.md",
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk/aaaa/R1.md",
+            "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz/mnbvcxzlk/aaaa/R1.rs",
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk/aaaa/bbbb/R1.md",
+            "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz/mnbvcxzlk/aaaa/bbbb/R1.rs",
         ];
-        for c in cases {
+        for content in cases {
             assert!(
-                !has_low_average_run_letter_entropy(c),
-                "{c} must NOT have low letters-only entropy (bypass would regress)"
+                check(content).is_err(),
+                "round-3 padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
+                scan(content)
             );
         }
     }
 
     #[test]
-    fn structured_identifier_repro_paths_pass_narrowed_exemption() {
-        // Documents the empirical basis for the round-2 narrowing: every
-        // existing FP-repro path near a trigger word passes BOTH new signals
-        // (or is already below ENTROPY_THRESHOLD on its own, making the
-        // exemption non-load-bearing for it regardless).
+    fn blocks_run_splitting_bypass_attempts() {
+        // A further adversarial construction found while stress-testing the
+        // round-3 fix (not itself a codex finding, but proves the general
+        // unsoundness): splitting a credential into short (4-6 char) runs
+        // drives EVERY run's own letters-only entropy toward log2(run_len),
+        // which ordinary short English path words already sit at or near —
+        // this is exactly why round 3 (and any per-run entropy ceiling) is
+        // unfixable. With the exemption dropped, these are blocked on
+        // full-token entropy regardless of run shape.
+        let cases = [
+            "secret_access_key abcd/efgh/ijkl/mnop/qrst/uvwx/yzab/cdef.md",
+            "secret_access_key abcde/fghij/klmno/pqrst/uvwxy/zabcd.md",
+            "secret_access_key abcdef/ghijkl/mnopqr/stuvwx/yzabcd.md",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "run-splitting bypass attempt must be blocked: {content:?}, got: {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_fp_paths_whose_full_token_entropy_is_already_below_threshold() {
+        // 4 of the 7 original FP-repro paths stay OK near a trigger word even
+        // with NO structured-identifier exemption at all, because their own
+        // full-token Shannon entropy already reads below ENTROPY_THRESHOLD
+        // (4.5) — the exemption was never load-bearing for these regardless
+        // of which version of it existed.
         let paths = [
-            "fable-ops/ADR-DRAFT-adr079-slices234.md",
-            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
-            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
             "codex_review_pr335_round2.md",
             "docs/adr/ADR-055-epistemic-edge-relations.md",
             "crates/khive-pack-session/src/mirror/ingest.rs",
             "check_entropy_heuristic_impl",
         ];
         for p in paths {
-            let passes_new_signals =
-                has_low_entropy_run_signal(p) && has_low_average_run_letter_entropy(p);
-            let low_entropy = shannon_entropy(p.as_bytes()) < ENTROPY_THRESHOLD;
+            let content = format!("api_key handling in {p}");
             assert!(
-                passes_new_signals || low_entropy,
-                "{p} must pass both new exemption signals or already be below \
-                 the entropy threshold, else the round-2 narrowing would regress it"
+                check(&content).is_ok(),
+                "{p} must stay allowed near 'api_key' (full-token entropy already \
+                 below threshold): fired {:?}",
+                scan(&content)
             );
         }
+    }
+
+    #[test]
+    fn accepted_false_positive_adr_draft_path_near_trigger() {
+        // Round-4 accepted tradeoff: this path's full-token Shannon entropy
+        // (4.5994) exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
+        // structured-identifier exemption dropped in trigger context, it is
+        // now blocked near an explicit credential trigger word. This is a
+        // deliberate, documented false positive — not a regression to fix —
+        // per the round-4 decision that no sound signal exists to
+        // distinguish this from a chopped/padded credential of the same
+        // shape.
+        let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked post round-4; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_workspace_packet_path_near_trigger() {
+        // Same tradeoff as above: full-token entropy 4.7938 > 4.5.
+        let content = "api_key handling in .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
+             post round-4; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_r1_repo_audit_path_near_trigger() {
+        // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
+        let content =
+            "api_key handling in .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
+             round-4; got {:?}",
+            scan(content)
+        );
     }
 }
