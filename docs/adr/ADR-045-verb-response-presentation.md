@@ -64,7 +64,7 @@ returned by the runtime.
 pub enum PresentationMode {
     /// Token-efficient. Default for MCP callers (agents).
     Agent,
-    /// Full canonical shape. Default for `kkernel call` and CI / scripted callers.
+    /// Full canonical shape. Default for `kkernel exec` and CI / scripted callers.
     Verbose,
     /// Pretty-printed terminal output. Default for `khive` CLI.
     Human,
@@ -81,12 +81,12 @@ the corresponding transform.
 
 ### 2. Selection rules
 
-| Caller surface               | Default mode | Override                                                     |
-| ---------------------------- | ------------ | ------------------------------------------------------------ |
-| MCP (`request` tool)         | `Agent`      | envelope-level `presentation_per_op` array (see §Wire shape) |
-| `kkernel call <pack> <verb>` | `Verbose`    | `--presentation agent` or `--presentation human` flag        |
-| `khive` CLI                  | `Human`      | `--json` for `Agent`, `--verbose` for `Verbose`              |
-| HTTP gateway (future)        | `Agent`      | `?presentation=verbose` query parameter                      |
+| Caller surface                      | Default mode | Override                                                     |
+| ----------------------------------- | ------------ | ------------------------------------------------------------ |
+| MCP (`request` tool)                | `Agent`      | envelope-level `presentation_per_op` array (see §Wire shape) |
+| `kkernel exec '<pack>.<verb>(...)'` | `Verbose`    | `--presentation agent` or `--presentation human` flag        |
+| `khive` CLI                         | `Human`      | `--json` for `Agent`, `--verbose` for `Verbose`              |
+| HTTP gateway (future)               | `Agent`      | `?presentation=verbose` query parameter                      |
 
 The presentation argument is parsed by the runtime envelope, not by the
 handler. Handlers MUST NOT inspect or branch on the mode.
@@ -161,7 +161,7 @@ shape that round-trips through CI / scripted callers without surprises.
 
 **MCP/runtime boundary: `Human` is a no-op at this layer.**
 
-When `presentation=human` is sent over the MCP wire or `kkernel call`, the
+When `presentation=human` is sent over the MCP wire or `kkernel exec`, the
 runtime returns canonical (verbose) JSON — identical to `Verbose`. No
 transformation is applied inside `khive-runtime::presentation`. This is a
 deliberate design decision, not an omission:
@@ -468,7 +468,7 @@ Adding more invites bikeshedding without clear use cases.
 | Mode declared once per session, not per call                           | Some workflows mix verbose and agent calls; per-call control is the safer default        |
 | Use Accept headers (HTTP-style)                                        | MCP doesn't have headers; introducing them for one ADR's worth of feature is overkill    |
 | Truncate to top-N keys based on size budget                            | Brittle; the same call from two agents would return different shapes — non-deterministic |
-| Strip empties only at MCP boundary, leave canonical for `kkernel call` | Already the design — `kkernel call` defaults to verbose                                  |
+| Strip empties only at MCP boundary, leave canonical for `kkernel exec` | Already the design — `kkernel exec` defaults to verbose                                  |
 
 ## Consequences
 
@@ -558,7 +558,7 @@ layer is purely additive.
 **Migration policy:** Agent mode ships as the default for MCP/stdio responses
 IN this release. An escape hatch `KHIVE_DEFAULT_PRESENTATION=verbose` is
 available for one minor version (v0.2.x). The escape hatch is removed in v0.3.
-Verbose remains the default for `kkernel call` and library callers.
+Verbose remains the default for `kkernel exec` and library callers.
 
 Agents that previously parsed against full-shape MCP responses must either
 migrate to Agent-mode shapes or set `presentation=verbose` per call (or

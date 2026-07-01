@@ -112,7 +112,7 @@ pub enum VerbCategory {
 ```
 
 The category is a runtime tag (`HandlerDef::category`) consumed by introspection
-(`kkernel call <pack> <handler> --help` per ADR-003) and not enforced at compile time.
+(`kkernel exec '<pack>.<handler>(help=true)'` per ADR-003) and not enforced at compile time.
 Mis-categorization is
 caught in code review, not by the type system. The point is naming the classification so
 verb-addition discussions can reference it.

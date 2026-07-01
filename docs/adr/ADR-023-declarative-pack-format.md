@@ -96,7 +96,7 @@ pub struct HandlerDef {
 pub enum Visibility {
     /// Exposed to MCP agents. Agents call via `request("pack.verb(args)")`.
     Verb,
-    /// Not on the MCP wire. Callable only via `kkernel call <pack> <handler>`.
+    /// Not on the MCP wire. Callable only via `kkernel exec '<pack>.<handler>(args)'`.
     /// Examples: `memory.recall_score`, `memory.recall_embed` — addressable
     /// through batch DSL chains but NOT registered as top-level MCP verbs.
     Subhandler,
@@ -106,17 +106,17 @@ pub enum Visibility {
 The MCP transport filters by `visibility == Verb` when building the agent capability
 list. `Subhandler` handlers are unreachable from MCP — agents never see them.
 
-The kkernel CLI exposes the **full** handler surface:
+The kkernel CLI exposes the **full** handler surface via the verb-DSL `exec` subcommand:
 
 ```bash
-kkernel call memory recall       query="..."                  # Verb       — also on MCP
-kkernel call memory recall_embed query="..."                  # Subhandler — admin only
-kkernel call memory recall_fuse  query="..." limit=5          # Subhandler — admin only
-kkernel call memory recall_score candidate_id="..."           # Subhandler — admin only
+kkernel exec 'memory.recall(query="...")'                      # Verb       — also on MCP
+kkernel exec 'memory.recall_embed(query="...")'                 # Subhandler — admin only
+kkernel exec 'memory.recall_fuse(query="...", limit=5)'         # Subhandler — admin only
+kkernel exec 'memory.recall_score(candidate_id="...")'          # Subhandler — admin only
 ```
 
 The same handler is reachable as `memory.recall` from MCP and as
-`kkernel call memory recall` from the CLI. The CLI is the operator's window into the
+`kkernel exec 'memory.recall(...)'` from the CLI. The CLI is the operator's window into the
 full surface; MCP is the agent's filtered view.
 
 This replaces the previous `VerbDef` type. Migration is mechanical: rename
@@ -205,14 +205,14 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 
 Any verb name change or new pack registration that violates §4 will fail CI.
 
-The kkernel CLI uses spaces, not dots, to invoke handlers:
+The kkernel CLI uses the same dotted verb-DSL form as MCP, via the `exec` subcommand:
 
 ```bash
-kkernel call <pack> <handler> [args...]
+kkernel exec '<pack>.<handler>(args...)'
 ```
 
 So the same handler is `memory.recall_candidates` on MCP and
-`kkernel call memory recall_candidates` from the CLI.
+`kkernel exec 'memory.recall_candidates(...)'` from the CLI.
 
 ### 5. Field naming — full words, context-portable
 
