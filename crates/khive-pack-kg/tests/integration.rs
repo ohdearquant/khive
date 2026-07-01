@@ -7424,7 +7424,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
             None,
             Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "to_actor": "email:user@example.com",
             })),
@@ -7440,7 +7440,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
         let note = Note::new("local", "message", format!("delivered {i}")).with_properties(
             serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "to_actor": "email:user@example.com",
                 "delivered_at": "2026-01-01T00:00:00Z",

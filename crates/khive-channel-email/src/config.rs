@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn validate_sasl_string_accepts_valid_email() {
-        assert!(validate_sasl_string("leo@khive.ai", "username").is_ok());
+        assert!(validate_sasl_string("mailbox@example.com", "username").is_ok());
     }
 
     // ── optional_port tests (env-mutating — serialized with ENV_MUTEX) ────────

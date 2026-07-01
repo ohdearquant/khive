@@ -4021,7 +4021,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
             expires_at: None,
             properties: Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
@@ -4042,7 +4042,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         &rt,
         serde_json::json!({
             "from": "email:user@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "this is a reply",
             "correlation_external_id": outbound_external_id,
             "external_id": "imap:mail:1:1",
@@ -4091,7 +4091,7 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
             expires_at: None,
             properties: Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
@@ -4111,7 +4111,7 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         &rt,
         serde_json::json!({
             "from": "email:user@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "this is a bracket-free reply",
             "correlation_external_id": inbound_correlation,
             "external_id": "imap:mail:2:1",
@@ -4145,7 +4145,7 @@ async fn ingest_routing_fresh_message_uses_default_actor() {
         &rt,
         serde_json::json!({
             "from": "email:stranger@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "hello from a stranger",
             "external_id": "imap:mail:1:2",
             "default_inbound_actor": "lambda:leo",
@@ -4171,7 +4171,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
         &rt,
         serde_json::json!({
             "from": "email:stranger@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "back-compat message",
             "external_id": "imap:mail:1:3",
             "namespace": "local",
@@ -4181,7 +4181,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
 
     assert_eq!(
         props["to_actor"].as_str(),
-        Some("email:leo@khive.ai"),
+        Some("email:mailbox@example.com"),
         "no default actor: to_actor must fall back to p.to; got props={props}"
     );
 }
@@ -4225,7 +4225,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
             expires_at: None,
             properties: Some(serde_json::json!({
                 "direction": "outbound",
-                "from": "email:leo@khive.ai",
+                "from": "email:mailbox@example.com",
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
@@ -4249,7 +4249,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         &rt,
         serde_json::json!({
             "from": "email:user@example.com",
-            "to": "email:leo@khive.ai",
+            "to": "email:mailbox@example.com",
             "content": "this is a reply via X-Khive-Thread-ID",
             "correlation_external_id": thread_uuid,
             "external_id": "imap:mail:thread-uuid-reply:1",

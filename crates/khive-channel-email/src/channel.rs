@@ -73,7 +73,7 @@ impl EmailChannel {
         Ok(Self { config, smtp, imap })
     }
 
-    /// The configured mailbox address (e.g. `leo@khive.ai`).
+    /// The configured mailbox address (e.g. `mailbox@example.com`).
     ///
     /// Used by the outbox delivery loop to derive the sender address and
     /// the domain component of the RFC 822 Message-ID header.
@@ -398,13 +398,13 @@ mod tests {
         // dotless canonical form, a googlemail alias, or a +tag. All are the same
         // Gmail mailbox and must authorize.
         for from in [
-            "quantoceanli@gmail.com",
-            "quantocean.li@gmail.com",
-            "quantoceanli@googlemail.com",
-            "quantocean.li+khive@gmail.com",
+            "samrivera@gmail.com",
+            "sam.rivera@gmail.com",
+            "samrivera@googlemail.com",
+            "sam.rivera+khive@gmail.com",
         ] {
             let ch = build_channel(
-                "quantocean.li@gmail.com",
+                "sam.rivera@gmail.com",
                 vec![make_email(from, "imap:test:0:1")],
             );
             let envs = ch.poll(Utc::now()).await.unwrap();
@@ -417,8 +417,8 @@ mod tests {
         // Dot-insensitivity is a Gmail-only rule; other providers treat dots as
         // significant, so a dotted variant of a non-Gmail maintainer is rejected.
         let ch = build_channel(
-            "quantocean.li@outlook.com",
-            vec![make_email("quantoceanli@outlook.com", "imap:test:0:1")],
+            "sam.rivera@outlook.com",
+            vec![make_email("samrivera@outlook.com", "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert!(envs.is_empty(), "non-gmail dot-variant must NOT authorize");
