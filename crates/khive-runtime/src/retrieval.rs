@@ -1326,10 +1326,12 @@ mod tests {
     }
 
     /// #388 regression: `hybrid_search` must not hard-fail on a query containing FTS5
-    /// metacharacters like `$` (e.g. the DSL doc query `$prev.id`). Even though
-    /// `sanitize_fts5_query` (khive-db) now strips `$`, this exercises the
-    /// runtime-level fail-open: if the FTS leg ever errors, `hybrid_search` degrades
-    /// to vector-only fusion instead of propagating the error.
+    /// metacharacters like `$` (e.g. the DSL doc query `$prev.id`). After this test was
+    /// first written, `sanitize_fts5_query` (khive-db) already strips `$`, so this alone
+    /// takes the `Ok` path and does not exercise the runtime-level fail-open `Err` arm
+    /// (PR #389 codex round-1 Medium finding) — it stays as a sanitizer-path regression;
+    /// see `hybrid_search_with_residual_fts5_char_degrades_to_vector_only` below for the
+    /// fail-open-branch regression.
     #[tokio::test]
     async fn hybrid_search_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1353,6 +1355,40 @@ mod tests {
         assert!(
             result.is_ok(),
             "#388 hybrid_search must not hard-fail on a '$'-bearing query, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// PR #389 codex round-1 Medium regression: unlike `$`, `@` is NOT stripped by
+    /// `sanitize_fts5_query` (by design — the sanitizer stays minimal per #388 scope;
+    /// the fail-open net is the systematic answer for residual punctuation). SQLite
+    /// FTS5's bareword parser still rejects `@` unconditionally, so this query reaches
+    /// the runtime-level `Err` arm added in `hybrid_search` and must degrade to
+    /// vector-only fusion rather than propagating the error.
+    #[tokio::test]
+    async fn hybrid_search_with_residual_fts5_char_degrades_to_vector_only() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "DSL docs",
+            Some("use foo@bar to chain calls"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .hybrid_search(&tok, "foo@bar", None, 10, None, None, &[], None)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "#389 hybrid_search must not hard-fail when the FTS leg errors on a residual \
+             FTS5 char ('@'), got: {:?}",
             result.err()
         );
     }

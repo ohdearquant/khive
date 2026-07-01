@@ -425,9 +425,11 @@ mod tests {
     }
 
     // 10. #388 regression: hybrid_search_with_strategy must not hard-fail on a query
-    // containing FTS5 metacharacters like `$`. sanitize_fts5_query (khive-db) strips
-    // `$`, but this exercises the runtime-level fail-open: if the FTS leg ever errors,
-    // the call degrades to vector-only fusion instead of propagating the error.
+    // containing FTS5 metacharacters like `$`. After this test was first written,
+    // sanitize_fts5_query (khive-db) already strips `$`, so this alone takes the `Ok`
+    // path and does not exercise the runtime-level fail-open `Err` arm (PR #389 codex
+    // round-1 Medium finding) — kept as a sanitizer-path regression; see test 11 below
+    // for the fail-open-branch regression.
     #[tokio::test]
     async fn hybrid_search_with_strategy_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -451,6 +453,40 @@ mod tests {
         assert!(
             result.is_ok(),
             "#388 hybrid_search_with_strategy must not hard-fail on a '$'-bearing query, got: {:?}",
+            result.err()
+        );
+    }
+
+    // 11. PR #389 codex round-1 Medium regression: unlike `$`, `@` is NOT stripped by
+    // sanitize_fts5_query (by design — the sanitizer stays minimal per #388 scope; the
+    // fail-open net is the systematic answer for residual punctuation). SQLite FTS5's
+    // bareword parser still rejects `@` unconditionally, so this query reaches the
+    // runtime-level `Err` arm added in hybrid_search_with_strategy and must degrade to
+    // vector-only fusion rather than propagating the error.
+    #[tokio::test]
+    async fn hybrid_search_with_strategy_residual_fts5_char_degrades_to_vector_only() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "DSL docs",
+            Some("use foo@bar to chain calls"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .hybrid_search_with_strategy(&tok, "foo@bar", None, FusionStrategy::default(), 10)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "#389 hybrid_search_with_strategy must not hard-fail when the FTS leg errors \
+             on a residual FTS5 char ('@'), got: {:?}",
             result.err()
         );
     }

@@ -587,19 +587,20 @@ impl MemoryPack {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
     use khive_pack_kg::KgPack;
-    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
     use crate::MemoryPack;
 
-    /// #388 regression: the `memory.recall` verb must not hard-fail on a query
-    /// containing FTS5 metacharacters like `$` (e.g. the DSL doc query `$prev.id`).
-    /// `sanitize_fts5_query` (khive-db) now strips `$`, but this exercises the
-    /// full verb-dispatch path end to end: `collect_recall_text_hits`
-    /// (khive-pack-memory) degrades to an empty candidate set on any residual FTS
-    /// error instead of aborting the recall, and the in-memory runtime here has no
-    /// embedder registered, so the vector leg trivially contributes zero hits —
-    /// isolating the assertion to the FTS leg's fail-open behavior.
+    /// #388 regression (sanitizer path): `sanitize_fts5_query` (khive-db) strips
+    /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
+    /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
+    /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
+    /// for a test that forces the `Err` arm itself (PR #389 codex round-1 Medium).
     #[tokio::test]
     async fn recall_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -637,6 +638,138 @@ mod tests {
             result.is_ok(),
             "#388 memory.recall must not hard-fail on a '$'-bearing query, got: {:?}",
             result.err()
+        );
+    }
+
+    // Deterministic embedding service: distinct vector per unique text via FNV
+    // hash (copied from `pack.rs`'s `ann_route_tests` — not semantically
+    // meaningful, but reproducible: identical input text always yields an
+    // identical vector, which is all a cosine-similarity vector leg needs to
+    // prove it found the right note).
+    struct HashVecService {
+        dims: usize,
+    }
+
+    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        let mut v = Vec::with_capacity(dims);
+        let mut s = h;
+        for _ in 0..dims {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+        }
+        v
+    }
+
+    #[async_trait]
+    impl EmbeddingService for HashVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hash-vec"
+        }
+    }
+
+    struct HashVecProvider {
+        model_name: String,
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for HashVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(HashVecService { dims: self.dims }))
+        }
+    }
+
+    /// PR #389 codex round-1 Medium regression: unlike `$`, `@` is NOT stripped
+    /// by `sanitize_fts5_query` (by design — the sanitizer stays minimal per
+    /// #388 scope; the fail-open net is the systematic answer for residual
+    /// punctuation). SQLite FTS5's bareword parser still rejects `@`
+    /// unconditionally, so this query reaches the `Err` arm added to
+    /// `collect_recall_text_hits` (khive-pack-memory/handlers/common.rs) and must
+    /// degrade to vector-only results rather than aborting the recall.
+    ///
+    /// Ties Medium to the codex round-1 High-2 finding: with a real (non-null)
+    /// embedder registered, this proves the vector leg still returns the
+    /// correct note while the FTS leg is degraded — i.e. degradation loses only
+    /// the FTS signal, not the overall recall. (This test does NOT assert an
+    /// `fts_degraded`/`partial` advisory field: `memory.recall`'s common-path
+    /// wire shape is a bare JSON array today, so adding such a field here would
+    /// be a breaking array-to-object shape change — reported separately as
+    /// blocked-on-shape, not fixed in this PR.)
+    #[tokio::test]
+    async fn recall_with_residual_fts5_char_degrades_and_vector_leg_survives() {
+        const MODEL: &str = "recall-residual-char-test-model";
+        const DIMS: usize = 32;
+        const NOTE_TEXT: &str = "foo@bar chain call helper note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // embedding_model: None — create_note auto-detects the registered
+        // custom provider (resolve_embedding_model only handles lattice
+        // aliases; custom provider names go through the auto-detect path).
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // Query text matches the note content exactly so the hash-vec embedder
+        // (which has no semantic notion of similarity) produces an identical
+        // vector for query and note, guaranteeing a vector-leg hit.
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": NOTE_TEXT,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("#389 memory.recall must not hard-fail on a residual FTS5 char ('@')");
+
+        let hits = result
+            .as_array()
+            .expect("memory.recall common-path result is a bare JSON array");
+        assert!(
+            !hits.is_empty(),
+            "vector leg must still return the seeded note while the FTS leg is \
+             degraded by the residual FTS5 char ('@'), got empty results"
         );
     }
 }

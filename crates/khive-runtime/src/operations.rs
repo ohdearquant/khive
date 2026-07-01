@@ -2537,7 +2537,15 @@ impl KhiveRuntime {
             .collect();
 
         // FTS5 over the notes index — search all visible namespaces.
-        let text_hits = self
+        //
+        // Fail-open on the FTS leg only (#388, #389 round 2): sanitize_fts5_query
+        // strips known-unsafe FTS5 metacharacters, but residual punctuation the
+        // sanitizer does not strip (by design — the sanitizer stays minimal, the
+        // fail-open net is the systematic answer) can still reach the FTS5 parser
+        // and error. Degrade to vector-only fusion instead of aborting the whole
+        // note search. Errors from any other leg (vector search, note hydration)
+        // still propagate normally.
+        let text_hits = match self
             .text_for_notes(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
@@ -2549,7 +2557,18 @@ impl KhiveRuntime {
                 top_k: candidates,
                 snippet_chars: 200,
             })
-            .await?;
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    query = %query_text,
+                    "search_notes: FTS leg failed, degrading to vector-only fusion"
+                );
+                Vec::new()
+            }
+        };
 
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
