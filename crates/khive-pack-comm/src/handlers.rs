@@ -788,3 +788,35 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
         vec![corr.to_string(), bare.to_string()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::message_id_match_candidates;
+
+    #[test]
+    fn candidates_bare_input_adds_bracketed_form() {
+        // A bracket-free correlation key (as delivered by mail_parser) must also
+        // try the wire form so it matches an outbound `<id@domain>` external_id.
+        assert_eq!(
+            message_id_match_candidates("sent-msg@khive.ai"),
+            vec![
+                "sent-msg@khive.ai".to_string(),
+                "<sent-msg@khive.ai>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn candidates_bracketed_input_adds_bare_form() {
+        // Reverse direction: a bracketed correlation key must also try the bare
+        // form so it matches a stored bracket-free external_id. Guards the `else`
+        // branch, which no ingest test exercises directly.
+        assert_eq!(
+            message_id_match_candidates("<sent-msg@khive.ai>"),
+            vec![
+                "<sent-msg@khive.ai>".to_string(),
+                "sent-msg@khive.ai".to_string(),
+            ],
+        );
+    }
+}
