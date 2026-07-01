@@ -662,10 +662,22 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // co-occurring with the word "auth" inside `authorized_write`) newly
         // blocked by this rule — an accepted false positive, not a systemic
         // regression.
-        if near_trigger && is_uuid_canonical(token) {
+        //
+        // Both exact-shape checkers require the WHOLE token to match, so a
+        // credential glued to ordinary storage syntax (`api_key=<uuid>`,
+        // `(<uuid>)`, `{"api_key":"<uuid>"}`, a trailing sentence period)
+        // would otherwise never reach them: `strip_delimiters` above only
+        // trims `"'`:=,;` at the token's OUTER ends, not braces/parens, and
+        // not an internal `=`/`:` from an assignment form. `value_candidate`
+        // extracts the bare value from those glued forms specifically for
+        // this pair of checks — it does not replace `token` for any other
+        // check in this loop (entropy, hex, structured-identifier), none of
+        // which require an exact shape match.
+        let value_candidate = extract_value_candidate(token);
+        if near_trigger && is_uuid_canonical(value_candidate) {
             return Some((token, "uuid-near-trigger"));
         }
-        if near_trigger && is_base64_content_hash(token) {
+        if near_trigger && is_base64_content_hash(value_candidate) {
             return Some((token, "content-hash-near-trigger"));
         }
         if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
@@ -1008,6 +1020,49 @@ fn strip_delimiters(s: &str) -> &str {
     s.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ':' | '=' | ',' | ';'))
 }
 
+/// Extract the bare value from an assignment/wrapper-glued whitespace token,
+/// so shape allowlists that require an EXACT match (`is_uuid_canonical`,
+/// `is_base64_content_hash`) still recognize the credential once it is glued
+/// to normal storage syntax: `key=value`, `(value)`, `{"key":"value"}`, or a
+/// trailing sentence period. Used only to derive a second, narrower candidate
+/// for the near-trigger UUID/content-hash checks in
+/// `check_entropy_heuristic` — it does NOT replace `token` for the entropy,
+/// hex, or structured-identifier paths, none of which require an exact shape
+/// match and so are unaffected by this extraction.
+///
+/// Strips `{}()[]"'.,;` from both ends (repeatedly, since JSON nests one
+/// wrapper inside another), then — if an internal `=` or `:` remains after
+/// that — takes the substring after the LAST such separator (the
+/// value/label side of `key=value` or `"key":value`) and strips wrappers
+/// from that remainder too. Falls back to the wrapper-stripped whole token
+/// when there is no internal separator, or when splitting on it would
+/// produce an empty remainder.
+fn extract_value_candidate(token: &str) -> &str {
+    fn strip_wrappers(s: &str) -> &str {
+        s.trim_matches(|c: char| {
+            matches!(
+                c,
+                '{' | '}' | '(' | ')' | '[' | ']' | '"' | '\'' | '`' | '.' | ',' | ';'
+            )
+        })
+    }
+    let mut cur = token;
+    loop {
+        let next = strip_wrappers(cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    if let Some(pos) = cur.rfind(['=', ':']) {
+        let after = strip_wrappers(&cur[pos + 1..]);
+        if !after.is_empty() {
+            return after;
+        }
+    }
+    cur
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 /// Extract a contiguous token (non-whitespace chars) starting at the beginning of `s`.
@@ -1056,8 +1111,6 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Catch suite ──────────────────────────────────────────────────────────
 
     #[test]
     fn blocks_aws_akia() {
@@ -2825,6 +2878,107 @@ mod tests {
             check(content).is_err(),
             "accepted FP: internal area_id UUID near 'authorized_write' substring \
              is now blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    // ── UUID/hash value extraction from assignment and wrapper syntax ───────
+
+    #[test]
+    fn blocks_uuid_glued_to_assignment_equals() {
+        let content = "api_key=550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_err(),
+            "UUID glued via '=' to a trigger word must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_with_trailing_sentence_period() {
+        let content = "api_key 550e8400-e29b-41d4-a716-446655440000.";
+        assert!(
+            check(content).is_err(),
+            "UUID with a trailing sentence period near a trigger must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_wrapped_in_parens() {
+        let content = "api_key (550e8400-e29b-41d4-a716-446655440000)";
+        assert!(
+            check(content).is_err(),
+            "UUID wrapped in parens near a trigger must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_in_json_object() {
+        let content = "{\"api_key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID in a JSON-ish object near a trigger key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_glued_to_assignment_equals() {
+        let content = "secret=sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash glued via '=' to a trigger word must be blocked; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_with_trailing_sentence_period() {
+        let content = "secret sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq.";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash with a trailing period near a trigger must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_wrapped_in_parens() {
+        let content = "secret (sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq)";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash wrapped in parens near a trigger must be blocked; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_in_json_object() {
+        let content = "{\"secret\":\"sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq\"}";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash in a JSON-ish object near a trigger key must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_uuid_wrapped_in_parens_with_no_trigger_nearby() {
+        // Control: the prose allowlist must survive for wrapper syntax when
+        // there is no credential trigger word anywhere in the window — only
+        // the trigger-context extraction changed, not the outside-context
+        // allowlist itself.
+        let content = "wrapper (550e8400-e29b-41d4-a716-446655440000) present";
+        assert!(
+            check(content).is_ok(),
+            "UUID wrapped in parens with no trigger word nearby must stay allowed; \
+             got {:?}",
             scan(content)
         );
     }
