@@ -48,12 +48,12 @@ let registry = builder.build()?;
 registry
     .dispatch(
         "schedule.remind",
-        json!({"content": "Ship the 0.2.12 release", "at": "2026-07-05T09:00:00Z"}),
+        json!({"content": "Ship the 0.3.0 release", "at": "2026-07-05T09:00:00Z"}),
     )
     .await?;
 ```
 
-Over MCP: `request(ops="schedule.remind(content=\"Ship the 0.2.12 release\", at=\"2026-07-05T09:00:00Z\")")`.
+Over MCP: `request(ops="schedule.remind(content=\"Ship the 0.3.0 release\", at=\"2026-07-05T09:00:00Z\")")`.
 
 ## Where this sits
 

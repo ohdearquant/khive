@@ -11,7 +11,7 @@ categories.workspace = true
 description = "Brain primitives — Beta posteriors, section types, profile state, weight derivation"
 
 [dependencies]
-khive-runtime = { version = "0.2.11", path = "../khive-runtime" }
+khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -45,7 +45,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.2.11"
+version = "0.3.0"
 edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
@@ -74,8 +74,8 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "0.3.0"
-lattice-fann = "0.4.0"
+lattice-embed = "0.4.2"
+lattice-fann = "0.4.2"
 parking_lot = "0.12"
 rand = "0.8"
 rand_distr = "0.4"
