@@ -8,8 +8,9 @@ SQL tables (ADR-080).
 
 The pack declares three verbs — `session.store`, `session.list`, `session.get` —
 over the notes substrate, but all three are `Visibility::Subhandler`: reachable
-via the runtime and `kkernel call`, but **withheld from the agent-facing MCP
-`request` surface** until the session-continuity query UX is designed. They add
+via the runtime and `kkernel exec` (a trusted operator surface), but **withheld
+from the agent-facing MCP `request` surface** until the session-continuity query
+UX is designed. They add
 zero verbs to what an agent sees in the `request` tool's catalog today.
 
 The pack's active feature this milestone is the **mirror service**, started from
