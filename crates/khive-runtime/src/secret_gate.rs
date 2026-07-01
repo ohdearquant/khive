@@ -42,18 +42,30 @@
 //!   non-ASCII-alphanumeric char (CJK, accented text, emoji) as a token
 //!   boundary, so a known-prefix secret is caught whether the adjacent
 //!   non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
-//! - Structured identifiers: a token that decomposes into two or more maximal
-//!   alphanumeric runs separated by `/`, `-`, `_`, or `.`, where every run is
-//!   letters-then-digits or pure digits, at most 24 chars long, with a low
-//!   case-transition density, is treated as a file path, branch name, or
-//!   similar identifier and skips the entropy check regardless of trigger
-//!   context.  This covers content like `fable-ops/ADR-DRAFT-adr079.md` or
+//! - Structured identifiers: a token is only considered for this exemption
+//!   when it contains at least one of `/`, `-`, `_`, or `.` (the gate); it is
+//!   then decomposed into maximal alphanumeric runs by splitting on *every*
+//!   non-alphanumeric character (not just the four gating separators — any
+//!   other ASCII punctuation glued into the same whitespace token, e.g. a
+//!   stray `:` or `,`, also acts as a run boundary).  A token exempts when it
+//!   decomposes into two or more such runs and every run is letters-then-digits
+//!   or pure digits, at most 24 chars long, with a low case-transition density.
+//!   This covers content like `fable-ops/ADR-DRAFT-adr079.md` or
 //!   `.khive/workspaces/20260701/adr079/PACKET.md`, which is otherwise
 //!   indistinguishable from a high-entropy secret once glued into one
 //!   whitespace token.  Random base64/base62 secrets do not decompose this
 //!   way: their case and digit placement is effectively uniform rather than
 //!   word-shaped, so a hyphenated or underscored secret still fails this
 //!   check and remains subject to the entropy heuristic below.
+//!   Outside an explicit credential trigger context this exemption applies on
+//!   shape alone.  In trigger context (near `key`, `secret`, `api_key`, …) an
+//!   additional positive signal is required — the token must end in a file
+//!   extension segment (`.md`, `.rs`, …) — because a separator-delimited,
+//!   word-shaped run structure alone does not rule out an unprefixed
+//!   high-entropy credential (e.g. an AWS Secret Access Key has no vendor
+//!   prefix for Layer 1 to catch, and its base64-ish alphabet can coincidentally
+//!   decompose into lowercase-only or digit-suffixed runs).  See
+//!   `has_extension_segment` and the call site in `check_entropy_heuristic`.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -631,13 +643,28 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         }
 
         // Structured identifiers (file paths, branch names, ADR/doc slugs,
-        // snake_case identifiers) are exempted regardless of trigger context
-        // — see the module doc and `is_structured_identifier`. This must come
-        // after the UUID/content-hash allowlist and the hex-credential-token
-        // check above (neither of which it weakens) and before the entropy
+        // snake_case identifiers) are exempted from the entropy check — see
+        // the module doc and `is_structured_identifier`. This must come after
+        // the UUID/content-hash allowlist and the hex-credential-token check
+        // above (neither of which it weakens) and before the entropy
         // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
         // on Shannon entropy alone.
-        if is_structured_identifier(token) {
+        //
+        // In an explicit credential context (`near_trigger`), word-shaped runs
+        // alone are NOT sufficient: an unprefixed high-entropy credential (e.g.
+        // an AWS Secret Access Key, which has no vendor prefix for Layer 1 to
+        // catch) can itself be separator-delimited with lowercase-only or
+        // digit-suffixed runs, satisfying `is_structured_identifier` by
+        // accident. Require an independent positive path/identifier signal in
+        // that case: the token ends in a file-extension segment (`.md`, `.rs`,
+        // …). Every existing FP repro string that is near a trigger word AND
+        // genuinely high-entropy carries a real extension (see
+        // `structured_identifier_true_for_repro_paths`); the one exception,
+        // `check_entropy_heuristic_impl`, has no extension but also has
+        // Shannon entropy 3.84 — below `ENTROPY_THRESHOLD` regardless of this
+        // exemption, so it is unaffected by the narrowing. Outside trigger
+        // context the exemption is unchanged (word-shape alone is enough).
+        if is_structured_identifier(token) && (!near_trigger || has_extension_segment(token)) {
             continue;
         }
 
@@ -806,8 +833,10 @@ fn is_base64_content_hash(token: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_')
 }
 
-/// Structural separators that both gate entry into (rule 1) and decompose
-/// (rule 2) a token for [`is_structured_identifier`].
+/// Structural separators that gate entry into [`is_structured_identifier`]
+/// (rule 1: the token must contain at least one of these). The actual run
+/// decomposition (rule 2) splits on every non-alphanumeric character, not
+/// just these four — see the doc comment on `is_structured_identifier`.
 const STRUCTURAL_SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
 
 /// Largest length a single path/branch/identifier segment (a "run" between
@@ -835,8 +864,10 @@ const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
 /// case and digit placement is essentially uniform rather than word-like, so
 /// a run either exceeds the length cap or mixes case too densely to pass.
 ///
-/// This exemption applies unconditionally (regardless of trigger-word
-/// context) — see the call site in [`check_entropy_heuristic`].
+/// Outside credential-trigger context this shape check alone is sufficient to
+/// exempt a token from the entropy heuristic. In trigger context the caller
+/// additionally requires [`has_extension_segment`] — see the call site in
+/// [`check_entropy_heuristic`].
 fn is_structured_identifier(token: &str) -> bool {
     if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
         return false;
@@ -846,6 +877,24 @@ fn is_structured_identifier(token: &str) -> bool {
         .filter(|r| !r.is_empty())
         .collect();
     runs.len() >= 2 && runs.iter().all(|run| is_word_shaped_run(run))
+}
+
+/// Returns `true` when `token` ends in a file-extension-shaped segment: a `.`
+/// followed by 1–5 ASCII alphabetic characters and nothing else after it
+/// (e.g. `.md`, `.rs`, `.toml`).
+///
+/// This is the independent positive signal required by
+/// [`check_entropy_heuristic`] when narrowing the [`is_structured_identifier`]
+/// exemption inside credential-trigger context: a real file path or doc slug
+/// almost always ends in an extension, while a bare separator-delimited
+/// high-entropy credential (which can coincidentally satisfy the run-shape
+/// check) generally does not.
+fn has_extension_segment(token: &str) -> bool {
+    let Some(dot) = token.rfind('.') else {
+        return false;
+    };
+    let ext = &token[dot + 1..];
+    (1..=5).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 /// A single run (segment between structural separators) is word-shaped when
@@ -2404,5 +2453,124 @@ mod tests {
         let long_run = "a".repeat(26);
         let token = format!("prefix-{long_run}-suffix");
         assert!(!is_structured_identifier(&token));
+    }
+
+    // ── Codex Critical: narrow structured-identifier exemption in trigger
+    //    context to path-shaped tokens (extension-bearing) ──────────────────
+    //
+    // The structured-identifier exemption was unconditional, so a prefixless
+    // high-entropy credential that happens to be separator-delimited with
+    // word-shaped runs (e.g. an AWS Secret Access Key: 40 chars, base64-ish
+    // alphabet including `/`, no vendor prefix for Layer 1 to catch) bypassed
+    // the entropy detector even in an explicit credential context.
+
+    #[test]
+    fn blocks_codex_repro_secret_access_key_bypass() {
+        // The exact bypass string from the codex Critical finding: four
+        // lowercase-only runs joined by `/`, entropy 4.6531 > 4.5 threshold,
+        // near the `secret`/`access_key` triggers, no extension segment.
+        let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk";
+        assert!(
+            check(content).is_err(),
+            "AWS Secret Access Key shaped bypass must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_lowercase_only_separator_token_near_access_key() {
+        let content = "access_key qrstuvwxyz/abcdefghij/klmnopqrst/uvwxyzab";
+        assert!(
+            check(content).is_err(),
+            "lowercase-only separator-delimited high-entropy token near \
+             'access_key' must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_digit_and_word_mixed_token_near_api_key() {
+        // A mix of pure-digit runs and letters-then-digits runs (both
+        // individually word-shaped) whose combined alphabet diversity crosses
+        // the entropy threshold. Pure-digit runs alone cap out at
+        // log2(10)~=3.32 bits/char, so a purely digit-segmented token can
+        // never reach ENTROPY_THRESHOLD on its own; mixing in lowercase runs
+        // is what makes this case realistic and adversarial.
+        let content = "api_key attaycofrsm827/festwqjhc493/8261947350/qwikjzx982";
+        assert!(
+            check(content).is_err(),
+            "digit-and-word-mixed high-entropy token near 'api_key' must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_token_assignment_separator_delimited_secret() {
+        // `token=` assignment form with a lowercase-only separator-delimited
+        // high-entropy value.
+        let content = "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk";
+        assert!(
+            check(content).is_err(),
+            "token= with lowercase-only separator-delimited high-entropy value \
+             must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_extension_bearing_path_near_api_key_positive_control() {
+        // Positive control: the narrowed exemption must still allow a real
+        // file path (extension-bearing) near an explicit trigger word.
+        let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
+        assert!(
+            check(content).is_ok(),
+            "extension-bearing path near 'api_key' must still be allowed; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn has_extension_segment_true_for_real_extensions() {
+        assert!(has_extension_segment("ADR-DRAFT-adr079-slices234.md"));
+        assert!(has_extension_segment("ingest.rs"));
+        assert!(has_extension_segment("PACKET.md"));
+        assert!(has_extension_segment("Cargo.toml"));
+    }
+
+    #[test]
+    fn has_extension_segment_false_without_dot_or_bad_shape() {
+        assert!(!has_extension_segment("abcdefghij/klmnopqrst/uvwxyzabcd"));
+        assert!(!has_extension_segment("check_entropy_heuristic_impl"));
+        // Trailing dot-segment too long to be a plausible extension.
+        assert!(!has_extension_segment("archive.tarball"));
+        // Trailing dot-segment with digits is not a plausible extension.
+        assert!(!has_extension_segment("v1.2"));
+    }
+
+    #[test]
+    fn structured_identifier_repro_paths_all_have_extension_or_low_entropy() {
+        // Documents the empirical basis for the narrowing: every existing
+        // FP-repro path near a trigger word either carries a real extension
+        // (so `has_extension_segment` keeps it exempted) or has Shannon
+        // entropy below `ENTROPY_THRESHOLD` on its own (so the exemption is
+        // not load-bearing for it in trigger context regardless).
+        let paths = [
+            "fable-ops/ADR-DRAFT-adr079-slices234.md",
+            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
+            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+            "codex_review_pr335_round2.md",
+            "docs/adr/ADR-055-epistemic-edge-relations.md",
+            "crates/khive-pack-session/src/mirror/ingest.rs",
+            "check_entropy_heuristic_impl",
+        ];
+        for p in paths {
+            let has_ext = has_extension_segment(p);
+            let low_entropy = shannon_entropy(p.as_bytes()) < ENTROPY_THRESHOLD;
+            assert!(
+                has_ext || low_entropy,
+                "{p} must have an extension or already be below the entropy \
+                 threshold, else the trigger-context narrowing would regress it"
+            );
+        }
     }
 }
