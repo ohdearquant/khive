@@ -80,9 +80,11 @@ pub struct EmailChannelConfig {
     pub mailbox: String,
     /// Authentication credentials and mode.
     pub auth: EmailAuth,
-    /// The single authorized maintainer address. Inbound messages from any other
-    /// sender are rejected before ingestion.
-    pub maintainer_address: MailAddress,
+    /// The authorized maintainer address(es). Inbound messages from any other
+    /// sender are rejected before ingestion. Populated from a comma-separated
+    /// `KHIVE_EMAIL_MAINTAINER_ADDRESS`; the first entry is the primary, used for
+    /// outbound-allowlist defaulting and envelope `to` fallback. Never empty.
+    pub maintainer_addresses: Vec<MailAddress>,
 }
 
 impl EmailChannelConfig {
@@ -123,12 +125,26 @@ impl EmailChannelConfig {
 
         let auth = build_auth()?;
 
+        // Comma-separated allowlist so the maintainer can register more than one
+        // address (e.g. both a Gmail and an Outlook account). First entry is primary.
         let maintainer_raw = require_env("KHIVE_EMAIL_MAINTAINER_ADDRESS")?;
-        let maintainer_address = MailAddress::parse(&maintainer_raw).ok_or_else(|| {
-            ChannelError::Config(format!(
-                "KHIVE_EMAIL_MAINTAINER_ADDRESS is not a valid RFC 5322 address: {maintainer_raw:?}"
-            ))
-        })?;
+        let maintainer_addresses = maintainer_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                MailAddress::parse(s).ok_or_else(|| {
+                    ChannelError::Config(format!(
+                        "KHIVE_EMAIL_MAINTAINER_ADDRESS contains an invalid RFC 5322 address: {s:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if maintainer_addresses.is_empty() {
+            return Err(ChannelError::Config(
+                "KHIVE_EMAIL_MAINTAINER_ADDRESS must contain at least one address".into(),
+            ));
+        }
 
         Ok(Self {
             smtp_host,
@@ -138,7 +154,7 @@ impl EmailChannelConfig {
             username,
             mailbox,
             auth,
-            maintainer_address,
+            maintainer_addresses,
         })
     }
 }

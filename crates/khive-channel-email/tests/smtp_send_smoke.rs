@@ -15,7 +15,7 @@ async fn smtp_send_to_maintainer_smoke() {
 
     let envelope = ChannelEnvelope::new(
         format!("email:{}", config.mailbox),
-        format!("email:{}", config.maintainer_address),
+        format!("email:{}", config.maintainer_addresses[0]),
         format!("khive email channel smoke test — sent at unix {ts}"),
     )
     .with_subject("khive email channel smoke test");
