@@ -198,7 +198,7 @@ fusion_weight = 0.5
 #                                Primary model. Becomes the default=true engine.
 #   KHIVE_ADDITIONAL_EMBEDDING_MODELS=paraphrase-multilingual-minilm-l12-v2,bge-small-en-v1.5
 #                                Comma-separated secondary models. When [[engines]] is present the
-#                                file wins and these are ignored (with an info-level log).
+#                                file wins and these are ignored (with a warn-level log).
 #
 # ── Deployment / multi-tenant safety ─────────────────────────────────────────────
 #   KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1

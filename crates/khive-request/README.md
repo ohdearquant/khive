@@ -14,7 +14,7 @@ let req = parse_request(r#"search(kind="entity", query="LoRA")"#)?;
 assert_eq!(req.mode, ExecutionMode::Single);
 
 // Parallel batch
-let req = parse_request(r#"[recall(query="x"), remember(content="y")]"#)?;
+let req = parse_request(r#"[memory.recall(query="x"), memory.remember(content="y")]"#)?;
 assert_eq!(req.mode, ExecutionMode::Parallel);
 
 // Chain — `$prev` resolves against the immediately preceding op's result
