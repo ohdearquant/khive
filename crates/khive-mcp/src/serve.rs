@@ -1264,10 +1264,11 @@ fn resolve_config(
         Some(khive_cfg) => {
             let env_primary = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
             let env_additional = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS").ok();
-            if env_primary.is_some() || env_additional.is_some() {
+            if !khive_cfg.engines.is_empty() && (env_primary.is_some() || env_additional.is_some())
+            {
                 tracing::warn!(
-                    "khive config file is present; KHIVE_EMBEDDING_MODEL and \
-                     KHIVE_ADDITIONAL_EMBEDDING_MODELS env vars are ignored"
+                    "khive config [[engines]] present; KHIVE_EMBEDDING_MODEL / \
+                     KHIVE_ADDITIONAL_EMBEDDING_MODELS env vars are overridden"
                 );
             }
 
@@ -1379,6 +1380,48 @@ default = true
             "config file declares one engine; additional list must be empty (not the default's)"
         );
         assert_eq!(resolved.db_path, None, ":memory: must map to in-memory db");
+    }
+
+    /// Regression for #379: when the loaded config file has NO `[[engines]]`
+    /// block, `KHIVE_EMBEDDING_MODEL` is genuinely used as the fallback — it
+    /// must resolve into `RuntimeConfig::embedding_model`, not be discarded.
+    /// The startup warning must not fire in this case either (the env pair is
+    /// applied, not overridden) — see the `resolve_config` fix.
+    #[test]
+    #[serial]
+    fn resolver_falls_back_to_env_when_config_has_no_engines() {
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::set_var("KHIVE_EMBEDDING_MODEL", "bge-small-en-v1.5");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Config file present, but with no [[engines]] block at all.
+        let path = write_config(
+            dir.path(),
+            r#"
+[runtime]
+brain_profile = "unrelated"
+"#,
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+
+        assert_eq!(
+            format!("{:?}", resolved.embedding_model),
+            "Some(BgeSmallEnV15)",
+            "KHIVE_EMBEDDING_MODEL must be applied as the fallback when the \
+             config file has no [[engines]] block, not treated as ignored"
+        );
     }
 
     /// Regression for BLOCKER-1 (PR #52 codex review): project-toml brain_profile
