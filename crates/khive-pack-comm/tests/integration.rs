@@ -4058,6 +4058,83 @@ async fn ingest_routing_reply_routes_to_original_sender() {
     );
 }
 
+/// (a2) Regression: outbound stores its Message-ID in wire form `<id@domain>`, but an
+/// inbound `In-Reply-To` is delivered bracket-free (`id@domain`) because `mail_parser`
+/// strips the angle brackets. Pass-1 must still correlate the reply back to the original
+/// sender. Before the bracket-toggle fix this fell through to `default_inbound_actor`
+/// (lambda:leo) with a fresh thread — the exact failure seen on the live round-trip.
+#[tokio::test]
+async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    // Outbound note stores the Message-ID WITH angle brackets (wire form).
+    let outbound_external_id = "<sent-msg-002@khive.ai>";
+    // Inbound In-Reply-To arrives WITHOUT brackets (mail_parser strips them).
+    let inbound_correlation = "sent-msg-002@khive.ai";
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "original outbound".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:leo@khive.ai",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                "external_id": outbound_external_id,
+                "thread_id": thread_uuid,
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:leo@khive.ai",
+            "content": "this is a bracket-free reply",
+            "correlation_external_id": inbound_correlation,
+            "external_id": "imap:mail:2:1",
+            "default_inbound_actor": "lambda:leo",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "bracket-free In-Reply-To must correlate to the bracketed outbound external_id \
+         and route to the original sender, not default_inbound_actor; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "correlated reply must attach to the original thread, not a fresh root; \
+         got props={props}"
+    );
+}
+
 /// (b) Fresh message, no correlation, default_inbound_actor=lambda:leo → to_actor=lambda:leo.
 #[tokio::test]
 async fn ingest_routing_fresh_message_uses_default_actor() {
