@@ -539,7 +539,7 @@ mod tests {
                     Subject: Re: original thread\r\n\
                     Message-ID: <reply-id@khive.ai>\r\n\
                     In-Reply-To: <some-id@khive.ai>\r\n\
-                    Date: Mon, 1 Jul 2026 10:00:00 +0000\r\n\
+                    Date: Wed, 1 Jul 2026 10:00:00 +0000\r\n\
                     \r\n\
                     This is a reply.";
         let email = parse_raw_bytes(11, raw, "imap.example.com", 42).unwrap();
@@ -563,7 +563,7 @@ mod tests {
                     Message-ID: <reply-id@khive.ai>\r\n\
                     In-Reply-To: <some-id@khive.ai>\r\n\
                     X-Khive-Thread-ID: thread-uuid-123\r\n\
-                    Date: Mon, 1 Jul 2026 10:00:00 +0000\r\n\
+                    Date: Wed, 1 Jul 2026 10:00:00 +0000\r\n\
                     \r\n\
                     This is a reply.";
         let email = parse_raw_bytes(12, raw, "imap.example.com", 42).unwrap();
