@@ -201,6 +201,10 @@ no side effects. It returns the merged live ontology of the running binary:
 }
 ```
 
+The JSON above is an illustrative snapshot of the default pack set at ratification, not
+a normative fixture: the generated documentation (§5) is the always-current projection,
+and prose examples must never be read as racing the binary.
+
 Normative details:
 
 1. **Merged pack vocabulary, not the base enum.** `entity_kinds` and `note_kinds` are the
