@@ -67,14 +67,18 @@ new binary, on the operator's terms.
 cp scripts/box/env.template ~/.khive/.env
 chmod 600 ~/.khive/.env
 # edit ~/.khive/.env with real values
-systemctl --user restart kkernel.service
+scripts/box/bootstrap.sh
 ```
 
 See `env.template` for the full variable list and which combinations are
 required. The email channel (`channel-email` feature, built in by
 `bootstrap.sh`) is inert until this file has valid SMTP/IMAP/auth values; an
 incomplete config disables the email channel with a warning in the logs
-rather than crashing the daemon.
+rather than crashing the daemon. Re-running `bootstrap.sh`, rather than only
+`systemctl --user restart kkernel.service`, both picks up the new secrets
+and exercises the OAuth token-endpoint check described below, so a bad or
+incomplete secret is caught at bootstrap time instead of discovered later
+from a silently-disabled channel.
 
 ## Actor identity
 
@@ -122,6 +126,64 @@ This kit installs one systemd unit, so this box runs as one actor identity.
 If more than one lambda needs an independent identity on the same physical
 box, that is a separate per-agent `~/.khive` home and daemon instance, not
 covered by this single-daemon bootstrap flow.
+
+## Email channel auth smoke
+
+The email channel does not crash the daemon when its OAuth configuration is
+incomplete or its client secret is invalid or expired; it disables itself
+with a warning in the logs (`crates/khive-channel-email/src/config.rs`). On
+a headless box nobody is watching those logs by default, so a rotated or
+expired client secret otherwise means email quietly stops working with
+nothing loud to notice it. `bootstrap.sh` closes that gap by calling the
+same OAuth2 `client_credentials` token endpoint the daemon itself would use,
+at bootstrap time.
+
+What it checks: whether `KHIVE_EMAIL_OAUTH_CLIENT_ID`,
+`KHIVE_EMAIL_OAUTH_CLIENT_SECRET`, and `KHIVE_EMAIL_OAUTH_TENANT_ID` (read
+the same way the daemon reads them: a real process environment variable
+wins, otherwise `~/.khive/.env`) resolve to a working client secret against
+`https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`.
+
+When it runs: on every `bootstrap.sh` run, including re-runs, not on a bare
+`systemctl --user restart`. Before secrets are placed, all three variables
+are absent and the check prints a one-line skip note; this is the normal
+first-run path, not a warning. See "Placing secrets" above: the documented
+flow after placing secrets is re-running `bootstrap.sh`, not only
+restarting the unit, specifically so this check runs against the new
+values.
+
+What PASS/FAIL mean:
+
+- **PASS**: the token endpoint returned an access token. The script prints
+  only the client id, masked (first 6 characters then an ellipsis); it
+  never prints the client secret or the token.
+- **Partial config** (only one or two of the three variables set): a loud
+  warning, since this is the exact condition under which the channel
+  silently disables itself.
+- **FAIL**: a loud warning containing the `error` and `error_description`
+  fields from Microsoft's response. That text is Microsoft's own
+  diagnostic and is safe to print, but since it can echo a configured
+  client id or tenant id verbatim (for example "Application with
+  identifier 'xxx' was not found in the directory"), the script scrubs any
+  occurrence of the configured client id or tenant id from it first,
+  replacing each with its masked form. `AADSTS7000222` means the client
+  secret has expired; `AADSTS7000215` means it is invalid. Either way, the
+  fix is in the Entra portal, under App registrations, then the
+  application, then Certificates & secrets: client secrets have bounded
+  lifetimes, and rotating one means updating `~/.khive/.env` and re-running
+  `bootstrap.sh`.
+
+Like the `stats()` smoke test and the actor-identity check, this is
+non-fatal: a box without email configured, or one with a transient network
+blip during bootstrap, is not a bootstrap failure.
+
+This smoke test does not cover Basic auth mode
+(`KHIVE_EMAIL_PASSWORD`). There is no equivalent safe check for it: probing
+would mean either attempting a live IMAP login from a bootstrap script or
+inventing a lighter check that does not actually verify the password. For
+Basic auth mode, the daemon's own startup log is the check: watch
+`journalctl --user -u kkernel.service` after restarting for whether the
+email channel reports itself enabled or disabled.
 
 ## Verifying boot persistence
 
