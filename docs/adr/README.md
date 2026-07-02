@@ -107,6 +107,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-078](ADR-078-output-format-shape-aware-rendering.md)    | Output Format and Shape-Aware Rendering (Proposed)                                                              |
 | [ADR-079](ADR-079-ann-persistence-warm-path-integration.md)  | ANN Persistence Warm-Path Integration — Wiring v2 Persistence into the Daemon (Proposed)                        |
 | [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md)     | Session Pack — OSS Storage Mechanism (Proposed)                                                                 |
+| [ADR-082](ADR-082-retrieval-quality-measurement-loop.md)     | Retrieval Quality Measurement Loop (Proposed)                                                                   |
 
 ## Closed Taxonomies — Quick Reference
 
