@@ -60,7 +60,21 @@ an arbitrary `Authentication-Results` header. It MUST:
 - when several such headers are present, use the topmost (most recently prepended by the trusted
   boundary), and ignore all `Authentication-Results` headers bearing any other `authserv-id`;
 - treat the absence of any trusted-authserv-id `Authentication-Results` header as a failed
-  authentication (quarantine), not as a pass.
+  authentication (quarantine), not as a pass;
+- never derive, learn, or select the trusted `authserv-id` from message content. It comes from
+  configuration only.
+
+**Operational precondition (RFC 8601 §1.6, §5).** `Authentication-Results` carries no integrity
+mechanism; the topmost-wins rule is sound only when the receiving boundary itself makes it so.
+Configuring `KHIVE_EMAIL_AUTHSERV_ID` is therefore only valid for a receiving boundary that is
+verified to prepend its own `Authentication-Results` on every delivered message and to remove or
+rename inbound headers claiming that same `authserv-id` (the ADMD-entry scrubbing RFC 8601
+requires). A deployment MUST verify this behavior against the live mailbox before enabling
+attribution: send a probe message carrying a forged `Authentication-Results` with the trusted
+`authserv-id` and confirm the boundary strips it or that the boundary's genuine stamp lands above
+it. If the boundary does neither, attribution MUST NOT be enabled for that mailbox; all inbound
+mail is quarantined until it is. The observed `authserv-id` string from a real delivered message,
+not provider documentation, is the source of the configured value.
 
 Re-verifying SPF/DKIM inside the adapter is out of scope for v1. The adapter is a downstream IMAP
 consumer; the receiving MTA has already performed SPF/DKIM/DMARC at delivery and recorded the
@@ -414,17 +428,25 @@ URL exists.
 ### 8. Inbound authentication
 
 Each adapter validates the external sender identity on every update before returning an
-envelope. Updates from unauthorized senders return `ChannelError::UnauthorizedSender` and are
-dropped. No note is written. This mirrors the `isSenderAllowed` pattern from the openclaw
-reference (`bot-access.ts:46-66`), simplified for the single-maintainer case.
+envelope. For Telegram, updates from unauthorized senders return
+`ChannelError::UnauthorizedSender` and are dropped with no note written. This mirrors the
+`isSenderAllowed` pattern from the openclaw reference (`bot-access.ts:46-66`), simplified for
+the single-maintainer case.
+
+> **Email disposition amended 2026-07-02.** For the email adapter, drop-with-no-note is
+> superseded: mail that fails authentication or the allowlist is quarantined (stored
+> unattributed by default) rather than dropped. See
+> [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening). The
+> Telegram drop behavior is unchanged.
 
 For Telegram, authentication is by numeric `chat.id` (stable across username changes),
 configured via env var. Username matching is a fallback only, as usernames can be reassigned.
 The maintainer identity is never stored in the KG.
 
 The exact identity model (which identity claim is authoritative and how it ties to the ADR-053
-actor model) is an open question requiring maintainer sign-off before implementation (see
-§OQ-2).
+actor model) was an open question at the original Proposed status; it is resolved by OQ-2 as
+hardened by the 2026-07-02 amendment (domain authentication with alignment plus allowlist
+before attribution; quarantined mail carries no trusted actor identity).
 
 ### 9. No secrets in the store
 
@@ -543,12 +565,17 @@ written. Authentication rules:
 4. Error messages intentionally omit the actual address values to avoid leaking sender
    addresses to logs.
 
-Messages that fail any check are skipped with a warning that logs only the IMAP UID. No note
-is written for unauthorized or malformed senders.
+_(Superseded 2026-07-02)_ ~~Messages that fail any check are skipped with a warning that logs
+only the IMAP UID. No note is written for unauthorized or malformed senders.~~ Failed messages
+are now quarantined per the amendment (stored unattributed when `KHIVE_EMAIL_QUARANTINE_STORE`
+is on; dropped with only the IMAP UID logged when it is off).
 
-This resolves OQ-2: env-var addr-spec comparison is the authoritative check for v1. The
-anonymous actor default for `VerbRegistry::dispatch` is acceptable. No `ActorRef` mapping to
-ADR-053 is required at this layer; the adapter pre-filters before dispatch.
+_(Superseded 2026-07-02)_ ~~This resolves OQ-2: env-var addr-spec comparison is the
+authoritative check for v1.~~ The addr-spec comparison is retained only as the allowlist
+condition; it is not authoritative on its own. The anonymous actor default for
+`VerbRegistry::dispatch` remains acceptable for quarantined mail specifically -- quarantined
+notes are exactly the ones that must not carry a trusted actor identity. Attributed mail
+requires both amendment conditions before the maintainer identity is stamped.
 
 #### Sender address format (OQ-1 resolved)
 
@@ -617,8 +644,9 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
   `"namespace"` param on each call.
 - No credentials appear in any note, entity, or KG store.
 - `CommPack` construction and `PackFactory` wiring are unchanged.
-- `khive-channel` and `khive-channel-telegram` are new crates at the platform layer (blocked on
-  OQ-1 and OQ-2 above).
+- `khive-channel` and `khive-channel-telegram` are new crates at the platform layer. (OQ-1 and
+  OQ-2 are resolved; OQ-2 as hardened by the 2026-07-02 amendment. The email adapter's
+  attribution gate and quarantine disposition follow that amendment.)
 
 ## Related ADRs
 
@@ -629,5 +657,7 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
 - ADR-053: Authorization Gate (ActorStore / SessionStore extension) -- extends ADR-018's actor
   model. `KhiveRuntime::authorize` (the public gate-checked door) and
   `NamespaceToken::mint_authorized` (`pub(crate)`, unreachable externally) are introduced here.
-  OQ-2 above requires a ruling on how the ingest loop's identity interacts with this model.
+  The ruling on how the ingest loop's identity interacts with this model is delivered by the
+  2026-07-02 amendment: attribution requires the two-part authentication gate, and quarantined
+  mail is written without a trusted actor identity.
 - ADR-028: Pack-Scoped Backends -- offset/cursor persistence pattern for channel adapters.
