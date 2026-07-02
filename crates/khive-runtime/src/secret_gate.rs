@@ -665,19 +665,21 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         //
         // Both exact-shape checkers require the WHOLE token to match, so a
         // credential glued to ordinary storage syntax (`api_key=<uuid>`,
-        // `(<uuid>)`, `{"api_key":"<uuid>"}`, a trailing sentence period)
+        // `(<uuid>)`, `{"api_key":"<uuid>"}`, a trailing sentence period,
+        // a doubled assignment, or a label itself containing `:`/`=`)
         // would otherwise never reach them: `strip_delimiters` above only
         // trims `"'`:=,;` at the token's OUTER ends, not braces/parens, and
-        // not an internal `=`/`:` from an assignment form. `value_candidate`
-        // extracts the bare value from those glued forms specifically for
-        // this pair of checks — it does not replace `token` for any other
-        // check in this loop (entropy, hex, structured-identifier), none of
-        // which require an exact shape match.
-        let value_candidate = extract_value_candidate(token);
-        if near_trigger && is_uuid_canonical(value_candidate) {
+        // not an internal `=`/`:` from an assignment form. `value_candidates`
+        // enumerates every plausible value extraction from those glued forms
+        // specifically for this pair of checks — it does not replace `token`
+        // for any other check in this loop (entropy, hex, structured-
+        // identifier), none of which require an exact shape match. This is a
+        // small bounded iteration over separator positions in one token, not
+        // an allocation-heavy scan.
+        if near_trigger && value_candidates(token).any(is_uuid_canonical) {
             return Some((token, "uuid-near-trigger"));
         }
-        if near_trigger && is_base64_content_hash(value_candidate) {
+        if near_trigger && value_candidates(token).any(is_base64_content_hash) {
             return Some((token, "content-hash-near-trigger"));
         }
         if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
@@ -1020,56 +1022,69 @@ fn strip_delimiters(s: &str) -> &str {
     s.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ':' | '=' | ',' | ';'))
 }
 
-/// Extract the bare value from an assignment/wrapper-glued whitespace token,
-/// so shape allowlists that require an EXACT match (`is_uuid_canonical`,
-/// `is_base64_content_hash`) still recognize the credential once it is glued
-/// to normal storage syntax: `key=value`, `(value)`, `{"key":"value"}`, or a
-/// trailing sentence period. Used only to derive a second, narrower candidate
-/// for the near-trigger UUID/content-hash checks in
-/// `check_entropy_heuristic` — it does NOT replace `token` for the entropy,
-/// hex, or structured-identifier paths, none of which require an exact shape
-/// match and so are unaffected by this extraction.
-///
-/// Strips `{}()[]"'.,;` from both ends (repeatedly, since JSON nests one
-/// wrapper inside another), then — if an internal `=` or `:` remains after
-/// that — takes the substring after the FIRST such separator (the
-/// value/label side of `key=value` or `"key":value`) and strips wrappers
-/// from that remainder too. Falls back to the wrapper-stripped whole token
-/// when there is no internal separator, or when splitting on it would
-/// produce an empty remainder.
-///
-/// Splits on the FIRST separator rather than the last: a base64/base64url
-/// value can itself end in `=` padding, which — for a padded content hash —
-/// IS the last `=` in the token. Splitting on the last separator would land
-/// on the padding boundary instead of the assignment boundary, handing back
-/// the whole `key=value` string (still containing the label) rather than
-/// the bare value. The first separator is always the true key/value or
-/// JSON-label boundary, since neither a UUID nor a base64 value can contain
-/// `=`/`:` before that point.
-fn extract_value_candidate(token: &str) -> &str {
-    fn strip_wrappers(s: &str) -> &str {
-        s.trim_matches(|c: char| {
-            matches!(
-                c,
-                '{' | '}' | '(' | ')' | '[' | ']' | '"' | '\'' | '`' | '.' | ',' | ';'
-            )
-        })
-    }
+/// Strip `{}()[]"'.,;` from both ends of `s`, repeatedly (JSON nests one
+/// wrapper inside another).
+fn strip_wrappers(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        matches!(
+            c,
+            '{' | '}' | '(' | ')' | '[' | ']' | '"' | '\'' | '`' | '.' | ',' | ';'
+        )
+    })
+}
+
+fn wrapper_strip_repeated(token: &str) -> &str {
     let mut cur = token;
     loop {
         let next = strip_wrappers(cur);
         if next == cur {
-            break;
+            return cur;
         }
         cur = next;
     }
-    if let Some(pos) = cur.find(['=', ':']) {
-        let after = strip_wrappers(&cur[pos + 1..]);
-        if !after.is_empty() {
-            return after;
+}
+
+/// Yield every candidate value that an assignment/wrapper-glued whitespace
+/// token could contain, so shape allowlists that require an EXACT match
+/// (`is_uuid_canonical`, `is_base64_content_hash`) still recognize the
+/// credential once it is glued to normal storage syntax: `key=value`,
+/// `(value)`, `{"key":"value"}`, `key1=key2=value`, a trailing sentence
+/// period, or a label itself containing `:`/`=` (`{"api:key":"value"}`).
+/// Used only to derive candidates for the near-trigger UUID/content-hash
+/// checks in `check_entropy_heuristic` — it does NOT replace `token` for
+/// the entropy, hex, or structured-identifier paths, none of which require
+/// an exact shape match and so are unaffected by this extraction.
+///
+/// Strips wrapper punctuation from both ends first, then yields the
+/// wrapper-stripped whole token, plus the wrapper-stripped suffix after
+/// EVERY internal `=`/`:` occurrence (skipping empty suffixes). No single
+/// separator position can be assumed correct: the true key/value or
+/// JSON-label boundary might be the first separator (`secret=sha256-...`),
+/// but a base64/base64url value can itself end in `=` padding — for a
+/// padded content hash that padding IS the last `=` in the token, so a
+/// last-separator split would land on the padding boundary instead. A
+/// label can also itself contain `:`/`=` (`{"api:key":"<uuid>"}`) or the
+/// assignment can be doubled (`key=label=<uuid>`), so neither "first" nor
+/// "last" is a sound single choice. Emitting every suffix and letting the
+/// caller test each one is the only choice that is sound in all these
+/// shapes: the true value always appears as *some* suffix, and a `=`/`:`
+/// that lands inside padding or a label simply yields a non-matching
+/// suffix that the caller's shape check harmlessly rejects.
+///
+/// Byte-scan via `char_indices` over an already-short token (whitespace-
+/// delimited, so bounded by realistic line length) — no allocation, since
+/// this runs in the hot scan path.
+fn value_candidates(token: &str) -> impl Iterator<Item = &str> {
+    let cur = wrapper_strip_repeated(token);
+    std::iter::once(cur).chain(cur.char_indices().filter_map(move |(i, c)| {
+        if c == '=' || c == ':' {
+            let after = strip_wrappers(&cur[i + c.len_utf8()..]);
+            if !after.is_empty() {
+                return Some(after);
+            }
         }
-    }
-    cur
+        None
+    }))
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -2994,12 +3009,11 @@ mod tests {
 
     #[test]
     fn blocks_padded_content_hash_glued_to_assignment_with_trailing_period() {
-        // A padded base64 value ends in its own `=`, which is also the last
-        // `=` in the whole token — splitting on the LAST separator would land
-        // on the padding boundary instead of the assignment boundary and
-        // hand back `secret=sha256-...=` (still containing the label) rather
-        // than the bare hash. extract_value_candidate must split on the
-        // FIRST separator to recover the padded value correctly.
+        // A padded base64 value ends in its own `=`, which is also a valid
+        // separator character — `value_candidates` must enumerate the
+        // suffix after every `=`/`:`, not assume any single separator
+        // position, so the true value is recovered regardless of which
+        // separator happens to sit where.
         let content = "secret=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
         assert!(
             check(content).is_err(),
@@ -3016,6 +3030,81 @@ mod tests {
             check(content).is_err(),
             "padded sha256 hash in a JSON-ish object near a trigger key must be \
              blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_when_json_label_itself_contains_colon() {
+        // The label can itself contain the separator character
+        // (`"api:key"` rather than `"api_key"`); the first `:` after
+        // wrapper-stripping then lands inside the label, not at the
+        // label/value boundary. value_candidates must still surface the
+        // bare UUID as a later suffix candidate.
+        let content = "{\"api:key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked even when the JSON label contains ':'; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_when_json_label_itself_contains_equals() {
+        let content = "{\"api=key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked even when the JSON label contains '='; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_behind_doubled_assignment() {
+        // key=label=value: the first `=` lands between two labels, not at
+        // the true value boundary.
+        let content = "api_key=label=550e8400-e29b-41d4-a716-446655440000"; // gitleaks:allow
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked behind a doubled assignment; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_behind_doubled_assignment_equals() {
+        let content = "secret=label=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded content hash must be blocked behind a doubled '=' assignment; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_behind_doubled_assignment_colon() {
+        let content = "secret:label=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded content hash must be blocked behind a doubled ':'+'=' \
+             assignment; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_benign_url_with_scheme_and_path_separators() {
+        // Adversarial self-check (codex round-8 guidance): any-suffix
+        // semantics must not newly block ordinary URLs, whose `://` and
+        // `/` characters produce several suffix candidates but none of
+        // them are UUID- or content-hash-shaped. Placed near a real
+        // trigger word ("key") so the check actually exercises the
+        // trigger-context path rather than being skipped outright.
+        let content = "api_key endpoint=https://example.test/resource/for/testing";
+        assert!(
+            check(content).is_ok(),
+            "a benign URL near a trigger word must stay allowed; got {:?}",
             scan(content)
         );
     }
