@@ -289,6 +289,16 @@ mod help_tests {
             h.params.iter().any(|p| p.name == "correlation_external_id"),
             "comm.ingest must declare correlation_external_id param for thread resolution"
         );
+        assert!(
+            h.params.iter().any(|p| p.name == "wire_message_id"),
+            "comm.ingest must declare wire_message_id param (IngestParams carries it; \
+             metadata must stay in sync per issue #403 finding 2)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "wire_references"),
+            "comm.ingest must declare wire_references param (IngestParams carries it; \
+             metadata must stay in sync per issue #403 finding 2)"
+        );
     }
 
     #[test]

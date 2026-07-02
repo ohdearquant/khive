@@ -259,6 +259,8 @@ async fn channel_poll_loop(
                             "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id,
                             "default_inbound_actor": default_inbound_actor,
+                            "wire_message_id": env.wire_message_id,
+                            "wire_references": env.wire_references,
                         });
                         if let Err(e) = registry.dispatch("comm.ingest", params).await {
                             tracing::warn!(
@@ -400,6 +402,24 @@ async fn channel_outbox_loop(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
+            // Issue #403: the parent's wire Message-ID, computed at reply time by
+            // comm.reply (khive-pack-comm) and stored on this note. Forwarded
+            // verbatim so the SMTP layer can set In-Reply-To for native MUA
+            // conversation grouping; absent for non-reply sends.
+            let in_reply_to = props
+                .get("in_reply_to_message_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Issue #403 finding 1: the full References chain (parent's existing
+            // chain, if any, followed by the parent's Message-ID), computed at
+            // reply time by comm.reply. Forwarded verbatim so the SMTP layer can
+            // set References without truncating ancestry; absent for non-reply sends.
+            let references = props
+                .get("references_chain")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             // Mint-before-send: derive or reuse the Message-ID.
             let message_id = match props.get("external_id").and_then(|v| v.as_str()) {
                 Some(eid) if !eid.is_empty() => eid.to_string(),
@@ -439,6 +459,12 @@ async fn channel_outbox_loop(
 
             if let Some(tid) = thread_id {
                 env = env.with_correlation(tid);
+            }
+            if let Some(irt) = in_reply_to {
+                env = env.with_in_reply_to(irt);
+            }
+            if let Some(refs) = references {
+                env = env.with_references(refs);
             }
 
             match email_channel.send(env).await {

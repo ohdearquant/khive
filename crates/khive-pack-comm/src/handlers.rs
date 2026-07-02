@@ -4,6 +4,8 @@
 //! `message` notes in the standard notes table. Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -107,6 +109,8 @@ pub(crate) async fn handle_send(
         &sent_at,
         Some(&from_actor),
         Some(&to_actor),
+        None,
+        None,
     )
     .await?;
 
@@ -307,6 +311,22 @@ pub(crate) async fn handle_reply(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // Issue #403: capture the parent's wire Message-ID so native mail clients
+    // (not khive's own X-Khive-Thread-ID/external_id correlation) can group this
+    // reply into the same conversation via In-Reply-To/References. `None` when
+    // the parent has no wire Message-ID -- the reply then sends without those
+    // headers, exactly as before this feature.
+    let in_reply_to_message_id = parent_wire_message_id(&orig_props);
+
+    // References must carry the FULL ancestor chain per RFC 5322, not just the
+    // immediate parent: the parent's existing chain (if any) followed by the
+    // parent's own Message-ID. `None` when the parent has no wire Message-ID at
+    // all (mirrors `in_reply_to_message_id`); malformed tokens in the parent's
+    // stored chain are individually skipped rather than corrupting the header.
+    let references_chain = in_reply_to_message_id.as_deref().map(|parent_mid| {
+        build_references_header(parent_references_chain(&orig_props), parent_mid)
+    });
+
     // UE6-H2: thread_id must always be a full 36-char hyphenated UUID.
     // If the stored thread_id is a valid full UUID, use it; otherwise fall
     // back to the original message's own full UUID as the thread root.
@@ -393,6 +413,8 @@ pub(crate) async fn handle_reply(
         &sent_at,
         Some(&reply_from_actor),
         Some(&reply_to_actor),
+        in_reply_to_message_id.as_deref(),
+        references_chain.as_deref(),
     )
     .await?;
 
@@ -742,6 +764,16 @@ pub(crate) async fn handle_ingest(
     if let Some(ref ext) = p.external_id {
         props["external_id"] = json!(ext);
     }
+    if let Some(ref wmid) = p.wire_message_id {
+        if !wmid.trim().is_empty() {
+            props["wire_message_id"] = json!(wmid.trim());
+        }
+    }
+    if let Some(ref wrefs) = p.wire_references {
+        if !wrefs.trim().is_empty() {
+            props["wire_references"] = json!(wrefs.trim());
+        }
+    }
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
@@ -798,9 +830,146 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
+/// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed).
+///
+/// Stored values may already be bracketed (an outbound note's self-minted
+/// `external_id`, e.g. `<uuid@domain>`) or bracket-free (an inbound note's
+/// `wire_message_id`, since `mail_parser` strips brackets when parsing). This is
+/// the single place that normalizes to the wire form the `In-Reply-To` /
+/// `References` headers require.
+fn wrap_message_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        trimmed.to_string()
+    } else {
+        format!("<{trimmed}>")
+    }
+}
+
+/// Resolve the parent message's wire Message-ID for an outbound reply's
+/// `In-Reply-To`/`References` headers (issue #403).
+///
+/// Direction-aware: an outbound parent's own Message-ID is self-minted into
+/// `external_id` at send time (e.g. `<uuid@domain>`). An inbound parent's
+/// Message-ID lives in `wire_message_id` instead -- an inbound note's
+/// `external_id` is the IMAP UIDVALIDITY/UID dedup key, never a Message-ID, and
+/// must not be read here. Returns `None` when the parent carries no wire
+/// Message-ID at all (e.g. a khive-internal parent, or an email parent the
+/// channel never captured one for).
+fn parent_wire_message_id(orig_props: &Value) -> Option<String> {
+    let direction = orig_props.get("direction").and_then(Value::as_str);
+    let raw = if direction == Some("outbound") {
+        orig_props.get("external_id").and_then(Value::as_str)
+    } else {
+        orig_props.get("wire_message_id").and_then(Value::as_str)
+    }?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(wrap_message_id(trimmed))
+    }
+}
+
+/// Resolve the parent message's own `References` chain, direction-aware
+/// (issue #403 finding: References must carry the full ancestor chain, not
+/// just the immediate parent).
+///
+/// An inbound parent's chain (as received over the wire) lives in
+/// `wire_references`. An outbound parent's chain is whatever we persisted on
+/// it as `references_chain` when *it* was sent (i.e. the chain that reply
+/// itself extended) -- an outbound note that was a fresh send, not a reply,
+/// carries no `references_chain`. Returns `None` when the parent has no chain
+/// to extend; the caller then falls back to the parent's Message-ID alone,
+/// matching RFC 5322 (References = prior chain, if any, + parent Message-ID).
+fn parent_references_chain(orig_props: &Value) -> Option<&str> {
+    let direction = orig_props.get("direction").and_then(Value::as_str);
+    let raw = if direction == Some("outbound") {
+        orig_props.get("references_chain").and_then(Value::as_str)
+    } else {
+        orig_props.get("wire_references").and_then(Value::as_str)
+    }?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Sanitize a single References/In-Reply-To token: reject anything containing
+/// CR or LF (header injection guard) or without an `@` (not a plausible
+/// message id), then normalize to wire form via [`wrap_message_id`].
+///
+/// Returns `None` for a malformed token so the caller can skip it rather than
+/// emit a corrupt header.
+fn sanitize_reference_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['\r', '\n']) {
+        return None;
+    }
+    let bare = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed);
+    if bare.is_empty() || !bare.contains('@') || bare.contains(['<', '>']) {
+        return None;
+    }
+    Some(wrap_message_id(trimmed))
+}
+
+/// Strip angle brackets and surrounding whitespace from a wire-form message id,
+/// for use as a de-duplication comparison key only -- callers keep pushing each
+/// token's original serialization into the emitted header, never this bare form.
+fn bare_reference_id(token: &str) -> String {
+    let trimmed = token.trim();
+    trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// Build the full `References` header value for a reply: the parent's existing
+/// chain (each token individually sanitized; malformed tokens skipped per
+/// issue #403 finding), followed by the parent's own Message-ID.
+///
+/// `parent_chain` tokens are whitespace-separated per RFC 5322. `parent_message_id`
+/// is expected already wire-wrapped (as returned by [`parent_wire_message_id`]).
+/// A stored chain can already contain an equivalent of the parent's own id (e.g.
+/// tainted or legacy data); tokens are de-duplicated by their bracket-stripped
+/// form, keeping first-seen order, so the parent id is skipped rather than
+/// appended a second time when an equivalent token is already present.
+fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) -> String {
+    let chain_tokens = parent_chain
+        .map(|chain| {
+            chain
+                .split_whitespace()
+                .filter_map(sanitize_reference_token)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for token in chain_tokens
+        .into_iter()
+        .chain(std::iter::once(parent_message_id.to_string()))
+    {
+        if seen.insert(bare_reference_id(&token)) {
+            tokens.push(token);
+        }
+    }
+    tokens.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::message_id_match_candidates;
+    use super::{
+        build_references_header, message_id_match_candidates, parent_references_chain,
+        parent_wire_message_id, sanitize_reference_token, wrap_message_id,
+    };
+    use serde_json::json;
 
     #[test]
     fn candidates_bare_input_adds_bracketed_form() {
@@ -826,6 +995,237 @@ mod tests {
                 "<sent-msg@khive.ai>".to_string(),
                 "sent-msg@khive.ai".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn wrap_message_id_adds_brackets_when_absent() {
+        assert_eq!(wrap_message_id("id@example.com"), "<id@example.com>");
+    }
+
+    #[test]
+    fn wrap_message_id_leaves_already_bracketed_form_unchanged() {
+        assert_eq!(
+            wrap_message_id("<id@example.com>"),
+            "<id@example.com>",
+            "must not double-wrap an already-bracketed id"
+        );
+    }
+
+    #[test]
+    fn wrap_message_id_trims_whitespace() {
+        assert_eq!(wrap_message_id("  id@example.com  "), "<id@example.com>");
+    }
+
+    #[test]
+    fn parent_wire_message_id_reads_wire_message_id_for_inbound_parent() {
+        let props = json!({
+            "direction": "inbound",
+            "wire_message_id": "inbound-msg@example.com",
+            "external_id": "imap:host:1:42",
+        });
+        assert_eq!(
+            parent_wire_message_id(&props).as_deref(),
+            Some("<inbound-msg@example.com>"),
+            "inbound parent must use wire_message_id, never the IMAP-key external_id"
+        );
+    }
+
+    #[test]
+    fn parent_wire_message_id_reads_external_id_for_outbound_parent() {
+        let props = json!({
+            "direction": "outbound",
+            "external_id": "<outbound-msg@khive.ai>",
+        });
+        assert_eq!(
+            parent_wire_message_id(&props).as_deref(),
+            Some("<outbound-msg@khive.ai>"),
+            "outbound parent must reuse its self-minted external_id verbatim"
+        );
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_when_outbound_parent_has_no_external_id() {
+        let props = json!({ "direction": "outbound" });
+        assert_eq!(parent_wire_message_id(&props), None);
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_when_inbound_parent_has_no_wire_message_id() {
+        let props = json!({ "direction": "inbound" });
+        assert_eq!(parent_wire_message_id(&props), None);
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_for_empty_properties() {
+        assert_eq!(parent_wire_message_id(&json!({})), None);
+    }
+
+    #[test]
+    fn parent_references_chain_reads_wire_references_for_inbound_parent() {
+        let props = json!({
+            "direction": "inbound",
+            "wire_references": "<grandparent1@example.com> <parent123@example.com>",
+            "references_chain": "should-not-be-read@example.com",
+        });
+        assert_eq!(
+            parent_references_chain(&props),
+            Some("<grandparent1@example.com> <parent123@example.com>"),
+            "inbound parent must use wire_references, never the outbound-only references_chain"
+        );
+    }
+
+    #[test]
+    fn parent_references_chain_reads_references_chain_for_outbound_parent() {
+        let props = json!({
+            "direction": "outbound",
+            "references_chain": "<grandparent1@example.com> <parent123@example.com>",
+            "wire_references": "should-not-be-read@example.com",
+        });
+        assert_eq!(
+            parent_references_chain(&props),
+            Some("<grandparent1@example.com> <parent123@example.com>"),
+            "outbound parent must use references_chain, never the inbound-only wire_references"
+        );
+    }
+
+    #[test]
+    fn parent_references_chain_none_when_outbound_parent_has_no_chain() {
+        let props = json!({ "direction": "outbound" });
+        assert_eq!(parent_references_chain(&props), None);
+    }
+
+    #[test]
+    fn parent_references_chain_none_when_inbound_parent_has_no_chain() {
+        let props = json!({ "direction": "inbound" });
+        assert_eq!(parent_references_chain(&props), None);
+    }
+
+    #[test]
+    fn parent_references_chain_none_for_empty_properties() {
+        assert_eq!(parent_references_chain(&json!({})), None);
+    }
+
+    #[test]
+    fn parent_references_chain_none_for_blank_chain() {
+        let props = json!({ "direction": "inbound", "wire_references": "   " });
+        assert_eq!(
+            parent_references_chain(&props),
+            None,
+            "a whitespace-only stored chain must resolve to None, not an empty References token"
+        );
+    }
+
+    #[test]
+    fn sanitize_reference_token_wraps_bare_id() {
+        assert_eq!(
+            sanitize_reference_token("id@example.com"),
+            Some("<id@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_reference_token_leaves_bracketed_id_unchanged() {
+        assert_eq!(
+            sanitize_reference_token("<id@example.com>"),
+            Some("<id@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_reference_token_rejects_crlf() {
+        assert_eq!(
+            sanitize_reference_token("id@example.com\r\nBcc: evil"),
+            None
+        );
+        assert_eq!(sanitize_reference_token("id@example.com\nBcc: evil"), None);
+    }
+
+    #[test]
+    fn sanitize_reference_token_rejects_missing_at_sign() {
+        assert_eq!(sanitize_reference_token("not-a-message-id"), None);
+    }
+
+    #[test]
+    fn sanitize_reference_token_rejects_empty() {
+        assert_eq!(sanitize_reference_token(""), None);
+        assert_eq!(sanitize_reference_token("   "), None);
+    }
+
+    #[test]
+    fn sanitize_reference_token_rejects_embedded_angle_brackets() {
+        assert_eq!(
+            sanitize_reference_token("a@example.com<b@example.com>"),
+            None
+        );
+    }
+
+    #[test]
+    fn build_references_header_extends_existing_chain_of_two_or_more() {
+        // Finding 1 core spec: a reply whose parent has an existing References
+        // chain of 2+ ids must produce chain + parent Message-ID, not just the
+        // immediate parent.
+        let chain = Some("<grandparent1@example.com> <grandparent2@example.com>");
+        assert_eq!(
+            build_references_header(chain, "<parent123@example.com>"),
+            "<grandparent1@example.com> <grandparent2@example.com> <parent123@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_falls_back_to_parent_message_id_when_no_chain() {
+        assert_eq!(
+            build_references_header(None, "<parent123@example.com>"),
+            "<parent123@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_skips_malformed_token_in_chain() {
+        // A malformed token embedded in a stored chain (e.g. corrupted data, or a
+        // CRLF injection attempt) must be skipped, not propagated into the header.
+        let chain = Some("<good1@example.com> not-a-message-id <good2@example.com>");
+        assert_eq!(
+            build_references_header(chain, "<parent123@example.com>"),
+            "<good1@example.com> <good2@example.com> <parent123@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_bare_chain_tokens_get_wrapped() {
+        // Chain tokens stored bracket-free (e.g. from an inbound parent's
+        // wire_references, since mail_parser strips brackets) must be
+        // normalized to wire form, matching wrap_message_id's contract.
+        let chain = Some("bare1@example.com bare2@example.com");
+        assert_eq!(
+            build_references_header(chain, "<parent123@example.com>"),
+            "<bare1@example.com> <bare2@example.com> <parent123@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_dedups_when_chain_already_contains_parent_id() {
+        // A stored chain that already contains an equivalent of the parent's own
+        // id (e.g. tainted/legacy data) must not yield a literal duplicate: the
+        // parent id keeps its original position in the chain (first-seen order)
+        // and is not appended a second time at the end.
+        let chain = Some("<root1@example.com> <parent123@example.com> <root2@example.com>");
+        assert_eq!(
+            build_references_header(chain, "<parent123@example.com>"),
+            "<root1@example.com> <parent123@example.com> <root2@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_dedups_bare_and_bracketed_forms_as_equivalent() {
+        // The de-dup comparison must strip brackets before comparing, not just
+        // compare byte-identical strings -- otherwise a bracket-free chain token
+        // and a bracketed parent_message_id (or vice versa) would both survive
+        // into the header as two "different" entries for the same id.
+        let chain = Some("<parent123@example.com>");
+        assert_eq!(
+            build_references_header(chain, "parent123@example.com"),
+            "<parent123@example.com>"
         );
     }
 }
