@@ -87,6 +87,12 @@ pub(crate) struct IngestParams {
     /// When absent and no correlation match is found, falls back to `p.to.trim()`.
     #[serde(default)]
     pub default_inbound_actor: Option<String>,
+    /// This message's own RFC 822 Message-ID (including angle brackets), when the
+    /// channel adapter captured one. Distinct from `external_id` (the transport
+    /// dedup key). Persisted so a later reply to this note can set In-Reply-To /
+    /// References for native MUA conversation grouping.
+    #[serde(default)]
+    pub wire_message_id: Option<String>,
 }
 
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {

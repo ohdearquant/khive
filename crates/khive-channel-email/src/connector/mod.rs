@@ -126,6 +126,15 @@ impl RawEmail {
         self.headers.get("in-reply-to").map(|s| s.as_str())
     }
 
+    /// Return this email's own `Message-ID` header value if present.
+    ///
+    /// Distinct from `imap_external_id` (the IMAP UIDVALIDITY/UID dedup key):
+    /// this is the RFC 822 identifier the sending MUA minted, needed so a
+    /// reply can set `In-Reply-To`/`References` for native MUA threading.
+    pub fn message_id(&self) -> Option<&str> {
+        self.headers.get("message-id").map(|s| s.as_str())
+    }
+
     /// Resolve the best available correlation key: `X-Khive-Thread-ID` first,
     /// then `In-Reply-To`.
     pub fn correlation(&self) -> Option<&str> {

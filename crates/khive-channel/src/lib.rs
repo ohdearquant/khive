@@ -47,6 +47,15 @@ pub struct ChannelEnvelope {
     /// e.g. `<uuid@domain>`). `None` on inbound envelopes and when the transport
     /// should auto-generate the identifier.
     pub message_id: Option<String>,
+    /// This email's own RFC 822 `Message-ID` header value, as received (including
+    /// angle brackets). `None` on outbound envelopes and when the inbound message
+    /// carried no `Message-ID`. Distinct from `external_id`, which is the IMAP
+    /// UIDVALIDITY/UID dedup key, not a wire Message-ID.
+    pub wire_message_id: Option<String>,
+    /// RFC 822 `In-Reply-To` (and `References`) value to set on an outbound reply
+    /// (including angle brackets, e.g. `<uuid@domain>`). `None` when the reply has
+    /// no known parent Message-ID, or on inbound envelopes.
+    pub in_reply_to: Option<String>,
 }
 
 impl ChannelEnvelope {
@@ -62,6 +71,8 @@ impl ChannelEnvelope {
             correlation_external_id: None,
             metadata: HashMap::new(),
             message_id: None,
+            wire_message_id: None,
+            in_reply_to: None,
         }
     }
 
@@ -92,6 +103,19 @@ impl ChannelEnvelope {
     /// Attach an RFC 822 Message-ID (including angle brackets) to set on the outbound email.
     pub fn with_message_id(mut self, id: impl Into<String>) -> Self {
         self.message_id = Some(id.into());
+        self
+    }
+
+    /// Attach this inbound email's own RFC 822 Message-ID (including angle brackets).
+    pub fn with_wire_message_id(mut self, id: impl Into<String>) -> Self {
+        self.wire_message_id = Some(id.into());
+        self
+    }
+
+    /// Attach the parent Message-ID (including angle brackets) this outbound reply
+    /// should set as `In-Reply-To`/`References`.
+    pub fn with_in_reply_to(mut self, id: impl Into<String>) -> Self {
+        self.in_reply_to = Some(id.into());
         self
     }
 }
@@ -242,7 +266,9 @@ mod tests {
             .with_sent_at(ts)
             .with_external_id("<msg1@example.com>")
             .with_correlation("correlation-uuid")
-            .with_message_id("<abc123@example.com>");
+            .with_message_id("<abc123@example.com>")
+            .with_wire_message_id("<wire123@example.com>")
+            .with_in_reply_to("<parent123@example.com>");
 
         assert_eq!(env.from, "email:a@example.com");
         assert_eq!(env.to, "email:b@example.com");
@@ -255,6 +281,18 @@ mod tests {
             Some("correlation-uuid")
         );
         assert_eq!(env.message_id.as_deref(), Some("<abc123@example.com>"));
+        assert_eq!(
+            env.wire_message_id.as_deref(),
+            Some("<wire123@example.com>")
+        );
+        assert_eq!(env.in_reply_to.as_deref(), Some("<parent123@example.com>"));
+    }
+
+    #[test]
+    fn envelope_new_defaults_wire_message_id_and_in_reply_to_to_none() {
+        let env = ChannelEnvelope::new("email:a@example.com", "email:b@example.com", "hello");
+        assert_eq!(env.wire_message_id, None);
+        assert_eq!(env.in_reply_to, None);
     }
 
     #[test]

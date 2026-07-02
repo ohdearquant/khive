@@ -111,6 +111,13 @@ fn build_preview(content: &str) -> String {
 /// When `thread_id` is already supplied (reply path), it is forwarded unchanged to both copies.
 ///
 /// Returns the outbound `Note` on success.
+///
+/// `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
+/// when this write is a reply to a message with a known one (issue #403). It is
+/// stored verbatim on both copies as `in_reply_to_message_id`; the outbox
+/// delivery loop reads it back to set the RFC 822 `In-Reply-To`/`References`
+/// headers for native MUA conversation grouping. `None` when there is no known
+/// parent Message-ID (a plain send, or a reply whose parent has none).
 // REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
 // content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
 // a struct would not reduce overall complexity and would require an extra allocation on the
@@ -127,6 +134,7 @@ pub(crate) async fn dual_write_message(
     sent_at: &str,
     from_actor: Option<&str>,
     to_actor: Option<&str>,
+    in_reply_to_message_id: Option<&str>,
 ) -> Result<Note, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
@@ -180,6 +188,9 @@ pub(crate) async fn dual_write_message(
     }
     if let Some(ta) = to_actor {
         outbound_props["to_actor"] = json!(ta);
+    }
+    if let Some(irt) = in_reply_to_message_id {
+        outbound_props["in_reply_to_message_id"] = json!(irt);
     }
 
     let outbound_note = runtime
@@ -259,6 +270,9 @@ pub(crate) async fn dual_write_message(
         }
         if let Some(ta) = to_actor {
             inbound_props["to_actor"] = json!(ta);
+        }
+        if let Some(irt) = in_reply_to_message_id {
+            inbound_props["in_reply_to_message_id"] = json!(irt);
         }
 
         let inbound_result = runtime

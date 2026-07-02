@@ -107,6 +107,7 @@ pub(crate) async fn handle_send(
         &sent_at,
         Some(&from_actor),
         Some(&to_actor),
+        None,
     )
     .await?;
 
@@ -307,6 +308,13 @@ pub(crate) async fn handle_reply(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // Issue #403: capture the parent's wire Message-ID so native mail clients
+    // (not khive's own X-Khive-Thread-ID/external_id correlation) can group this
+    // reply into the same conversation via In-Reply-To/References. `None` when
+    // the parent has no wire Message-ID -- the reply then sends without those
+    // headers, exactly as before this feature.
+    let in_reply_to_message_id = parent_wire_message_id(&orig_props);
+
     // UE6-H2: thread_id must always be a full 36-char hyphenated UUID.
     // If the stored thread_id is a valid full UUID, use it; otherwise fall
     // back to the original message's own full UUID as the thread root.
@@ -393,6 +401,7 @@ pub(crate) async fn handle_reply(
         &sent_at,
         Some(&reply_from_actor),
         Some(&reply_to_actor),
+        in_reply_to_message_id.as_deref(),
     )
     .await?;
 
@@ -733,6 +742,11 @@ pub(crate) async fn handle_ingest(
     if let Some(ref ext) = p.external_id {
         props["external_id"] = json!(ext);
     }
+    if let Some(ref wmid) = p.wire_message_id {
+        if !wmid.trim().is_empty() {
+            props["wire_message_id"] = json!(wmid.trim());
+        }
+    }
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
@@ -789,9 +803,51 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
+/// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed).
+///
+/// Stored values may already be bracketed (an outbound note's self-minted
+/// `external_id`, e.g. `<uuid@domain>`) or bracket-free (an inbound note's
+/// `wire_message_id`, since `mail_parser` strips brackets when parsing). This is
+/// the single place that normalizes to the wire form the `In-Reply-To` /
+/// `References` headers require.
+fn wrap_message_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        trimmed.to_string()
+    } else {
+        format!("<{trimmed}>")
+    }
+}
+
+/// Resolve the parent message's wire Message-ID for an outbound reply's
+/// `In-Reply-To`/`References` headers (issue #403).
+///
+/// Direction-aware: an outbound parent's own Message-ID is self-minted into
+/// `external_id` at send time (e.g. `<uuid@domain>`). An inbound parent's
+/// Message-ID lives in `wire_message_id` instead -- an inbound note's
+/// `external_id` is the IMAP UIDVALIDITY/UID dedup key, never a Message-ID, and
+/// must not be read here. Returns `None` when the parent carries no wire
+/// Message-ID at all (e.g. a khive-internal parent, or an email parent the
+/// channel never captured one for).
+fn parent_wire_message_id(orig_props: &Value) -> Option<String> {
+    let direction = orig_props.get("direction").and_then(Value::as_str);
+    let raw = if direction == Some("outbound") {
+        orig_props.get("external_id").and_then(Value::as_str)
+    } else {
+        orig_props.get("wire_message_id").and_then(Value::as_str)
+    }?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(wrap_message_id(trimmed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::message_id_match_candidates;
+    use super::{message_id_match_candidates, parent_wire_message_id, wrap_message_id};
+    use serde_json::json;
 
     #[test]
     fn candidates_bare_input_adds_bracketed_form() {
@@ -818,5 +874,68 @@ mod tests {
                 "sent-msg@khive.ai".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn wrap_message_id_adds_brackets_when_absent() {
+        assert_eq!(wrap_message_id("id@example.com"), "<id@example.com>");
+    }
+
+    #[test]
+    fn wrap_message_id_leaves_already_bracketed_form_unchanged() {
+        assert_eq!(
+            wrap_message_id("<id@example.com>"),
+            "<id@example.com>",
+            "must not double-wrap an already-bracketed id"
+        );
+    }
+
+    #[test]
+    fn wrap_message_id_trims_whitespace() {
+        assert_eq!(wrap_message_id("  id@example.com  "), "<id@example.com>");
+    }
+
+    #[test]
+    fn parent_wire_message_id_reads_wire_message_id_for_inbound_parent() {
+        let props = json!({
+            "direction": "inbound",
+            "wire_message_id": "inbound-msg@example.com",
+            "external_id": "imap:host:1:42",
+        });
+        assert_eq!(
+            parent_wire_message_id(&props).as_deref(),
+            Some("<inbound-msg@example.com>"),
+            "inbound parent must use wire_message_id, never the IMAP-key external_id"
+        );
+    }
+
+    #[test]
+    fn parent_wire_message_id_reads_external_id_for_outbound_parent() {
+        let props = json!({
+            "direction": "outbound",
+            "external_id": "<outbound-msg@khive.ai>",
+        });
+        assert_eq!(
+            parent_wire_message_id(&props).as_deref(),
+            Some("<outbound-msg@khive.ai>"),
+            "outbound parent must reuse its self-minted external_id verbatim"
+        );
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_when_outbound_parent_has_no_external_id() {
+        let props = json!({ "direction": "outbound" });
+        assert_eq!(parent_wire_message_id(&props), None);
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_when_inbound_parent_has_no_wire_message_id() {
+        let props = json!({ "direction": "inbound" });
+        assert_eq!(parent_wire_message_id(&props), None);
+    }
+
+    #[test]
+    fn parent_wire_message_id_none_for_empty_properties() {
+        assert_eq!(parent_wire_message_id(&json!({})), None);
     }
 }
