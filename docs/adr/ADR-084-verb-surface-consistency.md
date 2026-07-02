@@ -16,7 +16,7 @@ become generated artifacts under §5 of this document once the verb ships.
 
 ### The disease: documentation drift against a compiled surface
 
-khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (7 under the
+khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (9 under the
 default pack set today), and the per-relation endpoint matrix -- is a closed, compiled
 contract. The base endpoint allowlist lives in
 `BASE_ENTITY_ENDPOINT_RULES` (`crates/khive-runtime/src/operations.rs`), extended additively
@@ -128,6 +128,19 @@ alike (see §3). Where fields are genuinely different concepts -- entity `descri
 names stay distinct, and the error for supplying the wrong one names the right one for
 that substrate.
 
+**Rule 6 -- declared-vocabulary completeness.** A pack MUST declare, through the ADR-017
+vocabulary mechanism (`NOTE_KINDS` / `ENTITY_KINDS`), every note kind and entity kind it
+writes to the store -- except kinds already declared by a pack it `REQUIRES` (e.g.
+`knowledge.learn` writes the kg-declared `concept`; kg owns that declaration). An
+undeclared written kind makes the `schema` verb under-describe the live data,
+reintroducing one layer down exactly the drift this ADR exists to kill. Audited at
+ratification: comm declares `message` and schedule declares `scheduled_event` in their
+`Pack` impls -- the default pack set has no violator. Enforcement: review-level for new
+packs, plus the end-to-end smoke test asserting that every kind present in a driven store
+run appears in the merged declared vocabulary (`HandlerDef` carries no write-set, so a
+static phase-1 check is impossible; this is a §4 Phase-2-class boundary, stated not
+hidden).
+
 ### 2. The `schema` verb
 
 A new kg-pack verb (bare name, per ADR-023 naming rules), assertive, read-only,
@@ -146,7 +159,17 @@ no side effects. It returns the merged live ontology of the running binary:
     "service",
     "resource"
   ],
-  "note_kinds": ["observation", "insight", "question", "decision", "reference", "task", "memory"],
+  "note_kinds": [
+    "observation",
+    "insight",
+    "question",
+    "decision",
+    "reference",
+    "task",
+    "memory",
+    "message",
+    "scheduled_event"
+  ],
   "edge_relations": [
     "contains",
     "part_of",
@@ -180,8 +203,10 @@ Normative details:
 
 1. **Merged pack vocabulary, not the base enum.** `entity_kinds` and `note_kinds` are the
    union of all loaded packs' declared vocabulary (ADR-017) -- this is how `resource`
-   (pack-declared, ADR-048) appears. Serializing only the base `EntityKind` enum would
-   reintroduce the drift this verb exists to kill.
+   (pack-declared, ADR-048) appears, and how `message` / `scheduled_event` (comm /
+   schedule) appear. Rule 6 is what makes this union complete: the verb serializes
+   declarations, so an undeclared written kind would be invisible here. Serializing only
+   the base `EntityKind` enum would reintroduce the drift this verb exists to kill.
 2. **Every endpoint rule carries `origin`**: `"base"` for `BASE_ENTITY_ENDPOINT_RULES`
    rows, `"pack:NAME"` for rows contributed by a pack's `EDGE_RULES`. Agents see exactly
    what loading a pack added.
