@@ -3,9 +3,11 @@
 //! Every function here is deterministic and side-effect-free so the unit tests
 //! can run without any runtime or DB setup.
 
+use std::collections::HashSet;
+
 use chrono::DateTime;
 use khive_runtime::secret_gate;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// A single parsed event, source-agnostic.
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +17,7 @@ pub struct ParsedEvent {
     /// For Claude Code events this is the top-level `uuid` field.
     /// For Codex events (which carry no per-message uuid) this is synthesised
     /// as `"{session_id}:{abs_byte_offset}"`.
+    /// For ChatGPT export events this is the mapping node's `message.id`.
     pub uuid: String,
     /// Session UUID.
     pub session_id: String,
@@ -36,7 +39,8 @@ pub struct ParsedEvent {
     pub cwd: Option<String>,
     /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present.
     pub git_branch: Option<String>,
-    /// `slug` if present (CC-only; Codex files carry no slug concept).
+    /// `slug` if present (CC: project slug; ChatGPT export: conversation
+    /// title; Codex files carry no slug concept).
     pub slug: Option<String>,
 }
 
@@ -252,6 +256,39 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
     }
 }
 
+/// Parse a ChatGPT data-export `conversations.json` file.
+///
+/// Unlike `parse_cc_line`/`parse_codex_line` (one JSONL line in, one event
+/// out), a ChatGPT export is a single static JSON array of conversation
+/// objects — this function parses the whole file at once and returns every
+/// message-bearing event across every conversation it contains.
+///
+/// Returns `None` when `content` is not valid JSON or the top level is not a
+/// JSON array. The caller treats that as a per-file error so the mirror
+/// cursor does not advance: a partially-downloaded export is retried whole
+/// on the next tick, never half-consumed. A malformed *conversation* inside
+/// an otherwise-valid array is skipped individually (see `parse_conversation`)
+/// so one bad entry cannot sink the rest of the file.
+///
+/// Each conversation's `mapping` forms a tree; events are emitted in
+/// deterministic DFS preorder from the root, following each node's
+/// `children` array order (never JSON object key order). Nodes off the
+/// `current_node` root-to-tip path are flagged `is_sidechain`, mirroring how
+/// Claude Code flags abandoned/regenerated branches.
+///
+/// The returned `raw` and `text` fields have secrets masked, exactly like
+/// `parse_cc_line`/`parse_codex_line`.
+pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    let conversations = value.as_array()?;
+
+    let mut events = Vec::new();
+    for conv in conversations {
+        parse_conversation(conv, &mut events);
+    }
+    Some(events)
+}
+
 /// Extract a display-friendly text string from a message `content` value.
 ///
 /// Handles both the string form and the structured-block array form.
@@ -314,6 +351,245 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars).collect();
         out.push('…');
         out
+    }
+}
+
+/// Context threaded through node visitation for one conversation — the
+/// pieces that don't change as the DFS walks the mapping tree.
+struct ConvContext<'a> {
+    mapping: &'a Map<String, Value>,
+    current_path: &'a HashSet<String>,
+    session_id: &'a str,
+    /// Conversation-level `create_time` in micros (0 if absent) — the
+    /// fallback used when a message's own `create_time` is null/absent.
+    conv_created_at_micros: i64,
+    slug: Option<&'a str>,
+}
+
+/// Parse one ChatGPT export conversation object, appending its
+/// message-bearing nodes (deterministic DFS preorder from the mapping root)
+/// to `out`.
+///
+/// Skips the whole conversation on a missing/empty `id` or missing `mapping`
+/// so one malformed entry cannot sink the rest of the file.
+fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
+    let Some(conv_obj) = conv.as_object() else {
+        return;
+    };
+    let Some(session_id) = conv_obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(mapping) = conv_obj.get("mapping").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    let slug = conv_obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let conv_created_at_micros = conv_obj
+        .get("create_time")
+        .and_then(|v| v.as_f64())
+        .map(|secs| (secs * 1_000_000.0) as i64)
+        .unwrap_or(0);
+
+    // ── current-path set: walk current_node -> parent -> ... -> root ────────
+    //
+    // Off-path nodes (abandoned/regenerated branches) are flagged
+    // is_sidechain, mirroring how Claude Code flags sidechains.
+    let mut current_path: HashSet<String> = HashSet::new();
+    if let Some(current_node) = conv_obj.get("current_node").and_then(|v| v.as_str()) {
+        let mut cursor = Some(current_node.to_string());
+        while let Some(node_id) = cursor {
+            if !current_path.insert(node_id.clone()) {
+                break; // cycle guard against malformed mapping data
+            }
+            cursor = mapping
+                .get(&node_id)
+                .and_then(|n| n.as_object())
+                .and_then(|n| n.get("parent"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
+    }
+
+    let root_id = mapping.iter().find_map(|(id, node)| {
+        let node_obj = node.as_object()?;
+        let parent_is_null = node_obj.get("parent").map(|v| v.is_null()).unwrap_or(true);
+        parent_is_null.then(|| id.clone())
+    });
+    let Some(root_id) = root_id else {
+        return;
+    };
+
+    let ctx = ConvContext {
+        mapping,
+        current_path: &current_path,
+        session_id,
+        conv_created_at_micros,
+        slug: slug.as_deref(),
+    };
+
+    // ── deterministic DFS preorder from the root, following `children` order ─
+    //
+    // Explicit stack, not recursion — a long linear conversation can nest
+    // thousands of turns deep and would risk overflowing a worker-thread stack.
+    let mut stack: Vec<String> = vec![root_id];
+    let mut visited: HashSet<String> = HashSet::new();
+
+    while let Some(node_id) = stack.pop() {
+        if !visited.insert(node_id.clone()) {
+            continue; // cycle guard
+        }
+        let Some(node) = mapping.get(&node_id).and_then(|n| n.as_object()) else {
+            continue;
+        };
+
+        if let Some(message) = node.get("message").filter(|m| !m.is_null()) {
+            if let Some(message_obj) = message.as_object() {
+                if let Some(ev) = build_chatgpt_event(&node_id, node, message_obj, &ctx) {
+                    out.push(ev);
+                }
+            }
+        }
+
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            // Push in reverse so the first child in the array is popped (and
+            // thus visited) first — preorder must follow children order.
+            for child in children.iter().rev() {
+                if let Some(child_id) = child.as_str() {
+                    stack.push(child_id.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Build a `ParsedEvent` for a single message-bearing mapping node.
+///
+/// Returns `None` when the message carries no `id`, or when the extracted
+/// text is empty/whitespace-only (ChatGPT scaffolding nodes, e.g. system
+/// prompts with `parts: [""]`).
+fn build_chatgpt_event(
+    node_id: &str,
+    node: &Map<String, Value>,
+    message: &Map<String, Value>,
+    ctx: &ConvContext,
+) -> Option<ParsedEvent> {
+    let uuid = message
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    let role = message
+        .get("author")
+        .and_then(|a| a.as_object())
+        .and_then(|a| a.get("role"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let content = message.get("content").and_then(|c| c.as_object());
+    let content_type = content
+        .and_then(|c| c.get("content_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let text = extract_chatgpt_text(&content_type, content)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let created_at_micros = message
+        .get("create_time")
+        .and_then(|v| v.as_f64())
+        .map(|secs| (secs * 1_000_000.0) as i64)
+        .unwrap_or(ctx.conv_created_at_micros);
+
+    // Some(parent_node_id) only when that parent node itself carries a
+    // (non-null) message — the ChatGPT root is normally message=null, so its
+    // children correctly get parent_uuid=None. A parent that DOES carry a
+    // message but was itself skipped as an event (e.g. empty-parts
+    // scaffolding) still counts — this is provenance linkage, matching how
+    // CC parent chains can reference events that were never mirrored.
+    let parent_uuid = node
+        .get("parent")
+        .and_then(|v| v.as_str())
+        .filter(|pid| {
+            ctx.mapping
+                .get(*pid)
+                .and_then(|p| p.as_object())
+                .and_then(|p| p.get("message"))
+                .map(|m| !m.is_null())
+                .unwrap_or(false)
+        })
+        .map(str::to_string);
+
+    let is_sidechain = !ctx.current_path.contains(node_id);
+
+    let raw_json = serde_json::to_string(node).unwrap_or_default();
+    let raw = secret_gate::mask_secrets(&raw_json).into_owned();
+    let text = secret_gate::mask_secrets(&text).into_owned();
+
+    Some(ParsedEvent {
+        uuid,
+        session_id: ctx.session_id.to_string(),
+        parent_uuid,
+        is_sidechain,
+        role,
+        msg_type: content_type,
+        text: Some(text),
+        raw,
+        created_at_micros,
+        cwd: None,
+        git_branch: None,
+        slug: ctx.slug.map(str::to_string),
+    })
+}
+
+/// Extract display text from a ChatGPT message `content` object per its
+/// `content_type`.
+///
+/// - `"text"` — join string `parts` with `"\n"` (non-string parts ignored
+///   defensively).
+/// - anything else (`"code"`, `"execution_output"`, …) — `content.text` if
+///   present, else joined string `parts`, else `None`.
+fn extract_chatgpt_text(content_type: &str, content: Option<&Map<String, Value>>) -> Option<String> {
+    let content = content?;
+
+    if content_type == "text" {
+        let parts = content.get("parts")?.as_array()?;
+        let joined: Vec<String> = parts
+            .iter()
+            .filter_map(|p| p.as_str().map(str::to_string))
+            .collect();
+        return if joined.is_empty() {
+            None
+        } else {
+            Some(joined.join("\n"))
+        };
+    }
+
+    if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+
+    let parts = content.get("parts")?.as_array()?;
+    let joined: Vec<String> = parts
+        .iter()
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .collect();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.join("\n"))
     }
 }
 
