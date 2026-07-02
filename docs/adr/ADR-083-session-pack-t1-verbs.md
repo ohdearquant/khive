@@ -1,6 +1,6 @@
 # ADR-083: Session Pack T1 Verb Surface
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-07-02
 **Authors**: lambda:khive
 **GitHub**: #342

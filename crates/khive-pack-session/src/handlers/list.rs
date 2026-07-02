@@ -67,3 +67,91 @@ pub(crate) async fn handle_list(
     };
     Ok(serde_json::to_value(result).expect("ListResult serializes"))
 }
+
+#[cfg(test)]
+mod tests {
+    use khive_runtime::{KhiveRuntime, Namespace};
+    use serde_json::json;
+
+    use super::handle_list;
+
+    #[tokio::test]
+    async fn limit_zero_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = handle_list(&rt, &token, json!({ "limit": 0 }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(
+            msg.contains("limit must be in 1..=200"),
+            "error must name the limit-range violation; got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_over_max_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = handle_list(&rt, &token, json!({ "limit": 201 }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(
+            msg.contains("limit must be in 1..=200") && msg.contains("got 201"),
+            "error must name the limit-range violation with the offending value; got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_min_boundary_accepted() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let result = handle_list(&rt, &token, json!({ "limit": 1 }))
+            .await
+            .expect("limit=1 is the lower boundary of the valid range");
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["limit"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn limit_max_boundary_accepted() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let result = handle_list(&rt, &token, json!({ "limit": 200 }))
+            .await
+            .expect("limit=200 is the upper boundary of the valid range");
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["limit"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn blank_provider_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = handle_list(&rt, &token, json!({ "provider": "" }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(
+            msg.contains("provider must be a non-empty string when provided"),
+            "error must name the blank-provider violation; got: {msg}",
+        );
+    }
+}
