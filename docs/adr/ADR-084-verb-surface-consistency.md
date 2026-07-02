@@ -16,8 +16,9 @@ become generated artifacts under §5 of this document once the verb ships.
 
 ### The disease: documentation drift against a compiled surface
 
-khive's ontology -- 9 entity kinds, 17 edge relations, 5 note kinds, and the per-relation
-endpoint matrix -- is a closed, compiled contract. The base endpoint allowlist lives in
+khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (7 under the
+default pack set today), and the per-relation endpoint matrix -- is a closed, compiled
+contract. The base endpoint allowlist lives in
 `BASE_ENTITY_ENDPOINT_RULES` (`crates/khive-runtime/src/operations.rs`), extended additively
 by each loaded pack's `EDGE_RULES` (ADR-017). No runtime surface exposes this merged
 contract. Agents learn it from documentation snapshots that provably rot:
