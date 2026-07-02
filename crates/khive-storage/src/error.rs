@@ -161,7 +161,8 @@ impl StorageError {
         msg.contains("fts5: syntax error")
             || msg.contains("fts5: parser stack overflow")
             || msg.contains("fts5: column queries are not supported")
-            || msg.contains("queries are not supported (detail")
+            || msg.contains("fts5: phrase queries are not supported (detail")
+            || msg.contains("fts5: NEAR queries are not supported (detail")
     }
 }
 
@@ -241,6 +242,36 @@ mod tests {
         // A genuine connection/driver outage at the fts_search operation, but
         // whose message does not name a parser failure mode — must propagate.
         let e = driver_err("fts_search", "disk I/O error");
+        assert!(!e.is_fts5_syntax_error());
+    }
+
+    #[test]
+    fn fts5_phrase_detail_query_is_classified_as_syntax_error() {
+        let e = driver_err(
+            "fts_search",
+            "fts5: phrase queries are not supported (detail!=full)",
+        );
+        assert!(e.is_fts5_syntax_error());
+    }
+
+    #[test]
+    fn fts5_near_detail_query_is_classified_as_syntax_error() {
+        let e = driver_err(
+            "fts_search",
+            "fts5: NEAR queries are not supported (detail!=full)",
+        );
+        assert!(e.is_fts5_syntax_error());
+    }
+
+    #[test]
+    fn unprefixed_detail_message_is_not_classified_as_syntax_error() {
+        // Round-3 High: a driver message containing the detail-mode substring
+        // WITHOUT the `fts5: ` parser prefix is not from the FTS5 query
+        // parser — must propagate, not degrade.
+        let e = driver_err(
+            "fts_search",
+            "phrase queries are not supported (detail!=full)",
+        );
         assert!(!e.is_fts5_syntax_error());
     }
 
