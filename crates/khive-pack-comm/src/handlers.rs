@@ -593,16 +593,25 @@ pub(crate) async fn handle_ingest(
             // (angle brackets included), while `mail_parser` strips the brackets from an
             // inbound `In-Reply-To`, yielding `id@domain`. Match the correlation key as
             // received and in its bracket-toggled form so `<id>` and `id` correlate either
-            // way; the exact form is tried first.
+            // way; the exact form is tried first. Restricted to outbound notes (mirrors
+            // Pass 2) so an inbound note's own external_id can never be matched as a
+            // threading parent.
             let mut pass1 = None;
             for candidate in message_id_match_candidates(corr) {
                 let corr_filter = NoteFilter {
                     kind: Some("message".to_string()),
-                    property_filters: vec![PropertyFilter {
-                        json_path: "$.external_id".to_string(),
-                        op: FilterOp::Eq,
-                        value: SqlValue::Text(candidate),
-                    }],
+                    property_filters: vec![
+                        PropertyFilter {
+                            json_path: "$.external_id".to_string(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text(candidate),
+                        },
+                        PropertyFilter {
+                            json_path: "$.direction".to_string(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text("outbound".to_string()),
+                        },
+                    ],
                     ..Default::default()
                 };
                 let corr_page = store
