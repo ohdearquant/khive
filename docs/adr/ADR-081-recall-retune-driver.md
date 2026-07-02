@@ -4,7 +4,8 @@
 **Date**: 2026-07-02\
 **Authors**: lambda:khive, lambda:leo (scorer design and evidence)\
 **Measurement evidence**: hook scorer v0 dry run over 19 serve ledgers, 7 sessions (2026-07-02)\
-**Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-032](ADR-032-brain-profile-orchestration.md) (Brain Profile Orchestration), [ADR-055](ADR-055-epistemic-edge-relations.md) (Epistemic Relations)\
+**Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-032](ADR-032-brain-profile-orchestration.md) (Brain Profile Orchestration), [ADR-035](ADR-035-cli-config-and-auto-embed.md) (Feedback Profile Resolution Order), [ADR-055](ADR-055-epistemic-edge-relations.md) (Epistemic Relations)\
+**Amends**: the brain feedback weight table (`FeedbackEventKind::update_weight()`, khive-brain-core, issue #268)\
 **GitHub**: #517 (auto_feedback), #394 (recall latency), #391/#393 (resolver legs)
 
 ---
@@ -14,19 +15,24 @@
 ### What ships today
 
 The brain pack maintains per-profile Beta posteriors updated by feedback events. Two
-verbs feed them: `brain.feedback` (explicit, caller-judged signals: `useful`,
-`not_useful`, `wrong`, `correction`, and the explicit/implicit positive and negative
-pairs) and `brain.auto_feedback` (#517), a convenience verb agents call after
-`memory.recall` to emit implicit signals without constructing a `brain.feedback` call.
+verbs feed them: `brain.feedback` (explicit, caller-judged signals) and
+`brain.auto_feedback` (#517), a convenience verb agents call after `memory.recall` to
+emit implicit signals without constructing a `brain.feedback` call.
 
-Attribution is resolved at feedback time, not serve time. `memory.recall` does not
-consult the brain pack and its response carries no profile identifier. The feedback
-handler (`crates/khive-pack-memory/src/handlers/feedback.rs`) resolves the serving
-profile three-tier: explicit profile from config, then a namespace-bound
-`brain.resolve(consumer_kind="recall")` match (real binding matches only, per the
-binding discipline of ADR-032), then the pack-local global tuning prior. (The handler's
-doc comments cite "ADR-035" from a pre-renumbering series; the current governing record
-is ADR-032.)
+Event weighting is brain-owned. `FeedbackEventKind::update_weight()` in
+`khive-brain-core` (`src/signal.rs`) is the single authority: `correction` folds at 2.0,
+`explicit_positive`/`explicit_negative` at 1.5, `implicit_positive`/`implicit_negative`
+at 0.5.
+
+Profile attribution is resolved at feedback time, not serve time, by two cooperating
+records: ADR-032 governs `brain.resolve`, the binding table, and longest-match
+resolution; ADR-035 ("Feedback and recall-boost profile resolution order") governs the
+memory pack's three-tier discipline — explicit profile from config, then a
+namespace-bound `brain.resolve(consumer_kind="recall")` result **only on a real binding
+match** (`matched_binding = true`), then the pack-local global tuning prior. The
+`matched_binding` distinction is load-bearing: a system-default resolve result must fall
+through to tier 3, and only ADR-035 specifies that fallback. `memory.recall` itself does
+not consult the brain pack; its response carries no profile identifier.
 
 An out-of-band scorer now exists: it grades each served memory in a completed session as
 `used`, `ignored`, or `contradicted`, from serve markers
@@ -42,10 +48,9 @@ query. Both were topically unrelated to the active work (fused scores around 0.6
 junk-relevance tier), and every serve was graded `ignored`. Nothing in the current
 pipeline trains those re-serves away:
 
-1. **No governed implicit pathway.** Scorer events have no pinned weight, no cap
-   semantics, and no invariant preventing a 200-event batch from swamping a handful of
-   explicit judgments. Until that governance exists, enabling scorer emission is unsafe
-   for posterior quality.
+1. **No governed implicit pathway.** The 0.5 implicit weight predates any real implicit
+   emitter; with batch scoring, a single 200-event pass at 0.5 would carry the weight of
+   66 explicit judgments. No cap semantics or per-target bound exists.
 2. **No cross-session re-serve suppression.** Per-session query dedup exists
    (`recent_queries`), but nothing spans sessions. A memory served and ignored fourteen
    times ranks exactly as it did the first time.
@@ -55,90 +60,163 @@ pipeline trains those re-serves away:
 
 ## Decision
 
-### 1. Event weighting and the governing invariant
+### 1. Event weighting: amend the brain weight table
 
-**Invariant: implicit scorer events must never outweigh explicit feedback, individually
-or in aggregate.** Three mechanisms make this structural rather than statistical:
+Weighting stays brain-owned. This ADR amends `FeedbackEventKind::update_weight()`:
 
-- **Fractional weight.** Explicit signals carry full Beta pseudo-count weight, unchanged.
-  Implicit events carry a fractional pseudo-count of **0.1**, defined as a single named
-  constant in the memory pack configuration. The value is pinned now rather than measured
-  first because measurement requires emission (the profile-comparison data cannot exist
-  until a lid emits), and the per-target clamp below makes the exact value second-order.
-  A revisit note: once emission has run long enough to produce posterior-movement data on
-  a profile comparison, the constant is re-evaluated.
-- **Per-batch cap.** A scorer pass emits at most 200 events. Cap hits are logged, never
-  silently truncated.
-- **Per-target clamp.** Within a decay window, the total implicit pseudo-count
-  contribution to any single target cannot exceed the weight of one explicit signal.
-  This bounds aggregate swamping per target no matter how many sessions re-serve it.
+| Event kind                               | Weight  | Change    |
+| ---------------------------------------- | ------- | --------- |
+| `correction`                             | 2.0     | unchanged |
+| `explicit_positive`, `explicit_negative` | 1.5     | unchanged |
+| `implicit_positive`, `implicit_negative` | **0.1** | was 0.5   |
 
-### 2. Signal mapping
+The implicit weight drops before the first high-volume implicit emitter goes live, not
+after. 0.5 was set when implicit events were hypothetical; a batch scorer makes them the
+dominant event class by count, and the reduction is pinned now because measurement
+cannot precede emission (posterior-movement comparison data cannot exist until a lid
+emits). Once emission has produced comparison data across profiles, the constant is
+re-evaluated. Mis-tuning at 0.1 under-trains rather than corrupts, which is the safe
+failure direction.
 
-| Scorer grade   | Emitted signal      | Weight     |
-| -------------- | ------------------- | ---------- |
-| `used`         | `implicit_positive` | fractional |
-| `ignored`      | `implicit_negative` | fractional |
-| `contradicted` | none (see below)    | —          |
+**The explicit comparator** used by the clamp below is one `explicit_positive` or
+`explicit_negative` event: **C = 1.5**.
+
+### 2. The governing invariant and its enforcement
+
+**Invariant (exact scope): at any instant, the decayed implicit feedback mass folded
+into a posterior for a given accounting key never exceeds C, the weight of one explicit
+event.** The lifetime raw sum of implicit pseudo-counts is intentionally unbounded — ten
+non-overlapping decay windows of capped implicit events may in raw total exceed one
+explicit judgment — but the rate is bounded: per key, implicit events can move the
+posterior by at most C per decay scale, while a single explicit event moves it by C or
+more immediately. Explicit feedback therefore always dominates on any horizon where it
+is present at all.
+
+Enforcement is structural, at fold time, brain-side:
+
+- **Accounting key**: `(profile_id, namespace, target_id)`, across **all** query
+  classes. (Rejected alternative: keying by `(target, query_class)` would let N distinct
+  query classes deliver N·C of implicit mass to one target.)
+- **Decayed implicit mass**: `M(k) = Σ w_i · 2^(−Δt_i / T)` over prior folded implicit
+  events for key `k`, with `T` = 7 days (shared with the serve-ledger half-life).
+- **Fold gate**: an incoming implicit event folds at its full weight only if
+  `M(k) + w ≤ C`. Otherwise it is recorded in the event log (audit preserved) and folded
+  at zero weight. The mass check and the fold execute in the same transaction; the
+  daemon's serialized write lane makes this race-free across concurrent emitters.
+
+Because the clamp is enforced at the fold rather than by the emitter, no property of the
+emission surface (batching, partial failure, concurrent scorer passes) can breach it.
+
+- **Per-pass budget** (operational, scorer-side, best-effort): a scorer pass emits at
+  most 200 events; cap hits are logged, never silently truncated. This bounds cost and
+  noise, not correctness — correctness is the fold gate's job.
+- **Idempotency**: every scorer event carries a `scorer_run_id` and dedup key
+  `(scorer_run_id, target_id)`; the fold rejects duplicates, so replaying a
+  partially-failed batch is the recovery path.
+
+### 3. Signal mapping
+
+| Scorer grade   | Emitted signal      | Weight |
+| -------------- | ------------------- | ------ |
+| `used`         | `implicit_positive` | 0.1    |
+| `ignored`      | `implicit_negative` | 0.1    |
+| `contradicted` | none (see below)    | —      |
 
 `contradicted` emits nothing automatically. The `wrong` and `correction` signals remain
 caller-judged: they carry strong posterior weight and `correction` pairs with a
 `supersedes` write, so both stay coupled to a deliberate curation decision (ADR-014),
 never to transcript inference.
 
-### 3. Cross-session serve ledger
+### 4. Cross-session serve ledger
 
-A serve ledger records (target id, query class, serve timestamp, grade when known). It is
-**brain-owned**: serve history and posteriors are both epistemic state, and keeping them
-in one pack keeps the memory/brain seam a single read. The recall path consults the
-ledger with one read at serve time.
+A brain-owned ledger records serves and their grades. Serve rows are appended by the
+recall path asynchronously off the response path; grades are backfilled by scorer
+emission. The recall path consults the ledger with one read at serve time.
 
-- **Suppression is a score penalty, not a hard filter.** The ledger records what was
-  served; the ranker decides visibility. This follows the data-versus-view principle:
-  history is preserved, the view layer decides what surfaces.
-- **The window is decay-based**, consistent with memory decay semantics, with a 7-day
-  half-life as the starting point. A target repeatedly served without a `used` grade
-  decays toward suppression for that query class and recovers as the window decays.
+**Schema** (normative minimum):
 
-### 4. Serve-time attribution stamp
+| Column                 | Notes                                                            |
+| ---------------------- | ---------------------------------------------------------------- |
+| `id`                   | row id                                                           |
+| `namespace`            | write-stamp per ADR-007                                          |
+| `consumer_kind`        | e.g. `recall`                                                    |
+| `served_by_profile_id` | nullable until the section 5 stamp ships                         |
+| `resolved_profile_id`  | score-time resolution result (pre-stamp phase)                   |
+| `resolved_at`          | when score-time resolution ran (bounds binding drift, auditable) |
+| `target_id`            | served memory                                                    |
+| `query_class`          | deterministic key, defined below                                 |
+| `query_raw`            | the literal query, for audit                                     |
+| `served_at`            | serve timestamp                                                  |
+| `grade`                | nullable until graded (`used` / `ignored` / `contradicted`)      |
+| `graded_at`            | grade timestamp                                                  |
+| `scorer_run_id`        | idempotency and provenance                                       |
 
-`memory.recall` responses gain a `served_by_profile_id` field, resolved at serve time via
-the same three-tier logic the feedback path uses. This removes score-time re-resolution
-and its binding-drift exposure.
+Uniqueness `(namespace, target_id, query_class, served_at)` for serve rows; grade
+updates are idempotent by `scorer_run_id`. Indexes on `(target_id, query_class,
+served_at)` for suppression reads and on the section 2 accounting key for mass queries.
 
-The stamp is specified in this ADR but ships as a **separate implementation PR gated on a
+**Query class** is a deterministic normalization of the query string: lowercase, strip
+punctuation, collapse whitespace, sort unique tokens, join, take the first 16 hex chars
+of the SHA-256. Two serves count as the same failure mode exactly when their normalized
+token sets match; embedding-cluster or template-family keys were rejected as
+non-deterministic and non-auditable.
+
+**Suppression** is keyed `(target_id, query_class)` — per class, so recovery for one
+query class is not held hostage by unrelated queries — and is a **score penalty, not a
+hard filter**. The ledger records what was served; the ranker decides visibility (the
+data-versus-view principle). A target repeatedly served without a `used` grade decays
+toward suppression for that query class with the shared 7-day half-life and recovers as
+the window decays.
+
+### 5. Serve-time attribution stamp
+
+`memory.recall` responses gain a `served_by_profile_id` field, resolved at serve time
+via the ADR-035 three-tier discipline. This is a completion of ADR-032's own declared
+surface, not new shape: ADR-032 already specifies `served_by_profile_id:
+Option<String>` on profile-served event payloads and requires stage-scoped feedback to
+credit exactly the profile that served (ADR-032, "Profile-served events carry
+`served_by_profile_id`").
+
+The stamp is specified here but ships as a **separate implementation PR gated on a
 latency measurement**: resolution adds a cross-pack dispatch on the hot recall path
-(#394). The gate is fed by the instrumentation in section 6 plus caller-side failure
+(#394). The gate is fed by the section 7 instrumentation plus caller-side failure
 records (timestamp, wall-clock, error class per invocation failure) already collected by
 the hook integration. Until the stamp ships, batch scoring resolves at score time and
-records the resolve timestamp so binding drift is bounded and auditable.
+writes `resolved_profile_id` + `resolved_at` into the ledger row, so drift is bounded
+and auditable in place.
 
-### 5. Emission surface
+### 6. Emission surface
 
 Scorer batches emit through the existing surface: DSL batches of `brain.auto_feedback`
-(100 ops per request; the 200-event cap is two requests). `memory.recall` and
-`brain.auto_feedback` cannot be chained through `$prev` (recall returns a bare array), so
-emission is two-step with ids inlined.
+(100 ops per request; the 200-event budget is two requests). `memory.recall` and
+`brain.auto_feedback` cannot be chained through `$prev` (recall returns a bare array),
+so emission is two-step with ids inlined.
+
+ADR-016 batches are per-op independent with no cross-op transaction; that is acceptable
+here **because no correctness property lives on the emission surface**: the clamp and
+dedup are enforced at the brain fold (section 2), and a partially-failed batch is
+recovered by idempotent replay.
 
 A native bulk verb (`brain.feedback_batch(events=[...])`: one dispatch, single event-log
-append transaction, atomic cap accounting) is **carried as an option, not adopted**.
-Adoption rule: sustained emission above roughly 400 events per day (two scorer passes),
-or queue-depth instrumentation showing two-step DSL batches contending on the daemon.
-New verb surface is an ADR-023 amendment when triggered.
+append, atomic budget accounting) is **carried as an option, not adopted**. Adoption
+rule: sustained emission above roughly 400 events per day (two scorer passes), or
+queue-depth instrumentation showing two-step DSL batches contending on the daemon. New
+verb surface is an ADR-023 amendment when triggered.
 
-### 6. Instrumentation rider (#394)
+### 7. Instrumentation rider (#394)
 
 Three daemon-side signals ship together, motivated by the measured serve-path failure
-mode (hook-fire-instant latency under concurrent load, not relevance: an identical recall
-batch succeeded in 2.14 s with hits above the serve floor 90 seconds after a hook
-timeout):
+mode (hook-fire-instant latency under concurrent load, not relevance: an identical
+recall batch succeeded in 2.14 s with hits above the serve floor 90 seconds after a hook
+timeout; the first instrumented caller-side failure sample is a clean 6.017 s timeout
+class, not a fast daemon reject):
 
 1. arrival-overlap logging (concurrent request arrival windows),
 2. per-recall wall-clock,
 3. daemon queue depth sampled at query start.
 
 These discriminate the failure class conclusively and provide the measurement gate for
-the section 4 stamp.
+the section 5 stamp.
 
 ## Rollout
 
@@ -154,23 +232,33 @@ the section 4 stamp.
 ## Consequences
 
 - Positive: the dominant observed waste (junk-tier re-serves) becomes self-correcting;
-  negatives finally train the store; posterior quality is protected by construction, not
-  by operator discipline.
-- Positive: attribution becomes exact once the stamp ships, and bounded before then.
-- Cost: a new brain-owned table (serve ledger) and one extra read on the recall path;
-  the clamp adds per-target bookkeeping inside the window.
+  negatives finally train the store; posterior quality is protected at the fold, by
+  construction, independent of emitter behavior.
+- Positive: attribution becomes exact once the stamp ships, and bounded and auditable in
+  the ledger before then.
+- Cost: a new brain-owned table, one extra read on the recall path, one async write off
+  the response path, and per-key decayed-mass bookkeeping at fold time.
+- Cost: the implicit weight change (0.5 → 0.1) also affects #517's serve-time
+  `implicit_positive`; that is intended — the same saturation argument applies to it.
 - Risk: a mis-tuned fractional weight under-trains (too low) rather than corrupts (too
-  high), which is the safe failure direction given the clamp.
+  high); the revisit-on-data note covers it.
 
 ## Alternatives considered
 
 - **Measure the weight before pinning.** Rejected: circular, since measurement requires
-  emission. The clamp reduces the sensitivity of the choice; 0.1 with a revisit note
-  unblocks the pipeline.
-- **Hard filter for re-served targets.** Rejected: mutates visibility at the data layer
-  and destroys the audit trail; a decaying score penalty preserves history and recovers
+  emission. The fold-time clamp reduces the sensitivity of the choice; 0.1 with a
+  revisit note unblocks the pipeline.
+- **A separate scorer-only weight (new wire field, brain-validated).** Rejected for now:
+  two implicit weights complicate the invariant math and the weight table for no current
+  consumer; revisit if a second implicit emitter with different trust arrives.
+- **Emitter-side clamp enforcement.** Rejected: the emission surface is non-atomic
+  (ADR-016) and emitters can race; only the fold sees every event exactly once.
+- **Hard filter for re-served targets.** Rejected: mutates visibility at the data layer;
+  a decaying score penalty preserves the serve history in the ledger and recovers
   naturally.
 - **Auto-emitting `wrong` from `contradicted` grades.** Rejected: `wrong` triggers
   supersession review and must remain a deliberate judgment.
 - **Memory-pack-owned ledger.** Rejected: splits epistemic state across two packs and
   turns one seam read into two-sided bookkeeping.
+- **Keying the clamp by `(target, query_class)`.** Rejected: unboundedly many query
+  classes per target would multiply the per-target implicit mass bound away.
