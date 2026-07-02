@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
+use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackSchemaPlan};
 
 use crate::{handlers, vocab::SESSION_HANDLERS};
 
@@ -29,6 +29,10 @@ impl Pack for SessionPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &SESSION_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "session",
+        statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
+    });
 }
 
 struct SessionPackFactory;
@@ -73,6 +77,24 @@ impl PackRuntime for SessionPack {
 
     fn requires(&self) -> &'static [&'static str] {
         <SessionPack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "session",
+            statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
+        }
+    }
+
+    async fn warm(&self) {
+        let config = crate::mirror::MirrorConfig::from_env();
+        if !config.enabled && !config.codex_enabled {
+            return;
+        }
+        let runtime = self.runtime().clone();
+        tokio::spawn(async move {
+            crate::mirror::run_mirror_service(runtime, config).await;
+        });
     }
 
     async fn dispatch(
