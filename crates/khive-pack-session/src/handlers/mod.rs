@@ -151,13 +151,13 @@ pub(crate) async fn resolve_session_uuid(
         return match runtime.resolve_prefix(token, raw).await? {
             Some(uuid) => Ok(uuid),
             None => Err(RuntimeError::InvalidInput(format!(
-                "{verb}: id prefix {raw:?} matched no records; valid values: full UUID or 8+ hex prefix"
+                "{verb}: id prefix {raw} matched no records; valid values: full UUID or 8+ hex prefix"
             ))),
         };
     }
 
     Err(RuntimeError::InvalidInput(format!(
-        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {raw:?}"
+        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {raw}"
     )))
 }
 
@@ -172,7 +172,7 @@ pub(crate) async fn fetch_session_note(
     match runtime.resolve_primary(token, id).await? {
         Some(Resolved::Note(note)) if note.kind == SESSION_KIND => Ok(note),
         Some(Resolved::Note(note)) => Err(RuntimeError::InvalidInput(format!(
-            "{verb}: expected note kind \"session\"; valid note kind: session; got {:?}",
+            "{verb}: expected note kind \"session\"; valid note kind: session; got {}",
             note.kind
         ))),
         Some(_) => Err(RuntimeError::InvalidInput(format!(

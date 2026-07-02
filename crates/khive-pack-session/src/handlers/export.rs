@@ -21,7 +21,7 @@ pub(crate) async fn handle_export(
     let format = p.format.as_deref().unwrap_or("json");
     if !VALID_EXPORT_FORMATS.contains(&format) {
         return Err(RuntimeError::InvalidInput(format!(
-            "{VERB}: format must be one of {VALID_EXPORT_FORMATS:?}; got {format:?}"
+            "{VERB}: format must be one of {VALID_EXPORT_FORMATS:?}; got {format}"
         )));
     }
 
@@ -98,9 +98,10 @@ mod tests {
         let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
             panic!("expected InvalidInput, got {err:?}");
         };
-        assert!(
-            msg.contains("format must be one of") && msg.contains("xml"),
-            "format must be validated before id resolution; got: {msg}",
+        assert_eq!(
+            msg, "session.export: format must be one of [\"json\", \"markdown\"]; got xml",
+            "format must be validated before id resolution, with the caller's value \
+             displayed unquoted",
         );
     }
 

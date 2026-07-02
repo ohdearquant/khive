@@ -2,7 +2,7 @@
 
 Session pack: registers the `session` note kind and four agent-facing verbs
 for storing and retrieving agent-session records (transcripts or summaries)
-over the notes substrate (ADR-081).
+over the notes substrate (ADR-083).
 
 ## Verbs
 
@@ -35,9 +35,12 @@ runtime seam (`runtime.core()`, `create_note`, `query_notes_filtered`,
 
 ## Out of scope for this slice
 
-The digester/summarization pipeline is cloud-side. Transcript mirroring,
-tiering, billing, and `session.import` are deferred; see
-[ADR-081](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-081-session-pack.md).
+The digester/summarization pipeline is cloud-side. `session.import`, tiering,
+and billing are deferred; see
+[ADR-083](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-083-session-pack-t1-verbs.md).
+The session mirror (transcript parsing and ingestion into `session_messages`)
+is a separate, already-shipped concern — see
+[ADR-080 §6](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-080-session-pack-oss-storage-mechanism.md#6-the-session-mirror-amendment-2026-07-02).
 
 ## Where this sits
 

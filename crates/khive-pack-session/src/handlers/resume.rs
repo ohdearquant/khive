@@ -47,9 +47,12 @@ mod tests {
         let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
             panic!("expected InvalidInput, got {err:?}");
         };
-        assert!(
-            msg.contains("id must be a full UUID or 8+ hex prefix"),
-            "error must name the malformed-id violation; got: {msg}",
+        assert_eq!(
+            msg,
+            "session.resume: id must be a full UUID or 8+ hex prefix; \
+             valid values: full UUID or 8+ hex prefix; got not-an-id!",
+            "error must match ADR-083's byte-exact contract (display, not debug, formatting \
+             of the caller-supplied id)",
         );
     }
 
@@ -65,10 +68,46 @@ mod tests {
         let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
             panic!("expected InvalidInput, got {err:?}");
         };
-        assert!(
-            msg.contains("id prefix") && msg.contains("matched no records"),
+        assert_eq!(
+            msg,
+            "session.resume: id prefix deadbeef matched no records; \
+             valid values: full UUID or 8+ hex prefix",
             "an 8+ hex string must be accepted as short-prefix shape and routed to \
-             prefix resolution, not rejected as malformed; got: {msg}",
+             prefix resolution, not rejected as malformed, with the id displayed unquoted",
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_note_kind_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let note = rt
+            .core()
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "not a session",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create a non-session note");
+
+        let err = handle_resume(&rt, &token, json!({ "id": note.id.to_string() }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "session.resume: expected note kind \"session\"; valid note kind: session; \
+             got observation",
+            "error must name the actual note kind, displayed unquoted",
         );
     }
 
