@@ -571,7 +571,28 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        let hits = if fts_gather.enabled {
+        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
+        // (#388, #389 round-2 High): sanitize_fts5_query already strips
+        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors
+        // at runtime on residual punctuation the sanitizer does not strip,
+        // degrade to an empty candidate set instead of aborting the whole
+        // memory.recall (the vector leg runs independently in
+        // collect_recall_candidates and still contributes). A genuine backend
+        // outage (pool exhaustion, connection failure, etc.) is NOT a bad
+        // query and must propagate.
+        //
+        // Note: when `fts_gather.enabled`, `collect_text_hits` (text_gather.rs)
+        // already collapses every `StorageError` into `RuntimeError::Internal`
+        // via `.map_err(|e| RuntimeError::Internal(e.to_string()))` before this
+        // match ever sees it — the structured error is gone by the time it
+        // gets here, so it can never be classified as an FTS5 syntax error and
+        // always propagates in that branch. That is a pre-existing, separate
+        // information-loss issue in `collect_text_hits`, out of scope for this
+        // fix (which targets the four fail-open match arms named in #389 round
+        // 2, not `collect_text_hits`'s own `?`-propagation); it does not weaken
+        // this fix — it only means the gather-optimization path never degrades
+        // (always propagates), which is the safe direction.
+        let fts_result: Result<Vec<TextSearchHit>, RuntimeError> = if fts_gather.enabled {
             crate::text_gather::collect_text_hits(
                 searcher.as_ref(),
                 query,
@@ -582,9 +603,9 @@ impl MemoryPack {
                 fts_gather,
                 &terms,
             )
-            .await?
+            .await
         } else {
-            let mut h = searcher
+            searcher
                 .search(TextSearchRequest {
                     query: terms.join(" "),
                     mode: TextQueryMode::AnyTerm,
@@ -596,10 +617,25 @@ impl MemoryPack {
                     top_k: candidate_limit,
                     snippet_chars: snippet_policy.snippet_chars(),
                 })
-                .await?;
-            h.sort_by_key(|h| h.rank);
-            h.truncate(candidate_limit as usize);
-            h
+                .await
+                .map_err(RuntimeError::from)
+        };
+
+        let hits = match fts_result {
+            Ok(mut h) => {
+                h.sort_by_key(|h| h.rank);
+                h.truncate(candidate_limit as usize);
+                h
+            }
+            Err(RuntimeError::Storage(ref se)) if se.is_fts5_syntax_error() => {
+                tracing::warn!(
+                    error = %se,
+                    query = %query,
+                    "collect_recall_text_hits: FTS leg failed on a parser syntax error, degrading to vector-only recall"
+                );
+                Vec::new()
+            }
+            Err(e) => return Err(e),
         };
 
         if prof {

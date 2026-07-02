@@ -85,6 +85,14 @@ static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::ne
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Non-parser FTS *search*-leg failure injection for `search_notes` (issue #389
+/// round-2 High regression coverage) — distinct from `FTS_FAIL_NS` (which
+/// injects at the FTS *upsert*/write step of `create_note_inner`). Injects a
+/// `StorageError::Timeout` at the `search()` call the FTS fail-open arm
+/// guards, so the arm's `is_fts5_syntax_error()` gate can be exercised against
+/// a genuine non-parser failure and asserted to propagate rather than degrade.
+#[cfg(any(test, feature = "fault-injection"))]
+static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Arm the FTS failure injection for `create_note_inner` targeting namespace `ns`.
 ///
@@ -118,6 +126,20 @@ pub fn arm_fts_fail_many(ns: &str) {
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_fts_fail_many_partial(ns: &str) {
     *FTS_FAIL_MANY_PARTIAL_NS.lock().unwrap() = Some(ns.to_string());
+}
+
+/// Arm a non-parser FTS *search*-leg failure injection for `search_notes` targeting
+/// any call whose visible namespaces include `ns`.
+///
+/// The next `search_notes` call touching `ns` returns `StorageError::Timeout` from
+/// the FTS leg instead of calling the real `TextSearch::search`, then disarms.
+/// Used to prove the fail-open arm in `search_notes` propagates non-parser
+/// `StorageError`s (issue #389 round-2 High) instead of silently degrading them
+/// the way a genuine FTS5 parser syntax error is degraded.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_fts_search_fail(ns: &str) {
+    *FTS_SEARCH_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
 /// Arm the vector insertion failure injection for `create_note_inner` targeting `ns`.
@@ -2537,19 +2559,67 @@ impl KhiveRuntime {
             .collect();
 
         // FTS5 over the notes index — search all visible namespaces.
-        let text_hits = self
-            .text_for_notes(token)?
-            .search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: visible_ns.clone(),
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
+        //
+        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
+        // (#388, #389 round 2, #389 round-2 High): sanitize_fts5_query strips
+        // known-unsafe FTS5 metacharacters, but residual punctuation the
+        // sanitizer does not strip (by design — the sanitizer stays minimal, the
+        // fail-open net is the systematic answer) can still reach the FTS5 parser
+        // and error. Degrade to vector-only fusion in that case. A genuine
+        // backend outage (pool exhaustion, connection failure, etc.) is NOT a
+        // bad query and must propagate — `is_fts5_syntax_error` is the narrow
+        // gate that tells the two apart. Errors from any other leg (vector
+        // search, note hydration) still propagate normally.
+        //
+        // Injection: check FTS_SEARCH_FAIL_NS (armed by `arm_fts_search_fail(ns)`)
+        // — issue #389 round-2 High regression coverage for the propagate branch.
+        // Fires only when the armed namespace is among this call's visible
+        // namespaces, then clears (one-shot).
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_search_inject = {
+            let mut g = FTS_SEARCH_FAIL_NS.lock().unwrap();
+            match g.as_deref() {
+                Some(armed) if visible_ns.iter().any(|ns| ns == armed) => {
+                    *g = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_search_inject = false;
+
+        let text_search_result = if fts_search_inject {
+            Err(khive_storage::StorageError::Timeout {
+                operation: "fts_search".into(),
             })
-            .await?;
+        } else {
+            self.text_for_notes(token)?
+                .search(TextSearchRequest {
+                    query: query_text.to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(TextFilter {
+                        namespaces: visible_ns.clone(),
+                        ..TextFilter::default()
+                    }),
+                    top_k: candidates,
+                    snippet_chars: 200,
+                })
+                .await
+        };
+
+        let text_hits = match text_search_result {
+            Ok(hits) => hits,
+            Err(e) if e.is_fts5_syntax_error() => {
+                tracing::warn!(
+                    error = %e,
+                    query = %query_text,
+                    "search_notes: FTS leg failed on a parser syntax error, degrading to vector-only fusion"
+                );
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
@@ -4695,6 +4765,62 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.subject_id == note.id),
             "note should be indexed in FTS5 after create"
+        );
+    }
+
+    /// #389 round-2 High regression: the `search_notes` FTS fail-open arm must
+    /// only degrade genuine FTS5 parser syntax errors (see
+    /// `handler_search_note_residual_fts5_char_does_not_error` in
+    /// khive-pack-kg for that case). A non-parser `StorageError` — e.g. a pool
+    /// exhaustion or connection timeout on the text-search backend — is not a
+    /// bad query and must propagate as `Err`, not be silently swallowed into
+    /// an empty (falsely "successful") result set. This is the representative
+    /// site for the four fail-open arms named in the finding: `search_notes`
+    /// (khive-runtime/operations.rs), `hybrid_search`
+    /// (khive-runtime/retrieval.rs), `hybrid_search_with_strategy`
+    /// (khive-runtime/fusion.rs), and `collect_recall_text_hits`
+    /// (khive-pack-memory/handlers/common.rs) all share the exact same
+    /// `is_fts5_syntax_error()` gate added to `StorageError` — proving the
+    /// predicate propagates a non-parser error at one call site generalizes to
+    /// the other three, which route through the identical `match ... Err(e)
+    /// if e.is_fts5_syntax_error() => degrade, Err(e) => return Err(e.into())`
+    /// shape.
+    #[tokio::test]
+    async fn search_notes_propagates_non_parser_fts_error() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "FlashAttention reduces memory by using tiling",
+            Some(0.8),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let ns = tok.namespace().as_str().to_string();
+        arm_fts_search_fail(&ns);
+
+        let result = rt
+            .search_notes(&tok, "FlashAttention", None, 10, None, false, &[], None)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "search_notes must propagate a non-parser FTS StorageError (Timeout) \
+             as Err, not silently degrade it to an empty result, got: {:?}",
+            result.ok()
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
+            ),
+            "propagated error must be the injected StorageError::Timeout, unwrapped \
+             through RuntimeError::Storage"
         );
     }
 
