@@ -4,6 +4,8 @@
 //! `message` notes in the standard notes table. Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -907,25 +909,48 @@ fn sanitize_reference_token(raw: &str) -> Option<String> {
     Some(wrap_message_id(trimmed))
 }
 
+/// Strip angle brackets and surrounding whitespace from a wire-form message id,
+/// for use as a de-duplication comparison key only -- callers keep pushing each
+/// token's original serialization into the emitted header, never this bare form.
+fn bare_reference_id(token: &str) -> String {
+    let trimmed = token.trim();
+    trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 /// Build the full `References` header value for a reply: the parent's existing
 /// chain (each token individually sanitized; malformed tokens skipped per
 /// issue #403 finding), followed by the parent's own Message-ID.
 ///
 /// `parent_chain` tokens are whitespace-separated per RFC 5322. `parent_message_id`
 /// is expected already wire-wrapped (as returned by [`parent_wire_message_id`]).
-/// Returns `None` only when there is no parent Message-ID at all -- degrading
-/// gracefully to "no References header" exactly as before this chain-preserving
-/// fix, matching the existing `In-Reply-To`-absent behavior.
+/// A stored chain can already contain an equivalent of the parent's own id (e.g.
+/// tainted or legacy data); tokens are de-duplicated by their bracket-stripped
+/// form, keeping first-seen order, so the parent id is skipped rather than
+/// appended a second time when an equivalent token is already present.
 fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) -> String {
-    let mut tokens: Vec<String> = parent_chain
+    let chain_tokens = parent_chain
         .map(|chain| {
             chain
                 .split_whitespace()
                 .filter_map(sanitize_reference_token)
-                .collect()
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    tokens.push(parent_message_id.to_string());
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for token in chain_tokens
+        .into_iter()
+        .chain(std::iter::once(parent_message_id.to_string()))
+    {
+        if seen.insert(bare_reference_id(&token)) {
+            tokens.push(token);
+        }
+    }
     tokens.join(" ")
 }
 
@@ -1166,6 +1191,32 @@ mod tests {
         assert_eq!(
             build_references_header(chain, "<parent123@example.com>"),
             "<bare1@example.com> <bare2@example.com> <parent123@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_dedups_when_chain_already_contains_parent_id() {
+        // A stored chain that already contains an equivalent of the parent's own
+        // id (e.g. tainted/legacy data) must not yield a literal duplicate: the
+        // parent id keeps its original position in the chain (first-seen order)
+        // and is not appended a second time at the end.
+        let chain = Some("<root1@example.com> <parent123@example.com> <root2@example.com>");
+        assert_eq!(
+            build_references_header(chain, "<parent123@example.com>"),
+            "<root1@example.com> <parent123@example.com> <root2@example.com>"
+        );
+    }
+
+    #[test]
+    fn build_references_header_dedups_bare_and_bracketed_forms_as_equivalent() {
+        // The de-dup comparison must strip brackets before comparing, not just
+        // compare byte-identical strings -- otherwise a bracket-free chain token
+        // and a bracketed parent_message_id (or vice versa) would both survive
+        // into the header as two "different" entries for the same id.
+        let chain = Some("<parent123@example.com>");
+        assert_eq!(
+            build_references_header(chain, "parent123@example.com"),
+            "<parent123@example.com>"
         );
     }
 }

@@ -257,7 +257,7 @@ fn strip_kind_prefix<'a>(addr: &'a str, kind: &str) -> &'a str {
 mod tests {
     use super::*;
     use crate::config::EmailAuth;
-    use crate::connector::imap::{ImapConnector, ImapFetcher};
+    use crate::connector::imap::{parse_raw_bytes, ImapConnector, ImapFetcher};
     use crate::connector::smtp::{SmtpConnector, SmtpSender};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -435,6 +435,31 @@ mod tests {
             envs[0].wire_references.as_deref(),
             Some("<grandparent1@example.com> <parent123@example.com>"),
             "poll must surface the inbound email's own References chain as wire_references"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_preserves_multi_id_wire_references_through_real_parse() {
+        // Regression: connector::imap::parse_raw_bytes must not drop a multi-id
+        // References chain (mail-parser's `HeaderValue::TextList`) -- exercise the
+        // REAL byte-parsing path here, not a hand-built RawEmail.headers map, since
+        // that hand-built shortcut is exactly what let the live-path bug through.
+        let raw = b"From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Multi-id References test\r\n\
+                    References: <grandparent1@example.com> <grandparent2@example.com>\r\n\
+                    \r\n\
+                    body text";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 4242)
+            .expect("valid RFC 822 bytes must parse");
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].wire_references.as_deref(),
+            Some("grandparent1@example.com grandparent2@example.com"),
+            "both ancestor ids parsed from raw bytes must survive into wire_references; \
+             got envs={envs:?}"
         );
     }
 

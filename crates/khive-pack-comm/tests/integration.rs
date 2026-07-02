@@ -4660,7 +4660,12 @@ async fn reply_extends_references_chain_for_outbound_parent() {
             "from_actor": "lambda:khive",
             "to_actor": "email:ocean@example.com",
             "external_id": "<outbound-msg-002@khive.ai>",
-            "references_chain": "<root1@example.com> <outbound-msg-002@khive.ai>",
+            // Realistic stored shape: an outbound row's own `references_chain` is
+            // ancestors-only (exactly what `build_references_header` computes for
+            // it when it was sent) and never contains that same row's own
+            // `external_id`. See the dedicated dedup regression below for the
+            // tainted-data case where a stored chain does contain it.
+            "references_chain": "<root1@example.com>",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
             "sent_at": chrono::Utc::now().to_rfc3339(),
         }),
@@ -4677,7 +4682,7 @@ async fn reply_extends_references_chain_for_outbound_parent() {
     );
     assert_eq!(
         props["references_chain"].as_str(),
-        Some("<root1@example.com> <outbound-msg-002@khive.ai> <outbound-msg-002@khive.ai>"),
+        Some("<root1@example.com> <outbound-msg-002@khive.ai>"),
         "reply-to-outbound must extend the outbound parent's own references_chain \
          (read direction-aware, not wire_references) followed by its Message-ID; \
          got props={props}"
@@ -4715,5 +4720,48 @@ async fn reply_skips_malformed_token_in_parent_references_chain() {
         Some("<good1@example.com> <good2@example.com> <parent789@example.com>"),
         "a malformed token in the parent's stored chain must be skipped, not \
          propagated into the reply's References; got props={props}"
+    );
+}
+
+/// (e) A stored `references_chain` that is itself tainted -- already containing
+/// an equivalent of the parent's own Message-ID (e.g. legacy/corrupted data;
+/// this exact shape is never produced by `comm.reply` itself, see test (c)
+/// above, which now uses the realistic ancestors-only shape) -- must not be
+/// propagated as a literal duplicate. The duplicate is dropped and first-seen
+/// order is preserved: the parent's id keeps its original position in the
+/// chain rather than being appended again at the end.
+#[tokio::test]
+async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let parent_id = plant_message_note(
+        &rt,
+        "our earlier reply",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "local",
+            "to": "local",
+            "from_actor": "lambda:khive",
+            "to_actor": "email:ocean@example.com",
+            "external_id": "<dup-msg@khive.ai>",
+            "references_chain": "<root1@example.com> <dup-msg@khive.ai> <root2@example.com>",
+            "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
+
+    assert_eq!(
+        props["in_reply_to_message_id"].as_str(),
+        Some("<dup-msg@khive.ai>")
+    );
+    assert_eq!(
+        props["references_chain"].as_str(),
+        Some("<root1@example.com> <dup-msg@khive.ai> <root2@example.com>"),
+        "a tainted chain already containing the parent's own id must be \
+         deduplicated (not doubled at the end) and keep first-seen order; \
+         got props={props}"
     );
 }

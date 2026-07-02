@@ -356,13 +356,32 @@ pub(crate) fn parse_raw_bytes(
 
     let body_html = msg.body_html(0).map(|s| s.to_string());
 
-    // Collect headers into a flat lowercase map (first occurrence wins).
+    // Collect headers into a flat lowercase map (first occurrence wins). Id-list
+    // headers (Message-ID, In-Reply-To, References, ...) route through
+    // mail-parser's `parse_id`, which returns `HeaderValue::Text` for exactly one
+    // id but `HeaderValue::TextList` for two or more (mail-parser 0.9.4
+    // `parsers/fields/id.rs`) -- a `References` chain with an ancestor beyond the
+    // immediate parent is exactly that shape. Both variants are joined into a
+    // single RFC 5322 whitespace-separated value here so the chain survives;
+    // every other header shape (addresses, dates, ...) is dropped exactly as
+    // before.
     let mut headers: HashMap<String, String> = HashMap::new();
     for header in msg.headers() {
         let key = header.name().to_lowercase();
         if let std::collections::hash_map::Entry::Vacant(e) = headers.entry(key) {
-            if let mail_parser::HeaderValue::Text(v) = header.value() {
-                e.insert(v.to_string());
+            match header.value() {
+                mail_parser::HeaderValue::Text(v) => {
+                    e.insert(v.to_string());
+                }
+                mail_parser::HeaderValue::TextList(list) => {
+                    e.insert(
+                        list.iter()
+                            .map(|v| v.as_ref())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -498,6 +517,26 @@ mod tests {
         assert_eq!(email.from_addrs.len(), 2);
         assert!(email.from_addrs.contains(&"alice@example.com".to_string()));
         assert!(email.from_addrs.contains(&"bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_raw_bytes_preserves_multi_id_references() {
+        // mail-parser 0.9.4's `parse_id` returns `HeaderValue::TextList` (not
+        // `Text`) once a header holds 2+ ids -- a `References` chain with an
+        // ancestor beyond the immediate parent is exactly that shape. The raw
+        // parse path must not drop it down to a single (or zero) ids.
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Multi-id References test\r\n\
+                    References: <grandparent1@example.com> <grandparent2@example.com>\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(9, raw, "imap.example.com", 4242).unwrap();
+        assert_eq!(
+            email.references(),
+            Some("grandparent1@example.com grandparent2@example.com"),
+            "both ancestor ids must survive the raw IMAP parse, not just the first"
+        );
     }
 
     #[test]
