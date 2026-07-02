@@ -16,7 +16,7 @@ become generated artifacts under §5 of this document once the verb ships.
 
 ### The disease: documentation drift against a compiled surface
 
-khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (9 under the
+khive's ontology -- 9 entity kinds, 17 edge relations, 5 base note kinds (10 under the
 default pack set today), and the per-relation endpoint matrix -- is a closed, compiled
 contract. The base endpoint allowlist lives in
 `BASE_ENTITY_ENDPOINT_RULES` (`crates/khive-runtime/src/operations.rs`), extended additively
@@ -134,8 +134,9 @@ writes to the store -- except kinds already declared by a pack it `REQUIRES` (e.
 `knowledge.learn` writes the kg-declared `concept`; kg owns that declaration). An
 undeclared written kind makes the `schema` verb under-describe the live data,
 reintroducing one layer down exactly the drift this ADR exists to kill. Audited at
-ratification: comm declares `message` and schedule declares `scheduled_event` in their
-`Pack` impls -- the default pack set has no violator. Enforcement: review-level for new
+ratification: comm declares `message`, schedule declares `scheduled_event`, and session
+declares `session` in their `Pack` impls; brain writes kg-owned `artifact` (covered by
+the `REQUIRES` exception) -- the default pack set has no violator. Enforcement: review-level for new
 packs, plus the end-to-end smoke test asserting that every kind present in a driven store
 run appears in the merged declared vocabulary (`HandlerDef` carries no write-set, so a
 static phase-1 check is impossible; this is a §4 Phase-2-class boundary, stated not
@@ -168,7 +169,8 @@ no side effects. It returns the merged live ontology of the running binary:
     "task",
     "memory",
     "message",
-    "scheduled_event"
+    "scheduled_event",
+    "session"
   ],
   "edge_relations": [
     "contains",
@@ -194,7 +196,7 @@ no side effects. It returns the merged live ontology of the running binary:
     { "source": "*", "relation": "instance_of", "target": "concept", "origin": "base" },
     { "source": "task", "relation": "depends_on", "target": "task", "origin": "pack:gtd" }
   ],
-  "packs_loaded": ["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge"],
+  "packs_loaded": ["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge", "session"],
   "contract_version": "<schema content hash>"
 }
 ```
