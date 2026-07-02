@@ -19,8 +19,26 @@ jobs:
     defaults:
       run:
         working-directory: crates
+    env:
+      # CI gates do not need full debuginfo. line-tables-only keeps file:line
+      # in test backtraces while cutting most of the target-dir and linker
+      # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
+      # `ld terminated with signal 7 [Bus error]`, e.g. run 28604091732).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
+      # ubuntu-latest runners start with ~21GB free on /. The workspace's
+      # check + clippy + test + release passes exceed that, and ld's mmap'd
+      # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
+      # repo never uses (Android, .NET, GHC, CodeQL, docker images) to
+      # reclaim ~25GB before the build starts.
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt, clippy
@@ -30,6 +48,9 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          # Cache key bump: artifacts built with full debuginfo predate the
+          # line-tables-only profile; restoring them would defeat the disk cap.
+          key: line-tables
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
