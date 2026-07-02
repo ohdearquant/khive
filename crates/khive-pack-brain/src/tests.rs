@@ -3963,7 +3963,10 @@ async fn feedback_accepts_short_prefix_target_id() {
 // `resolve_prefix_visible`), mirroring how `memory.recall` already surfaces
 // records across the visible set. Strict `resolve_primary` / `resolve_prefix`
 // remain untouched for mutation-validation callers (gtd depends_on, link
-// endpoints, kg/memory/comm/schedule/knowledge by-id lookups) — see
+// endpoints, and non-KG prefix validators). KG by-ID CRUD
+// (get/update/delete/merge) is the OTHER policy in this fix: its prefix
+// resolution intentionally moved to `resolve_uuid_unfiltered` — no namespace
+// boundary at all, matching the full-UUID by-ID contract — see
 // `khive-pack-gtd/tests/dependencies.rs::resolve_primary_rejects_visible_only_*`
 // and `khive-runtime/tests/integration.rs` visible-set tests.
 //
