@@ -138,6 +138,11 @@ nothing loud to notice it. `bootstrap.sh` closes that gap by calling the
 same OAuth2 `client_credentials` token endpoint the daemon itself would use,
 at bootstrap time.
 
+While the client secret is resolved and in scope, the script also suspends
+any shell tracing that was already active (`set -x`, or running the whole
+script as `bash -x scripts/box/bootstrap.sh`) and restores it only after the
+secret variable has been unset, so tracing output cannot print the secret.
+
 What it checks: whether `KHIVE_EMAIL_OAUTH_CLIENT_ID`,
 `KHIVE_EMAIL_OAUTH_CLIENT_SECRET`, and `KHIVE_EMAIL_OAUTH_TENANT_ID` (read
 the same way the daemon reads them: a real process environment variable
@@ -160,6 +165,11 @@ What PASS/FAIL mean:
 - **Partial config** (only one or two of the three variables set): a loud
   warning, since this is the exact condition under which the channel
   silently disables itself.
+- **Malformed id**: if `KHIVE_EMAIL_OAUTH_CLIENT_ID` or
+  `KHIVE_EMAIL_OAUTH_TENANT_ID` is set but is not shaped like a Microsoft
+  GUID (`8-4-4-4-12` hex digits), a warning names the affected variable
+  (value masked, never raw) and the smoke is skipped non-fatally without
+  calling the token endpoint.
 - **FAIL**: a loud warning containing the `error` and `error_description`
   fields from Microsoft's response. That text is Microsoft's own
   diagnostic and is safe to print, but since it can echo a configured

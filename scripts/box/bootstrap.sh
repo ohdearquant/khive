@@ -91,14 +91,26 @@ mask_value() {
   printf '%s...\n' "${1:0:6}"
 }
 
+# True (exit 0) when `$1` matches the Microsoft GUID shape (8-4-4-4-12 hex
+# digits) used for both client_id and tenant_id. The email auth smoke below
+# calls this on both values, before either can reach scrub_value or a curl
+# argument, so a malformed .env value (stray glob characters, whitespace,
+# wrong length) is rejected at the gate instead of passed further down.
+is_guid_shaped() {
+  local re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  [[ "$1" =~ $re ]]
+}
+
 # Replace every literal occurrence of `value` in `text` with its masked
 # form. Used only to scrub a client_id or tenant_id out of Microsoft's
 # error/error_description text before printing it, since that text
 # sometimes echoes a configured id verbatim (e.g. "Application with
-# identifier 'xxx' was not found in the directory"). Client ids and tenant
-# ids are Microsoft-issued GUIDs, which cannot contain glob metacharacters,
-# so bash's `${text//pattern/repl}` pattern matching is a safe literal
-# replacement here.
+# identifier 'xxx' was not found in the directory"). Every caller passes
+# only a value that has already passed is_guid_shaped(), which guarantees
+# no glob metacharacters (*, ?, [, ]) are present, so bash's
+# `${text//pattern/repl}` pattern matching (where `pattern` is a glob, not
+# a literal string) is a safe literal replacement here. Do not call this
+# with a value that has not been through is_guid_shaped() first.
 scrub_value() {
   local text="$1" value="$2" masked
   if [ -z "$value" ]; then
@@ -293,6 +305,20 @@ fi
 # the client secret, in any form, on any path.
 stage "Email channel auth smoke"
 
+# Shell tracing (a caller-set `set -x`, or `bash -x scripts/box/bootstrap.sh`)
+# prints each command and its expanded arguments to stderr as it runs. Left
+# on through this stage, that would print both the EMAIL_CLIENT_SECRET
+# assignment below and the curl --data-urlencode argument that carries it,
+# in full, regardless of every other guard in this stage. Capture the
+# caller's xtrace state and force it off before any OAuth value is
+# resolved. The single exit seam at the bottom of this stage unsets the
+# secret (and the raw HTTP response) first and only then restores tracing,
+# so the secret exists only while tracing is off.
+case $- in
+  *x*) __smoke_had_xtrace=1; set +x ;;
+  *) __smoke_had_xtrace=0 ;;
+esac
+
 # The whole stage is best-effort: a curl failure, a malformed response, or a
 # missing python3 fallback path are all reported as warnings, matching the
 # non-fatal convention of the stats() smoke test and the actor-identity check
@@ -332,6 +358,22 @@ elif [ "$EMAIL_OAUTH_PRESENT" -lt 3 ]; then
   echo "         all three to use Basic auth (KHIVE_EMAIL_PASSWORD) instead," >&2
   echo "         then:" >&2
   echo "           systemctl --user restart kkernel.service" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+elif ! is_guid_shaped "$EMAIL_CLIENT_ID"; then
+  echo "" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  echo "WARNING: KHIVE_EMAIL_OAUTH_CLIENT_ID ($(mask_value "$EMAIL_CLIENT_ID")) is not" >&2
+  echo "         GUID-shaped (expected 8-4-4-4-12 hex digits); skipping email" >&2
+  echo "         auth smoke. Check $DOTENV for a copy-paste error or stray" >&2
+  echo "         characters." >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+elif ! is_guid_shaped "$EMAIL_TENANT_ID"; then
+  echo "" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  echo "WARNING: KHIVE_EMAIL_OAUTH_TENANT_ID ($(mask_value "$EMAIL_TENANT_ID")) is not" >&2
+  echo "         GUID-shaped (expected 8-4-4-4-12 hex digits); skipping email" >&2
+  echo "         auth smoke. Check $DOTENV for a copy-paste error or stray" >&2
+  echo "         characters." >&2
   echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
 else
   TOKEN_URL="https://login.microsoftonline.com/${EMAIL_TENANT_ID}/oauth2/v2.0/token"
@@ -373,6 +415,16 @@ else
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
   fi
 fi
+
+# Single exit seam for this stage: every path above (unconfigured skip,
+# partial-config warning, malformed-GUID skip x2, curl failure, parse
+# failure, PASS, FAIL) falls through to here with no early return. Unset the
+# secret and the raw HTTP response before restoring the caller's xtrace
+# state, so neither value can be traced by any later command in this stage
+# or by a future edit that re-enables tracing before they would otherwise
+# have gone out of scope.
+unset EMAIL_CLIENT_SECRET EMAIL_RESPONSE
+[ "${__smoke_had_xtrace}" = "1" ] && set -x
 
 set -e
 
