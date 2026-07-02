@@ -386,6 +386,28 @@ pub(crate) fn parse_raw_bytes(
         }
     }
 
+    // Every Authentication-Results occurrence, in document order (topmost
+    // first), verbatim. Collected separately from `headers` above because that
+    // map keeps only the first occurrence of a header name; the attribution
+    // gate needs every occurrence to find the topmost one carrying the
+    // configured trust anchor (ADR-056 Amendment 2026-07-02).
+    let mut authentication_results: Vec<String> = Vec::new();
+    for header in msg.headers() {
+        if !header.name().eq_ignore_ascii_case("authentication-results") {
+            continue;
+        }
+        match header.value() {
+            mail_parser::HeaderValue::Text(v) => authentication_results.push(v.to_string()),
+            mail_parser::HeaderValue::TextList(list) => authentication_results.push(
+                list.iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => {}
+        }
+    }
+
     Some(RawEmail {
         uid,
         imap_external_id,
@@ -397,6 +419,7 @@ pub(crate) fn parse_raw_bytes(
         body_text,
         body_html,
         headers,
+        authentication_results,
     })
 }
 
@@ -480,6 +503,7 @@ mod tests {
             body_text: Some("body".to_string()),
             body_html: None,
             headers: HashMap::new(),
+            authentication_results: Vec::new(),
         }
     }
 
@@ -614,6 +638,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_bytes_collects_single_authentication_results_header() {
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: single AR header\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(
+            email.authentication_results,
+            vec!["mx.example.com; dmarc=pass header.from=example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_preserves_all_authentication_results_in_document_order() {
+        // The general `headers` map keeps only the first occurrence of a header
+        // name; Authentication-Results needs every occurrence, in the order an
+        // MTA stamps them (topmost = most recently added), to support the
+        // "topmost trusted authserv-id wins" attribution gate.
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    Authentication-Results: mx.example.com; dmarc=fail header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: two AR headers\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(
+            email.authentication_results,
+            vec![
+                "mx.example.com; dmarc=pass header.from=example.com".to_string(),
+                "mx.example.com; dmarc=fail header.from=example.com".to_string(),
+            ],
+            "both occurrences must survive, topmost first"
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_no_authentication_results_header_yields_empty_vec() {
+        let raw = b"From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: no auth header\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert!(email.authentication_results.is_empty());
+    }
+
+    #[test]
     fn raw_email_khive_thread_id_header() {
         let mut headers = HashMap::new();
         headers.insert("x-khive-thread-id".to_string(), "some-uuid".to_string());
@@ -628,6 +702,7 @@ mod tests {
             body_text: None,
             body_html: None,
             headers,
+            authentication_results: Vec::new(),
         };
         assert_eq!(email.khive_thread_id(), Some("some-uuid"));
         assert_eq!(email.correlation(), Some("some-uuid"));
@@ -724,6 +799,7 @@ mod tests {
             body_text: Some("reply body".to_string()),
             body_html: None,
             headers,
+            authentication_results: Vec::new(),
         };
         assert_eq!(email.in_reply_to(), Some("<orig@example.com>"));
         assert_eq!(email.correlation(), Some("<orig@example.com>"));
