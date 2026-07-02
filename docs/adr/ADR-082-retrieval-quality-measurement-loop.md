@@ -245,9 +245,17 @@ k alongside the storage change it requires.
    `retrieval_eval_run_count` (introduced in D1 above) only ever counts complete, valid
    runs.
 2. For each query, invoke the existing `knowledge.search` runtime path with `limit = 5`
-   (scoped to the runner's namespace, above), collecting the returned atom slugs in rank
-   order (`search` already returns a `slug` field per hit —
-   `crates/khive-pack-knowledge/src/knowledge/search.rs`). Call this ordered list
+   and `type = "atom"` (scoped to the runner's namespace, above), collecting the returned
+   atom slugs in rank order (`search` already returns a `slug` field per hit —
+   `crates/khive-pack-knowledge/src/knowledge/search.rs`). Pinning the result type is
+   required, not optional: `search` defaults to `type = "both"`
+   (`crates/khive-pack-knowledge/src/vocab.rs:180-184`), and under that default, domain
+   mirror rows (`"kind": "domain"`,
+   `crates/khive-pack-knowledge/src/knowledge/search.rs:1102-1110`) can occupy top-5
+   slots. Slice 1 is atom-level evaluation — `expected_slugs` are atom slugs by the
+   step-1 contract — so the runner requests atoms at the search call rather than
+   filtering domains out of a mixed top 5 afterwards, which would silently hand the
+   metrics fewer than 5 atom candidates. Call this ordered list
    `top_5_returned_slugs`; it may have fewer than 5 entries if the corpus has fewer than 5
    matches.
 3. Score the query directly against `expected_slugs` by set intersection — no
@@ -284,14 +292,25 @@ k alongside the storage change it requires.
 
 ### `knowledge.stats()` reads the last run
 
-`stats()` (`crud.rs:604`) gains one additional `query_scalar` read, following the same
-pattern as the existing `finalized_count` query at `crud.rs:631-638`: select the most
-recent `knowledge_eval_runs` row for the token's namespace (`ORDER BY run_at DESC LIMIT
-1`) and emit the four `retrieval_eval_*` fields shown in D1. This is the same
-`token.namespace()` derivation the runner itself uses to write the row (§"Eval runner
-mechanics"), so the row `stats()` reads back is always the row the caller's own most
-recent run wrote — never a different namespace's row. No run for the namespace yet
-produces the zero/null sentinel row described above.
+`stats()` (`crud.rs:604`) gains two additional reads against `knowledge_eval_runs`, both
+filtered to the token's namespace. Two reads are required by the storage API's shapes:
+`query_scalar` returns the first column of the first row as one `Option<SqlValue>`
+(`crates/khive-storage/src/sql.rs`), so no single scalar read can supply both an
+aggregate count and the latest row's metric columns.
+
+1. A `query_scalar` `COUNT(*)` over the namespace's rows supplies
+   `retrieval_eval_run_count`, following the same pattern as the existing
+   `finalized_count` query at `crud.rs:631-638`. Every stored row is a complete valid
+   run (the fail-fast contract in §"Eval runner mechanics" writes no partial rows), so
+   the row count is the run count.
+2. A `query_row` read selecting the most recent row (`ORDER BY run_at DESC LIMIT 1`)
+   supplies the other three D1 fields: `retrieval_eval_coverage` (the row's
+   `precision_at_5`), `retrieval_eval_last_run_at`, and `retrieval_eval_last_mrr`.
+
+Both reads use the same `token.namespace()` derivation the runner itself uses to write
+the row (§"Eval runner mechanics"), so the values `stats()` reads back always describe
+the caller's own runs — never a different namespace's rows. No run for the namespace yet
+produces the zero/null sentinel values described above.
 
 ## Consequences
 
