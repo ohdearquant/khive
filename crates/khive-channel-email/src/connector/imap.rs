@@ -526,6 +526,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_bytes_strips_angle_brackets_from_real_in_reply_to() {
+        // Real RFC 822 bytes routed through mail_parser (not a synthetic
+        // RawEmail/headers map like the tests below) — pins the bracket-
+        // stripping behavior that comm.ingest's bracket-toggle matching
+        // depends on. mail_parser's id parser (used for
+        // In-Reply-To/Message-ID/References) strips the `<...>` envelope
+        // for the single-ancestor case, so the headers map must carry the
+        // bracket-free form.
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Re: original thread\r\n\
+                    Message-ID: <reply-id@khive.ai>\r\n\
+                    In-Reply-To: <some-id@khive.ai>\r\n\
+                    Date: Mon, 1 Jul 2026 10:00:00 +0000\r\n\
+                    \r\n\
+                    This is a reply.";
+        let email = parse_raw_bytes(11, raw, "imap.example.com", 42).unwrap();
+        assert_eq!(
+            email.headers.get("in-reply-to").map(String::as_str),
+            Some("some-id@khive.ai"),
+            "mail_parser must strip angle brackets for the single-ancestor case"
+        );
+        assert_eq!(
+            email.correlation(),
+            Some("some-id@khive.ai"),
+            "correlation() falls through to in_reply_to when X-Khive-Thread-ID is absent"
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_correlation_prefers_khive_thread_id_when_present() {
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Re: original thread\r\n\
+                    Message-ID: <reply-id@khive.ai>\r\n\
+                    In-Reply-To: <some-id@khive.ai>\r\n\
+                    X-Khive-Thread-ID: thread-uuid-123\r\n\
+                    Date: Mon, 1 Jul 2026 10:00:00 +0000\r\n\
+                    \r\n\
+                    This is a reply.";
+        let email = parse_raw_bytes(12, raw, "imap.example.com", 42).unwrap();
+        assert_eq!(
+            email.correlation(),
+            Some("thread-uuid-123"),
+            "correlation() must prefer X-Khive-Thread-ID over In-Reply-To"
+        );
+    }
+
+    #[test]
     fn raw_email_khive_thread_id_header() {
         let mut headers = HashMap::new();
         headers.insert("x-khive-thread-id".to_string(), "some-uuid".to_string());
