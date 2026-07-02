@@ -5,6 +5,10 @@
 **Authors**: Ocean, lambda:khive
 **Depends on**: [ADR-015](ADR-015-schema-migrations.md) (Schema Migrations), [ADR-023](ADR-023-declarative-pack-format.md) (Pack Verb Surface, Visibility, and Composition — `Visibility::Subhandler`), [ADR-047](ADR-047-knowledge-pack.md) (Knowledge Pack)
 **GitHub**: #80
+**Note**: this number was previously used by a retired v0-series draft ("Engine
+Configuration Schema") consolidated into [ADR-031](ADR-031-multi-engine-retrieval.md);
+that draft was archived at the 2026-05-23 v0→v1 ADR renumbering and does not refer to
+this document.
 
 ## Context
 
@@ -45,9 +49,12 @@ struct, and metric functions `recall_at_k`, `precision_at_k`, `ndcg_at_k`, `mrr`
 `compute_all`. It is used today only in bench fixtures
 (`crates/khive-retrieval/benches/fusion_bench.rs`), never invoked by `knowledge.search`
 or `knowledge.stats`. Issue #80's "minimal viable loop" (a labeled query set, an
-evaluation verb reporting hit-rate/MRR, optional feedback-grown set expansion) can be
-built almost entirely on this existing library — the missing piece is plumbing, not
-retrieval math.
+evaluation verb reporting hit-rate/MRR, optional feedback-grown set expansion) needs no
+new _retrieval_ math — `knowledge.search` already exists and returns ranked slugs, so the
+missing piece is plumbing, not a new search algorithm. It does need its own metric
+contract, not this library's label-based functions: the runner scores against a
+ground-truth expected-slug set (§"Eval runner mechanics" explains why the label-based
+conventions here do not fit that use case).
 
 ### Scoping and rulings
 
@@ -66,7 +73,8 @@ it records the decisions and specifies what ships.
 This ADR specifies the smallest increment that moves retrieval-quality measurement off
 "nonexistent" with an honest number: a versioned `knowledge_eval_runs` table, a labeled
 query-set format (synthetic and public by default, path-overridable), a CLI-only eval
-runner that reuses the existing evaluation library, hit-rate/MRR persisted per run, and
+runner that reuses `knowledge.search` as its retrieval path with its own expected-set
+metric contract (§"Eval runner mechanics"), hit-rate/MRR persisted per run, and
 `knowledge.stats()` reading the most recent run. Feedback-grown query-set expansion
 (issue #80's optional third bullet: accumulating labeled pairs from `brain.feedback`-style
 signals emitted by agents) is explicitly **out of scope** for this ADR. It requires its
@@ -114,7 +122,7 @@ in `crates/khive-pack-knowledge/src/vocab.rs` with `visibility: Visibility::Subh
 kkernel CLI's verb-DSL `exec` subcommand:
 
 ```bash
-kkernel exec 'knowledge.eval_retrieval(query_set="crates/khive-pack-knowledge/tests/fixtures/eval_set.toml", k=5)'
+kkernel exec 'knowledge.eval_retrieval(query_set="crates/khive-pack-knowledge/tests/fixtures/eval_set.toml")'
 ```
 
 This is the same pattern already shipped for `memory.recall_embed` and
@@ -179,15 +187,19 @@ The query set is a TOML file, one file per set, shaped:
 [[queries]]
 query = "how does grouped query attention reduce KV cache size"
 expected_slugs = ["gqa"]
-min_k = 5
 
 [[queries]]
 query = "retrieval augmented generation retrieving passages before generation"
 expected_slugs = ["rag"]
 ```
 
-`min_k` is optional (defaults to the runner's `k` parameter, §6). A query may name more
-than one `expected_slugs` entry when multiple atoms legitimately satisfy it.
+A query may name more than one `expected_slugs` entry when multiple atoms legitimately
+satisfy it. Every query MUST have non-empty `query` text and a non-empty `expected_slugs`
+list; §"Eval runner mechanics" specifies the fail-fast validation contract for violations.
+There is no `min_k` or other search-depth override in slice-1 — the runner always searches
+with `limit = 5` (§"Eval runner mechanics") — because k is fixed, not a per-query or
+per-run parameter; a future ADR may add configurable search depth alongside the
+dynamic-`k` metric storage that would require.
 
 The shipped public fixture, `crates/khive-pack-knowledge/tests/fixtures/eval_set.toml`,
 is synthetic: 10-15 queries built over the same domain vocabulary already seeded in the
@@ -205,33 +217,80 @@ run against their own labeled data without touching the repository.
 
 ### Eval runner mechanics
 
-`knowledge.eval_retrieval(query_set: <path>, k: usize = 5, namespace: <string>?)`:
+`knowledge.eval_retrieval(query_set: <path>)`:
 
-1. Parse the TOML query set at `query_set`.
-2. For each query, invoke the existing `knowledge.search` runtime path with
-   `limit = max(k, min_k)`, collecting the returned atom slugs in rank order (`search`
-   already returns a `slug` field per hit —
-   `crates/khive-pack-knowledge/src/knowledge/search.rs`).
-3. Map each ranked slug to a `khive_retrieval::eval::LabeledResult`: `label =
-   RetrievalLabel::Decisive` when the slug is in `expected_slugs`, else
-   `RetrievalLabel::Irrelevant`. `section_id` is populated with a placeholder UUID — it is
-   unread by `recall_at_k`, `precision_at_k`, and `mrr`, which key only on `.label`. This
-   is a deliberate, minimal use of the existing five-level taxonomy: atom-level retrieval
-   is being scored as a binary hit/miss, not the richer graded relevance that
-   `RetrievalLabel` supports for section-level retrieval. No new evaluation math is
-   written; `recall_at_k` and `mrr` from `khive_retrieval::eval::engine_eval` are called
-   unmodified.
-4. Aggregate mean `precision_at_5`, `recall_at_5`, and `mrr` across every query in the
-   set.
-5. Write one row to `knowledge_eval_runs`.
+**Namespace is derived, not a parameter.** The runner takes no `namespace` argument. It
+derives its namespace from the dispatch token exactly the way `knowledge.stats` and
+`knowledge.search` already do (`token.namespace()`), not from a caller-supplied override.
+Every `knowledge.search` call the runner issues, and the `knowledge_eval_runs` row it
+writes, therefore share exactly the token's namespace — `knowledge.stats()`
+(§"`knowledge.stats()` reads the last run") reads the latest row for that same token
+namespace, so a run's write and its later read can never diverge onto different
+namespaces. There is no cross-namespace override in slice-1; an operator who needs to
+evaluate a different namespace calls with a token scoped to that namespace.
+
+**k is fixed at 5, not a parameter.** The runner takes no `k` argument and searches with
+`limit = 5` for every query; every metric is computed at 5. Dynamic `k` (per-run or
+per-query) requires schema support for per-k metric storage — the `knowledge_eval_runs`
+schema above hard-codes `precision_at_5`/`recall_at_5` columns precisely because slice-1
+fixes the contract at one k — and is out of scope here; a future ADR may add configurable
+k alongside the storage change it requires.
+
+1. Parse the TOML query set at `query_set`, and validate every `[[queries]]` entry before
+   running anything. **Fail-fast contract**: if the file fails to parse, or any entry is
+   invalid (empty/missing `query` text, or an empty `expected_slugs` list), the run
+   **aborts** — no `knowledge_eval_runs` row is written — and `knowledge.eval_retrieval`
+   returns a validation error naming the file path and the 0-indexed position of the
+   offending entry in the `[[queries]]` array. Partial runs are never recorded, so
+   `retrieval_eval_run_count` (introduced in D1 above) only ever counts complete, valid
+   runs.
+2. For each query, invoke the existing `knowledge.search` runtime path with `limit = 5`
+   (scoped to the runner's namespace, above), collecting the returned atom slugs in rank
+   order (`search` already returns a `slug` field per hit —
+   `crates/khive-pack-knowledge/src/knowledge/search.rs`). Call this ordered list
+   `top_5_returned_slugs`; it may have fewer than 5 entries if the corpus has fewer than 5
+   matches.
+3. Score the query directly against `expected_slugs` by set intersection — no
+   `LabeledResult` mapping, and no call into `khive_retrieval::eval::engine_eval`:
+   - `hits = |expected_slugs ∩ top_5_returned_slugs|` — a slug-set intersection;
+     `expected_slugs` contributes no order, `top_5_returned_slugs`'s rank order is used
+     only by `mrr` below.
+   - `recall_at_5 = hits / |expected_slugs|`. The denominator is the query's own expected
+     set size. `expected_slugs` is guaranteed non-empty by the fail-fast contract in step
+     1, so this division is always defined.
+   - `precision_at_5 = hits / 5`. The denominator is the fixed requested k, never
+     `top_5_returned_slugs.len()`: if search returns fewer than 5 results, the missing
+     slots count as misses instead of shrinking the denominator.
+   - `mrr = 1 / rank` of the first entry in `top_5_returned_slugs` whose slug is in
+     `expected_slugs` (rank is 1-indexed); `0.0` if no entry in the top 5 matches.
+
+   This deliberately diverges from the label-based conventions in
+   `khive_retrieval::eval::engine_eval`: its `recall_at_k` returns a vacuous `1.0` when a
+   results list contains no relevant labels at all, and its `precision_at_k` clamps its
+   denominator to `results.len()` rather than the requested `k`. Those conventions are
+   correct for their own purpose — grading the ranking quality of a results list a human
+   or eval pipeline has already labeled, where "no relevant labels present" describes the
+   label set, not a retrieval failure. This ADR measures something different: retrieval
+   quality against a ground-truth expected set, where a query whose expected atoms are
+   entirely absent from the top 5 is exactly the failure case being measured, and must
+   score `recall_at_5 = 0.0`, not `1.0`. Reusing the label-based functions unmodified would
+   make that failure case invisible, so the runner computes its own set-intersection
+   metrics instead of calling `recall_at_k`, `precision_at_k`, or `mrr` from the eval
+   library — `LabeledResult` and `RetrievalLabel` are not constructed anywhere in this
+   runner.
+4. Aggregate mean `precision_at_5`, `recall_at_5`, and `mrr` across every query in the set.
+5. Write one row to `knowledge_eval_runs` with the runner's namespace (above).
 6. Return `{run_id, total_queries, precision_at_5, recall_at_5, mrr}`.
 
 ### `knowledge.stats()` reads the last run
 
 `stats()` (`crud.rs:604`) gains one additional `query_scalar` read, following the same
 pattern as the existing `finalized_count` query at `crud.rs:631-638`: select the most
-recent `knowledge_eval_runs` row for the namespace (`ORDER BY run_at DESC LIMIT 1`) and
-emit the four `retrieval_eval_*` fields shown in D1. No run for the namespace yet
+recent `knowledge_eval_runs` row for the token's namespace (`ORDER BY run_at DESC LIMIT
+1`) and emit the four `retrieval_eval_*` fields shown in D1. This is the same
+`token.namespace()` derivation the runner itself uses to write the row (§"Eval runner
+mechanics"), so the row `stats()` reads back is always the row the caller's own most
+recent run wrote — never a different namespace's row. No run for the namespace yet
 produces the zero/null sentinel row described above.
 
 ## Consequences
@@ -242,8 +301,12 @@ produces the zero/null sentinel row described above.
   namespace-scoped signal, closing the actual gap issue #80 identifies.
 - Zero risk to the existing `eval_coverage` consumer or its integration test — the
   change is purely additive at the JSON level and the SQL schema level.
-- No new evaluation math: `recall_at_k` and `mrr` are reused unmodified from an already
-  tested library.
+- No new _retrieval_ math: the runner reuses the existing `knowledge.search` runtime path
+  unmodified. Its metric computation is new but intentionally small — direct
+  set-intersection scoring against `expected_slugs` (§"Eval runner mechanics") — because
+  the existing label-based `recall_at_k`/`precision_at_k`/`mrr` in
+  `khive_retrieval::eval::engine_eval` are tuned for graded-relevance ranking review, not
+  ground-truth-expected-set retrieval, and would misscore a total miss as perfect recall.
 - No MCP wire-surface change, no ADR-023 amendment, no `AGENTS.md` churn — the entire
   runner ships behind `Visibility::Subhandler`.
 - The public repository never carries real corpus-derived query/answer pairs; the
@@ -291,7 +354,7 @@ produces the zero/null sentinel row described above.
 - [ADR-015](ADR-015-schema-migrations.md) — schema migration mechanism; append-only `VersionedMigration` convention used by §"Schema"
 - [ADR-023](ADR-023-declarative-pack-format.md) — `Visibility::{Verb, Subhandler}`; kkernel `exec` CLI verb-DSL; the mechanism D2 relies on
 - [ADR-047](ADR-047-knowledge-pack.md) — Knowledge Pack; `knowledge.stats`, `knowledge.search`, and the 19-verb baseline this ADR extends
-- `crates/khive-retrieval/src/eval/engine_eval.rs` — `RetrievalLabel`, `LabeledResult`, `recall_at_k`, `precision_at_k`, `ndcg_at_k`, `mrr`, `compute_all`
+- `crates/khive-retrieval/src/eval/engine_eval.rs` — existing label-based retrieval eval library (`RetrievalLabel`, `LabeledResult`, `recall_at_k`, `precision_at_k`, `ndcg_at_k`, `mrr`, `compute_all`); referenced for contrast in §"Eval runner mechanics" — not called by the runner
 - `crates/khive-pack-knowledge/src/knowledge/crud.rs` — `stats()` (lines 604-680), the `eval_coverage` computation this ADR leaves unchanged
 - `crates/khive-pack-knowledge/src/knowledge/search.rs` — atom search result shape (`slug` field) consumed by the eval runner
 - `crates/khive-pack-knowledge/tests/integration.rs` — existing `eval_coverage` assertion (line 1125) and domain-vocabulary fixture corpus (lines 1216-1225)
