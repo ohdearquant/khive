@@ -148,11 +148,15 @@ impl KhiveRuntime {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let ns = token.namespace().as_str().to_owned();
-        // Fail-open on the FTS leg only (#388): sanitize_fts5_query already strips
-        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors at
-        // runtime (anything sanitization misses), degrade to vector-only fusion
-        // instead of aborting the whole hybrid search. Errors from any other leg
-        // (vector search) still propagate normally.
+        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
+        // (#388, #389 round-2 High): sanitize_fts5_query already strips
+        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors
+        // at runtime on residual punctuation the sanitizer does not strip,
+        // degrade to vector-only fusion. A genuine backend outage (pool
+        // exhaustion, connection failure, etc.) is NOT a bad query and must
+        // propagate — `is_fts5_syntax_error` is the narrow gate that tells the
+        // two apart. Errors from any other leg (vector search) still
+        // propagate normally.
         let text_hits = match self
             .text(token)?
             .search(TextSearchRequest {
@@ -168,14 +172,15 @@ impl KhiveRuntime {
             .await
         {
             Ok(hits) => hits,
-            Err(e) => {
+            Err(e) if e.is_fts5_syntax_error() => {
                 tracing::warn!(
                     error = %e,
                     query = %query_text,
-                    "hybrid_search_with_strategy: FTS leg failed, degrading to vector-only fusion"
+                    "hybrid_search_with_strategy: FTS leg failed on a parser syntax error, degrading to vector-only fusion"
                 );
                 Vec::new()
             }
+            Err(e) => return Err(e.into()),
         };
 
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
