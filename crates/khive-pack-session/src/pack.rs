@@ -4,12 +4,32 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
-use crate::{handlers, SessionPack, SESSION_HANDLERS};
+use crate::{handlers, vocab::SESSION_HANDLERS};
 
-// ── inventory self-registration ───────────────────────────────────────────────
+pub struct SessionPack {
+    runtime: KhiveRuntime,
+}
+
+impl SessionPack {
+    pub fn new(runtime: KhiveRuntime) -> Self {
+        Self { runtime }
+    }
+
+    pub(crate) fn runtime(&self) -> &KhiveRuntime {
+        &self.runtime
+    }
+}
+
+impl Pack for SessionPack {
+    const NAME: &'static str = "session";
+    const NOTE_KINDS: &'static [&'static str] = &["session"];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &SESSION_HANDLERS;
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
 
 struct SessionPackFactory;
 
@@ -29,8 +49,6 @@ impl khive_runtime::PackFactory for SessionPackFactory {
 
 inventory::submit! { khive_runtime::PackRegistration(&SessionPackFactory) }
 
-// ── PackRuntime impl ──────────────────────────────────────────────────────────
-
 #[async_trait]
 impl PackRuntime for SessionPack {
     fn name(&self) -> &str {
@@ -46,7 +64,7 @@ impl PackRuntime for SessionPack {
     }
 
     fn handlers(&self) -> &'static [HandlerDef] {
-        &SESSION_HANDLERS
+        <SessionPack as Pack>::HANDLERS
     }
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
@@ -57,24 +75,6 @@ impl PackRuntime for SessionPack {
         <SessionPack as Pack>::REQUIRES
     }
 
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "session",
-            statements: &crate::SESSION_SCHEMA_PLAN_STMTS,
-        }
-    }
-
-    async fn warm(&self) {
-        let config = crate::mirror::MirrorConfig::from_env();
-        if !config.enabled && !config.codex_enabled {
-            return;
-        }
-        let runtime = self.runtime().clone();
-        tokio::spawn(async move {
-            crate::mirror::run_mirror_service(runtime, config).await;
-        });
-    }
-
     async fn dispatch(
         &self,
         verb: &str,
@@ -82,13 +82,15 @@ impl PackRuntime for SessionPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        let rt = self.runtime();
+        let runtime = self.runtime();
         match verb {
-            "session.store" => handlers::store::handle_store(rt, token, params).await,
-            "session.list" => handlers::list::handle_list(rt, token, params).await,
-            "session.get" => handlers::get::handle_get(rt, token, params).await,
+            "session.store" => handlers::store::handle_store(runtime, token, params).await,
+            "session.list" => handlers::list::handle_list(runtime, token, params).await,
+            "session.resume" => handlers::resume::handle_resume(runtime, token, params).await,
+            "session.export" => handlers::export::handle_export(runtime, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
-                "session pack does not handle verb {verb:?}"
+                "session pack does not handle verb {verb:?}; valid verbs: \
+                 session.store, session.list, session.resume, session.export"
             ))),
         }
     }

@@ -1,32 +1,17 @@
-//! Session serialization — an in-process helper, NOT a dispatchable verb.
-//!
-//! `handle_export` serializes a session record for downstream use. It is called
-//! directly in-process (no `HandlerDef`, no DSL dispatch arm): serialization is
-//! a function, not a speech act. Forward-deployed until the in-process call site
-//! lands; `#[allow(dead_code)]` on the module re-export covers the interim.
+//! `session.export` - serialize one stored session as json or markdown.
 
-use std::str::FromStr;
-
-use serde::Deserialize;
 use serde_json::Value;
-use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 
-use super::{deser, render_session_full};
+use super::{
+    deser, fetch_session_note, resolve_session_uuid, to_session_record, ExportJsonResult,
+    ExportMarkdownResult, ExportParams,
+};
+use crate::vocab::VALID_EXPORT_FORMATS;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExportParams {
-    id: String,
-    #[serde(default)]
-    format: Option<String>,
-}
+const VERB: &str = "session.export";
 
-/// Serialize a session record for downstream use.
-///
-/// `format="json"` (default) returns the full Note envelope as a JSON object.
-/// `format="text"` returns the `content` field as a plain JSON string.
 pub(crate) async fn handle_export(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -34,36 +19,58 @@ pub(crate) async fn handle_export(
 ) -> Result<Value, RuntimeError> {
     let p: ExportParams = deser(params)?;
     let format = p.format.as_deref().unwrap_or("json");
-
-    if format != "json" && format != "text" {
+    if !VALID_EXPORT_FORMATS.contains(&format) {
         return Err(RuntimeError::InvalidInput(format!(
-            "session.export: format must be \"json\" or \"text\"; got {format:?}"
+            "{VERB}: format must be one of {VALID_EXPORT_FORMATS:?}; got {format:?}"
         )));
     }
 
-    let uuid = Uuid::from_str(&p.id).map_err(|_| {
-        RuntimeError::InvalidInput(format!("session.export: id must be a UUID; got {:?}", p.id))
-    })?;
-
-    let note = runtime
-        .notes(token)?
-        .get_note(uuid)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("get_note: {e}")))?
-        .ok_or_else(|| RuntimeError::NotFound(format!("session not found: {}", p.id)))?;
-
-    if note.kind != "session" {
-        return Err(RuntimeError::InvalidInput(format!(
-            "session.export: expected kind=\"session\", got {:?}",
-            note.kind
-        )));
-    }
-    if note.deleted_at.is_some() {
-        return Err(RuntimeError::NotFound(format!("session deleted: {}", p.id)));
-    }
+    let uuid = resolve_session_uuid(runtime, token, &p.id, VERB).await?;
+    let note = fetch_session_note(runtime, token, uuid, VERB).await?;
+    let record = to_session_record(&note);
 
     match format {
-        "text" => Ok(Value::String(note.content.clone())),
-        _ => Ok(render_session_full(&note)),
+        "markdown" => {
+            let title = record
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Session {}", &record.id[..8]));
+            let tags = if record.tags.is_empty() {
+                String::new()
+            } else {
+                record.tags.join(", ")
+            };
+            let content = format!(
+                "# {title}\n\n\
+                 - id: {id}\n\
+                 - provider: {provider}\n\
+                 - provider_session_id: {provider_session_id}\n\
+                 - created_at: {created_at}\n\
+                 - updated_at: {updated_at}\n\
+                 - tags: {tags}\n\n\
+                 ## Content\n\n\
+                 {body}",
+                id = record.id,
+                provider = record.provider.as_deref().unwrap_or("null"),
+                provider_session_id = record.provider_session_id.as_deref().unwrap_or("null"),
+                created_at = record.created_at,
+                updated_at = record.updated_at,
+                body = record.content,
+            );
+            let result = ExportMarkdownResult {
+                ok: true,
+                format: "markdown",
+                content,
+            };
+            Ok(serde_json::to_value(result).expect("ExportMarkdownResult serializes"))
+        }
+        _ => {
+            let result = ExportJsonResult {
+                ok: true,
+                format: "json",
+                session: record,
+            };
+            Ok(serde_json::to_value(result).expect("ExportJsonResult serializes"))
+        }
     }
 }

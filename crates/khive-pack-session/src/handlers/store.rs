@@ -1,31 +1,14 @@
-//! `session.store` — store a session record as a `kind=session` note.
+//! `session.store` - store a session record as a `kind=session` note.
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 
-use super::{deser, render_session_full};
+use super::{deser, require_non_empty_if_present, to_session_record, StoreParams, StoreResult};
+use crate::vocab::SESSION_KIND;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoreParams {
-    content: String,
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    tags: Option<Vec<String>>,
-    #[serde(default)]
-    metadata: Option<Value>,
-}
+const VERB: &str = "session.store";
 
-/// Store a session blob as a `kind=session` note.
-///
-/// Builds `properties` from the optional `metadata` object (if provided),
-/// then overlays `agent_id` and `tags` from their explicit params so that
-/// named params always win over metadata keys.
-///
-/// Implementation: `runtime.create_note(token, "session", None, content, None, props, vec![])`.
 pub(crate) async fn handle_store(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -34,42 +17,50 @@ pub(crate) async fn handle_store(
     let p: StoreParams = deser(params)?;
 
     if p.content.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput(
-            "session.store: content must not be empty".into(),
-        ));
+        return Err(RuntimeError::InvalidInput(format!(
+            "{VERB}: content must not be empty"
+        )));
+    }
+    require_non_empty_if_present(&p.title, "title", VERB)?;
+    require_non_empty_if_present(&p.provider, "provider", VERB)?;
+    require_non_empty_if_present(&p.provider_session_id, "provider_session_id", VERB)?;
+    if let Some(tags) = &p.tags {
+        for tag in tags {
+            if tag.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{VERB}: tags entries must be non-empty strings"
+                )));
+            }
+        }
     }
 
-    // Build properties: start from caller-supplied metadata (if any), then
-    // overlay the named params so explicit args always take precedence.
-    let mut props = match p.metadata {
-        Some(Value::Object(obj)) => Value::Object(obj),
-        Some(_) => {
-            return Err(RuntimeError::InvalidInput(
-                "session.store: metadata must be a JSON object".into(),
-            ))
-        }
-        None => json!({}),
-    };
-
-    let obj = props.as_object_mut().expect("props is object");
-    if let Some(agent_id) = &p.agent_id {
-        obj.insert("agent_id".into(), json!(agent_id));
+    let mut properties = serde_json::Map::new();
+    if let Some(provider) = &p.provider {
+        properties.insert("provider".into(), json!(provider));
+    }
+    if let Some(provider_session_id) = &p.provider_session_id {
+        properties.insert("provider_session_id".into(), json!(provider_session_id));
     }
     if let Some(tags) = &p.tags {
-        obj.insert("tags".into(), json!(tags));
+        properties.insert("tags".into(), json!(tags));
     }
 
-    let note = runtime
+    let core = runtime.core();
+    let note = core
         .create_note(
             token,
-            "session",
-            None,
+            SESSION_KIND,
+            p.title.as_deref(),
             &p.content,
             None,
-            Some(props),
+            Some(Value::Object(properties)),
             vec![],
         )
         .await?;
 
-    Ok(render_session_full(&note))
+    let result = StoreResult {
+        ok: true,
+        session: to_session_record(&note),
+    };
+    Ok(serde_json::to_value(result).expect("StoreResult serializes"))
 }

@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Session verb pack — store/list/get over the notes substrate (ADR-080)"
+description = "Session verb pack - store/list/resume/export over the notes substrate"
 
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
@@ -18,10 +18,7 @@ khive-storage = { version = "0.3.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 uuid = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
