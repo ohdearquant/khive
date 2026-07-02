@@ -3,9 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: Ocean, lambda:khive\
-**Consolidates**: ADR-078 (umbrella), ADR-081 (Embedder trait + EmbedderRegistry), ADR-082
-(engine TOML schema), ADR-083 (runtime API — caller-computed embeddings), ADR-084 (pack
-fan-out + weighted RRF), ADR-091 (runtime-layer composition + SparseStore + memory.recall_* verbs)\
+**Consolidates** (retired v0-series drafts predating the 2026-05-23 ADR renumbering; these
+numbers do not refer to current-index ADRs): ADR-078 (umbrella), ADR-081 (Embedder trait +
+EmbedderRegistry), ADR-082 (engine TOML schema), ADR-083 (runtime API — caller-computed
+embeddings), ADR-084 (pack fan-out + weighted RRF), ADR-091 (runtime-layer composition +
+SparseStore + memory.recall_* verbs)\
 **Supersedes**: ADR-011 §"single-embedder direction"\
 **Depends on**: ADR-005 (Storage Capability Traits), ADR-030 (Retrieval Stack Port)\
 **Related**:
