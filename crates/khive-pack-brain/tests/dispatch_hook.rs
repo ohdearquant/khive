@@ -320,21 +320,37 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     );
 }
 
-// ---- Finding 3 regression: brain.feedback target_id must be primary-only ----
+// ---- #391 supersedes "Finding 3" (PR #127): brain.feedback resolves over ----
+// ---- the caller's VISIBLE set, not primary-only                         ----
 
-/// `brain.feedback` must reject a `target_id` that lives in a visible (non-primary)
-/// namespace. A visible-only record must not be the target of a feedback mutation.
+/// `brain.feedback` must ACCEPT a `target_id` that lives in a visible
+/// (non-primary) namespace.
 ///
-/// This tests that the fix from `resolve` to `resolve_primary` is in effect:
-/// a record the caller can READ but not MUTATE returns NotFound on feedback.
+/// PR #127 originally locked feedback to primary-only resolution
+/// (`resolve_primary`) under a general "mutation reference validation must be
+/// primary-only" principle, reasoning that feedback mutates its target.
+/// Issue #391 (Leo-ruled, 2026-07-01) corrected that framing: `brain.feedback`
+/// appends a NEW ledger event that *references* the target — it does not
+/// mutate the target row — so target resolution is read-class, the same
+/// class as `memory.recall`. Under ADR-007 Rev 6, EPISODIC memory notes are
+/// stamped with the caller's actor-id namespace, so primary-only resolution
+/// made every episodic memory feedback-unreachable the moment it was written
+/// under an actor-id namespace different from the caller's session-primary —
+/// a fleet-wide feedback-discipline outage. The fix moved feedback's target
+/// resolution from `resolve_primary` to `resolve` (visible-set-aware),
+/// mirroring the visibility recall already uses. This test (formerly
+/// `brain_feedback_rejects_visible_only_target_id`) now asserts the
+/// corrected contract; see `khive-pack-brain/src/tests.rs` `test_391_*` for
+/// the full 3-shape + negative regression suite (including the still-strict
+/// `resolve_primary` contract used by mutation-validation callers elsewhere).
 #[tokio::test]
-async fn brain_feedback_rejects_visible_only_target_id() {
+async fn brain_feedback_accepts_visible_only_target_id() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
     let ns_primary = Namespace::parse("brain-primary-ns").unwrap();
     let ns_foreign = Namespace::parse("brain-foreign-ns").unwrap();
 
-    // Create a KG entity in the foreign namespace.
+    // Create a KG entity in the foreign (visible-only) namespace.
     let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
     let foreign_entity = rt
         .create_entity(
@@ -362,7 +378,8 @@ async fn brain_feedback_rejects_visible_only_target_id() {
         "visible-set token must be able to read the foreign entity; got: {found:?}"
     );
 
-    // brain.feedback with the foreign entity as target_id must fail NotFound.
+    // brain.feedback with the foreign entity as target_id must now succeed:
+    // feedback is downstream of recall and follows recall's visibility.
     let brain = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new().build().unwrap();
 
@@ -372,7 +389,7 @@ async fn brain_feedback_rejects_visible_only_target_id() {
         .await
         .expect("promote primary namespace");
 
-    let err = brain
+    let result = brain
         .dispatch(
             "brain.feedback",
             json!({ "target_id": foreign_id, "signal": "useful" }),
@@ -380,11 +397,7 @@ async fn brain_feedback_rejects_visible_only_target_id() {
             &tok_vis,
         )
         .await
-        .unwrap_err();
+        .expect("#391: brain.feedback with a visible-only target_id must resolve");
 
-    let msg = err.to_string();
-    assert!(
-        msg.to_lowercase().contains("not found"),
-        "brain.feedback with visible-only target_id must return NotFound; got: {msg}"
-    );
+    assert_eq!(result["emitted"], json!(true), "emitted must be true");
 }

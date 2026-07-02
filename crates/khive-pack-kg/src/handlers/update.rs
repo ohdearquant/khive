@@ -9,8 +9,9 @@ use khive_runtime::{
 
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_async,
-    resolve_uuid_including_deleted, string_value, to_json, DeleteParams, KindSpec, UpdateParams,
+    optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_unfiltered,
+    resolve_uuid_unfiltered_including_deleted, string_value, to_json, DeleteParams, KindSpec,
+    UpdateParams,
 };
 use crate::KgPack;
 
@@ -166,7 +167,9 @@ impl KgPack {
         } else {
             None
         };
-        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
+        // By-ID resolution (including the hex-prefix form) is namespace-agnostic
+        // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
+        let id = resolve_uuid_unfiltered(&p.id, &self.runtime, token).await?;
         let spec: KindSpec = match explicit_spec {
             Some(s) => s,
             None => match self.infer_kind_from_uuid(token, id, &p.id).await {
@@ -260,10 +263,12 @@ impl KgPack {
         } else {
             None
         };
+        // By-ID resolution (including the hex-prefix form) is namespace-agnostic
+        // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
         let id = if hard {
-            resolve_uuid_including_deleted(&p.id, &self.runtime, token).await?
+            resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, token).await?
         } else {
-            resolve_uuid_async(&p.id, &self.runtime, token).await?
+            resolve_uuid_unfiltered(&p.id, &self.runtime, token).await?
         };
         let spec: Option<KindSpec> = match explicit_spec {
             Some(s) => Some(s),

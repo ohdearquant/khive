@@ -878,19 +878,19 @@ impl BrainPack {
             }
         };
 
-        // Validate target_id in the PRIMARY namespace only. A visible-only
-        // (foreign) record must not be targeted by a mutation (feedback event).
-        // NotFound (not Forbidden) per ADR-007:215-219.
+        // Resolve target_id over the caller's VISIBLE set — the same visibility recall
+        // uses. Feedback targets are recall outputs; a record recall can surface must be
+        // feedback-targetable, or the feedback-discipline loop breaks for every memory
+        // stamped with an actor-id namespace (ADR-007 Rev 6). NotFound (not Forbidden)
+        // when the id is neither owned nor visible.
         let resolved = self
             .runtime
-            .resolve_primary(token, target)
+            .resolve(token, target)
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         if resolved.is_none() {
             return Err(RuntimeError::NotFound(format!(
-                "target_id {:?} not found in namespace {:?}",
-                target,
-                token.namespace().as_str()
+                "target_id {target:?} not found or not visible to caller"
             )));
         }
 
@@ -1608,7 +1608,7 @@ pub(crate) async fn resolve_auto_feedback_target(
     }
     if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return runtime
-            .resolve_prefix(token, raw)
+            .resolve_prefix_visible(token, raw)
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
             .ok_or_else(|| {

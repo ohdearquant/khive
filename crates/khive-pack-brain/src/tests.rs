@@ -3952,6 +3952,267 @@ async fn feedback_accepts_short_prefix_target_id() {
     assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
 }
 
+// ── #391: feedback target resolution over the caller's VISIBLE set ──────────
+//
+// Root cause: ADR-007 Rev 6 stamps EPISODIC memory notes with the caller's
+// actor-id namespace (memory pack `remember.rs`), but `brain.feedback` /
+// `brain.auto_feedback` resolved targets against the caller's PRIMARY
+// namespace only (`resolve_primary` / `resolve_prefix`). Every episodic
+// memory written after the Rev-6 rollout became feedback-unreachable. The
+// fix widens resolution to the caller's full visible set (`resolve` /
+// `resolve_prefix_visible`), mirroring how `memory.recall` already surfaces
+// records across the visible set. Strict `resolve_primary` / `resolve_prefix`
+// remain untouched for mutation-validation callers (gtd depends_on, link
+// endpoints, kg/memory/comm/schedule/knowledge by-id lookups) — see
+// `khive-pack-gtd/tests/dependencies.rs::resolve_primary_rejects_visible_only_*`
+// and `khive-runtime/tests/integration.rs` visible-set tests.
+//
+// khive-pack-brain has no dependency on khive-pack-memory, so these tests
+// create notes directly via `rt.create_note(token, "memory", ...)` to
+// reproduce the actor-ns-stamped shape without pulling in the memory pack.
+// Note-kind validation is a no-op on a bare `KhiveRuntime::memory()` runtime
+// (no packs installed → `validate_note_kind` allows any kind), so "memory"
+// here behaves exactly like a real episodic memory row for resolution
+// purposes — the bug is about namespace visibility, not note kind.
+
+/// Shape 1 (baseline, must stay green): a note in the caller's own `local`
+/// primary namespace resolves via `brain.feedback` today and after the fix.
+#[tokio::test]
+async fn test_391_feedback_resolves_note_in_local_namespace_baseline() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let note = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "local baseline memory",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create baseline memory note");
+
+    let result = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": note.id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("baseline: feedback on a local-namespace memory note must resolve");
+    assert_eq!(result["emitted"], json!(true));
+}
+
+/// Shape 2, full-UUID form (leg C): an episodic-shaped note stamped with the
+/// caller's actor-id namespace (`lambda:test-391`, not `local`) must resolve
+/// via `brain.feedback`'s exact-UUID path once the caller's visible set
+/// includes that namespace. Before the fix (`resolve_primary`, primary-only)
+/// this returned NotFound; after the fix (`resolve`, visible-set-aware) it
+/// must succeed.
+#[tokio::test]
+async fn test_391_feedback_resolves_actor_namespace_note_full_uuid() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+
+    let actor_ns = Namespace::parse("lambda:test-391").unwrap();
+    let writer_token = rt.authorize(actor_ns.clone()).unwrap();
+    let note = rt
+        .create_note(
+            &writer_token,
+            "memory",
+            None,
+            "actor-ns memory",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create actor-ns memory note");
+
+    // Caller's primary is `local`; visible set additionally covers the actor ns
+    // (ADR-007 Rev 6 visible set = {local} ∪ {actor.id} ∪ {actor.visible_namespaces}).
+    let caller_token = rt
+        .authorize_with_visibility(Namespace::local(), vec![actor_ns])
+        .unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": note.id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1"
+            }),
+            &registry,
+            &caller_token,
+        )
+        .await
+        .expect(
+            "#391 leg C: feedback on an actor-ns memory note visible to the caller must resolve",
+        );
+    assert_eq!(result["emitted"], json!(true));
+}
+
+/// Shape 2, 8-char-prefix form (leg B, cascading into leg C): the same
+/// actor-ns note, targeted by hex prefix via `brain.auto_feedback` (the
+/// `memory.recall` → `brain.auto_feedback` calling convention). Exercises
+/// `resolve_auto_feedback_target`'s prefix branch (`resolve_prefix_visible`)
+/// feeding into `handle_feedback`'s visible-aware `resolve`.
+#[tokio::test]
+async fn test_391_auto_feedback_resolves_actor_namespace_note_prefix() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+
+    let actor_ns = Namespace::parse("lambda:test-391b").unwrap();
+    let writer_token = rt.authorize(actor_ns.clone()).unwrap();
+    let note = rt
+        .create_note(
+            &writer_token,
+            "memory",
+            None,
+            "actor-ns memory (prefix)",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create actor-ns memory note");
+    let full_id = note.id.to_string();
+    let prefix = &full_id[..8];
+
+    let caller_token = rt
+        .authorize_with_visibility(Namespace::local(), vec![actor_ns])
+        .unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "#391 actor-ns prefix regression",
+                "results": [{ "id": prefix }]
+            }),
+            &registry,
+            &caller_token,
+        )
+        .await
+        .expect(
+            "#391 leg B: auto_feedback prefix-resolving an actor-ns memory note visible to the caller must resolve",
+        );
+    assert_eq!(result["emitted"], json!(true));
+    assert_eq!(
+        result["target_id"].as_str().unwrap_or(""),
+        full_id,
+        "resolved target_id must match the full actor-ns note UUID"
+    );
+}
+
+/// Shape 3: a note under an explicit namespace override (a cross-agent grant
+/// via `authorize_with_visibility`'s `extra_visible`, not the caller's own
+/// actor id) must also resolve — proving the fix widens to the general
+/// visible set, not just the actor-id special case.
+#[tokio::test]
+async fn test_391_feedback_resolves_note_under_explicit_namespace_override() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+
+    let shared_ns = Namespace::parse("explicit-shared-ns-391").unwrap();
+    let writer_token = rt.authorize(shared_ns.clone()).unwrap();
+    let note = rt
+        .create_note(
+            &writer_token,
+            "memory",
+            None,
+            "explicit-ns memory",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create explicit-namespace memory note");
+
+    let caller_token = rt
+        .authorize_with_visibility(Namespace::local(), vec![shared_ns])
+        .unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": note.id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1"
+            }),
+            &registry,
+            &caller_token,
+        )
+        .await
+        .expect(
+            "#391 shape 3: feedback on a note under an explicit visible-namespace override must resolve",
+        );
+    assert_eq!(result["emitted"], json!(true));
+}
+
+/// Negative: a note in a namespace that is NOT in the caller's visible set
+/// (neither primary nor an extra-visible grant) must still fail `NotFound`.
+/// The fix widens resolution to the visible set — it must not widen to every
+/// namespace in the database.
+#[tokio::test]
+async fn test_391_feedback_rejects_note_outside_visible_set() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+
+    let hidden_ns = Namespace::parse("invisible-ns-391").unwrap();
+    let writer_token = rt.authorize(hidden_ns).unwrap();
+    let note = rt
+        .create_note(
+            &writer_token,
+            "memory",
+            None,
+            "hidden memory",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create hidden-namespace memory note");
+
+    // Caller's visible set covers local + a DIFFERENT extra namespace — not the
+    // note's namespace.
+    let caller_token = rt
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse("some-other-visible-ns-391").unwrap()],
+        )
+        .unwrap();
+
+    let err = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": note.id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1"
+            }),
+            &registry,
+            &caller_token,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "#391: feedback on a note outside the caller's visible set must return NotFound, got {err:?}"
+    );
+}
+
 // ── #354: brain.register_adapter ─────────────────────────────────────────────
 
 // ACCEPT: matching base_model_revision registers the adapter and persists the artifact.
