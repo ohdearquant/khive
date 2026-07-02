@@ -205,6 +205,18 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
                 required: false,
                 description: "External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID or In-Reply-To header value).",
             },
+            ParamDef {
+                name: "wire_message_id",
+                param_type: "string",
+                required: false,
+                description: "This message's own RFC 822 Message-ID (including angle brackets), distinct from `external_id` (the transport dedup key). Persisted so a later reply can set In-Reply-To/References.",
+            },
+            ParamDef {
+                name: "wire_references",
+                param_type: "string",
+                required: false,
+                description: "This message's own RFC 822 References header value, verbatim. Persisted so a later reply can extend the full ancestor chain instead of truncating it to the immediate parent.",
+            },
         ],
     },
 ];

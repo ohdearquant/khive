@@ -4498,3 +4498,222 @@ async fn ingest_omits_wire_message_id_when_absent() {
         "no wire_message_id in ingest params must mean none stored; got props={props}"
     );
 }
+
+/// `comm.ingest` with `wire_references` persists it on the resulting note, kept
+/// distinct from `external_id` (the IMAP dedup key) and from `wire_message_id`.
+#[tokio::test]
+async fn ingest_persists_wire_references_distinct_from_external_id() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:ocean@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "hello",
+            "external_id": "imap:host:1:101",
+            "wire_message_id": "real-msg-id@example.com",
+            "wire_references": "<grandparent1@example.com> <parent123@example.com>",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["wire_references"].as_str(),
+        Some("<grandparent1@example.com> <parent123@example.com>"),
+        "comm.ingest must persist wire_references verbatim; got props={props}"
+    );
+    assert_eq!(
+        props["external_id"].as_str(),
+        Some("imap:host:1:101"),
+        "wire_references must not overwrite the unrelated external_id dedup key; \
+         got props={props}"
+    );
+}
+
+/// `comm.ingest` without `wire_references` leaves it unset (no fabrication).
+#[tokio::test]
+async fn ingest_omits_wire_references_when_absent() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "hello",
+            "external_id": "imap:host:1:102",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert!(
+        props.get("wire_references").is_none(),
+        "no wire_references in ingest params must mean none stored; got props={props}"
+    );
+}
+
+// --- issue #403 finding 1: References must carry the full ancestor chain ---
+//
+// The codex round-1 review flagged that References was set from the single
+// `in_reply_to` value, dropping any ancestors before the immediate parent.
+// These tests assert the exact serialized References/In-Reply-To values
+// (not just presence) for each required case.
+
+/// (a) Reply whose parent has an existing References chain of 2+ ids: the
+/// reply's References must be that chain followed by the parent's own
+/// Message-ID, and In-Reply-To must remain exactly the parent Message-ID.
+#[tokio::test]
+async fn reply_extends_existing_references_chain_of_two_or_more() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let parent_id = plant_message_note(
+        &rt,
+        "hello from ocean",
+        serde_json::json!({
+            "direction": "inbound",
+            "from": "email:ocean@example.com",
+            "to": "email:mailbox@example.com",
+            "from_actor": "email:ocean@example.com",
+            "to_actor": "lambda:khive",
+            "external_id": "imap:host:1:43",
+            "wire_message_id": "parent123@example.com",
+            "wire_references": "grandparent1@example.com grandparent2@example.com",
+            "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
+
+    assert_eq!(
+        props["in_reply_to_message_id"].as_str(),
+        Some("<parent123@example.com>"),
+        "In-Reply-To must be exactly the parent Message-ID; got props={props}"
+    );
+    assert_eq!(
+        props["references_chain"].as_str(),
+        Some("<grandparent1@example.com> <grandparent2@example.com> <parent123@example.com>"),
+        "References must carry the parent's full existing chain followed by its own \
+         Message-ID, not just the immediate parent; got props={props}"
+    );
+}
+
+/// (b) Reply whose parent has no References chain of its own (e.g. it was a
+/// thread root): References must degrade gracefully to the parent Message-ID
+/// alone, identical to pre-chain-preservation behavior.
+#[tokio::test]
+async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let parent_id = plant_message_note(
+        &rt,
+        "hello from ocean",
+        serde_json::json!({
+            "direction": "inbound",
+            "from": "email:ocean@example.com",
+            "to": "email:mailbox@example.com",
+            "from_actor": "email:ocean@example.com",
+            "to_actor": "lambda:khive",
+            "external_id": "imap:host:1:44",
+            "wire_message_id": "parent456@example.com",
+            "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
+
+    assert_eq!(
+        props["in_reply_to_message_id"].as_str(),
+        Some("<parent456@example.com>")
+    );
+    assert_eq!(
+        props["references_chain"].as_str(),
+        Some("<parent456@example.com>"),
+        "no stored chain on the parent must mean References = parent Message-ID alone; \
+         got props={props}"
+    );
+}
+
+/// (c) Reply-to-outbound direction: the parent was one of our own prior sends,
+/// so its chain lives in `references_chain` (not `wire_references`). A reply
+/// must extend THAT chain, proving the direction-aware read is wired through
+/// `comm.reply` end-to-end, not just unit-tested on `parent_references_chain`.
+#[tokio::test]
+async fn reply_extends_references_chain_for_outbound_parent() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let parent_id = plant_message_note(
+        &rt,
+        "our earlier reply",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "local",
+            "to": "local",
+            "from_actor": "lambda:khive",
+            "to_actor": "email:ocean@example.com",
+            "external_id": "<outbound-msg-002@khive.ai>",
+            "references_chain": "<root1@example.com> <outbound-msg-002@khive.ai>",
+            "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
+
+    assert_eq!(
+        props["in_reply_to_message_id"].as_str(),
+        Some("<outbound-msg-002@khive.ai>"),
+        "In-Reply-To must be exactly the outbound parent's self-minted external_id; \
+         got props={props}"
+    );
+    assert_eq!(
+        props["references_chain"].as_str(),
+        Some("<root1@example.com> <outbound-msg-002@khive.ai> <outbound-msg-002@khive.ai>"),
+        "reply-to-outbound must extend the outbound parent's own references_chain \
+         (read direction-aware, not wire_references) followed by its Message-ID; \
+         got props={props}"
+    );
+}
+
+/// (d) A malformed token embedded in the parent's stored chain must be skipped
+/// rather than propagated into the reply's References header.
+#[tokio::test]
+async fn reply_skips_malformed_token_in_parent_references_chain() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let parent_id = plant_message_note(
+        &rt,
+        "hello from ocean",
+        serde_json::json!({
+            "direction": "inbound",
+            "from": "email:ocean@example.com",
+            "to": "email:mailbox@example.com",
+            "from_actor": "email:ocean@example.com",
+            "to_actor": "lambda:khive",
+            "external_id": "imap:host:1:45",
+            "wire_message_id": "parent789@example.com",
+            "wire_references": "good1@example.com not-a-message-id good2@example.com",
+            "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
+
+    assert_eq!(
+        props["references_chain"].as_str(),
+        Some("<good1@example.com> <good2@example.com> <parent789@example.com>"),
+        "a malformed token in the parent's stored chain must be skipped, not \
+         propagated into the reply's References; got props={props}"
+    );
+}

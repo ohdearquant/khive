@@ -188,6 +188,11 @@ impl EmailChannel {
         if let Some(mid) = email.message_id() {
             env = env.with_wire_message_id(mid);
         }
+        // Capture this email's own References chain so a future reply can extend
+        // the full ancestor chain instead of truncating it to the immediate parent.
+        if let Some(refs) = email.references() {
+            env = env.with_wire_references(refs);
+        }
 
         Ok(env)
     }
@@ -206,6 +211,7 @@ impl Channel for EmailChannel {
         let thread_id = envelope.correlation_external_id.as_deref();
         let message_id = envelope.message_id.as_deref();
         let in_reply_to = envelope.in_reply_to.as_deref();
+        let references = envelope.references.as_deref();
 
         debug!(from, to, subject, "email send");
         self.smtp
@@ -217,6 +223,7 @@ impl Channel for EmailChannel {
                 thread_id,
                 message_id,
                 in_reply_to,
+                references,
             )
             .await
     }
@@ -285,6 +292,7 @@ mod tests {
             _tid: Option<&str>,
             _message_id: Option<&str>,
             _in_reply_to: Option<&str>,
+            _references: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push(format!("{from}->{to}"));
             Ok(())
@@ -410,6 +418,37 @@ mod tests {
         assert_eq!(
             envs[0].wire_message_id, None,
             "no Message-ID header must leave wire_message_id unset, not fabricated"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_extracts_wire_references_from_headers() {
+        let mut email = make_email("maintainer@example.com", "imap:test:0:1");
+        email.headers.insert(
+            "references".to_string(),
+            "<grandparent1@example.com> <parent123@example.com>".to_string(),
+        );
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].wire_references.as_deref(),
+            Some("<grandparent1@example.com> <parent123@example.com>"),
+            "poll must surface the inbound email's own References chain as wire_references"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_wire_references_absent_when_no_header() {
+        let ch = build_channel(
+            "maintainer@example.com",
+            vec![make_email("maintainer@example.com", "imap:test:0:1")],
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].wire_references, None,
+            "no References header must leave wire_references unset, not fabricated"
         );
     }
 
@@ -609,6 +648,7 @@ mod tests {
                 _tid: Option<&str>,
                 _message_id: Option<&str>,
                 in_reply_to: Option<&str>,
+                _references: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -632,6 +672,53 @@ mod tests {
 
         let vals = captured.lock().unwrap();
         assert_eq!(vals[0].as_deref(), Some("<parent123@example.com>"));
+    }
+
+    #[tokio::test]
+    async fn send_forwards_references_to_connector() {
+        struct CapturingSmtp {
+            captured: Arc<Mutex<Vec<Option<String>>>>,
+        }
+
+        #[async_trait]
+        impl SmtpConnector for CapturingSmtp {
+            async fn deliver(
+                &self,
+                _from: &str,
+                _to: &str,
+                _subject: &str,
+                _body: &str,
+                _tid: Option<&str>,
+                _message_id: Option<&str>,
+                _in_reply_to: Option<&str>,
+                references: Option<&str>,
+            ) -> Result<(), ChannelError> {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push(references.map(|s| s.to_string()));
+                Ok(())
+            }
+        }
+
+        let config = make_config("maintainer@example.com");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let smtp = SmtpSender::with_connector(CapturingSmtp {
+            captured: captured.clone(),
+        });
+        let imap = ImapFetcher::with_connector(FixedImap { emails: vec![] });
+        let ch = EmailChannel::with_connectors(config, smtp, imap);
+
+        let env = ChannelEnvelope::new("email:from@example.com", "email:to@example.com", "hello")
+            .with_in_reply_to("<parent123@example.com>")
+            .with_references("<grandparent1@example.com> <parent123@example.com>");
+        ch.send(env).await.unwrap();
+
+        let vals = captured.lock().unwrap();
+        assert_eq!(
+            vals[0].as_deref(),
+            Some("<grandparent1@example.com> <parent123@example.com>")
+        );
     }
 
     #[test]

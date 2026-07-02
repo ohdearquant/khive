@@ -52,10 +52,22 @@ pub struct ChannelEnvelope {
     /// carried no `Message-ID`. Distinct from `external_id`, which is the IMAP
     /// UIDVALIDITY/UID dedup key, not a wire Message-ID.
     pub wire_message_id: Option<String>,
-    /// RFC 822 `In-Reply-To` (and `References`) value to set on an outbound reply
-    /// (including angle brackets, e.g. `<uuid@domain>`). `None` when the reply has
-    /// no known parent Message-ID, or on inbound envelopes.
+    /// This email's own RFC 822 `References` header value, as received verbatim
+    /// (space-separated angle-bracketed ids). `None` on outbound envelopes and
+    /// when the inbound message carried no `References` header. Captured so a
+    /// reply can extend the ancestor chain rather than truncating it to just the
+    /// immediate parent (issue #403).
+    pub wire_references: Option<String>,
+    /// RFC 822 `In-Reply-To` value to set on an outbound reply (including angle
+    /// brackets, e.g. `<uuid@domain>`). `None` when the reply has no known
+    /// parent Message-ID, or on inbound envelopes.
     pub in_reply_to: Option<String>,
+    /// RFC 822 `References` value to set on an outbound reply: the parent's
+    /// existing References chain (if any) followed by the parent's Message-ID,
+    /// space-separated angle-bracketed ids. `None` on inbound envelopes. When
+    /// the reply has a known parent Message-ID but no chain to extend, this is
+    /// `None` and the SMTP layer falls back to `in_reply_to` alone.
+    pub references: Option<String>,
 }
 
 impl ChannelEnvelope {
@@ -72,7 +84,9 @@ impl ChannelEnvelope {
             metadata: HashMap::new(),
             message_id: None,
             wire_message_id: None,
+            wire_references: None,
             in_reply_to: None,
+            references: None,
         }
     }
 
@@ -112,10 +126,23 @@ impl ChannelEnvelope {
         self
     }
 
+    /// Attach this inbound email's own RFC 822 References chain, verbatim.
+    pub fn with_wire_references(mut self, references: impl Into<String>) -> Self {
+        self.wire_references = Some(references.into());
+        self
+    }
+
     /// Attach the parent Message-ID (including angle brackets) this outbound reply
-    /// should set as `In-Reply-To`/`References`.
+    /// should set as `In-Reply-To`.
     pub fn with_in_reply_to(mut self, id: impl Into<String>) -> Self {
         self.in_reply_to = Some(id.into());
+        self
+    }
+
+    /// Attach the full References chain (parent's existing chain, if any, followed
+    /// by the parent's Message-ID) this outbound reply should set as `References`.
+    pub fn with_references(mut self, references: impl Into<String>) -> Self {
+        self.references = Some(references.into());
         self
     }
 }
@@ -268,7 +295,9 @@ mod tests {
             .with_correlation("correlation-uuid")
             .with_message_id("<abc123@example.com>")
             .with_wire_message_id("<wire123@example.com>")
-            .with_in_reply_to("<parent123@example.com>");
+            .with_wire_references("<ref1@example.com> <ref2@example.com>")
+            .with_in_reply_to("<parent123@example.com>")
+            .with_references("<ref1@example.com> <parent123@example.com>");
 
         assert_eq!(env.from, "email:a@example.com");
         assert_eq!(env.to, "email:b@example.com");
@@ -285,14 +314,24 @@ mod tests {
             env.wire_message_id.as_deref(),
             Some("<wire123@example.com>")
         );
+        assert_eq!(
+            env.wire_references.as_deref(),
+            Some("<ref1@example.com> <ref2@example.com>")
+        );
         assert_eq!(env.in_reply_to.as_deref(), Some("<parent123@example.com>"));
+        assert_eq!(
+            env.references.as_deref(),
+            Some("<ref1@example.com> <parent123@example.com>")
+        );
     }
 
     #[test]
     fn envelope_new_defaults_wire_message_id_and_in_reply_to_to_none() {
         let env = ChannelEnvelope::new("email:a@example.com", "email:b@example.com", "hello");
         assert_eq!(env.wire_message_id, None);
+        assert_eq!(env.wire_references, None);
         assert_eq!(env.in_reply_to, None);
+        assert_eq!(env.references, None);
     }
 
     #[test]

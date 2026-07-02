@@ -135,6 +135,16 @@ impl RawEmail {
         self.headers.get("message-id").map(|s| s.as_str())
     }
 
+    /// Return this email's own `References` header value if present, verbatim.
+    ///
+    /// RFC 5322 reply construction requires a reply's `References` to be the
+    /// parent's existing `References` chain (this value) followed by the
+    /// parent's `Message-ID`; capturing it here lets a later reply extend the
+    /// full ancestor chain instead of truncating it to the immediate parent.
+    pub fn references(&self) -> Option<&str> {
+        self.headers.get("references").map(|s| s.as_str())
+    }
+
     /// Resolve the best available correlation key: `X-Khive-Thread-ID` first,
     /// then `In-Reply-To`.
     pub fn correlation(&self) -> Option<&str> {

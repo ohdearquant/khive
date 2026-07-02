@@ -93,6 +93,12 @@ pub(crate) struct IngestParams {
     /// References for native MUA conversation grouping.
     #[serde(default)]
     pub wire_message_id: Option<String>,
+    /// This message's own RFC 822 References header value, verbatim, when the
+    /// channel adapter captured one. Persisted so a later reply to this note can
+    /// extend the full ancestor chain instead of truncating it to this message's
+    /// own Message-ID (issue #403).
+    #[serde(default)]
+    pub wire_references: Option<String>,
 }
 
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {

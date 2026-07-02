@@ -115,9 +115,19 @@ fn build_preview(content: &str) -> String {
 /// `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
 /// when this write is a reply to a message with a known one (issue #403). It is
 /// stored verbatim on both copies as `in_reply_to_message_id`; the outbox
-/// delivery loop reads it back to set the RFC 822 `In-Reply-To`/`References`
-/// headers for native MUA conversation grouping. `None` when there is no known
-/// parent Message-ID (a plain send, or a reply whose parent has none).
+/// delivery loop reads it back to set the RFC 822 `In-Reply-To` header for
+/// native MUA conversation grouping. `None` when there is no known parent
+/// Message-ID (a plain send, or a reply whose parent has none).
+///
+/// `references_chain` is the full RFC 5322 `References` value for this reply:
+/// the parent's existing chain (if any) followed by the parent's Message-ID,
+/// space-separated angle-bracketed ids (issue #403 finding: References must
+/// preserve ancestry, not truncate to the immediate parent). Stored verbatim
+/// on both copies as `references_chain`; the outbox delivery loop reads it
+/// back to set the `References` header, and a further reply reads it back
+/// (direction-aware, via `parent_references_chain`) to extend the chain again.
+/// `None` when there is no known parent Message-ID (mirrors
+/// `in_reply_to_message_id`).
 // REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
 // content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
 // a struct would not reduce overall complexity and would require an extra allocation on the
@@ -135,6 +145,7 @@ pub(crate) async fn dual_write_message(
     from_actor: Option<&str>,
     to_actor: Option<&str>,
     in_reply_to_message_id: Option<&str>,
+    references_chain: Option<&str>,
 ) -> Result<Note, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
@@ -191,6 +202,9 @@ pub(crate) async fn dual_write_message(
     }
     if let Some(irt) = in_reply_to_message_id {
         outbound_props["in_reply_to_message_id"] = json!(irt);
+    }
+    if let Some(refs) = references_chain {
+        outbound_props["references_chain"] = json!(refs);
     }
 
     let outbound_note = runtime
@@ -273,6 +287,9 @@ pub(crate) async fn dual_write_message(
         }
         if let Some(irt) = in_reply_to_message_id {
             inbound_props["in_reply_to_message_id"] = json!(irt);
+        }
+        if let Some(refs) = references_chain {
+            inbound_props["references_chain"] = json!(refs);
         }
 
         let inbound_result = runtime
