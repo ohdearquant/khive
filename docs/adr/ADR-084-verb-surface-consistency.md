@@ -145,7 +145,7 @@ no side effects. It returns the merged live ontology of the running binary:
     "service",
     "resource"
   ],
-  "note_kinds": ["observation", "insight", "question", "decision", "reference"],
+  "note_kinds": ["observation", "insight", "question", "decision", "reference", "task", "memory"],
   "edge_relations": [
     "contains",
     "part_of",
@@ -192,10 +192,14 @@ Normative details:
    (`schema(relation=...)`) are deferred until measured token cost justifies them.
 5. **Presentation**: ADR-045 rules apply. The response must render sanely in agent mode
    (count summary plus full matrix) and `format=table` must work.
-6. **Implementation is serialization, not new plumbing**: `base_entity_endpoint_rules()`
-   already exposes the base matrix (added for the ADR-076 certificate tests); the verb
-   serializes that accessor plus each loaded pack's `EDGE_RULES` and vocabulary
-   declarations.
+6. **Implementation is serialization plus one attributed accessor**: the base matrix is
+   already exposed via `base_entity_endpoint_rules()` (added for the ADR-076 certificate
+   tests). Pack rules, however, are currently only reachable through helpers that
+   flatten ownership away (`all_edge_rules` / the registry's installed
+   `Vec<EdgeEndpointRule>`), which cannot reconstruct `origin`. The implementation MUST
+   therefore add a pack-attributed accessor returning `(pack_name, EdgeEndpointRule)`
+   rows (the registry knows the owning pack at installation time) and serialize from
+   that; the existing flattened helpers are not a sufficient source for this verb.
 
 The name `schema` aligns with the existing "KG schema.yaml" ontology-manifest concept;
 this verb is that manifest's runtime dual. `verbs` and `help=true` are unchanged and
@@ -244,7 +248,13 @@ mechanically checkable subset of the contract.
 documentation string not used in validation):
 
 - no duplicate param names within a verb;
-- param names match the naming conventions (Rule 4) for verbs added after ratification;
+- param names match the naming conventions (Rule 4), checked against an explicit
+  **legacy baseline**: the conformance test carries a checked-in allowlist of the
+  non-conforming `(verb, param)` pairs that exist at ratification (`HandlerDef` carries
+  no introduced-version marker, so "new" is defined by absence from that baseline). A
+  new verb is anything not in the baseline and is checked unconditionally; the baseline
+  may only shrink -- adding to it fails the test by construction, which is what makes
+  the recurrence guard mechanical rather than review-dependent;
 - params whose `param_type` is `"uuid"` (or whose name is `id`/`ids`) follow the
   canonical naming;
 - every verb has a non-empty description; required flags are internally consistent.
@@ -303,8 +313,8 @@ taxonomy cannot silently diverge from the compiled one.
 
 **Negative / accepted costs**
 
-- One more kg verb (16 → 17) to document and maintain; mitigated by it being a pure
-  serialization of existing structures.
+- One more kg verb (16 → 17) to document and maintain; mitigated by it being a
+  serialization of existing structures plus one pack-attributed rule accessor (§2.6).
 - Phase-1 conformance is name-level only; behavioral rules remain review-enforced until
   the `ParamKind` enrichment lands. This is stated, not hidden.
 - The generated-docs pipeline adds a CI dependency on a built binary.
@@ -342,11 +352,11 @@ taxonomy cannot silently diverge from the compiled one.
   endpoints (the merge semantics `schema` serializes)
 - [ADR-023](ADR-023-declarative-pack-format.md) -- verb surface and naming rules
   (amended: `schema` row in the kg verb table)
-- [ADR-045](ADR-045-response-presentation.md) -- presentation rules applied to `schema`
+- [ADR-045](ADR-045-verb-response-presentation.md) -- presentation rules applied to `schema`
   output
 - [ADR-048](ADR-048-knowledge-section-profiles.md) -- `resource` kind (pack-declared;
   why §2 serializes merged vocabulary)
-- [ADR-076](ADR-076-edge-relation-algebra.md) -- certificate tests that motivated
+- [ADR-076](ADR-076-relation-calculability-and-system-role.md) -- certificate tests that motivated
   `base_entity_endpoint_rules()`
 - `crates/khive-runtime/src/operations.rs` -- `BASE_ENTITY_ENDPOINT_RULES`
 - `crates/khive-types/src/pack.rs` -- `ParamDef` / `HandlerDef` (phase-1 test substrate)
