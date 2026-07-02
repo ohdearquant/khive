@@ -20,13 +20,24 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::ingest::{self, MirrorSource};
 
-/// A discovered JSONL file together with its source type and (for Codex) the
-/// session UUID derived from the filename.
+/// How a discovered file should be ingested.
+///
+/// `ChatGptExport` is deliberately not a `MirrorSource` variant: ChatGPT
+/// export ingestion is whole-file (`mirror_chatgpt_export_file`), not
+/// line-tail, so it does not belong in that closed line-tail dispatch enum.
+enum DiscoveredKind {
+    LineTail {
+        source: MirrorSource,
+        /// Set for `MirrorSource::Codex`; `None` for `MirrorSource::ClaudeCode`.
+        session_id: Option<String>,
+    },
+    ChatGptExport,
+}
+
+/// A discovered file together with how it should be ingested.
 struct DiscoveredFile {
     path: PathBuf,
-    source: MirrorSource,
-    /// Set for `MirrorSource::Codex`; `None` for `MirrorSource::ClaudeCode`.
-    session_id: Option<String>,
+    kind: DiscoveredKind,
 }
 
 /// Configuration for the mirror service.
@@ -46,6 +57,13 @@ pub struct MirrorConfig {
     ///
     /// Defaults to `$HOME/.codex/sessions`.
     pub codex_sessions_dir: PathBuf,
+    /// Whether the ChatGPT export mirror is enabled (default: false — opt-in,
+    /// independent of `enabled` and `codex_enabled`).
+    pub chatgpt_enabled: bool,
+    /// Root directory scanned (recursively) for `conversations.json` export files.
+    ///
+    /// Defaults to `$HOME/.chatgpt/exports`.
+    pub chatgpt_exports_dir: PathBuf,
     /// How long to sleep between polling ticks (default: 2 seconds).
     pub poll_interval: Duration,
     /// When true (default), existing files are mirrored from byte offset 0.
@@ -62,6 +80,8 @@ impl MirrorConfig {
     /// | `KHIVE_MIRROR_PROJECTS_DIR`    | `$HOME/.claude/projects`       |
     /// | `KHIVE_MIRROR_CODEX_ENABLED`   | `false`                        |
     /// | `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`        |
+    /// | `KHIVE_MIRROR_CHATGPT_ENABLED` | `false`                        |
+    /// | `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports`       |
     /// | `KHIVE_MIRROR_POLL_SECS`       | `2`                            |
     /// | `KHIVE_MIRROR_BACKFILL`        | `true`                         |
     pub fn from_env() -> Self {
@@ -83,6 +103,14 @@ impl MirrorConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".codex").join("sessions"));
 
+        let chatgpt_enabled = std::env::var("KHIVE_MIRROR_CHATGPT_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let chatgpt_exports_dir = std::env::var("KHIVE_MIRROR_CHATGPT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".chatgpt").join("exports"));
+
         let poll_secs = std::env::var("KHIVE_MIRROR_POLL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -97,6 +125,8 @@ impl MirrorConfig {
             projects_dir,
             codex_enabled,
             codex_sessions_dir,
+            chatgpt_enabled,
+            chatgpt_exports_dir,
             poll_interval: Duration::from_secs(poll_secs),
             backfill,
         }
@@ -140,14 +170,22 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             for path in scan_cc_jsonl_files(&config.projects_dir) {
                 discovered.push(DiscoveredFile {
                     path,
-                    source: MirrorSource::ClaudeCode,
-                    session_id: None,
+                    kind: DiscoveredKind::LineTail {
+                        source: MirrorSource::ClaudeCode,
+                        session_id: None,
+                    },
                 });
             }
         }
 
         if config.codex_enabled {
             for item in scan_codex_jsonl_files(&config.codex_sessions_dir) {
+                discovered.push(item);
+            }
+        }
+
+        if config.chatgpt_enabled {
+            for item in scan_chatgpt_conversations_files(&config.chatgpt_exports_dir) {
                 discovered.push(item);
             }
         }
@@ -182,16 +220,24 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 continue;
             }
 
-            // Tail the new bytes.
-            match ingest::mirror_file(
-                &runtime,
-                &item.path,
-                offset,
-                item.source,
-                item.session_id.as_deref(),
-            )
-            .await
-            {
+            // Tail (line-tail sources) or whole-file re-read (ChatGPT export).
+            let result = match &item.kind {
+                DiscoveredKind::LineTail { source, session_id } => {
+                    ingest::mirror_file(
+                        &runtime,
+                        &item.path,
+                        offset,
+                        *source,
+                        session_id.as_deref(),
+                    )
+                    .await
+                }
+                DiscoveredKind::ChatGptExport => {
+                    ingest::mirror_chatgpt_export_file(&runtime, &item.path, offset).await
+                }
+            };
+
+            match result {
                 Ok(stats) => {
                     offsets.insert(item.path.clone(), stats.new_offset);
                     if stats.inserted > 0 || stats.new_offset > offset {
@@ -199,7 +245,6 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                         rows_inserted += stats.inserted;
                         tracing::debug!(
                             path = %item.path.display(),
-                            source = ?item.source,
                             inserted = stats.inserted,
                             scanned = stats.scanned,
                             new_offset = stats.new_offset,
@@ -332,10 +377,51 @@ fn scan_codex_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>
             if let Some(session_id) = extract_codex_session_id(&path) {
                 out.push(DiscoveredFile {
                     path,
-                    source: MirrorSource::Codex,
-                    session_id: Some(session_id),
+                    kind: DiscoveredKind::LineTail {
+                        source: MirrorSource::Codex,
+                        session_id: Some(session_id),
+                    },
                 });
             }
+        }
+    }
+}
+
+/// Find `conversations.json` ChatGPT export files under `path`.
+///
+/// If `path` is itself a file, it is accepted only when its basename is
+/// exactly `conversations.json`; otherwise `path` is scanned recursively.
+/// Silently skips unreadable directories, like the other scanners.
+fn scan_chatgpt_conversations_files(path: &std::path::Path) -> Vec<DiscoveredFile> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        if path.file_name().and_then(|n| n.to_str()) == Some("conversations.json") {
+            files.push(DiscoveredFile {
+                path: path.to_path_buf(),
+                kind: DiscoveredKind::ChatGptExport,
+            });
+        }
+        return files;
+    }
+    scan_chatgpt_dir_recursive(path, &mut files);
+    files
+}
+
+/// Recursive helper for `scan_chatgpt_conversations_files`.
+fn scan_chatgpt_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_chatgpt_dir_recursive(&path, out);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("conversations.json") {
+            out.push(DiscoveredFile {
+                path,
+                kind: DiscoveredKind::ChatGptExport,
+            });
         }
     }
 }

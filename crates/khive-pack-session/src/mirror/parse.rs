@@ -561,7 +561,10 @@ fn build_chatgpt_event(
 ///   defensively).
 /// - anything else (`"code"`, `"execution_output"`, …) — `content.text` if
 ///   present, else joined string `parts`, else `None`.
-fn extract_chatgpt_text(content_type: &str, content: Option<&Map<String, Value>>) -> Option<String> {
+fn extract_chatgpt_text(
+    content_type: &str,
+    content: Option<&Map<String, Value>>,
+) -> Option<String> {
     let content = content?;
 
     if content_type == "text" {

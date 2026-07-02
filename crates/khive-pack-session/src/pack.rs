@@ -88,7 +88,7 @@ impl PackRuntime for SessionPack {
 
     async fn warm(&self) {
         let config = crate::mirror::MirrorConfig::from_env();
-        if !config.enabled && !config.codex_enabled {
+        if !config.enabled && !config.codex_enabled && !config.chatgpt_enabled {
             return;
         }
         let runtime = self.runtime().clone();
