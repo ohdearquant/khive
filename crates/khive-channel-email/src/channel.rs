@@ -184,14 +184,16 @@ impl EmailChannel {
     }
 
     /// Evaluate the domain-authentication half of the attribution gate
-    /// (ADR-056 Amendment 2026-07-02): trust only the topmost
-    /// `Authentication-Results` header whose `authserv-id` matches this
-    /// deployment's configured trust anchor, and require `dmarc=pass`, or
-    /// `spf=pass` with an aligned envelope-from, or `dkim=pass` with an
-    /// aligned `d=` domain. Absence of any trusted header fails closed.
+    /// (ADR-056 Amendment 2026-07-02, refined 2026-07-03): trust only the
+    /// header selected per this deployment's configured [`TrustAnchor`]
+    /// (topmost matching `authserv-id`, or the topmost no-authserv-id header
+    /// for an EXO-shaped boundary), and require `dmarc=pass` aligned to the
+    /// From domain, or `spf=pass` with an aligned envelope-from, or
+    /// `dkim=pass` with an aligned `d=` domain. Absence of any trusted header
+    /// fails closed.
     fn evaluate_auth(&self, email: &RawEmail) -> Result<(), QuarantineReason> {
         let selected =
-            auth_results::select_trusted(&email.authentication_results, &self.config.authserv_id)
+            auth_results::select_trusted(&email.authentication_results, &self.config.trust_anchor)
                 .ok_or(QuarantineReason::AuthAbsent)?;
 
         let from_domain = email
@@ -201,7 +203,7 @@ impl EmailChannel {
             .map(|(_, domain)| domain.to_lowercase())
             .unwrap_or_default();
 
-        if selected.dmarc_pass()
+        if selected.dmarc_pass_aligned(&from_domain)
             || selected.spf_pass_aligned(&from_domain)
             || selected.dkim_pass_aligned(&from_domain)
         {
@@ -358,7 +360,7 @@ fn strip_kind_prefix<'a>(addr: &'a str, kind: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EmailAuth;
+    use crate::config::{EmailAuth, TrustAnchor};
     use crate::connector::imap::{parse_raw_bytes, ImapConnector, ImapFetcher};
     use crate::connector::smtp::{SmtpConnector, SmtpSender};
     use std::collections::HashMap;
@@ -379,7 +381,7 @@ mod tests {
                 password: "secret".to_string(),
             },
             maintainer_addresses: vec![MailAddress::parse(maintainer).unwrap()],
-            authserv_id: TEST_AUTHSERV_ID.to_string(),
+            trust_anchor: TrustAnchor::AuthservId(TEST_AUTHSERV_ID.to_string()),
             quarantine_store: true,
         }
     }
@@ -736,6 +738,13 @@ mod tests {
 
     #[tokio::test]
     async fn empty_from_list_rejected() {
+        // With no From address there is no domain to align dmarc's
+        // header.from against, so `dmarc_pass_aligned` (hardening #3, ADR-056
+        // Amendment 2026-07-03) now correctly fails alignment and the
+        // attribution gate catches this at the auth leg (dmarc-fail) before
+        // ever reaching the sender allowlist -- still quarantined, just a
+        // stricter (and more accurate) reason than the pre-hardening
+        // off-allowlist path.
         let ch = build_channel(
             "maintainer@example.com",
             vec![make_email_with_from_addrs(vec![], "imap:test:0:1")],
@@ -751,7 +760,7 @@ mod tests {
                 .metadata
                 .get("quarantine_reason")
                 .map(String::as_str),
-            Some("off-allowlist")
+            Some("dmarc-fail")
         );
     }
 
@@ -990,6 +999,67 @@ mod tests {
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].from, "email:maintainer@example.com");
+    }
+
+    // --- EXO no-authserv-id trust anchor, end-to-end (ADR-056 Amendment 2026-07-03) ---
+
+    #[tokio::test]
+    async fn exo_no_authserv_id_fixture_end_to_end_is_attributed() {
+        // Real Exchange Online header shape (verbatim values from the live
+        // fixture `ocean_0110_raw_headers.txt`): an ARC-Authentication-Results
+        // header (must be ignored -- collecting/trusting ARC is the rejected
+        // Shape B, out of scope) precedes the plain Authentication-Results
+        // header EXO stamps on its own internal hop, which carries no
+        // authserv-id at all. In TopmostNoAuthservId mode this must attribute
+        // cleanly through the real byte-parsing path.
+        let raw = b"ARC-Authentication-Results: i=2; mx.microsoft.com 1; spf=pass smtp.mailfrom=gmail.com; dmarc=pass header.from=gmail.com; dkim=pass header.d=gmail.com\r\n\
+                    Authentication-Results: spf=pass (sender IP is 2607:f8b0:4864:20::1129) smtp.mailfrom=gmail.com; dkim=pass (signature was verified) header.d=gmail.com;dmarc=pass action=none header.from=gmail.com;compauth=pass reason=100\r\n\
+                    From: Ocean Li <quantocean.li@gmail.com>\r\n\
+                    To: Leo Li <leo@khive.ai>\r\n\
+                    Subject: Khive email subject disappears into body\r\n\
+                    \r\n\
+                    body text";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+
+        let mut config = make_config("quantocean.li@gmail.com");
+        config.trust_anchor = TrustAnchor::TopmostNoAuthservId;
+        let ch = build_channel_from(config, vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:quantocean.li@gmail.com",
+            "the real EXO no-authserv-id header must attribute cleanly in TopmostNoAuthservId mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn exo_mode_topmost_carrying_an_authserv_id_quarantines_auth_absent() {
+        // If the topmost Authentication-Results unexpectedly carries an
+        // authserv-id while this deployment is configured for
+        // TopmostNoAuthservId mode, that violates the invariant that EXO's
+        // own stamp is topmost and unadorned (Microsoft could start emitting
+        // one, or an attacker's forged header floated to the top) --
+        // quarantine rather than trust it.
+        let raw = b"Authentication-Results: mx.microsoft.com; dmarc=pass header.from=gmail.com\r\n\
+                    From: Ocean Li <quantocean.li@gmail.com>\r\n\
+                    To: Leo Li <leo@khive.ai>\r\n\
+                    Subject: forged topmost carries an id\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let mut config = make_config("quantocean.li@gmail.com");
+        config.trust_anchor = TrustAnchor::TopmostNoAuthservId;
+        let ch = build_channel_from(config, vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("auth-absent")
+        );
     }
 
     #[tokio::test]

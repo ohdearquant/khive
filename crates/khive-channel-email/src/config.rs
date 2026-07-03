@@ -6,6 +6,43 @@
 use crate::connector::MailAddress;
 use khive_channel::ChannelError;
 
+/// Reserved sentinel value for `KHIVE_EMAIL_AUTHSERV_ID` that selects
+/// [`TrustAnchor::TopmostNoAuthservId`] mode. `!` is not excluded by RFC 8601
+/// `authserv-id` grammar (it is not a `tspecial`, so it is legal in an
+/// unquoted token) -- this sentinel is safe by *convention*, not by grammar
+/// guarantee: no real-world domain-form receiving-boundary identifier begins
+/// with `!`, and this config contract reserves the exact string.
+pub const TOPMOST_NO_AUTHSERV_ID_SENTINEL: &str = "!topmost-no-authserv-id";
+
+/// The trust-anchor mode this deployment uses to select which
+/// `Authentication-Results` header to trust (ADR-056 Amendment 2026-07-03,
+/// "EXO no-authserv-id trust anchor"). Parsed once, at config load, from
+/// `KHIVE_EMAIL_AUTHSERV_ID` -- never re-derived from message content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustAnchor {
+    /// RFC-compliant boundary: trust the topmost header whose `authserv-id`
+    /// equals this configured string (case-insensitive).
+    AuthservId(String),
+    /// A boundary that emits no `authserv-id` at all (e.g. Exchange Online's
+    /// internal-hop stamp): trust the topmost header only if it is itself in
+    /// the no-authserv-id form. Selected by the exact sentinel
+    /// [`TOPMOST_NO_AUTHSERV_ID_SENTINEL`]; any other value is treated as a
+    /// literal (and, for a typo, non-matching) `authserv-id` -- there is no
+    /// input that silently falls back to this mode.
+    TopmostNoAuthservId,
+}
+
+impl TrustAnchor {
+    /// Parse the raw `KHIVE_EMAIL_AUTHSERV_ID` value into a `TrustAnchor`.
+    fn parse(raw: String) -> Self {
+        if raw == TOPMOST_NO_AUTHSERV_ID_SENTINEL {
+            TrustAnchor::TopmostNoAuthservId
+        } else {
+            TrustAnchor::AuthservId(raw)
+        }
+    }
+}
+
 /// Authentication mode for SMTP and IMAP connections.
 ///
 /// Selected at construction time based on the environment variables that are
@@ -85,12 +122,15 @@ pub struct EmailChannelConfig {
     /// `KHIVE_EMAIL_MAINTAINER_ADDRESS`; the first entry is the primary, used for
     /// outbound-allowlist defaulting and envelope `to` fallback. Never empty.
     pub maintainer_addresses: Vec<MailAddress>,
-    /// The `authserv-id` this deployment trusts in inbound `Authentication-Results`
-    /// headers (ADR-056 Amendment 2026-07-02). Required: there is no safe default
-    /// that would not either trust an attacker-controlled id or silently accept
-    /// unauthenticated mail, so a missing value fails config construction rather
-    /// than falling back to an open default.
-    pub authserv_id: String,
+    /// The trust anchor this deployment uses to select which inbound
+    /// `Authentication-Results` header to trust (ADR-056 Amendment
+    /// 2026-07-02, refined 2026-07-03 for EXO's no-authserv-id boundary
+    /// shape). Required: there is no safe default that would not either
+    /// trust an attacker-controlled id or silently accept unauthenticated
+    /// mail, so a missing value fails config construction rather than
+    /// falling back to an open default. See [`TrustAnchor`] and
+    /// [`TOPMOST_NO_AUTHSERV_ID_SENTINEL`].
+    pub trust_anchor: TrustAnchor,
     /// Whether a message that fails the attribution gate (domain authentication
     /// or sender allowlist) is stored as an unattributed quarantine record
     /// instead of being dropped. Defaults to `true`. When `false`, such messages
@@ -159,7 +199,8 @@ impl EmailChannelConfig {
             ));
         }
 
-        let authserv_id = require_env("KHIVE_EMAIL_AUTHSERV_ID")?;
+        let authserv_id_raw = require_nonempty_env("KHIVE_EMAIL_AUTHSERV_ID")?;
+        let trust_anchor = TrustAnchor::parse(authserv_id_raw);
         let quarantine_store = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE", true)?;
 
         Ok(Self {
@@ -171,7 +212,7 @@ impl EmailChannelConfig {
             mailbox,
             auth,
             maintainer_addresses,
-            authserv_id,
+            trust_anchor,
             quarantine_store,
         })
     }
@@ -225,6 +266,22 @@ fn require_env(key: &str) -> Result<String, ChannelError> {
     std::env::var(key).map_err(|_| {
         ChannelError::Config(format!("required environment variable {key:?} is not set"))
     })
+}
+
+/// Like [`require_env`], but also rejects a set-but-empty (or whitespace-only)
+/// value. `std::env::var` returns `Ok("")` for `KEY=""`, which `require_env`
+/// alone would pass straight through -- for a security-relevant value like
+/// `KHIVE_EMAIL_AUTHSERV_ID` that must never silently degrade to an "empty"
+/// trust anchor, the guard belongs here at config construction, not inside
+/// [`TrustAnchor::parse`].
+fn require_nonempty_env(key: &str) -> Result<String, ChannelError> {
+    let value = require_env(key)?;
+    if value.trim().is_empty() {
+        return Err(ChannelError::Config(format!(
+            "environment variable {key:?} must not be empty"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_port(key: &str, default: u16) -> Result<u16, ChannelError> {
@@ -595,6 +652,47 @@ mod tests {
     }
 
     #[test]
+    fn from_env_empty_authserv_id_fails_closed() {
+        // Sibling of from_env_missing_authserv_id_fails_closed: `std::env::var`
+        // returns Ok("") for a set-but-empty var, so a bare `require_env` guard
+        // alone would let KHIVE_EMAIL_AUTHSERV_ID="" flow through to
+        // TrustAnchor::AuthservId(""), which then matches EXO's empty-authserv-id
+        // header form and silently degrades to trust-topmost without the
+        // sentinel opt-in. This must fail closed instead.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let result = EmailChannelConfig::from_env();
+        assert!(
+            result.is_err(),
+            "set-but-empty KHIVE_EMAIL_AUTHSERV_ID must fail closed, not default-open"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("KHIVE_EMAIL_AUTHSERV_ID"), "got: {msg}");
+    }
+
+    #[test]
     fn from_env_quarantine_store_defaults_true() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let keys = [
@@ -623,7 +721,10 @@ mod tests {
         std::env::remove_var(CS);
 
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
-        assert_eq!(config.authserv_id, "mx.example.com");
+        assert_eq!(
+            config.trust_anchor,
+            TrustAnchor::AuthservId("mx.example.com".to_string())
+        );
         assert!(config.quarantine_store, "must default to true when unset");
     }
 
@@ -657,5 +758,57 @@ mod tests {
 
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
         assert!(!config.quarantine_store);
+    }
+
+    // ── TrustAnchor sentinel parsing (Amendment 2026-07-03) ───────────────────
+
+    #[test]
+    fn trust_anchor_parses_exact_sentinel_to_topmost_no_authserv_id() {
+        assert_eq!(
+            TrustAnchor::parse(TOPMOST_NO_AUTHSERV_ID_SENTINEL.to_string()),
+            TrustAnchor::TopmostNoAuthservId
+        );
+    }
+
+    #[test]
+    fn trust_anchor_typo_of_sentinel_is_treated_as_literal_authserv_id_fail_closed() {
+        // A typo of the sentinel (missing trailing chars) must NOT silently
+        // fall back to topmost-no-authserv-id trust -- it is treated as a
+        // literal (and therefore non-matching, fail-closed) authserv-id.
+        let typo = "!topmost-no-authserv".to_string();
+        assert_eq!(
+            TrustAnchor::parse(typo.clone()),
+            TrustAnchor::AuthservId(typo)
+        );
+    }
+
+    #[test]
+    fn from_env_authserv_id_sentinel_selects_topmost_no_authserv_id_mode() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", TOPMOST_NO_AUTHSERV_ID_SENTINEL);
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert_eq!(config.trust_anchor, TrustAnchor::TopmostNoAuthservId);
     }
 }
