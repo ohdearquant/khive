@@ -26,6 +26,8 @@ use crate::types::SnapshotId;
 struct NdjsonEntity {
     id: Uuid,
     kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entity_type: Option<String>,
     name: String,
     #[serde(default)]
     description: Option<String>,
@@ -421,7 +423,7 @@ fn build_kg_archive(
         .map(|e| ExportedEntity {
             id: e.id,
             kind: e.kind.clone(),
-            entity_type: None,
+            entity_type: e.entity_type.clone(),
             name: e.name.clone(),
             description: e.description.clone(),
             properties: e.properties.clone(),
@@ -678,7 +680,7 @@ async fn upsert_entities(
                 id: r.id,
                 namespace: namespace.to_string(),
                 kind: r.kind.clone(),
-                entity_type: None,
+                entity_type: r.entity_type.clone(),
                 name: r.name.clone(),
                 description: r.description.clone(),
                 properties: r.properties.clone(),
@@ -1060,6 +1062,70 @@ mod tests {
         let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
         assert_eq!(report.entities, 0);
         assert_eq!(report.edges, 0);
+    }
+
+    /// #473: `run_sync` must preserve `entity_type` from NDJSON into the
+    /// SQLite-backed entity store so subtype-filtered reads see it.
+    #[tokio::test]
+    async fn sync_preserves_entity_type() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+
+        let id_a = "44444444-4444-4444-4444-444444444444";
+        let line_a = format!(
+            r#"{{"id":"{id_a}","kind":"document","entity_type":"paper","name":"Attention Is All You Need","properties":{{}},"tags":[]}}"#
+        );
+        write_repo(repo, &line_a, "");
+
+        let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(report.entities, 1);
+
+        let ns = khive_types::Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let token = rt.authorize(ns).unwrap();
+        let entity = rt
+            .entities(&token)
+            .unwrap()
+            .get_entity(id_a.parse().unwrap())
+            .await
+            .unwrap()
+            .expect("entity must be retrievable after sync");
+        assert_eq!(
+            entity.entity_type.as_deref(),
+            Some("paper"),
+            "entity_type must survive NDJSON sync, not be stored as NULL"
+        );
+    }
+
+    /// #473: two archives differing ONLY by `entity_type` must hash to
+    /// different `SnapshotId`s — the pin must be injective over entity_type,
+    /// not collide with the untyped archive.
+    #[test]
+    fn remote_hash_includes_ndjson_entity_type() {
+        let id_a = "55555555-5555-5555-5555-555555555555";
+        let untyped = format!(
+            r#"{{"id":"{id_a}","kind":"document","name":"Some Doc","properties":{{}},"tags":[]}}"#
+        );
+        let typed = format!(
+            r#"{{"id":"{id_a}","kind":"document","entity_type":"paper","name":"Some Doc","properties":{{}},"tags":[]}}"#
+        );
+
+        let untyped_pin = compute_pin(&untyped, "", "test-ns");
+        let typed_pin = compute_pin(&typed, "", "test-ns");
+
+        assert_ne!(
+            untyped_pin.as_str(),
+            typed_pin.as_str(),
+            "entity_type must be part of the canonical hash input; a pin for the \
+             untyped archive must not validate typed content"
+        );
     }
 
     /// F195: verify that FTS5 is populated during sync so text search works
