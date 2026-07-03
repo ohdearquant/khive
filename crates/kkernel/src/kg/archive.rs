@@ -713,6 +713,80 @@ mod tests {
         assert_eq!(entity.updated_at, expected_updated);
     }
 
+    /// #488a: a non-object element anywhere in the top-level JSON array must
+    /// abort the whole import — including entities before AND after it in the
+    /// array — before anything is written to the target DB. Previously this
+    /// was a warning that skipped just the bad element and kept going.
+    #[tokio::test]
+    async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-488.db");
+        let baseline_id = "88888888-8888-8888-8888-888888888888";
+
+        // Establish a baseline DB state via a first, valid import.
+        let baseline_json =
+            format!(r#"[{{"id":"{baseline_id}","kind":"concept","name":"Baseline"}}]"#);
+        let baseline_source = tmp.path().join("baseline.json");
+        std::fs::write(&baseline_source, &baseline_json).unwrap();
+        cmd_import(ImportArgs {
+            source: baseline_source,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        })
+        .await
+        .unwrap();
+
+        // A second import mixes a well-formed entity with a bare string
+        // element. The whole import must be rejected — the well-formed
+        // entity must NOT be written even though it appears before the
+        // malformed element in the array.
+        let never_imported_id = "99999999-9999-9999-9999-999999999999";
+        let bad_json = format!(
+            r#"[{{"id":"{never_imported_id}","kind":"concept","name":"NeverImported"}},"not-a-record"]"#
+        );
+        let bad_source = tmp.path().join("bad.json");
+        std::fs::write(&bad_source, &bad_json).unwrap();
+
+        let err = cmd_import(ImportArgs {
+            source: bad_source,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        })
+        .await
+        .expect_err("non-object array element must fail the whole import");
+        assert!(
+            err.chain().any(|e| e.to_string().contains("$record")),
+            "error must identify the malformed record, got: {err:#}"
+        );
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+
+        let baseline_uuid: Uuid = baseline_id.parse().unwrap();
+        let baseline = rt2
+            .get_entity(&tok2, baseline_uuid)
+            .await
+            .expect("baseline entity must still be present, untouched by the failed import");
+        assert_eq!(baseline.name, "Baseline");
+
+        let never_imported_uuid: Uuid = never_imported_id.parse().unwrap();
+        assert!(
+            rt2.get_entity(&tok2, never_imported_uuid).await.is_err(),
+            "entity preceding the malformed element in the array must not have been imported"
+        );
+    }
+
     #[test]
     fn validate_edge_weight_out_of_range_is_rejected() {
         let err = validate_edge_weight(1.5, "edge-z").unwrap_err();

@@ -49,11 +49,11 @@ impl JsonFormatAdapter {
             let obj = match item {
                 Value::Object(m) => m,
                 other => {
-                    warnings.push(format!(
-                        "record {index}: expected an object, got {}; skipped",
-                        other.type_str()
-                    ));
-                    continue;
+                    return Err(AdapterError::InvalidField {
+                        index,
+                        field: "$record".into(),
+                        reason: format!("expected object, got {}", other.type_str()),
+                    })
                 }
             };
 
@@ -378,7 +378,14 @@ fn parse_edge(
 
     let mut properties = match remove_ci(&mut obj, "properties") {
         Some((_, Value::Object(m))) => m,
-        Some(_) | None => serde_json::Map::new(),
+        Some((_, other)) => {
+            warnings.push(format!(
+                "record {index}: edge 'properties' is not an object (got {}); ignored",
+                other.type_str()
+            ));
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
     };
     for (k, v) in obj {
         properties.insert(k, v);

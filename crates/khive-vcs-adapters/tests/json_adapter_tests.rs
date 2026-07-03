@@ -600,3 +600,66 @@ fn test_json_adapter_edge_timestamps_are_reserved() {
     assert!(edges[0].properties.get("created_at").is_none());
     assert!(edges[0].properties.get("updated_at").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Test 17 — a non-object top-level array element is fatal, not skipped (#488a)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_non_object_array_element_is_fatal() {
+    // A bare string in the top-level array must abort construction with a
+    // fatal error identifying the offending record index, not be silently
+    // skipped with a warning.
+    let json = r#"[
+        {"kind":"concept","name":"Good"},
+        "not-a-record",
+        {"kind":"concept","name":"NeverParsed"}
+    ]"#;
+
+    let err = match JsonFormatAdapter::new(json) {
+        Err(e) => e,
+        Ok(_) => panic!("a non-object array element must be a fatal construction error"),
+    };
+    match &err {
+        AdapterError::InvalidField { index, field, .. } => {
+            assert_eq!(*index, 1, "error must point at the non-object element");
+            assert_eq!(field, "$record");
+        }
+        other => panic!("expected InvalidField at index 1, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 18 — non-object edge properties warns, never silently becomes {} (#488b)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_edge_properties_non_object_warns() {
+    let json = r#"[{
+        "source": "11111111-1111-1111-1111-111111111111",
+        "target": "22222222-2222-2222-2222-222222222222",
+        "relation": "extends",
+        "properties": "not-an-object"
+    }]"#;
+
+    let mut adapter = JsonFormatAdapter::new(json).expect("structurally valid JSON");
+    let edges: Vec<EdgeRecord> = adapter
+        .edges()
+        .map(|r| r.expect("no parse errors"))
+        .collect();
+
+    assert_eq!(edges.len(), 1);
+    assert_eq!(
+        edges[0].properties,
+        Value::Object(serde_json::Map::new()),
+        "non-object properties must fall back to an empty object"
+    );
+    assert!(
+        adapter
+            .warnings()
+            .iter()
+            .any(|w| w.contains("properties") && w.contains("not an object")),
+        "non-object edge properties must be reported as a warning, got: {:?}",
+        adapter.warnings()
+    );
+}
