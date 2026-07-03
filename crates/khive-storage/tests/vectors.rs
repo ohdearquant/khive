@@ -131,8 +131,12 @@ impl VectorStore for TestVectorStore {
 // Test cases — capabilities
 // ---------------------------------------------------------------------------
 
+/// STORAGE-AUD-001 / #485: the backend-neutral trait default must not
+/// advertise sqlite-vec-specific capabilities. A minimal `VectorStore` that
+/// does not override `capabilities()` must report an unknown dimension
+/// ceiling and no advertised index kind.
 #[tokio::test]
-async fn capabilities_returns_baseline_defaults() {
+async fn capabilities_default_is_neutral() {
     let store = TestVectorStore::new();
     let caps = store.capabilities();
     assert!(!caps.supports_filter);
@@ -140,24 +144,13 @@ async fn capabilities_returns_baseline_defaults() {
     assert!(!caps.supports_quantization);
     assert!(!caps.supports_update);
     assert!(!caps.supports_orphan_sweep);
-    // Baseline reports the sqlite-vec hard limit (SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192).
-    assert_eq!(caps.max_dimensions, Some(8192));
-    assert_eq!(caps.index_kinds, vec![VectorIndexKind::SqliteVec]);
-}
-
-/// Regression: baseline max_dimensions must be 8192 (SQLITE_VEC_VEC0_MAX_DIMENSIONS),
-/// not 4096 (SQLITE_VEC_VEC0_K_MAX). Callers with 5000-dim embeddings must not be
-/// falsely told the default backend is incapable.
-#[tokio::test]
-async fn baseline_max_dimensions_is_sqlite_vec_hard_limit() {
-    let store = TestVectorStore::new();
-    let caps = store.capabilities();
-    let max = caps
-        .max_dimensions
-        .expect("baseline must declare a finite dimension limit");
+    assert_eq!(
+        caps.max_dimensions, None,
+        "backend-neutral default must not advertise a dimension ceiling"
+    );
     assert!(
-        max >= 8192,
-        "baseline max_dimensions ({max}) must be at least 8192 — SQLITE_VEC_VEC0_MAX_DIMENSIONS"
+        caps.index_kinds.is_empty(),
+        "backend-neutral default must not advertise an index kind"
     );
 }
 
