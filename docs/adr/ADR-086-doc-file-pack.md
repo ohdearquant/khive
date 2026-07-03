@@ -27,7 +27,9 @@ Two facts about the current substrate shape drive this ADR's design directly:
   Option<String>`, and `properties: BTreeMap<String, PropertyValue>` — no dedicated content
   field, but `description` is an unconstrained free-text field with no length limit at the
   SQLite layer.
-- `fts_entities` (`crates/khive-db/sql/004-fts-consolidation.sql`) already indexes a
+- `fts_entities` (`crates/khive-db/sql/004-fts-consolidation.sql`; at runtime each
+  namespace additionally owns a suffixed variant, `fts_entities_{ns}` — e.g.
+  `fts_entities_local` — per `crates/khive-runtime/src/retrieval.rs`) already indexes a
   `title`/`body` pair (name/description) via FTS5 trigram tokenization for every entity,
   regardless of kind. Any text placed in `description` is automatically part of the
   existing hybrid FTS5 + vector search fusion — no new indexing path required.
@@ -187,7 +189,7 @@ which this ADR explicitly defers.
 - `crates/khive-types/src/entity.rs` — `Entity` struct (no content field; `description:
   Option<String>`, `properties: BTreeMap<String, PropertyValue>`)
 - `crates/khive-db/sql/004-fts-consolidation.sql` — `fts_entities` (title/body FTS5,
-  trigram tokenizer)
+  trigram tokenizer; live databases also carry per-namespace `fts_entities_{ns}` variants)
 - `crates/khive-storage/src/capability.rs` — `StorageCapability` (8 variants, no blob)
 - `crates/khive-db/sql/schema.sql` — `knowledge_atoms` (contrast: separate pack-owned
   table, not reused here)
