@@ -979,3 +979,83 @@ fn v2_parse_lifecycle_fs_add_overflow_returns_invalid_format_not_panic() {
     let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
     assert_eq!(&meta_after[..8], b"KHVVAMG2");
 }
+
+// ---- Issue #444: v2 commit config validation must feed the corrupt-snapshot rebuild path ----
+
+/// Regression: a persisted v2 commit with an invalid embedded config (e.g. max_degree = 0)
+/// used to surface as `VamanaError::InvalidConfig` from `load_v2_fast`'s `config.validate()`
+/// call, which `load_or_build`'s rebuild match only catches for `InvalidFormat`. That let a
+/// corrupt commit record propagate as an error out of `load_or_build` instead of rebuilding.
+/// With the fix, `parse_v2_commit` validates the embedded config and maps failures to
+/// `InvalidFormat`, so the existing corrupt-snapshot rebuild path handles it.
+#[test]
+fn load_or_build_rebuilds_when_v2_commit_config_invalid() {
+    let dim = 8usize;
+    let vectors = rand_unit_vectors(20, dim, 0xA6_44);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(16);
+    let idx = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    let meta_path = dir.path().join("metadata.bin");
+    let mut meta = fs::read(&meta_path).unwrap();
+    meta[168..176].copy_from_slice(&0u64.to_le_bytes()); // malformed persisted max_degree
+    fs::write(&meta_path, &meta).unwrap();
+
+    assert!(matches!(
+        VamanaIndex::load(dir.path()),
+        Err(VamanaError::InvalidFormat { .. })
+    ));
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(16);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback.clone()).unwrap();
+    assert_eq!(loaded.config(), &fallback);
+    assert_eq!(loaded.num_vectors(), vectors.len() / dim);
+}
+
+// ---- Issue #435: v2 lifecycle parser must reject tombstone bits past num_vectors ----
+
+/// Regression: parse_lifecycle resized the tombstone bitvec up to `needed_words` when it was
+/// too short but never rejected (or masked) extra set bits at or beyond `num_vectors` when the
+/// persisted word count already covered `needed_words`. Those out-of-range set bits were
+/// counted into `tombstone_count` and silently treated as tombstoned nodes past the valid
+/// node-id domain. With the fix, `parse_lifecycle` rejects tombstone bits set beyond
+/// `num_vectors` with `InvalidFormat` instead of accepting the corrupt state.
+#[test]
+fn v2_parse_lifecycle_rejects_tombstone_bits_past_num_vectors_not_panic() {
+    let dim = 4usize;
+    let n = 9usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA6_35);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    let mut lifecycle_body = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+    assert_eq!(&lifecycle_body[..8], b"KHVVLIF1");
+    assert_eq!(
+        u64::from_le_bytes(lifecycle_body[8..16].try_into().unwrap()),
+        1
+    );
+    // For num_vectors = 9, valid tombstone bits are 0..=8; this word sets only bits 9..=63.
+    lifecycle_body[16..24].copy_from_slice(&0xffff_ffff_ffff_fe00u64.to_le_bytes());
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    let load_result = std::panic::catch_unwind(|| VamanaIndex::load(dir.path()));
+    assert!(matches!(
+        load_result,
+        Ok(Err(VamanaError::InvalidFormat { .. }))
+    ));
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+}

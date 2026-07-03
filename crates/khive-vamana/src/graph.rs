@@ -283,6 +283,12 @@ impl VamanaGraph {
     ) -> Result<Self> {
         config.validate()?;
         let num_vectors = validate_vectors(vectors, config.dimensions)?;
+        if encoded.len() != num_vectors {
+            return Err(VamanaError::DimensionMismatch {
+                expected: num_vectors,
+                actual: encoded.len(),
+            });
+        }
 
         if num_vectors > u32::MAX as usize {
             return Err(VamanaError::TooManyVectors { count: num_vectors });
@@ -1672,5 +1678,27 @@ mod tests {
             .unwrap_or(BUILD_BATCH_SIZE)
             .max(1);
         assert_eq!(zero_parse, 1);
+    }
+
+    #[test]
+    fn build_sq8_rejects_encoded_row_count_mismatch_not_panic() {
+        let dim = 2usize;
+        let vectors = vec![0.0f32, 0.0, 1.0, 0.0]; // 2 valid rows
+        let cfg = VamanaConfig::with_dimensions(dim)
+            .with_max_degree(1)
+            .with_search_list_size(1);
+        let codec = GsSq8Codec::train_flat(&vectors, dim);
+        let mut encoded = codec.encode_flat_par(&vectors, dim);
+        encoded.truncate(0); // malformed: expected 2 encoded rows, actual 0
+
+        let result =
+            std::panic::catch_unwind(|| VamanaGraph::build_sq8(&vectors, &encoded, &codec, &cfg));
+        assert!(matches!(
+            result,
+            Ok(Err(VamanaError::DimensionMismatch {
+                expected: 2,
+                actual: 0
+            }))
+        ));
     }
 }
