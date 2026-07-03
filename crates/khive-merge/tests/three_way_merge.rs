@@ -1113,6 +1113,60 @@ fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
     }
 }
 
+// ── #456: shortcut strategies must not report dangling edges as Clean ──────
+
+#[test]
+fn ours_strategy_reports_dangling_edge_after_shortcut() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let base = archive_full(vec![entity(a, "A")], vec![]);
+    // ours deletes A and has no edges.
+    let ours = archive_full(vec![], vec![]);
+    // theirs retains A, adds B, and adds edge B -> A.
+    let theirs = archive_full(vec![entity(a, "A"), entity(b, "B")], vec![edge(b, a)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
+    assert!(
+        matches!(result, MergeResult::Conflicts { .. }),
+        "shortcut merge with a dangling edge must not be Clean"
+    );
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::DanglingEdge { missing_endpoint, .. } if *missing_endpoint == a)
+            ),
+            "expected DanglingEdge for missing entity A, got: {conflicts:?}"
+        );
+    }
+}
+
+#[test]
+fn theirs_strategy_reports_dangling_edge_after_shortcut() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let base = archive_full(vec![entity(a, "A")], vec![]);
+    // theirs deletes A and has no edges.
+    let theirs = archive_full(vec![], vec![]);
+    // ours retains A, adds B, and adds edge B -> A.
+    let ours = archive_full(vec![entity(a, "A"), entity(b, "B")], vec![edge(b, a)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
+    assert!(
+        matches!(result, MergeResult::Conflicts { .. }),
+        "shortcut merge with a dangling edge must not be Clean"
+    );
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::DanglingEdge { missing_endpoint, .. } if *missing_endpoint == a)
+            ),
+            "expected DanglingEdge for missing entity A, got: {conflicts:?}"
+        );
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn archive_with_entities(entities: Vec<ExportedEntity>) -> KgArchive {
