@@ -166,6 +166,7 @@ pub fn diff_edges(
 fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
     a.id == b.id
         && a.kind == b.kind
+        && a.entity_type == b.entity_type
         && a.name == b.name
         && a.description == b.description
         && a.tags == b.tags
@@ -173,7 +174,10 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
 }
 
 /// Property equality check; shared with entity.rs for duplicate-addition detection.
-pub(crate) fn properties_equal(a: &Option<serde_json::Value>, b: &Option<serde_json::Value>) -> bool {
+pub(crate) fn properties_equal(
+    a: &Option<serde_json::Value>,
+    b: &Option<serde_json::Value>,
+) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(av), Some(bv)) => av == bv,

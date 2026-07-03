@@ -37,6 +37,12 @@ fn entity(id: Uuid, name: &str) -> ExportedEntity {
     }
 }
 
+fn entity_with_type(id: Uuid, name: &str, entity_type: Option<&str>) -> ExportedEntity {
+    let mut e = entity(id, name);
+    e.entity_type = entity_type.map(|s| s.to_string());
+    e
+}
+
 fn edge(src: Uuid, tgt: Uuid) -> ExportedEdge {
     ExportedEdge {
         edge_id: Uuid::new_v4(),
@@ -922,6 +928,85 @@ fn diff_weight_modified_edge() {
         relation: "extends".into(),
     };
     assert!(matches!(diff[&key], EdgeChange::WeightModified { .. }));
+}
+
+// ── #454: entity_type must participate in diff and merge ───────────────────
+
+#[test]
+fn diff_entity_type_change_is_modified() {
+    use khive_merge::diff_local::{diff_entities, EntityChange};
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "FlashAttention", None)]);
+    let branch = archive_with_entities(vec![entity_with_type(
+        id,
+        "FlashAttention",
+        Some("algorithm"),
+    )]);
+    let diff = diff_entities(&base, &branch);
+    assert!(
+        matches!(diff[&id], EntityChange::Modified { .. }),
+        "entity_type-only change must be classified Modified, got: {:?}",
+        diff[&id]
+    );
+}
+
+#[test]
+fn auto_merge_preserves_single_sided_entity_type_change() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    if let MergeResult::Clean { merged } = result {
+        assert_eq!(
+            merged.entities[0].entity_type,
+            Some("algorithm".to_string()),
+            "single-sided entity_type change must survive the merge"
+        );
+    } else {
+        panic!("expected Clean, got Conflicts");
+    }
+}
+
+#[test]
+fn auto_merge_conflicts_on_divergent_entity_type_changes() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", Some("technique"))]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    assert!(matches!(result, MergeResult::Conflicts { .. }));
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::PropertyMismatch { key, .. } if key == "entity_type")
+            ),
+            "expected PropertyMismatch{{key: \"entity_type\"}}, got: {conflicts:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_uuid_different_entity_type_is_conflict() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", Some("technique"))]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    assert!(matches!(result, MergeResult::Conflicts { .. }));
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(|c| matches!(
+                c,
+                MergeConflict::DuplicateAddition { differing_fields, .. }
+                    if differing_fields.contains(&"entity_type".to_string())
+            )),
+            "expected DuplicateAddition with entity_type in differing_fields, got: {conflicts:?}"
+        );
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
