@@ -274,6 +274,8 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
     struct NdjsonEntity {
         id: Uuid,
         kind: String,
+        #[serde(default)]
+        entity_type: Option<String>,
         name: String,
         #[serde(default)]
         description: Option<String>,
@@ -311,7 +313,7 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
         .map(|e| ExportedEntity {
             id: e.id,
             kind: e.kind,
-            entity_type: None,
+            entity_type: e.entity_type,
             name: e.name,
             description: e.description,
             properties: e.properties,
