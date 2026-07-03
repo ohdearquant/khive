@@ -102,6 +102,12 @@ fn u8_dot_u32(a: &[u8], b: &[u8]) -> u32 {
 /// Safety: both slices must have the same length.
 #[inline(always)]
 pub fn u8_l2sq_u32(a: &[u8], b: &[u8]) -> u32 {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "u8_l2sq_u32 inputs must have equal length"
+    );
+
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
@@ -881,6 +887,15 @@ mod tests {
             })
             .sum();
         assert_eq!(u8_l2sq_u32(&a, &b), scalar, "u8_l2sq_u32 mismatch");
+    }
+
+    #[test]
+    #[should_panic(expected = "u8_l2sq_u32 inputs must have equal length")]
+    fn u8_l2sq_u32_rejects_shorter_second_slice() {
+        let a = [1u8; 16];
+        let b = [2u8; 1];
+
+        let _ = u8_l2sq_u32(&a, &b);
     }
 
     // ── GsSq8Codec tests ────────────────────────────────────────────────────
