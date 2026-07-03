@@ -867,6 +867,70 @@ fn quoted_prev_ref_non_numeric_index_treated_as_literal() {
     );
 }
 
+// ── #484 regression: nested malformed bracket paths in a quoted dotted ref ────
+
+#[test]
+fn quoted_prev_ref_nested_negative_index_treated_as_literal() {
+    // #484: `"$prev.items[-1].id"` — malformed bracket after a field segment
+    // must stay a literal Value, not be promoted to PrevRef.
+    let r = req(r#"list(kind="concept") | get(id="$prev.items[-1].id")"#);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(
+        r.ops[1].args["id"],
+        ArgValue::Value(json!("$prev.items[-1].id"))
+    );
+}
+
+#[test]
+fn quoted_prev_ref_nested_non_numeric_index_treated_as_literal() {
+    // #484: `"$prev.items[abc].id"` — non-numeric nested index is malformed.
+    let r = req(r#"list(kind="concept") | get(id="$prev.items[abc].id")"#);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(
+        r.ops[1].args["id"],
+        ArgValue::Value(json!("$prev.items[abc].id"))
+    );
+}
+
+#[test]
+fn quoted_prev_ref_nested_missing_close_bracket_treated_as_literal() {
+    // #484: `"$prev.items[0.id"` — unclosed nested bracket is malformed.
+    let r = req(r#"list(kind="concept") | get(id="$prev.items[0.id")"#);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(
+        r.ops[1].args["id"],
+        ArgValue::Value(json!("$prev.items[0.id"))
+    );
+}
+
+#[test]
+fn quoted_prev_ref_nested_valid_index_still_promotes_and_resolves() {
+    // #484 non-regression: a well-formed nested bracket path must still
+    // promote to PrevRef and resolve correctly.
+    let r = req(r#"list(kind="concept") | get(id="$prev.items[0].id")"#);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(
+        r.ops[1].args["id"],
+        ArgValue::PrevRef {
+            path: "items[0].id".into()
+        }
+    );
+    let prev = json!({"items": [{"id": "ok"}]});
+    assert_eq!(r.ops[1].args["id"].resolve_prev(&prev), Some(&json!("ok")));
+}
+
+#[test]
+fn quoted_prev_ref_root_bracket_with_malformed_nested_tail_treated_as_literal() {
+    // #484 risk flag: the root `$prev[N]...` branch must also validate
+    // malformed brackets in its tail, e.g. `"$prev[0].items[-1].id"`.
+    let r = req(r#"list(kind="concept") | get(id="$prev[0].items[-1].id")"#);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(
+        r.ops[1].args["id"],
+        ArgValue::Value(json!("$prev[0].items[-1].id"))
+    );
+}
+
 #[test]
 fn unquoted_negative_index_rejected_at_parse_time() {
     // Regression: unquoted `$prev[-1].id` — the `-` is not a digit, so the

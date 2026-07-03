@@ -375,19 +375,22 @@ impl<'a> Parser<'a> {
             });
         }
         if let Some(rest) = s.strip_prefix("$prev.") {
-            if !rest.is_empty() {
+            if !rest.is_empty() && quoted_prev_path_is_valid(rest) {
                 return Some(ArgValue::PrevRef {
                     path: rest.to_owned(),
                 });
             }
+            return None;
         }
         if let Some(after_bracket) = s.strip_prefix("$prev[") {
             if let Some(close) = after_bracket.find(']') {
                 let index_str = &after_bracket[..close];
                 if !index_str.is_empty() && index_str.chars().all(|c| c.is_ascii_digit()) {
                     let tail = &after_bracket[close + 1..];
-                    let path = format!("[{index_str}]{tail}");
-                    return Some(ArgValue::PrevRef { path });
+                    if quoted_prev_path_is_valid(tail) {
+                        let path = format!("[{index_str}]{tail}");
+                        return Some(ArgValue::PrevRef { path });
+                    }
                 }
             }
             return None;
@@ -454,4 +457,33 @@ impl<'a> Parser<'a> {
         }
         Ok(i)
     }
+}
+
+/// Validate a quoted `$prev` path tail (everything after `$prev.` or after the
+/// first `[N]` of a root `$prev[N]...` form) using the same bracket grammar as
+/// unquoted refs: every `[...]` segment must be non-empty digits followed by
+/// `]`, and a bare `]` outside a bracket is invalid. Malformed segments
+/// anywhere in the path must keep the whole string a literal `ArgValue::Value`
+/// rather than being promoted to `ArgValue::PrevRef`.
+fn quoted_prev_path_is_valid(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == start || i >= bytes.len() || bytes[i] != b']' {
+                    return false;
+                }
+                i += 1;
+            }
+            b']' => return false,
+            _ => i += 1,
+        }
+    }
+    true
 }
