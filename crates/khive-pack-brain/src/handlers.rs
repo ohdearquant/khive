@@ -1007,7 +1007,8 @@ impl BrainPack {
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
         // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
-        // the fold gate's mass check-and-write (fold_gate.rs) — the `resolve`
+        // the fold gate's mass check-and-write AND (Finding 1, codex round 2)
+        // the durable feedback event append (fold_gate.rs) — the `resolve`
         // check above is a non-atomic fast path only (it still handles the
         // common sequential case and the NotFound / forced-zero-weight
         // determination); this is the authoritative correctness mechanism
@@ -1018,101 +1019,130 @@ impl BrainPack {
                 _ => None,
             };
 
-        // ADR-081 §2: the bounded-mass fold gate applies only to implicit
-        // signals. Explicit/correction signals are never gated (they are the
-        // clamp's own comparator, ADR-081 §1).
-        let mut deduped_response: Option<Value> = None;
-        let gate_stamp: Option<serde_json::Value> =
-            if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
-                if matches!(
-                    event_kind,
-                    FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative
-                ) {
-                    let nominal_weight = event_kind.update_weight();
-                    if forced_zero_weight {
-                        Some(json!({
-                            "effective_weight": 0.0,
-                            "mass_before": 0.0,
-                            "mass_after": 0.0,
-                            "forced_zero_weight": true,
-                        }))
-                    } else {
-                        match crate::fold_gate::apply_fold_gate(
-                            sql.as_ref(),
-                            token.namespace().as_str(),
-                            effective_profile,
-                            &target.to_string(),
-                            nominal_weight,
-                            now_us,
-                            dedup_key,
-                        )
-                        .await?
-                        {
-                            crate::fold_gate::GateOutcome::Deduped => {
-                                deduped_response = Some(json!({
-                                    "emitted": false,
-                                    "deduped": true,
-                                    "verb": "brain.feedback",
-                                    "signal": signal,
-                                    "target_id": target.to_string(),
-                                    "serve_ledger_id": p.serve_ledger_id,
-                                    "scorer_run_id": p.scorer_run_id,
-                                }));
-                                None
-                            }
-                            crate::fold_gate::GateOutcome::Folded(outcome) => Some(json!({
-                                "effective_weight": outcome.effective_weight,
-                                "mass_before": outcome.mass_before,
-                                "mass_after": outcome.mass_after,
-                                "forced_zero_weight": false,
-                            })),
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        if let Some(resp) = deduped_response {
-            return Ok(resp);
-        }
-
-        let mut data = json!({"signal": signal});
+        // Base feedback payload, shared by every signal kind. The gated
+        // (implicit) path below adds a "gate" key inside the atomic unit;
+        // the ungated path (explicit/correction) adds nothing further.
+        let mut base_data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {
-            data["served_by_profile_id"] = json!(profile_id);
+            base_data["served_by_profile_id"] = json!(profile_id);
         }
         if let Some(ref ss) = p.section_signals {
-            data["section_signals"] = ss.clone();
-        }
-        if let Some(gate) = gate_stamp {
-            data["gate"] = gate;
+            base_data["section_signals"] = ss.clone();
         }
         if let (Some(ref scorer_run_id), Some(ref serve_ledger_id)) =
             (p.scorer_run_id.as_ref(), p.serve_ledger_id.as_ref())
         {
-            data["scorer_run_id"] = json!(scorer_run_id);
-            data["serve_ledger_id"] = json!(serve_ledger_id);
+            base_data["scorer_run_id"] = json!(scorer_run_id);
+            base_data["serve_ledger_id"] = json!(serve_ledger_id);
         }
 
-        let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
-        let event = Event::new(
-            token.namespace().as_str().to_string(),
-            "brain.feedback",
-            khive_types::EventKind::FeedbackExplicit,
-            khive_types::SubstrateKind::Event,
-            "brain",
-        )
-        .with_target(target)
-        .with_payload(data)
-        .with_duration_us(duration_us);
+        // ADR-081 §2: the bounded-mass fold gate applies only to implicit
+        // signals. Explicit/correction signals are never gated (they are the
+        // clamp's own comparator, ADR-081 §1) and — ADR-081 §6 — need not
+        // join the event append into the fold transaction: there is no
+        // dedup claim to keep consistent for them, so their append path
+        // below is unchanged from before this fix.
+        let is_gated_implicit = matches!(
+            FeedbackEventKind::from_signal_str(signal),
+            Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
+        );
 
-        let store = self.runtime.events(token)?;
-        store
-            .append_event(event.clone())
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let event = if is_gated_implicit {
+            let nominal_weight = FeedbackEventKind::from_signal_str(signal)
+                .expect("is_gated_implicit implies from_signal_str is Some")
+                .update_weight();
+            // Finding 2 (codex round 2): the forced-zero fail-safe path now
+            // runs through the SAME atomic claim+append unit as the nominal
+            // path below — only the mass fold write itself is skipped — so
+            // it participates in the dedup claim instead of bypassing it.
+            let gate_mode = if forced_zero_weight {
+                crate::fold_gate::FeedbackGateMode::ForcedZero
+            } else {
+                crate::fold_gate::FeedbackGateMode::Nominal(nominal_weight)
+            };
+
+            let namespace = token.namespace().as_str().to_string();
+            let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
+                sql.as_ref(),
+                &namespace,
+                effective_profile,
+                &target.to_string(),
+                gate_mode,
+                now_us,
+                dedup_key,
+                |fold_outcome, forced_zero| {
+                    let mut data = base_data.clone();
+                    let (effective_weight, mass_before, mass_after) = match fold_outcome {
+                        Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
+                        None => (0.0, 0.0, 0.0),
+                    };
+                    data["gate"] = json!({
+                        "effective_weight": effective_weight,
+                        "mass_before": mass_before,
+                        "mass_after": mass_after,
+                        "forced_zero_weight": forced_zero,
+                    });
+                    let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
+                    Event::new(
+                        namespace.clone(),
+                        "brain.feedback",
+                        khive_types::EventKind::FeedbackExplicit,
+                        khive_types::SubstrateKind::Event,
+                        "brain",
+                    )
+                    .with_target(target)
+                    .with_payload(data)
+                    .with_duration_us(duration_us)
+                },
+            )
+            .await?;
+
+            match outcome {
+                // Finding 1 fix: this is now the ONLY place a scorer-tagged
+                // implicit call returns `deduped` — reached only when the
+                // atomic unit's claim conflicted, meaning either a prior call
+                // already committed claim+fold+event together, or (never)
+                // a partially-failed prior attempt, since a failed attempt
+                // rolls back its claim too.
+                crate::fold_gate::GateAndAppendOutcome::Deduped => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": p.serve_ledger_id,
+                        "scorer_run_id": p.scorer_run_id,
+                    }));
+                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
+            }
+        } else {
+            // Unchanged: explicit/correction signals (and non-scorer implicit
+            // feedback would also land here if it ever reached this branch,
+            // but `is_gated_implicit` already routes all implicit signals
+            // above) append through the ordinary `EventStore` path, in its
+            // own transaction — ADR-081 §6 does not require these to join
+            // the fold gate's atomic unit.
+            let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
+            let event = Event::new(
+                token.namespace().as_str().to_string(),
+                "brain.feedback",
+                khive_types::EventKind::FeedbackExplicit,
+                khive_types::SubstrateKind::Event,
+                "brain",
+            )
+            .with_target(target)
+            .with_payload(base_data)
+            .with_duration_us(duration_us);
+
+            let store = self.runtime.events(token)?;
+            store
+                .append_event(event.clone())
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+            event
+        };
 
         let serving_profile_owned = p
             .served_by_profile_id

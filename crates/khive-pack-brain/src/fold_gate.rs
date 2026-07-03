@@ -68,6 +68,7 @@
 //! after event append) — that check is a useful non-atomic fast path, not a
 //! correctness mechanism.
 use khive_runtime::RuntimeError;
+use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
 
@@ -201,6 +202,174 @@ pub async fn apply_fold_gate(
             Err(e)
         }
     }
+}
+
+/// Which gating applies to the implicit event participating in the ADR-081
+/// §2/§6 atomic claim+fold+event-append unit
+/// (`apply_fold_gate_and_append_event`). Explicit/correction signals never
+/// reach this — `handlers.rs` keeps their append path unchanged, per ADR-081
+/// §6: "no dedup claim to keep consistent" for those signals.
+pub enum FeedbackGateMode {
+    /// The nominal implicit weight, subject to the ADR-081 §2 mass cap.
+    Nominal(f64),
+    /// ADR-081 §4 fail-safe: the serve ledger row has no resolvable
+    /// accounting profile. Always folds at zero weight and never writes
+    /// `brain_implicit_mass` — but (Finding 2, codex round 2) still
+    /// participates in the `(scorer_run_id, serve_ledger_id)` dedup claim,
+    /// atomically with the event append, so two concurrent forced-zero
+    /// submissions for the same pair cannot both append an audit event.
+    ForcedZero,
+}
+
+/// Result of the claim+fold(-or-skip) step inside
+/// `apply_fold_gate_and_append_event`, handed to the caller's `build_event`
+/// closure so the appended event's payload can carry the gate outcome.
+pub struct GateAndAppendResult {
+    /// `Some` for `FeedbackGateMode::Nominal` (the real mass check-and-fold
+    /// ran). `None` for `FeedbackGateMode::ForcedZero` (no mass write — the
+    /// zero-weight fail-safe never touches `brain_implicit_mass`).
+    pub fold_outcome: Option<FoldGateOutcome>,
+    /// `true` for `FeedbackGateMode::ForcedZero`.
+    pub forced_zero: bool,
+    /// The event this call appended (same value `build_event` returned).
+    pub event: Event,
+}
+
+/// Outcome of `apply_fold_gate_and_append_event`.
+pub enum GateAndAppendOutcome {
+    /// The `(scorer_run_id, serve_ledger_id)` pair was already claimed by a
+    /// prior call. Neither `brain_implicit_mass` nor the event log were
+    /// touched by this call — the caller must treat this emission as a
+    /// no-op.
+    Deduped,
+    /// The claim (if any) succeeded, the gate ran (or was skipped per
+    /// `ForcedZero`), and the feedback event was appended — all inside the
+    /// one held transaction, which is now committed. Boxed: `Event` carries
+    /// an owned `serde_json::Value` payload, making this variant much
+    /// larger than `Deduped`.
+    Applied(Box<GateAndAppendResult>),
+}
+
+/// ADR-081 §2/§6 (Finding 1 + Finding 2, codex round 2 review of PR #497):
+/// claim the `(scorer_run_id, serve_ledger_id)` dedup key (if supplied), run
+/// the bounded-mass fold gate (or skip it for `ForcedZero`), and append the
+/// resulting `brain.feedback` event — as ONE atomic, all-or-nothing unit on
+/// a single held `BEGIN IMMEDIATE` writer transaction, mirroring
+/// `apply_fold_gate`'s commit/rollback shape.
+///
+/// `build_event` is called with the gate outcome (after the claim/fold step,
+/// before the event is appended) so the event payload can carry the fold's
+/// numbers; it runs inside the transaction, so an error surfaced from
+/// appending the event it returns aborts the whole unit.
+///
+/// Finding 1 fix: on a claim conflict, this returns `Deduped` before running
+/// the fold or building/appending any event. If instead the claim succeeds
+/// but the event append fails, the whole transaction — claim included —
+/// rolls back (the same commit/rollback shell as `apply_fold_gate`), so a
+/// retry sees no claim and proceeds normally; the claim can never outlive a
+/// failed event append the way it could when the event append ran in its own
+/// separate transaction after this one committed.
+///
+/// Finding 2 fix: `FeedbackGateMode::ForcedZero` still runs the dedup claim
+/// step above — only the mass fold itself is skipped — so two concurrent
+/// forced-zero submissions for the same `(scorer_run_id, serve_ledger_id)`
+/// pair can no longer both append a zero-weight audit event.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_fold_gate_and_append_event<F>(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    profile_id: &str,
+    target_id: &str,
+    gate_mode: FeedbackGateMode,
+    now_us: i64,
+    dedup_key: Option<(&str, &str)>,
+    build_event: F,
+) -> Result<GateAndAppendOutcome, RuntimeError>
+where
+    F: FnOnce(Option<&FoldGateOutcome>, bool) -> Event,
+{
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+
+    exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
+        .await
+        .map_err(|e| sql_err("begin", e))?;
+
+    let result = apply_gate_and_append_within_tx(
+        writer.as_mut(),
+        namespace,
+        profile_id,
+        target_id,
+        gate_mode,
+        now_us,
+        dedup_key,
+        build_event,
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => match exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit").await {
+            Ok(()) => Ok(outcome),
+            Err(e) => {
+                // Same rationale as `apply_fold_gate`: an explicit ROLLBACK
+                // on a failed COMMIT avoids leaving a held write lock on a
+                // pooled/reused connection (in-memory backend).
+                let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
+                Err(sql_err("commit", e))
+            }
+        },
+        Err(e) => {
+            let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
+            Err(e)
+        }
+    }
+}
+
+/// Run the dedup claim (if any), the fold-or-skip, and the event append on
+/// `writer`, which must already be inside an open transaction. Does not
+/// commit or roll back — the caller owns transaction boundaries.
+#[allow(clippy::too_many_arguments)]
+async fn apply_gate_and_append_within_tx<F>(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    profile_id: &str,
+    target_id: &str,
+    gate_mode: FeedbackGateMode,
+    now_us: i64,
+    dedup_key: Option<(&str, &str)>,
+    build_event: F,
+) -> Result<GateAndAppendOutcome, RuntimeError>
+where
+    F: FnOnce(Option<&FoldGateOutcome>, bool) -> Event,
+{
+    if let Some((scorer_run_id, serve_ledger_id)) = dedup_key {
+        let claimed = claim_dedup_within_tx(writer, scorer_run_id, serve_ledger_id, now_us).await?;
+        if !claimed {
+            return Ok(GateAndAppendOutcome::Deduped);
+        }
+    }
+
+    let (fold_outcome, forced_zero) = match gate_mode {
+        FeedbackGateMode::Nominal(weight) => {
+            let outcome =
+                fold_within_tx(writer, namespace, profile_id, target_id, weight, now_us).await?;
+            (Some(outcome), false)
+        }
+        FeedbackGateMode::ForcedZero => (None, true),
+    };
+
+    let event = build_event(fold_outcome.as_ref(), forced_zero);
+
+    khive_db::stores::event::append_event_on_writer(writer, &event)
+        .await
+        .map_err(|e| sql_err("append feedback event", e))?;
+
+    Ok(GateAndAppendOutcome::Applied(Box::new(
+        GateAndAppendResult {
+            fold_outcome,
+            forced_zero,
+            event,
+        },
+    )))
 }
 
 /// Run the dedup claim (if any) followed by the mass `SELECT` + decision +
@@ -829,5 +998,420 @@ mod tests {
              decaying as if the row's clock had been dragged back to t"
         );
         assert!((outcome2.mass_after - IMPLICIT_MASS_CAP).abs() < 1e-9);
+    }
+
+    /// Proves the Finding-1 fix (codex round 2 review of PR #497): if the
+    /// feedback event append fails AFTER a successful dedup claim, the whole
+    /// atomic unit — claim and (skipped-on-clamp-aside) mass write included
+    /// — rolls back, so a retry sees no claim and proceeds normally.
+    ///
+    /// The failure is injected by making `build_event` return an `Event`
+    /// whose `id` collides with a row already seeded in `events` (`id` is
+    /// that table's `PRIMARY KEY`) — a real, deterministic SQLite
+    /// constraint violation on the INSERT, not a mock. `append_event_on_writer`'s
+    /// INSERT has no `OR IGNORE`, so the conflict surfaces as an `Err` from
+    /// `SqlWriter::execute`, propagating out of `apply_fold_gate_and_append_event`
+    /// before `COMMIT` — exercising exactly the rollback path codex flagged
+    /// as untested (before this fix, the claim+fold committed in their own
+    /// transaction before the event append ran in a separate one, so this
+    /// scenario could not roll back the claim at all).
+    #[tokio::test]
+    async fn fold_gate_rolls_back_claim_and_mass_when_event_append_fails() {
+        use khive_storage::event::Event;
+        use khive_types::{EventKind, SubstrateKind};
+
+        let (rt, _dir) = file_backed_runtime("fold-gate-append-failure-rollback.db");
+        let sql = rt.sql();
+
+        let namespace = "local";
+        let profile_id = "rollback-profile";
+        let target_id = "rollback-target";
+        let weight = 0.1;
+        let now_us: i64 = 1_700_000_000_000_000;
+        let scorer_run_id = "rollback-scorer-run";
+        let serve_ledger_id = "rollback-serve-ledger-row";
+        let event_target = uuid::Uuid::new_v4();
+        let colliding_id = uuid::Uuid::new_v4();
+
+        // Seed a colliding `events` row outside the unit under test.
+        {
+            let mut writer = sql.writer().await.expect("writer");
+            exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "seed_begin")
+                .await
+                .expect("begin seed txn");
+            let seed_event = Event {
+                id: colliding_id,
+                ..Event::new(
+                    namespace.to_string(),
+                    "brain.feedback",
+                    EventKind::FeedbackExplicit,
+                    SubstrateKind::Event,
+                    "brain",
+                )
+            };
+            khive_db::stores::event::append_event_on_writer(writer.as_mut(), &seed_event)
+                .await
+                .expect("seed colliding event");
+            exec_stmt(writer.as_mut(), "COMMIT", vec![], "seed_commit")
+                .await
+                .expect("commit seed txn");
+        }
+
+        // First attempt: claim succeeds, mass folds, but the event append
+        // hits the seeded PRIMARY KEY collision and the whole unit errors.
+        let first_attempt = apply_fold_gate_and_append_event(
+            sql.as_ref(),
+            namespace,
+            profile_id,
+            target_id,
+            FeedbackGateMode::Nominal(weight),
+            now_us,
+            Some((scorer_run_id, serve_ledger_id)),
+            |_fold_outcome, _forced_zero| Event {
+                id: colliding_id,
+                ..Event::new(
+                    namespace.to_string(),
+                    "brain.feedback",
+                    EventKind::FeedbackExplicit,
+                    SubstrateKind::Event,
+                    "brain",
+                )
+                .with_target(event_target)
+            },
+        )
+        .await;
+        assert!(
+            first_attempt.is_err(),
+            "event append PK collision must surface as an error, not succeed silently"
+        );
+
+        // The claim and the mass write must both have rolled back — neither
+        // table shows the failed attempt.
+        {
+            let mut reader = sql.reader().await.expect("reader");
+            let claim_count: i64 = match khive_storage::SqlReader::query_row(
+                reader.as_mut(),
+                SqlStatement {
+                    sql: "SELECT COUNT(*) AS n FROM brain_scorer_dedup \
+                          WHERE scorer_run_id = ?1 AND serve_ledger_id = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(scorer_run_id.to_string()),
+                        SqlValue::Text(serve_ledger_id.to_string()),
+                    ],
+                    label: None,
+                },
+            )
+            .await
+            .expect("read claim count")
+            .expect("count row must exist")
+            .get("n")
+            {
+                Some(SqlValue::Integer(v)) => *v,
+                other => panic!("unexpected count column value: {other:?}"),
+            };
+            assert_eq!(
+                claim_count, 0,
+                "the failed attempt's claim must have rolled back, not stuck as a committed \
+                 orphan that would suppress a legitimate retry"
+            );
+
+            let mass_count: i64 = match khive_storage::SqlReader::query_row(
+                reader.as_mut(),
+                SqlStatement {
+                    sql: "SELECT COUNT(*) AS n FROM brain_implicit_mass \
+                          WHERE profile_id = ?1 AND namespace = ?2 AND target_id = ?3"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(profile_id.to_string()),
+                        SqlValue::Text(namespace.to_string()),
+                        SqlValue::Text(target_id.to_string()),
+                    ],
+                    label: None,
+                },
+            )
+            .await
+            .expect("read mass count")
+            .expect("count row must exist")
+            .get("n")
+            {
+                Some(SqlValue::Integer(v)) => *v,
+                other => panic!("unexpected count column value: {other:?}"),
+            };
+            assert_eq!(
+                mass_count, 0,
+                "the failed attempt's mass write must have rolled back with the claim"
+            );
+        }
+
+        // Retry with the same dedup key: since the claim rolled back, this
+        // must proceed normally (not `Deduped`), fold at full weight, and
+        // append its own event.
+        let retry = apply_fold_gate_and_append_event(
+            sql.as_ref(),
+            namespace,
+            profile_id,
+            target_id,
+            FeedbackGateMode::Nominal(weight),
+            now_us,
+            Some((scorer_run_id, serve_ledger_id)),
+            |_fold_outcome, _forced_zero| {
+                Event::new(
+                    namespace.to_string(),
+                    "brain.feedback",
+                    EventKind::FeedbackExplicit,
+                    SubstrateKind::Event,
+                    "brain",
+                )
+                .with_target(event_target)
+            },
+        )
+        .await
+        .expect("retry after rollback must succeed");
+
+        match retry {
+            GateAndAppendOutcome::Applied(result) => {
+                assert!(!result.forced_zero);
+                let outcome = result
+                    .fold_outcome
+                    .expect("Nominal gate mode always produces a fold outcome");
+                assert!((outcome.effective_weight - weight).abs() < 1e-9);
+                assert!((outcome.mass_after - weight).abs() < 1e-9);
+            }
+            GateAndAppendOutcome::Deduped => {
+                panic!("retry after a rolled-back claim must not be deduped")
+            }
+        }
+
+        // Persisted state after the retry: exactly one claim, mass moved
+        // exactly once (to `weight`), exactly one durable event for this
+        // target — the failed attempt's event never persisted.
+        let mut reader = sql.reader().await.expect("reader");
+        let claim_count_after: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM brain_scorer_dedup \
+                      WHERE scorer_run_id = ?1 AND serve_ledger_id = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(scorer_run_id.to_string()),
+                    SqlValue::Text(serve_ledger_id.to_string()),
+                ],
+                label: None,
+            },
+        )
+        .await
+        .expect("read claim count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(claim_count_after, 1, "exactly one claim after the retry");
+
+        let mass_after: f64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT mass FROM brain_implicit_mass \
+                      WHERE profile_id = ?1 AND namespace = ?2 AND target_id = ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(profile_id.to_string()),
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text(target_id.to_string()),
+                ],
+                label: None,
+            },
+        )
+        .await
+        .expect("read mass")
+        .expect("row must exist after the retry")
+        .get("mass")
+        {
+            Some(SqlValue::Float(v)) => *v,
+            Some(SqlValue::Integer(v)) => *v as f64,
+            other => panic!("unexpected mass column value: {other:?}"),
+        };
+        assert!(
+            (mass_after - weight).abs() < 1e-9,
+            "mass must have moved exactly once (to {weight}), got {mass_after}"
+        );
+
+        let event_count: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM events WHERE target_id = ?1".into(),
+                params: vec![SqlValue::Text(event_target.to_string())],
+                label: None,
+            },
+        )
+        .await
+        .expect("read event count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(
+            event_count, 1,
+            "exactly one durable event for this target: the retry's — the failed \
+             attempt's event insert rolled back with everything else in its transaction"
+        );
+    }
+
+    /// Proves the Finding-2 fix (codex round 2 review of PR #497): the
+    /// ADR-081 §4 forced-zero fail-safe (`FeedbackGateMode::ForcedZero`) now
+    /// claims the dedup key atomically, on the SAME held transaction as the
+    /// (skipped) mass fold and the event append — so N concurrent identical
+    /// `(scorer_run_id, serve_ledger_id)` forced-zero submissions can no
+    /// longer all bypass the claim and each append their own zero-weight
+    /// audit event; exactly one must land, mirroring
+    /// `fold_gate_concurrent_duplicate_scorer_submissions_fold_once`'s shape
+    /// for the nominal path.
+    #[tokio::test]
+    async fn fold_gate_concurrent_forced_zero_duplicate_submissions_append_once() {
+        use khive_storage::event::Event;
+        use khive_types::{EventKind, SubstrateKind};
+        use std::sync::Arc;
+
+        let (rt, _dir) = file_backed_runtime("fold-gate-forced-zero-dedup-concurrency.db");
+        let sql = rt.sql();
+        const N: usize = 30;
+        let now_us: i64 = 1_700_000_000_000_000;
+        let scorer_run_id = "forced-zero-scorer-run";
+        let serve_ledger_id = "forced-zero-serve-ledger-row";
+        let event_target = uuid::Uuid::new_v4();
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let sql = Arc::clone(&sql);
+            handles.push(tokio::spawn(async move {
+                apply_fold_gate_and_append_event(
+                    sql.as_ref(),
+                    "local",
+                    "forced-zero-profile",
+                    "forced-zero-target",
+                    FeedbackGateMode::ForcedZero,
+                    now_us,
+                    Some((scorer_run_id, serve_ledger_id)),
+                    move |fold_outcome, forced_zero| {
+                        assert!(
+                            fold_outcome.is_none(),
+                            "ForcedZero must never run the mass fold"
+                        );
+                        assert!(forced_zero);
+                        Event::new(
+                            "local".to_string(),
+                            "brain.feedback",
+                            EventKind::FeedbackExplicit,
+                            SubstrateKind::Event,
+                            "brain",
+                        )
+                        .with_target(event_target)
+                        .with_payload(serde_json::json!({
+                            "signal": "implicit_negative",
+                            "gate": {"forced_zero_weight": true},
+                        }))
+                    },
+                )
+                .await
+                .expect("apply_fold_gate_and_append_event must not error under concurrent access")
+            }));
+        }
+
+        let mut applied_count = 0;
+        let mut deduped_count = 0;
+        for h in handles {
+            match h.await.expect("fold gate task must not panic") {
+                GateAndAppendOutcome::Applied(result) => {
+                    applied_count += 1;
+                    assert!(result.forced_zero);
+                    assert!(result.fold_outcome.is_none());
+                }
+                GateAndAppendOutcome::Deduped => deduped_count += 1,
+            }
+        }
+
+        assert_eq!(
+            applied_count, 1,
+            "exactly one of {N} concurrent identical forced-zero submissions must append; \
+             got {applied_count} applied, {deduped_count} deduped"
+        );
+        assert_eq!(deduped_count, N - 1);
+
+        let mut reader = sql.reader().await.expect("reader");
+        let claim_count: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM brain_scorer_dedup \
+                      WHERE scorer_run_id = ?1 AND serve_ledger_id = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(scorer_run_id.to_string()),
+                    SqlValue::Text(serve_ledger_id.to_string()),
+                ],
+                label: None,
+            },
+        )
+        .await
+        .expect("read claim count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(
+            claim_count, 1,
+            "the primary key must admit exactly one claim row for this dedup key"
+        );
+
+        let mass_count: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM brain_implicit_mass \
+                      WHERE profile_id = 'forced-zero-profile' AND namespace = 'local' \
+                      AND target_id = 'forced-zero-target'"
+                    .into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await
+        .expect("read mass count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(
+            mass_count, 0,
+            "ForcedZero must never write brain_implicit_mass, even for the one applied call"
+        );
+
+        let event_count: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM events WHERE target_id = ?1".into(),
+                params: vec![SqlValue::Text(event_target.to_string())],
+                label: None,
+            },
+        )
+        .await
+        .expect("read event count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(
+            event_count, 1,
+            "exactly one zero-weight feedback event must be appended across all {N} \
+             concurrent forced-zero submissions"
+        );
     }
 }

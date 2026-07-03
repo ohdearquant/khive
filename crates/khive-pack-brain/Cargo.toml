@@ -16,6 +16,13 @@ khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"]
 khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
 khive-fold = { version = "0.3.0", path = "../khive-fold" }
 khive-storage = { version = "0.3.0", path = "../khive-storage" }
+# ADR-081 §2/§6 (codex round 2, findings 1+2): the fold gate needs the event
+# append on the SAME held `SqlWriter` transaction as the dedup claim + mass
+# fold, so it calls khive-db's transaction-enlisted `append_event_on_writer`
+# seam directly rather than going through the higher-level `EventStore`
+# trait (which always opens its own transaction). No cycle: khive-db does not
+# depend on this crate.
+khive-db = { version = "0.3.0", path = "../khive-db" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 lattice-fann = { workspace = true, optional = true }
