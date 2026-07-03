@@ -128,6 +128,32 @@ fn effective_score<T>(
     base * (1.0 - bias * count as f32 / (count as f32 + 1.0))
 }
 
+fn validate_selector_weights(weights: &SelectorWeights) -> Result<(), FoldError> {
+    if !weights.min_score.is_finite() {
+        return Err(FoldError::InvalidInput(
+            "SelectorWeights.min_score must be finite".to_string(),
+        ));
+    }
+    if !weights.diversity_bias.is_finite() {
+        return Err(FoldError::InvalidInput(
+            "SelectorWeights.diversity_bias must be finite".to_string(),
+        ));
+    }
+    if !weights.epistemic_weight.is_finite() {
+        return Err(FoldError::InvalidInput(
+            "SelectorWeights.epistemic_weight must be finite".to_string(),
+        ));
+    }
+    for (category, weight) in &weights.category_weights {
+        if !weight.is_finite() {
+            return Err(FoldError::InvalidInput(format!(
+                "SelectorWeights.category_weights['{category}'] must be finite"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl<T: Clone> Selector<T> for GreedySelector {
     fn select(
         &self,
@@ -135,6 +161,18 @@ impl<T: Clone> Selector<T> for GreedySelector {
         budget: usize,
         weights: &SelectorWeights,
     ) -> Result<SelectorOutput<T>, FoldError> {
+        validate_selector_weights(weights)?;
+        for input in &inputs {
+            if let Some(gain) = input.information_gain {
+                if !gain.is_finite() {
+                    return Err(FoldError::InvalidInput(format!(
+                        "information_gain for '{}' must be finite",
+                        input.id
+                    )));
+                }
+            }
+        }
+
         // Filter non-finite and below min_score.
         inputs.retain(|i| i.score.is_finite() && i.score >= weights.min_score);
 
@@ -153,15 +191,26 @@ impl<T: Clone> Selector<T> for GreedySelector {
         let ew = weights.epistemic_weight;
 
         // Initial sort: effective score (pragmatic + epistemic bonus) desc, size asc, id asc —
-        // deterministic across platforms.
-        inputs.sort_by(|a, b| {
-            let a_eff = pragmatic_plus_epistemic(a, ew);
-            let b_eff = pragmatic_plus_epistemic(b, ew);
+        // deterministic across platforms. Non-finite effective scores are rejected rather
+        // than silently sorted, since a checked score can still overflow to non-finite.
+        let mut ranked = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let effective = pragmatic_plus_epistemic(&input, ew);
+            if !effective.is_finite() {
+                return Err(FoldError::InvalidInput(format!(
+                    "effective score for '{}' must be finite",
+                    input.id
+                )));
+            }
+            ranked.push((input, effective));
+        }
+        ranked.sort_by(|(a, a_eff), (b, b_eff)| {
             b_eff
-                .total_cmp(&a_eff)
+                .total_cmp(a_eff)
                 .then_with(|| a.size.cmp(&b.size))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        let inputs: Vec<_> = ranked.into_iter().map(|(input, _)| input).collect();
 
         let mut selected = Vec::new();
         let mut total_size = 0usize;
@@ -181,19 +230,28 @@ impl<T: Clone> Selector<T> for GreedySelector {
                 std::collections::BTreeMap::new();
 
             while !remaining.is_empty() && total_size < budget {
-                let best_idx = remaining
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| item.size <= budget.saturating_sub(total_size))
-                    .max_by(|(_, a), (_, b)| {
-                        let a_eff =
-                            effective_score(a, &category_counts, weights.diversity_bias, ew);
-                        let b_eff =
-                            effective_score(b, &category_counts, weights.diversity_bias, ew);
+                let mut candidates = Vec::with_capacity(remaining.len());
+                for (i, item) in remaining.iter().enumerate() {
+                    if item.size > budget.saturating_sub(total_size) {
+                        continue;
+                    }
+                    let eff = effective_score(item, &category_counts, weights.diversity_bias, ew);
+                    if !eff.is_finite() {
+                        return Err(FoldError::InvalidInput(format!(
+                            "effective score for '{}' must be finite",
+                            item.id
+                        )));
+                    }
+                    candidates.push((i, eff));
+                }
+
+                let best_idx = candidates
+                    .into_iter()
+                    .max_by(|&(i, a_eff), &(j, b_eff)| {
                         a_eff
                             .total_cmp(&b_eff)
-                            .then_with(|| b.size.cmp(&a.size))
-                            .then_with(|| a.id.cmp(&b.id))
+                            .then_with(|| remaining[j].size.cmp(&remaining[i].size))
+                            .then_with(|| remaining[i].id.cmp(&remaining[j].id))
                     })
                     .map(|(i, _)| i);
 
@@ -619,5 +677,69 @@ mod tests {
         assert_eq!(out.selected[0].id, "a");
         // b (eff=0.8*0.75=0.6) > c (eff=0.3) after a is placed in category x.
         assert_eq!(out.selected[1].id, "b");
+    }
+
+    // ── non-finite validation tests (FOLD-AUD-003) ─────────────────────────────
+
+    #[test]
+    fn greedy_selector_rejects_nan_information_gain() {
+        let inputs = vec![
+            input_with_gain("a", 100, 0.1, f32::NAN),
+            input_with_gain("b", 100, 0.9, 0.0),
+        ];
+        let w = SelectorWeights {
+            epistemic_weight: 1.0,
+            ..Default::default()
+        };
+        let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+        assert!(matches!(err, FoldError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn greedy_selector_rejects_non_finite_epistemic_weight() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let inputs = vec![input("a", 100, 0.5)];
+            let w = SelectorWeights {
+                epistemic_weight: bad,
+                ..Default::default()
+            };
+            let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+            assert!(matches!(err, FoldError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn greedy_selector_rejects_non_finite_diversity_bias() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let inputs = vec![input("a", 100, 0.5)];
+            let w = SelectorWeights {
+                diversity_bias: bad,
+                ..Default::default()
+            };
+            let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+            assert!(matches!(err, FoldError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn greedy_selector_rejects_non_finite_category_weight() {
+        let inputs = vec![input_cat("a", 100, 0.5, "x")];
+        let w = SelectorWeights {
+            category_weights: [("x".to_string(), f32::NAN)].into_iter().collect(),
+            ..Default::default()
+        };
+        let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+        assert!(matches!(err, FoldError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn greedy_selector_rejects_non_finite_effective_score_before_compare() {
+        let inputs = vec![input_with_gain("a", 100, f32::MAX, f32::MAX)];
+        let w = SelectorWeights {
+            epistemic_weight: f32::MAX,
+            ..Default::default()
+        };
+        let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+        assert!(matches!(err, FoldError::InvalidInput(_)));
     }
 }
