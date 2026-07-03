@@ -41,6 +41,26 @@ fn fuse_search_results_empty_sources_returns_empty() {
 }
 
 #[test]
+fn fuse_search_results_vector_only_returns_only_vector_source() {
+    let vector = vec![("vec_only", DeterministicScore::from_f64(0.9))];
+    let keyword = vec![("kw_only", DeterministicScore::from_f64(1.0))];
+    let config = HybridConfig::new(10).with_fusion_strategy(FusionStrategy::VectorOnly);
+    let results = fuse_search_results(vec![vector, keyword], &config);
+    let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec!["vec_only"]);
+}
+
+#[test]
+fn fuse_search_results_keyword_only_returns_only_keyword_source() {
+    let vector = vec![("vec_only", DeterministicScore::from_f64(0.9))];
+    let keyword = vec![("kw_only", DeterministicScore::from_f64(1.0))];
+    let config = HybridConfig::new(10).with_fusion_strategy(FusionStrategy::KeywordOnly);
+    let results = fuse_search_results(vec![vector, keyword], &config);
+    let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec!["kw_only"]);
+}
+
+#[test]
 fn fuse_search_results_single_source_truncates_to_top_k() {
     let source: Vec<_> = (0..20)
         .map(|i| {
