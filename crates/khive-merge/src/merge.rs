@@ -112,7 +112,9 @@ fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::Date
 /// Perform a three-way merge.
 ///
 /// - `Auto`: validate → entity pass → edge pass → dangling validation → deterministic sort → `Conflicts` or `Clean`.
-/// - `Ours`/`Theirs`: validate → last-write-wins shortcut → deterministic sort → always returns `Clean`.
+/// - `Ours`/`Theirs`: validate → last-write-wins shortcut (skips field conflict detection) →
+///   deterministic sort → dangling-edge validation against the shortcut-composed entity set,
+///   returning `Conflicts` if the shortcut output would reference a missing endpoint, else `Clean`.
 pub fn three_way_merge(
     base: &KgArchive,
     ours: &KgArchive,
