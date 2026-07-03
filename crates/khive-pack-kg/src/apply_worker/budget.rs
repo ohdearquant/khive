@@ -43,3 +43,16 @@ pub(crate) fn count_new_entries(changeset: &ProposalChangeset) -> u64 {
         _ => 0,
     }
 }
+
+/// Return true when a proposal changeset contains a Compound with more than one
+/// step. Multi-step Compound cannot be applied atomically with the current
+/// runtime/storage APIs, so pack-kg rejects it until an atomic apply primitive
+/// exists.
+pub(crate) fn has_multi_step_compound(changeset: &ProposalChangeset) -> bool {
+    match changeset {
+        ProposalChangeset::Compound { steps } => {
+            steps.len() > 1 || steps.iter().any(has_multi_step_compound)
+        }
+        _ => false,
+    }
+}

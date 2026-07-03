@@ -16,6 +16,7 @@ use khive_types::{
 use super::common::{
     deser, to_json, ListProposalsParams, ProposeParams, ReviewParams, WithdrawParams,
 };
+use crate::apply_worker::has_multi_step_compound;
 use crate::KgPack;
 
 use khive_runtime::micros_to_iso;
@@ -98,8 +99,14 @@ impl KgPack {
         khive_runtime::secret_gate::check_tags(&p.reviewers)?;
         khive_runtime::secret_gate::check_json(&p.changeset)?;
 
-        let _changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
+        let changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
+        if has_multi_step_compound(&changeset) {
+            return Err(RuntimeError::InvalidInput(
+                "multi-step Compound proposals are not supported until atomic proposal apply is available"
+                    .into(),
+            ));
+        }
 
         let proposal_id = Uuid::new_v4();
         let actor = token.actor().id.clone();
@@ -146,7 +153,7 @@ impl KgPack {
             proposer: actor.clone(),
             title: p.title.clone(),
             description: p.description.clone(),
-            changeset: _changeset,
+            changeset,
             reviewers: p.reviewers.clone(),
             expiry: p
                 .expiry

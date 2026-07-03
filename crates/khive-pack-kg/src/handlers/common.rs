@@ -364,12 +364,14 @@ pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
     note_value
 }
 
-pub(crate) fn parse_direction(s: Option<&str>) -> Direction {
+pub(crate) fn parse_direction(s: Option<&str>) -> Result<Direction, RuntimeError> {
     match s {
-        Some("in") | Some("incoming") => Direction::In,
-        Some("both") => Direction::Both,
-        Some("out") | Some("outgoing") | None => Direction::Out,
-        Some(_) => Direction::Out,
+        Some("in") | Some("incoming") => Ok(Direction::In),
+        Some("both") | None => Ok(Direction::Both),
+        Some("out") | Some("outgoing") => Ok(Direction::Out),
+        Some(raw) => Err(RuntimeError::InvalidInput(format!(
+            "unknown direction {raw:?}; valid: out | outgoing | in | incoming | both"
+        ))),
     }
 }
 

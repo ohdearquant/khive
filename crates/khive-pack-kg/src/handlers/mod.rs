@@ -13,7 +13,7 @@ mod search;
 mod stats;
 mod update;
 
-pub(crate) use common::{canonical_note_kind, parse_relation};
+pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relation};
 
 #[cfg(test)]
 pub(crate) use common::{

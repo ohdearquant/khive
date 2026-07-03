@@ -6,12 +6,14 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{NamespaceToken, Resolved, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::event::Event;
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_types::EventKind;
 
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
-    remap_note_status, resolve_uuid_unfiltered, to_json, GetParams,
+    parse_event_kind, parse_event_outcome, parse_event_substrate, remap_note_status,
+    resolve_uuid_unfiltered, to_json, GetParams,
 };
 use crate::KgPack;
 
@@ -83,19 +85,8 @@ impl KgPack {
             return flatten_get_result("edge", to_json(&edge)?);
         }
 
-        if let Some(event) = self
-            .runtime
-            .events(token)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-        {
-            if token
-                .visible_namespace_strs()
-                .contains(&event.namespace.as_str())
-            {
-                return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
-            }
+        if let Some(event) = self.get_event_unfiltered_by_id(id).await? {
+            return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
         }
 
         // Pack-resolver probe: ask each registered resolver for pack-private records
@@ -113,6 +104,64 @@ impl KgPack {
         }
 
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
+    }
+
+    /// Fetch an event by ID without a namespace predicate (ADR-007 Rev 6 pattern).
+    /// Only for by-ID `get`; event `list`/`query` surfaces must keep namespace scoping.
+    async fn get_event_unfiltered_by_id(&self, id: Uuid) -> Result<Option<Event>, RuntimeError> {
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                      payload_schema_version, profile_state_version, duration_us, target_id, \
+                      session_id, aggregate_kind, aggregate_id, created_at \
+                      FROM events WHERE id = ?1 LIMIT 1"
+                    .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("events.get_unfiltered_by_id".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(Event {
+            id: parse_uuid_column(&row, "id")?,
+            namespace: sql_text(&row, "namespace")?,
+            verb: sql_text(&row, "verb")?,
+            substrate: parse_event_substrate(&sql_text(&row, "substrate")?)
+                .map_err(|_| RuntimeError::Internal("stored event substrate is invalid".into()))?,
+            actor: sql_text(&row, "actor")?,
+            kind: parse_event_kind(&sql_text(&row, "kind")?)
+                .map_err(|_| RuntimeError::Internal("stored event kind is invalid".into()))?,
+            outcome: parse_event_outcome(&sql_text(&row, "outcome")?)
+                .map_err(|_| RuntimeError::Internal("stored event outcome is invalid".into()))?,
+            payload: serde_json::from_str(&sql_text(&row, "payload")?).map_err(|e| {
+                RuntimeError::Internal(format!("stored event payload is invalid JSON: {e}"))
+            })?,
+            payload_schema_version: u32::try_from(sql_i64(&row, "payload_schema_version")?)
+                .map_err(|_| {
+                    RuntimeError::Internal("stored event payload_schema_version is invalid".into())
+                })?,
+            profile_state_version: sql_optional_i64(&row, "profile_state_version")?
+                .map(|v| {
+                    u64::try_from(v).map_err(|_| {
+                        RuntimeError::Internal(
+                            "stored event profile_state_version is invalid".into(),
+                        )
+                    })
+                })
+                .transpose()?,
+            duration_us: sql_i64(&row, "duration_us")?,
+            target_id: sql_optional_uuid(&row, "target_id")?,
+            session_id: sql_optional_uuid(&row, "session_id")?,
+            aggregate_kind: sql_optional_text(&row, "aggregate_kind")?,
+            aggregate_id: sql_optional_uuid(&row, "aggregate_id")?,
+            created_at: sql_i64(&row, "created_at")?,
+        }))
     }
 
     pub(crate) async fn try_get_proposal_payload(
@@ -237,4 +286,58 @@ impl KgPack {
 
         Ok(Some(result))
     }
+}
+
+fn sql_text(row: &SqlRow, name: &str) -> Result<String, RuntimeError> {
+    match row.get(name) {
+        Some(SqlValue::Text(v)) => Ok(v.clone()),
+        Some(other) => Err(RuntimeError::Internal(format!(
+            "events.{name} has unexpected SQL value {other:?}"
+        ))),
+        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
+    }
+}
+
+fn sql_optional_text(row: &SqlRow, name: &str) -> Result<Option<String>, RuntimeError> {
+    match row.get(name) {
+        Some(SqlValue::Null) | None => Ok(None),
+        Some(SqlValue::Text(v)) => Ok(Some(v.clone())),
+        Some(other) => Err(RuntimeError::Internal(format!(
+            "events.{name} has unexpected SQL value {other:?}"
+        ))),
+    }
+}
+
+fn sql_i64(row: &SqlRow, name: &str) -> Result<i64, RuntimeError> {
+    match row.get(name) {
+        Some(SqlValue::Integer(v)) => Ok(*v),
+        Some(other) => Err(RuntimeError::Internal(format!(
+            "events.{name} has unexpected SQL value {other:?}"
+        ))),
+        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
+    }
+}
+
+fn sql_optional_i64(row: &SqlRow, name: &str) -> Result<Option<i64>, RuntimeError> {
+    match row.get(name) {
+        Some(SqlValue::Null) | None => Ok(None),
+        Some(SqlValue::Integer(v)) => Ok(Some(*v)),
+        Some(other) => Err(RuntimeError::Internal(format!(
+            "events.{name} has unexpected SQL value {other:?}"
+        ))),
+    }
+}
+
+fn parse_uuid_column(row: &SqlRow, name: &str) -> Result<Uuid, RuntimeError> {
+    Uuid::from_str(&sql_text(row, name)?)
+        .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+}
+
+fn sql_optional_uuid(row: &SqlRow, name: &str) -> Result<Option<Uuid>, RuntimeError> {
+    sql_optional_text(row, name)?
+        .map(|v| {
+            Uuid::from_str(&v)
+                .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+        })
+        .transpose()
 }

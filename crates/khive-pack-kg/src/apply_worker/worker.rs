@@ -1,7 +1,5 @@
 //! ProposalApplyWorker implementation.
 
-use std::str::FromStr;
-
 use uuid::Uuid;
 
 use khive_runtime::{
@@ -11,11 +9,11 @@ use khive_runtime::{
 use khive_storage::types::PageRequest;
 use khive_storage::{EdgeRelation, EventFilter};
 use khive_types::{
-    ApplyResult, EntityDraft, EntityKind, EventKind, Id128, NoteDraft, ProposalAppliedPayload,
+    ApplyResult, EntityDraft, EventKind, Id128, NoteDraft, ProposalAppliedPayload,
     ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch, Timestamp,
 };
 
-use super::budget::{count_new_entries, WriteBudget};
+use super::budget::{count_new_entries, has_multi_step_compound, WriteBudget};
 use crate::projection_worker::ProposalsProjectionWorker;
 
 /// Worker that applies approved proposal changesets.
@@ -59,6 +57,18 @@ impl ProposalApplyWorker {
                 return Ok(());
             }
         };
+
+        if has_multi_step_compound(&changeset) {
+            self.emit_apply_failed(
+                token,
+                proposal_id,
+                "multi-step Compound proposals are not supported until atomic proposal apply is available"
+                    .to_string(),
+                0,
+            )
+            .await;
+            return Ok(());
+        }
 
         if let Some(max) = max_new_entries {
             let needed = count_new_entries(&changeset);
@@ -200,7 +210,7 @@ impl ProposalApplyWorker {
         Box::pin(async move {
             match changeset {
                 ProposalChangeset::AddEntity { entity } => {
-                    self.apply_add_entity(token, entity, budget).await
+                    self.apply_add_entity(token, entity, registry, budget).await
                 }
                 ProposalChangeset::UpdateEntity { id, patch } => {
                     self.apply_update_entity(token, *id, patch).await?;
@@ -245,22 +255,19 @@ impl ProposalApplyWorker {
         &self,
         token: &NamespaceToken,
         draft: &EntityDraft,
+        registry: &VerbRegistry,
         budget: &mut WriteBudget,
     ) -> Result<Vec<Uuid>, RuntimeError> {
-        let kind = draft.kind.as_str();
-        EntityKind::from_str(kind).map_err(|_| {
-            let valid: Vec<&str> = EntityKind::ALL.iter().map(|k| k.name()).collect();
-            RuntimeError::InvalidInput(format!(
-                "AddEntity: unknown entity_kind {kind:?}; valid: {}",
-                valid.join(" | ")
-            ))
-        })?;
+        let kind = crate::handlers::canonical_entity_kind(draft.kind.as_str(), registry)?;
+        if draft.name.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+        }
         budget.consume_new_entry()?;
         let entity = self
             .runtime
             .create_entity(
                 token,
-                kind,
+                kind.as_str(),
                 None,
                 draft.name.as_str(),
                 draft.description.as_deref(),

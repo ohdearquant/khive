@@ -428,6 +428,223 @@ async fn apply_worker_rejects_invalid_note_kind() {
     );
 }
 
+/// #423 regression: a legacy queued multi-step Compound (AddEntity then an
+/// AddEdge with a phantom target) must not leak the entity write — the whole
+/// compound is rejected before any step is applied.
+#[tokio::test]
+async fn apply_worker_rejects_legacy_multi_step_compound_without_partial_entity_write() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::Compound {
+        steps: vec![
+            ProposalChangeset::AddEntity {
+                entity: make_entity_draft("AtomicLeak"),
+            },
+            ProposalChangeset::AddEdge {
+                source: Id128::from_u128(Uuid::new_v4().as_u128()),
+                target: Id128::from_u128(Uuid::new_v4().as_u128()),
+                relation: khive_types::EdgeRelation::Extends,
+                weight: Some(1.0),
+            },
+        ],
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed (rejection emitted as ProposalApplied{Failed})");
+
+    // No entity leaked from the first (successful-looking) step.
+    let entities = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    assert!(
+        !entities.iter().any(|e| e.name == "AtomicLeak"),
+        "#423: multi-step Compound must not leak the AddEntity write"
+    );
+
+    // Exactly one ProposalApplied{Failed} event, applied_step_count == 0.
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    assert_eq!(
+        applied_events.items.len(),
+        1,
+        "#423: exactly one ProposalApplied event must be emitted"
+    );
+    let payload_str = applied_events.items[0].payload.to_string();
+    assert!(
+        payload_str.contains("multi-step Compound"),
+        "#423: failure payload must mention multi-step Compound; got: {payload_str}"
+    );
+    assert!(
+        payload_str.contains("\"applied_step_count\":0"),
+        "#423: failure payload must report zero applied steps; got: {payload_str}"
+    );
+}
+
+/// #423 regression: `propose` itself must reject multi-step Compound changesets
+/// up front, before a proposal is even created.
+#[tokio::test]
+async fn propose_rejects_multi_step_compound_until_atomic_apply() {
+    let (rt, _tok) = setup();
+    ensure_schema(&rt).await;
+
+    let registry = build_registry(&rt);
+    let params = serde_json::json!({
+        "title": "Multi-step compound",
+        "description": "should be rejected",
+        "changeset": {
+            "kind": "compound",
+            "steps": [
+                {"kind": "add_entity", "entity": {"kind": "concept", "name": "A"}},
+                {"kind": "add_entity", "entity": {"kind": "concept", "name": "B"}}
+            ]
+        }
+    });
+    let err = registry
+        .dispatch("propose", params)
+        .await
+        .expect_err("multi-step Compound propose must fail");
+    match err {
+        RuntimeError::InvalidInput(msg) => {
+            assert!(
+                msg.contains("multi-step Compound"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+/// #424 regression: `AddEntity` proposals must accept pack-local entity kinds
+/// (e.g. `resource`) even though `khive_types::EntityKind` does not know them.
+#[tokio::test]
+async fn apply_add_entity_accepts_pack_local_resource_kind() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddEntity {
+        entity: EntityDraft {
+            kind: "resource".to_string(),
+            name: "ProposedResource".to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed");
+
+    let entities = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    let created = entities
+        .iter()
+        .find(|e| e.name == "ProposedResource")
+        .expect("#424: ProposedResource must be created");
+    assert_eq!(
+        created.kind, "resource",
+        "#424: kind must resolve to resource"
+    );
+}
+
+/// #424 regression: `AddEntity` proposals must reject whitespace-only names the
+/// same way the normal `create` handler does, with zero net writes.
+#[tokio::test]
+async fn apply_add_entity_rejects_whitespace_name_without_write() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddEntity {
+        entity: EntityDraft {
+            kind: "concept".to_string(),
+            name: "   ".to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let entities_before = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed (errors emitted as ProposalApplied{Failed})");
+
+    let entities_after = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    assert_eq!(
+        entities_before.len(),
+        entities_after.len(),
+        "#424: whitespace-only name must result in zero net writes"
+    );
+
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    assert_eq!(applied_events.items.len(), 1);
+    let payload_str = applied_events.items[0].payload.to_string();
+    assert!(
+        payload_str.contains("name must not be empty"),
+        "#424: failure payload must mention the empty-name guard; got: {payload_str}"
+    );
+}
+
 // ---- Write-budget tests ------------------------------------------------
 
 fn make_entity_draft(name: &str) -> EntityDraft {
@@ -498,11 +715,16 @@ async fn budget_exceeded_flat_compound_creates_zero_rows() {
         1,
         "budget: ProposalApplied event must be emitted on over-budget"
     );
+    // #423: multi-step Compound is now rejected for containment before the
+    // budget check ever runs, so the failure reason is the containment
+    // message rather than WriteBudgetExceeded. The all-or-nothing outcome
+    // (zero new entity rows) is what this test actually guards.
     let payload_str = applied_events.items[0].payload.to_string();
     assert!(
         payload_str.contains("WriteBudgetExceeded")
-            || payload_str.contains("write budget exceeded"),
-        "budget: failure payload must mention WriteBudgetExceeded; got: {payload_str}"
+            || payload_str.contains("write budget exceeded")
+            || payload_str.contains("multi-step Compound"),
+        "budget: failure payload must mention WriteBudgetExceeded or multi-step Compound; got: {payload_str}"
     );
 
     // Verify: zero new entity rows (all-or-nothing guarantee).
@@ -517,10 +739,12 @@ async fn budget_exceeded_flat_compound_creates_zero_rows() {
     );
 }
 
-/// In-budget flat Compound: 2 AddEntity steps, budget=Some(2).
-/// Expects: ProposalApplied{Success}, two new entities.
+/// #423 superseded this scenario: a 2-step Compound (previously "in-budget,
+/// applies fully") is now rejected outright as a multi-step Compound before
+/// the budget check runs, regardless of budget. Renamed from
+/// `budget_in_budget_flat_compound_applies_fully` to reflect the new contract.
 #[tokio::test]
-async fn budget_in_budget_flat_compound_applies_fully() {
+async fn budget_in_budget_flat_compound_is_rejected_as_multi_step() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
 
@@ -544,24 +768,25 @@ async fn budget_in_budget_flat_compound_applies_fully() {
     worker
         .maybe_apply(&tok, proposal_id, &registry, Some(2))
         .await
-        .expect("maybe_apply must succeed");
+        .expect("maybe_apply must succeed (rejection emitted as ProposalApplied{Failed})");
 
     let entities = rt
         .list_entities(&tok, None, None, 100, 0)
         .await
         .expect("list_entities");
     assert!(
-        entities.iter().any(|e| e.name == "InBudgetA"),
-        "budget: InBudgetA must be created"
+        !entities.iter().any(|e| e.name == "InBudgetA"),
+        "#423: multi-step Compound must not apply any step, including InBudgetA"
     );
     assert!(
-        entities.iter().any(|e| e.name == "InBudgetB"),
-        "budget: InBudgetB must be created"
+        !entities.iter().any(|e| e.name == "InBudgetB"),
+        "#423: multi-step Compound must not apply any step, including InBudgetB"
     );
 }
 
 /// Nested Compound: outer has 1 AddEntity + inner Compound with 2 AddEntity.
-/// Total = 3. budget=Some(2) → fail before any write.
+/// Now rejected as multi-step Compound (#423) before the budget check runs;
+/// zero-write invariant still holds either way.
 #[tokio::test]
 async fn budget_nested_compound_counts_recursively() {
     let (rt, tok) = setup();

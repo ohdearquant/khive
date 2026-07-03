@@ -2002,6 +2002,69 @@ async fn get_event_uuid_returns_event_wrapper() {
     );
 }
 
+/// #425 regression: `get(id=<event_uuid>)` from a caller in a DIFFERENT
+/// namespace than the event must succeed, matching the ADR-007 Rev 6 pattern
+/// #393 already established for entity/note/edge. Guards against the residual
+/// event-UUID resolver path #393 did not cover.
+#[tokio::test]
+async fn get_event_uuid_cross_namespace_succeeds() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "CrossNsEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    assert!(!events.is_empty(), "must have at least one create event");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id field")
+        .to_string();
+    let stored_namespace = events[0]
+        .get("namespace")
+        .and_then(Value::as_str)
+        .expect("event must have namespace field")
+        .to_string();
+    assert_ne!(
+        stored_namespace, "ns-caller",
+        "event must be stored in a namespace other than the cross-namespace caller"
+    );
+
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        get_result.is_ok(),
+        "#425: get(id=<event_uuid>) from a different namespace must succeed; got: {get_result:?}"
+    );
+    let get_result = get_result.unwrap();
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "#425: get must have kind=event at top level"
+    );
+    assert_eq!(
+        get_result.get("id").and_then(Value::as_str),
+        Some(event_id.as_str()),
+        "#425: id must match the requested event UUID"
+    );
+    assert_eq!(
+        get_result.get("namespace").and_then(Value::as_str),
+        Some(stored_namespace.as_str()),
+        "#425: returned event's namespace must be preserved, not overwritten by the caller's"
+    );
+}
+
 // ADR-045 §5: event `created_at` must be an ISO-8601 string at the MCP boundary,
 // not a raw microsecond integer (round-4 blocker fix).
 
@@ -3448,6 +3511,166 @@ async fn neighbors_direction_filter_incoming_outgoing() {
             "K-C2: neighbors(B, {dir_spelling}) must NOT return A; got: {node_ids:?}"
         );
     }
+}
+
+/// #445 regression: omitted `direction` must default to "both" (per the
+/// advertised `help=true` contract), not outgoing-only. On an incoming-only
+/// graph (A --extends--> B, no outgoing edges from B), `neighbors(B)` with no
+/// `direction` must still surface the incoming edge from A.
+#[tokio::test]
+async fn neighbors_default_direction_includes_incoming_edges() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DefaultDir_A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DefaultDir_B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // A --extends--> B; B has no outgoing edges.
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    let result = pack
+        .dispatch("neighbors", json!({"id": b_id}))
+        .await
+        .expect("neighbors with omitted direction must succeed");
+    let items = result.as_array().expect("must be array");
+    let node_ids: Vec<&str> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert!(
+        node_ids
+            .iter()
+            .any(|&id| id == a_id || a_id.starts_with(id) || id.starts_with(&a_id[..8])),
+        "#445: neighbors(B) with omitted direction must default to both and surface A; got: {node_ids:?}"
+    );
+}
+
+/// #480 regression: an unrecognized `direction` string (e.g. a plausible typo
+/// like "inbound") must be rejected with a descriptive error, not silently
+/// coerced to outgoing-only.
+#[tokio::test]
+async fn neighbors_invalid_direction_is_rejected() {
+    let pack = pack();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "InvalidDir_B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let result = pack
+        .dispatch("neighbors", json!({"id": b_id, "direction": "inbound"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "#480: neighbors with direction=\"inbound\" must be rejected, not silently coerced"
+    );
+    let err = result.unwrap_err();
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("unknown direction") && msg.contains("out | outgoing | in | incoming | both"),
+        "#480: error must list valid direction values; got: {msg}"
+    );
+}
+
+/// #445 regression (traverse variant): omitted `direction` must default to
+/// "both", so traversing from an incoming-only node still expands via the
+/// incoming edge.
+#[tokio::test]
+async fn traverse_default_direction_includes_incoming_edges() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TraverseDefaultDir_A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TraverseDefaultDir_B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    let result = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": [b_id], "max_depth": 1, "include_roots": false}),
+        )
+        .await
+        .expect("traverse with omitted direction must succeed");
+    let items = result.as_array().expect("must be array");
+    assert!(
+        !items.is_empty(),
+        "#445: traverse(roots=[B]) with omitted direction must default to both and expand via the incoming edge from A"
+    );
+}
+
+/// #480 regression (traverse variant): an unrecognized `direction` string must
+/// be rejected with a descriptive error.
+#[tokio::test]
+async fn traverse_invalid_direction_is_rejected() {
+    let pack = pack();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TraverseInvalidDir_B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let result = pack
+        .dispatch("traverse", json!({"roots": [b_id], "direction": "inbound"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "#480: traverse with direction=\"inbound\" must be rejected, not silently coerced"
+    );
+    let err = result.unwrap_err();
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("unknown direction") && msg.contains("out | outgoing | in | incoming | both"),
+        "#480: error must list valid direction values; got: {msg}"
+    );
 }
 
 // ── verbs() dispatch-level tests (codex review Medium: H5 not covered) ────────

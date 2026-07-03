@@ -19,7 +19,7 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let p: NeighborsParams = deser(params)?;
         let node_id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
-        let direction = parse_direction(p.direction.as_deref());
+        let direction = parse_direction(p.direction.as_deref())?;
         let relations = p
             .relations
             .map(|v| {
@@ -62,7 +62,7 @@ impl KgPack {
         for s in &p.roots {
             roots.push(resolve_uuid_async(s, &self.runtime, token).await?);
         }
-        let direction = parse_direction(p.direction.as_deref());
+        let direction = parse_direction(p.direction.as_deref())?;
         let relations = p
             .relations
             .map(|v| {
