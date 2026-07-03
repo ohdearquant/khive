@@ -153,6 +153,24 @@ pub fn arm_vector_fail(ns: &str) {
     *VECTOR_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
+/// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
+/// cleanup step (issue #460) — distinct from `FTS_FAIL_NS`/`VECTOR_FAIL_NS`, which
+/// target `create_note_inner`. Lets tests prove that a rollback compensation's
+/// cleanup failure still leaves the note row (and thus the live message) gone.
+#[cfg(any(test, feature = "fault-injection"))]
+static ROLLBACK_CLEANUP_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Arm the rollback-compensation cleanup failure injection targeting `ns`.
+///
+/// The next `delete_note_row_first_for_compensation` call whose note namespace
+/// equals `ns` removes the row as usual, then returns an injected cleanup error
+/// instead of running the real graph/FTS/vector cleanup, then disarms.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_rollback_cleanup_fail(ns: &str) {
+    *ROLLBACK_CLEANUP_FAIL_NS.lock().unwrap() = Some(ns.to_string());
+}
+
 /// A note search result with UUID, salience-weighted RRF score, and display text.
 #[derive(Clone, Debug)]
 pub struct NoteSearchHit {
@@ -3141,6 +3159,83 @@ impl KhiveRuntime {
             })?;
         }
         Ok(deleted)
+    }
+
+    /// Row-first compensating delete for rolling back a partially-written note
+    /// (issue #460 — `dual_write_message` rollback after a later delivery step
+    /// fails). Unlike [`KhiveRuntime::delete_note`], which cleans up graph/FTS/
+    /// vector indexes *before* removing the row, this removes the row first so
+    /// that a cleanup failure afterward cannot leave the compensated note live.
+    ///
+    /// Returns `Ok(())` once the row is gone (whether or not cleanup fully
+    /// succeeded). Returns `Err(RuntimeError::Internal)` naming the failed
+    /// cleanup legs when row removal succeeded but cleanup did not — the
+    /// message is gone, but stale index entries may remain and should be
+    /// surfaced to the caller rather than silently discarded.
+    ///
+    /// Returns `Ok(())` immediately, with no cleanup attempted, if the note
+    /// does not exist (nothing to compensate).
+    ///
+    /// Not a general-purpose replacement for `delete_note(..., hard=true)`:
+    /// normal hard delete still needs cleanup-first semantics (ADR-002
+    /// no-dangling-references) since a caller-visible error there should not
+    /// remove the row.
+    pub async fn delete_note_row_first_for_compensation(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<()> {
+        let note_store = self.notes(token)?;
+        let Some(note) = note_store.get_note_including_deleted(id).await? else {
+            return Ok(());
+        };
+        let record_tok = NamespaceToken::for_namespace(
+            khive_types::Namespace::parse(&note.namespace)
+                .map_err(|e| RuntimeError::Internal(format!("note namespace invalid: {e}")))?,
+        );
+        let record_ns = note.namespace.clone();
+
+        // Critical ordering: remove the row before any cleanup that can fail.
+        note_store.delete_note(id, DeleteMode::Hard).await?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let armed = ROLLBACK_CLEANUP_FAIL_NS.lock().unwrap().take();
+            if armed.as_deref() == Some(record_ns.as_str()) {
+                return Err(RuntimeError::Internal(
+                    "row removed but compensation cleanup failed: injected=true".to_string(),
+                ));
+            }
+        }
+
+        let mut cleanup_errors = Vec::new();
+        if let Err(e) = self.graph(&record_tok)?.purge_incident_edges(id).await {
+            cleanup_errors.push(format!("graph={e}"));
+        }
+        if let Err(e) = self
+            .text_for_notes(&record_tok)?
+            .delete_document(&record_ns, id)
+            .await
+        {
+            cleanup_errors.push(format!("fts={e}"));
+        }
+        for model_name in self.registered_embedding_model_names() {
+            if let Err(e) = self
+                .vectors_for_model(&record_tok, &model_name)?
+                .delete(id)
+                .await
+            {
+                cleanup_errors.push(format!("vector[{model_name}]={e}"));
+            }
+        }
+        if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Internal(format!(
+                "row removed but compensation cleanup failed: {}",
+                cleanup_errors.join("; ")
+            )))
+        }
     }
 }
 

@@ -36,6 +36,31 @@ pub(crate) async fn resolve_id(
     )))
 }
 
+/// Roll back a partially-written outbound note after a later `dual_write_message`
+/// step fails (issue #460). Uses a row-first compensating delete so that a
+/// cleanup failure cannot leave the outbound row (and thus the failed send's
+/// live message) behind. Returns `original` unchanged when rollback fully
+/// succeeds; returns a composite `RuntimeError::Internal` naming both the
+/// original failure and the rollback cleanup failure when the row was removed
+/// but cleanup did not complete.
+async fn rollback_outbound(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    outbound_id: Uuid,
+    context: &str,
+    original: RuntimeError,
+) -> RuntimeError {
+    match runtime
+        .delete_note_row_first_for_compensation(token, outbound_id)
+        .await
+    {
+        Ok(()) => original,
+        Err(rollback_err) => RuntimeError::Internal(format!(
+            "{context}: original error: {original}; outbound rollback failed after row removal attempt for {outbound_id}: {rollback_err}"
+        )),
+    }
+}
+
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
     let props = note.properties.as_ref();
 
@@ -240,12 +265,17 @@ pub(crate) async fn dual_write_message(
         patched.properties = Some(props);
         patched.updated_at = chrono::Utc::now().timestamp_micros();
         if let Err(patch_err) = store.upsert_note(patched).await {
-            let _ = runtime
-                .delete_note(caller_token, outbound_note.id, true)
-                .await;
-            return Err(RuntimeError::Internal(format!(
+            let original = RuntimeError::Internal(format!(
                 "dual_write: patch outbound thread_id: {patch_err}"
-            )));
+            ));
+            return Err(rollback_outbound(
+                runtime,
+                caller_token,
+                outbound_note.id,
+                "dual_write: patch outbound thread_id rollback",
+                original,
+            )
+            .await);
         }
     }
 
@@ -305,10 +335,14 @@ pub(crate) async fn dual_write_message(
             .await;
 
         if let Err(inbound_err) = inbound_result {
-            let _ = runtime
-                .delete_note(caller_token, outbound_note.id, true)
-                .await;
-            return Err(inbound_err);
+            return Err(rollback_outbound(
+                runtime,
+                caller_token,
+                outbound_note.id,
+                "dual_write: inbound write rollback",
+                inbound_err,
+            )
+            .await);
         }
     }
 
@@ -320,6 +354,90 @@ mod tests {
     use super::*;
     use khive_storage::note::Note;
     use serde_json::json;
+
+    // Issue #460: dual_write_message must not leave a live outbound note behind
+    // when the inbound write fails AND the rollback's compensation cleanup also
+    // fails. Forces outbound creation to succeed (sender_ns), the inbound create
+    // to fail (recipient_ns, via `arm_fts_fail`), and the rollback's post-row-
+    // removal cleanup to fail (sender_ns, via `arm_rollback_cleanup_fail`). Row-
+    // first ordering in `delete_note_row_first_for_compensation` means the
+    // outbound row is gone before cleanup runs, so it must stay gone even though
+    // cleanup errors; the caller must see that cleanup failure surfaced in the
+    // returned error rather than silently discarded.
+    #[tokio::test]
+    async fn dual_write_inbound_failure_rollback_delete_failure_removes_outbound_or_reports_composite(
+    ) {
+        use khive_runtime::{
+            arm_fts_fail, arm_rollback_cleanup_fail, AllowAllGate, BackendId, RuntimeConfig,
+        };
+
+        let sender_ns = format!("t460-sender-{}", Uuid::new_v4().simple());
+        let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse(&sender_ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+
+        let caller_token = runtime
+            .authorize(Namespace::parse(&sender_ns).unwrap())
+            .expect("authorize sender");
+
+        // Outbound (1st create_note call) targets sender_ns and is unaffected.
+        // Inbound (2nd create_note call) targets recipient_ns and fails.
+        arm_fts_fail(&recipient_ns);
+        // The rollback compensation's post-row-removal cleanup also fails.
+        arm_rollback_cleanup_fail(&sender_ns);
+
+        let result = dual_write_message(
+            &runtime,
+            &caller_token,
+            &sender_ns,
+            &recipient_ns,
+            None,
+            "F1 regression content",
+            None,
+            "2026-07-03T00:00:00Z",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "dual_write_message must fail when the inbound create fails; got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rollback") || err_msg.contains("cleanup"),
+            "error must explicitly surface the rollback/cleanup failure, not discard it; got: {err_msg}"
+        );
+
+        let alive = runtime
+            .list_notes(&caller_token, Some("message"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count();
+        assert_eq!(
+            alive, 0,
+            "no live outbound note may remain after rollback, even though the \
+             compensation cleanup itself failed; got {alive}"
+        );
+    }
 
     fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
         let mut n = Note::new(namespace, "message", content);
