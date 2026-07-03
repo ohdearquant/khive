@@ -157,7 +157,7 @@ async fn s_c1_schedule_valid_rfc3339_succeeds() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2099-01-01T00:00:00Z"
             }),
         )
@@ -175,7 +175,7 @@ async fn s_c1_schedule_invalid_at_not_a_date() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "not-a-date"
             }),
         )
@@ -197,7 +197,7 @@ async fn s_c1_schedule_invalid_at_natural_language() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "tomorrow at 3pm"
             }),
         )
@@ -218,7 +218,7 @@ async fn s_c1_schedule_invalid_at_out_of_range_date() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2027-13-99"
             }),
         )
@@ -382,9 +382,10 @@ async fn cancel_rejects_already_cancelled_event() {
         .dispatch("schedule.cancel", serde_json::json!({ "id": full_id }))
         .await
         .unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("already cancelled"),
-        "second cancel must report already-cancelled state, got: {err:?}"
+        msg.contains("not pending") && msg.contains("cancelled"),
+        "second cancel must report the event is no longer pending, got: {msg}"
     );
 }
 
@@ -398,7 +399,7 @@ async fn c3_schedule_past_date_rejected() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"past\")",
+                "action": "schedule.remind(content=\"past\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2020-01-01T00:00:00Z"
             }),
         )
@@ -525,7 +526,7 @@ async fn c4_schedule_valid_action_succeeds() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"hello world\")",
+                "action": "schedule.remind(content=\"hello world\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -641,7 +642,7 @@ async fn h5_schedule_at_with_offset_preserves_original_string() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"tz-test\")",
+                "action": "schedule.remind(content=\"tz-test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": input_at
             }),
         )

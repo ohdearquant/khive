@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
-use khive_storage::types::{PageRequest, SqlValue};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -88,19 +88,27 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validate a cron expression (5-field).
+/// Validate a repeat spec: named aliases or a limited five-field form.
 ///
-/// Accepts the literals `daily`, `weekly`, `monthly`, and standard five-field
-/// cron expressions of the form `MIN HOUR DOM MON DOW`, where each field is
-/// either `*` or a non-negative integer within the accepted range:
+/// Accepts the literals `daily`, `weekly`, `monthly`, and a limited five-field
+/// form `MIN HOUR DOM MON DOW`, where each field is exactly `*` or one
+/// non-negative integer within the accepted range:
 /// - MIN  0–59
 /// - HOUR 0–23
 /// - DOM  1–31
 /// - MON  1–12
 /// - DOW  0–7
 ///
-/// Malformed fields (non-numeric, out-of-range) are rejected with
-/// `RuntimeError::InvalidInput` rather than silently accepted.
+/// Standard cron operators such as steps (`*/15`), ranges (`9-17`), and lists
+/// (`0,30`) are NOT accepted (issue #481): `kkernel`'s pending-events runner
+/// does not yet compute next-fire times for cron-form repeats (it fires them
+/// one-shot), so advertising and accepting full cron syntax here would imply
+/// recurrence semantics that do not exist yet. Use `daily` / `weekly` /
+/// `monthly` for recurring runtime advancement until cron next-fire support
+/// lands.
+///
+/// Malformed fields (non-numeric, out-of-range, or a cron operator) are
+/// rejected with `RuntimeError::InvalidInput` rather than silently accepted.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     match repeat {
         "daily" | "weekly" | "monthly" => return Ok(()),
@@ -111,7 +119,9 @@ fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     if fields.len() != 5 {
         return Err(RuntimeError::InvalidInput(format!(
             "invalid repeat expression {repeat:?}: must be \"daily\", \"weekly\", \
-             \"monthly\", or a 5-field cron expression (MIN HOUR DOM MON DOW)"
+             \"monthly\", or a limited 5-field form (MIN HOUR DOM MON DOW) where each \
+             field is '*' or one in-range integer; cron operators such as steps, \
+             ranges, and lists are not accepted"
         )));
     }
 
@@ -155,9 +165,97 @@ fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, Runtime
     khive_request::parse_request(action).map_err(|e| {
         RuntimeError::InvalidInput(format!(
             "schedule.action: invalid DSL ({e}); \
-             provide a valid verb call (e.g. \"remind(content=\\\"hello\\\")\")"
+             provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")"
         ))
     })
+}
+
+/// Validate that a parsed `schedule.schedule` action can be replayed exactly
+/// as stored (issue #461).
+///
+/// The pending-events runner reparses the stored DSL at trigger time and
+/// dispatches it through the normal request surface. For that replay to
+/// succeed it must be a single op against an exactly-registered handler name
+/// (not a bare shorthand resolved via a `schedule.{tool}` fallback), with
+/// only literal argument values (no `$prev` references, which are only
+/// meaningful inside a chain the replay path does not reconstruct) and all
+/// required handler parameters present. Rejecting anything else here, at
+/// write time, prevents storing an action that is guaranteed to fail (and be
+/// silently marked "fired") when it comes due.
+fn validate_replayable_single_action(
+    parsed: &khive_request::ParsedRequest,
+    registry: &VerbRegistry,
+) -> Result<(), RuntimeError> {
+    if parsed.mode != khive_request::ExecutionMode::Single {
+        return Err(RuntimeError::InvalidInput(
+            "schedule.action: chains and $prev references are not supported for scheduled \
+             replay; provide a single verb call"
+                .into(),
+        ));
+    }
+
+    let op = parsed
+        .ops
+        .first()
+        .ok_or_else(|| RuntimeError::InvalidInput("schedule.action: missing verb".into()))?;
+
+    let help = registry.describe_verb(&op.tool).map_err(|_| {
+        RuntimeError::InvalidInput(format!(
+            "schedule.action: verb {:?} is not registered; use the exact pack-prefixed name \
+             (e.g. \"schedule.remind(...)\")",
+            op.tool
+        ))
+    })?;
+
+    for value in op.args.values() {
+        if !matches!(value, khive_request::ArgValue::Value(_)) {
+            return Err(RuntimeError::InvalidInput(
+                "schedule.action: $prev references are not replayable in a scheduled action".into(),
+            ));
+        }
+    }
+
+    validate_args_against_help(&op.tool, &op.args, &help)
+}
+
+/// Validate `args` against a verb's `describe_verb` help schema: reject
+/// unknown argument names and ensure every required parameter is present.
+fn validate_args_against_help(
+    tool: &str,
+    args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
+    help: &Value,
+) -> Result<(), RuntimeError> {
+    let params: &[Value] = help
+        .get("params")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    for name in args.keys() {
+        let known = params
+            .iter()
+            .any(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()));
+        if !known {
+            return Err(RuntimeError::InvalidInput(format!(
+                "schedule.action: verb {tool:?} does not accept argument {name:?}"
+            )));
+        }
+    }
+
+    for p in params {
+        let required = p.get("required").and_then(Value::as_bool).unwrap_or(false);
+        if !required {
+            continue;
+        }
+        let name = p.get("name").and_then(Value::as_str).unwrap_or_default();
+        if !args.contains_key(name) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "schedule.action: verb {tool:?} is missing required argument {name:?}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ── param structs ────────────────────────────────────────────────────────────
@@ -282,24 +380,13 @@ pub(crate) async fn handle_schedule(
     // Validate DSL parseability at write time (C4). Garbage like "x" or
     // "bogus-not-a-valid-verb()" is rejected before it enters storage.
     let parsed = validate_action(p.action.trim())?;
-    // Validate that each verb in the action string is registered. This catches
-    // nonexistent verbs at schedule-creation time rather than at trigger time
-    // when nobody is watching.
-    //
-    // The DSL allows bare verb names (e.g. "remind(...)") as shorthand for
-    // pack-prefixed verbs (e.g. "schedule.remind(...)"). Try the bare form
-    // first, then the "schedule.{verb}" form, so both are accepted.
-    for op in &parsed.ops {
-        let qualified = format!("schedule.{}", op.tool);
-        if registry.describe_verb(&op.tool).is_err() && registry.describe_verb(&qualified).is_err()
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "schedule.action: verb {:?} is not registered; \
-                 provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")",
-                op.tool
-            )));
-        }
-    }
+    // Validate that the action is a single, exactly-registered verb call with
+    // only literal args and all required params present, so the pending-events
+    // runner can replay it exactly at trigger time (issue #461). Bare
+    // shorthand (e.g. "remind(...)") is rejected: it is not the verb name
+    // that gets stored and replayed, so accepting it here would let a
+    // trigger-time replay fail as an unknown verb.
+    validate_replayable_single_action(&parsed, registry)?;
 
     // Validate RFC 3339 and reject past timestamps (C3).
     // Preserve the caller's original string as `trigger_at` so the
@@ -520,7 +607,7 @@ pub(crate) async fn handle_cancel(
     let id = resolve_id(runtime, token, &p.id, "cancel").await?;
 
     let store = runtime.notes(token)?;
-    let mut note = store
+    let note = store
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("cancel: get_note: {e}")))?
@@ -542,7 +629,7 @@ pub(crate) async fn handle_cancel(
     // Mutable string-key indexing on a non-object value panics in serde_json;
     // reject corrupt notes here with a clear error instead (SCH-AUD-001).
     let raw_props = note.properties.clone().unwrap_or_else(|| json!({}));
-    let mut props = match raw_props {
+    let props = match raw_props {
         Value::Object(_) => raw_props,
         ref other => {
             let type_name = match other {
@@ -559,22 +646,44 @@ pub(crate) async fn handle_cancel(
             )));
         }
     };
-    if props.get("status").and_then(Value::as_str) == Some("cancelled") {
+    // Scheduled events are a state machine: cancel only transitions
+    // pending -> cancelled. Any other current status (already "cancelled",
+    // "fired" by the pending-events runner, or anything else) is rejected
+    // outright rather than unconditionally overwritten (issue #462).
+    let status = props
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if status.as_deref() != Some("pending") {
         return Err(RuntimeError::InvalidInput(format!(
-            "cancel: event {id} is already cancelled"
+            "cancel: event {id} is not pending (current status: {status:?}); \
+             only pending events can be cancelled"
         )));
     }
 
     let cancelled_at = Utc::now().to_rfc3339();
-    props["status"] = json!("cancelled");
-    props["cancelled_at"] = json!(cancelled_at);
-    note.properties = Some(props.clone());
-    note.updated_at = Utc::now().timestamp_micros();
-
-    store
-        .upsert_note(note)
+    // Persist the transition with a conditional (CAS) update on
+    // (id, namespace, kind, current status) instead of a full-row
+    // `upsert_note`/`INSERT OR REPLACE`. This closes the race where a
+    // pending-events dispatch fires the event (writing status="fired" and
+    // fired_at) between our read above and the write below: the CAS only
+    // succeeds if the row is still "pending" at write time, so a concurrent
+    // fire can never be clobbered by a stale cancel (issue #462).
+    let updated = cancel_pending_event(runtime, token.namespace().as_str(), id, &cancelled_at)
         .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: upsert_note: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
+    if !updated {
+        return Err(RuntimeError::InvalidInput(format!(
+            "cancel: event {id} is no longer pending; it was cancelled or fired concurrently"
+        )));
+    }
+
+    let note = store
+        .get_note(id)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: get_note: {e}")))?
+        .ok_or_else(|| RuntimeError::NotFound(format!("cancel: event {id} not found")))?;
+    let props = note.properties.unwrap_or_else(|| json!({}));
 
     Ok(json!({
         "id": short_id(id),
@@ -583,4 +692,51 @@ pub(crate) async fn handle_cancel(
         "cancelled_at": cancelled_at,
         "properties": props,
     }))
+}
+
+/// Conditionally transition a `scheduled_event` note from `pending` to
+/// `cancelled`, returning `true` iff the transition was applied.
+///
+/// Uses a `json_set`-on-`properties` UPDATE gated by
+/// `json_extract(properties,'$.status') = 'pending'` so the write only lands
+/// if the row is still pending at the moment the statement executes — a
+/// concurrent fire (or a second cancel) that already changed the status
+/// causes this to affect zero rows instead of overwriting the newer state.
+async fn cancel_pending_event(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    id: Uuid,
+    cancelled_at: &str,
+) -> Result<bool, RuntimeError> {
+    let updated_at = Utc::now().timestamp_micros();
+    let mut writer = runtime
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: open SQL writer: {e}")))?;
+
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set(COALESCE(properties, '{}'), \
+                      '$.status', 'cancelled', '$.cancelled_at', ?1), \
+                      updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'pending'"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(cancelled_at.to_string()),
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("schedule_cancel_pending".into()),
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
+
+    Ok(rows == 1)
 }

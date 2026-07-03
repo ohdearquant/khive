@@ -13,7 +13,11 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 | `schedule.cancel`   | Cancel a scheduled event                                                |
 
 `at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`
-or a 5-field cron expression.
+or a limited 5-field form where each field is `*` or one in-range integer
+(e.g. `"0 9 * * 1"`). Cron operators such as steps (`*/15`), ranges (`9-17`),
+and lists (`0,30`) are not accepted, and `kkernel`'s pending-events runner
+currently fires the 5-field form one-shot rather than advancing it to its
+next occurrence.
 
 ## Semantics
 

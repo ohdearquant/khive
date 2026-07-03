@@ -91,7 +91,7 @@ async fn s_c1_schedule_valid_rfc3339_succeeds() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2099-01-01T00:00:00Z"
             }),
         )
@@ -109,7 +109,7 @@ async fn s_c1_schedule_invalid_at_not_a_date() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "not-a-date"
             }),
         )
@@ -131,7 +131,7 @@ async fn s_c1_schedule_invalid_at_natural_language() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "tomorrow at 3pm"
             }),
         )
@@ -152,7 +152,7 @@ async fn s_c1_schedule_invalid_at_out_of_range_date() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"test\")",
+                "action": "schedule.remind(content=\"test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2027-13-99"
             }),
         )
@@ -215,7 +215,7 @@ async fn c3_schedule_past_date_rejected() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"past\")",
+                "action": "schedule.remind(content=\"past\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2020-01-01T00:00:00Z"
             }),
         )
@@ -305,7 +305,7 @@ async fn c4_schedule_valid_action_succeeds() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"hello world\")",
+                "action": "schedule.remind(content=\"hello world\", at=\"2099-12-31T00:00:00Z\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -326,7 +326,7 @@ async fn h5_schedule_at_with_offset_preserves_original_string() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "remind(content=\"tz-test\")",
+                "action": "schedule.remind(content=\"tz-test\", at=\"2099-12-31T00:00:00Z\")",
                 "at": input_at
             }),
         )
@@ -488,5 +488,177 @@ async fn sch_aud_002_valid_numeric_cron_accepted() {
         )
         .await
         .expect("SCH-AUD-002: valid numeric cron must be accepted");
+    assert_eq!(result["status"], "pending");
+}
+
+// ── Issue #481: repeat contract matrix (narrowed, Option B) ─────────────────
+//
+// Standard cron operators (steps, ranges, lists) are documented as accepted
+// but rejected by the implementation, and `kkernel` does not advance
+// five-field repeats yet. Rather than build a full cron parser, the contract
+// is narrowed to named aliases plus a 5-field form where each field is `*`
+// or one in-range integer. This matrix asserts the narrowed contract.
+
+async fn assert_repeat_accepted(repeat: &str) {
+    let (registry, _rt) = build_registry();
+    let result = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "repeat contract check",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": repeat
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("repeat {repeat:?} must be accepted under Option B; got: {e}"));
+    assert_eq!(result["status"], "pending");
+}
+
+async fn assert_repeat_rejected(repeat: &str) {
+    let (registry, _rt) = build_registry();
+    let err = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "repeat contract check",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": repeat
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("repeat") || msg.contains("cron"),
+        "repeat {repeat:?} must be rejected under Option B; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_aliases_accepted() {
+    assert_repeat_accepted("daily").await;
+    assert_repeat_accepted("weekly").await;
+    assert_repeat_accepted("monthly").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_wildcard_accepted() {
+    assert_repeat_accepted("* * * * *").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_single_numeric_field_accepted() {
+    assert_repeat_accepted("0 9 * * 1").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_step_operator_rejected() {
+    assert_repeat_rejected("*/15 * * * *").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_range_operator_rejected() {
+    assert_repeat_rejected("0 9-17 * * 1-5").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_list_operator_rejected() {
+    assert_repeat_rejected("0,30 9 * * 1").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_out_of_range_rejected() {
+    assert_repeat_rejected("99 * * * *").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_malformed_rejected() {
+    assert_repeat_rejected("foo bar baz qux zap").await;
+}
+
+// ── Issue #461: schedule.schedule write-time replayability ──────────────────
+
+#[tokio::test]
+async fn schedule_schedule_rejects_bare_schedule_pack_action() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "remind(content=\"hello\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not registered") || msg.contains("pack-prefixed"),
+        "#461: bare unqualified schedule-pack verb must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_chain_with_prev() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "stats() | create(kind=\"entity\", name=$prev.id)",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("chain") || msg.contains("$prev"),
+        "#461: chained actions with $prev must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_missing_required_replay_args() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "schedule.remind(content=\"hello\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing") && msg.contains("at"),
+        "#461: missing required replay arg `at` must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_exact_replayable_single_action() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "stats()",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("#461: exact registered zero-arg verb call must be accepted");
+
     assert_eq!(result["status"], "pending");
 }

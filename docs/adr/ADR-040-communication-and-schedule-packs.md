@@ -294,15 +294,20 @@ reminders and a JSON-encoded verb call string for scheduled dispatch.
 
 `repeat` accepts:
 
-| Value                     | Semantics                                   |
-| ------------------------- | ------------------------------------------- |
-| `"daily"`                 | Repeat every 24 hours from `trigger_at`     |
-| `"weekly"`                | Repeat every 7 days                         |
-| `"monthly"`               | Repeat on the same day-of-month each month  |
-| cron expression (5-field) | Standard cron: `"0 9 * * 1"` (Monday 09:00) |
+| Value                | Semantics                                                               |
+| -------------------- | ----------------------------------------------------------------------- |
+| `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
+| `"weekly"`           | Repeat every 7 days                                                     |
+| `"monthly"`          | Repeat on the same day-of-month each month                              |
+| limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
 
-No sub-minute precision. The pack validates cron expressions at write time and returns
-`RuntimeError::InvalidInput` for malformed expressions.
+No sub-minute precision. The pack validates this limited 5-field form (not standard
+cron: steps, ranges, and lists such as `*/15`, `9-17`, `0,30` are rejected — issue
+#481) at write time and returns `RuntimeError::InvalidInput` for malformed or
+unsupported expressions. `kkernel`'s pending-events runner does not yet compute
+next-fire times for the 5-field form; such events are stored and validated but fire
+one-shot rather than advancing to their next occurrence until next-occurrence
+computation lands.
 
 #### Trigger evaluation and execution
 

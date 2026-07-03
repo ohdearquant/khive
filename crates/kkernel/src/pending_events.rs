@@ -343,26 +343,30 @@ async fn dispatch_action(
     })?;
 
     // Re-serialize as JSON form with namespace injected.
-    let ops_json: Vec<Value> = parsed
-        .ops
-        .iter()
-        .map(|op| {
-            let mut args = serde_json::Map::new();
-            for (k, v) in &op.args {
-                if let khive_request::ArgValue::Value(val) = v {
-                    args.insert(k.clone(), val.clone());
-                }
-                // $prev references are not supported in stored actions (they were
-                // validated at schedule-creation time). Skip them gracefully.
-            }
-            // Inject the event's namespace so the registry writes to it.
-            args.insert(
-                "namespace".to_string(),
-                Value::String(namespace.to_string()),
-            );
-            json!({ "tool": op.tool, "args": Value::Object(args) })
-        })
-        .collect();
+    //
+    // `$prev` references are rejected at schedule-creation time (issue #461),
+    // but legacy rows written before that guard may still carry one. Reject
+    // rather than silently drop: a dropped arg can dispatch successfully with
+    // missing/wrong data, which is worse than a visible replay failure.
+    let mut ops_json: Vec<Value> = Vec::with_capacity(parsed.ops.len());
+    for op in &parsed.ops {
+        let mut args = serde_json::Map::new();
+        for (k, v) in &op.args {
+            let khive_request::ArgValue::Value(val) = v else {
+                return Err(anyhow::anyhow!(
+                    "pending-events: non-literal scheduled action argument {k:?} is not \
+                     replayable: {action_dsl:?}"
+                ));
+            };
+            args.insert(k.clone(), val.clone());
+        }
+        // Inject the event's namespace so the registry writes to it.
+        args.insert(
+            "namespace".to_string(),
+            Value::String(namespace.to_string()),
+        );
+        ops_json.push(json!({ "tool": op.tool, "args": Value::Object(args) }));
+    }
 
     let ops_str = serde_json::to_string(&ops_json)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize ops: {e}"))?;
