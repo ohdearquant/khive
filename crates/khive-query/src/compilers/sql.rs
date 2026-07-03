@@ -26,6 +26,60 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
     }
 }
 
+/// Union of every primary-substrate table (entities, notes, events, graph_edges)
+/// that can legally bind to a canonical `-[:relation]->` endpoint (issue #467).
+/// Canonical edge endpoints are not entity-only: `annotates` admits note/entity/
+/// note/event/edge targets, and same-substrate relations like `supports` admit
+/// note-note pairs. This source lets node binding stay substrate-agnostic instead
+/// of hard-coding `entities`.
+const PRIMARY_NODE_SQL: &str = "\
+    SELECT id, namespace, kind, entity_type, name, description, NULL AS content, \
+           NULL AS status, NULL AS salience, NULL AS decay_factor, properties, \
+           created_at, updated_at, deleted_at, 'entity' AS substrate_kind \
+      FROM entities \
+    UNION ALL \
+    SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
+           content, status, salience, decay_factor, properties, \
+           created_at, updated_at, deleted_at, 'note' AS substrate_kind \
+      FROM notes \
+    UNION ALL \
+    SELECT id, namespace, kind, NULL AS entity_type, verb AS name, \
+           NULL AS description, NULL AS content, NULL AS status, \
+           NULL AS salience, NULL AS decay_factor, payload AS properties, \
+           created_at, created_at AS updated_at, NULL AS deleted_at, \
+           'event' AS substrate_kind \
+      FROM events \
+    UNION ALL \
+    SELECT id, namespace, relation AS kind, NULL AS entity_type, NULL AS name, \
+           NULL AS description, NULL AS content, NULL AS status, \
+           NULL AS salience, NULL AS decay_factor, metadata AS properties, \
+           created_at, updated_at, deleted_at, 'edge' AS substrate_kind \
+      FROM graph_edges";
+
+fn primary_node_source(alias: &str) -> String {
+    format!("({PRIMARY_NODE_SQL}) {alias}")
+}
+
+/// Union of entity/note tables that can legally bind to a synthetic
+/// `observed_as_*` target (issue #468): `observed_as_target` admits entity OR
+/// note referents, `observed_as_signal` admits entity referents. This source
+/// lets the target join stay entity-capable instead of hard-coding `notes`.
+const OBSERVATION_TARGET_SQL: &str = "\
+    SELECT id, namespace, kind, entity_type, name, description, \
+           NULL AS content, NULL AS status, NULL AS salience, \
+           NULL AS decay_factor, properties, created_at, updated_at, \
+           deleted_at, 'entity' AS referent_kind \
+      FROM entities \
+    UNION ALL \
+    SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
+           content, status, salience, decay_factor, properties, \
+           created_at, updated_at, deleted_at, 'note' AS referent_kind \
+      FROM notes";
+
+fn observation_target_source(alias: &str) -> String {
+    format!("({OBSERVATION_TARGET_SQL}) {alias}")
+}
+
 /// Parameterized SQL emitted by the compiler, ready for execution by the runtime.
 #[derive(Debug)]
 pub struct CompiledQuery {
@@ -165,8 +219,9 @@ fn compile_fixed_length(
         std::collections::HashMap::new();
 
     // Pre-compute which node indices are endpoints of synthetic edges.
-    // Source nodes bind to `events`; target nodes bind to `notes`.
-    let (event_source_indices, note_target_indices) =
+    // Source nodes bind to `events`; target nodes bind to the entity/note
+    // observation-target union (issue #468).
+    let (event_source_indices, observation_target_indices) =
         synthetic_endpoint_node_indices(&query.pattern.elements);
 
     let mut node_idx = 0usize;
@@ -179,16 +234,14 @@ fn compile_fixed_length(
                 node_aliases.push(alias.clone());
 
                 let is_event_source = event_source_indices.contains(&node_idx);
-                let is_note_target = note_target_indices.contains(&node_idx);
+                let is_observation_target = observation_target_indices.contains(&node_idx);
 
                 if node_idx == 0 {
                     if is_event_source {
                         from_parts.push(format!("events {alias}"));
-                    } else {
-                        // Note targets are joined by the synthetic edge handler, not FROM.
-                        if !is_note_target {
-                            from_parts.push(format!("entities {alias}"));
-                        }
+                    } else if !is_observation_target {
+                        // Observation targets are joined by the synthetic edge handler, not FROM.
+                        from_parts.push(primary_node_source(&alias));
                     }
                 }
 
@@ -217,8 +270,8 @@ fn compile_fixed_length(
                                 .into(),
                         ));
                     }
-                } else if is_note_target {
-                    // Note targets: `notes` table (joined by the synthetic edge handler).
+                } else if is_observation_target {
+                    // Observation targets: entity/note union (joined by the synthetic edge handler).
                     where_parts.push(format!("{alias}.deleted_at IS NULL"));
 
                     let ns_filter = namespace_filter(&alias, opts, &mut params);
@@ -231,11 +284,11 @@ fn compile_fixed_length(
                         where_parts.push(format!("{alias}.kind = ?{}", params.len()));
                     }
 
-                    // entity_type does not exist on notes — reject explicitly.
-                    if np.entity_type.is_some() {
-                        return Err(QueryError::Compile(
-                            "observed note targets do not have an entity_type column".into(),
-                        ));
+                    // entity_type is NULL on note rows and populated on entity rows;
+                    // the filter still applies correctly across the union.
+                    if let Some(ref et) = np.entity_type {
+                        params.push(QueryValue::Text(et.clone()));
+                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
                     }
 
                     let mut props: Vec<_> = np.properties.iter().collect();
@@ -291,8 +344,8 @@ fn compile_fixed_length(
                 if let Some(ref var) = np.variable {
                     let kind = if is_event_source {
                         VarKind::EventNode
-                    } else if is_note_target {
-                        VarKind::NoteNode
+                    } else if is_observation_target {
+                        VarKind::ObservationTargetNode
                     } else {
                         VarKind::Node
                     };
@@ -354,15 +407,21 @@ fn compile_fixed_length(
                         where_parts
                             .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
                     }
-                    // Join the target node via event_observations.entity_id.
-                    // The `referent_kind` column discriminates between note and entity
-                    // Recall/rerank observations always target notes
-                    // (`referent_kind='note'`); we filter to note substrate and join
-                    // the `notes` table.  An explicit `AND e0.referent_kind='note'`
-                    // prevents cross-substrate ID collisions.
+                    // Join the target node via event_observations.entity_id against the
+                    // entity/note referent union, discriminated by referent_kind so
+                    // cross-substrate ID collisions cannot occur.
                     join_parts.push(format!(
-                        "JOIN notes {next_alias} ON {next_alias}.id = {e_alias}.entity_id \
-                         AND {e_alias}.referent_kind = 'note'"
+                        "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
+                         AND {next_alias}.referent_kind = {e_alias}.referent_kind",
+                        observation_target_source(&next_alias)
+                    ));
+                    // Admit exactly the in-code legal (role, referent_kind) pairs:
+                    // candidate/selected -> note only; target -> entity or note;
+                    // signal -> entity only.
+                    where_parts.push(format!(
+                        "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind = 'note') \
+                          OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
+                          OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind = 'entity'))"
                     ));
                 } else {
                     // Standard canonical edge: join graph_edges.
@@ -401,7 +460,8 @@ fn compile_fixed_length(
                     }
 
                     join_parts.push(format!(
-                        "JOIN entities {next_alias} ON {next_alias}.id = {next_join_col}"
+                        "JOIN {} ON {next_alias}.id = {next_join_col}",
+                        primary_node_source(&next_alias)
                     ));
 
                     if !ep.relations.is_empty() {
@@ -459,15 +519,17 @@ fn compile_fixed_length(
                              {alias}.updated_at AS {var}_updated_at"
                         ));
                     }
-                    VarKind::NoteNode => {
+                    VarKind::ObservationTargetNode => {
                         select_parts.push(format!(
                             "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.status AS {var}_status, \
+                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
+                             {alias}.status AS {var}_status, \
                              {alias}.content AS {var}_content, \
                              {alias}.salience AS {var}_salience, \
                              {alias}.properties AS {var}_properties, \
                              {alias}.created_at AS {var}_created_at, \
-                             {alias}.updated_at AS {var}_updated_at"
+                             {alias}.updated_at AS {var}_updated_at, \
+                             {alias}.referent_kind AS {var}_referent_kind"
                         ));
                     }
                     VarKind::EventNode => {
@@ -579,8 +641,8 @@ fn compile_single_condition(
                 )
             }
         }
-        VarKind::NoteNode => {
-            if NOTE_COLUMNS.contains(&cond.property.as_str()) {
+        VarKind::ObservationTargetNode => {
+            if OBSERVATION_TARGET_COLUMNS.contains(&cond.property.as_str()) {
                 format!("{alias}.{}", cond.property)
             } else {
                 format!(
@@ -1101,7 +1163,7 @@ fn compile_variable_length(
             match item {
                 ReturnItem::Property(_, prop) => {
                     let is_start = start.variable.as_deref() == Some(var);
-                    if matches!(kind, VarKind::EventNode | VarKind::NoteNode) {
+                    if matches!(kind, VarKind::EventNode | VarKind::ObservationTargetNode) {
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1153,7 +1215,7 @@ fn compile_variable_length(
                             ));
                         }
                     }
-                    VarKind::EventNode | VarKind::NoteNode => {
+                    VarKind::EventNode | VarKind::ObservationTargetNode => {
                         // Synthetic observed_as_* edges require a fixed-length pattern;
                         // variable-length recursion over the events/notes tables is not supported.
                         return Err(QueryError::Unsupported(
@@ -1186,11 +1248,11 @@ fn compile_variable_length(
     // `r.namespace` (and possibly r.kind / r.properties) regardless of whether
     // it appears in RETURN.
     let join_start = if has_start {
-        "JOIN entities s ON s.id = t.start_id"
+        "JOIN primary_nodes s ON s.id = t.start_id"
     } else {
         ""
     };
-    let join_end = "JOIN entities r ON r.id = t.current_id";
+    let join_end = "JOIN primary_nodes r ON r.id = t.current_id";
 
     // Build the next-node namespace filter clause (may be empty).
     // Already pushed into params by namespace_filter above.
@@ -1201,10 +1263,11 @@ fn compile_variable_length(
     };
 
     let sql = format!(
-        "WITH RECURSIVE traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
+        "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
+         traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
                     e.id, e.relation, e.weight \
-             FROM entities s \
+             FROM primary_nodes s \
              JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE {start_where} \
              UNION ALL \
@@ -1214,7 +1277,7 @@ fn compile_variable_length(
                     e.id, e.relation, e.weight \
              FROM traverse t CROSS JOIN graph_edges e \
                  ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
-             JOIN entities next_node ON next_node.id = ({recurse_next}) \
+             JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
                     AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE t.depth < ?{depth_param} \
                AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
@@ -1225,6 +1288,7 @@ fn compile_variable_length(
          WHERE {end_where} \
          ORDER BY t.depth, t.total_weight DESC, t.start_id, t.current_id \
          LIMIT ?{limit_param}",
+        primary_nodes = PRIMARY_NODE_SQL,
         seed_next = seed_next,
         seed_join = seed_join,
         e_ns_filter = e_ns_filter,
@@ -1254,8 +1318,9 @@ enum VarKind {
     Node,
     /// Node that maps to the `events` table (synthetic `observed_as_*` edge source).
     EventNode,
-    /// Node that maps to the `notes` table (synthetic `observed_as_*` edge target).
-    NoteNode,
+    /// Node that maps to an entity/note `event_observations` referent
+    /// (synthetic `observed_as_*` edge target).
+    ObservationTargetNode,
     Edge,
 }
 
@@ -1270,11 +1335,13 @@ const NODE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-/// Columns available for projection on `notes` table nodes (synthetic edge targets).
-const NOTE_COLUMNS: &[&str] = &[
+/// Columns available for projection on entity/note observation-target nodes
+/// (synthetic edge targets, issue #468).
+const OBSERVATION_TARGET_COLUMNS: &[&str] = &[
     "id",
     "namespace",
     "kind",
+    "entity_type",
     "status",
     "name",
     "content",
@@ -1283,6 +1350,7 @@ const NOTE_COLUMNS: &[&str] = &[
     "properties",
     "created_at",
     "updated_at",
+    "referent_kind",
 ];
 /// Columns available for projection on `events` table nodes (synthetic edge sources).
 const EVENT_COLUMNS: &[&str] = &[
@@ -1304,7 +1372,7 @@ const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "wei
 fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
     let (valid, kind_name) = match kind {
         VarKind::Node => (NODE_COLUMNS, "node"),
-        VarKind::NoteNode => (NOTE_COLUMNS, "note"),
+        VarKind::ObservationTargetNode => (OBSERVATION_TARGET_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_COLUMNS, "event"),
         VarKind::Edge => (EDGE_COLUMNS, "edge"),
     };
@@ -1536,13 +1604,13 @@ mod tests {
     #[test]
     fn variable_length_return_start_only_joins_end_entity() {
         // Even when only the start variable is projected, the outer query
-        // references `r.deleted_at` / `r.namespace`, so entities r must be
+        // references `r.deleted_at` / `r.namespace`, so primary_nodes r must be
         // joined unconditionally.
         let q = gql::parse("MATCH (a:concept)-[:extends*1..3]->(b) RETURN a LIMIT 10").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
-            compiled.sql.contains("JOIN entities r"),
-            "entities r must always be joined when r.* conditions are emitted; sql: {}",
+            compiled.sql.contains("JOIN primary_nodes r"),
+            "primary_nodes r must always be joined when r.* conditions are emitted; sql: {}",
             compiled.sql
         );
     }
@@ -1590,9 +1658,7 @@ mod tests {
             compiled.sql
         );
         assert!(
-            compiled
-                .sql
-                .contains("JOIN entities n1 ON n1.id = e0.target_id"),
+            compiled.sql.contains("ON n1.id = e0.target_id"),
             "SPARQL object must bind graph_edges.target_id; sql: {}",
             compiled.sql
         );
@@ -2096,8 +2162,8 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         // The recursive CTE member must join next_node to filter deleted intermediates.
         assert!(
-            compiled.sql.contains("JOIN entities next_node"),
-            "recursive CTE must join entities next_node for deleted-intermediate filtering; sql: {}",
+            compiled.sql.contains("JOIN primary_nodes next_node"),
+            "recursive CTE must join primary_nodes next_node for deleted-intermediate filtering; sql: {}",
             compiled.sql
         );
         assert!(
@@ -2278,6 +2344,147 @@ mod tests {
         assert!(
             matches!(err, QueryError::Validation(_)),
             "unknown synthetic relation must return Validation error; got {err:?}"
+        );
+    }
+
+    // --- Issue #467: canonical edge queries must admit legal note endpoints ---
+
+    /// `annotates` is the cross-substrate relation: note -> entity/note/event/edge.
+    /// Endpoints must not be hard-bound to `entities` only.
+    #[test]
+    fn canonical_edge_annotates_compiles_note_source_and_any_target_substrate() {
+        let q = gql::parse("MATCH (n)-[:annotates]->(x) RETURN n.id, x.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            !compiled.sql.contains("FROM entities n0"),
+            "endpoint must not be hard-bound to entities only; sql: {}",
+            compiled.sql
+        );
+        for table in ["FROM notes", "FROM events", "FROM graph_edges"] {
+            assert!(
+                compiled.sql.contains(table),
+                "endpoint source must admit {table} rows for annotates; sql: {}",
+                compiled.sql
+            );
+        }
+    }
+
+    /// `supports` is same-substrate: note -> note (or entity -> entity). A
+    /// legal note-note pair must be able to bind through the endpoint source.
+    #[test]
+    fn canonical_edge_supports_compiles_note_note_endpoints() {
+        let q = gql::parse("MATCH (a)-[:supports]->(b) RETURN a.id, b.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.sql.matches("FROM notes").count(),
+            2,
+            "both supports endpoints must admit note rows; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// Pack-declared `depends_on` on task-kind notes must bind through the
+    /// endpoint source rather than being restricted to `entities`.
+    #[test]
+    fn canonical_edge_depends_on_compiles_pack_task_note_endpoints() {
+        let q = gql::parse("MATCH (a:task)-[:depends_on]->(b:task) RETURN a.id, b.id LIMIT 10")
+            .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.sql.matches("FROM notes").count(),
+            2,
+            "task-kind depends_on endpoints must admit note rows; sql: {}",
+            compiled.sql
+        );
+        let task_params = compiled
+            .params
+            .iter()
+            .filter(|p| matches!(p, QueryValue::Text(s) if s == "task"))
+            .count();
+        assert_eq!(
+            task_params, 2,
+            "kind='task' must be bound for both endpoints"
+        );
+    }
+
+    /// Variable-length canonical traversal must bind seed, intermediate, and
+    /// final endpoints to the primary substrate union, not `entities` only.
+    #[test]
+    fn variable_length_canonical_compiles_primary_substrate_nodes() {
+        let q = gql::parse("MATCH (a)-[:supports*1..2]->(b) RETURN b.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            !compiled.sql.contains("FROM entities s"),
+            "seed must not be hard-bound to entities only; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("JOIN primary_nodes next_node"),
+            "intermediate must join primary_nodes; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("JOIN primary_nodes r"),
+            "final endpoint must join primary_nodes; sql: {}",
+            compiled.sql
+        );
+    }
+
+    // --- Issue #468: observed_as_target/observed_as_signal must admit entity referents ---
+
+    /// `observed_as_target` admits entity OR note referents (event.substrate
+    /// determines the legal referent_kind); the target must not be forced to notes.
+    #[test]
+    fn synthetic_edge_observed_as_target_compiles_entity_referents() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_target]->(t) RETURN t.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            !compiled
+                .sql
+                .contains("JOIN notes n1 ON n1.id = e0.entity_id AND e0.referent_kind = 'note'"),
+            "target join must not be hard-bound to notes; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("FROM entities"),
+            "observation target source must admit entity referents; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("n1.referent_kind = e0.referent_kind"),
+            "target join must discriminate by referent_kind instead of hard-coding 'note'; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// `observed_as_signal` only admits entity referents (brain feedback signals
+    /// target entities, never notes).
+    #[test]
+    fn synthetic_edge_observed_as_signal_compiles_entity_referents() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_signal]->(t) RETURN t.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .sql
+                .contains("e0.role = 'signal' AND e0.referent_kind = 'entity'"),
+            "signal role must be admitted only against entity referents; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// `observed_as_selected` must still be restricted to note referents —
+    /// the fix must not widen recall/rerank observations to entities.
+    #[test]
+    fn synthetic_edge_observed_as_selected_still_compiles_note_referents() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN m.id LIMIT 10")
+            .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .sql
+                .contains("e0.role IN ('candidate', 'selected') AND e0.referent_kind = 'note'"),
+            "selected/candidate roles must still be guarded to note referents only; sql: {}",
+            compiled.sql
         );
     }
 }

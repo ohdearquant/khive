@@ -282,8 +282,8 @@ fn variable_length_return_start_only_joins_end_entity() {
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
     assert!(
-        compiled.sql.contains("JOIN entities r"),
-        "entities r must always be joined; sql: {}",
+        compiled.sql.contains("JOIN primary_nodes r"),
+        "primary_nodes r must always be joined; sql: {}",
         compiled.sql
     );
 }
@@ -341,9 +341,7 @@ fn sparql_subject_object_direction_compiles_outbound() {
         compiled.sql
     );
     assert!(
-        compiled
-            .sql
-            .contains("JOIN entities n1 ON n1.id = e0.target_id"),
+        compiled.sql.contains("ON n1.id = e0.target_id"),
         "SPARQL object must bind graph_edges.target_id; sql: {}",
         compiled.sql
     );
