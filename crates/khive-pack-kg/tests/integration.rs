@@ -5998,6 +5998,78 @@ async fn link_person_to_org_part_of_succeeds() {
     assert_eq!(edge["relation"], "part_of");
 }
 
+/// person→project with part_of must succeed after edge rules are installed (#60).
+#[tokio::test]
+async fn link_person_to_project_part_of_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let person = f
+        .dispatch(
+            "create",
+            json!({ "kind": "person", "name": "Alice Researcher" }),
+        )
+        .await
+        .expect("create person");
+    let project = f
+        .dispatch("create", json!({ "kind": "project", "name": "khive" }))
+        .await
+        .expect("create project");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": person["id"],
+                "target_id": project["id"],
+                "relation": "part_of",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "person→project part_of must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "part_of");
+}
+
+/// person→project with instance_of must succeed after edge rules are installed (#60).
+#[tokio::test]
+async fn link_person_to_project_instance_of_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let person = f
+        .dispatch(
+            "create",
+            json!({ "kind": "person", "name": "Bob Engineer" }),
+        )
+        .await
+        .expect("create person");
+    let project = f
+        .dispatch("create", json!({ "kind": "project", "name": "lattice" }))
+        .await
+        .expect("create project");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": person["id"],
+                "target_id": project["id"],
+                "relation": "instance_of",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "person→project instance_of must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "instance_of");
+}
+
 /// org→org with depends_on must succeed after edge rules are installed.
 #[tokio::test]
 async fn link_org_to_org_depends_on_succeeds() {

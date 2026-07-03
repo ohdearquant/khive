@@ -4,8 +4,11 @@ use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack
 
 use crate::handler_defs::KG_HANDLERS;
 
-/// Pack-extensible edge endpoint rules — adds person→org and org→org pairs to the base allowlist.
-pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 7] = [
+/// Pack-extensible edge endpoint rules — adds person→org, person→project, and org→org
+/// pairs to the base allowlist. The person→project rows mirror person→org (issue #60):
+/// a person is a member of a project the same way they are a member of an org, so the
+/// same member-not-component semantic stretch accepted for person→org is extended here.
+pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
     EdgeEndpointRule {
         relation: EdgeRelation::PartOf,
         source: EndpointKind::EntityOfKind("person"),
@@ -15,6 +18,16 @@ pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 7] = [
         relation: EdgeRelation::InstanceOf,
         source: EndpointKind::EntityOfKind("person"),
         target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::PartOf,
+        source: EndpointKind::EntityOfKind("person"),
+        target: EndpointKind::EntityOfKind("project"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::InstanceOf,
+        source: EndpointKind::EntityOfKind("person"),
+        target: EndpointKind::EntityOfKind("project"),
     },
     EdgeEndpointRule {
         relation: EdgeRelation::DependsOn,

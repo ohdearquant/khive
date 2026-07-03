@@ -304,20 +304,28 @@ Event and edge endpoints are invalid for `supports`/`refutes`.
 The KG pack extends the base endpoint contract via `EDGE_RULES` to cover
 person→org and org→org relationships common in research KGs:
 
-| Source   | Relation      | Target | Added  |
-| -------- | ------------- | ------ | ------ |
-| `Person` | `part_of`     | `Org`  | v0.2.4 |
-| `Person` | `instance_of` | `Org`  | v0.2.4 |
-| `Org`    | `depends_on`  | `Org`  | v0.2.4 |
-| `Org`    | `enables`     | `Org`  | v0.2.4 |
-| `Org`    | `contains`    | `Org`  | v0.2.4 |
-| `Org`    | `part_of`     | `Org`  | v0.2.4 |
-| `Org`    | `precedes`    | `Org`  | v0.2.4 |
+| Source   | Relation      | Target    | Added      |
+| -------- | ------------- | --------- | ---------- |
+| `Person` | `part_of`     | `Org`     | v0.2.4     |
+| `Person` | `instance_of` | `Org`     | v0.2.4     |
+| `Person` | `part_of`     | `Project` | unreleased |
+| `Person` | `instance_of` | `Project` | unreleased |
+| `Org`    | `depends_on`  | `Org`     | v0.2.4     |
+| `Org`    | `enables`     | `Org`     | v0.2.4     |
+| `Org`    | `contains`    | `Org`     | v0.2.4     |
+| `Org`    | `part_of`     | `Org`     | v0.2.4     |
+| `Org`    | `precedes`    | `Org`     | v0.2.4     |
 
 These are additive — the base contract is unchanged. Semantics:
 
 - `Person part_of Org` — a person is a member or employee of an org
 - `Person instance_of Org` — a person represents or embodies an org (e.g. a founder)
+- `Person part_of Project` — a person is a member or contributor of a project (issue #60);
+  the same member-not-component semantic stretch accepted for `Person part_of Org` is extended
+  here — a person is not a structural component of a project, but the closest base relation is
+  `part_of`, mirroring the org row.
+- `Person instance_of Project` — a person represents or embodies a project (e.g. a founder or
+  maintainer), mirroring `Person instance_of Org`.
 - `Org depends_on Org` — one org depends on another (e.g. subsidiary dependency)
 - `Org enables Org` — one org enables another (e.g. incubator → startup)
 - `Org contains Org` — org hierarchy (e.g. parent company contains subsidiary)
