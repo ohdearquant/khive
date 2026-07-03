@@ -20,7 +20,7 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 | Capability                  | How                                                                                                                                                |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **67 verbs, 7 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge — all load by default                                                                            |
+| **72 verbs, 8 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge, session — all load by default                                                                   |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                      |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                |
@@ -58,17 +58,20 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 7 packs load by default — **67 verbs** out of the box:
+All 8 packs load by default — **72 verbs** out of the box (verified against the live
+`verbs()` registry, 2026-07-03 — regenerate with `request(ops="verbs()")` before editing
+this table):
 
-| Pack          | Prefix       | Verbs | What it does                                     |
-| ------------- | ------------ | ----- | ------------------------------------------------ |
-| **kg**        | _(bare)_     | 16    | Entities, edges, notes, graph queries            |
-| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)    |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall |
-| **brain**     | `brain.`     | 13    | Bayesian user profiles + feedback loop           |
-| **comm**      | `comm.`      | 5     | Threaded messaging                               |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution           |
-| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search       |
+| Pack          | Prefix       | Verbs | What it does                                          |
+| ------------- | ------------ | ----- | ----------------------------------------------------- |
+| **kg**        | _(bare)_     | 16    | Entities, edges, notes, graph queries                 |
+| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)         |
+| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall      |
+| **brain**     | `brain.`     | 14    | Bayesian user profiles + feedback loop                |
+| **comm**      | `comm.`      | 5     | Threaded messaging                                    |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                |
+| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search            |
+| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export) |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only — they auto-detect the record type.
@@ -93,10 +96,11 @@ No language SDK to learn.
 │  khive-pack-kg         — KG vocabulary + 16 verb handlers    │
 │  khive-pack-gtd        — task lifecycle (5 verbs)            │
 │  khive-pack-memory     — salience + decay recall (5 verbs)   │
-│  khive-pack-brain      — Bayesian profiles (13 verbs)        │
+│  khive-pack-brain      — Bayesian profiles (14 verbs)        │
 │  khive-pack-comm       — threaded messaging (5 verbs)        │
 │  khive-pack-schedule   — reminders + scheduled ops (4 verbs) │
 │  khive-pack-knowledge  — atom KB + embedding rerank (19 verbs)│
+│  khive-pack-session    — session record persistence (4 verbs)│
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -191,8 +195,8 @@ global):
 { "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
 ```
 
-**That's it.** All 7 packs load by default, a background daemon auto-spawns to keep the runtime
-warm, and Claude Code discovers the `request` tool with the full 67-verb catalog.
+**That's it.** All 8 packs load by default, a background daemon auto-spawns to keep the runtime
+warm, and Claude Code discovers the `request` tool with the full 72-verb catalog.
 
 ### Alternative: install via Cargo
 
@@ -285,7 +289,7 @@ Deno 2.x (for the TypeScript CLI layer — optional)
 
 ## Status
 
-**v0.3.0 — published on [crates.io](https://crates.io/crates/khive-mcp).** 67 verbs across 7
+**v0.3.0 — published on [crates.io](https://crates.io/crates/khive-mcp).** 72 verbs across 8
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
 embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
