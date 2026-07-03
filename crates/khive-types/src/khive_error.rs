@@ -253,10 +253,9 @@ impl<'de> Deserialize<'de> for Details {
                 let mut entries: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
                     alloc::vec::Vec::new();
                 while let Some((k, v)) = map.next_entry::<String, String>()? {
-                    if entries.len() >= 8 {
-                        break;
+                    if entries.len() < 8 {
+                        entries.push((Cow::Owned(k), Cow::Owned(v)));
                     }
-                    entries.push((Cow::Owned(k), Cow::Owned(v)));
                 }
                 Ok(Details { entries })
             }

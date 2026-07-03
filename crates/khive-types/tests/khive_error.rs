@@ -240,4 +240,50 @@ mod serde_tests {
         assert_eq!(got.get("resource"), Some("entity"));
         assert_eq!(got.get("id"), Some("x1"));
     }
+
+    /// Regression for #487: a details map with 9-10 entries must deserialize
+    /// successfully (the visitor must keep draining MapAccess until None,
+    /// not stop reading once 8 entries have been retained), and must retain
+    /// exactly the first 8 insertion-order pairs.
+    #[test]
+    fn details_drains_oversized_map_retains_8() {
+        let json = serde_json::json!({
+            "k0": "v0", "k1": "v1", "k2": "v2", "k3": "v3",
+            "k4": "v4", "k5": "v5", "k6": "v6", "k7": "v7",
+            "k8": "v8", "k9": "v9"
+        })
+        .to_string();
+        let details: Details =
+            serde_json::from_str(&json).expect("oversized map must deserialize successfully");
+        let pairs: Vec<(&str, &str)> = details.iter().collect();
+        assert_eq!(pairs.len(), 8, "must retain exactly 8 pairs");
+        for i in 0..8 {
+            let key = format!("k{i}");
+            assert_eq!(
+                details.get(&key),
+                Some(format!("v{i}").as_str()),
+                "entry {key} must be one of the first 8 insertion-order pairs"
+            );
+        }
+    }
+
+    /// Nine-pair variant embedded inside a full `KhiveError` envelope, proving
+    /// the outer struct also deserializes successfully when details overflow.
+    #[test]
+    fn khive_error_with_nine_details_pairs_deserializes() {
+        let json = serde_json::json!({
+            "kind": "not_found",
+            "message": "missing",
+            "code": null,
+            "details": {
+                "a": "1", "b": "2", "c": "3", "d": "4",
+                "e": "5", "f": "6", "g": "7", "h": "8", "i": "9"
+            }
+        })
+        .to_string();
+        let deserialized: KhiveError =
+            serde_json::from_str(&json).expect("envelope with 9 details pairs must deserialize");
+        let got = deserialized.details().unwrap();
+        assert_eq!(got.iter().count(), 8, "must retain exactly 8 pairs");
+    }
 }
