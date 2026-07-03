@@ -24,12 +24,20 @@ next occurrence.
 This pack is **intent storage only**. It creates and queries
 `scheduled_event` notes; it does not itself evaluate triggers. `schedule.remind`
 stores a plain reminder payload, while `schedule.schedule`'s `action` parameter
-is a full verb-dispatch string (e.g. `"schedule.remind(content=\"hello\")"`)
-that is parsed with `khive_request::parse_request` at write time — an
-unparseable `action` is rejected before the event is stored, not at trigger
-time. Reading pending events and dispatching their stored payload at
-`trigger_at` is the execution environment's responsibility (a `kkernel
-scheduler` daemon, or an external cron / cloud scheduler invoking the runtime).
+is a full verb-dispatch string (e.g.
+`"schedule.remind(content=\"hello\", at=\"2099-06-01T09:00:00Z\")"`) that must
+satisfy a stricter *replayable* contract, validated at write time (issue
+\#461): a single call (no chains, no `$prev` references) against an
+exactly-registered, pack-prefixed verb name, with only literal argument
+values and every one of that verb's own required arguments present. This is
+stricter than plain `khive_request::parse_request`-level parseability — the
+inner call must itself be independently valid, because `kkernel`'s
+pending-events runner re-parses and re-dispatches the stored string
+unmodified at trigger time. An `action` that fails any of these checks is
+rejected before the event is stored, not at trigger time. Reading pending
+events and dispatching their stored payload at `trigger_at` is the execution
+environment's responsibility (a `kkernel scheduler` daemon, or an external
+cron / cloud scheduler invoking the runtime).
 
 ## Usage
 

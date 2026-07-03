@@ -215,7 +215,60 @@ fn validate_replayable_single_action(
         }
     }
 
-    validate_args_against_help(&op.tool, &op.args, &help)
+    // Reject a business `namespace` arg on a scheduled action (issue #461).
+    // Replay unconditionally overwrites `args["namespace"]` with the routing
+    // namespace of the firing event (`pending_events.rs`); for handlers that
+    // declare `namespace` as a business param (e.g. `brain.bind`,
+    // `brain.resolve`), that clobbers the caller's intended profile scope
+    // with whatever namespace the event happens to fire from. Replay cannot
+    // yet carry routing-namespace and arg-namespace as separate concepts, so
+    // reject at write time rather than silently mis-scope on trigger.
+    let handler_accepts_namespace =
+        help.get("params")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(|p| p.get("name").and_then(Value::as_str) == Some("namespace"))
+            });
+    if handler_accepts_namespace && op.args.contains_key("namespace") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "schedule.action: verb {:?} treats `namespace` as a business argument; scheduled \
+             replay always overwrites `namespace` with the firing event's routing namespace, \
+             so a stored `namespace` arg would be silently discarded and replaced. Omit \
+             `namespace` from the scheduled action",
+            op.tool
+        )));
+    }
+
+    validate_args_against_help(&op.tool, &op.args, &help)?;
+    validate_conditional_requirements(&op.tool, &op.args)
+}
+
+/// Reject scheduled actions known to fail a handler's *conditional* required
+/// param even though `describe_verb` marks none of the alternatives
+/// `required:true` (issue #461).
+///
+/// `validate_args_against_help` only enforces metadata-declared
+/// `required:true` params. Some handlers accept one of several alternative
+/// arg sets (e.g. `create` requires `kind` unless bulk `items` is given), so
+/// neither alternative is marked required in metadata and both can be
+/// omitted at write time — then fail at trigger-time replay. This function
+/// hard-codes the known cases; it is not a general conditional-requirements
+/// mechanism (there is no metadata surface for that yet), so it does not
+/// guarantee every handler-internal semantic precondition is caught.
+fn validate_conditional_requirements(
+    tool: &str,
+    args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
+) -> Result<(), RuntimeError> {
+    if tool == "create" && !args.contains_key("kind") && !args.contains_key("items") {
+        return Err(RuntimeError::InvalidInput(
+            "schedule.action: verb \"create\" requires either `kind` (singleton) or `items` \
+             (bulk); neither is present"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate `args` against a verb's `describe_verb` help schema: reject

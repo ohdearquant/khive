@@ -12,6 +12,16 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
+fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    (registry, runtime)
+}
+
 #[tokio::test]
 async fn remind_creates_pending_event() {
     let (registry, _rt) = build_registry();
@@ -643,6 +653,87 @@ async fn schedule_schedule_rejects_missing_required_replay_args() {
         msg.contains("missing") && msg.contains("at"),
         "#461: missing required replay arg `at` must be rejected; got: {msg}"
     );
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_create_missing_kind_and_items() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("kind") && msg.contains("items"),
+        "#461: create() missing both kind and items must be rejected at write time; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_create_with_kind() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"entity\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("#461: create() with kind present must be accepted");
+
+    assert_eq!(result["status"], "pending");
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_business_namespace_arg() {
+    let (registry, _rt) = build_registry_with_brain();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "brain.bind(profile_id=\"p\", namespace=\"team-a\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("namespace"),
+        "#461: scheduled action with a business `namespace` arg must be rejected \
+         (replay always overwrites it with the firing event's routing namespace); got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_verb_without_namespace_arg() {
+    let (registry, _rt) = build_registry_with_brain();
+
+    let result = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "brain.bind(profile_id=\"p\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("#461: brain.bind without a namespace arg must be accepted at write time");
+
+    assert_eq!(result["status"], "pending");
 }
 
 #[tokio::test]

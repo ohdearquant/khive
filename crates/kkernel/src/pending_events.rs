@@ -38,7 +38,7 @@ use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter, SortDir};
-use khive_storage::types::{PageRequest, SqlValue};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::dbpath::resolve_db_override;
 
@@ -50,6 +50,7 @@ pub struct DrainSummary {
     pub advanced: u64,
     pub failed: u64,
     pub skipped_not_due: u64,
+    pub skipped_race: u64,
 }
 
 /// One-shot drain: fire all pending, due scheduled events.
@@ -209,6 +210,37 @@ pub async fn run_pending_events(
                     None
                 };
 
+                // ── Claim the row before dispatch (issue #462, fire side) ──
+                // `note` is a snapshot read by the page query above; a
+                // concurrent `schedule.cancel` could have transitioned the
+                // row to "cancelled" since then. CAS-claim pending -> firing
+                // now so that: (a) a concurrent cancel's own CAS (which only
+                // matches status='pending') fails once we've claimed it, and
+                // (b) if cancel already won the race, our claim fails and we
+                // skip — the drain can no longer clobber a cancel that
+                // landed between the read and this point.
+                let claimed = match claim_pending_event(&rt, ns_str, note.id).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("[pending-events] claim failed for note {}: {e}", note.id);
+                        }
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                if !claimed {
+                    if verbose {
+                        eprintln!(
+                            "[pending-events] skip note {}: no longer pending (concurrent \
+                             cancel or claim)",
+                            note.id
+                        );
+                    }
+                    summary.skipped_race += 1;
+                    continue;
+                }
+
                 // ── Dispatch the action ──────────────────────────────────
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result = dispatch_action(dsl, ns_str, &server, verbose).await;
@@ -258,19 +290,45 @@ pub async fn run_pending_events(
                 }
 
                 // ── Persist the updated note ─────────────────────────────
-                if let Err(e) = store.upsert_note(note.clone()).await {
-                    if verbose {
-                        eprintln!("[pending-events] upsert_note failed for {}: {e}", note.id);
+                // Conditional on status='firing' (set by the claim above)
+                // instead of a full-row `upsert_note`, so this write can never
+                // clobber a cancel that (impossibly, given the claim above,
+                // but defensively) raced in after the claim.
+                let final_props = note.properties.clone().unwrap_or_else(|| json!({}));
+                match finalize_fired_event(&rt, ns_str, note.id, &final_props, note.updated_at)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if verbose {
+                            eprintln!(
+                                "[pending-events] finalize no-op for {}: row no longer in \
+                                 \"firing\" state",
+                                note.id
+                            );
+                        }
+                        summary.failed += 1;
+                        if summary.fired > 0 {
+                            summary.fired -= 1;
+                        }
+                        if summary.advanced > 0 {
+                            summary.advanced -= 1;
+                        }
                     }
-                    // Count as failed; drain continues.
-                    summary.failed += 1;
-                    // Undo the advance/fired accounting since persist failed.
-                    // (fired/advanced were already incremented above — adjust back)
-                    if summary.fired > 0 {
-                        summary.fired -= 1;
-                    }
-                    if summary.advanced > 0 {
-                        summary.advanced -= 1;
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("[pending-events] finalize failed for {}: {e}", note.id);
+                        }
+                        // Count as failed; drain continues.
+                        summary.failed += 1;
+                        // Undo the advance/fired accounting since persist failed.
+                        // (fired/advanced were already incremented above — adjust back)
+                        if summary.fired > 0 {
+                            summary.fired -= 1;
+                        }
+                        if summary.advanced > 0 {
+                            summary.advanced -= 1;
+                        }
                     }
                 }
             }
@@ -285,6 +343,86 @@ pub async fn run_pending_events(
     }
 
     Ok(summary)
+}
+
+/// CAS-claim a pending scheduled event for firing: `pending -> firing`.
+///
+/// Returns `Ok(true)` iff exactly one row transitioned, meaning this drain
+/// (and not a concurrent `schedule.cancel`) now owns the row. Mirrors the
+/// `schedule.cancel` CAS in `khive-pack-schedule/src/handlers.rs` so the two
+/// writers share one state machine: cancel only matches `status='pending'`,
+/// so once a row is claimed to `firing` a racing cancel fails cleanly instead
+/// of clobbering (or being clobbered by) this drain's eventual write.
+async fn claim_pending_event(rt: &KhiveRuntime, namespace: &str, id: uuid::Uuid) -> Result<bool> {
+    let updated_at = Utc::now().timestamp_micros();
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set(COALESCE(properties, '{}'), '$.status', 'firing'), \
+                      updated_at = ?1 \
+                  WHERE id = ?2 \
+                    AND namespace = ?3 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'pending'"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("pending_events_claim_firing".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: claim conditional update: {e}"))?;
+    Ok(rows == 1)
+}
+
+/// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
+/// | pending}` (the latter for an advanced repeat), replacing the full-row
+/// `upsert_note` that could otherwise clobber a concurrent write.
+///
+/// Returns `Ok(true)` iff exactly one row (still `firing`) was updated.
+async fn finalize_fired_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    properties: &Value,
+    updated_at: i64,
+) -> Result<bool> {
+    let props_json = serde_json::to_string(properties)
+        .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = ?1, updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing'"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(props_json),
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("pending_events_finalize_fired".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: finalize conditional update: {e}"))?;
+    Ok(rows == 1)
 }
 
 /// Compute the next `trigger_at` for a repeating event, given the current
@@ -477,6 +615,7 @@ pub fn print_summary(summary: &DrainSummary) {
         "advanced": summary.advanced,
         "failed": summary.failed,
         "skipped_not_due": summary.skipped_not_due,
+        "skipped_race": summary.skipped_race,
     });
     println!(
         "{}",
@@ -894,6 +1033,95 @@ mod tests {
         assert!(
             summary.failed >= 1,
             "a legacy $prev reference must surface as a dispatch failure, not a silent drop"
+        );
+    }
+
+    /// Deterministic regression for the fire-side of issue #462: simulates
+    /// the exact interleaving the reviewer/critic flagged — a drain claims a
+    /// row for firing (its read-then-act window), and only *after* that does
+    /// a `schedule.cancel` request arrive for the same id. Before this fix,
+    /// the drain read a `pending` snapshot and later did a full-row
+    /// `upsert_note` unconditionally, so a cancel landing in between would be
+    /// silently clobbered back to "fired". With the `pending -> firing` CAS
+    /// claim in place, the drain's claim (standing in for "drain read the row
+    /// before the cancel") must make the *subsequent* cancel fail — proving
+    /// cancel can no longer be lost to a fire that was already in flight.
+    #[tokio::test]
+    async fn fire_claim_wins_race_against_concurrent_cancel() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Simulate the drain's claim (pending -> firing), which in the real
+        // drain happens right after the page read and before dispatch.
+        let claimed = claim_pending_event(&rt, "local", id)
+            .await
+            .expect("claim query");
+        assert!(claimed, "claim must succeed on a fresh pending row");
+
+        // A `schedule.cancel` arriving after the claim (the race window the
+        // reviewer identified) must now fail instead of clobbering the
+        // in-flight fire.
+        let cancel_ops = serde_json::to_string(&serde_json::json!([
+            { "tool": "schedule.cancel", "args": { "id": id.to_string() } }
+        ]))
+        .expect("serialize cancel op");
+        let cancel_result = server
+            .dispatch_request_local(RequestParams {
+                ops: cancel_ops,
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("dispatch_request_local must not error at the RPC layer");
+        let cancel_json: Value = serde_json::from_str(&cancel_result).expect("valid JSON");
+        let op_result = &cancel_json["results"][0];
+        assert_eq!(
+            op_result["ok"], false,
+            "cancel of a claimed (firing) event must fail, not silently succeed: {cancel_json}"
+        );
+        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        assert!(
+            cancel_err.contains("not pending"),
+            "cancel must report the event is no longer pending; got: {cancel_err}"
+        );
+
+        // Finalize the fire as the drain would, then confirm the terminal
+        // state is "fired" — the cancel never got a chance to overwrite it.
+        let finalized = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &serde_json::json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+        )
+        .await
+        .expect("finalize query");
+        assert!(
+            finalized,
+            "finalize must succeed on a row still in \"firing\""
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str().unwrap_or(""),
+            "fired",
+            "terminal state must be \"fired\"; cancel must not have won the race"
         );
     }
 
