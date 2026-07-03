@@ -385,3 +385,175 @@ fn embedding_model_dim_u32_max_is_accepted() {
     let records = result.unwrap();
     assert_eq!(records[0].dimensions, u32::MAX);
 }
+
+// ── V6: ADR-081 recall retune driver (brain_implicit_mass + brain_serve_ledger) ──
+
+#[test]
+fn v6_creates_brain_retune_tables() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    assert!(
+        table_exists(&conn, "brain_implicit_mass"),
+        "V6 must create brain_implicit_mass"
+    );
+    assert!(
+        table_exists(&conn, "brain_serve_ledger"),
+        "V6 must create brain_serve_ledger"
+    );
+    // Note: `pragma_table_info` does not surface `GENERATED ALWAYS AS ... VIRTUAL`
+    // columns on this SQLite version (verified empirically) — the column's
+    // presence and COALESCE behavior are instead exercised directly by the
+    // v6_accounting_profile_id_* tests below via SELECT.
+    assert!(index_exists(&conn, "idx_brain_serve_ledger_unique"));
+    // `index_is_unique` (shared helper) hardcodes `pragma_index_list('notes')`, so
+    // it cannot check an index on brain_serve_ledger — query the correct table
+    // directly instead.
+    let is_unique: bool = conn
+        .query_row(
+            "SELECT \"unique\" FROM pragma_index_list('brain_serve_ledger') WHERE name = ?1",
+            rusqlite::params!["idx_brain_serve_ledger_unique"],
+            |row| {
+                let v: i64 = row.get(0)?;
+                Ok(v != 0)
+            },
+        )
+        .unwrap_or(false);
+    assert!(is_unique, "idx_brain_serve_ledger_unique must be UNIQUE");
+    assert!(index_exists(&conn, "idx_brain_serve_ledger_suppression"));
+    assert!(index_exists(&conn, "idx_brain_serve_ledger_accounting"));
+}
+
+#[test]
+fn v6_accounting_profile_id_prefers_served_by() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_serve_ledger \
+         (id, namespace, consumer_kind, served_by_profile_id, resolved_profile_id, \
+          target_id, query_class, query_raw, served_at) \
+         VALUES ('row-1', 'local', 'recall', 'served-profile', 'resolved-profile', \
+                 'target-1', 'class-1', 'raw query', 1000)",
+        [],
+    )
+    .expect("insert");
+    let accounting: String = conn
+        .query_row(
+            "SELECT accounting_profile_id FROM brain_serve_ledger WHERE id = 'row-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read accounting_profile_id");
+    assert_eq!(
+        accounting, "served-profile",
+        "served_by_profile_id must win when both are set"
+    );
+}
+
+#[test]
+fn v6_accounting_profile_id_falls_back_to_resolved() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_serve_ledger \
+         (id, namespace, consumer_kind, resolved_profile_id, \
+          target_id, query_class, query_raw, served_at) \
+         VALUES ('row-2', 'local', 'recall', 'resolved-profile', \
+                 'target-1', 'class-1', 'raw query', 1000)",
+        [],
+    )
+    .expect("insert");
+    let accounting: Option<String> = conn
+        .query_row(
+            "SELECT accounting_profile_id FROM brain_serve_ledger WHERE id = 'row-2'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read accounting_profile_id");
+    assert_eq!(accounting.as_deref(), Some("resolved-profile"));
+}
+
+#[test]
+fn v6_accounting_profile_id_null_when_both_unset() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_serve_ledger \
+         (id, namespace, consumer_kind, target_id, query_class, query_raw, served_at) \
+         VALUES ('row-3', 'local', 'recall', 'target-1', 'class-1', 'raw query', 1000)",
+        [],
+    )
+    .expect("insert");
+    let accounting: Option<String> = conn
+        .query_row(
+            "SELECT accounting_profile_id FROM brain_serve_ledger WHERE id = 'row-3'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read accounting_profile_id");
+    assert!(
+        accounting.is_none(),
+        "accounting_profile_id must be NULL (fail-safe path) when neither source is set"
+    );
+}
+
+#[test]
+fn v6_serve_ledger_uniqueness_rejects_duplicate() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_serve_ledger \
+         (id, namespace, consumer_kind, target_id, query_class, query_raw, served_at) \
+         VALUES ('row-a', 'local', 'recall', 'target-1', 'class-1', 'q', 1000)",
+        [],
+    )
+    .expect("first insert");
+    let dup = conn.execute(
+        "INSERT INTO brain_serve_ledger \
+         (id, namespace, consumer_kind, target_id, query_class, query_raw, served_at) \
+         VALUES ('row-b', 'local', 'recall', 'target-1', 'class-1', 'q', 1000)",
+        [],
+    );
+    assert!(
+        dup.is_err(),
+        "duplicate (namespace, target_id, query_class, served_at) must be rejected"
+    );
+}
+
+#[test]
+fn v6_implicit_mass_upsert_on_conflict() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at) \
+         VALUES ('p1', 'local', 't1', 0.1, 1000) \
+         ON CONFLICT(profile_id, namespace, target_id) \
+         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at",
+        [],
+    )
+    .expect("first insert");
+    conn.execute(
+        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at) \
+         VALUES ('p1', 'local', 't1', 0.2, 2000) \
+         ON CONFLICT(profile_id, namespace, target_id) \
+         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at",
+        [],
+    )
+    .expect("conflicting upsert");
+    let (mass, last_event_at): (f64, i64) = conn
+        .query_row(
+            "SELECT mass, last_event_at FROM brain_implicit_mass WHERE profile_id='p1' AND namespace='local' AND target_id='t1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read row");
+    assert_eq!(mass, 0.2);
+    assert_eq!(last_event_at, 2000);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM brain_implicit_mass WHERE profile_id='p1' AND namespace='local' AND target_id='t1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count rows");
+    assert_eq!(count, 1, "upsert must not create a second row");
+}
