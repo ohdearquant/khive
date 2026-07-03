@@ -185,6 +185,89 @@ async fn noop_transition_does_not_write_audit_record() {
     );
 }
 
+/// F3 regression: a `gtd_lifecycle_audit` table created by an older pack
+/// version (no `namespace` column) must be upgraded in place on the next
+/// `ensure_audit_schema` call, and the transition must still write an audit row.
+#[tokio::test]
+async fn transition_upgrades_namespace_less_audit_table_and_writes_row() {
+    let rt = rt();
+
+    {
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        writer
+            .execute_script(
+                "CREATE TABLE gtd_lifecycle_audit (\
+                    note_id TEXT NOT NULL,\
+                    from_state TEXT NOT NULL,\
+                    to_state TEXT NOT NULL,\
+                    note TEXT,\
+                    at INTEGER NOT NULL\
+                )"
+                .into(),
+            )
+            .await
+            .expect("old audit table");
+    }
+
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "legacy audit table task", "status": "inbox"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch("gtd.transition", json!({"id": task_id, "status": "next"}))
+        .await
+        .expect("transition should succeed against upgraded legacy table");
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+
+    let cols = reader
+        .query_all(SqlStatement {
+            sql: "PRAGMA table_info(gtd_lifecycle_audit)".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("table_info query");
+    assert!(
+        cols.iter().any(|row| matches!(
+            row.get("name"),
+            Some(SqlValue::Text(name)) if name == "namespace"
+        )),
+        "gtd_lifecycle_audit must be upgraded with a namespace column; got columns {cols:?}"
+    );
+
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT namespace FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit query");
+    assert_eq!(
+        rows.len(),
+        1,
+        "transition against an upgraded legacy table must write exactly one audit row; got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].get("namespace").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("local"),
+        "audit row namespace must be 'local'"
+    );
+}
+
 #[tokio::test]
 async fn cc1_complete_cancelled_writes_audit_record() {
     let rt = rt();
