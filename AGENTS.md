@@ -13,8 +13,10 @@ khive gives your agent:
 7. **Scheduling** — time-triggered reminders and future verb dispatch
 8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
 9. **Brain** — Bayesian profile tuning from feedback signals
+10. **Session** — persist and resume agent-session records
 
-All 7 packs load by default. **67 public verbs** across the packs.
+All 8 packs load by default. **72 public verbs** across the packs (regenerate via
+`request(ops="verbs()")` before editing this line).
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -95,23 +97,24 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 13 verbs (`brain.` prefix)
+### Brain pack — 14 verbs (`brain.` prefix)
 
-| Verb                   | What it does                                         | When to use                                     |
-| ---------------------- | ---------------------------------------------------- | ----------------------------------------------- |
-| `brain.profiles`       | List profiles (optionally filtered by lifecycle)     | See what profiles exist                         |
-| `brain.profile`        | Full detail: metadata, snapshot, state summary       | Inspect a specific profile                      |
-| `brain.create_profile` | Create a new profile with optional seed priors       | Custom tuning for a new consumer                |
-| `brain.resolve`        | Which profile serves a given consumer context?       | Before recall — check active tuning             |
-| `brain.activate`       | Start live update loop for a profile                 | Enable feedback-driven tuning                   |
-| `brain.deactivate`     | Stop live updates, retain state                      | Pause tuning without losing progress            |
-| `brain.archive`        | Read-only, audit-retained                            | Retire a profile permanently                    |
-| `brain.reset`          | Reset posteriors to priors (preserves event history) | Start tuning fresh                              |
-| `brain.feedback`       | Emit explicit feedback event                         | Rate a recall result as useful/not_useful/wrong |
-| `brain.auto_feedback`  | Emit implicit feedback for recall results            | Convenience: agents call after memory.recall    |
-| `brain.bind`           | Bind a profile to an actor + consumer                | Route a specific caller to a specific profile   |
-| `brain.unbind`         | Remove a binding                                     | Stop routing                                    |
-| `brain.bindings`       | List binding rows                                    | Audit profile routing                           |
+| Verb                     | What it does                                         | When to use                                                |
+| ------------------------ | ---------------------------------------------------- | ---------------------------------------------------------- |
+| `brain.profiles`         | List profiles (optionally filtered by lifecycle)     | See what profiles exist                                    |
+| `brain.profile`          | Full detail: metadata, snapshot, state summary       | Inspect a specific profile                                 |
+| `brain.create_profile`   | Create a new profile with optional seed priors       | Custom tuning for a new consumer                           |
+| `brain.resolve`          | Which profile serves a given consumer context?       | Before recall — check active tuning                        |
+| `brain.activate`         | Start live update loop for a profile                 | Enable feedback-driven tuning                              |
+| `brain.deactivate`       | Stop live updates, retain state                      | Pause tuning without losing progress                       |
+| `brain.archive`          | Read-only, audit-retained                            | Retire a profile permanently                               |
+| `brain.reset`            | Reset posteriors to priors (preserves event history) | Start tuning fresh                                         |
+| `brain.feedback`         | Emit explicit feedback event                         | Rate a recall result as useful/not_useful/wrong            |
+| `brain.auto_feedback`    | Emit implicit feedback for recall results            | Convenience: agents call after memory.recall               |
+| `brain.bind`             | Bind a profile to an actor + consumer                | Route a specific caller to a specific profile              |
+| `brain.unbind`           | Remove a binding                                     | Stop routing                                               |
+| `brain.bindings`         | List binding rows                                    | Audit profile routing                                      |
+| `brain.register_adapter` | Register an adapter integrity record                 | Gate adapter composition to the active base-model revision |
 
 ### Comm pack — 5 verbs (`comm.` prefix)
 
@@ -178,6 +181,15 @@ is a **closed enum** — valid values: `overview` | `core_model` | `boundary_con
 `formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
 `references` | `other`. Content must be **at least 80 characters**. Shorter content or an
 unrecognized `section_type` returns a validation error listing the valid values.
+
+### Session pack — 4 verbs (`session.` prefix)
+
+| Verb             | What it does                                      | When to use                              |
+| ---------------- | ------------------------------------------------- | ---------------------------------------- |
+| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session      |
+| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
+| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
+| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
 
 ### How to call a verb
 

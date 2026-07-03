@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 scheduling, and a domain-knowledge corpus, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 67 verbs across 7 packs.
+exposing one tool — `request` — that dispatches 72 verbs across 8 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -50,7 +50,9 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all seven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`).
+server config loads all eight (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`) — this plugin currently ships pattern skills for the first seven; `session` has no
+skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links
