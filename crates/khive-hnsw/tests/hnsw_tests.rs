@@ -1838,6 +1838,54 @@ mod snapshot_tests {
         );
     }
 
+    /// Regression for #416: restore must reject a snapshot with duplicate
+    /// `indexed_ids` before mutating the existing index. Accepting it would
+    /// let last-wins `HashMap::insert` corrupt `internal_to_id` with two
+    /// live internal nodes mapped to the same external ID.
+    #[test]
+    fn restore_rejects_duplicate_indexed_ids_before_mutation() {
+        let config = HnswConfig::with_dimensions(4);
+        let mut index = HnswIndex::with_config(config.clone());
+
+        let keep_id = make_id(99);
+        index
+            .insert(keep_id, vec![1.0, 0.0, 0.0, 0.0])
+            .expect("insert");
+
+        let x = make_id(1);
+        let snap = khive_hnsw::checkpoint::HnswSnapshot {
+            vector_count: 0,
+            total_nodes: 2,
+            live_nodes: 2,
+            tombstone_count: 0,
+            max_layer: 0,
+            entry_point: Some(x),
+            config: khive_hnsw::checkpoint::HnswCheckpointConfig {
+                m: 20,
+                ef_construction: 200,
+                metric: "cosine".to_string(),
+            },
+            indexed_ids: vec![x, x], // duplicate
+            tombstoned_ids: vec![],
+            layers: vec![vec![(x, vec![])]],
+            vectors: vec![(x, vec![0.0, 1.0, 0.0, 0.0])],
+        };
+
+        let vectors = HashMap::new();
+        let result = index.restore_from_snapshot(&snap, &vectors);
+        assert!(result.is_err(), "should reject duplicate indexed_ids");
+
+        assert_eq!(
+            index.len(),
+            1,
+            "existing index must be unmodified after rejected restore"
+        );
+        assert!(
+            index.get_vector(&keep_id).is_some(),
+            "existing node must still be present"
+        );
+    }
+
     /// Large snapshot round-trip preserves search quality.
     #[test]
     fn snapshot_restore_preserves_search_quality() {

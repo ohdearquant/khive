@@ -767,3 +767,70 @@ fn canonical_snapshot_serializes_deterministically() {
         "Canonical snapshots should serialize identically"
     );
 }
+
+// ── #415 / #416 regression tests ─────────────────────────────────────────
+
+/// Regression for #415: a legacy (v1-style) snapshot whose `tombstoned_ids`
+/// somehow exceeds `indexed_ids` must not panic on unchecked subtraction
+/// while normalizing cardinality in `TryFrom<RawHnswSnapshot>`.
+#[test]
+fn try_from_rejects_legacy_tombstones_exceed_indexed_without_panic() {
+    use super::snapshot::RawHnswSnapshot;
+    let x = make_id(1);
+    let raw = RawHnswSnapshot {
+        vector_count: 0,
+        total_nodes: 0, // triggers legacy normalization fallback
+        live_nodes: 0,
+        tombstone_count: 0,
+        max_layer: 0,
+        entry_point: Some(x),
+        config: sample_config(),
+        indexed_ids: vec![x],
+        tombstoned_ids: vec![x, x], // more tombstones than indexed ids
+        layers: vec![vec![(x, vec![])]],
+        vectors: vec![],
+    };
+
+    let result = HnswSnapshot::try_from(raw);
+    assert!(
+        result.is_err(),
+        "TryFrom must reject invalid legacy cardinality instead of panicking"
+    );
+}
+
+/// Regression for #415: `verify()` must not panic on unchecked addition
+/// when `live_nodes + tombstone_count` would overflow `usize`.
+#[test]
+fn verify_rejects_wrapping_count_sum_without_panic() {
+    let mut snap = sample_snapshot();
+    snap.total_nodes = 0;
+    snap.live_nodes = usize::MAX;
+    snap.tombstone_count = 1;
+    snap.indexed_ids = vec![];
+    snap.tombstoned_ids = vec![];
+
+    let result = snap.verify();
+    assert!(
+        matches!(result, Err(SnapshotError::InconsistentCounts { .. })),
+        "verify() must reject a wrapping count sum instead of panicking, got {result:?}"
+    );
+}
+
+/// Regression for #416: `verify()` must reject duplicate `indexed_ids`
+/// before restore can build ID maps from them (last-wins insertion would
+/// otherwise silently corrupt `internal_to_id`).
+#[test]
+fn verify_rejects_duplicate_indexed_ids() {
+    let x = make_id(1);
+    let mut snap = sample_snapshot();
+    snap.total_nodes = 2;
+    snap.live_nodes = 2;
+    snap.tombstone_count = 0;
+    snap.indexed_ids = vec![x, x];
+
+    let result = snap.verify();
+    assert!(
+        matches!(result, Err(SnapshotError::DuplicateIndexedId { id }) if id == x),
+        "verify() must reject duplicate indexed_ids, got {result:?}"
+    );
+}
