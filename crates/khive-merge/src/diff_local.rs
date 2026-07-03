@@ -64,10 +64,20 @@ pub struct EdgeKey {
 
 impl EdgeKey {
     /// Construct an `EdgeKey` from a `ExportedEdge` by cloning its identity fields.
+    ///
+    /// Symmetric relations (e.g. `competes_with`, `composed_with`) canonicalize
+    /// endpoints to `min(source, target)`/`max(source, target)` (ADR-002) so that
+    /// a swapped-order duplicate collides with the original in the key's hash/eq.
     pub fn from_edge(e: &ExportedEdge) -> Self {
+        let (source, target) = if e.relation.is_symmetric() && e.target < e.source {
+            (e.target, e.source)
+        } else {
+            (e.source, e.target)
+        };
+
         Self {
-            source: e.source,
-            target: e.target,
+            source,
+            target,
             relation: e.relation.to_string(),
         }
     }
@@ -166,6 +176,7 @@ pub fn diff_edges(
 fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
     a.id == b.id
         && a.kind == b.kind
+        && a.entity_type == b.entity_type
         && a.name == b.name
         && a.description == b.description
         && a.tags == b.tags
@@ -173,7 +184,10 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
 }
 
 /// Property equality check; shared with entity.rs for duplicate-addition detection.
-pub(crate) fn properties_equal(a: &Option<serde_json::Value>, b: &Option<serde_json::Value>) -> bool {
+pub(crate) fn properties_equal(
+    a: &Option<serde_json::Value>,
+    b: &Option<serde_json::Value>,
+) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(av), Some(bv)) => av == bv,

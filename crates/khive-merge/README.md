@@ -31,8 +31,9 @@ fn merge(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) {
 }
 ```
 
-`SnapshotMergeStrategy::Ours` / `Theirs` skip conflict detection entirely and apply a
-last-write-wins shortcut instead — always `Clean`. `SnapshotMergeStrategy::Auto` runs the
+`SnapshotMergeStrategy::Ours` / `Theirs` skip field conflict detection and apply a
+last-write-wins shortcut, then report `DanglingEdge` conflicts if the shortcut output
+would reference missing endpoints. `SnapshotMergeStrategy::Auto` runs the
 full three-way algorithm: entity pass, edge pass, dangling-edge validation, deterministic
 sort, and returns `MergeResult::Conflicts` if anything needs a human. The free function
 `khive_merge::three_way_merge(base, ours, theirs, strategy)` is the same algorithm without

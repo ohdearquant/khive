@@ -186,6 +186,16 @@ fn field_level_merge(
         });
     }
 
+    // Entity type: governed subtype field; use the existing generic value conflict payload.
+    if ours.entity_type != theirs.entity_type {
+        conflicts.push(MergeConflict::PropertyMismatch {
+            entity_id: id,
+            key: "entity_type".into(),
+            ours: serde_json::json!(&ours.entity_type),
+            theirs: serde_json::json!(&theirs.entity_type),
+        });
+    }
+
     // Description: ours wins (annotation, not identity).
     if ours.description != theirs.description {
         // Auto-resolved: keep ours (no conflict).
@@ -280,6 +290,9 @@ fn detect_entity_diffs(ours: &ExportedEntity, theirs: &ExportedEntity) -> Vec<St
     }
     if ours.kind != theirs.kind {
         diffs.push("kind".into());
+    }
+    if ours.entity_type != theirs.entity_type {
+        diffs.push("entity_type".into());
     }
     if ours.description != theirs.description {
         diffs.push("description".into());

@@ -61,15 +61,26 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
         }
     }
 
-    // Reject duplicate edge natural keys.
+    // Reject duplicate edge IDs.
+    let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(archive.edges.len());
+    for edge in &archive.edges {
+        if !edge_ids.insert(edge.edge_id) {
+            return Err(MergeError::Internal(format!(
+                "duplicate edge IDs in archive: {}",
+                edge.edge_id
+            )));
+        }
+    }
+
+    // Reject duplicate edge semantic keys.
     let mut edge_keys: HashSet<EdgeKey> = HashSet::with_capacity(archive.edges.len());
     for edge in &archive.edges {
         let key = EdgeKey::from_edge(edge);
         if !edge_keys.insert(key.clone()) {
             return Err(MergeError::DuplicateEdgeKey {
-                edge_source: edge.source,
-                edge_target: edge.target,
-                edge_relation: edge.relation.to_string(),
+                edge_source: key.source,
+                edge_target: key.target,
+                edge_relation: key.relation,
             });
         }
     }
@@ -101,7 +112,9 @@ fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::Date
 /// Perform a three-way merge.
 ///
 /// - `Auto`: validate → entity pass → edge pass → dangling validation → deterministic sort → `Conflicts` or `Clean`.
-/// - `Ours`/`Theirs`: validate → last-write-wins shortcut → deterministic sort → always returns `Clean`.
+/// - `Ours`/`Theirs`: validate → last-write-wins shortcut (skips field conflict detection) →
+///   deterministic sort → dangling-edge validation against the shortcut-composed entity set,
+///   returning `Conflicts` if the shortcut output would reference a missing endpoint, else `Clean`.
 pub fn three_way_merge(
     base: &KgArchive,
     ours: &KgArchive,
@@ -112,20 +125,37 @@ pub fn three_way_merge(
 
     match strategy {
         SnapshotMergeStrategy::Ours => {
-            let mut merged = apply_ours(base, ours, theirs);
-            sort_entities(&mut merged);
-            sort_edges(&mut merged.edges);
-            merged.exported_at = deterministic_timestamp(ours, theirs);
-            Ok(MergeResult::Clean { merged })
+            let merged = apply_ours(base, ours, theirs);
+            finish_shortcut_merge(merged, ours, theirs)
         }
         SnapshotMergeStrategy::Theirs => {
-            let mut merged = apply_theirs(base, ours, theirs);
-            sort_entities(&mut merged);
-            sort_edges(&mut merged.edges);
-            merged.exported_at = deterministic_timestamp(ours, theirs);
-            Ok(MergeResult::Clean { merged })
+            let merged = apply_theirs(base, ours, theirs);
+            finish_shortcut_merge(merged, ours, theirs)
         }
         SnapshotMergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
+    }
+}
+
+/// Finish a last-write-wins shortcut merge: sort, stamp, then check that the
+/// shortcut-composed archive has no dangling edge endpoints before labeling
+/// the result `Clean`.
+fn finish_shortcut_merge(
+    mut merged: KgArchive,
+    ours: &KgArchive,
+    theirs: &KgArchive,
+) -> Result<MergeResult, MergeError> {
+    sort_entities(&mut merged);
+    sort_edges(&mut merged.edges);
+    merged.exported_at = deterministic_timestamp(ours, theirs);
+
+    let entity_id_set: HashSet<Uuid> = merged.entities.iter().map(|e| e.id).collect();
+    let dangling = validate_dangling_edges(&merged.edges, &entity_id_set);
+    if dangling.is_empty() {
+        Ok(MergeResult::Clean { merged })
+    } else {
+        Ok(MergeResult::Conflicts {
+            conflicts: dangling,
+        })
     }
 }
 
