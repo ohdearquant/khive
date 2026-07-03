@@ -1,7 +1,7 @@
 //! Idempotent file tail + upsert into the session mirror tables.
 //!
 //! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`,
-//! parses complete lines using the parser selected by `MirrorSource`, and writes
+//! parses complete lines using the parser selected by `LineTailSource`, and writes
 //! them to the session mirror tables in a single transaction.  It is safe to call
 //! repeatedly on the same file; `INSERT OR IGNORE` keyed by the event UUID ensures
 //! idempotency.
@@ -12,18 +12,26 @@ use std::path::Path;
 use chrono::Utc;
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlTxOptions, SqlValue};
+use khive_storage::SqlTransaction;
 
 use super::parse;
 
-/// Identifies which CLI produced the JSONL file being mirrored.
+/// The full ADR-080 mirror-source contract — the closed set of sources
+/// `sessions.source` can hold (`docs/adr/ADR-080-session-pack-oss-storage-mechanism.md`,
+/// "Mirror sources — closed set"). Adding a source requires amending that ADR
+/// section and this enum together.
 ///
-/// The value is written to `sessions.source` and selects the line parser.
+/// This is a superset of [`LineTailSource`]: `ChatGptExport` ingests via
+/// whole-file re-parse (`mirror_chatgpt_export_file`), not the per-line
+/// dispatch `LineTailSource` selects, so it has no `LineTailSource` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
     ClaudeCode,
     /// Codex CLI (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`).
     Codex,
+    /// ChatGPT data export (`<exports dir>/**/conversations.json`).
+    ChatGptExport,
 }
 
 impl MirrorSource {
@@ -32,8 +40,33 @@ impl MirrorSource {
         match self {
             MirrorSource::ClaudeCode => "claude_code",
             MirrorSource::Codex => "codex",
+            MirrorSource::ChatGptExport => "chatgpt_export",
         }
     }
+}
+
+impl From<LineTailSource> for MirrorSource {
+    fn from(source: LineTailSource) -> Self {
+        match source {
+            LineTailSource::ClaudeCode => MirrorSource::ClaudeCode,
+            LineTailSource::Codex => MirrorSource::Codex,
+        }
+    }
+}
+
+/// Identifies which CLI produced the JSONL file being mirrored, for the
+/// purpose of selecting `mirror_file`'s per-line parser.
+///
+/// This is narrower than [`MirrorSource`]: it covers only the line-tail
+/// sources (append-only JSONL, tailed by byte offset). ChatGPT export
+/// ingestion is whole-file re-parse, not line-tail, so it has no variant
+/// here — see [`mirror_chatgpt_export_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineTailSource {
+    /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
+    ClaudeCode,
+    /// Codex CLI (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`).
+    Codex,
 }
 
 /// Statistics returned by a single `mirror_file` call.
@@ -51,10 +84,10 @@ pub struct MirrorStats {
 /// using the parser selected by `source`, and upsert them idempotently into the
 /// session mirror tables.
 ///
-/// For `MirrorSource::Codex`, `codex_session_id` must be the session UUID
+/// For `LineTailSource::Codex`, `codex_session_id` must be the session UUID
 /// derived from the filename; it is used both to key the `sessions` row and to
 /// synthesise per-line event UUIDs (`"{session_id}:{abs_byte_offset}"`).
-/// For `MirrorSource::ClaudeCode`, `codex_session_id` is ignored (the session
+/// For `LineTailSource::ClaudeCode`, `codex_session_id` is ignored (the session
 /// UUID is embedded in each line).
 ///
 /// Returns stats including the advanced byte offset.  A partial trailing line
@@ -68,7 +101,7 @@ pub async fn mirror_file(
     runtime: &KhiveRuntime,
     path: &Path,
     start_offset: u64,
-    source: MirrorSource,
+    source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
     // ── read new bytes ────────────────────────────────────────────────────────
@@ -120,12 +153,12 @@ pub async fn mirror_file(
     // the synthesised event UUID is stable across re-tails.  Compute line
     // boundaries once, then iterate with offsets.
     let events: Vec<parse::ParsedEvent> = match source {
-        MirrorSource::ClaudeCode => complete_content
+        LineTailSource::ClaudeCode => complete_content
             .split('\n')
             .filter(|l| !l.is_empty())
             .filter_map(parse::parse_cc_line)
             .collect(),
-        MirrorSource::Codex => {
+        LineTailSource::Codex => {
             let sid = codex_session_id.unwrap_or("");
             let mut line_start: u64 = start_offset;
             let mut evs = Vec::new();
@@ -160,18 +193,101 @@ pub async fn mirror_file(
 
     // ── write in one transaction ──────────────────────────────────────────────
 
+    write_events_and_cursor(
+        runtime,
+        path,
+        MirrorSource::from(source).as_str(),
+        &events,
+        scanned,
+        new_offset,
+    )
+    .await
+}
+
+/// Read the whole ChatGPT export `conversations.json` at `path`, parse every
+/// conversation's mapping tree via [`parse::parse_chatgpt_export`], and upsert
+/// every message-bearing event idempotently into the session mirror tables in
+/// a single transaction.
+///
+/// Unlike `mirror_file` (append-only line-tail), a ChatGPT export is a single
+/// static JSON array with no stable "new bytes" boundary to tail, so this
+/// function always re-reads and re-parses the whole file. `start_offset` is
+/// used only as a cheap re-poll guard: if the file has not grown past it,
+/// nothing is read or parsed. `new_offset` is set to the whole file's byte
+/// length only after a successful parse and commit — any IO, parse, or DB
+/// error leaves the persisted cursor untouched, so a partially-downloaded
+/// export is retried whole on the next tick, never half-consumed.
+pub async fn mirror_chatgpt_export_file(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+) -> Result<MirrorStats, RuntimeError> {
+    let file_len = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "mirror_chatgpt_export_file: failed to stat {path:?}: {e}"
+        ))
+    })?;
+
+    if file_len <= start_offset {
+        return Ok(MirrorStats {
+            inserted: 0,
+            scanned: 0,
+            new_offset: start_offset,
+        });
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "mirror_chatgpt_export_file: failed to read {path:?}: {e}"
+        ))
+    })?;
+
+    let events = parse::parse_chatgpt_export(&content).ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "mirror_chatgpt_export_file: {path:?} is not a valid ChatGPT export (expected a top-level JSON array)"
+        ))
+    })?;
+
+    let scanned = events.len() as u64;
+
+    write_events_and_cursor(
+        runtime,
+        path,
+        MirrorSource::ChatGptExport.as_str(),
+        &events,
+        scanned,
+        file_len,
+    )
+    .await
+}
+
+/// Upsert `events` and the mirror cursor for `path` in one transaction.
+///
+/// Shared by `mirror_file`'s eventful line-tail path and
+/// `mirror_chatgpt_export_file`'s whole-file path, so the session/message row
+/// construction and cursor semantics (create-only sessions, `INSERT OR
+/// IGNORE` message dedup, monotonic `last_seen_at`, cursor advances only on
+/// success) live in exactly one place.
+async fn write_events_and_cursor(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    source_value: &'static str,
+    events: &[parse::ParsedEvent],
+    scanned: u64,
+    new_offset: u64,
+) -> Result<MirrorStats, RuntimeError> {
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
 
     let mut tx = sql
         .begin_tx(SqlTxOptions::default())
         .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror_file: begin_tx: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("mirror: begin_tx: {e}")))?;
 
     let mut inserted: u64 = 0;
     let mut last_session_id: Option<String> = None;
 
-    for ev in &events {
+    for ev in events {
         let created_at = if ev.created_at_micros != 0 {
             ev.created_at_micros
         } else {
@@ -192,7 +308,7 @@ pub async fn mirror_file(
                    message_count, first_seen_at, last_seen_at, namespace) \
                   VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
                   ON CONFLICT(id) DO NOTHING",
-                source.as_str()
+                source_value
             ),
             params: vec![
                 SqlValue::Text(ev.session_id.clone()),
@@ -213,7 +329,7 @@ pub async fn mirror_file(
             label: Some("session_mirror_create_session".into()),
         })
         .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror_file: session create: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("mirror: session create: {e}")))?;
 
         // ── session_messages insert (idempotent) ──────────────────────────────
         let affected = tx
@@ -248,7 +364,7 @@ pub async fn mirror_file(
                 label: Some("session_mirror_insert_message".into()),
             })
             .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror_file: message insert: {e}")))?;
+            .map_err(|e| RuntimeError::Internal(format!("mirror: message insert: {e}")))?;
 
         // ── advance session metadata ONLY when a new message landed ────────────
         //
@@ -284,7 +400,7 @@ pub async fn mirror_file(
                 label: Some("session_mirror_touch_session".into()),
             })
             .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror_file: session touch: {e}")))?;
+            .map_err(|e| RuntimeError::Internal(format!("mirror: session touch: {e}")))?;
         }
 
         inserted += affected;
@@ -293,7 +409,7 @@ pub async fn mirror_file(
 
     // ── refresh message_count for each distinct session ───────────────────────
     //
-    // In practice one JSONL file maps to one session_id, but we refresh every
+    // In practice one file maps to one session_id, but we refresh every
     // session_id we touched to stay correct even if that changes. Skipped
     // entirely on a pure replay (`inserted == 0`): the counts cannot have
     // changed, so writing them would be needless churn.
@@ -316,11 +432,39 @@ pub async fn mirror_file(
                 label: Some("session_mirror_refresh_count".into()),
             })
             .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror_file: count refresh: {e}")))?;
+            .map_err(|e| RuntimeError::Internal(format!("mirror: count refresh: {e}")))?;
         }
     }
 
-    // ── cursor upsert ─────────────────────────────────────────────────────────
+    upsert_cursor_in_tx(
+        &mut *tx,
+        path,
+        last_session_id.as_deref(),
+        new_offset,
+        now_us,
+    )
+    .await?;
+
+    // ── commit ────────────────────────────────────────────────────────────────
+    tx.commit()
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("mirror: commit: {e}")))?;
+
+    Ok(MirrorStats {
+        inserted,
+        scanned,
+        new_offset,
+    })
+}
+
+/// Upsert the `session_mirror_cursor` row for `path` inside an open transaction.
+async fn upsert_cursor_in_tx(
+    tx: &mut dyn SqlTransaction,
+    path: &Path,
+    session_id: Option<&str>,
+    new_offset: u64,
+    now_us: i64,
+) -> Result<(), RuntimeError> {
     let path_str = path.to_string_lossy().into_owned();
     tx.execute(SqlStatement {
         sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
@@ -332,8 +476,7 @@ pub async fn mirror_file(
             .into(),
         params: vec![
             SqlValue::Text(path_str),
-            last_session_id
-                .as_deref()
+            session_id
                 .map(|s| SqlValue::Text(s.to_string()))
                 .unwrap_or(SqlValue::Null),
             SqlValue::Integer(new_offset as i64),
@@ -342,18 +485,8 @@ pub async fn mirror_file(
         label: Some("session_mirror_cursor_upsert".into()),
     })
     .await
-    .map_err(|e| RuntimeError::Internal(format!("mirror_file: cursor upsert: {e}")))?;
-
-    // ── commit ────────────────────────────────────────────────────────────────
-    tx.commit()
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror_file: commit: {e}")))?;
-
-    Ok(MirrorStats {
-        inserted,
-        scanned,
-        new_offset,
-    })
+    .map_err(|e| RuntimeError::Internal(format!("mirror: cursor upsert: {e}")))?;
+    Ok(())
 }
 
 /// Read bytes from `path` starting at `offset` to EOF.
@@ -549,7 +682,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First call: should insert all 3 rows.
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file first call");
         assert_eq!(stats.inserted, 3, "should insert 3 new messages");
@@ -563,16 +696,22 @@ mod tests {
         assert_eq!(session_count, 1, "1 session row");
 
         // Idempotency: second call over the SAME range inserts 0 rows.
-        let stats2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file second call");
         assert_eq!(stats2.inserted, 0, "second pass must insert 0 rows");
         assert_eq!(count_rows(&rt, "session_messages").await, 3);
 
         // Offset-aware: calling from the advanced offset finds nothing new.
-        let stats3 = mirror_file(&rt, &path, stats.new_offset, MirrorSource::ClaudeCode, None)
-            .await
-            .expect("mirror_file from new_offset");
+        let stats3 = mirror_file(
+            &rt,
+            &path,
+            stats.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("mirror_file from new_offset");
         assert_eq!(stats3.inserted, 0, "no new data past advanced offset");
         assert_eq!(stats3.new_offset, stats.new_offset);
 
@@ -597,7 +736,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let full_len = std::fs::metadata(&path).unwrap().len();
 
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file partial");
 
@@ -610,9 +749,15 @@ mod tests {
         );
 
         // The partial bytes remain; calling again from new_offset finds no complete lines.
-        let stats2 = mirror_file(&rt, &path, stats.new_offset, MirrorSource::ClaudeCode, None)
-            .await
-            .expect("second call");
+        let stats2 = mirror_file(
+            &rt,
+            &path,
+            stats.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("second call");
         assert_eq!(
             stats2.inserted, 0,
             "partial line must not be consumed on re-poll"
@@ -635,7 +780,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First call inserts.
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -644,14 +789,14 @@ mod tests {
         writeln!(file, "{line}").unwrap();
 
         // Second call from offset 0 should see both lines but insert 0 new rows.
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "duplicate uuid must not be re-inserted");
         assert_eq!(count_rows(&rt, "session_messages").await, 1);
 
         // Incremental: call from first call's new_offset; the second line is the dup.
-        let s3 = mirror_file(&rt, &path, s1.new_offset, MirrorSource::ClaudeCode, None)
+        let s3 = mirror_file(&rt, &path, s1.new_offset, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s3.inserted, 0, "incremental dup must also insert 0");
@@ -670,7 +815,7 @@ mod tests {
         writeln!(file, "{line}").unwrap();
         let path = file.path().to_path_buf();
 
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -680,7 +825,7 @@ mod tests {
 
         // Replay from offset 0: re-scans the same line, inserts 0, and must
         // leave last_seen_at byte-identical even though now_us has advanced.
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "replay must insert 0 rows");
@@ -698,7 +843,7 @@ mod tests {
         let file = NamedTempFile::new().expect("tmpfile");
         let path = file.path().to_path_buf();
 
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 0);
@@ -710,7 +855,7 @@ mod tests {
     async fn test_missing_file_returns_error() {
         let (rt, _dir) = setup().await;
         let bad_path = std::path::PathBuf::from("/nonexistent/path/session.jsonl");
-        let result = mirror_file(&rt, &bad_path, 0, MirrorSource::ClaudeCode, None).await;
+        let result = mirror_file(&rt, &bad_path, 0, LineTailSource::ClaudeCode, None).await;
         assert!(
             matches!(result, Err(RuntimeError::Internal(_))),
             "missing file should return Internal error"
@@ -764,7 +909,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // Mirror the file as Codex source.
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .expect("codex mirror_file");
 
@@ -849,7 +994,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First pass.
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -878,7 +1023,7 @@ mod tests {
         );
 
         // Second pass from offset 0: same lines, 0 new rows (idempotent).
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "second pass must be idempotent");
@@ -889,7 +1034,7 @@ mod tests {
             &rt,
             &path,
             s1.new_offset,
-            MirrorSource::Codex,
+            LineTailSource::Codex,
             Some(session_id),
         )
         .await
@@ -911,7 +1056,7 @@ mod tests {
         let mut cdx_file = NamedTempFile::new().expect("cdx tmpfile");
         writeln!(cdx_file, "{cdx_msg}").unwrap();
 
-        mirror_file(&rt, cc_file.path(), 0, MirrorSource::ClaudeCode, None)
+        mirror_file(&rt, cc_file.path(), 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
 
@@ -919,7 +1064,7 @@ mod tests {
             &rt,
             cdx_file.path(),
             0,
-            MirrorSource::Codex,
+            LineTailSource::Codex,
             Some(cdx_session_id),
         )
         .await
@@ -947,5 +1092,513 @@ mod tests {
             })
             .collect();
         assert_eq!(sources, vec!["claude_code", "codex"]);
+    }
+
+    // ── ChatGPT export whole-file ingest tests ────────────────────────────────
+    //
+    // All fixtures below are hand-authored synthetic JSON, not real export
+    // content. Node ids are set equal to their own `message.id` so that
+    // `parent_uuid` (which threads through the mapping node id, per
+    // `parse::build_chatgpt_event`) resolves to the expected message uuid.
+
+    use serde_json::json;
+
+    fn write_export_file(content: &str) -> (NamedTempFile, std::path::PathBuf) {
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        write!(file, "{content}").unwrap();
+        let path = file.path().to_path_buf();
+        (file, path)
+    }
+
+    fn chatgpt_happy_export_json() -> String {
+        let conv = json!({
+            "id": "conv-happy",
+            "title": "Synthetic Happy",
+            "create_time": 1_751_462_400.0,
+            "current_node": "msg-happy-assistant",
+            "mapping": {
+                "root-happy": {
+                    "id": "root-happy",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-happy-user"]
+                },
+                "msg-happy-user": {
+                    "id": "msg-happy-user",
+                    "parent": "root-happy",
+                    "children": ["msg-happy-assistant"],
+                    "message": {
+                        "id": "msg-happy-user",
+                        "author": {"role": "user"},
+                        "create_time": 1_751_462_400.0,
+                        "content": {"content_type": "text", "parts": ["Hello synthetic"]}
+                    }
+                },
+                "msg-happy-assistant": {
+                    "id": "msg-happy-assistant",
+                    "parent": "msg-happy-user",
+                    "children": [],
+                    "message": {
+                        "id": "msg-happy-assistant",
+                        "author": {"role": "assistant"},
+                        "create_time": 1_751_462_401.0,
+                        "content": {"content_type": "text", "parts": ["Hi synthetic"]}
+                    }
+                }
+            }
+        });
+        serde_json::to_string(&json!([conv])).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_happy_conversations_json() {
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file(&chatgpt_happy_export_json());
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("happy path ingest");
+        assert_eq!(stats.inserted, 2, "2 message-bearing nodes");
+        assert_eq!(stats.scanned, 2, "2 events parsed");
+        assert_eq!(stats.new_offset, file_len, "whole-file cursor-at-length");
+
+        let sql = rt.sql();
+        let mut r = sql.reader().await.expect("reader");
+        let row = r
+            .query_row(SqlStatement {
+                sql: "SELECT source, slug, cwd, git_branch FROM sessions WHERE id='conv-happy'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok")
+            .expect("session row must exist");
+        match row.get("source") {
+            Some(SqlValue::Text(s)) => assert_eq!(s, "chatgpt_export"),
+            other => panic!("unexpected source: {other:?}"),
+        }
+        match row.get("slug") {
+            Some(SqlValue::Text(s)) => assert_eq!(s, "Synthetic Happy"),
+            other => panic!("unexpected slug: {other:?}"),
+        }
+        assert!(
+            matches!(row.get("cwd"), Some(SqlValue::Null) | None),
+            "chatgpt export never carries a cwd"
+        );
+        assert!(
+            matches!(row.get("git_branch"), Some(SqlValue::Null) | None),
+            "chatgpt export never carries a git branch"
+        );
+
+        let mut r2 = sql.reader().await.expect("reader");
+        let rows = r2
+            .query_all(SqlStatement {
+                sql: "SELECT seq, role FROM session_messages \
+                      WHERE session_id='conv-happy' ORDER BY seq"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok");
+        let roles: Vec<(i64, String)> = rows
+            .iter()
+            .map(|row| {
+                let seq = match row.get("seq") {
+                    Some(SqlValue::Integer(n)) => *n,
+                    other => panic!("unexpected seq: {other:?}"),
+                };
+                let role = match row.get("role") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => panic!("unexpected role: {other:?}"),
+                };
+                (seq, role)
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec![(0, "user".to_string()), (1, "assistant".to_string())]
+        );
+    }
+
+    fn chatgpt_idempotency_export_json() -> String {
+        let conv = json!({
+            "id": "conv-idem",
+            "title": "Synthetic Idempotency",
+            "current_node": "msg-idem-assistant",
+            "mapping": {
+                "root-idem": {
+                    "id": "root-idem",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-idem-user"]
+                },
+                "msg-idem-user": {
+                    "id": "msg-idem-user",
+                    "parent": "root-idem",
+                    "children": ["msg-idem-assistant"],
+                    "message": {
+                        "id": "msg-idem-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Same question again"]}
+                    }
+                },
+                "msg-idem-assistant": {
+                    "id": "msg-idem-assistant",
+                    "parent": "msg-idem-user",
+                    "children": [],
+                    "message": {
+                        "id": "msg-idem-assistant",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["Same answer again"]}
+                    }
+                }
+            }
+        });
+        serde_json::to_string(&json!([conv])).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_reingest_idempotency_conversations_json() {
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file(&chatgpt_idempotency_export_json());
+
+        let s1 = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("first ingest");
+        assert_eq!(s1.inserted, 2);
+
+        let seen_after_first = last_seen_at(&rt, "conv-idem")
+            .await
+            .expect("session row exists");
+
+        // Re-ingest from offset 0 (the service always re-reads the whole file
+        // for this source): same event uuids, INSERT OR IGNORE must dedup.
+        let s2 = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("second ingest");
+        assert_eq!(s2.inserted, 0, "re-ingest must insert 0 new rows");
+
+        let sql = rt.sql();
+        let mut r = sql.reader().await.expect("reader");
+        let count = r
+            .query_row(SqlStatement {
+                sql: "SELECT COUNT(*) FROM session_messages WHERE session_id='conv-idem'".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok")
+            .expect("count row");
+        match count.columns.first().map(|c| &c.value) {
+            Some(SqlValue::Integer(n)) => assert_eq!(*n, 2, "message count stays at 2"),
+            other => panic!("unexpected count: {other:?}"),
+        }
+
+        let seen_after_replay = last_seen_at(&rt, "conv-idem")
+            .await
+            .expect("session row still exists");
+        assert_eq!(
+            seen_after_first, seen_after_replay,
+            "pure replay must not advance last_seen_at"
+        );
+    }
+
+    fn chatgpt_branch_sidechain_export_json() -> String {
+        let conv = json!({
+            "id": "conv-branch",
+            "title": "Synthetic Branch",
+            "current_node": "msg-branch-main",
+            "mapping": {
+                "root-branch": {
+                    "id": "root-branch",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-branch-user"]
+                },
+                "msg-branch-user": {
+                    "id": "msg-branch-user",
+                    "parent": "root-branch",
+                    "children": ["msg-branch-main", "msg-branch-alt"],
+                    "message": {
+                        "id": "msg-branch-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Branch question"]}
+                    }
+                },
+                "msg-branch-main": {
+                    "id": "msg-branch-main",
+                    "parent": "msg-branch-user",
+                    "children": [],
+                    "message": {
+                        "id": "msg-branch-main",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["Main answer"]}
+                    }
+                },
+                "msg-branch-alt": {
+                    "id": "msg-branch-alt",
+                    "parent": "msg-branch-user",
+                    "children": [],
+                    "message": {
+                        "id": "msg-branch-alt",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["Alternate answer"]}
+                    }
+                }
+            }
+        });
+        serde_json::to_string(&json!([conv])).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_branch_sidechain_conversations_json() {
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file(&chatgpt_branch_sidechain_export_json());
+
+        let stats = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("branch ingest");
+        assert_eq!(stats.inserted, 3, "user + main + alt all stored");
+
+        let sql = rt.sql();
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT id, is_sidechain, text FROM session_messages \
+                      WHERE session_id='conv-branch' ORDER BY id"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok");
+        assert_eq!(rows.len(), 3);
+
+        for row in &rows {
+            let id = match row.get("id") {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => panic!("unexpected id: {other:?}"),
+            };
+            let is_sidechain = match row.get("is_sidechain") {
+                Some(SqlValue::Integer(n)) => *n,
+                other => panic!("unexpected is_sidechain: {other:?}"),
+            };
+            let text = match row.get("text") {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => panic!("unexpected text: {other:?}"),
+            };
+            match id.as_str() {
+                "msg-branch-user" | "msg-branch-main" => {
+                    assert_eq!(is_sidechain, 0, "{id} is on the current-node path")
+                }
+                "msg-branch-alt" => {
+                    assert_eq!(is_sidechain, 1, "alt branch is off the current-node path");
+                    assert_eq!(
+                        text, "Alternate answer",
+                        "sidechain content must be preserved, not dropped"
+                    );
+                }
+                other => panic!("unexpected message id: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_malformed_conversations_json_cursor_does_not_advance() {
+        let (rt, _dir) = setup().await;
+
+        // Seed the path with a valid (if empty) export and record its cursor.
+        let (mut file, path) = write_export_file("[]");
+        let seeded_stats = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("seeding with an empty array is a valid parse");
+        assert_eq!(seeded_stats.inserted, 0);
+        let seeded_offset = seeded_stats.new_offset;
+
+        let seeded_sessions = count_rows(&rt, "sessions").await;
+        let seeded_messages = count_rows(&rt, "session_messages").await;
+
+        // Overwrite with a longer, malformed (valid-JSON-but-not-an-array) body.
+        let malformed = r#"{"oops": "not a chatgpt export array"}"#;
+        file.as_file_mut().set_len(0).expect("truncate");
+        std::io::Seek::seek(file.as_file_mut(), std::io::SeekFrom::Start(0)).unwrap();
+        write!(file, "{malformed}").unwrap();
+
+        let result = mirror_chatgpt_export_file(&rt, &path, seeded_offset).await;
+        assert!(
+            matches!(result, Err(RuntimeError::Internal(_))),
+            "malformed export must return Internal error, got {result:?}"
+        );
+
+        let stored_offset = cursor_offset(&rt, &path.to_string_lossy()).await;
+        assert_eq!(
+            stored_offset,
+            Some(seeded_offset as i64),
+            "cursor must remain at the pre-error value"
+        );
+        assert_eq!(
+            count_rows(&rt, "sessions").await,
+            seeded_sessions,
+            "no new session rows on parse failure"
+        );
+        assert_eq!(
+            count_rows(&rt, "session_messages").await,
+            seeded_messages,
+            "no new message rows on parse failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_secret_bearing_conversations_json_is_masked() {
+        // Assembled from fragments at runtime so no credential-shaped literal
+        // is committed to the repo; matches the AWS-key shape already covered
+        // by `khive_runtime::secret_gate`'s own detector tests.
+        let secret_fragment_a = "AKIA";
+        let secret_fragment_b = "FAKEKEY1234567890";
+        let secret = format!("{secret_fragment_a}{secret_fragment_b}");
+        let user_text = format!("here is my key: {secret}");
+
+        let conv = json!({
+            "id": "conv-secret",
+            "title": "Synthetic Secret",
+            "current_node": "msg-secret-user",
+            "mapping": {
+                "root-secret": {
+                    "id": "root-secret",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-secret-user"]
+                },
+                "msg-secret-user": {
+                    "id": "msg-secret-user",
+                    "parent": "root-secret",
+                    "children": [],
+                    "message": {
+                        "id": "msg-secret-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": [user_text]}
+                    }
+                }
+            }
+        });
+        let content = serde_json::to_string(&json!([conv])).unwrap();
+        let (_file, path) = write_export_file(&content);
+
+        let (rt, _dir) = setup().await;
+        let stats = mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("secret-bearing content must still ingest, only masked");
+        assert_eq!(stats.inserted, 1);
+
+        let sql = rt.sql();
+        let mut r = sql.reader().await.expect("reader");
+        let row = r
+            .query_row(SqlStatement {
+                sql: "SELECT text, raw FROM session_messages WHERE session_id='conv-secret'".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok")
+            .expect("message row must exist");
+        let (stored_text, stored_raw) = match (row.get("text"), row.get("raw")) {
+            (Some(SqlValue::Text(t)), Some(SqlValue::Text(r))) => (t.clone(), r.clone()),
+            other => panic!("unexpected text/raw shape: {other:?}"),
+        };
+
+        assert!(
+            !stored_text.contains(&secret),
+            "stored text must not contain the raw secret"
+        );
+        assert!(
+            !stored_raw.contains(&secret),
+            "stored raw must not contain the raw secret"
+        );
+        assert!(
+            stored_text.contains("***MASKED***"),
+            "stored text must carry the secret_gate redaction marker"
+        );
+        assert!(
+            stored_raw.contains("***MASKED***"),
+            "stored raw must carry the secret_gate redaction marker"
+        );
+    }
+
+    /// SS6 invariants #4 ("an ingest error never advances the cursor") and #5
+    /// ("one transaction per file pass") both rest on the same underlying
+    /// contract that `write_events_and_cursor` depends on: a `begin_tx()`
+    /// transaction that hits an error before `commit()` is called must leave
+    /// no visible trace of ANY write it made in that pass — including the
+    /// cursor upsert, which runs last, right before `commit()`.
+    ///
+    /// The real ingest loop can't be driven into a mid-loop DB error through
+    /// crafted event data: the `sessions` insert uses `ON CONFLICT(id) DO
+    /// NOTHING` and the `session_messages` insert uses `INSERT OR IGNORE`,
+    /// both of which swallow constraint violations by design (that's what
+    /// makes re-ingest idempotent). So this test exercises the same
+    /// `begin_tx`/`execute`/drop-without-commit path directly — the exact
+    /// machinery `mirror_chatgpt_export_file`'s `?`-propagated errors rely
+    /// on — and forces a genuine, non-suppressed SQL error (a `prepare()`
+    /// failure on a nonexistent table) after a session write AND a cursor
+    /// advance have already succeeded within the same open transaction.
+    #[tokio::test]
+    async fn test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced() {
+        let (rt, _dir) = setup().await;
+        let sql = rt.sql();
+        let path = std::path::Path::new("/synthetic/mid-tx-probe.json");
+
+        let mut tx = sql
+            .begin_tx(SqlTxOptions::default())
+            .await
+            .expect("begin_tx");
+
+        // First write succeeds — mirrors event 1's session row in a
+        // multi-event file pass.
+        tx.execute(SqlStatement {
+            sql: "INSERT INTO sessions \
+                  (id, provider_session_id, source, message_count, first_seen_at, last_seen_at, namespace) \
+                  VALUES('mid-tx-session', 'mid-tx-session', 'chatgpt_export', 0, 1, 1, 'local')"
+                .into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("first write in transaction must succeed");
+
+        // Cursor advance succeeds too — mirrors `upsert_cursor_in_tx` running
+        // near the end of `write_events_and_cursor`, before `commit()`.
+        upsert_cursor_in_tx(&mut *tx, path, Some("mid-tx-session"), 999, 1)
+            .await
+            .expect("cursor upsert in transaction must succeed");
+
+        // Third write fails with a genuine (non-suppressed) SQL error —
+        // mirrors a mid-loop DB failure on a later event in the same file.
+        let err = tx
+            .execute(SqlStatement {
+                sql: "INSERT INTO no_such_table_mid_tx_probe(a) VALUES(1)".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(err.is_err(), "forced third write must fail");
+
+        // No `commit()` is ever called — `tx` is dropped here, exactly as
+        // `write_events_and_cursor` drops its `tx` when an earlier `?`
+        // returns `Err` before reaching its own `tx.commit()` call.
+        drop(tx);
+
+        assert_eq!(
+            count_rows(&rt, "sessions").await,
+            0,
+            "session write must not survive a later error in the same transaction"
+        );
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            None,
+            "cursor must not advance when a later write in the same transaction fails"
+        );
     }
 }
