@@ -102,13 +102,23 @@ impl KnowledgeHandlers {
             // error instead of a defined lifecycle error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("upsert_atoms lookup", e))?;
             if let Some(row) = &existing {
+                // A domain's mirror atom shares the (namespace, slug) index with
+                // ordinary atoms. Reject here (mirroring the delete_atoms guard)
+                // so a plain upsert_atoms call can never blind-overwrite the
+                // mirror's tags/content and desynchronize it from its domain.
+                let existing_tags = row_str(row, "tags").unwrap_or_default();
+                if existing_tags.contains("type:domain") {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
+                    )));
+                }
                 if row_i64(row, "deleted_at").is_some() {
                     return Err(RuntimeError::InvalidInput(format!(
                         "atom slug {slug:?} was previously deleted; choose a new slug"

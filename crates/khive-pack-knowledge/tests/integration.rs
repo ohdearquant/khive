@@ -731,6 +731,62 @@ async fn upsert_domains_rejects_atom_slug_collision_without_partial_domain() {
     assert!(tags.iter().any(|t| t == "distinctive-tag"));
 }
 
+#[tokio::test]
+async fn upsert_atoms_rejects_domain_mirror_slug_collision_without_mutation() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "retrieval",
+            "name": "Retrieval",
+            "description": "Dense and sparse retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
+        }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    // A plain upsert_atoms call targeting the domain's mirror slug must be
+    // rejected, not silently strip type:domain from the mirror's tags.
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": "retrieval",
+                "name": "Retrieval Atom Overwrite Attempt",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // The domain mirror must be untouched: still classified as a domain by
+    // direct lookup and by search, with its original name intact.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "retrieval" }))
+        .await
+        .expect("get must still resolve the domain");
+    assert_eq!(got["kind"], "domain");
+    assert_eq!(got["name"], "Retrieval");
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "retrieval"),
+        "search must still find the domain, not a demoted atom: {results:?}"
+    );
+}
+
 // ── knowledge.get ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
