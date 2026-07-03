@@ -1391,7 +1391,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn namespace_absent_defaults_to_none() {
+        std::env::remove_var("KHIVE_NAMESPACE");
         let args = ReindexArgs::parse_from(["reindex"]);
         assert!(
             args.namespace.is_none(),
