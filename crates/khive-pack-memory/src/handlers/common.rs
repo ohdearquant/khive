@@ -110,7 +110,7 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
     match s {
         "rrf" => Ok(FusionStrategy::Rrf { k: 60 }),
         "weighted" => Ok(FusionStrategy::Weighted {
-            weights: vec![0.3, 0.7],
+            weights: vec![0.7, 0.3],
         }),
         "union" => Ok(FusionStrategy::Union),
         "vector_only" => Ok(FusionStrategy::VectorOnly),

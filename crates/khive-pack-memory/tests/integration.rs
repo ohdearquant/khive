@@ -944,6 +944,82 @@ async fn test_recall_excludes_non_memory_notes() {
     }
 }
 
+/// Regression test for issue #430: recall must return the requested count of
+/// memory results even when a tiny `candidate_limit` and many higher-ranking
+/// non-memory notes would otherwise exhaust the candidate cap before the
+/// memory-kind scope is ever applied.
+#[tokio::test]
+async fn recall_candidate_cap_counts_eligible_memories_not_generic_notes() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // 30 non-memory notes, all matching the query, all ranked ahead of the
+    // memory notes below (higher salience is irrelevant to FTS/vector rank,
+    // but sheer count is enough to exhaust a `candidate_limit` of 5).
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    for i in 0..30 {
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            &format!("observation {i} about quokka migration patterns in tundra"),
+            Some(0.9),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation");
+    }
+
+    let want = 5usize;
+    let mut memory_ids = Vec::with_capacity(want);
+    for i in 0..want {
+        let mem = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("memory note {i} about quokka migration patterns in tundra"),
+                    "salience": 0.6
+                }),
+            )
+            .await
+            .expect("remember");
+        memory_ids.push(mem["id"].as_str().unwrap().to_string());
+    }
+
+    // `candidate_limit: 5` is smaller than the 30 non-memory notes competing
+    // for the same candidate window — without memory-kind scoping applied
+    // before the cap, the 5 memory notes can be starved out entirely.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "quokka migration patterns tundra",
+                "limit": want,
+                "config": { "candidate_limit": 5 },
+            }),
+        )
+        .await
+        .expect("recall succeeds");
+
+    let hits = result.as_array().expect("array of hits");
+    assert_eq!(
+        hits.len(),
+        want,
+        "recall must return the requested count of memories even when non-memory \
+         notes dominate a small candidate window; got {} of {want}: {hits:?}",
+        hits.len()
+    );
+    let ids: std::collections::HashSet<&str> =
+        hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
+    for mid in &memory_ids {
+        assert!(
+            ids.contains(mid.as_str()),
+            "expected memory {mid} in recall results, got {ids:?}"
+        );
+    }
+}
+
 /// Regression for #159: PackTunable::apply_config must actually affect recall
 /// scoring, not just mutate a Mutex that handlers ignore.
 ///
