@@ -105,6 +105,53 @@ mod unit_tests {
     }
 
     #[test]
+    fn test_reinsert_tombstoned_node_does_not_duplicate_internal_id() {
+        // Regression for #414: re-inserting a tombstoned NodeId must not
+        // resurrect the old internal slot alongside a fresh one. That would
+        // inflate len()/len_live(), let exact-scan search return the stale
+        // pre-delete vector, and duplicate the ID in snapshot.indexed_ids.
+        let mut index = HnswIndex::new(3);
+
+        let x = make_id(1);
+        let y = make_id(2);
+        let z = make_id(3);
+
+        index.insert(x, vec![1.0, 0.0, 0.0]).expect("insert x");
+        index.insert(y, vec![0.9, 0.1, 0.0]).expect("insert y");
+        index.insert(z, vec![0.0, 1.0, 0.0]).expect("insert z");
+
+        assert!(index.delete(x));
+        index
+            .insert(x, vec![0.0, 0.0, 1.0])
+            .expect("reinsert tombstoned x");
+
+        assert_eq!(index.len(), 3, "no duplicate internal slot for x");
+        assert_eq!(index.len_live(), 3, "no duplicate internal slot for x");
+        assert_eq!(index.tombstone_stats().tombstone_count, 0);
+
+        let stale_hit = index
+            .search(&[1.0, 0.0, 0.0], 1)
+            .expect("search for stale x vector");
+        assert_ne!(
+            stale_hit[0].0, x,
+            "stale pre-delete vector must not resolve back to x"
+        );
+
+        let fresh_hit = index
+            .search(&[0.0, 0.0, 1.0], 1)
+            .expect("search for fresh x vector");
+        assert_eq!(fresh_hit[0].0, x, "fresh vector must resolve to x");
+
+        let snap = index.snapshot();
+        let unique_ids: HashSet<_> = snap.indexed_ids.iter().collect();
+        assert_eq!(
+            unique_ids.len(),
+            snap.indexed_ids.len(),
+            "snapshot.indexed_ids must not contain duplicate IDs"
+        );
+    }
+
+    #[test]
     fn test_delete_tombstone() {
         let mut index = HnswIndex::new(3);
 

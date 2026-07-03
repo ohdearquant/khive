@@ -80,16 +80,18 @@ impl HnswIndex {
         if let Some(&iid) = self.id_to_internal.get(&id) {
             let is_tombstoned = iid < self.tombstones.len() && self.tombstones[iid];
             if is_tombstoned {
-                // Undo the tombstone so `delete` does not double-count it,
-                // and so the fresh insert below sees the ID as gone.
-                self.tombstones[iid] = false;
-                self.tombstone_count -= 1;
-                // Remove from the ID maps so insert_inner treats this as a new node.
-                // The internal slot (iid) becomes a permanent hole (like any deleted node).
-                self.id_to_internal.remove(&id);
-                // internal_to_id still holds the old external ID at position iid;
-                // leave it in place — the slot is effectively dead (tombstoned above).
-                // Fall through to the fresh-insert path below.
+                // Compact away tombstoned slots (including this one) before
+                // falling through to the fresh-insert path below. Merely
+                // clearing the tombstone and removing `id` from
+                // `id_to_internal` left `internal_to_id[iid]` still pointing
+                // at `id`, so the fresh-insert path would append a second
+                // internal slot for the same external ID -- duplicating
+                // `internal_to_id` / `snapshot.indexed_ids` and letting
+                // exact-scan search return the stale pre-delete vector
+                // (#414). `rebuild()` physically removes the old slot and
+                // its `id_to_internal` entry, so the fresh insert below
+                // allocates a single, clean internal ID for `id`.
+                self.rebuild();
             } else {
                 // Live node update: just swap the vector. Graph edges remain valid
                 // because neighbors were chosen by proximity; after an in-place
