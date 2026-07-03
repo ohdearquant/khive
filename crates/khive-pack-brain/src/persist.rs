@@ -44,7 +44,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
 
 use khive_brain_core::{
-    validate_brain_state_snapshot, BrainSignal, BrainState, BrainStateSnapshot,
+    validate_brain_state_snapshot_with_capacity, BrainSignal, BrainState, BrainStateSnapshot,
 };
 
 use crate::event::interpret;
@@ -420,6 +420,7 @@ pub async fn persist_brain_state_mutation<R>(
 pub async fn load_latest_snapshot(
     sql: &dyn SqlAccess,
     namespace: &str,
+    entity_capacity: usize,
 ) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let row = reader
@@ -447,7 +448,7 @@ pub async fn load_latest_snapshot(
             };
             let snapshot: BrainStateSnapshot =
                 serde_json::from_str(&json_str).map_err(|e| sql_err("deserialize snapshot", e))?;
-            validate_brain_state_snapshot(&snapshot)
+            validate_brain_state_snapshot_with_capacity(&snapshot, entity_capacity)
                 .map_err(|e| sql_err("snapshot invariant violation", e))?;
             Ok(Some((snapshot, updated_at)))
         }
@@ -612,7 +613,8 @@ pub async fn ensure_loaded(
         None
     } else {
         let sql = runtime.sql();
-        let snapshot_result = load_latest_snapshot(sql.as_ref(), &namespace).await?;
+        let snapshot_result =
+            load_latest_snapshot(sql.as_ref(), &namespace, entity_capacity).await?;
 
         let bs = if let Some((snapshot, updated_at)) = snapshot_result {
             let replay_result = load_events_since(sql.as_ref(), &namespace, updated_at).await?;
@@ -1285,5 +1287,78 @@ mod brain_007_replay_quarantine {
             "snippet body must contain only '日' chars; got: {:?}",
             snippet_body
         );
+    }
+}
+
+// ── BRAINCORE-AUD-001: entity-posterior cache-capacity enforcement on load ────
+
+#[cfg(test)]
+mod braincore_aud_001_capacity {
+    use uuid::Uuid;
+
+    use super::*;
+    use khive_brain_core::BetaPosterior;
+    use khive_runtime::{KhiveRuntime, Namespace};
+
+    /// Oversized persisted snapshot restore is bounded/rejected: a snapshot
+    /// with more entity posteriors than `ENTITY_CACHE_CAPACITY` must fail
+    /// capacity-aware validation at the load boundary rather than silently
+    /// restoring past the configured bound.
+    #[tokio::test]
+    async fn oversized_brain_snapshot_load_returns_runtime_error() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let capacity = 2;
+        let mut state = BrainState::new(capacity);
+        for _ in 0..capacity {
+            state
+                .balanced_recall
+                .entity_posteriors
+                .get_or_insert(Uuid::new_v4(), BetaPosterior::default);
+        }
+        let mut snapshot = state.to_snapshot();
+        // Force one entry past the configured capacity — simulates a crafted
+        // or legacy oversized snapshot that live inserts could never produce.
+        snapshot
+            .balanced_recall
+            .entity_posteriors
+            .insert(Uuid::new_v4(), BetaPosterior::default());
+
+        upsert_snapshot(sql.as_ref(), ns, &snapshot, 500_000)
+            .await
+            .expect("seed oversized snapshot");
+
+        let result = load_latest_snapshot(sql.as_ref(), ns, capacity).await;
+        assert!(
+            result.is_err(),
+            "snapshot with entity_posteriors.len() > capacity must be rejected at load"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("snapshot invariant violation"),
+            "error must name the invariant-violation load boundary, got: {err}"
+        );
+    }
+
+    /// A snapshot within the configured capacity restores without error.
+    #[tokio::test]
+    async fn in_capacity_brain_snapshot_load_succeeds() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let capacity = 2;
+        let state = BrainState::new(capacity);
+        let snapshot = state.to_snapshot();
+        upsert_snapshot(sql.as_ref(), ns, &snapshot, 500_000)
+            .await
+            .expect("seed snapshot");
+
+        let result = load_latest_snapshot(sql.as_ref(), ns, capacity).await;
+        assert!(result.is_ok(), "in-capacity snapshot must load cleanly");
     }
 }

@@ -102,6 +102,8 @@ impl BalancedRecallState {
             salience: self.salience.clone(),
             temporal: self.temporal.clone(),
             entity_posteriors: self.entity_posteriors.to_snapshot(),
+            entity_posteriors_version: 1,
+            entity_posterior_order: self.entity_posteriors.order(),
             total_events: self.total_events,
             exploration_epoch: self.exploration_epoch,
         }
@@ -114,6 +116,7 @@ impl BalancedRecallState {
             temporal: snapshot.temporal,
             entity_posteriors: EntityPosteriors::from_snapshot(
                 snapshot.entity_posteriors,
+                snapshot.entity_posterior_order,
                 entity_capacity,
             ),
             total_events: snapshot.total_events,
@@ -222,6 +225,16 @@ pub struct BalancedRecallSnapshot {
     pub salience: BetaPosterior,
     pub temporal: BetaPosterior,
     pub entity_posteriors: HashMap<Uuid, BetaPosterior>,
+    /// Snapshot schema version for `entity_posteriors`/`entity_posterior_order`.
+    /// `0` (the serde default) marks a legacy snapshot with no order metadata;
+    /// `1` marks a snapshot written with `entity_posterior_order` populated.
+    #[serde(default)]
+    pub entity_posteriors_version: u32,
+    /// Eviction order (oldest first) for `entity_posteriors`, as of the write.
+    /// Empty on legacy snapshots — restore falls back to a deterministic
+    /// ascending-`Uuid` compatibility order in that case.
+    #[serde(default)]
+    pub entity_posterior_order: Vec<Uuid>,
     pub total_events: u64,
     pub exploration_epoch: u64,
 }
@@ -288,5 +301,52 @@ mod tests {
             shift >= 0.3,
             "ESS cap convergence: mean shift {shift:.4} < 0.3 (positive={mean_after_positive:.4}, opposing={mean_after_opposing:.4})"
         );
+    }
+
+    /// BRAINCORE-AUD-001 regression: a legacy snapshot (version 0, no order
+    /// metadata) with more entries than the configured capacity must restore
+    /// bounded, using a deterministic ascending-`Uuid` compatibility order.
+    #[test]
+    fn legacy_entity_posteriors_restore_uses_deterministic_order_and_capacity() {
+        let capacity = 2;
+        let mut ids = vec![
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ];
+        ids.sort();
+
+        let mut entity_posteriors = HashMap::new();
+        for id in &ids {
+            entity_posteriors.insert(*id, BetaPosterior::default());
+        }
+
+        let legacy = BalancedRecallSnapshot {
+            relevance: BetaPosterior::default(),
+            salience: BetaPosterior::default(),
+            temporal: BetaPosterior::default(),
+            entity_posteriors,
+            entity_posteriors_version: 0,
+            entity_posterior_order: Vec::new(),
+            total_events: 0,
+            exploration_epoch: 0,
+        };
+
+        let restored = BalancedRecallState::from_snapshot(legacy, capacity);
+
+        assert_eq!(restored.entity_posteriors.len(), capacity);
+        for id in ids.iter().take(capacity) {
+            assert!(
+                restored.entity_posteriors.get(id).is_some(),
+                "deterministic sort prefix id {id} must be retained"
+            );
+        }
+        for id in ids.iter().skip(capacity) {
+            assert!(
+                restored.entity_posteriors.get(id).is_none(),
+                "id {id} beyond the deterministic sort prefix must be dropped"
+            );
+        }
     }
 }

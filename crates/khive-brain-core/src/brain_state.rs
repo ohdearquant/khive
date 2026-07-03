@@ -294,6 +294,61 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
     Ok(())
 }
 
+/// Validate posterior numerics (via [`validate_brain_state_snapshot`]) plus
+/// entity-posterior cache-capacity bounds for a persisted snapshot.
+///
+/// Rejects a snapshot whose `balanced_recall` or any `profile_states` entry
+/// holds more entity posteriors than `entity_capacity`, and rejects
+/// `entity_posterior_order` values that contain duplicate ids or reference
+/// ids absent from `entity_posteriors`. This is the capacity-aware
+/// counterpart used at the persistence load boundary, so a crafted or legacy
+/// oversized snapshot is rejected outright rather than silently truncated.
+pub fn validate_brain_state_snapshot_with_capacity(
+    snapshot: &BrainStateSnapshot,
+    entity_capacity: usize,
+) -> Result<(), String> {
+    validate_brain_state_snapshot(snapshot)?;
+
+    fn check_recall(
+        label: &str,
+        br: &BalancedRecallSnapshot,
+        entity_capacity: usize,
+    ) -> Result<(), String> {
+        if br.entity_posteriors.len() > entity_capacity {
+            return Err(format!(
+                "{label}.entity_posteriors: {} entries exceeds capacity {entity_capacity}",
+                br.entity_posteriors.len()
+            ));
+        }
+        if !br.entity_posterior_order.is_empty() {
+            let mut seen =
+                std::collections::HashSet::with_capacity(br.entity_posterior_order.len());
+            for id in &br.entity_posterior_order {
+                if !seen.insert(*id) {
+                    return Err(format!("{label}.entity_posterior_order: duplicate id {id}"));
+                }
+                if !br.entity_posteriors.contains_key(id) {
+                    return Err(format!(
+                        "{label}.entity_posterior_order: id {id} not present in entity_posteriors"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    check_recall(
+        "balanced_recall",
+        &snapshot.balanced_recall,
+        entity_capacity,
+    )?;
+    for (pid, ps) in &snapshot.profile_states {
+        check_recall(&format!("profile_states[{pid}]"), ps, entity_capacity)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -476,6 +531,67 @@ mod tests {
         assert!(
             restored.adapter_set.is_empty(),
             "adapter_set must default to empty map when absent from JSON"
+        );
+    }
+
+    /// BRAINCORE-AUD-001 regression: oversized-snapshot restore is rejected
+    /// (bounded/rejected) at the capacity-aware validation boundary.
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_entity_posteriors_over_capacity() {
+        use uuid::Uuid;
+
+        let capacity = 2;
+        let mut state = BrainState::new(capacity);
+        for _ in 0..(capacity + 1) {
+            state
+                .balanced_recall
+                .entity_posteriors
+                .get_or_insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default);
+        }
+        // Force an over-capacity snapshot directly, since live inserts already
+        // enforce the bound — this simulates a crafted/legacy oversized snapshot.
+        let mut snapshot = state.to_snapshot();
+        snapshot
+            .balanced_recall
+            .entity_posteriors
+            .insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default());
+
+        let result = validate_brain_state_snapshot_with_capacity(&snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "snapshot with entity_posteriors.len() > capacity must be rejected"
+        );
+    }
+
+    /// BRAINCORE-AUD-001 regression: capacity violation in a named
+    /// `profile_states` entry (not just the default profile) must also be
+    /// rejected.
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_profile_state_over_capacity() {
+        use uuid::Uuid;
+
+        let capacity = 1;
+        let mut state = BrainState::new(capacity);
+        let mut extra = BalancedRecallState::new(capacity);
+        extra
+            .entity_posteriors
+            .get_or_insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default);
+        state
+            .profile_states
+            .insert("extra-profile".to_owned(), extra);
+
+        let mut snapshot = state.to_snapshot();
+        snapshot
+            .profile_states
+            .get_mut("extra-profile")
+            .unwrap()
+            .entity_posteriors
+            .insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default());
+
+        let result = validate_brain_state_snapshot_with_capacity(&snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "profile_states entry with entity_posteriors.len() > capacity must be rejected"
         );
     }
 }
