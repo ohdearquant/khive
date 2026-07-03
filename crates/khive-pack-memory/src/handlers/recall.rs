@@ -133,12 +133,21 @@ impl MemoryPack {
             .ann_overfetch_max_rounds
             .unwrap_or_else(super::common::ann_overfetch_max_rounds);
 
-        let candidates = self
+        // #430: the FTS/vector candidate cap (`candidate_limit`) is applied over all
+        // note kinds, not just `memory` rows, so a query pool dominated by higher-ranking
+        // non-memory notes can starve out eligible memories before hydration ever sees
+        // them. `load_memory_candidate_notes` is the first point where kind=="memory"
+        // eligibility is known, so widen the cap and re-gather here (bounded by
+        // `ann_overfetch_max_rounds` and `max_recall_candidates`) until enough eligible
+        // memories are hydrated or the corpus is exhausted, instead of applying the
+        // memory-kind scope only after the cap has already discarded candidates.
+        let mut current_candidate_limit = candidate_limit;
+        let mut candidates = self
             .collect_recall_candidates(
                 query_trimmed,
                 token,
                 RecallCandidateParams {
-                    candidate_limit,
+                    candidate_limit: current_candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
                     cjk_fts_bypass,
                     use_multilingual,
@@ -149,6 +158,48 @@ impl MemoryPack {
                 },
             )
             .await?;
+        let (mut memory_ids, mut notes_by_id) =
+            self.load_memory_candidate_notes(token, &candidates).await?;
+
+        for _round in 1..ann_overfetch_max_rounds {
+            if memory_ids.len() >= limit {
+                break;
+            }
+            let corpus_exhausted = candidates.text_hits.len() < current_candidate_limit as usize
+                && candidates
+                    .vector_hits_per_model
+                    .iter()
+                    .all(|(_, h)| h.len() < current_candidate_limit as usize);
+            if corpus_exhausted {
+                break;
+            }
+            let widened = current_candidate_limit
+                .saturating_mul(4)
+                .min(scoring_cfg.max_recall_candidates as u32);
+            if widened <= current_candidate_limit {
+                break;
+            }
+            current_candidate_limit = widened;
+            candidates = self
+                .collect_recall_candidates(
+                    query_trimmed,
+                    token,
+                    RecallCandidateParams {
+                        candidate_limit: current_candidate_limit,
+                        embedding_model: p.embedding_model.as_deref(),
+                        cjk_fts_bypass,
+                        use_multilingual,
+                        scoring_cfg: &scoring_cfg,
+                        snippet_policy: TextSnippetPolicy::Omit,
+                        fts_gather: &effective_fts_gather,
+                        ann_overfetch_max_rounds,
+                    },
+                )
+                .await?;
+            (memory_ids, notes_by_id) =
+                self.load_memory_candidate_notes(token, &candidates).await?;
+        }
+        let candidate_limit = current_candidate_limit;
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -168,8 +219,6 @@ impl MemoryPack {
         }
 
         let actual_multilingual_routed = candidates.multilingual_routed;
-        let (memory_ids, mut notes_by_id) =
-            self.load_memory_candidate_notes(token, &candidates).await?;
 
         if prof {
             if let Some(ref t) = t_stage {
