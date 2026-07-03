@@ -12,7 +12,7 @@ use super::schema::{
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
-    domain_to_json, new_id, now_us, row_str, sql_err, status_sql_clause, status_values,
+    domain_to_json, new_id, now_us, row_i64, row_str, sql_err, status_sql_clause, status_values,
     tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
@@ -96,14 +96,25 @@ impl KnowledgeHandlers {
                 .reader()
                 .await
                 .map_err(|e| sql_err("upsert_atoms reader", e))?;
+            // Look up by slug WITHOUT the deleted_at filter so a tombstoned row that
+            // still owns the (namespace, slug) unique index is detected before the
+            // insert path runs — otherwise SQLite raises a raw unique-constraint
+            // error instead of a defined lifecycle error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("upsert_atoms lookup", e))?;
+            if let Some(row) = &existing {
+                if row_i64(row, "deleted_at").is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "atom slug {slug:?} was previously deleted; choose a new slug"
+                    )));
+                }
+            }
 
             let mut writer = sql
                 .writer()
@@ -242,14 +253,24 @@ impl KnowledgeHandlers {
                 .reader()
                 .await
                 .map_err(|e| sql_err("upsert_domains reader", e))?;
+            // Look up by slug WITHOUT the deleted_at filter so a tombstoned domain
+            // that still owns the (namespace, slug) unique index is detected before
+            // the insert path runs, instead of leaking a raw unique-constraint error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("upsert_domains lookup", e))?;
+            if let Some(row) = &existing {
+                if row_i64(row, "deleted_at").is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "domain slug {slug:?} was previously deleted; choose a new slug"
+                    )));
+                }
+            }
 
             let id = match &existing {
                 Some(row) => row_str(row, "id").ok_or_else(|| {
