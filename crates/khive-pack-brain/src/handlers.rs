@@ -738,20 +738,40 @@ impl BrainPack {
 
     // ── brain.activate / deactivate / archive ─────────────────────────────
 
-    pub(crate) async fn handle_activate(&self, params: Value) -> Result<Value, RuntimeError> {
-        self.set_lifecycle(params, ProfileLifecycle::Active).await
+    pub(crate) async fn handle_activate(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(token, params, ProfileLifecycle::Active)
+            .await
     }
 
-    pub(crate) async fn handle_deactivate(&self, params: Value) -> Result<Value, RuntimeError> {
-        self.set_lifecycle(params, ProfileLifecycle::Inactive).await
+    pub(crate) async fn handle_deactivate(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(token, params, ProfileLifecycle::Inactive)
+            .await
     }
 
-    pub(crate) async fn handle_archive(&self, params: Value) -> Result<Value, RuntimeError> {
-        self.set_lifecycle(params, ProfileLifecycle::Archived).await
+    pub(crate) async fn handle_archive(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(token, params, ProfileLifecycle::Archived)
+            .await
     }
 
+    /// Route a profile lifecycle transition through the durable-write helper
+    /// (issue #457): the transition is validated and applied against a
+    /// proposed state copy, and only takes effect in `self.state` after the
+    /// brain event-log append + snapshot upsert commit in one transaction.
     pub(crate) async fn set_lifecycle(
         &self,
+        token: &NamespaceToken,
         params: Value,
         lifecycle: ProfileLifecycle,
     ) -> Result<Value, RuntimeError> {
@@ -763,45 +783,76 @@ impl BrainPack {
         let p: LifecycleParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let mut state = self.state.lock().unwrap();
-        let record = state
-            .profiles
-            .get_mut(&p.profile_id)
-            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.profile_id)))?;
+        let event_kind = match lifecycle {
+            ProfileLifecycle::Active => "brain.activate",
+            ProfileLifecycle::Inactive => "brain.deactivate",
+            ProfileLifecycle::Archived => "brain.archive",
+            // set_lifecycle is only ever invoked (via handle_activate /
+            // handle_deactivate / handle_archive) with one of the three
+            // targets above; other lifecycle values are registry-only states
+            // that no handler transitions to here.
+            ProfileLifecycle::Defined | ProfileLifecycle::Registered => "brain.set_lifecycle",
+        };
+        let profile_id = p.profile_id;
+        let event_payload = json!({ "profile_id": profile_id, "lifecycle": lifecycle.clone() });
 
-        // Lifecycle DAG: defined → registered → active ⟷ inactive → archived
-        // Terminal state: archived is read-only/audit-retained.
-        // No transition OUT of archived is legal.
-        // Active → archived is also illegal; must deactivate first.
-        match (&record.lifecycle, &lifecycle) {
-            // archived is terminal — nothing leaves it
-            (ProfileLifecycle::Archived, _) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "profile {:?} is archived; archive is terminal and no transition is permitted",
-                    p.profile_id
-                )));
-            }
-            // active → archived is illegal (must go through inactive first)
-            (ProfileLifecycle::Active, ProfileLifecycle::Archived) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "profile {:?} is active; deactivate it before archiving",
-                    p.profile_id
-                )));
-            }
-            // all other transitions are permitted
-            _ => {}
-        }
+        crate::persist::persist_brain_state_mutation(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            crate::persist::BrainMutationEvent {
+                profile_id: profile_id.clone(),
+                event_kind: event_kind.to_string(),
+                payload: event_payload,
+            },
+            ENTITY_CACHE_CAPACITY,
+            move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                let record = state
+                    .profiles
+                    .get_mut(&profile_id)
+                    .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
 
-        record.lifecycle = lifecycle.clone();
-        Ok(json!({
-            "profile_id": p.profile_id,
-            "lifecycle": lifecycle,
-        }))
+                // Lifecycle DAG: defined → registered → active ⟷ inactive → archived
+                // Terminal state: archived is read-only/audit-retained.
+                // No transition OUT of archived is legal.
+                // Active → archived is also illegal; must deactivate first.
+                match (&record.lifecycle, &lifecycle) {
+                    // archived is terminal — nothing leaves it
+                    (ProfileLifecycle::Archived, _) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "profile {:?} is archived; archive is terminal and no transition is permitted",
+                            profile_id
+                        )));
+                    }
+                    // active → archived is illegal (must go through inactive first)
+                    (ProfileLifecycle::Active, ProfileLifecycle::Archived) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "profile {:?} is active; deactivate it before archiving",
+                            profile_id
+                        )));
+                    }
+                    // all other transitions are permitted
+                    _ => {}
+                }
+
+                record.lifecycle = lifecycle.clone();
+                Ok(json!({
+                    "profile_id": profile_id,
+                    "lifecycle": lifecycle,
+                }))
+            },
+        )
+        .await
     }
 
     // ── brain.reset ───────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_reset(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_reset(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // profile_id is optional; defaults to "balanced-recall-v1".
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -813,51 +864,69 @@ impl BrainPack {
         let profile_id = p
             .profile_id
             .unwrap_or_else(|| "balanced-recall-v1".to_string());
-        let mut state = self.state.lock().unwrap();
+        let event_payload = json!({ "profile_id": profile_id });
 
-        // Validate profile exists.
-        let lifecycle = state
-            .profiles
-            .get(&profile_id)
-            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?
-            .lifecycle
-            .clone();
+        // Route through the durable-write helper (issue #457): reset is
+        // applied to a proposed state copy and only takes effect after the
+        // brain event-log append + snapshot upsert commit.
+        crate::persist::persist_brain_state_mutation(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            crate::persist::BrainMutationEvent {
+                profile_id: profile_id.clone(),
+                event_kind: "brain.reset".to_string(),
+                payload: event_payload,
+            },
+            ENTITY_CACHE_CAPACITY,
+            move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                // Validate profile exists.
+                let lifecycle = state
+                    .profiles
+                    .get(&profile_id)
+                    .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?
+                    .lifecycle
+                    .clone();
 
-        // Reject archived profiles — archive is terminal and read-only.
-        if lifecycle == ProfileLifecycle::Archived {
-            return Err(RuntimeError::InvalidInput(format!(
-                "profile {:?} is archived; archive is terminal and reset is not permitted",
-                profile_id
-            )));
-        }
+                // Reject archived profiles — archive is terminal and read-only.
+                if lifecycle == ProfileLifecycle::Archived {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "profile {:?} is archived; archive is terminal and reset is not permitted",
+                        profile_id
+                    )));
+                }
 
-        if profile_id == "balanced-recall-v1" {
-            state.reset_posteriors();
-            // Sync profile record after reset so brain.profile reflects the restored
-            // domain-informed priors, not stale pre-reset values.
-            sync_balanced_recall_record(&mut state);
-        } else if state.profile_states.contains_key(&profile_id) {
-            // User-created Bayesian profile — reset its own posteriors.
-            state.reset_profile_posteriors(&profile_id);
-        } else {
-            // Profile exists in registry but has no live state (e.g. non-Bayesian).
-            // Increment exploration_epoch on the record to mark the reset event.
-            if let Some(record) = state.profiles.get_mut(&profile_id) {
-                record.exploration_epoch += 1;
-            }
-        }
+                if profile_id == "balanced-recall-v1" {
+                    state.reset_posteriors();
+                    // Sync profile record after reset so brain.profile reflects the restored
+                    // domain-informed priors, not stale pre-reset values.
+                    sync_balanced_recall_record(state);
+                } else if state.profile_states.contains_key(&profile_id) {
+                    // User-created Bayesian profile — reset its own posteriors.
+                    state.reset_profile_posteriors(&profile_id);
+                } else {
+                    // Profile exists in registry but has no live state (e.g. non-Bayesian).
+                    // Increment exploration_epoch on the record to mark the reset event.
+                    if let Some(record) = state.profiles.get_mut(&profile_id) {
+                        record.exploration_epoch += 1;
+                    }
+                }
 
-        let epoch = if profile_id == "balanced-recall-v1" {
-            state.balanced_recall.exploration_epoch
-        } else {
-            state.profiles[&profile_id].exploration_epoch
-        };
+                let epoch = if profile_id == "balanced-recall-v1" {
+                    state.balanced_recall.exploration_epoch
+                } else {
+                    state.profiles[&profile_id].exploration_epoch
+                };
 
-        Ok(json!({
-            "reset": true,
-            "profile_id": profile_id,
-            "exploration_epoch": epoch,
-        }))
+                Ok(json!({
+                    "reset": true,
+                    "profile_id": profile_id,
+                    "exploration_epoch": epoch,
+                }))
+            },
+        )
+        .await
     }
 
     // ── brain.feedback ────────────────────────────────────────────────────
@@ -1155,113 +1224,112 @@ impl BrainPack {
             .unwrap_or("balanced-recall-v1")
             .to_string();
 
-        // Posteriors snapshotted while the lock is held; routing runs after the lock drops
-        // so the mutex scope is not widened across fann inference.
-        // Declared uninitialized: definitely assigned inside the lock scope below (in
-        // the feature-on build the cfg block always executes, so the compiler can verify
-        // definite initialization without a dead initial-value assignment).
-        #[cfg(feature = "lattice-router")]
-        #[allow(clippy::type_complexity)]
-        let router_inputs: Option<(
-            BetaPosterior,
-            BetaPosterior,
-            BetaPosterior,
-            Option<std::collections::HashMap<SectionType, BetaPosterior>>,
-        )>;
+        let brain_signal = interpret(&event);
 
-        {
-            let signal = interpret(&event);
-            let mut state = self.state.lock().unwrap();
-            let serving_profile = serving_profile_owned.as_str();
-
-            if serving_profile == "balanced-recall-v1" {
-                state.balanced_recall.apply_signal(&signal);
-                sync_balanced_recall_record(&mut state);
-            } else if state.profile_states.contains_key(serving_profile) {
-                let ps = state
-                    .profile_states
-                    .get_mut(serving_profile)
-                    .expect("key checked above");
-                ps.apply_signal(&signal);
-                let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                let total = ps.total_events;
-                if let Some(record) = state.profiles.get_mut(serving_profile) {
-                    record.total_events = total;
-                    record.state_snapshot = snap;
-                }
-            } else {
-                state.balanced_recall.apply_signal(&signal);
-                sync_balanced_recall_record(&mut state);
-            }
-
-            // Seed and backfill section posteriors, then apply the signal.
-            // Shared contract with the replay path — see `ensure_section_state_seeded`.
-            {
-                let section_state = crate::ensure_section_state_seeded(
-                    &mut state.section_states,
-                    &serving_profile_owned,
-                );
-                section_state.apply_signal(&signal);
-            }
-
-            // Snapshot posteriors for lattice-router while the lock is still held.
-            // BetaPosterior is two f64s — cloning is cheap.
-            #[cfg(feature = "lattice-router")]
-            {
-                let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
-                    (
-                        state.balanced_recall.relevance.clone(),
-                        state.balanced_recall.salience.clone(),
-                        state.balanced_recall.temporal.clone(),
-                    )
-                } else if let Some(ps) = state.profile_states.get(serving_profile) {
-                    (
-                        ps.relevance.clone(),
-                        ps.salience.clone(),
-                        ps.temporal.clone(),
-                    )
-                } else {
-                    (
-                        state.balanced_recall.relevance.clone(),
-                        state.balanced_recall.salience.clone(),
-                        state.balanced_recall.temporal.clone(),
-                    )
-                };
-                let sec = state
-                    .section_states
-                    .get(serving_profile)
-                    .map(|ss| ss.posteriors.clone());
-                router_inputs = Some((rel, sal, temp, sec));
-            }
-        }
-
-        // lattice-router: build the context vector from snapshotted posteriors and forward
-        // through the fann network. Lock is already released here.
-        // Consumption of routed weights lands with the engine route() seam (#343) and the
-        // compose value-gate (#346); no per-event stdout/stderr spam.
-        #[cfg(feature = "lattice-router")]
-        if let Some((rel, sal, temp, sec)) = router_inputs {
-            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
-            let _routed = route_via_fann(&ctx);
-        }
-
-        // Persist feedback to brain_event_log; batch-upsert snapshot when dirty threshold reached.
-        if let Err(e) = crate::persist::persist_after_feedback(
+        // Issue #458: apply the posterior mutation and make its durability
+        // part of the success contract. `persist_brain_state_mutation` runs
+        // this closure against a *proposed* state copy, then commits the
+        // brain event-log append + snapshot upsert in one transaction —
+        // `self.state` is only replaced with the proposed copy after that
+        // commit succeeds. If persistence fails, this returns `Err` and
+        // `self.state` is left completely untouched (no phantom in-memory
+        // posterior update that vanishes on restart).
+        crate::persist::persist_brain_state_mutation(
             &self.runtime,
             token,
             &self.persistence,
             &self.state,
-            &event,
-            &serving_profile_owned,
+            crate::persist::BrainMutationEvent {
+                profile_id: serving_profile_owned.clone(),
+                event_kind: event.verb.clone(),
+                payload: serde_json::to_value(&event)
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+            },
+            ENTITY_CACHE_CAPACITY,
+            {
+                let brain_signal = brain_signal.clone();
+                let serving_profile_owned = serving_profile_owned.clone();
+                move |state: &mut khive_brain_core::BrainState| -> Result<(), RuntimeError> {
+                    let serving_profile = serving_profile_owned.as_str();
+
+                    if serving_profile == "balanced-recall-v1" {
+                        state.balanced_recall.apply_signal(&brain_signal);
+                        sync_balanced_recall_record(state);
+                    } else if state.profile_states.contains_key(serving_profile) {
+                        let ps = state
+                            .profile_states
+                            .get_mut(serving_profile)
+                            .expect("key checked above");
+                        ps.apply_signal(&brain_signal);
+                        let snap = serde_json::to_value(ps.to_snapshot()).ok();
+                        let total = ps.total_events;
+                        if let Some(record) = state.profiles.get_mut(serving_profile) {
+                            record.total_events = total;
+                            record.state_snapshot = snap;
+                        }
+                    } else {
+                        state.balanced_recall.apply_signal(&brain_signal);
+                        sync_balanced_recall_record(state);
+                    }
+
+                    // Seed and backfill section posteriors, then apply the signal.
+                    // Shared contract with the replay path — see `ensure_section_state_seeded`.
+                    {
+                        let section_state = crate::ensure_section_state_seeded(
+                            &mut state.section_states,
+                            &serving_profile_owned,
+                        );
+                        section_state.apply_signal(&brain_signal);
+                    }
+
+                    Ok(())
+                }
+            },
         )
-        .await
+        .await?;
+
+        // lattice-router: build the context vector from the now-published live
+        // state and forward through the fann network. This is a best-effort
+        // routing computation independent of durability, so it reads from
+        // `self.state` only after the mutation above has durably committed.
+        // Consumption of routed weights lands with the engine route() seam (#343) and the
+        // compose value-gate (#346); no per-event stdout/stderr spam.
+        #[cfg(feature = "lattice-router")]
         {
-            eprintln!("[brain] persistence failed (non-fatal): {e}");
+            let state = self.state.lock().unwrap();
+            let serving_profile = serving_profile_owned.as_str();
+            let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
+                (
+                    state.balanced_recall.relevance.clone(),
+                    state.balanced_recall.salience.clone(),
+                    state.balanced_recall.temporal.clone(),
+                )
+            } else if let Some(ps) = state.profile_states.get(serving_profile) {
+                (
+                    ps.relevance.clone(),
+                    ps.salience.clone(),
+                    ps.temporal.clone(),
+                )
+            } else {
+                (
+                    state.balanced_recall.relevance.clone(),
+                    state.balanced_recall.salience.clone(),
+                    state.balanced_recall.temporal.clone(),
+                )
+            };
+            let sec = state
+                .section_states
+                .get(serving_profile)
+                .map(|ss| ss.posteriors.clone());
+            drop(state);
+            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
+            let _routed = route_via_fann(&ctx);
         }
 
         // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
         // the fold itself so a ledger-write failure never blocks the feedback
-        // event from landing; non-fatal like the persistence call above.
+        // event from landing — intentionally non-fatal, unlike the fail-closed
+        // brain-state persistence above (#458).
         if let (Some(scorer_run_id), Some(serve_ledger_id)) =
             (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
         {
@@ -1365,7 +1433,11 @@ impl BrainPack {
 
     // ── brain.bind ────────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_bind(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_bind(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct BindParams {
@@ -1377,25 +1449,6 @@ impl BrainPack {
         }
         let p: BindParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-        let mut state = self.state.lock().unwrap();
-
-        // Verify the profile exists and is not archived (archived = terminal, no new bindings).
-        match state.profiles.get(&p.profile_id) {
-            None => {
-                return Err(RuntimeError::NotFound(format!(
-                    "profile {:?}",
-                    p.profile_id
-                )));
-            }
-            Some(record) if record.lifecycle == ProfileLifecycle::Archived => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "profile {:?} is archived; bindings to archived profiles are not permitted",
-                    p.profile_id
-                )));
-            }
-            Some(_) => {}
-        }
 
         let actor = p.actor.unwrap_or_else(|| "*".into());
         let namespace = p.namespace.unwrap_or_else(|| "*".into());
@@ -1426,32 +1479,80 @@ impl BrainPack {
             khive_runtime::secret_gate::check(&consumer_kind)?;
         }
 
-        // Remove any existing binding for the same (actor, namespace, consumer_kind)
-        state.bindings.retain(|b| {
-            !(b.actor == actor && b.namespace == namespace && b.consumer_kind == consumer_kind)
-        });
-
-        state.bindings.push(ProfileBinding {
-            actor: actor.clone(),
-            namespace: namespace.clone(),
-            consumer_kind: consumer_kind.clone(),
-            profile_id: p.profile_id.clone(),
-            priority: p.priority.unwrap_or(0),
-            created_at: Utc::now(),
-        });
-
-        Ok(json!({
-            "bound": true,
-            "profile_id": p.profile_id,
+        let profile_id = p.profile_id;
+        let priority = p.priority.unwrap_or(0);
+        let event_payload = json!({
+            "profile_id": profile_id,
             "actor": actor,
             "namespace": namespace,
             "consumer_kind": consumer_kind,
-        }))
+            "priority": priority,
+        });
+
+        // Route through the durable-write helper (issue #457): the binding
+        // change is applied to a proposed state copy and only takes effect
+        // after the brain event-log append + snapshot upsert commit.
+        crate::persist::persist_brain_state_mutation(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            crate::persist::BrainMutationEvent {
+                profile_id: profile_id.clone(),
+                event_kind: "brain.bind".to_string(),
+                payload: event_payload,
+            },
+            ENTITY_CACHE_CAPACITY,
+            move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                // Verify the profile exists and is not archived (archived = terminal, no new bindings).
+                match state.profiles.get(&profile_id) {
+                    None => {
+                        return Err(RuntimeError::NotFound(format!("profile {:?}", profile_id)));
+                    }
+                    Some(record) if record.lifecycle == ProfileLifecycle::Archived => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "profile {:?} is archived; bindings to archived profiles are not permitted",
+                            profile_id
+                        )));
+                    }
+                    Some(_) => {}
+                }
+
+                // Remove any existing binding for the same (actor, namespace, consumer_kind)
+                state.bindings.retain(|b| {
+                    !(b.actor == actor
+                        && b.namespace == namespace
+                        && b.consumer_kind == consumer_kind)
+                });
+
+                state.bindings.push(ProfileBinding {
+                    actor: actor.clone(),
+                    namespace: namespace.clone(),
+                    consumer_kind: consumer_kind.clone(),
+                    profile_id: profile_id.clone(),
+                    priority,
+                    created_at: Utc::now(),
+                });
+
+                Ok(json!({
+                    "bound": true,
+                    "profile_id": profile_id,
+                    "actor": actor,
+                    "namespace": namespace,
+                    "consumer_kind": consumer_kind,
+                }))
+            },
+        )
+        .await
     }
 
     // ── brain.unbind ──────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_unbind(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_unbind(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct UnbindParams {
@@ -1474,25 +1575,50 @@ impl BrainPack {
             ));
         }
 
-        let mut state = self.state.lock().unwrap();
-        let before = state.bindings.len();
-
-        state.bindings.retain(|b| {
-            let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
-            let actor_match = p.actor.as_ref().is_none_or(|a| &b.actor == a);
-            let ns_match = p.namespace.as_ref().is_none_or(|n| &b.namespace == n);
-            let kind_match = p
-                .consumer_kind
-                .as_ref()
-                .is_none_or(|k| &b.consumer_kind == k);
-            // Retain if this binding does NOT match ALL of the provided filters.
-            // A filter that is absent (None) matches everything — only bindings
-            // satisfying every supplied criterion are removed.
-            !(pid_match && actor_match && ns_match && kind_match)
+        let event_payload = json!({
+            "profile_id": p.profile_id,
+            "actor": p.actor,
+            "namespace": p.namespace,
+            "consumer_kind": p.consumer_kind,
         });
+        let event_profile_id = p.profile_id.clone().unwrap_or_else(|| "*".to_string());
 
-        let removed = before - state.bindings.len();
-        Ok(json!({ "unbound": removed }))
+        // Route through the durable-write helper (issue #457): the binding
+        // removal is applied to a proposed state copy and only takes effect
+        // after the brain event-log append + snapshot upsert commit.
+        crate::persist::persist_brain_state_mutation(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            crate::persist::BrainMutationEvent {
+                profile_id: event_profile_id,
+                event_kind: "brain.unbind".to_string(),
+                payload: event_payload,
+            },
+            ENTITY_CACHE_CAPACITY,
+            move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                let before = state.bindings.len();
+
+                state.bindings.retain(|b| {
+                    let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
+                    let actor_match = p.actor.as_ref().is_none_or(|a| &b.actor == a);
+                    let ns_match = p.namespace.as_ref().is_none_or(|n| &b.namespace == n);
+                    let kind_match = p
+                        .consumer_kind
+                        .as_ref()
+                        .is_none_or(|k| &b.consumer_kind == k);
+                    // Retain if this binding does NOT match ALL of the provided filters.
+                    // A filter that is absent (None) matches everything — only bindings
+                    // satisfying every supplied criterion are removed.
+                    !(pid_match && actor_match && ns_match && kind_match)
+                });
+
+                let removed = before - state.bindings.len();
+                Ok(json!({ "unbound": removed }))
+            },
+        )
+        .await
     }
 
     // ── brain.bindings ────────────────────────────────────────────────────
@@ -1538,7 +1664,11 @@ impl BrainPack {
 
     // ── brain.create_profile ──────────────────────────────────────────────
 
-    pub(crate) async fn handle_create_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_create_profile(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Allow external agents to create new profiles via MCP.
         // seed_priors: optional object for seeding section priors, or null for defaults.
         #[derive(Deserialize)]
@@ -1592,89 +1722,117 @@ impl BrainPack {
         if let Some(ref seed) = p.seed_priors {
             khive_runtime::secret_gate::check_json(seed)?;
         }
+        let seed_priors = p.seed_priors;
 
-        let mut state = self.state.lock().unwrap();
-
-        if state.profiles.contains_key(&p_name) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "profile {:?} already exists",
-                p_name
-            )));
-        }
-
-        // Initialize live BalancedRecallState for this profile so that reset and
-        // feedback can route to its actual posteriors rather than a metadata-only record.
-        let ps = khive_brain_core::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
-        let snap = serde_json::to_value(ps.to_snapshot()).ok();
-
-        let record = ProfileRecord {
-            id: p_name.clone(),
-            description: description.clone(),
-            consumer_kind: consumer_kind.clone(),
-            state_class: "Bayesian".into(),
-            lifecycle: ProfileLifecycle::Inactive,
-            created_at: Utc::now(),
-            state_snapshot: snap,
-            total_events: 0,
-            exploration_epoch: 0,
-        };
-
-        // Seed section posteriors: parse explicit section_posteriors object if provided,
-        // else use default informative priors.
-        let section_state = if let Some(ref seed) = p.seed_priors {
-            if let Some(sp_obj) = seed.get("section_posteriors").and_then(|v| v.as_object()) {
-                let mut priors = std::collections::HashMap::new();
-                for (key, val) in sp_obj {
-                    let st: SectionType = key.parse().map_err(|_| {
-                        RuntimeError::InvalidInput(format!("unknown section type: {key:?}"))
-                    })?;
-                    let alpha = val.get("alpha").and_then(|v| v.as_f64()).ok_or_else(|| {
-                        RuntimeError::InvalidInput(format!(
-                            "missing or invalid alpha for section {key:?}"
-                        ))
-                    })?;
-                    let beta = val.get("beta").and_then(|v| v.as_f64()).ok_or_else(|| {
-                        RuntimeError::InvalidInput(format!(
-                            "missing or invalid beta for section {key:?}"
-                        ))
-                    })?;
-                    let posterior =
-                        khive_brain_core::BetaPosterior::try_new(alpha, beta).map_err(|e| {
-                            RuntimeError::InvalidInput(format!(
-                                "invalid seed_priors for section {key:?}: {e}"
-                            ))
-                        })?;
-                    let ess = posterior.effective_sample_size();
-                    if ess > DEFAULT_ESS_CAP {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "seed_priors for section {key:?}: alpha+beta ({ess}) exceeds \
-                             maximum allowed ESS ({DEFAULT_ESS_CAP}); use values where \
-                             alpha + beta <= {DEFAULT_ESS_CAP}"
-                        )));
-                    }
-                    priors.insert(st, posterior);
-                }
-                SectionPosteriorState::from_priors(priors)
-            } else {
-                return Err(RuntimeError::InvalidInput(
-                    "seed_priors must contain a 'section_posteriors' object".into(),
-                ));
-            }
-        } else {
-            SectionPosteriorState::new()
-        };
-
-        state.profiles.insert(p_name.clone(), record);
-        state.profile_states.insert(p_name.clone(), ps);
-        state.section_states.insert(p_name.clone(), section_state);
-
-        Ok(json!({
-            "created": true,
+        let event_payload = json!({
             "profile_id": p_name,
             "consumer_kind": consumer_kind,
-            "lifecycle": "inactive",
             "description": description,
-        }))
+        });
+
+        // Route through the durable-write helper (issue #457): the new
+        // profile/state/section rows are applied to a proposed state copy
+        // and only take effect after the brain event-log append + snapshot
+        // upsert commit — so a persistence failure never leaves a phantom
+        // profile that vanishes on restart.
+        crate::persist::persist_brain_state_mutation(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            crate::persist::BrainMutationEvent {
+                profile_id: p_name.clone(),
+                event_kind: "brain.create_profile".to_string(),
+                payload: event_payload,
+            },
+            ENTITY_CACHE_CAPACITY,
+            move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                if state.profiles.contains_key(&p_name) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "profile {:?} already exists",
+                        p_name
+                    )));
+                }
+
+                // Initialize live BalancedRecallState for this profile so that reset and
+                // feedback can route to its actual posteriors rather than a metadata-only record.
+                let ps = khive_brain_core::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
+                let snap = serde_json::to_value(ps.to_snapshot()).ok();
+
+                let record = ProfileRecord {
+                    id: p_name.clone(),
+                    description: description.clone(),
+                    consumer_kind: consumer_kind.clone(),
+                    state_class: "Bayesian".into(),
+                    lifecycle: ProfileLifecycle::Inactive,
+                    created_at: Utc::now(),
+                    state_snapshot: snap,
+                    total_events: 0,
+                    exploration_epoch: 0,
+                };
+
+                // Seed section posteriors: parse explicit section_posteriors object if provided,
+                // else use default informative priors.
+                let section_state = if let Some(ref seed) = seed_priors {
+                    if let Some(sp_obj) = seed.get("section_posteriors").and_then(|v| v.as_object())
+                    {
+                        let mut priors = std::collections::HashMap::new();
+                        for (key, val) in sp_obj {
+                            let st: SectionType = key.parse().map_err(|_| {
+                                RuntimeError::InvalidInput(format!("unknown section type: {key:?}"))
+                            })?;
+                            let alpha =
+                                val.get("alpha").and_then(|v| v.as_f64()).ok_or_else(|| {
+                                    RuntimeError::InvalidInput(format!(
+                                        "missing or invalid alpha for section {key:?}"
+                                    ))
+                                })?;
+                            let beta =
+                                val.get("beta").and_then(|v| v.as_f64()).ok_or_else(|| {
+                                    RuntimeError::InvalidInput(format!(
+                                        "missing or invalid beta for section {key:?}"
+                                    ))
+                                })?;
+                            let posterior = khive_brain_core::BetaPosterior::try_new(alpha, beta)
+                                .map_err(|e| {
+                                RuntimeError::InvalidInput(format!(
+                                    "invalid seed_priors for section {key:?}: {e}"
+                                ))
+                            })?;
+                            let ess = posterior.effective_sample_size();
+                            if ess > DEFAULT_ESS_CAP {
+                                return Err(RuntimeError::InvalidInput(format!(
+                                    "seed_priors for section {key:?}: alpha+beta ({ess}) exceeds \
+                                     maximum allowed ESS ({DEFAULT_ESS_CAP}); use values where \
+                                     alpha + beta <= {DEFAULT_ESS_CAP}"
+                                )));
+                            }
+                            priors.insert(st, posterior);
+                        }
+                        SectionPosteriorState::from_priors(priors)
+                    } else {
+                        return Err(RuntimeError::InvalidInput(
+                            "seed_priors must contain a 'section_posteriors' object".into(),
+                        ));
+                    }
+                } else {
+                    SectionPosteriorState::new()
+                };
+
+                state.profiles.insert(p_name.clone(), record);
+                state.profile_states.insert(p_name.clone(), ps);
+                state.section_states.insert(p_name.clone(), section_state);
+
+                Ok(json!({
+                    "created": true,
+                    "profile_id": p_name,
+                    "consumer_kind": consumer_kind,
+                    "lifecycle": "inactive",
+                    "description": description,
+                }))
+            },
+        )
+        .await
     }
 
     // ── brain.register_adapter ────────────────────────────────────────────
@@ -1950,16 +2108,16 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.resolve" => self.handle_resolve(params).await,
             "brain.bindings" => self.handle_bindings(params).await,
             // Commissive
-            "brain.activate" => self.handle_activate(params).await,
-            "brain.deactivate" => self.handle_deactivate(params).await,
-            "brain.archive" => self.handle_archive(params).await,
-            "brain.reset" => self.handle_reset(params).await,
+            "brain.activate" => self.handle_activate(token, params).await,
+            "brain.deactivate" => self.handle_deactivate(token, params).await,
+            "brain.archive" => self.handle_archive(token, params).await,
+            "brain.reset" => self.handle_reset(token, params).await,
             "brain.feedback" => self.handle_feedback(token, params).await,
             "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
             // Declaration
-            "brain.bind" => self.handle_bind(params).await,
-            "brain.unbind" => self.handle_unbind(params).await,
-            "brain.create_profile" => self.handle_create_profile(params).await,
+            "brain.bind" => self.handle_bind(token, params).await,
+            "brain.unbind" => self.handle_unbind(token, params).await,
+            "brain.create_profile" => self.handle_create_profile(token, params).await,
             "brain.register_adapter" => self.handle_register_adapter(token, params).await,
             // Legacy
             "brain.emit" => self.handle_emit(token, params).await,

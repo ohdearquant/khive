@@ -41,7 +41,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::SqlAccess;
+use khive_storage::{SqlAccess, SqlWriter};
 
 use khive_brain_core::{
     validate_brain_state_snapshot, BrainSignal, BrainState, BrainStateSnapshot,
@@ -221,8 +221,10 @@ fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Internal(format!("brain persistence {context}: {e}"))
 }
 
-pub async fn append_brain_event(
-    sql: &dyn SqlAccess,
+/// Append one `brain_event_log` row using an already-acquired writer (plain
+/// writer or an open transaction — both implement `SqlWriter`).
+async fn append_brain_event_on_writer(
+    writer: &mut dyn SqlWriter,
     namespace: &str,
     profile_id: &str,
     event_kind: &str,
@@ -231,7 +233,6 @@ pub async fn append_brain_event(
 ) -> Result<(), RuntimeError> {
     let payload_str = serde_json::to_string(payload).map_err(|e| sql_err("serialize event", e))?;
 
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
     writer
         .execute(SqlStatement {
             sql: "INSERT INTO brain_event_log (profile_id, namespace, event_kind, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
@@ -250,8 +251,10 @@ pub async fn append_brain_event(
     Ok(())
 }
 
-pub async fn upsert_snapshot(
-    sql: &dyn SqlAccess,
+/// Upsert the namespace's `brain_profile_snapshots` row using an
+/// already-acquired writer (plain writer or an open transaction).
+async fn upsert_snapshot_on_writer(
+    writer: &mut dyn SqlWriter,
     namespace: &str,
     snapshot: &BrainStateSnapshot,
     updated_at_us: i64,
@@ -259,7 +262,6 @@ pub async fn upsert_snapshot(
     let snapshot_json =
         serde_json::to_string(snapshot).map_err(|e| sql_err("serialize snapshot", e))?;
 
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
     writer
         .execute(SqlStatement {
             sql: "INSERT INTO brain_profile_snapshots (profile_id, namespace, snapshot_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(profile_id, namespace) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at".into(),
@@ -275,6 +277,144 @@ pub async fn upsert_snapshot(
         .map_err(|e| sql_err("upsert snapshot", e))?;
 
     Ok(())
+}
+
+pub async fn append_brain_event(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    profile_id: &str,
+    event_kind: &str,
+    payload: &Value,
+    created_at_us: i64,
+) -> Result<(), RuntimeError> {
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    append_brain_event_on_writer(
+        writer.as_mut(),
+        namespace,
+        profile_id,
+        event_kind,
+        payload,
+        created_at_us,
+    )
+    .await
+}
+
+pub async fn upsert_snapshot(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    snapshot: &BrainStateSnapshot,
+    updated_at_us: i64,
+) -> Result<(), RuntimeError> {
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    upsert_snapshot_on_writer(writer.as_mut(), namespace, snapshot, updated_at_us).await
+}
+
+/// Descriptor for a single durable `BrainState` mutation (issues #457/#458):
+/// which brain-event-log row to append alongside the snapshot upsert.
+pub struct BrainMutationEvent {
+    pub profile_id: String,
+    pub event_kind: String,
+    pub payload: Value,
+}
+
+async fn exec_raw(writer: &mut dyn SqlWriter, sql: &str, label: &str) -> Result<(), RuntimeError> {
+    writer
+        .execute(SqlStatement {
+            sql: sql.to_string(),
+            params: Vec::new(),
+            label: Some(label.to_string()),
+        })
+        .await
+        .map_err(|e| sql_err(label, e))?;
+    Ok(())
+}
+
+/// Apply a `BrainState` mutation with durability as part of the success
+/// contract (issues #457/#458).
+///
+/// `mutate` runs against a *proposed* copy of the state (never the live
+/// `state` mutex) built via a snapshot round-trip. Its result and the
+/// resulting snapshot are then persisted — brain event-log append AND
+/// snapshot upsert — inside ONE `BEGIN IMMEDIATE` transaction held on a
+/// single `SqlWriter` connection. Only after that transaction commits does
+/// the proposed state replace the live state and the tracker get marked
+/// clean.
+///
+/// This deliberately does NOT use `SqlAccess::begin_tx` — per `fold_gate.rs`'s
+/// module doc, that API requires a file-backed database and errors for
+/// in-memory pools (used throughout this crate's test suite and by
+/// `KhiveRuntime::memory()`). Issuing `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` as
+/// ordinary statements on a plain `SqlWriter` handle gives the same
+/// all-or-nothing guarantee on both backends.
+///
+/// If `mutate` fails, or the transaction fails to begin, append, upsert, or
+/// commit, this returns `Err` and the live state is left completely
+/// untouched — there is no in-memory mutation to roll back because it was
+/// never applied to the shared state in the first place.
+pub async fn persist_brain_state_mutation<R>(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    tracker: &Mutex<PersistenceTracker>,
+    state: &Mutex<BrainState>,
+    event: BrainMutationEvent,
+    entity_capacity: usize,
+    mutate: impl FnOnce(&mut BrainState) -> Result<R, RuntimeError>,
+) -> Result<R, RuntimeError> {
+    let namespace = token.namespace().as_str().to_string();
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    let mut proposed = {
+        let current = state.lock().unwrap();
+        BrainState::from_snapshot(current.to_snapshot(), entity_capacity)
+    };
+
+    let result = mutate(&mut proposed)?;
+    let snapshot = proposed.to_snapshot();
+
+    let sql = runtime.sql();
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+
+    exec_raw(writer.as_mut(), "BEGIN IMMEDIATE", "begin mutation tx").await?;
+
+    let write_result: Result<(), RuntimeError> = async {
+        append_brain_event_on_writer(
+            writer.as_mut(),
+            &namespace,
+            &event.profile_id,
+            &event.event_kind,
+            &event.payload,
+            now_us,
+        )
+        .await?;
+        upsert_snapshot_on_writer(writer.as_mut(), &namespace, &snapshot, now_us).await?;
+        Ok(())
+    }
+    .await;
+
+    match write_result {
+        Ok(()) => {
+            if let Err(e) = exec_raw(writer.as_mut(), "COMMIT", "commit mutation tx").await {
+                let _ = exec_raw(writer.as_mut(), "ROLLBACK", "rollback mutation tx").await;
+                return Err(e);
+            }
+        }
+        Err(e) => {
+            let _ = exec_raw(writer.as_mut(), "ROLLBACK", "rollback mutation tx").await;
+            return Err(e);
+        }
+    }
+
+    {
+        let mut live = state.lock().unwrap();
+        *live = proposed;
+    }
+    {
+        let mut t = tracker.lock().unwrap();
+        t.reset_dirty(&namespace);
+        t.mark_loaded(namespace);
+    }
+
+    Ok(result)
 }
 
 pub async fn load_latest_snapshot(
@@ -634,51 +774,6 @@ pub async fn ensure_loaded(
         }
 
         t.loaded_namespaces.insert(namespace, ());
-    }
-
-    Ok(())
-}
-
-pub async fn persist_after_feedback(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    tracker: &Mutex<PersistenceTracker>,
-    state: &Mutex<BrainState>,
-    event: &khive_storage::event::Event,
-    serving_profile: &str,
-) -> Result<(), RuntimeError> {
-    let namespace = token.namespace().as_str().to_string();
-    let now_us = chrono::Utc::now().timestamp_micros();
-
-    let sql = runtime.sql();
-
-    let event_payload = serde_json::to_value(event).map_err(|e| sql_err("serialize event", e))?;
-
-    append_brain_event(
-        sql.as_ref(),
-        &namespace,
-        serving_profile,
-        &event.verb,
-        &event_payload,
-        now_us,
-    )
-    .await?;
-
-    let should_snapshot = {
-        let mut t = tracker.lock().unwrap();
-        t.increment_dirty(&namespace)
-    };
-
-    if should_snapshot {
-        let snapshot = {
-            let s = state.lock().unwrap();
-            s.to_snapshot()
-        };
-
-        upsert_snapshot(sql.as_ref(), &namespace, &snapshot, now_us).await?;
-
-        let mut t = tracker.lock().unwrap();
-        t.reset_dirty(&namespace);
     }
 
     Ok(())
