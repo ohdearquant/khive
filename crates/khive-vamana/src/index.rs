@@ -2144,6 +2144,20 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
         ));
     }
 
+    VamanaConfig {
+        dimensions,
+        max_degree,
+        search_list_size,
+        alpha,
+    }
+    .validate()
+    .map_err(|err| match err {
+        VamanaError::InvalidConfig { reason } => {
+            VamanaError::invalid_format(format!("v2 commit invalid config: {reason}"))
+        }
+        other => other,
+    })?;
+
     Ok(V2Commit {
         vectors_hash,
         graph_hash,

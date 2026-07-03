@@ -979,3 +979,40 @@ fn v2_parse_lifecycle_fs_add_overflow_returns_invalid_format_not_panic() {
     let meta_after = fs::read(dir.path().join("metadata.bin")).unwrap();
     assert_eq!(&meta_after[..8], b"KHVVAMG2");
 }
+
+// ---- Issue #444: v2 commit config validation must feed the corrupt-snapshot rebuild path ----
+
+/// Regression: a persisted v2 commit with an invalid embedded config (e.g. max_degree = 0)
+/// used to surface as `VamanaError::InvalidConfig` from `load_v2_fast`'s `config.validate()`
+/// call, which `load_or_build`'s rebuild match only catches for `InvalidFormat`. That let a
+/// corrupt commit record propagate as an error out of `load_or_build` instead of rebuilding.
+/// With the fix, `parse_v2_commit` validates the embedded config and maps failures to
+/// `InvalidFormat`, so the existing corrupt-snapshot rebuild path handles it.
+#[test]
+fn load_or_build_rebuilds_when_v2_commit_config_invalid() {
+    let dim = 8usize;
+    let vectors = rand_unit_vectors(20, dim, 0xA6_44);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(16);
+    let idx = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    let meta_path = dir.path().join("metadata.bin");
+    let mut meta = fs::read(&meta_path).unwrap();
+    meta[168..176].copy_from_slice(&0u64.to_le_bytes()); // malformed persisted max_degree
+    fs::write(&meta_path, &meta).unwrap();
+
+    assert!(matches!(
+        VamanaIndex::load(dir.path()),
+        Err(VamanaError::InvalidFormat { .. })
+    ));
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(8)
+        .with_search_list_size(16);
+    let loaded = VamanaIndex::load_or_build(dir.path(), &vectors, fallback.clone()).unwrap();
+    assert_eq!(loaded.config(), &fallback);
+    assert_eq!(loaded.num_vectors(), vectors.len() / dim);
+}
