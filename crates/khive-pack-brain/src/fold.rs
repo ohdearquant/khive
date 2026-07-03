@@ -287,19 +287,19 @@ mod tests {
         let event = make_semantic_feedback_event("implicit_negative", id);
         let state = fold.reduce(state, &event, &ctx);
 
-        // ImplicitNegative: weight=0.5, is_positive=false → salience.beta() += 0.5
+        // ImplicitNegative: weight=0.1 (ADR-081 §1), is_positive=false → salience.beta() += 0.1
         assert!(
             (state.salience.alpha() - sal_alpha_prior).abs() < 1e-12,
             "implicit_negative must not change salience.alpha()"
         );
         assert!(
-            (state.salience.beta() - (sal_beta_prior + 0.5)).abs() < 1e-12,
-            "implicit_negative must add 0.5 to salience.beta(): expected {}, got {}",
-            sal_beta_prior + 0.5,
+            (state.salience.beta() - (sal_beta_prior + 0.1)).abs() < 1e-12,
+            "implicit_negative must add 0.1 to salience.beta(): expected {}, got {}",
+            sal_beta_prior + 0.1,
             state.salience.beta()
         );
 
-        // Entity posterior: beta += 0.5
+        // Entity posterior: beta += 0.1
         let ep = state.entity_posteriors.get(&id).unwrap();
         assert!(
             (ep.alpha() - 1.0).abs() < 1e-12,
@@ -307,8 +307,8 @@ mod tests {
             ep.alpha()
         );
         assert!(
-            (ep.beta() - 1.5).abs() < 1e-12,
-            "entity posterior beta must be 1.0 + 0.5 = 1.5, got {}",
+            (ep.beta() - 1.1).abs() < 1e-12,
+            "entity posterior beta must be 1.0 + 0.1 = 1.1, got {}",
             ep.beta()
         );
     }

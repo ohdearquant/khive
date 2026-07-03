@@ -27,7 +27,10 @@ impl FeedbackEventKind {
         match self {
             FeedbackEventKind::Correction => 2.0,
             FeedbackEventKind::ExplicitPositive | FeedbackEventKind::ExplicitNegative => 1.5,
-            FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative => 0.5,
+            // ADR-081 §1: dropped from 0.5 before the first high-volume implicit
+            // emitter (batch scorer) goes live; see the fold gate (ADR-081 §2) for
+            // the per-key decayed-mass clamp that bounds cumulative implicit mass.
+            FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative => 0.1,
         }
     }
 
