@@ -470,6 +470,63 @@ async fn json_form_request_works_identically() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RUNTIME-AUD-002 (#433): a present-but-malformed `namespace` value entering
+/// through the MCP JSON-form wire boundary must fail closed with a per-op
+/// invalid-input error — never be silently coerced to the default namespace and
+/// written. The JSON parser preserves the non-string value verbatim (it is not
+/// dropped or treated as absent), so `VerbRegistry::dispatch` sees it and
+/// rejects it before any gate Allow / storage write. This is the end-to-end
+/// ingress counterpart to the runtime-layer `namespace_null_rejected_not_coerced`
+/// gate-spy test.
+#[tokio::test]
+async fn json_form_namespace_non_string_returns_invalid_input() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Every non-string JSON type the finding enumerates, embedded in a real
+    // JSON-form `create` op exactly as an MCP client would send it.
+    let cases: [(&str, &str); 5] = [
+        ("null", "null"),
+        ("number", "42"),
+        ("boolean", "true"),
+        ("array", r#"["local"]"#),
+        ("object", r#"{"ns":"local"}"#),
+    ];
+
+    for (label, ns_json) in cases {
+        let ops = format!(
+            r#"[{{"tool":"create","args":{{"kind":"entity","entity_kind":"concept","name":"aud002-{label}","namespace":{ns_json}}}}}]"#
+        );
+        let result = call(&client, "request", json!({ "ops": ops })).await?;
+        let body: Value = serde_json::from_str(&first_text(&result))?;
+
+        // Malformed namespace is a per-op validation failure, NOT a protocol
+        // error — the JSON parses fine, so the batch is not aborted.
+        let first = &body["results"][0];
+        assert_eq!(
+            first["ok"],
+            json!(false),
+            "case {label}: op must fail closed, got: {body}"
+        );
+        let err = first["error"].as_str().unwrap_or_default().to_lowercase();
+        assert!(
+            err.contains("namespace"),
+            "case {label}: error must name the namespace, got: {first}"
+        );
+
+        // No local write may have slipped through under a coerced default.
+        assert_eq!(
+            body["summary"]["succeeded"], 0,
+            "case {label}: no op may succeed, got: {body}"
+        );
+        assert_eq!(
+            body["summary"]["failed"], 1,
+            "case {label}: the malformed op must be counted as failed, got: {body}"
+        );
+    }
+
+    Ok(())
+}
+
 // ── Kind hooks (ADR-030) — shared CRUD reaches gtd-owned `task` via TaskHook ──
 
 #[tokio::test]
