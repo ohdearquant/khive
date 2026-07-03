@@ -689,6 +689,44 @@ async fn get_returns_not_found_for_unknown_slug() {
     );
 }
 
+#[tokio::test]
+async fn get_by_domain_uuid_returns_canonical_domain_not_mirror_atom() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "uuid-domain", "name": "UUID Domain", "description": "Retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "members": ["rag"] }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert_domains ok");
+
+    // Resolve the domain's UUID via the slug path (already correct).
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "uuid-domain" }))
+        .await
+        .expect("get by slug ok");
+    assert_eq!(by_slug["kind"], "domain");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    // The UUID path must agree with the slug path: canonical domain, not the mirror atom.
+    let by_uuid = f
+        .dispatch("knowledge.get", json!({ "id": uuid }))
+        .await
+        .expect("get by uuid ok");
+    assert_eq!(
+        by_uuid["kind"], "domain",
+        "UUID lookup must return the canonical domain, got: {by_uuid}"
+    );
+    let members = by_uuid["members"]
+        .as_array()
+        .expect("members must be present and an array");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0], "rag");
+}
+
 // ── knowledge.get + include_sections ─────────────────────────────────────────
 
 #[tokio::test]

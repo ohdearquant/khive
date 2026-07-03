@@ -366,6 +366,23 @@ impl KnowledgeHandlers {
         let mut reader = sql.reader().await.map_err(|e| sql_err("get reader", e))?;
 
         if is_uuid {
+            // Domain-first: a domain's canonical row and its FTS mirror atom share
+            // the same UUID, so the UUID branch must match the slug branch below
+            // and prefer knowledge_domains — otherwise a domain UUID resolves to
+            // its own mirror atom instead of the canonical domain record.
+            let row = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("get domain by id", e))?;
+            if let Some(r) = row {
+                return domain_from_row(&r)
+                    .map(|d| domain_to_json(&d))
+                    .ok_or_else(|| RuntimeError::Internal("domain row parse failed".into()));
+            }
             let row = reader
                 .query_row(SqlStatement {
                     sql: "SELECT * FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
@@ -383,19 +400,6 @@ impl KnowledgeHandlers {
                     out["sections"] = fetch_sections(runtime, &ns, &atom_id).await?;
                 }
                 return Ok(out);
-            }
-            let row = reader
-                .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("get domain by id", e))?;
-            if let Some(r) = row {
-                return domain_from_row(&r)
-                    .map(|d| domain_to_json(&d))
-                    .ok_or_else(|| RuntimeError::Internal("domain row parse failed".into()));
             }
         }
 
