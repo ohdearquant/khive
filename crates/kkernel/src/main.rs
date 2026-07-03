@@ -279,8 +279,16 @@ async fn main() -> Result<()> {
                     backend_reg.register(backend_id, Arc::clone(rt));
                 }
 
-                let coord =
-                    SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+                let note_kinds: std::collections::HashSet<String> = multi
+                    .registry
+                    .all_note_kinds()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                let coord = SubstrateCoordinatorService::new(
+                    SubstrateCoordinator::new(backend_reg),
+                    note_kinds,
+                );
                 // Resolve the ADR-078 output-format default (env > [runtime] TOML >
                 // builtin json) for this serve path too — the single-backend branch
                 // does this inside `serve::run`, but this multi-backend branch builds

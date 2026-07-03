@@ -14,8 +14,8 @@ fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
 }
 
-/// Build a VerbRegistry with the `kg` pack loaded, using the given runtime.
-fn kg_registry(runtime: Arc<KhiveRuntime>) -> khive_runtime::VerbRegistry {
+/// Build a VerbRegistry with the given packs loaded, using the given runtime.
+fn packs_registry(runtime: Arc<KhiveRuntime>, pack_names: &[&str]) -> khive_runtime::VerbRegistry {
     let gate = runtime.config().gate.clone();
     let default_ns = runtime.config().default_namespace.clone();
     let actor_id = runtime.config().actor_id.clone();
@@ -23,8 +23,9 @@ fn kg_registry(runtime: Arc<KhiveRuntime>) -> khive_runtime::VerbRegistry {
     builder.with_gate(gate);
     builder.with_default_namespace(default_ns.as_str());
     builder.with_actor_id(actor_id);
-    PackRegistry::register_packs(&["kg".to_string()], (*runtime).clone(), &mut builder)
-        .expect("register kg");
+    let names: Vec<String> = pack_names.iter().map(|s| s.to_string()).collect();
+    PackRegistry::register_packs(&names, (*runtime).clone(), &mut builder)
+        .unwrap_or_else(|n| panic!("pack {n:?} declared in inventory but factory missing"));
     let registry = builder.build().expect("build registry");
     runtime.install_edge_rules(registry.all_edge_rules());
     registry
@@ -951,14 +952,31 @@ fn two_backend_server(
     rt_a: Arc<KhiveRuntime>,
     rt_b: Arc<KhiveRuntime>,
 ) -> khive_mcp::server::KhiveMcpServer {
-    // Build the VerbRegistry from rt_a (single runtime, kg pack).
-    let registry = kg_registry(Arc::clone(&rt_a));
+    two_backend_server_with_packs(rt_a, rt_b, &["kg"])
+}
+
+/// Helper: build a two-backend server whose `VerbRegistry` (and the
+/// coordinator's note-kind substrate classification, #439) includes the given
+/// packs.
+fn two_backend_server_with_packs(
+    rt_a: Arc<KhiveRuntime>,
+    rt_b: Arc<KhiveRuntime>,
+    pack_names: &[&str],
+) -> khive_mcp::server::KhiveMcpServer {
+    // Build the VerbRegistry from rt_a (single runtime, given packs).
+    let registry = packs_registry(Arc::clone(&rt_a), pack_names);
+    let note_kinds: std::collections::HashSet<String> = registry
+        .all_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
     // Build a two-backend coordinator.
     let mut backend_reg = BackendRegistry::new();
     backend_reg.register(BackendId::new("alpha"), Arc::clone(&rt_a));
     backend_reg.register(BackendId::new("beta"), Arc::clone(&rt_b));
-    let coordinator = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+    let coordinator =
+        SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
 
     khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
         registry,
@@ -1184,4 +1202,74 @@ async fn t7c_multi_backend_search_min_score_applied() {
         "T7c: min_score=1.0 must filter all hits, got {} hit(s)",
         hits.len()
     );
+}
+
+/// T7d (#439): multi-backend search for the `session` note kind must route to
+/// note FTS through the coordinator, not fall through to entity search.
+///
+/// RED before fix: `is_note_substrate` was a hardcoded list omitting `session`,
+/// so `search(kind="session")` searched entity FTS with an entity-kind filter
+/// and never found the seeded session note.
+/// GREEN after fix: substrate classification is driven by the merged
+/// `VerbRegistry` note-kind set (installed on `SubstrateCoordinatorService`),
+/// so `session` (registered by `khive-pack-session`) routes to note FTS.
+#[tokio::test]
+async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    let ns = RuntimeNamespace::local();
+
+    let tok_a = rt_a.authorize(ns.clone()).unwrap();
+    rt_a.create_note(
+        &tok_a,
+        "session",
+        Some("Daily standup"),
+        "standup notes for the team",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .expect("T7d: create session note on alpha");
+
+    let _ = rt_b.authorize(ns.clone()).unwrap();
+
+    let server =
+        two_backend_server_with_packs(Arc::clone(&rt_a), Arc::clone(&rt_b), &["kg", "session"]);
+
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="session", query="standup")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+        })
+        .await
+        .expect("T7d: dispatch");
+
+    let response: serde_json::Value = serde_json::from_str(&result_str).expect("T7d: parse");
+    let results = response["results"].as_array().expect("T7d: results");
+    let op = &results[0];
+    assert!(
+        op["ok"].as_bool() == Some(true),
+        "T7d: search op must succeed, got: {op}"
+    );
+    let hits = op["result"].as_array().expect("T7d: result array");
+    assert!(
+        !hits.is_empty(),
+        "T7d: session note must be found through the coordinator path"
+    );
+    for hit in hits {
+        assert_eq!(
+            hit.get("note_kind").and_then(|v| v.as_str()),
+            Some("session"),
+            "T7d: hit must be note-shaped with note_kind='session', got: {hit}"
+        );
+        assert!(
+            hit.get("entity_kind").map(|v| v.is_null()).unwrap_or(true),
+            "T7d: note-substrate hit must not carry an entity_kind, got: {hit}"
+        );
+    }
 }
