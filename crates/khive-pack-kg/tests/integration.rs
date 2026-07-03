@@ -2002,6 +2002,69 @@ async fn get_event_uuid_returns_event_wrapper() {
     );
 }
 
+/// #425 regression: `get(id=<event_uuid>)` from a caller in a DIFFERENT
+/// namespace than the event must succeed, matching the ADR-007 Rev 6 pattern
+/// #393 already established for entity/note/edge. Guards against the residual
+/// event-UUID resolver path #393 did not cover.
+#[tokio::test]
+async fn get_event_uuid_cross_namespace_succeeds() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "CrossNsEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    assert!(!events.is_empty(), "must have at least one create event");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id field")
+        .to_string();
+    let stored_namespace = events[0]
+        .get("namespace")
+        .and_then(Value::as_str)
+        .expect("event must have namespace field")
+        .to_string();
+    assert_ne!(
+        stored_namespace, "ns-caller",
+        "event must be stored in a namespace other than the cross-namespace caller"
+    );
+
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        get_result.is_ok(),
+        "#425: get(id=<event_uuid>) from a different namespace must succeed; got: {get_result:?}"
+    );
+    let get_result = get_result.unwrap();
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "#425: get must have kind=event at top level"
+    );
+    assert_eq!(
+        get_result.get("id").and_then(Value::as_str),
+        Some(event_id.as_str()),
+        "#425: id must match the requested event UUID"
+    );
+    assert_eq!(
+        get_result.get("namespace").and_then(Value::as_str),
+        Some(stored_namespace.as_str()),
+        "#425: returned event's namespace must be preserved, not overwritten by the caller's"
+    );
+}
+
 // ADR-045 §5: event `created_at` must be an ISO-8601 string at the MCP boundary,
 // not a raw microsecond integer (round-4 blocker fix).
 
