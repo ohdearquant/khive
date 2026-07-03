@@ -537,6 +537,114 @@ async fn propose_rejects_multi_step_compound_until_atomic_apply() {
     }
 }
 
+/// #424 regression: `AddEntity` proposals must accept pack-local entity kinds
+/// (e.g. `resource`) even though `khive_types::EntityKind` does not know them.
+#[tokio::test]
+async fn apply_add_entity_accepts_pack_local_resource_kind() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddEntity {
+        entity: EntityDraft {
+            kind: "resource".to_string(),
+            name: "ProposedResource".to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed");
+
+    let entities = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    let created = entities
+        .iter()
+        .find(|e| e.name == "ProposedResource")
+        .expect("#424: ProposedResource must be created");
+    assert_eq!(
+        created.kind, "resource",
+        "#424: kind must resolve to resource"
+    );
+}
+
+/// #424 regression: `AddEntity` proposals must reject whitespace-only names the
+/// same way the normal `create` handler does, with zero net writes.
+#[tokio::test]
+async fn apply_add_entity_rejects_whitespace_name_without_write() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddEntity {
+        entity: EntityDraft {
+            kind: "concept".to_string(),
+            name: "   ".to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let entities_before = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed (errors emitted as ProposalApplied{Failed})");
+
+    let entities_after = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    assert_eq!(
+        entities_before.len(),
+        entities_after.len(),
+        "#424: whitespace-only name must result in zero net writes"
+    );
+
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    assert_eq!(applied_events.items.len(), 1);
+    let payload_str = applied_events.items[0].payload.to_string();
+    assert!(
+        payload_str.contains("name must not be empty"),
+        "#424: failure payload must mention the empty-name guard; got: {payload_str}"
+    );
+}
+
 // ---- Write-budget tests ------------------------------------------------
 
 fn make_entity_draft(name: &str) -> EntityDraft {
