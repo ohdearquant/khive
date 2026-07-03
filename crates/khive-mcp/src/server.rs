@@ -970,12 +970,23 @@ async fn dispatch_via_coordinator_inner(
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
             let query = args_value.get("query")?.as_str()?;
-            let limit = args_value
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32)
-                .unwrap_or(10)
-                .min(100);
+            // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
+            // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
+            // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
+            // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
+            // result set rather than rejecting it (MCP-AUD-003).
+            let limit = match args_value.get("limit") {
+                None | Some(Value::Null) => 10,
+                Some(v) => match serde_json::from_value::<u32>(v.clone()) {
+                    Ok(limit) => limit.min(100),
+                    Err(_) => {
+                        return Some(Err((
+                            "search".to_string(),
+                            json!("limit must be an unsigned 32-bit integer"),
+                        )));
+                    }
+                },
+            };
             let score_floor = args_value
                 .get("min_score")
                 .and_then(Value::as_f64)
@@ -1155,8 +1166,14 @@ result (e.g. create then link with the new entity's id)."#)]
         // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. Any failure (no socket, spawn failure, namespace
         // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        //
+        // MCP-AUD-002: the daemon wire frame has no `save_to` field, so
+        // daemon-forwarded requests silently drop the sink and return the
+        // inline result instead. Bypass daemon forwarding whenever `save_to`
+        // is set so the local path's manifest/file behavior always applies,
+        // matching the existing `kkernel exec --save-file` precedent.
         #[cfg(unix)]
-        {
+        if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return res;
@@ -1479,7 +1496,8 @@ impl ServerHandler for KhiveMcpServer {
 
 #[cfg(test)]
 mod tests {
-    use super::build_verb_catalog;
+    use super::*;
+    use serial_test::serial;
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
         (pack.to_owned(), verb.to_owned(), desc.to_owned())
@@ -1523,5 +1541,100 @@ mod tests {
             .map(|l| l.trim_start().split(' ').next().unwrap())
             .collect();
         assert_eq!(names, vec!["assign", "list", "search"]);
+    }
+
+    // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────
+
+    fn make_daemon_save_to_test_server() -> KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    fn clear_daemon_env() {
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    async fn connect_when_daemon_ready(sock: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::UnixStream::connect(sock).await.is_ok() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daemon never bound {sock:?} within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Regression for MCP-AUD-002 / #440: `request()` must NOT forward a
+    /// `save_to`-bearing call to a warm daemon (whose wire frame has no
+    /// `save_to` field and would silently return the inline result instead of
+    /// writing the sink). With a real daemon reachable at `KHIVE_SOCKET`, a
+    /// `save_to` request must still take the local path and return the
+    /// manifest with the file actually written — proving the daemon was
+    /// bypassed rather than silently dropping the sink.
+    #[tokio::test]
+    #[serial]
+    async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let server = make_daemon_save_to_test_server();
+        let daemon_server = server.clone();
+        let handle = tokio::spawn(async move {
+            let _ = khive_runtime::daemon::run_daemon(daemon_server).await;
+        });
+        connect_when_daemon_ready(&sock).await;
+
+        let sink_path = dir.path().join("out.jsonl");
+        let resp = server
+            .request(Parameters(RequestParams {
+                ops: "stats()".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: Some(sink_path.to_string_lossy().to_string()),
+                format: None,
+                format_per_op: None,
+            }))
+            .await
+            .expect("request with save_to must succeed even with a warm daemon reachable");
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&resp).expect("response must be the save_to manifest JSON");
+        assert!(
+            manifest.get("rows").is_some() && manifest.get("path").is_some(),
+            "response must be the save_to manifest, not an inline daemon result; got: {resp}"
+        );
+        assert!(
+            sink_path.exists(),
+            "save_to file must be written even when a daemon is reachable"
+        );
+        let contents = std::fs::read_to_string(&sink_path).expect("read sink file");
+        assert!(
+            !contents.trim().is_empty(),
+            "sink file must contain JSONL content"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
     }
 }
