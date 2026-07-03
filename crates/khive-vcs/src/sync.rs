@@ -86,13 +86,67 @@ pub struct SyncReport {
 
 // ── F201: Remote archive fetch ────────────────────────────────────────────────
 
+/// A validated remote cache name: a single path segment safe to join under
+/// `.khive/kg/remotes/` without escaping that directory.
+///
+/// Construct via [`RemoteName::parse`]. There is no public way to build a
+/// `RemoteName` that fails validation, so a `RemoteConfig` can never carry an
+/// unsafe name into [`run_sync_remote`] (VCS-AUD-002).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RemoteName(String);
+
+/// Renders exactly like a plain `String`'s `Debug` (quoted), so existing
+/// `{:?}`-formatted error messages that embedded `remote.name` keep the same
+/// shape after the `String` -> `RemoteName` migration.
+impl std::fmt::Debug for RemoteName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl RemoteName {
+    /// Validate `raw` as a safe single-path-segment remote name.
+    ///
+    /// Rejects: empty strings, `.`, `..`, any name containing `/` or `\`, and
+    /// any character outside `[A-Za-z0-9._-]`. Because path separators are
+    /// rejected outright, an absolute path (Unix `/root`, Windows `C:\root`)
+    /// can never pass — `:` is also outside the allowed character set.
+    pub fn parse(raw: impl Into<String>) -> Result<Self, VcsError> {
+        let raw = raw.into();
+        let valid = !raw.is_empty()
+            && raw != "."
+            && raw != ".."
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && !raw.contains('/')
+            && !raw.contains('\\');
+        if !valid {
+            return Err(VcsError::InvalidRemoteName(raw));
+        }
+        Ok(Self(raw))
+    }
+
+    /// The validated name as a `&str`, safe to join onto a cache directory path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RemoteName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Configuration for a remote KG archive (maps to one entry in `schema.yaml`
 /// `remotes:` list).
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
-    /// Human-readable name for this remote (used in error messages and cache
-    /// directory paths).
-    pub name: String,
+    /// Validated name for this remote (used in error messages and cache
+    /// directory paths). Constructed via [`RemoteName::parse`], so a
+    /// `RemoteConfig` can never carry a path-traversal or absolute-path name.
+    pub name: RemoteName,
     /// Git remote URL (e.g. `https://github.com/org/kg-data.git`).
     pub url: String,
     /// Git ref to check out (branch or tag, e.g. `main`).
@@ -238,7 +292,9 @@ pub async fn run_sync_remote(
     }
 
     // ── 5. Atomically publish to cache ────────────────────────────────────────
-    let cache_dir = repo_root.join(".khive/kg/remotes").join(&remote.name);
+    let cache_dir = repo_root
+        .join(".khive/kg/remotes")
+        .join(remote.name.as_str());
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
@@ -1184,6 +1240,74 @@ mod tests {
         );
     }
 
+    // ── #474 RemoteName tests (VCS-AUD-002) ─────────────────────────────────────
+
+    /// #474: `RemoteName::parse` must reject every path-traversal / absolute
+    /// / separator-containing shape before it can reach `run_sync_remote`.
+    #[test]
+    fn remote_name_rejects_path_traversal_cases() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../evil",
+            "../../outside",
+            "/tmp/evil",
+            "safe/name",
+            "safe\\name",
+            "safe/../evil",
+        ] {
+            assert!(
+                RemoteName::parse(bad).is_err(),
+                "expected RemoteName::parse to reject {bad:?}"
+            );
+        }
+    }
+
+    /// #474: safe single-segment names must be accepted and preserved verbatim.
+    #[test]
+    fn remote_name_accepts_single_safe_segment() {
+        for good in ["upstream", "team.data-1", "remote_2"] {
+            let parsed = RemoteName::parse(good).expect("expected safe name to be accepted");
+            assert_eq!(parsed.as_str(), good);
+        }
+    }
+
+    /// #474: `run_sync_remote("../evil" | "/tmp/evil" | "safe/name")` must be
+    /// impossible to even construct — `RemoteConfig::name` is a `RemoteName`,
+    /// and `RemoteName::parse` is its only constructor — so these names never
+    /// reach `run_sync_remote`'s cache-directory join. Confirm both the
+    /// construction-time rejection AND (via filesystem check) that nothing
+    /// was created at the traversal targets or under `.khive/kg/remotes/`.
+    #[tokio::test]
+    async fn run_sync_remote_cannot_be_constructed_with_invalid_name() {
+        let repo_dir = TempDir::new().unwrap();
+        let outside_target = repo_dir.path().parent().unwrap().join("evil-outside-probe");
+        let _ = std::fs::remove_file(&outside_target);
+
+        for bad in ["../evil", "/tmp/evil", "safe/name"] {
+            assert!(
+                RemoteName::parse(bad).is_err(),
+                "RemoteName::parse must reject {bad:?} before any RemoteConfig can be built"
+            );
+        }
+
+        // No RemoteConfig could be built from these names, so run_sync_remote was
+        // never called: the cache tree and any traversal target are both absent.
+        assert!(
+            !repo_dir.path().join(".khive/kg/remotes").exists(),
+            "cache tree must not exist — no sync ever ran"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/evil").exists(),
+            "/tmp/evil must not have been created by this test run"
+        );
+        assert!(
+            !outside_target.exists(),
+            "nothing must be written outside the repo root"
+        );
+    }
+
     // ── F201 tests ────────────────────────────────────────────────────────────
 
     /// F201-1: `run_sync_remote` with a correct pin succeeds and writes the
@@ -1203,7 +1327,7 @@ mod tests {
         let expected_pin = compute_pin(&entities, edges, "remote-ns");
 
         let remote = RemoteConfig {
-            name: "upstream".to_string(),
+            name: RemoteName::parse("upstream").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1275,7 +1399,7 @@ mod tests {
         let wrong_pin = SnapshotId::from_hash(&"0".repeat(64)).unwrap();
 
         let remote = RemoteConfig {
-            name: "upstream".to_string(),
+            name: RemoteName::parse("upstream").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1319,7 +1443,7 @@ mod tests {
         let remote_url = make_git_remote(remote_dir.path(), &entities, "");
 
         let remote = RemoteConfig {
-            name: "no-pin-remote".to_string(),
+            name: RemoteName::parse("no-pin-remote").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1362,7 +1486,7 @@ mod tests {
         let stale_pin = SnapshotId::from_hash(&"f".repeat(64)).unwrap();
 
         let remote = RemoteConfig {
-            name: "repinned".to_string(),
+            name: RemoteName::parse("repinned").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "repin-ns".to_string(),
@@ -1518,7 +1642,7 @@ mod tests {
         let repo_dir = tempfile::TempDir::new().unwrap();
         // Use a credential-bearing HTTPS URL that will fail immediately.
         let remote = RemoteConfig {
-            name: "cred-test".to_string(),
+            name: RemoteName::parse("cred-test").unwrap(),
             url: "https://user:secret_token@nonexistent.example.invalid/org/repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),
@@ -1568,7 +1692,7 @@ mod tests {
     async fn public_error_redacts_scp_style_remote() {
         let repo_dir = tempfile::TempDir::new().unwrap();
         let remote = RemoteConfig {
-            name: "scp-test".to_string(),
+            name: RemoteName::parse("scp-test").unwrap(),
             url: "git@nonexistent.example.invalid:org/private-repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),
@@ -1658,7 +1782,7 @@ mod tests {
     async fn public_error_redacts_user_pass_at_host_scp() {
         let repo_dir = tempfile::TempDir::new().unwrap();
         let remote = RemoteConfig {
-            name: "userpass-scp".to_string(),
+            name: RemoteName::parse("userpass-scp").unwrap(),
             url: "deploy@nonexistent.example.invalid:infra/secret-repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),
