@@ -4896,3 +4896,284 @@ async fn ingest_metadata_cannot_override_stamped_identity_fields() {
         "metadata must never override the handler-stamped direction; got props={props}"
     );
 }
+
+// ── Issue #479a: comm.ingest must reject malformed thread_id ─────────────────
+
+/// `comm.ingest` with a malformed `thread_id` must return `InvalidInput` and
+/// must not write any note (issue #479a). Before the fix, an invalid thread_id
+/// was silently filtered out and replaced with a fresh UUID, splitting the
+/// message into the wrong conversation while still reporting success.
+#[tokio::test]
+async fn ingest_rejects_malformed_thread_id_without_writing_note() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let result = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "thread_id": "not-a-uuid",
+                "from": "email:a@example.com",
+                "to": "email:b@example.com",
+                "content": "reply",
+                "namespace": "local",
+            }),
+        )
+        .await;
+
+    let err = result.expect_err("ingest with malformed thread_id must fail");
+    let err_msg = err.to_string();
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err_msg.contains("thread_id"),
+        "error must mention thread_id; got: {err_msg}"
+    );
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .expect("authorize local");
+    let notes = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes");
+    let alive = notes.iter().filter(|n| n.deleted_at.is_none()).count();
+    assert_eq!(
+        alive, 0,
+        "no note may be written when thread_id validation fails; got {alive}"
+    );
+}
+
+/// `comm.ingest` with a valid UUID `thread_id` must succeed and persist it verbatim.
+#[tokio::test]
+async fn ingest_accepts_valid_uuid_thread_id() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let supplied_thread_id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let result = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "thread_id": supplied_thread_id,
+                "from": "email:a@example.com",
+                "to": "email:b@example.com",
+                "content": "reply",
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect("ingest with valid UUID thread_id must succeed");
+
+    assert_eq!(
+        result["thread_id"].as_str(),
+        Some(supplied_thread_id.as_str()),
+        "response thread_id must equal the supplied UUID; got {result}"
+    );
+
+    let full_id = result["full_id"].as_str().expect("full_id present");
+    let uuid = full_id.parse::<uuid::Uuid>().expect("valid UUID");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let note = store
+        .get_note(uuid)
+        .await
+        .expect("get_note ok")
+        .expect("note exists");
+    assert_eq!(
+        note.properties
+            .as_ref()
+            .and_then(|p| p.get("thread_id"))
+            .and_then(|v| v.as_str()),
+        Some(supplied_thread_id.as_str()),
+        "stored note properties.thread_id must equal the supplied UUID"
+    );
+}
+
+// ── Issue #479b: missing thread roots fall back to the matched message's own UUID ──
+
+/// A reply correlated to an outbound message that has no `thread_id` property
+/// (e.g. a legacy/imported row) must reuse the outbound note's own UUID as the
+/// canonical root and route to the original `from_actor`, instead of being
+/// treated as unmatched and split into a fresh thread routed to the default
+/// inbound actor.
+#[tokio::test]
+async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let outbound_external_id = "<legacy@khive.ai>";
+    let outbound_id = uuid::Uuid::new_v4();
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = Note {
+            id: outbound_id,
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "legacy outbound".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:mailbox@example.com",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                "external_id": outbound_external_id,
+                // No `thread_id` -- simulates a legacy/imported root row written
+                // before the canonical thread_id field existed.
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    let result = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:user@example.com",
+                "to": "email:mailbox@example.com",
+                "content": "reply to legacy root",
+                "correlation_external_id": outbound_external_id,
+                "external_id": "imap:mail:legacy:1",
+                "default_inbound_actor": "lambda:leo",
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect("ingest succeeds");
+
+    let expected_thread_id = outbound_id.as_hyphenated().to_string();
+    assert_eq!(
+        result["thread_id"].as_str(),
+        Some(expected_thread_id.as_str()),
+        "reply must use the matched outbound note's own UUID as the canonical root; got {result}"
+    );
+
+    let full_id = result["full_id"].as_str().expect("full_id present");
+    let uuid = full_id.parse::<uuid::Uuid>().expect("valid UUID");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let note = store
+        .get_note(uuid)
+        .await
+        .expect("get_note ok")
+        .expect("note exists");
+    let props = note.properties.expect("note has properties");
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(expected_thread_id.as_str()),
+        "stored reply properties.thread_id must equal the outbound note's own UUID"
+    );
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "reply must route to the original from_actor, not default_inbound_actor; got props={props}"
+    );
+}
+
+/// `comm.thread` must include a root message that has no `thread_id` property
+/// at all (issue #479b) -- the SQL query only matches `properties.thread_id ==
+/// root`, which a thread-id-less root can never satisfy on its own.
+#[tokio::test]
+async fn thread_includes_root_message_without_thread_id_property() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root_id = uuid::Uuid::new_v4();
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let root_note = Note {
+            id: root_id,
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "legacy root, no thread_id".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "local",
+                "to": "local",
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(root_note).await.expect("upsert root");
+
+        let child_note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "child reply".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "inbound",
+                "from": "local",
+                "to": "local",
+                "thread_id": root_id.as_hyphenated().to_string(),
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now + 1,
+            updated_at: now + 1,
+            deleted_at: None,
+        };
+        store.upsert_note(child_note).await.expect("upsert child");
+    }
+
+    let thread_result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_id.as_hyphenated().to_string() }),
+        )
+        .await
+        .expect("thread dispatch succeeds");
+
+    assert_eq!(
+        thread_result["thread_id"].as_str(),
+        Some(root_id.as_hyphenated().to_string().as_str()),
+        "canonical thread_id must be the root's own UUID; got {thread_result}"
+    );
+    let messages = thread_result["messages"]
+        .as_array()
+        .expect("messages is an array");
+    let root_full_id = root_id.as_hyphenated().to_string();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.get("full_id").and_then(|v| v.as_str()) == Some(root_full_id.as_str())),
+        "thread must include the root message even though it has no thread_id property; got {thread_result}"
+    );
+    let count = thread_result["count"].as_u64().expect("count present");
+    assert!(
+        count >= 2,
+        "thread must include root + child (at least 2); got count={count}"
+    );
+}

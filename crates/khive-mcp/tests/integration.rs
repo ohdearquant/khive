@@ -2159,6 +2159,134 @@ async fn link_is_always_verbose_returns_full_uuids_in_agent_mode() -> anyhow::Re
     Ok(())
 }
 
+// ── #469 regression: bulk/symmetric link write-key conflict preflight ────────
+
+/// #469: a bulk `link(links=[...])` op and a singleton `link` op that target
+/// the same natural edge key must both be rejected with per-op conflict
+/// errors by MCP preflight (`khive_request::write_keys_for_op_pub`) before
+/// either dispatches, instead of racing through storage where SQLite's
+/// `ON CONFLICT DO UPDATE` would let the last write silently win.
+#[tokio::test]
+async fn parallel_link_bulk_conflict_is_rejected_before_storage_race() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let a = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="BulkConflictA")"#,
+    )
+    .await?;
+    let b = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="BulkConflictB")"#,
+    )
+    .await?;
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    let ops = format!(
+        r#"[link(links=[{{"source_id":"{a_id}","target_id":"{b_id}","relation":"extends","weight":0.1}}]), link(source_id="{a_id}", target_id="{b_id}", relation="extends", weight=0.9)]"#
+    );
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+
+    assert_eq!(body["summary"]["total"], json!(2));
+    assert_eq!(
+        body["summary"]["failed"],
+        json!(2),
+        "both conflicting link ops must fail preflight: {body}"
+    );
+    for i in 0..2 {
+        let entry = &body["results"][i];
+        assert_eq!(entry["ok"], json!(false), "op #{i} must fail: {entry}");
+        let err = entry["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("conflict"),
+            "op #{i} error must mention conflict: {entry}"
+        );
+    }
+
+    // No edge should have been written — neither op reached storage.
+    let get_result = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(r#"list(kind="entity_edge", source_id="{a_id}", target_id="{b_id}")"#),
+            "presentation": "verbose"
+        }),
+    )
+    .await;
+    if let Ok(get_result) = get_result {
+        if let Ok(get_body) = serde_json::from_str::<Value>(&first_text(&get_result)) {
+            if get_body["results"][0]["ok"] == json!(true) {
+                let items = get_body["results"][0]["result"]["items"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    items.is_empty(),
+                    "no edge should have been written from conflicting preflight-rejected ops: {items:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #469: reversed singleton symmetric links (`link(A,B,competes_with)` and
+/// `link(B,A,competes_with)`) must canonicalize to the same natural edge key
+/// and be rejected as conflicting, matching storage's own endpoint-order
+/// canonicalization for symmetric relations.
+#[tokio::test]
+async fn parallel_reversed_symmetric_link_conflict_is_rejected() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let a = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="SymConflictA")"#,
+    )
+    .await?;
+    let b = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="SymConflictB")"#,
+    )
+    .await?;
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    let ops = format!(
+        r#"[link(source_id="{a_id}", target_id="{b_id}", relation="competes_with"), link(source_id="{b_id}", target_id="{a_id}", relation="competes_with")]"#
+    );
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+
+    assert_eq!(body["summary"]["total"], json!(2));
+    assert_eq!(
+        body["summary"]["failed"],
+        json!(2),
+        "reversed symmetric link ops must both fail preflight: {body}"
+    );
+    for i in 0..2 {
+        let entry = &body["results"][i];
+        assert_eq!(entry["ok"], json!(false), "op #{i} must fail: {entry}");
+        let err = entry["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("conflict"),
+            "op #{i} error must mention conflict: {entry}"
+        );
+    }
+    Ok(())
+}
+
 // ── ADR-046 regression: get(id=proposal_id) returns ProposalCreated payload ──
 
 /// ADR-046:299 — get(id=<proposal_id>) must return the full ProposalCreated
