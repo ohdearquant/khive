@@ -1328,7 +1328,8 @@ impl BrainPack {
 
         // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
         // the fold itself so a ledger-write failure never blocks the feedback
-        // event from landing; non-fatal like the persistence call above.
+        // event from landing — intentionally non-fatal, unlike the fail-closed
+        // brain-state persistence above (#458).
         if let (Some(scorer_run_id), Some(serve_ledger_id)) =
             (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
         {
