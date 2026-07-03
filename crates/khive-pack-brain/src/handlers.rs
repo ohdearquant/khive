@@ -1224,108 +1224,106 @@ impl BrainPack {
             .unwrap_or("balanced-recall-v1")
             .to_string();
 
-        // Posteriors snapshotted while the lock is held; routing runs after the lock drops
-        // so the mutex scope is not widened across fann inference.
-        // Declared uninitialized: definitely assigned inside the lock scope below (in
-        // the feature-on build the cfg block always executes, so the compiler can verify
-        // definite initialization without a dead initial-value assignment).
-        #[cfg(feature = "lattice-router")]
-        #[allow(clippy::type_complexity)]
-        let router_inputs: Option<(
-            BetaPosterior,
-            BetaPosterior,
-            BetaPosterior,
-            Option<std::collections::HashMap<SectionType, BetaPosterior>>,
-        )>;
+        let brain_signal = interpret(&event);
 
-        {
-            let signal = interpret(&event);
-            let mut state = self.state.lock().unwrap();
-            let serving_profile = serving_profile_owned.as_str();
-
-            if serving_profile == "balanced-recall-v1" {
-                state.balanced_recall.apply_signal(&signal);
-                sync_balanced_recall_record(&mut state);
-            } else if state.profile_states.contains_key(serving_profile) {
-                let ps = state
-                    .profile_states
-                    .get_mut(serving_profile)
-                    .expect("key checked above");
-                ps.apply_signal(&signal);
-                let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                let total = ps.total_events;
-                if let Some(record) = state.profiles.get_mut(serving_profile) {
-                    record.total_events = total;
-                    record.state_snapshot = snap;
-                }
-            } else {
-                state.balanced_recall.apply_signal(&signal);
-                sync_balanced_recall_record(&mut state);
-            }
-
-            // Seed and backfill section posteriors, then apply the signal.
-            // Shared contract with the replay path — see `ensure_section_state_seeded`.
-            {
-                let section_state = crate::ensure_section_state_seeded(
-                    &mut state.section_states,
-                    &serving_profile_owned,
-                );
-                section_state.apply_signal(&signal);
-            }
-
-            // Snapshot posteriors for lattice-router while the lock is still held.
-            // BetaPosterior is two f64s — cloning is cheap.
-            #[cfg(feature = "lattice-router")]
-            {
-                let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
-                    (
-                        state.balanced_recall.relevance.clone(),
-                        state.balanced_recall.salience.clone(),
-                        state.balanced_recall.temporal.clone(),
-                    )
-                } else if let Some(ps) = state.profile_states.get(serving_profile) {
-                    (
-                        ps.relevance.clone(),
-                        ps.salience.clone(),
-                        ps.temporal.clone(),
-                    )
-                } else {
-                    (
-                        state.balanced_recall.relevance.clone(),
-                        state.balanced_recall.salience.clone(),
-                        state.balanced_recall.temporal.clone(),
-                    )
-                };
-                let sec = state
-                    .section_states
-                    .get(serving_profile)
-                    .map(|ss| ss.posteriors.clone());
-                router_inputs = Some((rel, sal, temp, sec));
-            }
-        }
-
-        // lattice-router: build the context vector from snapshotted posteriors and forward
-        // through the fann network. Lock is already released here.
-        // Consumption of routed weights lands with the engine route() seam (#343) and the
-        // compose value-gate (#346); no per-event stdout/stderr spam.
-        #[cfg(feature = "lattice-router")]
-        if let Some((rel, sal, temp, sec)) = router_inputs {
-            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
-            let _routed = route_via_fann(&ctx);
-        }
-
-        // Persist feedback to brain_event_log; batch-upsert snapshot when dirty threshold reached.
-        if let Err(e) = crate::persist::persist_after_feedback(
+        // Issue #458: apply the posterior mutation and make its durability
+        // part of the success contract. `persist_brain_state_mutation` runs
+        // this closure against a *proposed* state copy, then commits the
+        // brain event-log append + snapshot upsert in one transaction —
+        // `self.state` is only replaced with the proposed copy after that
+        // commit succeeds. If persistence fails, this returns `Err` and
+        // `self.state` is left completely untouched (no phantom in-memory
+        // posterior update that vanishes on restart).
+        crate::persist::persist_brain_state_mutation(
             &self.runtime,
             token,
             &self.persistence,
             &self.state,
-            &event,
-            &serving_profile_owned,
+            crate::persist::BrainMutationEvent {
+                profile_id: serving_profile_owned.clone(),
+                event_kind: event.verb.clone(),
+                payload: serde_json::to_value(&event)
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+            },
+            ENTITY_CACHE_CAPACITY,
+            {
+                let brain_signal = brain_signal.clone();
+                let serving_profile_owned = serving_profile_owned.clone();
+                move |state: &mut khive_brain_core::BrainState| -> Result<(), RuntimeError> {
+                    let serving_profile = serving_profile_owned.as_str();
+
+                    if serving_profile == "balanced-recall-v1" {
+                        state.balanced_recall.apply_signal(&brain_signal);
+                        sync_balanced_recall_record(state);
+                    } else if state.profile_states.contains_key(serving_profile) {
+                        let ps = state
+                            .profile_states
+                            .get_mut(serving_profile)
+                            .expect("key checked above");
+                        ps.apply_signal(&brain_signal);
+                        let snap = serde_json::to_value(ps.to_snapshot()).ok();
+                        let total = ps.total_events;
+                        if let Some(record) = state.profiles.get_mut(serving_profile) {
+                            record.total_events = total;
+                            record.state_snapshot = snap;
+                        }
+                    } else {
+                        state.balanced_recall.apply_signal(&brain_signal);
+                        sync_balanced_recall_record(state);
+                    }
+
+                    // Seed and backfill section posteriors, then apply the signal.
+                    // Shared contract with the replay path — see `ensure_section_state_seeded`.
+                    {
+                        let section_state = crate::ensure_section_state_seeded(
+                            &mut state.section_states,
+                            &serving_profile_owned,
+                        );
+                        section_state.apply_signal(&brain_signal);
+                    }
+
+                    Ok(())
+                }
+            },
         )
-        .await
+        .await?;
+
+        // lattice-router: build the context vector from the now-published live
+        // state and forward through the fann network. This is a best-effort
+        // routing computation independent of durability, so it reads from
+        // `self.state` only after the mutation above has durably committed.
+        // Consumption of routed weights lands with the engine route() seam (#343) and the
+        // compose value-gate (#346); no per-event stdout/stderr spam.
+        #[cfg(feature = "lattice-router")]
         {
-            eprintln!("[brain] persistence failed (non-fatal): {e}");
+            let state = self.state.lock().unwrap();
+            let serving_profile = serving_profile_owned.as_str();
+            let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
+                (
+                    state.balanced_recall.relevance.clone(),
+                    state.balanced_recall.salience.clone(),
+                    state.balanced_recall.temporal.clone(),
+                )
+            } else if let Some(ps) = state.profile_states.get(serving_profile) {
+                (
+                    ps.relevance.clone(),
+                    ps.salience.clone(),
+                    ps.temporal.clone(),
+                )
+            } else {
+                (
+                    state.balanced_recall.relevance.clone(),
+                    state.balanced_recall.salience.clone(),
+                    state.balanced_recall.temporal.clone(),
+                )
+            };
+            let sec = state
+                .section_states
+                .get(serving_profile)
+                .map(|ss| ss.posteriors.clone());
+            drop(state);
+            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
+            let _routed = route_via_fann(&ctx);
         }
 
         // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after

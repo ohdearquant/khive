@@ -4901,7 +4901,7 @@ mod adr081_retune_driver_tests {
     }
 }
 
-// ── issue #457: durable-write helper regressions ────────────────────────────
+// ── issues #457 / #458: durable-write helper regressions ─────────────────────
 
 mod durable_write_tests {
     use super::*;
@@ -5073,6 +5073,98 @@ mod durable_write_tests {
             bindings["count"],
             json!(0u64),
             "brain.unbind must survive restart — no bob binding should remain"
+        );
+    }
+
+    /// #458 success path: `brain.feedback`'s posterior update must survive a
+    /// restart via the same durable-write helper used by #457, instead of the
+    /// old best-effort `persist_after_feedback` that ran after the in-memory
+    /// mutation and was logged (not surfaced) on failure.
+    #[tokio::test]
+    async fn feedback_posteriors_survive_restart() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "useful"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("brain.feedback");
+
+        let live_total = pack.snapshot().balanced_recall.total_events;
+
+        drop(pack);
+        let pack2 = crate::BrainPack::new(rt.clone());
+        pack2
+            .ensure_loaded(&token)
+            .await
+            .expect("ensure_loaded on fresh pack");
+
+        assert_eq!(
+            pack2.snapshot().balanced_recall.total_events,
+            live_total,
+            "brain.feedback's posterior update must survive restart"
+        );
+    }
+
+    /// #458 fail-closed path: if the brain-specific persistence (event append
+    /// + snapshot upsert) fails, `brain.feedback` must return an error and
+    /// leave the in-memory state untouched — not log the failure as
+    /// non-fatal and still report `emitted: true`.
+    ///
+    /// The failure is injected by dropping the real `brain_profile_snapshots`
+    /// table to simulate genuine schema drift, so this exercises the actual
+    /// SQL failure path rather than a test-only mock hook.
+    #[tokio::test]
+    async fn feedback_fails_closed_when_brain_persistence_fails() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let before_us = chrono::Utc::now().timestamp_micros();
+        let total_before = pack.snapshot().balanced_recall.total_events;
+
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("writer");
+            writer
+                .execute_script("DROP TABLE brain_profile_snapshots;".to_string())
+                .await
+                .expect("drop brain_profile_snapshots to simulate schema drift");
+        }
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("brain.feedback must fail when brain-specific persistence fails");
+        let _ = err;
+
+        let total_after = pack.snapshot().balanced_recall.total_events;
+        assert_eq!(
+            total_after, total_before,
+            "a failed brain-persistence write must leave in-memory state untouched"
+        );
+
+        // No brain_event_log row must have been committed for this call either
+        // — the append and the (failing) snapshot upsert share one transaction.
+        let sql = rt.sql();
+        let replay = crate::persist::load_events_since(sql.as_ref(), "local", before_us)
+            .await
+            .expect("load_events_since must still work (brain_event_log untouched)");
+        assert!(
+            replay.events.is_empty(),
+            "no brain_event_log row must be committed when the snapshot upsert fails"
         );
     }
 }

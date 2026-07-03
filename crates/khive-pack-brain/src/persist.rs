@@ -779,51 +779,6 @@ pub async fn ensure_loaded(
     Ok(())
 }
 
-pub async fn persist_after_feedback(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    tracker: &Mutex<PersistenceTracker>,
-    state: &Mutex<BrainState>,
-    event: &khive_storage::event::Event,
-    serving_profile: &str,
-) -> Result<(), RuntimeError> {
-    let namespace = token.namespace().as_str().to_string();
-    let now_us = chrono::Utc::now().timestamp_micros();
-
-    let sql = runtime.sql();
-
-    let event_payload = serde_json::to_value(event).map_err(|e| sql_err("serialize event", e))?;
-
-    append_brain_event(
-        sql.as_ref(),
-        &namespace,
-        serving_profile,
-        &event.verb,
-        &event_payload,
-        now_us,
-    )
-    .await?;
-
-    let should_snapshot = {
-        let mut t = tracker.lock().unwrap();
-        t.increment_dirty(&namespace)
-    };
-
-    if should_snapshot {
-        let snapshot = {
-            let s = state.lock().unwrap();
-            s.to_snapshot()
-        };
-
-        upsert_snapshot(sql.as_ref(), &namespace, &snapshot, now_us).await?;
-
-        let mut t = tracker.lock().unwrap();
-        t.reset_dirty(&namespace);
-    }
-
-    Ok(())
-}
-
 // ── BRAIN-007: event-log replay quarantine diagnostics ────────────────────────
 
 #[cfg(test)]
