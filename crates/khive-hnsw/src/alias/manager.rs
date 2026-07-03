@@ -114,27 +114,61 @@ impl IndexAliasManager {
     }
 
     /// Acquire a reader guard; holds an `Arc<HnswIndex>` snapshot that stays alive until dropped.
-    /// Critical section is minimal: resolve alias, clone Arc, increment counter.
+    ///
+    /// Holds the `aliases` read lock for the entire resolve -> lookup ->
+    /// count sequence (not just alias resolution). `switch_alias` needs the
+    /// `aliases` write lock, so it cannot swap the alias -- and therefore
+    /// cannot make a concurrent `drain_and_remove` observe a zero reader
+    /// count -- until this reader has been counted or has failed outright
+    /// (#417).
     pub fn acquire_reader(&self, alias: &str) -> Result<ReaderGuard, AliasError> {
-        // Resolve alias -> collection name
-        let collection_name = {
-            let aliases = self.aliases.read();
-            aliases
-                .get(alias)
-                .ok_or_else(|| AliasError::AliasNotFound(alias.to_string()))?
-                .clone()
-        };
+        let aliases = self.aliases.read();
+        let collection_name = aliases
+            .get(alias)
+            .ok_or_else(|| AliasError::AliasNotFound(alias.to_string()))?;
 
-        // Get collection and create reader guard
         let collections = self.collections.read();
         let collection = collections
-            .get(&collection_name)
+            .get(collection_name)
             .ok_or_else(|| AliasError::CollectionNotFound(collection_name.clone()))?;
 
-        Ok(ReaderGuard::new(
+        let guard = ReaderGuard::new(
             Arc::clone(&collection.index),
             Arc::clone(&collection.readers),
-        ))
+        );
+        drop(collections);
+        drop(aliases);
+        Ok(guard)
+    }
+
+    /// Test-only variant of `acquire_reader` that runs `hook` right after
+    /// alias resolution while still holding the `aliases` read lock, used
+    /// to deterministically exercise the switch/drain race window (#417).
+    #[cfg(test)]
+    pub(crate) fn acquire_reader_with_test_hook(
+        &self,
+        alias: &str,
+        hook: impl FnOnce(),
+    ) -> Result<ReaderGuard, AliasError> {
+        let aliases = self.aliases.read();
+        let collection_name = aliases
+            .get(alias)
+            .ok_or_else(|| AliasError::AliasNotFound(alias.to_string()))?;
+
+        hook();
+
+        let collections = self.collections.read();
+        let collection = collections
+            .get(collection_name)
+            .ok_or_else(|| AliasError::CollectionNotFound(collection_name.clone()))?;
+
+        let guard = ReaderGuard::new(
+            Arc::clone(&collection.index),
+            Arc::clone(&collection.readers),
+        );
+        drop(collections);
+        drop(aliases);
+        Ok(guard)
     }
 
     /// Switch an alias to a different collection, optionally validating first.
@@ -169,25 +203,27 @@ impl IndexAliasManager {
         Ok(old_collection)
     }
 
-    /// Wait for all readers on a collection to drain, then remove it.
-    /// If drain times out, the collection is NOT removed and an error is returned.
+    /// Retire a collection from manager ownership and wait for its readers to drain.
+    ///
+    /// The collection is removed from `self.collections` *before* waiting,
+    /// not after: outstanding `ReaderGuard`s hold their own `Arc<HnswIndex>`
+    /// clone, so removing the manager's entry does not affect them. This
+    /// means that even if drain times out below, the manager no longer
+    /// owns the retired collection forever -- its memory is reclaimed
+    /// normally once the last guard drops (#418).
     pub async fn drain_and_remove(&self, collection: &str) -> Result<(), AliasError> {
-        // Extract the reader counter (under read lock -- we just need the Arc)
         let counter = {
-            let collections = self.collections.read();
+            let mut collections = self.collections.write();
             let coll = collections
-                .get(collection)
+                .remove(collection)
                 .ok_or_else(|| AliasError::CollectionNotFound(collection.to_string()))?;
             Arc::clone(&coll.readers)
         };
 
-        // Wait for readers to drain (async, no locks held)
-        drain_readers(&counter, self.drain_timeout, self.drain_poll_interval).await?;
-
-        // Remove the collection (exclusive lock)
-        let mut collections = self.collections.write();
-        collections.remove(collection);
-        Ok(())
+        // Wait for readers to drain (async, no locks held). A timeout here
+        // no longer leaves the collection manager-owned -- it was already
+        // retired above.
+        drain_readers(&counter, self.drain_timeout, self.drain_poll_interval).await
     }
 
     /// Build new index, validate, swap alias atomically, drain old; returns `MigrationReport`.
@@ -286,11 +322,11 @@ impl IndexAliasManager {
         // Switch the alias
         self.switch_alias(alias, &new_collection_name, None)?;
 
-        // Drain and remove old collection
-        // Note: if drain times out, the old collection stays around but the
-        // alias already points to the new one. This is acceptable -- readers
-        // on the old index will finish eventually, and the memory will be
-        // reclaimed when the last Arc is dropped.
+        // Retire and drain the old collection. `drain_and_remove` removes it
+        // from `self.collections` up front, so even if drain times out below
+        // the manager no longer owns it -- outstanding reader guards keep
+        // their own Arc<HnswIndex> clone alive and the memory is reclaimed
+        // normally once the last guard drops (#418).
         let drain_result = self.drain_and_remove(&old_collection_name).await;
 
         let swap_drain_duration = swap_drain_start.elapsed();
@@ -299,8 +335,8 @@ impl IndexAliasManager {
         // Log drain timeout but don't fail the migration -- the alias is
         // already switched, so new queries go to the new index.
         if let Err(AliasError::DrainTimeout { .. }) = &drain_result {
-            // The old collection will be cleaned up when the last reader drops.
-            // We report this in the migration report but don't fail.
+            // The old collection is already retired from manager ownership;
+            // we report this in the migration report but don't fail.
         } else if let Err(e) = drain_result {
             return Err(e);
         }
@@ -536,5 +572,121 @@ mod tests {
         // The alias should now point to the new collection
         let guard = mgr.acquire_reader("active").unwrap();
         assert_eq!(guard.len(), 8);
+    }
+
+    /// Regression for #417: acquiring a reader must not race a concurrent
+    /// alias switch + drain/remove of the collection the reader resolved
+    /// to. Pauses right after alias resolution (deterministic via channel,
+    /// no sleep), then performs a switch+drain+remove that would, on the
+    /// buggy code, remove the collection before the reader is counted.
+    #[tokio::test]
+    async fn test_acquire_reader_switch_drain_race_does_not_return_collection_not_found() {
+        let mgr = Arc::new(IndexAliasManager::new(Duration::from_secs(5)));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.register_collection("v2", make_index(4, 10)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+
+        let mgr_a = Arc::clone(&mgr);
+        let handle_a = std::thread::spawn(move || {
+            mgr_a.acquire_reader_with_test_hook("active", || {
+                paused_tx.send(()).expect("send paused signal");
+                release_rx.recv().expect("recv release signal");
+            })
+        });
+
+        // Wait until thread A has resolved alias -> v1 and is paused.
+        paused_rx.recv().expect("recv paused signal");
+
+        // Concurrently switch the alias to v2 and drain+remove v1 on a
+        // second thread -- exactly what a migration does. On the buggy
+        // code this has no lock contention and completes immediately,
+        // removing v1 before A is released below. On the fixed code it
+        // blocks behind A's held `aliases` read lock until A is released.
+        let mgr_b = Arc::clone(&mgr);
+        let handle_b = std::thread::spawn(move || {
+            mgr_b.switch_alias("active", "v2", None).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build nested runtime for thread B");
+            rt.block_on(mgr_b.drain_and_remove("v1")).unwrap();
+            b_done_tx.send(()).ok();
+        });
+
+        // Give B a bounded window to run to completion if nothing blocks it
+        // (the pre-fix case: B finishes almost instantly). Whether or not
+        // it finished, release A next -- on the fixed code B is still
+        // blocked at this point and only proceeds once A releases the
+        // `aliases` lock below.
+        let _ = b_done_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).expect("send release signal");
+
+        let result = handle_a.join().expect("thread A join");
+        let a_len = match result {
+            Ok(guard) => {
+                let len = guard.len();
+                // Drop the guard so B's drain_and_remove (waiting on this
+                // reader on the fixed code) does not block on join below.
+                drop(guard);
+                len
+            }
+            Err(e) => panic!(
+                "acquire_reader must not return an error due to a switch/drain race, got {e:?}"
+            ),
+        };
+        handle_b.join().expect("thread B join");
+
+        assert_eq!(a_len, 5, "must return the old v1 snapshot");
+    }
+
+    /// Regression for #418: if drain times out during migration, the old
+    /// collection must be retired from `self.collections` immediately
+    /// (not kept forever), even though the held reader guard keeps the
+    /// underlying index alive until it is dropped.
+    #[tokio::test]
+    async fn test_migrate_timeout_retires_old_collection_from_manager() {
+        let mgr = Arc::new(IndexAliasManager::new(Duration::ZERO));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+
+        // Hold a reader guard on v1 so drain can never complete within the
+        // zero-duration timeout.
+        let guard = mgr.acquire_reader("active").unwrap();
+        assert_eq!(guard.len(), 5);
+
+        let vectors: Vec<(NodeId, Vec<f32>)> = (0..8u8)
+            .map(|i| (NodeId::new([i; 16]), vec![i as f32; 4]))
+            .collect();
+        let config = HnswConfig::with_dimensions(4);
+
+        let report = mgr
+            .migrate("active", vectors, config, None)
+            .await
+            .expect("migration must succeed even if drain times out");
+        assert_eq!(report.old_collection, "v1");
+
+        assert_eq!(
+            mgr.resolve_alias("active"),
+            Some(report.new_collection.clone())
+        );
+        assert_eq!(
+            mgr.reader_count("v1"),
+            None,
+            "old collection must no longer be manager-owned even though drain timed out"
+        );
+        assert_eq!(
+            mgr.collection_count(),
+            1,
+            "manager must not keep the retired collection around forever"
+        );
+
+        // The held guard must still be usable until dropped.
+        assert_eq!(guard.len(), 5);
+        drop(guard);
+        assert_eq!(mgr.collection_count(), 1);
     }
 }
