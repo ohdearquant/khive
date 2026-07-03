@@ -5,10 +5,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::EdgeRelation;
-use khive_types::EntityKind;
 use khive_vcs_adapters::{EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter};
 use uuid::Uuid;
 
@@ -90,6 +90,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         ..Default::default()
     };
     let runtime = KhiveRuntime::new(config)?;
+    install_import_kind_registry(&runtime)?;
     let token = runtime.authorize(ns)?;
 
     let source = std::fs::read_to_string(&args.source)
@@ -99,7 +100,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         ImportFormat::Archive => {
             let archive: KgArchive = serde_json::from_str(&source)
                 .with_context(|| format!("parse archive {}", args.source.display()))?;
-            validate_archive_entity_kinds(&archive)?;
+            validate_archive_edge_weights(&archive)?;
             runtime
                 .import_kg(&archive, &token)
                 .await
@@ -162,9 +163,9 @@ fn adapter_records_to_archive(
     let exported_entities: Vec<ExportedEntity> = entities
         .into_iter()
         .map(|e| {
-            let _: EntityKind = e.kind.parse().map_err(|_| {
-                anyhow::anyhow!("unknown entity kind {:?} on entity {}", e.kind, e.id)
-            })?;
+            // Entity kind is validated against the merged pack/runtime kind
+            // registry inside `runtime.import_kg`, not here — a bare base-enum
+            // parse would reject valid pack-registered kinds like `resource`.
             Ok(ExportedEntity {
                 id: e.id,
                 kind: e.kind,
@@ -215,16 +216,41 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
     Ok(())
 }
 
-pub(super) fn validate_archive_entity_kinds(archive: &KgArchive) -> Result<()> {
-    for e in &archive.entities {
-        let _: EntityKind = e
-            .kind
-            .parse()
-            .map_err(|_| anyhow::anyhow!("unknown entity kind {:?} on entity {}", e.kind, e.id))?;
-    }
+/// Pre-import validation that does not require entity-kind knowledge.
+/// Entity-kind validation happens inside `runtime.import_kg` against the
+/// merged pack/runtime kind registry installed by `install_import_kind_registry`.
+pub(super) fn validate_archive_edge_weights(archive: &KgArchive) -> Result<()> {
     for edge in &archive.edges {
         validate_edge_weight(edge.weight, edge.edge_id)?;
     }
+    Ok(())
+}
+
+/// Install the merged pack/runtime entity- and note-kind registry on `runtime`
+/// so that `runtime.import_kg` (and any other runtime-layer kind validation)
+/// accepts pack-registered kinds such as `resource`, not just the eight base
+/// `khive_types::EntityKind` variants.
+fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<()> {
+    let mut builder = VerbRegistryBuilder::new();
+    let names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
+        .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
+    let registry = builder.build().context("building import VerbRegistry")?;
+    runtime.install_kind_registry(
+        registry
+            .all_entity_kinds()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        registry
+            .all_note_kinds()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
     Ok(())
 }
 
@@ -540,6 +566,81 @@ mod tests {
         let entity_uuid: Uuid = entity_id.parse().unwrap();
         let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
         assert_eq!(entity.name, "Imported");
+    }
+
+    #[tokio::test]
+    async fn import_archive_accepts_resource_kind() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("import-resource.db");
+        let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+        let archive_json = format!(
+            r#"{{"format":"khive-kg","version":"0.1","namespace":"test-ns","exported_at":"2026-01-01T00:00:00Z","entities":[{{"id":"{entity_id}","kind":"resource","name":"ImportedResource","tags":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}],"edges":[]}}"#
+        );
+        let source_path = tmp.path().join("archive.json");
+        std::fs::write(&source_path, &archive_json).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Archive,
+            verbose: false,
+        };
+        cmd_import(args)
+            .await
+            .expect("archive import must accept pack-registered `resource` kind");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.kind, "resource");
+        assert_eq!(entity.name, "ImportedResource");
+    }
+
+    // NOTE: the JSON/NDJSON adapter import path (`ImportFormat::Json` /
+    // `ImportFormat::Ndjson`) goes through `khive_vcs_adapters::JsonFormatAdapter`,
+    // which independently gates entity kind through the base
+    // `khive_types::EntityKind::from_str` in `parse_entity` — before an
+    // `ExportedEntity`/`KgArchive` is even constructed, and before this module's
+    // `install_import_kind_registry` fix has any effect. Making that path accept
+    // pack-registered kinds like `resource` requires an API change to the shared
+    // `khive-vcs-adapters` crate (also consumed by `khive-vcs` sync) to accept an
+    // injected valid-kind set — architecture work beyond this issue's scope
+    // (archive.rs kind validation, per #438's evidence). Only the archive-format
+    // round-trip path (the issue's reported failure scenario) is fixed here; see
+    // `import_archive_accepts_resource_kind` above.
+
+    #[tokio::test]
+    async fn import_rejects_unregistered_entity_kind() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("import-unknown-kind.db");
+        let entity_id = "12345678-1234-1234-1234-123456789012";
+
+        let json_input =
+            format!(r#"[{{"id":"{entity_id}","kind":"not_a_registered_kind","name":"Bad"}}]"#);
+        let source_path = tmp.path().join("records.json");
+        std::fs::write(&source_path, &json_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path,
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        };
+        assert!(
+            cmd_import(args).await.is_err(),
+            "import must still reject entity kinds unknown to every registered pack"
+        );
     }
 
     #[tokio::test]
