@@ -6280,6 +6280,280 @@ async fn hard_delete_soft_deleted_note_cross_namespace_succeeds() {
     );
 }
 
+// ---- #391 §3: by-ID CRUD prefix resolution is fully unfiltered ----
+//
+// The `*_cross_namespace_succeeds` tests above already lock in that a FULL
+// UUID by-ID lookup is namespace-agnostic (ADR-007 Rev 2). Before #391, the
+// *prefix* form of the same by-ID lookup fell through to the
+// primary-namespace-only `resolve_prefix`, so a caller in a different
+// namespace than the record got `NotFound` for a prefix that would have
+// resolved fine as a full UUID — the outage's by-ID-adjacent half. These
+// tests lock in the fix: prefix resolution is now unfiltered too, matching
+// the full-UUID contract. by-ID CRUD has no visibility boundary at all; the
+// Gate is the authz seam (ADR-007 Rev 6). This shares the namespace-agnostic
+// by-ID contract that `brain.feedback` now follows
+// (`brain_feedback_accepts_foreign_namespace_target_id` in
+// `khive-pack-brain/tests/dispatch_hook.rs`, #498).
+
+/// `get` by short prefix from a caller in a DIFFERENT namespace than the
+/// record must now succeed (was `NotFound` pre-#391).
+#[tokio::test]
+async fn get_entity_by_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsGet"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"].as_str().unwrap().to_string();
+    let prefix = &full_id[..8];
+
+    let result = f
+        .dispatch("get", json!({"id": prefix, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        result.is_ok(),
+        "get by prefix from a different namespace must succeed (#391 §3); got: {result:?}"
+    );
+    assert_eq!(result.unwrap()["id"].as_str(), Some(full_id.as_str()));
+}
+
+/// `get` by full UUID from a different namespace still succeeds — guards the
+/// already-working path this fix must not regress.
+#[tokio::test]
+async fn get_entity_by_full_uuid_cross_namespace_still_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "FullUuidCrossNsGet"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"].as_str().unwrap().to_string();
+
+    let result = f
+        .dispatch("get", json!({"id": full_id, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        result.is_ok(),
+        "get by full UUID from a different namespace must still succeed; got: {result:?}"
+    );
+}
+
+/// `update` by short prefix from a different namespace must now succeed.
+#[tokio::test]
+async fn update_entity_by_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsUpdate"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"].as_str().unwrap().to_string();
+    let prefix = &full_id[..8];
+
+    let result = f
+        .dispatch(
+            "update",
+            json!({"id": prefix, "namespace": "ns-caller", "description": "updated via prefix"}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "update by prefix from a different namespace must succeed (#391 §3); got: {result:?}"
+    );
+}
+
+/// `delete` (soft) by short prefix from a different namespace must now succeed.
+#[tokio::test]
+async fn soft_delete_entity_by_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsSoftDelete"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"].as_str().unwrap().to_string();
+    let prefix = &full_id[..8];
+
+    let result = f
+        .dispatch("delete", json!({"id": prefix, "namespace": "ns-caller"}))
+        .await;
+    assert!(
+        result.is_ok(),
+        "soft delete by prefix from a different namespace must succeed (#391 §3); got: {result:?}"
+    );
+}
+
+/// `delete(hard=true)` by short prefix from a different namespace must now
+/// succeed — mirrors `hard_delete_soft_deleted_entity_cross_namespace_succeeds`
+/// but resolves via prefix instead of full UUID.
+#[tokio::test]
+async fn hard_delete_entity_by_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsHardDelete"}),
+        )
+        .await
+        .expect("create must succeed");
+    let full_id = created["id"].as_str().unwrap().to_string();
+    let prefix = &full_id[..8];
+
+    f.dispatch("delete", json!({"id": full_id}))
+        .await
+        .expect("soft delete must succeed");
+
+    let result = f
+        .dispatch(
+            "delete",
+            json!({"id": prefix, "hard": true, "namespace": "ns-caller"}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "hard delete by prefix from a different namespace must succeed (#391 §3); got: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap().get("deleted").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+/// `merge` resolves both `into_id` and `from_id` by short prefix even when the
+/// caller is in a DIFFERENT namespace than the records — id resolution is no
+/// longer the blocker (pre-#391 this failed at resolution with
+/// `InvalidInput("no record matches prefix...")`). `merge_entity` separately
+/// enforces its OWN namespace-ownership check deep in the merge transaction
+/// (`curation.rs::merge_entity`, `belongs to namespace` — entirely downstream
+/// of and unrelated to id resolution). That is a deliberate, pre-existing
+/// mutation-safety constraint, not part of the #391 outage, and out of scope
+/// here (SPEC's own "merge if cheap" hedge: this is not cheap, it is a
+/// distinct design question). This test locks in exactly that boundary:
+/// resolution now succeeds, the ownership check still legitimately blocks the
+/// cross-namespace merge, and the failure mode is the ownership error, not a
+/// resolution error.
+#[tokio::test]
+async fn merge_entities_by_prefix_cross_namespace_resolves_then_hits_ownership_check() {
+    let f = pack();
+
+    let into_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsMergeInto"}),
+        )
+        .await
+        .expect("create into-entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixCrossNsMergeFrom"}),
+        )
+        .await
+        .expect("create from-entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let into_prefix = &into_full[..8];
+    let from_prefix = &from_full[..8];
+
+    let err = f
+        .dispatch(
+            "merge",
+            json!({"into_id": into_prefix, "from_id": from_prefix, "namespace": "ns-caller"}),
+        )
+        .await
+        .expect_err(
+            "cross-namespace merge must still fail (ownership check), just NOT at id resolution",
+        );
+
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("no record matches prefix"),
+        "#391 §3: prefix resolution must no longer be the failure — got a resolution-layer error: {msg}"
+    );
+    assert!(
+        msg.contains("belongs to namespace"),
+        "expected the deeper merge ownership check to fail instead; got: {msg}"
+    );
+}
+
+/// `merge` by short prefix within the records' own namespace still succeeds —
+/// guards the already-working path.
+#[tokio::test]
+async fn merge_entities_by_prefix_same_namespace_succeeds() {
+    let f = pack();
+
+    let into_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixSameNsMergeInto"}),
+        )
+        .await
+        .expect("create into-entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PrefixSameNsMergeFrom"}),
+        )
+        .await
+        .expect("create from-entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let into_prefix = &into_full[..8];
+    let from_prefix = &from_full[..8];
+
+    let result = f
+        .dispatch(
+            "merge",
+            json!({"into_id": into_prefix, "from_id": from_prefix}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "merge by prefix within the records' own namespace must succeed; got: {result:?}"
+    );
+}
+
+/// Negative: a hex prefix matching nothing resolves to `NotFound` even though
+/// resolution is now unfiltered — unfiltered means "no namespace predicate",
+/// not "match anything" (#391 §3).
+#[tokio::test]
+async fn get_by_prefix_with_no_match_returns_not_found() {
+    let f = pack();
+
+    let err = f
+        .dispatch("get", json!({"id": "deadbeef"}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "unmatched prefix must return NotFound; got: {err:?}"
+    );
+}
+
 /// Soft-delete an edge, then hard-delete it WITHOUT supplying explicit kind — must
 /// succeed and leave the row physically gone (ADR-002: public delete auto-detects).
 #[tokio::test]

@@ -260,7 +260,14 @@ pub(crate) async fn resolve_uuid_async(
     resolve_name_async(s, runtime, token).await
 }
 
-pub(crate) async fn resolve_uuid_including_deleted(
+/// By-ID contract (ADR-007 Rev 6): UUID resolution for get/update/delete/merge
+/// is namespace-agnostic — the Gate is the authz seam, not storage-layer
+/// filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this
+/// closes the gap for the *prefix* form, which previously fell through to the
+/// primary-namespace-only `resolve_prefix` and was invisible for any row
+/// stamped with a non-primary namespace (#391 §3). Exact copy of
+/// `resolve_uuid_async` except the prefix branch.
+pub(crate) async fn resolve_uuid_unfiltered(
     s: &str,
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -269,7 +276,32 @@ pub(crate) async fn resolve_uuid_including_deleted(
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_including_deleted(token, s).await {
+        match runtime.resolve_prefix_unfiltered(s).await {
+            Ok(Some(uuid)) => return Ok(uuid),
+            Ok(None) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "no record matches prefix: {s:?}"
+                )))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    resolve_name_async(s, runtime, token).await
+}
+
+/// `resolve_uuid_unfiltered`, including soft-deleted rows — used by the
+/// hard-delete by-ID path (#391 §3). Exact copy of
+/// `resolve_uuid_including_deleted` except the prefix branch.
+pub(crate) async fn resolve_uuid_unfiltered_including_deleted(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = Uuid::from_str(s) {
+        return Ok(uuid);
+    }
+    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        match runtime.resolve_prefix_unfiltered_including_deleted(s).await {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(

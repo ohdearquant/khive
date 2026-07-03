@@ -11,7 +11,7 @@ use khive_types::EventKind;
 
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
-    remap_note_status, resolve_uuid_async, to_json, GetParams,
+    remap_note_status, resolve_uuid_unfiltered, to_json, GetParams,
 };
 use crate::KgPack;
 
@@ -25,9 +25,11 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
 
-        let id = if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, graph_token).await {
+        // By-ID resolution (including the hex-prefix form) is namespace-agnostic
+        // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
+        let id = if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, graph_token).await {
             id
-        } else if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
+        } else if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, token).await {
             id
         } else {
             if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {

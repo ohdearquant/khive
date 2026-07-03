@@ -6,7 +6,8 @@ use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
     deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, parse_content_strategy,
-    parse_entity_policy, resolve_kind_spec, resolve_uuid_async, to_json, KindSpec, MergeParams,
+    parse_entity_policy, resolve_kind_spec, resolve_uuid_unfiltered, to_json, KindSpec,
+    MergeParams,
 };
 use crate::KgPack;
 
@@ -18,8 +19,10 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: MergeParams = deser(params)?;
-        let into_id = resolve_uuid_async(&p.into_id, &self.runtime, token).await?;
-        let from_id = resolve_uuid_async(&p.from_id, &self.runtime, token).await?;
+        // By-ID resolution (including the hex-prefix form) is namespace-agnostic
+        // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
+        let into_id = resolve_uuid_unfiltered(&p.into_id, &self.runtime, token).await?;
+        let from_id = resolve_uuid_unfiltered(&p.from_id, &self.runtime, token).await?;
         let raw_kind = p.kind.as_deref().unwrap_or("entity");
         let spec = resolve_kind_spec(raw_kind, registry)?;
         let policy = parse_entity_policy(p.strategy.as_deref().unwrap_or("prefer_into"))?;

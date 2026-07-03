@@ -32,8 +32,10 @@ def test_read_isolation_between_namespaces(
     Contract verified here:
     - get(id, namespace=beta) where entity lives in alpha: SUCCEEDS — full-UUID by-ID is
       namespace-agnostic (ADR-007 Rev 6 Rule 2, SHIPPED PR-A1 commit 2607e263).
-    - 8-char prefix get from beta: FAILS with not-found — prefix expansion is a namespace-scoped
-      lookup, distinct from the full-UUID by-ID path; ADR-007 Rule 2 covers "by UUID" only.
+    - 8-char prefix get from beta: SUCCEEDS — prefix expansion for by-ID ops is unfiltered
+      (issue #391 fix): the prefix path now matches the full-UUID by-ID contract instead of
+      silently narrowing it to the caller namespace. Ambiguity across namespaces errors;
+      a unique prefix resolves regardless of namespace.
     - list(namespace=beta): alpha entity ABSENT — multi-record namespace scoping survives.
     - search(namespace=beta): alpha entity ABSENT — multi-record namespace scoping survives.
     - get(id, namespace=alpha): SUCCEEDS — control path confirming same-namespace access.
@@ -102,22 +104,25 @@ def test_read_isolation_between_namespaces(
         f"Entity name mismatch: {fetched}"
     )
 
-    # 8-char prefix get from beta: prefix expansion is namespace-scoped (distinct from full-UUID
-    # by-ID path). ADR-007 Rule 2 covers "by UUID" only; prefix resolution expands via a
-    # namespace-scoped query and correctly returns not-found for a cross-namespace prefix.
+    # 8-char prefix get from beta: prefix expansion for by-ID CRUD is unfiltered (issue #391
+    # fix). The prior contract asserted not-found here, but that namespace-scoped prefix filter
+    # silently narrowed by-ID lookups to a boundary the full-UUID path never had (ADR-007 Rev 6
+    # Rule 2). Prefix resolution now matches the full-UUID by-ID contract: a unique prefix
+    # resolves regardless of namespace; an ambiguous prefix errors.
     prefix8 = full_id[:8]
     envelope_prefix = khive_session.request_batch([{
         "tool": "get",
         "args": {"id": prefix8, "namespace": ns_beta},
     }])
     first_prefix = envelope_prefix["results"][0]
-    assert not first_prefix.get("ok", False), (
-        "8-char prefix get from beta namespace must not resolve alpha entity: "
-        "prefix expansion is namespace-scoped (not the full-UUID by-ID path of ADR-007 Rule 2)"
+    assert first_prefix.get("ok", False), (
+        "8-char prefix get from beta namespace must resolve the alpha entity: by-ID prefix "
+        "expansion is unfiltered, matching the full-UUID by-ID contract "
+        f"(ADR-007 Rev 6 Rule 2, issue #391), got: {first_prefix}"
     )
-    err_prefix = first_prefix.get("error", "").lower()
-    assert "not found" in err_prefix or "no record" in err_prefix, (
-        f"Expected not-found prefix error from beta, got: {first_prefix.get('error')!r}"
+    prefix_result = first_prefix.get("result", {})
+    assert prefix_result.get("name") == "AlphaEntity", (
+        f"prefix get from beta must return AlphaEntity, got: {first_prefix}"
     )
 
 
