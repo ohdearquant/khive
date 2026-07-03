@@ -162,6 +162,7 @@ fn structural_checks(
     taxonomy: &KgTaxonomy,
 ) -> Vec<RuleResult> {
     let mut results = vec![
+        check_schema_compliance(entities_path, edges_path, notes_path),
         check_no_duplicate_uuids(entities_path),
         check_sort_order(entities_path, edges_path),
         check_referential_integrity(entities_path, notes_path, edges_path),
@@ -172,6 +173,136 @@ fn structural_checks(
         results.push(check_valid_note_kinds(notes_path, &taxonomy.note_kinds));
     }
     results
+}
+
+fn schema_violation(file: &str, line_no: usize, message: impl std::fmt::Display) -> Violation {
+    Violation {
+        entity_id: None,
+        entity_name: None,
+        entity_kind: None,
+        rule_id: "schema-compliance".into(),
+        severity: "error",
+        message: format!("{file} line {line_no}: {message}"),
+        fixable: false,
+    }
+}
+
+/// Fail-closed schema-compliance check: every non-empty NDJSON line in
+/// entities.ndjson, edges.ndjson, and (if present) notes.ndjson must parse as
+/// JSON and carry the minimal required fields for its record type. Unlike the
+/// other structural checks, malformed lines here are reported as violations
+/// instead of being silently skipped, so corrupt NDJSON cannot pass `kg
+/// validate` only to fail later in `kkernel sync` / `kg import`.
+fn check_schema_compliance(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+) -> RuleResult {
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(entities_path) {
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_no = idx + 1;
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    let missing: Vec<&str> = ["id", "kind", "name"]
+                        .into_iter()
+                        .filter(|f| v.get(f).and_then(|x| x.as_str()).is_none())
+                        .collect();
+                    if !missing.is_empty() {
+                        violations.push(schema_violation(
+                            "entities.ndjson",
+                            line_no,
+                            format!("missing required field(s): {}", missing.join(", ")),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    violations.push(schema_violation(
+                        "entities.ndjson",
+                        line_no,
+                        format!("invalid JSON: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Ok(content) = std::fs::read_to_string(edges_path) {
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_no = idx + 1;
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    let missing: Vec<&str> = ["source_id", "target_id", "relation"]
+                        .into_iter()
+                        .filter(|f| v.get(f).and_then(|x| x.as_str()).is_none())
+                        .collect();
+                    if !missing.is_empty() {
+                        violations.push(schema_violation(
+                            "edges.ndjson",
+                            line_no,
+                            format!("missing required field(s): {}", missing.join(", ")),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    violations.push(schema_violation(
+                        "edges.ndjson",
+                        line_no,
+                        format!("invalid JSON: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    // notes.ndjson is optional: an absent file is fine, a present-but-malformed
+    // file is not.
+    if notes_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(notes_path) {
+            for (idx, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let line_no = idx + 1;
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(v) => {
+                        let missing: Vec<&str> = ["id", "kind"]
+                            .into_iter()
+                            .filter(|f| v.get(f).and_then(|x| x.as_str()).is_none())
+                            .collect();
+                        if !missing.is_empty() {
+                            violations.push(schema_violation(
+                                "notes.ndjson",
+                                line_no,
+                                format!("missing required field(s): {}", missing.join(", ")),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        violations.push(schema_violation(
+                            "notes.ndjson",
+                            line_no,
+                            format!("invalid JSON: {e}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "schema-compliance".into(),
+        severity: "error",
+        passed: violations.is_empty(),
+        violations,
+    }
 }
 
 /// Format a record identifier prefix from the available violation fields.
@@ -770,11 +901,21 @@ pub(super) fn fix_sort_order(path: &Path, sort_key: &str) -> Result<()> {
     }
     let content =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut lines: Vec<serde_json::Value> = content
+    let mut lines: Vec<serde_json::Value> = Vec::new();
+    for (idx, l) in content
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let v = serde_json::from_str(l).with_context(|| {
+            format!(
+                "{} line {}: refusing to apply --fix over malformed JSON; run `kg validate` for details",
+                path.display(),
+                idx + 1
+            )
+        })?;
+        lines.push(v);
+    }
     lines.sort_by(|a, b| {
         let ak = a.get(sort_key).and_then(|v| v.as_str()).unwrap_or("");
         let bk = b.get(sort_key).and_then(|v| v.as_str()).unwrap_or("");
@@ -794,11 +935,21 @@ fn fix_sort_order_edges(path: &Path) -> Result<()> {
     }
     let content =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut lines: Vec<serde_json::Value> = content
+    let mut lines: Vec<serde_json::Value> = Vec::new();
+    for (idx, l) in content
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let v = serde_json::from_str(l).with_context(|| {
+            format!(
+                "{} line {}: refusing to apply --fix over malformed JSON; run `kg validate` for details",
+                path.display(),
+                idx + 1
+            )
+        })?;
+        lines.push(v);
+    }
     lines.sort_by(|a, b| {
         let ak = (
             a.get("source_id").and_then(|v| v.as_str()).unwrap_or(""),
@@ -949,6 +1100,78 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(kg_dir.join("notes.ndjson"), content + "\n").unwrap();
+    }
+
+    // ── Schema-compliance tests (#437) ────────────────────────────────────────
+
+    #[test]
+    fn schema_compliance_rejects_malformed_entities_ndjson() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        std::fs::write(kg_dir.join("entities.ndjson"), "not-valid-json\n").unwrap();
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+
+        let taxonomy = KgTaxonomy {
+            entity_kinds: base_entity_kinds(),
+            note_kinds: base_note_kinds(),
+        };
+        let results = structural_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &taxonomy,
+        );
+
+        let schema_rule = results
+            .iter()
+            .find(|r| r.id == "schema-compliance")
+            .expect("schema-compliance rule must always run");
+        assert!(
+            !schema_rule.passed,
+            "malformed NDJSON must fail schema-compliance"
+        );
+        assert!(
+            schema_rule.violations[0]
+                .message
+                .contains("entities.ndjson line 1"),
+            "violation must point at the malformed line: {}",
+            schema_rule.violations[0].message
+        );
+    }
+
+    #[test]
+    fn schema_compliance_passes_well_formed_kg_and_absent_notes() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        write_edges(&kg_dir, &[]);
+
+        let result = check_schema_compliance(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+        );
+        assert!(
+            result.passed,
+            "well-formed KG with absent notes.ndjson must pass: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn fix_sort_order_refuses_malformed_json() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let path = kg_dir.join("entities.ndjson");
+        std::fs::write(&path, "not-valid-json\n").unwrap();
+
+        let err = fix_sort_order(&path, "id").expect_err("fix must refuse malformed JSON");
+        assert!(err.to_string().contains("line 1"));
+        // The file must be left untouched, not truncated/dropped.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not-valid-json\n");
     }
 
     // ── Entity kind tests ─────────────────────────────────────────────────────
