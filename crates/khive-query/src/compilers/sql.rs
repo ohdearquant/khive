@@ -26,6 +26,40 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
     }
 }
 
+/// Union of every primary-substrate table (entities, notes, events, graph_edges)
+/// that can legally bind to a canonical `-[:relation]->` endpoint (issue #467).
+/// Canonical edge endpoints are not entity-only: `annotates` admits note/entity/
+/// note/event/edge targets, and same-substrate relations like `supports` admit
+/// note-note pairs. This source lets node binding stay substrate-agnostic instead
+/// of hard-coding `entities`.
+const PRIMARY_NODE_SQL: &str = "\
+    SELECT id, namespace, kind, entity_type, name, description, NULL AS content, \
+           NULL AS status, NULL AS salience, NULL AS decay_factor, properties, \
+           created_at, updated_at, deleted_at, 'entity' AS substrate_kind \
+      FROM entities \
+    UNION ALL \
+    SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
+           content, status, salience, decay_factor, properties, \
+           created_at, updated_at, deleted_at, 'note' AS substrate_kind \
+      FROM notes \
+    UNION ALL \
+    SELECT id, namespace, kind, NULL AS entity_type, verb AS name, \
+           NULL AS description, NULL AS content, NULL AS status, \
+           NULL AS salience, NULL AS decay_factor, payload AS properties, \
+           created_at, created_at AS updated_at, NULL AS deleted_at, \
+           'event' AS substrate_kind \
+      FROM events \
+    UNION ALL \
+    SELECT id, namespace, relation AS kind, NULL AS entity_type, NULL AS name, \
+           NULL AS description, NULL AS content, NULL AS status, \
+           NULL AS salience, NULL AS decay_factor, metadata AS properties, \
+           created_at, updated_at, deleted_at, 'edge' AS substrate_kind \
+      FROM graph_edges";
+
+fn primary_node_source(alias: &str) -> String {
+    format!("({PRIMARY_NODE_SQL}) {alias}")
+}
+
 /// Parameterized SQL emitted by the compiler, ready for execution by the runtime.
 #[derive(Debug)]
 pub struct CompiledQuery {
@@ -184,11 +218,9 @@ fn compile_fixed_length(
                 if node_idx == 0 {
                     if is_event_source {
                         from_parts.push(format!("events {alias}"));
-                    } else {
+                    } else if !is_note_target {
                         // Note targets are joined by the synthetic edge handler, not FROM.
-                        if !is_note_target {
-                            from_parts.push(format!("entities {alias}"));
-                        }
+                        from_parts.push(primary_node_source(&alias));
                     }
                 }
 
@@ -401,7 +433,8 @@ fn compile_fixed_length(
                     }
 
                     join_parts.push(format!(
-                        "JOIN entities {next_alias} ON {next_alias}.id = {next_join_col}"
+                        "JOIN {} ON {next_alias}.id = {next_join_col}",
+                        primary_node_source(&next_alias)
                     ));
 
                     if !ep.relations.is_empty() {
@@ -1186,11 +1219,11 @@ fn compile_variable_length(
     // `r.namespace` (and possibly r.kind / r.properties) regardless of whether
     // it appears in RETURN.
     let join_start = if has_start {
-        "JOIN entities s ON s.id = t.start_id"
+        "JOIN primary_nodes s ON s.id = t.start_id"
     } else {
         ""
     };
-    let join_end = "JOIN entities r ON r.id = t.current_id";
+    let join_end = "JOIN primary_nodes r ON r.id = t.current_id";
 
     // Build the next-node namespace filter clause (may be empty).
     // Already pushed into params by namespace_filter above.
@@ -1201,10 +1234,11 @@ fn compile_variable_length(
     };
 
     let sql = format!(
-        "WITH RECURSIVE traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
+        "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
+         traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
                     e.id, e.relation, e.weight \
-             FROM entities s \
+             FROM primary_nodes s \
              JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE {start_where} \
              UNION ALL \
@@ -1214,7 +1248,7 @@ fn compile_variable_length(
                     e.id, e.relation, e.weight \
              FROM traverse t CROSS JOIN graph_edges e \
                  ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
-             JOIN entities next_node ON next_node.id = ({recurse_next}) \
+             JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
                     AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE t.depth < ?{depth_param} \
                AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
@@ -1225,6 +1259,7 @@ fn compile_variable_length(
          WHERE {end_where} \
          ORDER BY t.depth, t.total_weight DESC, t.start_id, t.current_id \
          LIMIT ?{limit_param}",
+        primary_nodes = PRIMARY_NODE_SQL,
         seed_next = seed_next,
         seed_join = seed_join,
         e_ns_filter = e_ns_filter,
@@ -1541,8 +1576,8 @@ mod tests {
         let q = gql::parse("MATCH (a:concept)-[:extends*1..3]->(b) RETURN a LIMIT 10").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
-            compiled.sql.contains("JOIN entities r"),
-            "entities r must always be joined when r.* conditions are emitted; sql: {}",
+            compiled.sql.contains("JOIN primary_nodes r"),
+            "primary_nodes r must always be joined when r.* conditions are emitted; sql: {}",
             compiled.sql
         );
     }
@@ -1590,9 +1625,7 @@ mod tests {
             compiled.sql
         );
         assert!(
-            compiled
-                .sql
-                .contains("JOIN entities n1 ON n1.id = e0.target_id"),
+            compiled.sql.contains("ON n1.id = e0.target_id"),
             "SPARQL object must bind graph_edges.target_id; sql: {}",
             compiled.sql
         );
@@ -2096,8 +2129,8 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         // The recursive CTE member must join next_node to filter deleted intermediates.
         assert!(
-            compiled.sql.contains("JOIN entities next_node"),
-            "recursive CTE must join entities next_node for deleted-intermediate filtering; sql: {}",
+            compiled.sql.contains("JOIN primary_nodes next_node"),
+            "recursive CTE must join primary_nodes next_node for deleted-intermediate filtering; sql: {}",
             compiled.sql
         );
         assert!(
@@ -2278,6 +2311,89 @@ mod tests {
         assert!(
             matches!(err, QueryError::Validation(_)),
             "unknown synthetic relation must return Validation error; got {err:?}"
+        );
+    }
+
+    // --- Issue #467: canonical edge queries must admit legal note endpoints ---
+
+    /// `annotates` is the cross-substrate relation: note -> entity/note/event/edge.
+    /// Endpoints must not be hard-bound to `entities` only.
+    #[test]
+    fn canonical_edge_annotates_compiles_note_source_and_any_target_substrate() {
+        let q = gql::parse("MATCH (n)-[:annotates]->(x) RETURN n.id, x.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            !compiled.sql.contains("FROM entities n0"),
+            "endpoint must not be hard-bound to entities only; sql: {}",
+            compiled.sql
+        );
+        for table in ["FROM notes", "FROM events", "FROM graph_edges"] {
+            assert!(
+                compiled.sql.contains(table),
+                "endpoint source must admit {table} rows for annotates; sql: {}",
+                compiled.sql
+            );
+        }
+    }
+
+    /// `supports` is same-substrate: note -> note (or entity -> entity). A
+    /// legal note-note pair must be able to bind through the endpoint source.
+    #[test]
+    fn canonical_edge_supports_compiles_note_note_endpoints() {
+        let q = gql::parse("MATCH (a)-[:supports]->(b) RETURN a.id, b.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.sql.matches("FROM notes").count(),
+            2,
+            "both supports endpoints must admit note rows; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// Pack-declared `depends_on` on task-kind notes must bind through the
+    /// endpoint source rather than being restricted to `entities`.
+    #[test]
+    fn canonical_edge_depends_on_compiles_pack_task_note_endpoints() {
+        let q = gql::parse("MATCH (a:task)-[:depends_on]->(b:task) RETURN a.id, b.id LIMIT 10")
+            .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.sql.matches("FROM notes").count(),
+            2,
+            "task-kind depends_on endpoints must admit note rows; sql: {}",
+            compiled.sql
+        );
+        let task_params = compiled
+            .params
+            .iter()
+            .filter(|p| matches!(p, QueryValue::Text(s) if s == "task"))
+            .count();
+        assert_eq!(
+            task_params, 2,
+            "kind='task' must be bound for both endpoints"
+        );
+    }
+
+    /// Variable-length canonical traversal must bind seed, intermediate, and
+    /// final endpoints to the primary substrate union, not `entities` only.
+    #[test]
+    fn variable_length_canonical_compiles_primary_substrate_nodes() {
+        let q = gql::parse("MATCH (a)-[:supports*1..2]->(b) RETURN b.id LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            !compiled.sql.contains("FROM entities s"),
+            "seed must not be hard-bound to entities only; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("JOIN primary_nodes next_node"),
+            "intermediate must join primary_nodes; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("JOIN primary_nodes r"),
+            "final endpoint must join primary_nodes; sql: {}",
+            compiled.sql
         );
     }
 }
