@@ -181,6 +181,61 @@ fn test_weighted_strategy_preserves_pack_weights() {
 }
 
 #[test]
+fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
+    let base = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 60 },
+        ..RecallConfig::default()
+    };
+
+    let p = RecallParams {
+        query: "test".to_string(),
+        limit: None,
+        memory_type: None,
+        min_score: None,
+        min_salience: None,
+        config: None,
+        top_k: None,
+        fusion_strategy: Some("weighted".to_string()),
+        score_floor: None,
+        embedding_model: None,
+        include_breakdown: None,
+        tags: None,
+        tag_mode: TagMode::Any,
+        entity_names: None,
+        full_content: None,
+    };
+
+    let mut cfg = p.effective_config(base);
+    if let Some(ref fs) = p.fusion_strategy {
+        let mut new_strategy = parse_fusion_strategy_str(fs).unwrap();
+        if let (
+            FusionStrategy::Weighted {
+                weights: ref mut new_w,
+            },
+            FusionStrategy::Weighted {
+                weights: ref existing_w,
+            },
+        ) = (&mut new_strategy, &cfg.fuse_strategy)
+        {
+            *new_w = existing_w.clone();
+        }
+        cfg.fuse_strategy = new_strategy;
+    }
+
+    match cfg.fuse_strategy {
+        FusionStrategy::Weighted { weights } => {
+            assert_eq!(
+                weights,
+                vec![0.7, 0.3],
+                "fusion_strategy=weighted must fall back to vector-heavy defaults [0.7, 0.3] \
+                 when overriding a non-Weighted (e.g. RRF) effective config"
+            );
+        }
+        other => panic!("expected Weighted strategy, got {other:?}"),
+    }
+}
+
+#[test]
 fn fusion_strategy_change_produces_observable_ordering_difference() {
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use std::collections::HashSet;

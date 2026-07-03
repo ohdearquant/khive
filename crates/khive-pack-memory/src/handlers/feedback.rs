@@ -31,6 +31,7 @@ impl MemoryPack {
         let p: FeedbackParams = serde_json::from_value(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.feedback: invalid params: {e}"))
         })?;
+        validate_feedback_signal(&p.signal)?;
 
         let target_id = p.target_id.parse::<Uuid>().map_err(|_| {
             RuntimeError::InvalidInput(format!(
@@ -58,6 +59,22 @@ impl MemoryPack {
         }
 
         Ok(json!({ "ok": true, "target_id": p.target_id, "signal": p.signal }))
+    }
+}
+
+/// Validate that `signal` is a known feedback vocabulary entry before it is routed
+/// to any tier. Tier-3 (`on_explicit_feedback`) silently no-ops on unknown strings,
+/// which would otherwise let an invalid signal return `ok=true`.
+fn validate_feedback_signal(signal: &str) -> Result<(), RuntimeError> {
+    let semantic = khive_brain_core::FeedbackEventKind::from_signal_str(signal).is_some();
+    let legacy = serde_json::from_value::<khive_brain_core::FeedbackSignal>(json!(signal)).is_ok();
+    if semantic || legacy {
+        Ok(())
+    } else {
+        Err(RuntimeError::InvalidInput(format!(
+            "memory.feedback: invalid signal {signal:?}; valid: useful | not_useful | wrong | \
+             explicit_positive | explicit_negative | implicit_positive | implicit_negative | correction"
+        )))
     }
 }
 
@@ -126,7 +143,7 @@ async fn resolve_namespace_profile(
 #[cfg(test)]
 mod tests {
     use khive_pack_kg::KgPack;
-    use khive_runtime::{Namespace, RuntimeConfig, VerbRegistryBuilder};
+    use khive_runtime::{Namespace, RuntimeConfig, RuntimeError, VerbRegistryBuilder};
 
     fn build_memory_rt(brain_profile: Option<String>) -> khive_runtime::KhiveRuntime {
         let tmp = tempfile::Builder::new()
@@ -233,6 +250,56 @@ mod tests {
 
         assert_eq!(r["ok"], true);
         assert_eq!(r["signal"], "not_useful");
+    }
+
+    /// Tier-3: an invalid signal string must be rejected before it reaches
+    /// `on_explicit_feedback`, which otherwise silently no-ops and still
+    /// returns `ok=true` (AUD-004).
+    #[tokio::test]
+    async fn feedback_tier3_invalid_signal_is_rejected() {
+        let rt = build_memory_rt(None);
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+
+        let note_id = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "invalid signal note",
+                Some(0.5),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+
+        let memory_pack = crate::MemoryPack::new(rt.clone());
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(memory_pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.feedback",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "target_id": note_id.id.to_string(),
+                    "signal": "bad_value",
+                }),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "invalid signal must be rejected, got {:?}",
+            result
+        );
+        assert!(matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)));
     }
 
     /// Tier-1: explicit brain_profile config routes to brain.feedback (which errors
