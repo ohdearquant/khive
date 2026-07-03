@@ -172,8 +172,13 @@ where
                 fuse(sources, safe, top_k).expect("non-Custom strategies are infallible")
             }
             DualIndexStrategy::Weighted { primary_weight } => {
-                let w = primary_weight.clamp(0.0, 1.0);
-                let strategy = FusionStrategy::weighted(vec![w, 1.0 - w]);
+                let w = if primary_weight.is_nan() {
+                    0.5
+                } else {
+                    primary_weight.clamp(0.0, 1.0)
+                };
+                let strategy = FusionStrategy::try_weighted(vec![w, 1.0 - w])
+                    .unwrap_or_else(|_| FusionStrategy::weighted(vec![0.5, 0.5]));
                 let sources = vec![primary_results, legacy_results];
                 fuse(sources, &strategy, top_k).expect("Weighted is infallible")
             }
@@ -366,6 +371,38 @@ mod tests {
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"b"));
         assert!(ids.contains(&"c"));
+    }
+
+    #[test]
+    fn test_merge_weighted_non_finite_weights_do_not_panic() {
+        let cases = [
+            (f64::NAN, vec!["a_primary", "z_legacy"]),
+            (f64::INFINITY, vec!["a_primary"]),
+            (f64::NEG_INFINITY, vec!["z_legacy"]),
+        ];
+
+        for (primary_weight, expected_ids) in cases {
+            let config = DualIndexConfig::default()
+                .with_strategy(DualIndexStrategy::Weighted { primary_weight });
+            let router = DualIndexRouter::<String>::new(config);
+
+            let result = std::panic::catch_unwind(|| {
+                router.merge_results(
+                    make_results(vec![("a_primary", 0.9)]),
+                    make_results(vec![("z_legacy", 0.8)]),
+                    10,
+                )
+            });
+
+            assert!(
+                result.is_ok(),
+                "merge_results must not panic for primary_weight={primary_weight}"
+            );
+
+            let merged = result.unwrap();
+            let ids: Vec<_> = merged.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, expected_ids);
+        }
     }
 
     #[test]
