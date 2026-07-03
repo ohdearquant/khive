@@ -291,48 +291,170 @@ pub async fn run_sync_remote(
         }
     }
 
-    // ── 5. Atomically publish to cache ────────────────────────────────────────
-    let cache_dir = repo_root
-        .join(".khive/kg/remotes")
-        .join(remote.name.as_str());
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-
-    // Write files into staging first, then rename into place atomically.
-    let tmp_entities = cache_dir.with_extension("entities.tmp");
-    let tmp_edges = cache_dir.with_extension("edges.tmp");
-
-    write_sorted_entities(&tmp_entities, &entities_ndjson)
-        .context("writing staged entities.ndjson")?;
-    write_sorted_edges(&tmp_edges, &edges_ndjson).context("writing staged edges.ndjson")?;
-
-    std::fs::rename(&tmp_entities, cache_dir.join("entities.ndjson"))
-        .context("renaming entities.ndjson into cache")?;
-    std::fs::rename(&tmp_edges, cache_dir.join("edges.ndjson"))
-        .context("renaming edges.ndjson into cache")?;
-
-    // ── 6. Write meta.json ────────────────────────────────────────────────────
+    // ── 5. Build meta and atomically publish to cache ─────────────────────────
     let meta = MetaJson {
         fetched_at: Utc::now().to_rfc3339(),
         git_ref: remote.git_ref.clone(),
         commit_sha,
         content_hash: actual_hash.as_str().to_string(),
     };
-    let meta_path = cache_dir.join("meta.json");
-    let meta_json = serde_json::to_string_pretty(&meta).context("serializing meta.json")?;
-    std::fs::write(&meta_path, meta_json.as_bytes()).context("writing meta.json")?;
 
-    // staging tempdir is dropped here, cleaning up the clone.
+    let remotes_root = repo_root.join(".khive/kg/remotes");
+    let cache_dir = remotes_root.join(remote.name.as_str());
+    let published = publish_remote_cache(
+        &remotes_root,
+        remote.name.as_str(),
+        &entities_ndjson,
+        &edges_ndjson,
+        &meta,
+        #[cfg(test)]
+        None,
+    )
+    .with_context(|| format!("publishing cache for remote {:?}", remote.name))?;
+    debug_assert_eq!(published, cache_dir);
+
+    // staging tempdir (the git clone) is dropped here, cleaning up the clone.
     drop(staging);
 
     Ok(RemoteSyncReport {
         entities: entities_ndjson.len(),
         edges: edges_ndjson.len(),
         cache_dir: cache_dir.to_string_lossy().into_owned(),
-        meta_path: meta_path.to_string_lossy().into_owned(),
+        meta_path: cache_dir.join("meta.json").to_string_lossy().into_owned(),
         content_hash: actual_hash.as_str().to_string(),
         repinned: repin,
     })
+}
+
+/// Injection points for #475 failure-injection tests: simulate a crash at each
+/// publish step so tests can assert readers never observe a mixed cache state.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishFailAt {
+    AfterEntities,
+    AfterEdges,
+    AfterMeta,
+    BeforeSwap,
+}
+
+/// Publish a complete `{entities.ndjson, edges.ndjson, meta.json}` triple to
+/// `<remotes_root>/<name>/` as a single atomic unit.
+///
+/// Builds a complete staging directory (a sibling of the cache directory,
+/// under `remotes_root`) containing all three files, then switches visibility
+/// with one directory-rename swap ([`atomic_replace_dir`]). A crash or error
+/// at any point before the swap leaves the existing cache untouched; a crash
+/// or error during the swap either leaves the old cache in place or completes
+/// to the new cache — a reader never observes a mix of old and new files.
+fn publish_remote_cache(
+    remotes_root: &Path,
+    name: &str,
+    entities: &[NdjsonEntity],
+    edges: &[NdjsonEdge],
+    meta: &MetaJson,
+    #[cfg(test)] fail_at: Option<PublishFailAt>,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(remotes_root)
+        .with_context(|| format!("creating {}", remotes_root.display()))?;
+    let staging = tempfile::TempDir::new_in(remotes_root).context("creating staging dir")?;
+
+    write_sorted_entities(&staging.path().join("entities.ndjson"), entities)
+        .context("writing staged entities.ndjson")?;
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterEntities) {
+        anyhow::bail!("injected failure after staged entities write");
+    }
+
+    write_sorted_edges(&staging.path().join("edges.ndjson"), edges)
+        .context("writing staged edges.ndjson")?;
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterEdges) {
+        anyhow::bail!("injected failure after staged edges write");
+    }
+
+    let meta_json = serde_json::to_string_pretty(meta).context("serializing meta.json")?;
+    std::fs::write(staging.path().join("meta.json"), meta_json.as_bytes())
+        .context("writing staged meta.json")?;
+    fsync_dir_best_effort(staging.path());
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterMeta) {
+        anyhow::bail!("injected failure after staged meta write, before swap");
+    }
+
+    let cache_dir = remotes_root.join(name);
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::BeforeSwap) {
+        anyhow::bail!("injected failure before swap");
+    }
+    atomic_replace_dir(staging.path(), &cache_dir)?;
+    fsync_dir_best_effort(remotes_root);
+
+    Ok(cache_dir)
+}
+
+/// Atomically replace `target_dir` with `new_dir` (a complete, ready-to-serve
+/// directory). If `target_dir` does not exist yet, `new_dir` is simply renamed
+/// into place. If `target_dir` already exists, the existing directory is first
+/// renamed to a sibling backup path, then `new_dir` is renamed into
+/// `target_dir`'s place; the backup is removed only after the swap succeeds.
+/// If the second rename fails, the backup is restored so the old cache is
+/// never lost. Both renames are single filesystem rename(2) calls, each of
+/// which is atomic — at every instant `target_dir` resolves to either the
+/// complete old directory, is briefly absent, or resolves to the complete new
+/// directory; it never contains a mix of old and new files.
+fn atomic_replace_dir(new_dir: &Path, target_dir: &Path) -> Result<()> {
+    if !target_dir.exists() {
+        std::fs::rename(new_dir, target_dir).with_context(|| {
+            format!("renaming {} -> {}", new_dir.display(), target_dir.display())
+        })?;
+        return Ok(());
+    }
+
+    let backup = target_dir.with_file_name(format!(
+        "{}.replaced-{}",
+        target_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&backup);
+
+    std::fs::rename(target_dir, &backup).with_context(|| {
+        format!(
+            "backing up existing cache {} -> {}",
+            target_dir.display(),
+            backup.display()
+        )
+    })?;
+
+    match std::fs::rename(new_dir, target_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // Restore the old cache so a failed swap never leaves the target missing.
+            let _ = std::fs::rename(&backup, target_dir);
+            Err(e).with_context(|| {
+                format!(
+                    "renaming {} -> {} (old cache restored)",
+                    new_dir.display(),
+                    target_dir.display()
+                )
+            })
+        }
+    }
+}
+
+/// Best-effort `fsync` of a directory's entries, where the platform supports
+/// opening a directory as a file handle (Unix). Errors are ignored: this is a
+/// durability improvement, not a correctness requirement for the atomicity
+/// guarantee above (which relies on rename(2) semantics, not fsync).
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 /// Redact URLs and embedded credentials from git stderr before surfacing in errors.
@@ -1306,6 +1428,196 @@ mod tests {
             !outside_target.exists(),
             "nothing must be written outside the repo root"
         );
+    }
+
+    // ── #475 atomic publish failure-injection tests (VCS-AUD-003) ───────────────
+
+    fn sample_entity(id: &str, name: &str) -> NdjsonEntity {
+        NdjsonEntity {
+            id: id.parse().unwrap(),
+            kind: "concept".to_string(),
+            entity_type: None,
+            name: name.to_string(),
+            description: None,
+            properties: Some(serde_json::json!({})),
+            tags: vec![],
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn sample_meta(tag: &str) -> MetaJson {
+        MetaJson {
+            fetched_at: "2026-01-01T00:00:00Z".to_string(),
+            git_ref: "main".to_string(),
+            commit_sha: "deadbeef".to_string(),
+            content_hash: format!("sha256:{tag}"),
+        }
+    }
+
+    /// Publish an "old" cache generation successfully, used as the baseline
+    /// state that a subsequent failed publish must leave untouched.
+    fn publish_old_generation(remotes_root: &Path, name: &str) -> PathBuf {
+        let entities = vec![sample_entity(
+            "11111111-1111-1111-1111-111111111111",
+            "OldEntity",
+        )];
+        publish_remote_cache(
+            remotes_root,
+            name,
+            &entities,
+            &[],
+            &sample_meta("old"),
+            None,
+        )
+        .expect("baseline publish must succeed")
+    }
+
+    fn assert_cache_is_old_generation(cache_dir: &Path) {
+        let entities = std::fs::read_to_string(cache_dir.join("entities.ndjson")).unwrap();
+        assert!(
+            entities.contains("OldEntity"),
+            "cache entities must still be the old generation, got: {entities}"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["content_hash"], "sha256:old");
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_entities_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterEntities),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_edges_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterEdges),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_meta_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterMeta),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    /// Failure injected immediately before the directory swap: the staged
+    /// directory is fully built but never made visible, so the reader-visible
+    /// cache must still be exactly the old generation.
+    #[test]
+    fn remote_cache_publish_failure_before_swap_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::BeforeSwap),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    /// A successful publish exposes the complete new entities+edges+meta
+    /// together — never a partial mix with the previous generation.
+    #[test]
+    fn remote_cache_publish_success_exposes_complete_new_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+        assert_cache_is_old_generation(&cache_dir);
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let published = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            None,
+        )
+        .expect("publish must succeed");
+        assert_eq!(published, cache_dir);
+
+        let entities = std::fs::read_to_string(cache_dir.join("entities.ndjson")).unwrap();
+        assert!(entities.contains("NewEntity"));
+        assert!(
+            !entities.contains("OldEntity"),
+            "old generation entity must not linger after a successful publish"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["content_hash"], "sha256:new");
     }
 
     // ── F201 tests ────────────────────────────────────────────────────────────
