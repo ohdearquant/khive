@@ -436,6 +436,54 @@ async fn test_valid_json_wrong_schema_bm25() {
 }
 
 #[tokio::test]
+async fn test_schema_valid_bad_bm25_snapshot_returns_deserialize() {
+    let persist = setup_test_persistence().await;
+
+    // Schema-valid BM25 JSON (all required fields present with correct types),
+    // but internally inconsistent: doc_lengths has a live doc_id (0) that is
+    // out of range because next_internal_id is 0. This must be rejected by
+    // Bm25Index's cross-field validation (issue #446), not just its shape.
+    {
+        let conn = persist.conn.clone();
+        let namespace = "test".to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let bad_snapshot = br#"{
+                "inverted_index": {},
+                "doc_lengths": {"0": 1},
+                "id_to_internal": {},
+                "internal_to_id": [],
+                "next_internal_id": 0,
+                "total_tokens": 1,
+                "postings_epoch": 0,
+                "block_size": 128,
+                "config": {"k1": 1.2, "b": 0.75, "memory_budget": null}
+            }"#;
+            conn.execute(
+                r#"
+                INSERT OR REPLACE INTO retrieval_snapshots
+                    (namespace, index_type, snapshot, created_at)
+                VALUES
+                    (?1, 'bm25', ?2, strftime('%s', 'now'))
+                "#,
+                rusqlite::params![namespace, bad_snapshot.as_slice()],
+            )
+            .expect("insert schema-valid but inconsistent snapshot");
+        })
+        .await
+        .expect("spawn");
+    }
+
+    let result = persist.load_bm25_index().await;
+    assert!(
+        result.is_err(),
+        "loading a schema-valid but invariant-broken snapshot should fail"
+    );
+    let err = result.unwrap_err();
+    assert!(matches!(err, PersistError::Deserialize(_)));
+}
+
+#[tokio::test]
 async fn test_valid_json_wrong_schema_hnsw() {
     let persist = setup_test_persistence().await;
 

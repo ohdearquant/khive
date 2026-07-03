@@ -201,17 +201,83 @@ impl<'de> serde::Deserialize<'de> for Bm25Index {
             .validate()
             .map_err(|e| D::Error::custom(format!("invalid config: {e}")))?;
 
-        // Validate: PostingList doc_ids must reference valid internal IDs.
-        // Each doc_id in a posting list must exist in doc_lengths.
+        // Validate: every live doc_id (a doc_lengths key) must be in range and have a
+        // consistent internal_to_id / id_to_internal mapping; accumulate a checked sum
+        // of doc_lengths so total_tokens can be cross-checked below.
+        let mut checked_total: usize = 0;
+        for (&internal_id, &len) in &wire.doc_lengths {
+            if internal_id == u32::MAX || internal_id >= wire.next_internal_id {
+                return Err(D::Error::custom(format!(
+                    "doc_lengths contains invalid live doc_id {internal_id} (next_internal_id={})",
+                    wire.next_internal_id
+                )));
+            }
+            let external = wire
+                .internal_to_id
+                .get(internal_id as usize)
+                .ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "missing internal_to_id entry for live doc_id {internal_id}"
+                    ))
+                })?;
+            match wire.id_to_internal.get(external.as_ref() as &str) {
+                Some(&mapped) if mapped == internal_id => {}
+                _ => {
+                    return Err(D::Error::custom(format!(
+                        "id_to_internal does not map '{external}' back to live doc_id {internal_id}"
+                    )));
+                }
+            }
+            checked_total = checked_total.checked_add(len).ok_or_else(|| {
+                D::Error::custom("total_tokens overflow while summing doc_lengths")
+            })?;
+        }
+
+        // Validate: every id_to_internal entry must point at a live, in-range doc that
+        // reverse-maps back through internal_to_id to the same external ID.
+        for (external_id, &internal_id) in &wire.id_to_internal {
+            if internal_id == u32::MAX
+                || internal_id >= wire.next_internal_id
+                || !wire.doc_lengths.contains_key(&internal_id)
+            {
+                return Err(D::Error::custom(format!(
+                    "id_to_internal maps '{external_id}' to non-live doc_id {internal_id}"
+                )));
+            }
+            let reverse = wire
+                .internal_to_id
+                .get(internal_id as usize)
+                .ok_or_else(|| {
+                    D::Error::custom(format!("missing internal_to_id entry for '{external_id}'"))
+                })?;
+            if reverse.as_ref() != external_id.as_str() {
+                return Err(D::Error::custom(format!(
+                    "internal_to_id[{internal_id}] does not reverse-map to '{external_id}'"
+                )));
+            }
+        }
+
+        // Validate: PostingList doc_ids must reference only live, in-range doc IDs.
         for (term, postings) in &wire.inverted_index {
             for &doc_id in &postings.doc_ids {
-                if !wire.doc_lengths.contains_key(&doc_id) {
+                if doc_id == u32::MAX
+                    || doc_id >= wire.next_internal_id
+                    || !wire.doc_lengths.contains_key(&doc_id)
+                {
                     return Err(D::Error::custom(format!(
-                        "PostingList for term '{}' references doc_id {} not in doc_lengths",
+                        "PostingList for term '{}' references non-live doc_id {}",
                         term, doc_id
                     )));
                 }
             }
+        }
+
+        // Validate: total_tokens must equal the checked sum of doc_lengths.
+        if wire.total_tokens != checked_total {
+            return Err(D::Error::custom(format!(
+                "total_tokens {} does not match doc_lengths sum {}",
+                wire.total_tokens, checked_total
+            )));
         }
 
         // Build the derived caches from the persisted data.
@@ -853,6 +919,119 @@ mod regression_tests {
             results.len(),
             4,
             "all documents must be found in clone after block_max_state lock was poisoned"
+        );
+    }
+
+    /// A schema-valid single-live-doc wire snapshot: doc "doc0" -> internal id 0,
+    /// one posting for term "alpha". Tests corrupt one field at a time from this base.
+    fn valid_single_doc_json() -> serde_json::Value {
+        serde_json::json!({
+            "inverted_index": {
+                "alpha": { "doc_ids": [0], "term_freqs": [1] }
+            },
+            "doc_lengths": { "0": 1 },
+            "id_to_internal": { "doc0": 0 },
+            "internal_to_id": ["doc0"],
+            "next_internal_id": 1,
+            "total_tokens": 1,
+            "postings_epoch": 0,
+            "block_size": 128,
+            "config": { "k1": 1.2, "b": 0.75, "memory_budget": null }
+        })
+    }
+
+    #[test]
+    fn deserialize_rejects_doc_length_id_at_u32_max() {
+        let json = serde_json::json!({
+            "inverted_index": {},
+            "doc_lengths": { "4294967295": 1 },
+            "id_to_internal": {},
+            "internal_to_id": [],
+            "next_internal_id": 0,
+            "total_tokens": 1,
+            "postings_epoch": 0,
+            "block_size": 128,
+            "config": { "k1": 1.2, "b": 0.75, "memory_budget": null }
+        });
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid live doc_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_live_doc_id_at_or_above_next_internal_id() {
+        let mut json = valid_single_doc_json();
+        // doc_lengths key 0 is fine, but shift next_internal_id below it.
+        json["next_internal_id"] = serde_json::json!(0);
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid live doc_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_posting_id_at_or_above_next_internal_id() {
+        let mut json = valid_single_doc_json();
+        json["doc_lengths"] = serde_json::json!({ "0": 1, "5": 1 });
+        json["inverted_index"] = serde_json::json!({
+            "alpha": { "doc_ids": [0, 5], "term_freqs": [1, 1] }
+        });
+        json["total_tokens"] = serde_json::json!(2);
+        // next_internal_id stays 1, so doc_id 5 is out of range for both doc_lengths and postings.
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid live doc_id")
+                || err.to_string().contains("non-live doc_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_missing_internal_to_id_for_live_doc() {
+        let mut json = valid_single_doc_json();
+        json["internal_to_id"] = serde_json::json!([]);
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("missing internal_to_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_mismatched_internal_to_id_reverse_mapping() {
+        let mut json = valid_single_doc_json();
+        json["internal_to_id"] = serde_json::json!(["wrong"]);
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("does not map")
+                || err.to_string().contains("does not reverse-map"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_stale_id_to_internal_value() {
+        let mut json = valid_single_doc_json();
+        // "stale" points at internal id 7, which is neither live nor in range.
+        json["id_to_internal"] = serde_json::json!({ "doc0": 0, "stale": 7 });
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("non-live doc_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_total_tokens() {
+        let mut json = valid_single_doc_json();
+        json["total_tokens"] = serde_json::json!(4);
+        let err = serde_json::from_value::<Bm25Index>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match doc_lengths sum"),
+            "unexpected error: {err}"
         );
     }
 }
