@@ -654,6 +654,139 @@ async fn upsert_domains_rejects_empty_list() {
     assert!(err.to_string().contains("must not be empty"), "got: {err}");
 }
 
+#[tokio::test]
+async fn upsert_domains_rejects_atom_slug_collision_without_partial_domain() {
+    let f = pack(rt());
+
+    // Seed a normal atom that owns the slug the domain upsert will collide on.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "shared-slug",
+            "name": "Original Atom Name",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "tags": ["distinctive-tag"],
+        }] }),
+    )
+    .await
+    .expect("seed atom");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{
+                "slug": "shared-slug",
+                "name": "Colliding Domain",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // No domain row must exist after the rejected upsert (no partial commit).
+    let domains = f
+        .dispatch("knowledge.list", json!({ "type": "domain" }))
+        .await
+        .expect("list domains ok");
+    let results = domains["results"].as_array().expect("results array");
+    assert!(
+        results
+            .iter()
+            .all(|d| d["slug"].as_str() != Some("shared-slug")),
+        "no domain with slug 'shared-slug' should exist after rejected collision: {results:?}"
+    );
+
+    // Retry — still rejected, and the original atom is untouched.
+    let err2 = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{
+                "slug": "shared-slug",
+                "name": "Colliding Domain Retry",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err2, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput on retry, got: {err2:?}"
+    );
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "shared-slug" }))
+        .await
+        .expect("original atom still resolvable");
+    assert_eq!(atom["kind"], "atom");
+    assert_eq!(atom["name"], "Original Atom Name");
+    assert_eq!(
+        atom["content"],
+        "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+    );
+    let tags = atom["tags"].as_array().expect("tags array");
+    assert!(tags.iter().any(|t| t == "distinctive-tag"));
+}
+
+#[tokio::test]
+async fn upsert_atoms_rejects_domain_mirror_slug_collision_without_mutation() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "retrieval",
+            "name": "Retrieval",
+            "description": "Dense and sparse retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
+        }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    // A plain upsert_atoms call targeting the domain's mirror slug must be
+    // rejected, not silently strip type:domain from the mirror's tags.
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": "retrieval",
+                "name": "Retrieval Atom Overwrite Attempt",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // The domain mirror must be untouched: still classified as a domain by
+    // direct lookup and by search, with its original name intact.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "retrieval" }))
+        .await
+        .expect("get must still resolve the domain");
+    assert_eq!(got["kind"], "domain");
+    assert_eq!(got["name"], "Retrieval");
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "retrieval"),
+        "search must still find the domain, not a demoted atom: {results:?}"
+    );
+}
+
 // ── knowledge.get ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -687,6 +820,44 @@ async fn get_returns_not_found_for_unknown_slug() {
         err.to_string().contains("not found") || err.to_string().contains("NotFound"),
         "expected not-found error, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn get_by_domain_uuid_returns_canonical_domain_not_mirror_atom() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "uuid-domain", "name": "UUID Domain", "description": "Retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "members": ["rag"] }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert_domains ok");
+
+    // Resolve the domain's UUID via the slug path (already correct).
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "uuid-domain" }))
+        .await
+        .expect("get by slug ok");
+    assert_eq!(by_slug["kind"], "domain");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    // The UUID path must agree with the slug path: canonical domain, not the mirror atom.
+    let by_uuid = f
+        .dispatch("knowledge.get", json!({ "id": uuid }))
+        .await
+        .expect("get by uuid ok");
+    assert_eq!(
+        by_uuid["kind"], "domain",
+        "UUID lookup must return the canonical domain, got: {by_uuid}"
+    );
+    let members = by_uuid["members"]
+        .as_array()
+        .expect("members must be present and an array");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0], "rag");
 }
 
 // ── knowledge.get + include_sections ─────────────────────────────────────────
@@ -1081,6 +1252,128 @@ async fn delete_atoms_returns_zero_for_unknown_slug() {
         .await
         .expect("delete ok even for missing");
     assert_eq!(resp["deleted"], 0);
+}
+
+#[tokio::test]
+async fn delete_atoms_rejects_domain_mirror_slug_without_mutation() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "retrieval", "name": "Retrieval", "description": "Dense and sparse retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": ["retrieval"] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // Direct lookup and search must agree: the domain is present on both paths.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "retrieval" }))
+        .await
+        .expect("get must still resolve the domain");
+    assert_eq!(got["kind"], "domain");
+    assert!(got["members"].is_array());
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "retrieval"),
+        "search must still find the domain: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_rejects_domain_mirror_uuid_without_mutation() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "embedding-theory" }))
+        .await
+        .expect("get domain by slug");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": [uuid.clone()] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // Direct lookup by UUID must agree with search: both say the domain is present.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": uuid }))
+        .await
+        .expect("get must still resolve the domain by uuid");
+    assert_eq!(got["kind"], "domain");
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "embedding", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "embedding-theory"),
+        "search must still find the domain: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_mixed_request_with_domain_mirror_leaves_normal_atom_live() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "normal-atom", "name": "Normal Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("seed atom");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "mixed-domain", "name": "Mixed Domain", "description": "Mixed domain techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+    )
+    .await
+    .expect("seed domain");
+
+    let err = f
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({ "ids": ["normal-atom", "mixed-domain"] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "normal-atom" }))
+        .await
+        .expect("normal atom must remain live after the rejected mixed request");
+    assert_eq!(atom["kind"], "atom");
 }
 
 // ── stats ──────────────────────────────────────────────────────────────────────
@@ -1986,6 +2279,107 @@ async fn upsert_domains_clean_slug_passes() {
     assert!(
         result.is_ok(),
         "upsert_domains with clean slug must succeed; got: {result:?}"
+    );
+}
+
+// ── #441: soft-deleted slugs cannot be upserted again ────────────────────────
+
+/// Soft-deleting an atom's slug and then upserting the same slug again must
+/// return a clean lifecycle error, never a raw SQLite unique-constraint error.
+#[tokio::test]
+async fn upsert_atoms_rejects_reuse_of_soft_deleted_slug_cleanly() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "draft-guide", "name": "Draft Guide", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("seed atom");
+
+    f.dispatch("knowledge.delete_atoms", json!({ "ids": ["draft-guide"] }))
+        .await
+        .expect("soft delete atom");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{ "slug": "draft-guide", "name": "Draft Guide Reborn", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("deleted") || msg.contains("previously deleted"),
+        "error should explain the slug was previously deleted: {msg}"
+    );
+    let lower = msg.to_lowercase();
+    assert!(
+        !lower.contains("unique") && !lower.contains("constraint") && !lower.contains("sqlite"),
+        "no raw SQLite unique-constraint wording may leak to the caller: {msg}"
+    );
+}
+
+/// Soft-deleting a domain (via the generic delete verb, which tombstones both
+/// the canonical domain row and its mirror atom) and then upserting the same
+/// slug again must return a clean lifecycle error, never a raw SQLite error.
+#[tokio::test]
+async fn upsert_domains_rejects_reuse_of_soft_deleted_slug_cleanly() {
+    let f = pack_via_registry(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "draft-domain", "name": "Draft Domain", "description": "Draft domain techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+    )
+    .await
+    .expect("seed domain");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "draft-domain" }))
+        .await
+        .expect("get domain before delete");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    // Soft-delete via the generic delete verb, not knowledge.delete_atoms.
+    f.dispatch("delete", json!({ "id": uuid }))
+        .await
+        .expect("generic soft delete domain");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{ "slug": "draft-domain", "name": "Draft Domain Reborn", "description": "Draft domain techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("deleted") || msg.contains("previously deleted"),
+        "error should explain the slug was previously deleted: {msg}"
+    );
+    let lower = msg.to_lowercase();
+    assert!(
+        !lower.contains("unique")
+            && !lower.contains("constraint")
+            && !lower.contains("sqlite")
+            && !lower.contains("knowledge_domains")
+            && !lower.contains("knowledge_atoms"),
+        "no raw SQLite unique-constraint wording may leak to the caller: {msg}"
+    );
+
+    // The rejected reuse must not resurrect the tombstoned domain.
+    let not_found = f
+        .dispatch("knowledge.get", json!({ "id": "draft-domain" }))
+        .await;
+    assert!(
+        matches!(not_found, Err(RuntimeError::NotFound(_))),
+        "expected NotFound after rejected reuse, got: {not_found:?}"
     );
 }
 

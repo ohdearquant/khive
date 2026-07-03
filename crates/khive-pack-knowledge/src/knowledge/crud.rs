@@ -12,7 +12,7 @@ use super::schema::{
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
-    domain_to_json, new_id, now_us, row_str, sql_err, status_sql_clause, status_values,
+    domain_to_json, new_id, now_us, row_i64, row_str, sql_err, status_sql_clause, status_values,
     tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
@@ -96,14 +96,35 @@ impl KnowledgeHandlers {
                 .reader()
                 .await
                 .map_err(|e| sql_err("upsert_atoms reader", e))?;
+            // Look up by slug WITHOUT the deleted_at filter so a tombstoned row that
+            // still owns the (namespace, slug) unique index is detected before the
+            // insert path runs — otherwise SQLite raises a raw unique-constraint
+            // error instead of a defined lifecycle error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("upsert_atoms lookup", e))?;
+            if let Some(row) = &existing {
+                // A domain's mirror atom shares the (namespace, slug) index with
+                // ordinary atoms. Reject here (mirroring the delete_atoms guard)
+                // so a plain upsert_atoms call can never blind-overwrite the
+                // mirror's tags/content and desynchronize it from its domain.
+                let existing_tags = row_str(row, "tags").unwrap_or_default();
+                if existing_tags.contains("type:domain") {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
+                    )));
+                }
+                if row_i64(row, "deleted_at").is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "atom slug {slug:?} was previously deleted; choose a new slug"
+                    )));
+                }
+            }
 
             let mut writer = sql
                 .writer()
@@ -242,103 +263,128 @@ impl KnowledgeHandlers {
                 .reader()
                 .await
                 .map_err(|e| sql_err("upsert_domains reader", e))?;
+            // Look up by slug WITHOUT the deleted_at filter so a tombstoned domain
+            // that still owns the (namespace, slug) unique index is detected before
+            // the insert path runs, instead of leaking a raw unique-constraint error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
                 .await
                 .map_err(|e| sql_err("upsert_domains lookup", e))?;
+            if let Some(row) = &existing {
+                if row_i64(row, "deleted_at").is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "domain slug {slug:?} was previously deleted; choose a new slug"
+                    )));
+                }
+            }
+
+            let id = match &existing {
+                Some(row) => row_str(row, "id").ok_or_else(|| {
+                    RuntimeError::Internal("missing id in existing domain row".into())
+                })?,
+                None => new_id(),
+            };
+
+            // Preflight: a normal atom (or a tombstoned atom that still owns the
+            // unique (namespace, slug) index) must never share this domain's slug.
+            // The mirror atom for THIS domain shares its id with the domain, so the
+            // collision is only real when the colliding row belongs to a different
+            // id. This must run BEFORE any write so a collision never leaves a
+            // partially-committed domain row behind.
+            let atom_collision = reader
+                .query_row(SqlStatement {
+                    sql:
+                        "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
+                            .into(),
+                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("upsert_domains atom collision check", e))?;
+            if let Some(row) = &atom_collision {
+                let collision_id = row_str(row, "id").ok_or_else(|| {
+                    RuntimeError::Internal("missing id in colliding atom row".into())
+                })?;
+                if collision_id != id {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "domain slug {slug:?} collides with an existing atom of the same slug"
+                    )));
+                }
+            }
+
+            // Mirror write is keyed by id (shared with the domain), never by slug —
+            // ON CONFLICT(namespace, slug) would blind-overwrite an unrelated atom
+            // that merely happens to share this slug.
+            let mirror_stmt = SqlStatement {
+                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
+                      VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
+                      ON CONFLICT(id) DO UPDATE SET slug=?3, name=?4, content=?5, tags=?6, properties=?7, status='reviewed', finalized=1, updated_at=?9".into(),
+                params: vec![
+                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Text(slug.clone()),
+                    SqlValue::Text(name.clone()),
+                    SqlValue::Text(domain_in.description.clone().unwrap_or_default()),
+                    SqlValue::Text(tags_json.clone()),
+                    SqlValue::Text(properties_json.clone()),
+                    SqlValue::Integer(now),
+                    SqlValue::Integer(now),
+                ],
+                label: None,
+            };
 
             let mut writer = sql
                 .writer()
                 .await
                 .map_err(|e| sql_err("upsert_domains writer", e))?;
-            if let Some(row) = existing {
-                let id = row_str(&row, "id").ok_or_else(|| {
-                    RuntimeError::Internal("missing id in existing domain row".into())
-                })?;
+            if existing.is_some() {
+                let domain_stmt = SqlStatement {
+                    sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
+                    params: vec![
+                        SqlValue::Text(name.clone()),
+                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        SqlValue::Text(tags_json.clone()),
+                        SqlValue::Text(members_json.clone()),
+                        SqlValue::Integer(now),
+                        SqlValue::Text(id.clone()),
+                        SqlValue::Text(ns.clone()),
+                    ],
+                    label: None,
+                };
+                // Atomic: the canonical domain row and its FTS mirror atom are one
+                // logical record; a mirror-write failure must roll back the domain
+                // update too.
                 writer
-                    .execute(SqlStatement {
-                        sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
-                        params: vec![
-                            SqlValue::Text(name.clone()),
-                            domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(tags_json.clone()),
-                            SqlValue::Text(members_json.clone()),
-                            SqlValue::Integer(now),
-                            SqlValue::Text(id.clone()),
-                            SqlValue::Text(ns.clone()),
-                        ],
-                        label: None,
-                    })
+                    .execute_batch(vec![domain_stmt, mirror_stmt])
                     .await
-                    .map_err(|e| sql_err("upsert_domains update", e))?;
-                // Dual-write: sync the mirror atom in knowledge_atoms for FTS.
-                // The domain's description text becomes the mirror atom's content.
-                writer
-                    .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
-                              ON CONFLICT(namespace, slug) DO UPDATE SET name=?4, content=?5, tags=?6, properties=?7, status='reviewed', updated_at=?9".into(),
-                        params: vec![
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(name.clone()),
-                            SqlValue::Text(domain_in.description.clone().unwrap_or_default()),
-                            SqlValue::Text(tags_json.clone()),
-                            SqlValue::Text(properties_json.clone()),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("upsert_domains atom mirror update", e))?;
+                    .map_err(|e| sql_err("upsert_domains update batch", e))?;
                 updated += 1;
             } else {
-                let id = new_id();
+                let domain_stmt = SqlStatement {
+                    sql: "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)".into(),
+                    params: vec![
+                        SqlValue::Text(id.clone()),
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(slug.clone()),
+                        SqlValue::Text(name.clone()),
+                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        SqlValue::Text(tags_json.clone()),
+                        SqlValue::Text(members_json.clone()),
+                        SqlValue::Integer(now),
+                        SqlValue::Integer(now),
+                    ],
+                    label: None,
+                };
+                // Atomic: a mirror-insert failure must roll back the domain insert
+                // too, so no domain row is ever left committed without its mirror.
                 writer
-                    .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)".into(),
-                        params: vec![
-                            SqlValue::Text(id.clone()),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(name.clone()),
-                            domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
-                            SqlValue::Text(tags_json.clone()),
-                            SqlValue::Text(members_json.clone()),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    })
+                    .execute_batch(vec![domain_stmt, mirror_stmt])
                     .await
-                    .map_err(|e| sql_err("upsert_domains insert", e))?;
-                // Dual-write: mirror atom in knowledge_atoms for FTS indexing.
-                // The domain's description text becomes the mirror atom's content.
-                writer
-                    .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9)".into(),
-                        params: vec![
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(name.clone()),
-                            SqlValue::Text(domain_in.description.clone().unwrap_or_default()),
-                            SqlValue::Text(tags_json.clone()),
-                            SqlValue::Text(properties_json.clone()),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("upsert_domains atom mirror insert", e))?;
+                    .map_err(|e| sql_err("upsert_domains insert batch", e))?;
                 created += 1;
             }
         }
@@ -366,6 +412,23 @@ impl KnowledgeHandlers {
         let mut reader = sql.reader().await.map_err(|e| sql_err("get reader", e))?;
 
         if is_uuid {
+            // Domain-first: a domain's canonical row and its FTS mirror atom share
+            // the same UUID, so the UUID branch must match the slug branch below
+            // and prefer knowledge_domains — otherwise a domain UUID resolves to
+            // its own mirror atom instead of the canonical domain record.
+            let row = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("get domain by id", e))?;
+            if let Some(r) = row {
+                return domain_from_row(&r)
+                    .map(|d| domain_to_json(&d))
+                    .ok_or_else(|| RuntimeError::Internal("domain row parse failed".into()));
+            }
             let row = reader
                 .query_row(SqlStatement {
                     sql: "SELECT * FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
@@ -383,19 +446,6 @@ impl KnowledgeHandlers {
                     out["sections"] = fetch_sections(runtime, &ns, &atom_id).await?;
                 }
                 return Ok(out);
-            }
-            let row = reader
-                .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("get domain by id", e))?;
-            if let Some(r) = row {
-                return domain_from_row(&r)
-                    .map(|d| domain_to_json(&d))
-                    .ok_or_else(|| RuntimeError::Internal("domain row parse failed".into()));
             }
         }
 
@@ -573,6 +623,50 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let now = now_us();
         let mut deleted = 0usize;
+
+        // Preflight the full request before mutating anything: knowledge.delete_atoms
+        // is documented as atom-only. A domain's canonical row and its FTS mirror
+        // atom share an id/slug, so deleting the mirror here would tombstone one
+        // half of the domain while leaving knowledge_domains live — a split-brain
+        // where direct lookup and search/suggest disagree. Domains must go through
+        // the generic delete verb, which deletes both halves together.
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("delete_atoms reader", e))?;
+        for id_or_slug in &p.ids {
+            let key = id_or_slug.trim().to_string();
+            let domain = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT id FROM knowledge_domains WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("delete_atoms domain preflight", e))?;
+            if domain.is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID"
+                )));
+            }
+
+            let mirror = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT tags FROM knowledge_atoms WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
+            if let Some(row) = mirror {
+                let tags = row_str(&row, "tags").unwrap_or_default();
+                if tags.contains("type:domain") {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "knowledge.delete_atoms cannot delete domain mirror {key:?}; use the generic delete verb by domain UUID"
+                    )));
+                }
+            }
+        }
 
         let mut writer = sql
             .writer()
