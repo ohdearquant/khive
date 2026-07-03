@@ -878,20 +878,25 @@ impl BrainPack {
             }
         };
 
-        // Validate target_id in the PRIMARY namespace only. A visible-only
-        // (foreign) record must not be targeted by a mutation (feedback event).
-        // NotFound (not Forbidden) per ADR-007:215-219.
-        let resolved = self
+        // Resolve the target by UUID with no namespace filter (ADR-007 Rule 2 /
+        // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
+        // not a post-fetch namespace check). Rule 3b recall fans out actor-stamped
+        // memories from other namespaces by design, so a primary-only check would
+        // reject the flywheel's own recalled targets. NotFound only for a
+        // genuinely absent UUID.
+        use khive_runtime::Resolved;
+        match self
             .runtime
-            .resolve_primary(token, target)
+            .resolve_by_id(token, target)
             .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        if resolved.is_none() {
-            return Err(RuntimeError::NotFound(format!(
-                "target_id {:?} not found in namespace {:?}",
-                target,
-                token.namespace().as_str()
-            )));
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        {
+            Some(Resolved::Entity(_)) | Some(Resolved::Note(_)) => {}
+            _ => {
+                return Err(RuntimeError::NotFound(format!(
+                    "target_id {target:?} not found"
+                )));
+            }
         }
 
         // Compute the effective serving profile (explicit or default), then validate
