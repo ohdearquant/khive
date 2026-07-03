@@ -15,7 +15,7 @@ use khive_types::{
     ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch, Timestamp,
 };
 
-use super::budget::{count_new_entries, WriteBudget};
+use super::budget::{count_new_entries, has_multi_step_compound, WriteBudget};
 use crate::projection_worker::ProposalsProjectionWorker;
 
 /// Worker that applies approved proposal changesets.
@@ -59,6 +59,18 @@ impl ProposalApplyWorker {
                 return Ok(());
             }
         };
+
+        if has_multi_step_compound(&changeset) {
+            self.emit_apply_failed(
+                token,
+                proposal_id,
+                "multi-step Compound proposals are not supported until atomic proposal apply is available"
+                    .to_string(),
+                0,
+            )
+            .await;
+            return Ok(());
+        }
 
         if let Some(max) = max_new_entries {
             let needed = count_new_entries(&changeset);
