@@ -409,6 +409,150 @@ async fn assign_rejects_malformed_context_entity_id() {
     );
 }
 
+// ---- Finding 1 regression: generic create must normalize nested properties ----
+
+#[tokio::test]
+async fn create_task_normalizes_nested_priority_and_depends_on_before_write() {
+    use khive_storage::types::{Direction, NeighborQuery};
+    use khive_storage::EdgeRelation;
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+
+    let blocker = assign(&pack, json!({"title": "write spec"})).await;
+    let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "generic dependent",
+                "properties": {"priority": "p1", "depends_on": [blocker_full.clone()]}
+            }),
+        )
+        .await
+        .expect("generic create with nested properties must succeed");
+
+    assert_eq!(
+        created["properties"]["priority"].as_str(),
+        Some("p1"),
+        "nested properties.priority must be preserved, not overwritten with default p2; got {created:?}"
+    );
+    let deps = created["properties"]["depends_on"]
+        .as_array()
+        .expect("depends_on must be an array");
+    assert_eq!(
+        deps.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>(),
+        vec![blocker_full.as_str()],
+        "nested depends_on must be canonicalized to hyphenated UUID form; got {created:?}"
+    );
+
+    let dep_uuid = uuid::Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    let blocker_uuid = uuid::Uuid::parse_str(&blocker_full).unwrap();
+    let graph = rt
+        .graph(&rt.authorize(khive_runtime::Namespace::local()).unwrap())
+        .expect("graph store");
+    let neighbors = graph
+        .neighbors(
+            dep_uuid,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: Some(vec![EdgeRelation::DependsOn]),
+                limit: Some(16),
+                min_weight: None,
+            },
+        )
+        .await
+        .expect("neighbors query");
+    let targets: Vec<_> = neighbors.iter().map(|hit| hit.node_id).collect();
+    assert!(
+        targets.contains(&blocker_uuid),
+        "generic create with nested depends_on must also create the graph edge; got targets {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_task_top_level_priority_wins_over_nested_priority() {
+    let pack = pack(rt());
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "conflicting priority",
+                "priority": "p0",
+                "properties": {"priority": "p3"}
+            }),
+        )
+        .await
+        .expect("generic create must succeed");
+
+    assert_eq!(
+        created["properties"]["priority"].as_str(),
+        Some("p0"),
+        "top-level priority must win over nested properties.priority when both are present; got {created:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_task_rejects_nested_depends_on_non_task_without_persisting() {
+    use khive_storage::types::PageRequest;
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+
+    let entity = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Not A Task"}))
+        .await
+        .expect("entity create must succeed");
+    let entity_id = entity["id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "bad nested dep",
+                "properties": {"depends_on": [entity_id]}
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be a task note"),
+        "expected rejection of non-task nested depends_on target; got: {msg}"
+    );
+
+    let local_token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let notes = rt.notes(&local_token).expect("note store");
+    let task_page = notes
+        .query_notes(
+            "local",
+            Some("task"),
+            PageRequest {
+                offset: 0,
+                limit: 64,
+            },
+        )
+        .await
+        .expect("query task notes");
+    assert!(
+        task_page.items.is_empty(),
+        "rejected generic create must not persist a task; found {:?}",
+        task_page
+            .items
+            .iter()
+            .filter_map(|n| n.name.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 // ---- Finding 2 regression: depends_on and context_entity_id must be primary-only ----
 
 /// A task in a visible (non-primary) namespace must be treated as NotFound
@@ -507,5 +651,115 @@ async fn resolve_primary_rejects_visible_only_entity() {
         resolved_primary.is_none(),
         "resolve_primary must return None for a visible-only entity; \
          context_entity_id validation uses resolve_primary and must reject it as NotFound"
+    );
+}
+
+/// Documents current KG-create-path behavior for a visible-only `depends_on`
+/// target — NOT a discriminating regression test for the F2 `resolve` vs
+/// `resolve_primary` fix. The KG create dispatch only forwards the token's
+/// primary namespace string to `TaskHook` (`khive-pack-kg/src/handlers/create.rs`
+/// builds `args["namespace"]` from `token.namespace()` alone, discarding any
+/// wider visible set), and `TaskHook::prepare_create` always re-derives its
+/// own token via `runtime.authorize(ns)`, which mints a primary-namespace-only
+/// token (`KhiveRuntime::authorize` -> `mint_with_visibility(ns, vec![], ..)`).
+/// So `TaskHook` can never hold a token that sees a foreign namespace on this
+/// path today, and `resolve`/`resolve_primary` are indistinguishable here —
+/// this test would pass identically with the F2 fix reverted. It is kept to
+/// pin the current (safe) end-to-end behavior — reject + persist nothing —
+/// as defensive parity with `gtd.assign`. The test that actually proves the
+/// `resolve_primary` fix matters is `resolve_primary_rejects_visible_only_task`
+/// above, which hand-builds a widened (`authorize_with_visibility`) token and
+/// shows `resolve` finds the foreign task while `resolve_primary` does not —
+/// the exact distinction `TaskHook`'s dependency validator now relies on.
+#[tokio::test]
+async fn create_task_with_visible_only_dependency_is_rejected_and_persists_no_local_task() {
+    use khive_pack_gtd::GtdPack;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::types::PageRequest;
+
+    let rt = KhiveRuntime::memory().unwrap();
+
+    let ns_foreign = Namespace::parse("dep-foreign-ns-create").unwrap();
+    let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
+    let foreign_task = rt
+        .create_note(
+            &tok_foreign,
+            "task",
+            Some("foreign blocker"),
+            "foreign blocker",
+            Some(0.5),
+            Some(json!({"status": "inbox", "priority": "p2"})),
+            vec![],
+        )
+        .await
+        .expect("create foreign blocker task");
+
+    let tok_visible = rt
+        .authorize_with_visibility(Namespace::local(), vec![ns_foreign.clone()])
+        .unwrap();
+    assert!(
+        rt.resolve(&tok_visible, foreign_task.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "visible-aware resolve must find the foreign task"
+    );
+    assert!(
+        rt.resolve_primary(&tok_visible, foreign_task.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "resolve_primary must not find the foreign task"
+    );
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GtdPack::new(rt.clone()));
+    builder.with_visible_namespaces(vec![ns_foreign.clone()]);
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let foreign_full = foreign_task.id.as_hyphenated().to_string();
+    let err = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "local dependent",
+                "depends_on": [foreign_full]
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::NotFound(_))
+            || msg.contains("not found in namespace"),
+        "visible-only depends_on target must be rejected as NotFound; got: {msg}"
+    );
+
+    let local_token = rt.authorize(Namespace::local()).unwrap();
+    let notes = rt.notes(&local_token).expect("note store");
+    let task_page = notes
+        .query_notes(
+            "local",
+            Some("task"),
+            PageRequest {
+                offset: 0,
+                limit: 64,
+            },
+        )
+        .await
+        .expect("query local task notes");
+    assert!(
+        task_page.items.is_empty(),
+        "rejected create must not persist a local task; found {:?}",
+        task_page
+            .items
+            .iter()
+            .filter_map(|n| n.name.clone())
+            .collect::<Vec<_>>()
     );
 }
