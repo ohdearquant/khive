@@ -49,11 +49,11 @@ impl JsonFormatAdapter {
             let obj = match item {
                 Value::Object(m) => m,
                 other => {
-                    warnings.push(format!(
-                        "record {index}: expected an object, got {}; skipped",
-                        other.type_str()
-                    ));
-                    continue;
+                    return Err(AdapterError::InvalidField {
+                        index,
+                        field: "$record".into(),
+                        reason: format!("expected object, got {}", other.type_str()),
+                    })
                 }
             };
 
@@ -69,7 +69,7 @@ impl JsonFormatAdapter {
             });
 
             if has_source && has_target {
-                edges.push(parse_edge(index, obj));
+                edges.push(parse_edge(index, obj, &mut warnings));
             } else {
                 entities.push(parse_entity(index, obj, &mut warnings));
             }
@@ -199,15 +199,49 @@ fn parse_entity(
 ) -> Result<EntityRecord, AdapterError> {
     let name = extract_required_string(&mut obj, index, "name")?;
 
-    let kind = {
-        let raw = extract_required_string(&mut obj, index, "kind")?;
-        EntityKind::from_str(&raw)
-            .map_err(|_| AdapterError::UnknownKind {
-                index,
-                kind: raw.clone(),
-            })?
-            .name()
-            .to_owned()
+    let raw_kind = extract_required_string(&mut obj, index, "kind")?;
+    let kind = EntityKind::from_str(&raw_kind)
+        .map_err(|_| AdapterError::UnknownKind {
+            index,
+            kind: raw_kind.clone(),
+        })?
+        .name()
+        .to_owned();
+
+    // ADR-020 subtype: prefer an explicit `entity_type`, else preserve a
+    // `kind="paper"`-style alias (which `EntityKind::from_str` canonicalizes
+    // to the base kind "document") as `entity_type="paper"`.
+    let entity_type = match remove_ci(&mut obj, "entity_type") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: 'entity_type' is not a string; ignored"
+            ));
+            None
+        }
+        None if raw_kind.trim().eq_ignore_ascii_case("paper") => Some("paper".to_string()),
+        None => None,
+    };
+
+    let created_at = match remove_ci(&mut obj, "created_at") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: 'created_at' is not a string; ignored"
+            ));
+            None
+        }
+        None => None,
+    };
+    let updated_at = match remove_ci(&mut obj, "updated_at") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: 'updated_at' is not a string; ignored"
+            ));
+            None
+        }
+        None => None,
     };
 
     let id = extract_uuid_field(&mut obj, index, "id")?;
@@ -259,16 +293,20 @@ fn parse_entity(
     Ok(EntityRecord {
         id,
         kind,
+        entity_type,
         name,
         description,
         properties: Value::Object(props_base),
         tags,
+        created_at,
+        updated_at,
     })
 }
 
 fn parse_edge(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
+    warnings: &mut Vec<String>,
 ) -> Result<EdgeRecord, AdapterError> {
     let source = remove_ci(&mut obj, "source")
         .or_else(|| remove_ci(&mut obj, "from"))
@@ -317,9 +355,37 @@ fn parse_edge(
 
     let weight = extract_weight(&mut obj, index)?;
 
+    let created_at = match remove_ci(&mut obj, "created_at") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: edge 'created_at' is not a string; ignored"
+            ));
+            None
+        }
+        None => None,
+    };
+    let updated_at = match remove_ci(&mut obj, "updated_at") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: edge 'updated_at' is not a string; ignored"
+            ));
+            None
+        }
+        None => None,
+    };
+
     let mut properties = match remove_ci(&mut obj, "properties") {
         Some((_, Value::Object(m))) => m,
-        Some(_) | None => serde_json::Map::new(),
+        Some((_, other)) => {
+            warnings.push(format!(
+                "record {index}: edge 'properties' is not an object (got {}); ignored",
+                other.type_str()
+            ));
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
     };
     for (k, v) in obj {
         properties.insert(k, v);
@@ -332,6 +398,8 @@ fn parse_edge(
         relation,
         weight,
         properties: Value::Object(properties),
+        created_at,
+        updated_at,
     })
 }
 

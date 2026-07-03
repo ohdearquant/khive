@@ -168,7 +168,7 @@ fn adapter_records_to_archive(
             Ok(ExportedEntity {
                 id: e.id,
                 kind: e.kind,
-                entity_type: None,
+                entity_type: e.entity_type,
                 name: e.name,
                 description: e.description,
                 properties: if e.properties.is_null() {
@@ -177,8 +177,8 @@ fn adapter_records_to_archive(
                     Some(e.properties)
                 },
                 tags: e.tags,
-                created_at: now,
-                updated_at: now,
+                created_at: parse_dt(e.created_at.as_deref(), now),
+                updated_at: parse_dt(e.updated_at.as_deref(), now),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -274,6 +274,8 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
     struct NdjsonEntity {
         id: Uuid,
         kind: String,
+        #[serde(default)]
+        entity_type: Option<String>,
         name: String,
         #[serde(default)]
         description: Option<String>,
@@ -311,7 +313,7 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
         .map(|e| ExportedEntity {
             id: e.id,
             kind: e.kind,
-            entity_type: None,
+            entity_type: e.entity_type,
             name: e.name,
             description: e.description,
             properties: e.properties,
@@ -637,6 +639,153 @@ mod tests {
         assert!(
             err.to_string().contains("not finite"),
             "expected 'not finite' in error: {err}"
+        );
+    }
+
+    /// #472: `adapter_records_to_archive` must preserve ADR-020 `entity_type`
+    /// and timestamp fields from adapter-parsed `EntityRecord`s instead of
+    /// forcing `entity_type: None` and `Utc::now()`.
+    #[test]
+    fn adapter_records_to_archive_preserves_entity_adr020_fields() {
+        let id = Uuid::new_v4();
+        let record = EntityRecord {
+            id,
+            kind: "document".to_string(),
+            entity_type: Some("paper".to_string()),
+            name: "Attention Is All You Need".to_string(),
+            description: None,
+            properties: serde_json::Value::Null,
+            tags: vec![],
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            updated_at: Some("2026-02-02T00:00:00Z".to_string()),
+        };
+
+        let archive = adapter_records_to_archive("test-ns", vec![record], vec![]).unwrap();
+        assert_eq!(archive.entities.len(), 1);
+        let e = &archive.entities[0];
+        assert_eq!(e.entity_type.as_deref(), Some("paper"));
+        assert_eq!(e.created_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(e.updated_at.to_rfc3339(), "2026-02-02T00:00:00+00:00");
+    }
+
+    /// #472: importing adapter JSON with `entity_type`/timestamps end-to-end
+    /// through `cmd_import` must land those fields in the runtime, not `None`
+    /// + import-time `Utc::now()`.
+    #[tokio::test]
+    async fn import_json_adapter_preserves_entity_type_and_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-adr020.db");
+        let entity_id = "77777777-7777-7777-7777-777777777777";
+
+        let json_input = format!(
+            r#"[{{"id":"{entity_id}","kind":"paper","name":"Some Paper","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-02-02T00:00:00Z"}}]"#
+        );
+        let source_path = tmp.path().join("records.json");
+        std::fs::write(&source_path, &json_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        };
+        cmd_import(args).await.unwrap();
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.kind, "document");
+        assert_eq!(entity.entity_type.as_deref(), Some("paper"));
+        let expected_created = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        let expected_updated = chrono::DateTime::parse_from_rfc3339("2026-02-02T00:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        assert_eq!(entity.created_at, expected_created);
+        assert_eq!(entity.updated_at, expected_updated);
+    }
+
+    /// #488a: a non-object element anywhere in the top-level JSON array must
+    /// abort the whole import — including entities before AND after it in the
+    /// array — before anything is written to the target DB. Previously this
+    /// was a warning that skipped just the bad element and kept going.
+    #[tokio::test]
+    async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-488.db");
+        let baseline_id = "88888888-8888-8888-8888-888888888888";
+
+        // Establish a baseline DB state via a first, valid import.
+        let baseline_json =
+            format!(r#"[{{"id":"{baseline_id}","kind":"concept","name":"Baseline"}}]"#);
+        let baseline_source = tmp.path().join("baseline.json");
+        std::fs::write(&baseline_source, &baseline_json).unwrap();
+        cmd_import(ImportArgs {
+            source: baseline_source,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        })
+        .await
+        .unwrap();
+
+        // A second import mixes a well-formed entity with a bare string
+        // element. The whole import must be rejected — the well-formed
+        // entity must NOT be written even though it appears before the
+        // malformed element in the array.
+        let never_imported_id = "99999999-9999-9999-9999-999999999999";
+        let bad_json = format!(
+            r#"[{{"id":"{never_imported_id}","kind":"concept","name":"NeverImported"}},"not-a-record"]"#
+        );
+        let bad_source = tmp.path().join("bad.json");
+        std::fs::write(&bad_source, &bad_json).unwrap();
+
+        let err = cmd_import(ImportArgs {
+            source: bad_source,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        })
+        .await
+        .expect_err("non-object array element must fail the whole import");
+        assert!(
+            err.chain().any(|e| e.to_string().contains("$record")),
+            "error must identify the malformed record, got: {err:#}"
+        );
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+
+        let baseline_uuid: Uuid = baseline_id.parse().unwrap();
+        let baseline = rt2
+            .get_entity(&tok2, baseline_uuid)
+            .await
+            .expect("baseline entity must still be present, untouched by the failed import");
+        assert_eq!(baseline.name, "Baseline");
+
+        let never_imported_uuid: Uuid = never_imported_id.parse().unwrap();
+        assert!(
+            rt2.get_entity(&tok2, never_imported_uuid).await.is_err(),
+            "entity preceding the malformed element in the array must not have been imported"
         );
     }
 

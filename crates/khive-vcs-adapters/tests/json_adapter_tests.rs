@@ -486,10 +486,13 @@ fn test_json_adapter_entity_byte_identical_roundtrip() {
     let original = EntityRecord {
         id,
         kind: "dataset".into(),
+        entity_type: None,
         name: "CIFAR-10".into(),
         description: Some("60k images, 10 classes".into()),
         properties: serde_json::json!({"num_classes": 10, "license": "MIT"}),
         tags: vec!["vision".into(), "benchmark".into()],
+        created_at: None,
+        updated_at: None,
     };
 
     // First serialization — this is the wire form the adapter will receive.
@@ -510,5 +513,153 @@ fn test_json_adapter_entity_byte_identical_roundtrip() {
     assert_eq!(
         first_json, second_json,
         "entity serialize → parse → serialize must be byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14 — ADR-020 entity fields are reserved, not folded into properties (#472)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_adr020_entity_fields_are_reserved() {
+    let json = r#"[{
+        "id": "66666666-6666-6666-6666-666666666666",
+        "kind": "document",
+        "name": "Attention Is All You Need",
+        "entity_type": "paper",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-02-02T00:00:00Z"
+    }]"#;
+
+    let mut adapter = JsonFormatAdapter::new(json).expect("valid fixture");
+    let ents: Vec<EntityRecord> = adapter.entities().map(|r| r.expect("no errors")).collect();
+
+    assert_eq!(ents.len(), 1);
+    let e = &ents[0];
+    assert_eq!(e.entity_type.as_deref(), Some("paper"));
+    assert_eq!(e.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    assert_eq!(e.updated_at.as_deref(), Some("2026-02-02T00:00:00Z"));
+
+    assert!(
+        e.properties.get("entity_type").is_none(),
+        "entity_type must not be folded into properties"
+    );
+    assert!(
+        e.properties.get("created_at").is_none(),
+        "created_at must not be folded into properties"
+    );
+    assert!(
+        e.properties.get("updated_at").is_none(),
+        "updated_at must not be folded into properties"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15 — kind="paper" alias preserves entity_type="paper" (#472)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_kind_paper_alias_sets_entity_type() {
+    let mut adapter =
+        JsonFormatAdapter::new(r#"[{"kind":"paper","name":"Some Paper"}]"#).expect("valid JSON");
+    let first = adapter.entities().next().expect("one record");
+    let entity = first.expect("alias must parse as valid kind");
+
+    assert_eq!(
+        entity.kind, "document",
+        "alias 'paper' must canonicalize kind to 'document'"
+    );
+    assert_eq!(
+        entity.entity_type.as_deref(),
+        Some("paper"),
+        "alias 'paper' must be preserved as entity_type"
+    );
+    assert!(entity.properties.get("entity_type").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Test 16 — ADR-020 edge timestamp fields are reserved (#472)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_edge_timestamps_are_reserved() {
+    let json = r#"[{
+        "source": "11111111-1111-1111-1111-111111111111",
+        "target": "22222222-2222-2222-2222-222222222222",
+        "relation": "extends",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-02-02T00:00:00Z"
+    }]"#;
+
+    let mut adapter = JsonFormatAdapter::new(json).expect("valid");
+    let edges: Vec<EdgeRecord> = adapter.edges().map(|r| r.expect("no errors")).collect();
+
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    assert_eq!(edges[0].updated_at.as_deref(), Some("2026-02-02T00:00:00Z"));
+    assert!(edges[0].properties.get("created_at").is_none());
+    assert!(edges[0].properties.get("updated_at").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Test 17 — a non-object top-level array element is fatal, not skipped (#488a)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_non_object_array_element_is_fatal() {
+    // A bare string in the top-level array must abort construction with a
+    // fatal error identifying the offending record index, not be silently
+    // skipped with a warning.
+    let json = r#"[
+        {"kind":"concept","name":"Good"},
+        "not-a-record",
+        {"kind":"concept","name":"NeverParsed"}
+    ]"#;
+
+    let err = match JsonFormatAdapter::new(json) {
+        Err(e) => e,
+        Ok(_) => panic!("a non-object array element must be a fatal construction error"),
+    };
+    match &err {
+        AdapterError::InvalidField { index, field, .. } => {
+            assert_eq!(*index, 1, "error must point at the non-object element");
+            assert_eq!(field, "$record");
+        }
+        other => panic!("expected InvalidField at index 1, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 18 — non-object edge properties warns, never silently becomes {} (#488b)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_edge_properties_non_object_warns() {
+    let json = r#"[{
+        "source": "11111111-1111-1111-1111-111111111111",
+        "target": "22222222-2222-2222-2222-222222222222",
+        "relation": "extends",
+        "properties": "not-an-object"
+    }]"#;
+
+    let mut adapter = JsonFormatAdapter::new(json).expect("structurally valid JSON");
+    let edges: Vec<EdgeRecord> = adapter
+        .edges()
+        .map(|r| r.expect("no parse errors"))
+        .collect();
+
+    assert_eq!(edges.len(), 1);
+    assert_eq!(
+        edges[0].properties,
+        Value::Object(serde_json::Map::new()),
+        "non-object properties must fall back to an empty object"
+    );
+    assert!(
+        adapter
+            .warnings()
+            .iter()
+            .any(|w| w.contains("properties") && w.contains("not an object")),
+        "non-object edge properties must be reported as a warning, got: {:?}",
+        adapter.warnings()
     );
 }

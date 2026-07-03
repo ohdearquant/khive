@@ -13,6 +13,10 @@ use uuid::Uuid;
 pub struct EntityRecord {
     pub id: Uuid,
     pub kind: String,
+    /// ADR-020 pack-governed subtype token (e.g. `"paper"`). Reserved key
+    /// parsed before the unknown-key fold, so it never lands in `properties`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -20,6 +24,12 @@ pub struct EntityRecord {
     pub properties: serde_json::Value,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// ADR-020 RFC3339 creation timestamp. Reserved key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// ADR-020 RFC3339 last-update timestamp. Reserved key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 /// Raw deserialization target for [`EdgeRecord`].
@@ -33,6 +43,10 @@ struct EdgeRecordRaw {
     weight: f64,
     #[serde(default)]
     properties: serde_json::Value,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 impl TryFrom<EdgeRecordRaw> for EdgeRecord {
@@ -58,6 +72,8 @@ impl TryFrom<EdgeRecordRaw> for EdgeRecord {
             relation: raw.relation,
             weight: raw.weight,
             properties: raw.properties,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
         })
     }
 }
@@ -74,6 +90,12 @@ pub struct EdgeRecord {
     pub weight: f64,
     #[serde(default)]
     pub properties: serde_json::Value,
+    /// ADR-020 RFC3339 creation timestamp. Reserved key; not folded into `properties`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// ADR-020 RFC3339 last-update timestamp. Reserved key; not folded into `properties`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 fn default_weight() -> f64 {
@@ -93,6 +115,8 @@ mod tests {
             relation: "extends".into(),
             weight: w,
             properties: serde_json::Value::Null,
+            created_at: None,
+            updated_at: None,
         }
     }
 
@@ -178,6 +202,8 @@ mod tests {
             relation: "extends".into(),
             weight: 0.7,
             properties: serde_json::Value::Null,
+            created_at: None,
+            updated_at: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let restored: EdgeRecord = serde_json::from_str(&json).unwrap();

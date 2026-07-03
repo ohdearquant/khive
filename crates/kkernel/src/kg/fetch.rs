@@ -1,24 +1,12 @@
 //! `kkernel kg fetch` — fetch a remote KG archive.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use super::types::FetchArgs;
-
-pub(super) fn is_safe_remote_name(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
+use crate::sync::RemoteName;
 
 pub(super) async fn cmd_fetch(args: FetchArgs) -> Result<()> {
-    if !is_safe_remote_name(&args.remote) {
-        bail!(
-            "invalid remote name {:?}: must be [A-Za-z0-9._-]+ and not . or ..",
-            args.remote
-        );
-    }
+    let name = RemoteName::parse(args.remote).context("invalid --remote")?;
 
     let pin = args
         .pin
@@ -28,7 +16,7 @@ pub(super) async fn cmd_fetch(args: FetchArgs) -> Result<()> {
         .context("invalid --pin")?;
 
     let remote = crate::sync::RemoteConfig {
-        name: args.remote,
+        name,
         url: args.url,
         git_ref: args.git_ref,
         namespace: args.namespace,

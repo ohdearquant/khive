@@ -4,16 +4,18 @@
 //! Builds atomically into a `.tmp` file then renames. Also supports remote archive
 //! fetch with SHA-256 pin verification via [`run_sync_remote`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
-use khive_types::EdgeRelation;
+use khive_types::{EdgeRelation, EntityKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,6 +28,8 @@ use crate::types::SnapshotId;
 struct NdjsonEntity {
     id: Uuid,
     kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entity_type: Option<String>,
     name: String,
     #[serde(default)]
     description: Option<String>,
@@ -84,13 +88,67 @@ pub struct SyncReport {
 
 // ── F201: Remote archive fetch ────────────────────────────────────────────────
 
+/// A validated remote cache name: a single path segment safe to join under
+/// `.khive/kg/remotes/` without escaping that directory.
+///
+/// Construct via [`RemoteName::parse`]. There is no public way to build a
+/// `RemoteName` that fails validation, so a `RemoteConfig` can never carry an
+/// unsafe name into [`run_sync_remote`] (VCS-AUD-002).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RemoteName(String);
+
+/// Renders exactly like a plain `String`'s `Debug` (quoted), so existing
+/// `{:?}`-formatted error messages that embedded `remote.name` keep the same
+/// shape after the `String` -> `RemoteName` migration.
+impl std::fmt::Debug for RemoteName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl RemoteName {
+    /// Validate `raw` as a safe single-path-segment remote name.
+    ///
+    /// Rejects: empty strings, `.`, `..`, any name containing `/` or `\`, and
+    /// any character outside `[A-Za-z0-9._-]`. Because path separators are
+    /// rejected outright, an absolute path (Unix `/root`, Windows `C:\root`)
+    /// can never pass — `:` is also outside the allowed character set.
+    pub fn parse(raw: impl Into<String>) -> Result<Self, VcsError> {
+        let raw = raw.into();
+        let valid = !raw.is_empty()
+            && raw != "."
+            && raw != ".."
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && !raw.contains('/')
+            && !raw.contains('\\');
+        if !valid {
+            return Err(VcsError::InvalidRemoteName(raw));
+        }
+        Ok(Self(raw))
+    }
+
+    /// The validated name as a `&str`, safe to join onto a cache directory path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RemoteName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Configuration for a remote KG archive (maps to one entry in `schema.yaml`
 /// `remotes:` list).
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
-    /// Human-readable name for this remote (used in error messages and cache
-    /// directory paths).
-    pub name: String,
+    /// Validated name for this remote (used in error messages and cache
+    /// directory paths). Constructed via [`RemoteName::parse`], so a
+    /// `RemoteConfig` can never carry a path-traversal or absolute-path name.
+    pub name: RemoteName,
     /// Git remote URL (e.g. `https://github.com/org/kg-data.git`).
     pub url: String,
     /// Git ref to check out (branch or tag, e.g. `main`).
@@ -235,46 +293,170 @@ pub async fn run_sync_remote(
         }
     }
 
-    // ── 5. Atomically publish to cache ────────────────────────────────────────
-    let cache_dir = repo_root.join(".khive/kg/remotes").join(&remote.name);
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-
-    // Write files into staging first, then rename into place atomically.
-    let tmp_entities = cache_dir.with_extension("entities.tmp");
-    let tmp_edges = cache_dir.with_extension("edges.tmp");
-
-    write_sorted_entities(&tmp_entities, &entities_ndjson)
-        .context("writing staged entities.ndjson")?;
-    write_sorted_edges(&tmp_edges, &edges_ndjson).context("writing staged edges.ndjson")?;
-
-    std::fs::rename(&tmp_entities, cache_dir.join("entities.ndjson"))
-        .context("renaming entities.ndjson into cache")?;
-    std::fs::rename(&tmp_edges, cache_dir.join("edges.ndjson"))
-        .context("renaming edges.ndjson into cache")?;
-
-    // ── 6. Write meta.json ────────────────────────────────────────────────────
+    // ── 5. Build meta and atomically publish to cache ─────────────────────────
     let meta = MetaJson {
         fetched_at: Utc::now().to_rfc3339(),
         git_ref: remote.git_ref.clone(),
         commit_sha,
         content_hash: actual_hash.as_str().to_string(),
     };
-    let meta_path = cache_dir.join("meta.json");
-    let meta_json = serde_json::to_string_pretty(&meta).context("serializing meta.json")?;
-    std::fs::write(&meta_path, meta_json.as_bytes()).context("writing meta.json")?;
 
-    // staging tempdir is dropped here, cleaning up the clone.
+    let remotes_root = repo_root.join(".khive/kg/remotes");
+    let cache_dir = remotes_root.join(remote.name.as_str());
+    let published = publish_remote_cache(
+        &remotes_root,
+        remote.name.as_str(),
+        &entities_ndjson,
+        &edges_ndjson,
+        &meta,
+        #[cfg(test)]
+        None,
+    )
+    .with_context(|| format!("publishing cache for remote {:?}", remote.name))?;
+    debug_assert_eq!(published, cache_dir);
+
+    // staging tempdir (the git clone) is dropped here, cleaning up the clone.
     drop(staging);
 
     Ok(RemoteSyncReport {
         entities: entities_ndjson.len(),
         edges: edges_ndjson.len(),
         cache_dir: cache_dir.to_string_lossy().into_owned(),
-        meta_path: meta_path.to_string_lossy().into_owned(),
+        meta_path: cache_dir.join("meta.json").to_string_lossy().into_owned(),
         content_hash: actual_hash.as_str().to_string(),
         repinned: repin,
     })
+}
+
+/// Injection points for #475 failure-injection tests: simulate a crash at each
+/// publish step so tests can assert readers never observe a mixed cache state.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishFailAt {
+    AfterEntities,
+    AfterEdges,
+    AfterMeta,
+    BeforeSwap,
+}
+
+/// Publish a complete `{entities.ndjson, edges.ndjson, meta.json}` triple to
+/// `<remotes_root>/<name>/` as a single atomic unit.
+///
+/// Builds a complete staging directory (a sibling of the cache directory,
+/// under `remotes_root`) containing all three files, then switches visibility
+/// with one directory-rename swap ([`atomic_replace_dir`]). A crash or error
+/// at any point before the swap leaves the existing cache untouched; a crash
+/// or error during the swap either leaves the old cache in place or completes
+/// to the new cache — a reader never observes a mix of old and new files.
+fn publish_remote_cache(
+    remotes_root: &Path,
+    name: &str,
+    entities: &[NdjsonEntity],
+    edges: &[NdjsonEdge],
+    meta: &MetaJson,
+    #[cfg(test)] fail_at: Option<PublishFailAt>,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(remotes_root)
+        .with_context(|| format!("creating {}", remotes_root.display()))?;
+    let staging = tempfile::TempDir::new_in(remotes_root).context("creating staging dir")?;
+
+    write_sorted_entities(&staging.path().join("entities.ndjson"), entities)
+        .context("writing staged entities.ndjson")?;
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterEntities) {
+        anyhow::bail!("injected failure after staged entities write");
+    }
+
+    write_sorted_edges(&staging.path().join("edges.ndjson"), edges)
+        .context("writing staged edges.ndjson")?;
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterEdges) {
+        anyhow::bail!("injected failure after staged edges write");
+    }
+
+    let meta_json = serde_json::to_string_pretty(meta).context("serializing meta.json")?;
+    std::fs::write(staging.path().join("meta.json"), meta_json.as_bytes())
+        .context("writing staged meta.json")?;
+    fsync_dir_best_effort(staging.path());
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::AfterMeta) {
+        anyhow::bail!("injected failure after staged meta write, before swap");
+    }
+
+    let cache_dir = remotes_root.join(name);
+    #[cfg(test)]
+    if fail_at == Some(PublishFailAt::BeforeSwap) {
+        anyhow::bail!("injected failure before swap");
+    }
+    atomic_replace_dir(staging.path(), &cache_dir)?;
+    fsync_dir_best_effort(remotes_root);
+
+    Ok(cache_dir)
+}
+
+/// Atomically replace `target_dir` with `new_dir` (a complete, ready-to-serve
+/// directory). If `target_dir` does not exist yet, `new_dir` is simply renamed
+/// into place. If `target_dir` already exists, the existing directory is first
+/// renamed to a sibling backup path, then `new_dir` is renamed into
+/// `target_dir`'s place; the backup is removed only after the swap succeeds.
+/// If the second rename fails, the backup is restored so the old cache is
+/// never lost. Both renames are single filesystem rename(2) calls, each of
+/// which is atomic — at every instant `target_dir` resolves to either the
+/// complete old directory, is briefly absent, or resolves to the complete new
+/// directory; it never contains a mix of old and new files.
+fn atomic_replace_dir(new_dir: &Path, target_dir: &Path) -> Result<()> {
+    if !target_dir.exists() {
+        std::fs::rename(new_dir, target_dir).with_context(|| {
+            format!("renaming {} -> {}", new_dir.display(), target_dir.display())
+        })?;
+        return Ok(());
+    }
+
+    let backup = target_dir.with_file_name(format!(
+        "{}.replaced-{}",
+        target_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&backup);
+
+    std::fs::rename(target_dir, &backup).with_context(|| {
+        format!(
+            "backing up existing cache {} -> {}",
+            target_dir.display(),
+            backup.display()
+        )
+    })?;
+
+    match std::fs::rename(new_dir, target_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // Restore the old cache so a failed swap never leaves the target missing.
+            let _ = std::fs::rename(&backup, target_dir);
+            Err(e).with_context(|| {
+                format!(
+                    "renaming {} -> {} (old cache restored)",
+                    new_dir.display(),
+                    target_dir.display()
+                )
+            })
+        }
+    }
+}
+
+/// Best-effort `fsync` of a directory's entries, where the platform supports
+/// opening a directory as a file handle (Unix). Errors are ignored: this is a
+/// durability improvement, not a correctness requirement for the atomicity
+/// guarantee above (which relies on rename(2) semantics, not fsync).
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 /// Redact URLs and embedded credentials from git stderr before surfacing in errors.
@@ -421,7 +603,7 @@ fn build_kg_archive(
         .map(|e| ExportedEntity {
             id: e.id,
             kind: e.kind.clone(),
-            entity_type: None,
+            entity_type: e.entity_type.clone(),
             name: e.name.clone(),
             description: e.description.clone(),
             properties: e.properties.clone(),
@@ -514,6 +696,119 @@ fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
     Ok(())
 }
 
+/// Full ADR-020 structural validation of parsed NDJSON records (#476).
+///
+/// Checks entity kind validity, entity/edge timestamp validity, entity/edge
+/// sort order (matching `write_sorted_entities`/`write_sorted_edges`), duplicate
+/// entity ids, duplicate edge ids, duplicate semantic edge triples
+/// (source, target, relation), dangling edge endpoints, and edge relation/weight
+/// validity. Called before any temp DB is created so a violation here leaves
+/// the existing target DB completely untouched.
+fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> Result<()> {
+    let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(entities.len());
+    let mut prev_entity_key: Option<String> = None;
+    for (i, e) in entities.iter().enumerate() {
+        EntityKind::from_str(&e.kind)
+            .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+
+        if !entity_ids.insert(e.id) {
+            bail!("entity {i}: duplicate entity id {}", e.id);
+        }
+
+        for (field, value) in [("created_at", &e.created_at), ("updated_at", &e.updated_at)] {
+            if let Some(s) = value {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .with_context(|| format!("entity {i} ({}): invalid {field} {s:?}", e.id))?;
+            }
+        }
+
+        let key = e.id.to_string().to_ascii_lowercase();
+        if let Some(prev) = &prev_entity_key {
+            if key < *prev {
+                bail!(
+                    "entities.ndjson is not sorted: entity {i} ({}) is out of order",
+                    e.id
+                );
+            }
+        }
+        prev_entity_key = Some(key);
+    }
+
+    let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
+    let mut triples: HashSet<(Uuid, Uuid, EdgeRelation)> = HashSet::with_capacity(edges.len());
+    let mut prev_edge_key: Option<(String, String, String)> = None;
+    for (i, r) in edges.iter().enumerate() {
+        let relation = r.relation.parse::<EdgeRelation>().with_context(|| {
+            format!(
+                "invalid edge relation {:?} at record {} — sync aborted before any DB write",
+                r.relation,
+                i + 1
+            )
+        })?;
+
+        if !r.weight.is_finite() || !(0.0..=1.0).contains(&r.weight) {
+            bail!(
+                "edge {i} ({}): weight {} out of range; must be finite and in [0.0, 1.0]",
+                r.edge_id,
+                r.weight
+            );
+        }
+
+        if !edge_ids.insert(r.edge_id) {
+            bail!("edge {i}: duplicate edge id {}", r.edge_id);
+        }
+
+        if !triples.insert((r.source, r.target, relation)) {
+            bail!(
+                "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",
+                r.edge_id,
+                r.source,
+                r.target,
+                relation
+            );
+        }
+
+        if !entity_ids.contains(&r.source) {
+            bail!(
+                "edge {i} ({}): dangling source {} — no matching entity",
+                r.edge_id,
+                r.source
+            );
+        }
+        if !entity_ids.contains(&r.target) {
+            bail!(
+                "edge {i} ({}): dangling target {} — no matching entity",
+                r.edge_id,
+                r.target
+            );
+        }
+
+        for (field, value) in [("created_at", &r.created_at), ("updated_at", &r.updated_at)] {
+            if let Some(s) = value {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .with_context(|| format!("edge {i} ({}): invalid {field} {s:?}", r.edge_id))?;
+            }
+        }
+
+        let key = (
+            r.source.to_string(),
+            r.target.to_string(),
+            r.relation.clone(),
+        );
+        if let Some(prev) = &prev_edge_key {
+            if key < *prev {
+                bail!(
+                    "edges.ndjson is not sorted: edge {i} ({}) is out of order",
+                    r.edge_id
+                );
+            }
+        }
+        prev_edge_key = Some(key);
+    }
+
+    Ok(())
+}
+
 /// Rebuild `db_path` from `.khive/kg/{entities,edges}.ndjson` under `repo_root`.
 ///
 /// The operation is atomic: the database is built in a `.tmp` sibling file and
@@ -533,18 +828,12 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     let edge_records =
         read_edges(&edges_path).with_context(|| format!("reading {}", edges_path.display()))?;
 
-    // ── Validate-first gate ──────────────────────────────────────────────────────
-    // Parse every edge relation before creating the temp DB so that an invalid
-    // relation causes a clean error that leaves the existing DB intact.
-    for (i, r) in edge_records.iter().enumerate() {
-        r.relation.parse::<EdgeRelation>().with_context(|| {
-            format!(
-                "invalid edge relation {:?} at record {} — sync aborted before any DB write",
-                r.relation,
-                i + 1
-            )
-        })?;
-    }
+    // ── Validate-first gate (#476) ────────────────────────────────────────────
+    // Run the full ADR-020 structural validation before creating the temp DB,
+    // so any violation leaves the existing DB completely untouched.
+    validate_ndjson_records(&entity_records, &edge_records).context(
+        "validating ADR-020 KG NDJSON before DB rebuild — sync aborted before any DB write",
+    )?;
 
     let tmp_path = with_extension_suffix(db_path, ".tmp");
     let _ = std::fs::remove_file(&tmp_path);
@@ -678,7 +967,7 @@ async fn upsert_entities(
                 id: r.id,
                 namespace: namespace.to_string(),
                 kind: r.kind.clone(),
-                entity_type: None,
+                entity_type: r.entity_type.clone(),
                 name: r.name.clone(),
                 description: r.description.clone(),
                 properties: r.properties.clone(),
@@ -934,31 +1223,56 @@ mod tests {
 
         // Generate N synthetic entity lines with predictable UUIDs.
         let ids: Vec<uuid::Uuid> = (0..N).map(|_| uuid::Uuid::new_v4()).collect();
-        let entity_lines: Vec<String> = ids
+        // #476 requires entities.ndjson to be in canonical ascending-by-id
+        // order (matching `write_sorted_entities`), so sort the lines below
+        // even though `ids` itself stays in generation order (used to build
+        // the wrap-around edges and to spot-check the last-generated entity).
+        let mut entity_lines: Vec<(uuid::Uuid, String)> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                format!(
-                    r#"{{"id":"{id}","kind":"concept","name":"SyntheticEntity{i}","description":"Synthetic test entity {i} for chunk-boundary coverage","properties":{{}},"tags":["bench","synthetic"]}}"#
+                (
+                    *id,
+                    format!(
+                        r#"{{"id":"{id}","kind":"concept","name":"SyntheticEntity{i}","description":"Synthetic test entity {i} for chunk-boundary coverage","properties":{{}},"tags":["bench","synthetic"]}}"#
+                    ),
                 )
             })
             .collect();
-        let entities_ndjson = entity_lines.join("\n");
+        entity_lines.sort_by(|a, b| {
+            a.0.to_string()
+                .to_ascii_lowercase()
+                .cmp(&b.0.to_string().to_ascii_lowercase())
+        });
+        let entities_ndjson = entity_lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Generate N synthetic edges: each entity points at the next one via
-        // "extends". The last entity wraps back to the first.
-        let edge_lines: Vec<String> = ids
+        // "extends". The last entity wraps back to the first. #476 requires
+        // edges.ndjson sorted by (source, target, relation), matching
+        // `write_sorted_edges`.
+        let mut edge_lines: Vec<((String, String, String), String)> = ids
             .iter()
             .enumerate()
             .map(|(i, &src)| {
                 let tgt = ids[(i + 1) % N];
                 let eid = uuid::Uuid::new_v4();
-                format!(
+                let key = (src.to_string(), tgt.to_string(), "extends".to_string());
+                let line = format!(
                     r#"{{"edge_id":"{eid}","source":"{src}","target":"{tgt}","relation":"extends","weight":0.9,"properties":{{}}}}"#
-                )
+                );
+                (key, line)
             })
             .collect();
-        let edges_ndjson = edge_lines.join("\n");
+        edge_lines.sort_by(|a, b| a.0.cmp(&b.0));
+        let edges_ndjson = edge_lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         write_repo(repo, &entities_ndjson, &edges_ndjson);
 
@@ -1062,6 +1376,355 @@ mod tests {
         assert_eq!(report.edges, 0);
     }
 
+    // ── #476: validate-first gate — one test per violation type ─────────────────
+    //
+    // Each test writes a sentinel DB file, runs `run_sync` against NDJSON that
+    // violates exactly one structural rule, asserts `run_sync` returns `Err`,
+    // and asserts the sentinel DB file is byte-unchanged: the violation must be
+    // caught before the temp DB is even created, let alone renamed over the
+    // target.
+
+    async fn assert_sync_rejected_before_db_write(
+        repo: &Path,
+        db_path: &Path,
+        entities_ndjson: &str,
+        edges_ndjson: &str,
+        expected_substr: &str,
+    ) {
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(db_path, b"SENTINEL").unwrap();
+        write_repo(repo, entities_ndjson, edges_ndjson);
+
+        let err = run_sync(repo, db_path, "test-ns")
+            .await
+            .expect_err("run_sync must reject invalid NDJSON");
+        assert!(
+            err.chain().any(|e| e.to_string().contains(expected_substr)),
+            "error must mention {expected_substr:?}, got: {err:#}"
+        );
+
+        let after = std::fs::read(db_path).unwrap();
+        assert_eq!(
+            after, b"SENTINEL",
+            "rejected sync must leave the target DB completely untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unknown_entity_kind_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = format!(
+            r#"{{"id":"{id}","kind":"not-a-real-kind","name":"Bad","properties":{{}},"tags":[]}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_out_of_range_edge_weight_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":1.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "out of range")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_entity_ids_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = [
+            format!(r#"{{"id":"{id}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id}","kind":"concept","name":"A2","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "duplicate entity id")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_edge_ids_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let id_c = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_c}","kind":"concept","name":"C","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "44444444-4444-4444-4444-444444444444";
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_c}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "duplicate edge id",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_edge_triples_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "33333333-3333-3333-3333-333333333333";
+        let edge_id_2 = "44444444-4444-4444-4444-444444444444";
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.9,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "duplicate edge triple",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_dangling_edge_source_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let missing_source = "99999999-9999-9999-9999-999999999999";
+        let entities =
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#);
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{missing_source}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "dangling source")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_dangling_edge_target_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let missing_target = "99999999-9999-9999-9999-999999999999";
+        let entities =
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#);
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{missing_target}","relation":"extends","weight":0.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "dangling target")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_invalid_entity_timestamp_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = format!(
+            r#"{{"id":"{id}","kind":"concept","name":"A","properties":{{}},"tags":[],"created_at":"not-a-timestamp"}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "invalid created_at")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_invalid_edge_timestamp_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}},"updated_at":"not-a-timestamp"}}"#
+        );
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "invalid updated_at",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unsorted_entities_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        // "b..." sorts after "a...", so writing it first violates the
+        // ascending-by-lowercase-id order that `write_sorted_entities` enforces.
+        let id_hi = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let id_lo = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let entities = [
+            format!(
+                r#"{{"id":"{id_hi}","kind":"concept","name":"Hi","properties":{{}},"tags":[]}}"#
+            ),
+            format!(
+                r#"{{"id":"{id_lo}","kind":"concept","name":"Lo","properties":{{}},"tags":[]}}"#
+            ),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            "",
+            "entities.ndjson is not sorted",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unsorted_edges_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let id_c = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_c}","kind":"concept","name":"C","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "44444444-4444-4444-4444-444444444444";
+        let edge_id_2 = "55555555-5555-5555-5555-555555555555";
+        // (source=c, target=a) sorts after (source=a, target=b) lexicographically
+        // by UUID string, so writing it first violates edge sort order.
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_c}","target":"{id_a}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "edges.ndjson is not sorted",
+        )
+        .await;
+    }
+
+    /// #473: `run_sync` must preserve `entity_type` from NDJSON into the
+    /// SQLite-backed entity store so subtype-filtered reads see it.
+    #[tokio::test]
+    async fn sync_preserves_entity_type() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+
+        let id_a = "44444444-4444-4444-4444-444444444444";
+        let line_a = format!(
+            r#"{{"id":"{id_a}","kind":"document","entity_type":"paper","name":"Attention Is All You Need","properties":{{}},"tags":[]}}"#
+        );
+        write_repo(repo, &line_a, "");
+
+        let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(report.entities, 1);
+
+        let ns = khive_types::Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let token = rt.authorize(ns).unwrap();
+        let entity = rt
+            .entities(&token)
+            .unwrap()
+            .get_entity(id_a.parse().unwrap())
+            .await
+            .unwrap()
+            .expect("entity must be retrievable after sync");
+        assert_eq!(
+            entity.entity_type.as_deref(),
+            Some("paper"),
+            "entity_type must survive NDJSON sync, not be stored as NULL"
+        );
+    }
+
+    /// #473: two archives differing ONLY by `entity_type` must hash to
+    /// different `SnapshotId`s — the pin must be injective over entity_type,
+    /// not collide with the untyped archive.
+    #[test]
+    fn remote_hash_includes_ndjson_entity_type() {
+        let id_a = "55555555-5555-5555-5555-555555555555";
+        let untyped = format!(
+            r#"{{"id":"{id_a}","kind":"document","name":"Some Doc","properties":{{}},"tags":[]}}"#
+        );
+        let typed = format!(
+            r#"{{"id":"{id_a}","kind":"document","entity_type":"paper","name":"Some Doc","properties":{{}},"tags":[]}}"#
+        );
+
+        let untyped_pin = compute_pin(&untyped, "", "test-ns");
+        let typed_pin = compute_pin(&typed, "", "test-ns");
+
+        assert_ne!(
+            untyped_pin.as_str(),
+            typed_pin.as_str(),
+            "entity_type must be part of the canonical hash input; a pin for the \
+             untyped archive must not validate typed content"
+        );
+    }
+
     /// F195: verify that FTS5 is populated during sync so text search works
     /// after sync without a separate `kkernel kg embed` pass.
     #[tokio::test]
@@ -1118,6 +1781,264 @@ mod tests {
         );
     }
 
+    // ── #474 RemoteName tests (VCS-AUD-002) ─────────────────────────────────────
+
+    /// #474: `RemoteName::parse` must reject every path-traversal / absolute
+    /// / separator-containing shape before it can reach `run_sync_remote`.
+    #[test]
+    fn remote_name_rejects_path_traversal_cases() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../evil",
+            "../../outside",
+            "/tmp/evil",
+            "safe/name",
+            "safe\\name",
+            "safe/../evil",
+        ] {
+            assert!(
+                RemoteName::parse(bad).is_err(),
+                "expected RemoteName::parse to reject {bad:?}"
+            );
+        }
+    }
+
+    /// #474: safe single-segment names must be accepted and preserved verbatim.
+    #[test]
+    fn remote_name_accepts_single_safe_segment() {
+        for good in ["upstream", "team.data-1", "remote_2"] {
+            let parsed = RemoteName::parse(good).expect("expected safe name to be accepted");
+            assert_eq!(parsed.as_str(), good);
+        }
+    }
+
+    /// #474: `run_sync_remote("../evil" | "/tmp/evil" | "safe/name")` must be
+    /// impossible to even construct — `RemoteConfig::name` is a `RemoteName`,
+    /// and `RemoteName::parse` is its only constructor — so these names never
+    /// reach `run_sync_remote`'s cache-directory join. Confirm both the
+    /// construction-time rejection AND (via filesystem check) that nothing
+    /// was created at the traversal targets or under `.khive/kg/remotes/`.
+    #[tokio::test]
+    async fn run_sync_remote_cannot_be_constructed_with_invalid_name() {
+        let repo_dir = TempDir::new().unwrap();
+        let outside_target = repo_dir.path().parent().unwrap().join("evil-outside-probe");
+        let _ = std::fs::remove_file(&outside_target);
+
+        for bad in ["../evil", "/tmp/evil", "safe/name"] {
+            assert!(
+                RemoteName::parse(bad).is_err(),
+                "RemoteName::parse must reject {bad:?} before any RemoteConfig can be built"
+            );
+        }
+
+        // No RemoteConfig could be built from these names, so run_sync_remote was
+        // never called: the cache tree and any traversal target are both absent.
+        assert!(
+            !repo_dir.path().join(".khive/kg/remotes").exists(),
+            "cache tree must not exist — no sync ever ran"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/evil").exists(),
+            "/tmp/evil must not have been created by this test run"
+        );
+        assert!(
+            !outside_target.exists(),
+            "nothing must be written outside the repo root"
+        );
+    }
+
+    // ── #475 atomic publish failure-injection tests (VCS-AUD-003) ───────────────
+
+    fn sample_entity(id: &str, name: &str) -> NdjsonEntity {
+        NdjsonEntity {
+            id: id.parse().unwrap(),
+            kind: "concept".to_string(),
+            entity_type: None,
+            name: name.to_string(),
+            description: None,
+            properties: Some(serde_json::json!({})),
+            tags: vec![],
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn sample_meta(tag: &str) -> MetaJson {
+        MetaJson {
+            fetched_at: "2026-01-01T00:00:00Z".to_string(),
+            git_ref: "main".to_string(),
+            commit_sha: "deadbeef".to_string(),
+            content_hash: format!("sha256:{tag}"),
+        }
+    }
+
+    /// Publish an "old" cache generation successfully, used as the baseline
+    /// state that a subsequent failed publish must leave untouched.
+    fn publish_old_generation(remotes_root: &Path, name: &str) -> PathBuf {
+        let entities = vec![sample_entity(
+            "11111111-1111-1111-1111-111111111111",
+            "OldEntity",
+        )];
+        publish_remote_cache(
+            remotes_root,
+            name,
+            &entities,
+            &[],
+            &sample_meta("old"),
+            None,
+        )
+        .expect("baseline publish must succeed")
+    }
+
+    fn assert_cache_is_old_generation(cache_dir: &Path) {
+        let entities = std::fs::read_to_string(cache_dir.join("entities.ndjson")).unwrap();
+        assert!(
+            entities.contains("OldEntity"),
+            "cache entities must still be the old generation, got: {entities}"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["content_hash"], "sha256:old");
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_entities_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterEntities),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_edges_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterEdges),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    #[test]
+    fn remote_cache_publish_failure_after_meta_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::AfterMeta),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    /// Failure injected immediately before the directory swap: the staged
+    /// directory is fully built but never made visible, so the reader-visible
+    /// cache must still be exactly the old generation.
+    #[test]
+    fn remote_cache_publish_failure_before_swap_keeps_old_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let err = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::BeforeSwap),
+        )
+        .expect_err("injected failure must surface as an error");
+        assert!(err.to_string().contains("injected failure"));
+
+        assert_cache_is_old_generation(&cache_dir);
+    }
+
+    /// A successful publish exposes the complete new entities+edges+meta
+    /// together — never a partial mix with the previous generation.
+    #[test]
+    fn remote_cache_publish_success_exposes_complete_new_cache() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join(".khive/kg/remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+        assert_cache_is_old_generation(&cache_dir);
+
+        let new_entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        let published = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &new_entities,
+            &[],
+            &sample_meta("new"),
+            None,
+        )
+        .expect("publish must succeed");
+        assert_eq!(published, cache_dir);
+
+        let entities = std::fs::read_to_string(cache_dir.join("entities.ndjson")).unwrap();
+        assert!(entities.contains("NewEntity"));
+        assert!(
+            !entities.contains("OldEntity"),
+            "old generation entity must not linger after a successful publish"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["content_hash"], "sha256:new");
+    }
+
     // ── F201 tests ────────────────────────────────────────────────────────────
 
     /// F201-1: `run_sync_remote` with a correct pin succeeds and writes the
@@ -1137,7 +2058,7 @@ mod tests {
         let expected_pin = compute_pin(&entities, edges, "remote-ns");
 
         let remote = RemoteConfig {
-            name: "upstream".to_string(),
+            name: RemoteName::parse("upstream").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1209,7 +2130,7 @@ mod tests {
         let wrong_pin = SnapshotId::from_hash(&"0".repeat(64)).unwrap();
 
         let remote = RemoteConfig {
-            name: "upstream".to_string(),
+            name: RemoteName::parse("upstream").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1253,7 +2174,7 @@ mod tests {
         let remote_url = make_git_remote(remote_dir.path(), &entities, "");
 
         let remote = RemoteConfig {
-            name: "no-pin-remote".to_string(),
+            name: RemoteName::parse("no-pin-remote").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "remote-ns".to_string(),
@@ -1296,7 +2217,7 @@ mod tests {
         let stale_pin = SnapshotId::from_hash(&"f".repeat(64)).unwrap();
 
         let remote = RemoteConfig {
-            name: "repinned".to_string(),
+            name: RemoteName::parse("repinned").unwrap(),
             url: remote_url,
             git_ref: "main".to_string(),
             namespace: "repin-ns".to_string(),
@@ -1452,7 +2373,7 @@ mod tests {
         let repo_dir = tempfile::TempDir::new().unwrap();
         // Use a credential-bearing HTTPS URL that will fail immediately.
         let remote = RemoteConfig {
-            name: "cred-test".to_string(),
+            name: RemoteName::parse("cred-test").unwrap(),
             url: "https://user:secret_token@nonexistent.example.invalid/org/repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),
@@ -1502,7 +2423,7 @@ mod tests {
     async fn public_error_redacts_scp_style_remote() {
         let repo_dir = tempfile::TempDir::new().unwrap();
         let remote = RemoteConfig {
-            name: "scp-test".to_string(),
+            name: RemoteName::parse("scp-test").unwrap(),
             url: "git@nonexistent.example.invalid:org/private-repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),
@@ -1592,7 +2513,7 @@ mod tests {
     async fn public_error_redacts_user_pass_at_host_scp() {
         let repo_dir = tempfile::TempDir::new().unwrap();
         let remote = RemoteConfig {
-            name: "userpass-scp".to_string(),
+            name: RemoteName::parse("userpass-scp").unwrap(),
             url: "deploy@nonexistent.example.invalid:infra/secret-repo.git".to_string(),
             git_ref: "main".to_string(),
             namespace: "test-ns".to_string(),

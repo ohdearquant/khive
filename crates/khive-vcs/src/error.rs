@@ -36,6 +36,13 @@ pub enum VcsError {
     #[error("invalid branch name: {0:?}")]
     InvalidBranchName(String),
 
+    /// A remote name failed validation (must be a single path segment
+    /// matching `[A-Za-z0-9._-]+`, and not `.` or `..`). Rejected before any
+    /// filesystem path is built from it, to prevent path traversal into
+    /// `.khive/kg/remotes/`.
+    #[error("invalid remote name {0:?}: must be one path segment [A-Za-z0-9._-]+ and not . or ..")]
+    InvalidRemoteName(String),
+
     /// An underlying storage operation failed.
     #[error("storage: {0}")]
     Storage(String),
