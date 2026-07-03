@@ -379,8 +379,11 @@ impl IndexAliasManager {
 
 impl std::fmt::Debug for IndexAliasManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let collections = self.collections.read();
+        // Canonical lock order is aliases -> collections, matching
+        // `acquire_reader`; do not flip this or a concurrent
+        // migrate/switch_alias can form a lock cycle with this fmt (#417).
         let aliases = self.aliases.read();
+        let collections = self.collections.read();
         f.debug_struct("IndexAliasManager")
             .field("collections", &collections.keys().collect::<Vec<_>>())
             .field("aliases", &*aliases)

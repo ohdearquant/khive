@@ -834,3 +834,22 @@ fn verify_rejects_duplicate_indexed_ids() {
         "verify() must reject duplicate indexed_ids, got {result:?}"
     );
 }
+
+/// Regression for #416: `verify()` must reject duplicate `tombstoned_ids`
+/// before restore can build ID maps from them (last-wins insertion would
+/// otherwise silently corrupt the tombstone set).
+#[test]
+fn verify_rejects_duplicate_tombstoned_ids() {
+    let x = make_id(1);
+    let mut snap = sample_snapshot();
+    snap.total_nodes = 2;
+    snap.live_nodes = 0;
+    snap.tombstone_count = 2;
+    snap.tombstoned_ids = vec![x, x];
+
+    let result = snap.verify();
+    assert!(
+        matches!(result, Err(SnapshotError::DuplicateTombstonedId { id }) if id == x),
+        "verify() must reject duplicate tombstoned_ids, got {result:?}"
+    );
+}
