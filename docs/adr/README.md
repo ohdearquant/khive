@@ -110,6 +110,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-082](ADR-082-retrieval-quality-measurement-loop.md)     | Retrieval Quality Measurement Loop (Proposed)                                                                   |
 | [ADR-083](ADR-083-session-pack-t1-verbs.md)                  | Session Pack T1 Verb Surface (Accepted)                                                                         |
 | [ADR-084](ADR-084-verb-surface-consistency.md)               | Verb-Surface Consistency Contract and Live Ontology Introspection (Proposed)                                    |
+| [ADR-085](ADR-085-code-pack.md)                              | Code Pack — Source-Code Ontology and Audit-Finding Vocabulary (Proposed)                                        |
 
 ## Closed Taxonomies — Quick Reference
 
