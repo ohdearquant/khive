@@ -190,10 +190,17 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
         let Some((method, result)) = methodspec.split_once('=') else {
             continue;
         };
-        // RFC 8601 permits an optional "/version" suffix on the method name
-        // (e.g. `dkim/1=pass`). Strip it before matching so a versioned method
-        // is recognized the same as its unversioned form.
-        let method = method.split_once('/').map_or(method, |(base, _)| base);
+        // RFC 8601 §2.2 permits an optional "/version" suffix on the method name
+        // (method-version = 1*DIGIT). §2.6 requires consumers to IGNORE resinfo
+        // for a method version they do not support -- an unsupported or
+        // non-numeric version must never be silently trusted as the current
+        // version. This module supports only version 1 (absent suffix is
+        // implicitly version 1); anything else skips the whole segment.
+        let method = match method.split_once('/') {
+            None => method,
+            Some((base, "1")) => base,
+            Some(_) => continue,
+        };
 
         let mut props = HashMap::new();
         for token in tokens {
@@ -335,6 +342,33 @@ mod tests {
     fn parse_header_dmarc_version_suffix_is_stripped_before_matching() {
         let parsed = parse_header("mx.example.com; dmarc/1=pass header.from=example.com").unwrap();
         assert!(parsed.dmarc_pass());
+    }
+
+    #[test]
+    fn parse_header_dkim_non_numeric_version_suffix_is_ignored_not_trusted_as_v1() {
+        // codex round-2 evidence: a non-numeric "version" must never be silently
+        // treated as the supported version 1 -- the whole resinfo must be ignored.
+        let parsed = parse_header("mx.example.com; dkim/evil=pass header.d=example.com").unwrap();
+        assert!(
+            parsed.dkim.is_empty(),
+            "a non-numeric method-version must not record a dkim entry; got {:?}",
+            parsed.dkim
+        );
+        assert!(!parsed.dkim_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn parse_header_dkim_unsupported_numeric_version_is_ignored_not_trusted_as_v1() {
+        // RFC 8601 §2.6: consumers must ignore resinfo for a method version they
+        // do not support. This module supports only version 1, so /2 must be
+        // ignored entirely, not coerced down to version 1's semantics.
+        let parsed = parse_header("mx.example.com; dkim/2=pass header.d=example.com").unwrap();
+        assert!(
+            parsed.dkim.is_empty(),
+            "an unsupported method-version must not record a dkim entry; got {:?}",
+            parsed.dkim
+        );
+        assert!(!parsed.dkim_pass_aligned("example.com"));
     }
 
     #[test]
