@@ -554,3 +554,26 @@ async fn read_event_rejects_payload_schema_version_u32_max_plus_one() {
         "payload_schema_version = u32::MAX + 1 ({overflow_version}) must be rejected"
     );
 }
+
+/// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
+/// InvalidInput instead of silently narrowing to a negative i64 offset.
+#[tokio::test]
+async fn page_offset_over_i64max_rejected() {
+    let store = setup_memory_store();
+    store.append_event(make_event("default")).await.unwrap();
+
+    let result = store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: (i64::MAX as u64) + 1,
+                limit: 10,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+}

@@ -385,3 +385,34 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
         "PK collision without external_id must return StorageError, not Ok(false)"
     );
 }
+
+/// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
+/// InvalidInput for both list paths instead of silently narrowing to a
+/// negative i64 offset.
+#[tokio::test]
+async fn page_offset_over_i64max_rejected() {
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note("ns1", "observation", "Hello world"))
+        .await
+        .unwrap();
+
+    let oversized = PageRequest {
+        offset: (i64::MAX as u64) + 1,
+        limit: 10,
+    };
+
+    let result = store.query_notes("ns1", None, oversized.clone()).await;
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "query_notes: expected InvalidInput, got {result:?}"
+    );
+
+    let filtered_result = store
+        .query_notes_filtered("ns1", &NoteFilter::default(), oversized)
+        .await;
+    assert!(
+        matches!(filtered_result, Err(StorageError::InvalidInput { .. })),
+        "query_notes_filtered: expected InvalidInput, got {filtered_result:?}"
+    );
+}

@@ -437,6 +437,15 @@ impl EntityStore for SqlEntityStore {
         page: PageRequest,
     ) -> Result<Page<Entity>, StorageError> {
         let namespace = namespace.to_string();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Entities,
+            operation: "query_entities".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
 
         self.with_reader("query_entities", move |conn| {
             let (count_sql, count_params) = build_entity_where(&namespace, &filter);
@@ -449,8 +458,8 @@ impl EntityStore for SqlEntityStore {
             };
 
             let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
-            data_params.push(Box::new(page.limit as i64));
-            data_params.push(Box::new(page.offset as i64));
+            data_params.push(Box::new(limit_i64));
+            data_params.push(Box::new(offset_i64));
 
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();

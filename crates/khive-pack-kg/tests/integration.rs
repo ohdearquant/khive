@@ -765,6 +765,61 @@ async fn link_two_entities_visible_via_neighbors() {
     );
 }
 
+/// Regression for #471: `link` must reject relation strings with punctuation
+/// (`supports!`, `part/of`, `depends.on`, `competes with`) as InvalidInput
+/// instead of silently normalizing them into a canonical relation.
+#[tokio::test]
+async fn link_edge_relation_bang_returns_invalid_input() {
+    let pack = pack();
+
+    let src = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Alpha", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create source must succeed");
+    let src_id = src
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("must have id")
+        .to_string();
+
+    let tgt = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Beta", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create target must succeed");
+    let tgt_id = tgt
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("must have id")
+        .to_string();
+
+    for bad_relation in ["supports!", "part/of", "depends.on", "competes with"] {
+        let err = pack
+            .dispatch(
+                "link",
+                json!({
+                    "source_id": src_id,
+                    "target_id": tgt_id,
+                    "relation": bad_relation,
+                    "weight": 0.5
+                }),
+            )
+            .await
+            .expect_err(&format!(
+                "relation {bad_relation:?} must be rejected as InvalidInput"
+            ));
+        assert!(
+            is_invalid_input(&err),
+            "relation {bad_relation:?} must be InvalidInput, got: {err:?}"
+        );
+    }
+}
+
 /// Regression for #160: search response includes `entity_kind` so agents can
 /// distinguish hit kinds without an extra `get()` call.
 #[tokio::test]
@@ -1316,6 +1371,59 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
         !arr.is_empty(),
         "traverse must find the child node at depth 1"
     );
+}
+
+/// STORAGE-AUD-003 / #485: an oversized max_depth (> i64::MAX) must reject at
+/// the storage boundary, not silently narrow to a negative i64 depth and
+/// return an empty or wrong traversal.
+#[tokio::test]
+async fn traverse_max_depth_over_i64max_rejected() {
+    let pack = pack();
+
+    let root = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "RootConcept", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create root must succeed");
+    let root_id = root.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let child = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ChildConcept", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create child must succeed");
+    let child_id = child.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": root_id, "target_id": child_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    let oversized_max_depth = (i64::MAX as u64) + 1;
+    let err = pack
+        .dispatch(
+            "traverse",
+            json!({
+                "roots": [root_id],
+                "max_depth": oversized_max_depth,
+                "direction": "out",
+                "include_roots": false
+            }),
+        )
+        .await
+        .expect_err("traverse with max_depth > i64::MAX must not succeed");
+
+    match err {
+        RuntimeError::Storage(khive_storage::StorageError::InvalidInput { .. }) => {}
+        RuntimeError::InvalidInput(_) => {}
+        other => panic!("expected InvalidInput (directly or via Storage), got {other:?}"),
+    }
 }
 
 // ---- include_entity_type / include_properties optional enrichment ----
