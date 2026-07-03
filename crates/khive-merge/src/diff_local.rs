@@ -64,10 +64,20 @@ pub struct EdgeKey {
 
 impl EdgeKey {
     /// Construct an `EdgeKey` from a `ExportedEdge` by cloning its identity fields.
+    ///
+    /// Symmetric relations (e.g. `competes_with`, `composed_with`) canonicalize
+    /// endpoints to `min(source, target)`/`max(source, target)` (ADR-002) so that
+    /// a swapped-order duplicate collides with the original in the key's hash/eq.
     pub fn from_edge(e: &ExportedEdge) -> Self {
+        let (source, target) = if e.relation.is_symmetric() && e.target < e.source {
+            (e.target, e.source)
+        } else {
+            (e.source, e.target)
+        };
+
         Self {
-            source: e.source,
-            target: e.target,
+            source,
+            target,
             relation: e.relation.to_string(),
         }
     }

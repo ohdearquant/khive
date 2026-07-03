@@ -61,15 +61,26 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
         }
     }
 
-    // Reject duplicate edge natural keys.
+    // Reject duplicate edge IDs.
+    let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(archive.edges.len());
+    for edge in &archive.edges {
+        if !edge_ids.insert(edge.edge_id) {
+            return Err(MergeError::Internal(format!(
+                "duplicate edge IDs in archive: {}",
+                edge.edge_id
+            )));
+        }
+    }
+
+    // Reject duplicate edge semantic keys.
     let mut edge_keys: HashSet<EdgeKey> = HashSet::with_capacity(archive.edges.len());
     for edge in &archive.edges {
         let key = EdgeKey::from_edge(edge);
         if !edge_keys.insert(key.clone()) {
             return Err(MergeError::DuplicateEdgeKey {
-                edge_source: edge.source,
-                edge_target: edge.target,
-                edge_relation: edge.relation.to_string(),
+                edge_source: key.source,
+                edge_target: key.target,
+                edge_relation: key.relation,
             });
         }
     }

@@ -1009,6 +1009,110 @@ fn duplicate_uuid_different_entity_type_is_conflict() {
     }
 }
 
+// ── #455: duplicate edge_id and symmetric duplicate identity validation ────
+
+#[test]
+fn rejects_duplicate_edge_ids_in_archive() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let d = Uuid::new_v4();
+    let dup_id = Uuid::new_v4();
+
+    let entities = vec![
+        entity(a, "A"),
+        entity(b, "B"),
+        entity(c, "C"),
+        entity(d, "D"),
+    ];
+    let base = archive_full(vec![], vec![]);
+    let mut ours = archive_full(entities, vec![]);
+    ours.edges = vec![
+        ExportedEdge {
+            edge_id: dup_id,
+            source: a,
+            target: b,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+        },
+        ExportedEdge {
+            edge_id: dup_id,
+            source: c,
+            target: d,
+            relation: EdgeRelation::DependsOn,
+            weight: 1.0,
+        },
+    ];
+    let theirs = archive_full(vec![], vec![]);
+
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
+    match err {
+        MergeError::Internal(msg) => {
+            assert!(
+                msg.contains("duplicate edge IDs") && msg.contains(&dup_id.to_string()),
+                "expected message mentioning duplicate edge IDs and the UUID, got: {msg}"
+            );
+        }
+        other => panic!("expected MergeError::Internal, got: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
+    let (lo, hi) = {
+        let x = Uuid::new_v4();
+        let y = Uuid::new_v4();
+        if x < y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    };
+
+    let entities = vec![entity(lo, "A"), entity(hi, "B")];
+    let base = archive_full(vec![], vec![]);
+    let ours = archive_full(
+        entities,
+        vec![
+            ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: lo,
+                target: hi,
+                relation: EdgeRelation::CompetesWith,
+                weight: 1.0,
+            },
+            ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: hi,
+                target: lo,
+                relation: EdgeRelation::CompetesWith,
+                weight: 1.0,
+            },
+        ],
+    );
+    let theirs = archive_full(vec![], vec![]);
+
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
+    match err {
+        MergeError::DuplicateEdgeKey {
+            edge_source,
+            edge_target,
+            edge_relation,
+        } => {
+            assert_eq!(
+                edge_source, lo,
+                "canonical source must be min(source, target)"
+            );
+            assert_eq!(
+                edge_target, hi,
+                "canonical target must be max(source, target)"
+            );
+            assert_eq!(edge_relation, "competes_with");
+        }
+        other => panic!("expected MergeError::DuplicateEdgeKey, got: {other:?}"),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn archive_with_entities(entities: Vec<ExportedEntity>) -> KgArchive {
