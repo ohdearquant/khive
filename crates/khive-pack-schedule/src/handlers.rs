@@ -314,10 +314,22 @@ fn validate_conditional_requirements(
         .get("entity_kind")
         .and_then(khive_request::ArgValue::as_value)
         .and_then(Value::as_str);
+    let note_kind_arg = args
+        .get("note_kind")
+        .and_then(khive_request::ArgValue::as_value)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
 
     match classify_create_kind(kind_str, registry)? {
         CreateKindClass::Entity { specific } => {
-            if specific.is_none() && entity_kind_arg.is_none() {
+            let canonical = reconcile_specific_for_replay(
+                "",
+                specific,
+                entity_kind_arg,
+                |s| canonical_entity_kind_for_replay(s, registry),
+                "entity_kind",
+            )?;
+            if canonical.is_none() {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": kind=\"entity\" requires a specific \
                      kind — use kind=<concept|document|dataset|project|person|org|artifact|\
@@ -337,7 +349,14 @@ fn validate_conditional_requirements(
                 ));
             }
         }
-        CreateKindClass::Note => {
+        CreateKindClass::Note { specific } => {
+            reconcile_specific_for_replay(
+                "",
+                specific,
+                note_kind_arg,
+                |s| canonical_note_kind_for_replay(s, registry),
+                "note_kind",
+            )?;
             let content = args
                 .get("content")
                 .and_then(khive_request::ArgValue::as_value)
@@ -358,9 +377,12 @@ fn validate_conditional_requirements(
 /// Resolved shape of a `create(kind=...)` discriminator, mirroring
 /// `khive-pack-kg`'s `KindSpec` for the two branches that carry a
 /// conditional requirement (`entity` needs `name`, `note` needs `content`).
+/// Both variants carry the resolved granular `specific` kind (`None` for a
+/// bare `"entity"`/`"note"`) so callers can run the same kind/legacy-kind
+/// reconciliation `khive-pack-kg::handlers::create` runs.
 enum CreateKindClass {
     Entity { specific: Option<String> },
-    Note,
+    Note { specific: Option<String> },
 }
 
 /// Classify a `create(kind=...)` value the same way
@@ -377,7 +399,7 @@ fn classify_create_kind(
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "entity" => return Ok(CreateKindClass::Entity { specific: None }),
-        "note" => return Ok(CreateKindClass::Note),
+        "note" => return Ok(CreateKindClass::Note { specific: None }),
         "edge" => {
             return Err(RuntimeError::InvalidInput(
                 "schedule.action: verb \"create\" with kind=\"edge\" always fails at replay; \
@@ -407,7 +429,9 @@ fn classify_create_kind(
         });
     }
     if registry.all_note_kinds().contains(&normalized.as_str()) {
-        return Ok(CreateKindClass::Note);
+        return Ok(CreateKindClass::Note {
+            specific: Some(normalized),
+        });
     }
     Err(RuntimeError::InvalidInput(format!(
         "schedule.action: verb \"create\" with kind={raw:?} always fails at replay (unknown \
@@ -415,6 +439,88 @@ fn classify_create_kind(
         registry.all_entity_kinds().join(" | "),
         registry.all_note_kinds().join(" | "),
     )))
+}
+
+/// Canonicalize a legacy `entity_kind` value the same way
+/// `khive-pack-kg::handlers::common::canonical_entity_kind` does: try the
+/// base `khive_types::EntityKind` parser (the 8 base kinds plus its common
+/// aliases, e.g. `"paper"` -> `document`), then fall back to the registry's
+/// merged entity-kind vocabulary (covers pack-declared additions such as
+/// `resource`, ADR-048). `khive-pack-schedule` does not depend on
+/// `khive-pack-kg` (only as a dev-dependency for tests), so it cannot resolve
+/// KG's own pack-private alias set (e.g. `"atom"` -> `resource`) — an
+/// unresolved alias here is rejected as an unknown `entity_kind`, which is
+/// strictly safe: it never lets through a value KG would accept, it only
+/// ever rejects earlier (at schedule time) something that would otherwise
+/// also need to canonicalize successfully at replay.
+fn canonical_entity_kind_for_replay(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<String, RuntimeError> {
+    if let Ok(k) = raw.parse::<khive_types::EntityKind>() {
+        return Ok(k.name().to_string());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_entity_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown entity_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+/// Canonicalize a legacy `note_kind` value the same way
+/// `khive-pack-kg::handlers::common::canonical_note_kind` does. Note kinds
+/// carry no alias set beyond their 5 canonical names (ADR-013), so this is
+/// exactly the registry's merged note-kind vocabulary check.
+fn canonical_note_kind_for_replay(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<String, RuntimeError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_note_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown note_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+/// Reconcile a granular `kind`'s resolved `specific` value against a legacy
+/// `entity_kind`/`note_kind` argument, mirroring
+/// `khive-pack-kg::handlers::common::reconcile_specific` exactly (including
+/// the contradiction error shape) so a scheduled action that the real KG
+/// `create` handler would reject for a kind/legacy-kind contradiction is
+/// rejected at schedule time too, not only discovered at trigger-time replay.
+/// `context` prefixes error messages (e.g. `"items[3] "` for a bulk entry,
+/// `""` for the singleton path).
+fn reconcile_specific_for_replay(
+    context: &str,
+    spec_specific: Option<String>,
+    legacy_raw: Option<&str>,
+    canonicalize: impl Fn(&str) -> Result<String, RuntimeError>,
+    legacy_field: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let legacy_canonical = match legacy_raw {
+        Some(s) => Some(canonicalize(s).map_err(|e| {
+            RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {context}{e}"))
+        })?),
+        None => None,
+    };
+    match (spec_specific, legacy_canonical) {
+        (Some(a), Some(b)) if a != b => Err(RuntimeError::InvalidInput(format!(
+            "schedule.action: verb \"create\": {context}kind={a:?} contradicts \
+             {legacy_field}={b:?}; pick one"
+        ))),
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
 }
 
 /// A single entry in a bulk `create(items=[...])` action, mirroring
@@ -452,7 +558,14 @@ fn validate_create_bulk_items(
     for (idx, entry) in entries.iter().enumerate() {
         match classify_create_kind(&entry.kind, registry)? {
             CreateKindClass::Entity { specific } => {
-                if specific.is_none() && entry.entity_kind.is_none() {
+                let canonical = reconcile_specific_for_replay(
+                    &format!("items[{idx}] "),
+                    specific,
+                    entry.entity_kind.as_deref(),
+                    |s| canonical_entity_kind_for_replay(s, registry),
+                    "entity_kind",
+                )?;
+                if canonical.is_none() {
                     return Err(RuntimeError::InvalidInput(format!(
                         "schedule.action: verb \"create\": items[{idx}] kind=\"entity\" \
                          requires a specific kind — use kind=<concept|…> or kind=entity + \
@@ -460,7 +573,7 @@ fn validate_create_bulk_items(
                     )));
                 }
             }
-            CreateKindClass::Note => {
+            CreateKindClass::Note { .. } => {
                 return Err(RuntimeError::InvalidInput(format!(
                     "schedule.action: verb \"create\": items[{idx}] bulk create only supports \
                      entity kinds; got kind={:?}",

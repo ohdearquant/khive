@@ -249,7 +249,7 @@ pub async fn run_pending_events(
                 // (b) if cancel already won the race, our claim fails and we
                 // skip — the drain can no longer clobber a cancel that
                 // landed between the read and this point.
-                let claimed = match claim_pending_event(&rt, ns_str, note.id).await {
+                let claimed_firing_at = match claim_pending_event(&rt, ns_str, note.id).await {
                     Ok(c) => c,
                     Err(e) => {
                         if verbose {
@@ -259,7 +259,7 @@ pub async fn run_pending_events(
                         continue;
                     }
                 };
-                if !claimed {
+                let Some(claimed_firing_at) = claimed_firing_at else {
                     if verbose {
                         eprintln!(
                             "[pending-events] skip note {}: no longer pending (concurrent \
@@ -269,7 +269,7 @@ pub async fn run_pending_events(
                     }
                     summary.skipped_race += 1;
                     continue;
-                }
+                };
 
                 // ── Dispatch the action ──────────────────────────────────
                 if let Some(dsl) = &action_dsl {
@@ -325,8 +325,15 @@ pub async fn run_pending_events(
                 // clobber a cancel that (impossibly, given the claim above,
                 // but defensively) raced in after the claim.
                 let final_props = note.properties.clone().unwrap_or_else(|| json!({}));
-                match finalize_fired_event(&rt, ns_str, note.id, &final_props, note.updated_at)
-                    .await
+                match finalize_fired_event(
+                    &rt,
+                    ns_str,
+                    note.id,
+                    &final_props,
+                    note.updated_at,
+                    claimed_firing_at,
+                )
+                .await
                 {
                     Ok(true) => {}
                     Ok(false) => {
@@ -377,17 +384,27 @@ pub async fn run_pending_events(
 
 /// CAS-claim a pending scheduled event for firing: `pending -> firing`.
 ///
-/// Returns `Ok(true)` iff exactly one row transitioned, meaning this drain
-/// (and not a concurrent `schedule.cancel`) now owns the row. Mirrors the
-/// `schedule.cancel` CAS in `khive-pack-schedule/src/handlers.rs` so the two
-/// writers share one state machine: cancel only matches `status='pending'`,
-/// so once a row is claimed to `firing` a racing cancel fails cleanly instead
-/// of clobbering (or being clobbered by) this drain's eventual write.
+/// Returns `Ok(Some(firing_at))` iff exactly one row transitioned, meaning
+/// this drain (and not a concurrent `schedule.cancel`) now owns the row.
+/// The returned `firing_at` (epoch µs) is this drain's **claim token** —
+/// callers MUST thread it through to `finalize_fired_event` so finalization
+/// binds to the specific claim that won, not merely to `status='firing'`
+/// (issue #462 round-2: a stale claimant that resumes after a reclaim +
+/// re-claim must not be able to finalize over the new claimant's row).
+/// Mirrors the `schedule.cancel` CAS in `khive-pack-schedule/src/handlers.rs`
+/// so the two writers share one state machine: cancel only matches
+/// `status='pending'`, so once a row is claimed to `firing` a racing cancel
+/// fails cleanly instead of clobbering (or being clobbered by) this drain's
+/// eventual write.
 ///
 /// Also stamps `properties.firing_at` (epoch µs, same instant as
 /// `updated_at`) so a later drain pass can detect and reclaim this row if
 /// this process crashes before `finalize_fired_event` runs (issue #462).
-async fn claim_pending_event(rt: &KhiveRuntime, namespace: &str, id: uuid::Uuid) -> Result<bool> {
+async fn claim_pending_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+) -> Result<Option<i64>> {
     let updated_at = Utc::now().timestamp_micros();
     let mut writer = rt
         .sql()
@@ -417,7 +434,7 @@ async fn claim_pending_event(rt: &KhiveRuntime, namespace: &str, id: uuid::Uuid)
         })
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: claim conditional update: {e}"))?;
-    Ok(rows == 1)
+    Ok((rows == 1).then_some(updated_at))
 }
 
 /// Reclaim `scheduled_event` rows stuck in `status="firing"` whose
@@ -466,15 +483,38 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64
 /// | pending}` (the latter for an advanced repeat), replacing the full-row
 /// `upsert_note` that could otherwise clobber a concurrent write.
 ///
-/// Returns `Ok(true)` iff exactly one row (still `firing`) was updated.
+/// `claimed_firing_at` is the claim token returned by `claim_pending_event`
+/// (or reconstructed from a reclaimed row's own `firing_at`) — the CAS
+/// requires the row's CURRENT `firing_at` to still equal this value, not
+/// merely that `status='firing'`. Without this, a stale claimant that stalls
+/// past `STALE_FIRING_TIMEOUT_MICROS`, gets reclaimed, and is then re-claimed
+/// by a second drain could resume and finalize over the second drain's live
+/// claim purely because both rows share `status='firing'` (issue #462
+/// round-2). Binding to the specific `firing_at` instant closes that gap:
+/// a reclaim always rewrites `firing_at` (via a fresh `claim_pending_event`
+/// call) or clears `status` back to `pending`, so a stale token can never
+/// match the row's current one.
+///
+/// `properties` must NOT already carry a `firing_at` field for the terminal
+/// write — this function clears it (the event has reached a terminal state
+/// for this cycle, `fired` or re-armed `pending`, so no claim token should
+/// survive to be mistaken for a live claim by a future finalize).
+///
+/// Returns `Ok(true)` iff exactly one row (still `firing` under this exact
+/// claim token) was updated.
 async fn finalize_fired_event(
     rt: &KhiveRuntime,
     namespace: &str,
     id: uuid::Uuid,
     properties: &Value,
     updated_at: i64,
+    claimed_firing_at: i64,
 ) -> Result<bool> {
-    let props_json = serde_json::to_string(properties)
+    let mut properties = properties.clone();
+    if let Some(obj) = properties.as_object_mut() {
+        obj.remove("firing_at");
+    }
+    let props_json = serde_json::to_string(&properties)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
     let mut writer = rt
         .sql()
@@ -489,13 +529,15 @@ async fn finalize_fired_event(
                     AND namespace = ?4 \
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'firing'"
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5"
                 .to_string(),
             params: vec![
                 SqlValue::Text(props_json),
                 SqlValue::Integer(updated_at),
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(claimed_firing_at),
             ],
             label: Some("pending_events_finalize_fired".into()),
         })
@@ -1138,10 +1180,10 @@ mod tests {
 
         // Simulate the drain's claim (pending -> firing), which in the real
         // drain happens right after the page read and before dispatch.
-        let claimed = claim_pending_event(&rt, "local", id)
+        let claimed_firing_at = claim_pending_event(&rt, "local", id)
             .await
-            .expect("claim query");
-        assert!(claimed, "claim must succeed on a fresh pending row");
+            .expect("claim query")
+            .expect("claim must succeed on a fresh pending row");
 
         // A `schedule.cancel` arriving after the claim (the race window the
         // reviewer identified) must now fail instead of clobbering the
@@ -1189,6 +1231,7 @@ mod tests {
                 "cancelled_at": null,
             }),
             Utc::now().timestamp_micros(),
+            claimed_firing_at,
         )
         .await
         .expect("finalize query");
@@ -1293,10 +1336,10 @@ mod tests {
             create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
 
         // Fresh claim: firing_at = now, well under the stale threshold.
-        let claimed = claim_pending_event(&rt, "local", id)
+        let _claimed_firing_at = claim_pending_event(&rt, "local", id)
             .await
-            .expect("claim query");
-        assert!(claimed, "claim must succeed on a fresh pending row");
+            .expect("claim query")
+            .expect("claim must succeed on a fresh pending row");
 
         let summary = run_pending_events(Some(&db_path), "local", false)
             .await
@@ -1317,6 +1360,142 @@ mod tests {
             Some("firing"),
             "a fresh firing row must remain firing (owned by the process that claimed it), \
              got {props:?}"
+        );
+    }
+
+    /// Round-2 regression (codex REJECT, "finalize must be bound to the
+    /// owning claim"): reproduces the exact stale-claimant-resumes
+    /// interleaving. Drain A claims and (simulated) crashes/stalls past the
+    /// stale timeout with its own `firing_at` token recorded. A reclaim pass
+    /// then runs, and drain B re-claims the row, minting a fresh `firing_at`
+    /// token distinct from A's. A now resumes and attempts to finalize using
+    /// its stale token: before this fix, `finalize_fired_event` matched on
+    /// `status='firing'` alone and would have clobbered B's live claim with
+    /// A's stale final state. With the claim-token CAS in place, A's
+    /// finalize must be a no-op and B's claim (and eventual finalize) must
+    /// survive untouched.
+    #[tokio::test]
+    async fn stale_claimant_cannot_finalize_over_a_fresh_reclaim() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Drain A claims, then (simulated) stalls: fabricate a status="firing"
+        // row whose firing_at predates the stale threshold — this stands in
+        // for "A really did claim it, then never got back to finalize".
+        let a_claimed_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        force_set_properties(
+            &rt,
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "firing",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": null,
+                "cancelled_at": null,
+                "firing_at": a_claimed_firing_at,
+            }),
+        )
+        .await;
+
+        // A reclaim pass runs (as a live drain's periodic sweep would),
+        // moving the row back to "pending" since A's firing_at is stale.
+        let stale_before = Utc::now().timestamp_micros() - STALE_FIRING_TIMEOUT_MICROS;
+        let reclaimed = reclaim_stale_firing_events(&rt, stale_before)
+            .await
+            .expect("reclaim query");
+        assert_eq!(reclaimed, 1, "A's stale claim must be reclaimed");
+
+        // Drain B re-claims the now-pending row, minting a fresh firing_at
+        // token that differs from A's stale one.
+        let b_claimed_firing_at = claim_pending_event(&rt, "local", id)
+            .await
+            .expect("claim query")
+            .expect("B's claim must succeed on the reclaimed row");
+        assert_ne!(
+            a_claimed_firing_at, b_claimed_firing_at,
+            "B's claim token must differ from A's stale token"
+        );
+
+        // A resumes (unaware it was reclaimed) and attempts to finalize using
+        // its own stale claim token. This must be a no-op: it must NOT match
+        // B's current firing_at, and must NOT clobber B's live claim.
+        let a_finalize_result = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+            a_claimed_firing_at,
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            !a_finalize_result,
+            "A's finalize with a stale claim token must be a no-op, not a successful write"
+        );
+
+        // B's claim must be completely intact: still "firing", still stamped
+        // with B's own firing_at — A's stale finalize must not have touched it.
+        let props_after_a = get_note_props(&rt, id).await;
+        assert_eq!(
+            props_after_a["status"].as_str(),
+            Some("firing"),
+            "B's claim must survive A's stale finalize attempt untouched, got {props_after_a:?}"
+        );
+        assert_eq!(
+            props_after_a["firing_at"].as_i64(),
+            Some(b_claimed_firing_at),
+            "B's firing_at token must be unchanged by A's stale finalize attempt"
+        );
+
+        // B now finalizes with its own (correct) claim token — this must
+        // succeed, proving the fix doesn't wedge legitimate finalization.
+        let b_finalize_result = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+            b_claimed_firing_at,
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            b_finalize_result,
+            "B's finalize with its own claim token must succeed"
+        );
+
+        let final_props = get_note_props(&rt, id).await;
+        assert_eq!(
+            final_props["status"].as_str(),
+            Some("fired"),
+            "terminal state must be \"fired\" via B's own claim, got {final_props:?}"
+        );
+        assert!(
+            final_props.get("firing_at").is_none() || final_props["firing_at"].is_null(),
+            "firing_at must be cleared on terminal finalize, got {final_props:?}"
         );
     }
 
