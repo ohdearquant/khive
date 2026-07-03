@@ -13,6 +13,12 @@ pub(crate) fn is_zero(val: &usize) -> bool {
     *val == 0
 }
 
+/// Return the first ID that appears more than once in `ids`, if any.
+fn first_duplicate(ids: &[NodeId]) -> Option<NodeId> {
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.iter().copied().find(|id| !seen.insert(*id))
+}
+
 /// Errors that can occur during snapshot verification.
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum SnapshotError {
@@ -51,6 +57,20 @@ pub enum SnapshotError {
     #[error("tombstoned id {id:?} not found in indexed_ids")]
     TombstoneNotInIndex {
         /// The missing tombstone ID.
+        id: NodeId,
+    },
+
+    /// `indexed_ids` contains the same ID more than once.
+    #[error("indexed_ids contains duplicate id {id:?}")]
+    DuplicateIndexedId {
+        /// The duplicated ID.
+        id: NodeId,
+    },
+
+    /// `tombstoned_ids` contains the same ID more than once.
+    #[error("tombstoned_ids contains duplicate id {id:?}")]
+    DuplicateTombstonedId {
+        /// The duplicated ID.
         id: NodeId,
     },
 
@@ -160,9 +180,15 @@ impl HnswSnapshot {
                 self.live_nodes = self.vector_count;
                 self.tombstone_count = 0;
             } else if !self.indexed_ids.is_empty() {
-                // Fallback: infer from indexed_ids
+                // Fallback: infer from indexed_ids. Use saturating_sub so a
+                // malformed legacy snapshot (more tombstones than indexed
+                // ids) cannot panic here; `verify()` is the rejecting
+                // boundary and will catch the resulting inconsistency.
                 self.total_nodes = self.indexed_ids.len();
-                self.live_nodes = self.indexed_ids.len() - self.tombstoned_ids.len();
+                self.live_nodes = self
+                    .indexed_ids
+                    .len()
+                    .saturating_sub(self.tombstoned_ids.len());
                 self.tombstone_count = self.tombstoned_ids.len();
             }
         }
@@ -175,8 +201,12 @@ impl HnswSnapshot {
 
     /// Verify internal consistency: counts, ID list lengths, tombstone membership.
     pub fn verify(&self) -> Result<(), SnapshotError> {
-        // Check count consistency
-        if self.total_nodes != self.live_nodes + self.tombstone_count {
+        // Check count consistency. Use checked_add so a malformed snapshot
+        // with `live_nodes + tombstone_count` overflowing `usize` is
+        // rejected instead of panicking (or, in release builds, wrapping
+        // and silently comparing equal to a bogus total_nodes) (#415).
+        let expected_total = self.live_nodes.checked_add(self.tombstone_count);
+        if expected_total != Some(self.total_nodes) {
             return Err(SnapshotError::InconsistentCounts {
                 total: self.total_nodes,
                 live: self.live_nodes,
@@ -198,6 +228,17 @@ impl HnswSnapshot {
                 expected: self.tombstone_count,
                 actual: self.tombstoned_ids.len(),
             });
+        }
+
+        // Reject duplicate indexed/tombstoned IDs before any restore path
+        // can build ID maps from them (#416): last-wins `HashMap::insert`
+        // during restore would otherwise silently corrupt `internal_to_id`
+        // by mapping two live internal nodes to the same external ID.
+        if let Some(id) = first_duplicate(&self.indexed_ids) {
+            return Err(SnapshotError::DuplicateIndexedId { id });
+        }
+        if let Some(id) = first_duplicate(&self.tombstoned_ids) {
+            return Err(SnapshotError::DuplicateTombstonedId { id });
         }
 
         // Check all tombstoned IDs are in indexed_ids
@@ -301,7 +342,20 @@ impl TryFrom<RawHnswSnapshot> for HnswSnapshot {
                 raw.tombstone_count = 0;
             } else if !raw.indexed_ids.is_empty() {
                 raw.total_nodes = raw.indexed_ids.len();
-                raw.live_nodes = raw.indexed_ids.len() - raw.tombstoned_ids.len();
+                // checked_sub: a malformed legacy snapshot can report more
+                // tombstones than indexed ids; reject it here instead of
+                // panicking on unchecked subtraction (#415). `verify()`
+                // below is still the primary rejecting boundary for
+                // well-formed-but-inconsistent snapshots.
+                raw.live_nodes = raw
+                    .indexed_ids
+                    .len()
+                    .checked_sub(raw.tombstoned_ids.len())
+                    .ok_or(SnapshotError::InconsistentCounts {
+                        total: raw.indexed_ids.len(),
+                        live: raw.indexed_ids.len(),
+                        tombstones: raw.tombstoned_ids.len(),
+                    })?;
                 raw.tombstone_count = raw.tombstoned_ids.len();
             }
         }
