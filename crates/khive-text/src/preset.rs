@@ -1,19 +1,18 @@
 //! Named analyzer constructors for common use cases.
 
 use crate::analyzer::StandardAnalyzer;
-use crate::filter::{LowercaseFilter, MaxLengthFilter, MinLengthFilter, StopWordFilter};
+use crate::filter::{Bm25StopWordFilter, LowercaseFilter, MaxLengthFilter, MinLengthFilter};
 use crate::tokenizer::{CjkCharTokenizer, KeywordTokenizer, WhitespaceTokenizer};
 
-/// Standard English analyzer: whitespace + lowercase + stop words + length filters.
+/// Standard English analyzer: whitespace + lowercase + stop words.
 ///
 /// Produces the same token stream as `khive-bm25`'s `SimpleTokenizer::default()`,
 /// but returns a `StandardAnalyzer` rather than a `khive-bm25` tokenizer type.
 pub fn standard() -> StandardAnalyzer {
     StandardAnalyzer::with_tokenizer(WhitespaceTokenizer)
         .filter(LowercaseFilter)
-        .filter(StopWordFilter)
-        .filter(MinLengthFilter(2))
-        .filter(MaxLengthFilter(40))
+        .filter(Bm25StopWordFilter)
+        .filter(MinLengthFilter(1))
 }
 
 /// Simple analyzer: whitespace split + lowercase only.
@@ -21,11 +20,9 @@ pub fn simple() -> StandardAnalyzer {
     StandardAnalyzer::with_tokenizer(WhitespaceTokenizer).filter(LowercaseFilter)
 }
 
-/// Keyword analyzer: entire input is one lowercased token.
+/// Keyword analyzer: entire input is one lowercased token, regardless of length.
 pub fn keyword() -> StandardAnalyzer {
-    StandardAnalyzer::with_tokenizer(KeywordTokenizer)
-        .filter(LowercaseFilter)
-        .filter(MaxLengthFilter(200))
+    StandardAnalyzer::with_tokenizer(KeywordTokenizer).filter(LowercaseFilter)
 }
 
 /// CJK analyzer: character-level unigrams for CJK, whitespace for Latin.
@@ -53,18 +50,22 @@ mod tests {
     #[test]
     fn standard_english() {
         let a = standard();
+        // "over" is not in the BM25 default stop list, so it survives under
+        // the parity contract even though khive-text's own StopWordFilter
+        // would have dropped it.
         let tokens = a.analyze("The quick brown fox jumps over the lazy dog");
         assert_eq!(
             tokens,
-            vec!["quick", "brown", "fox", "jumps", "lazy", "dog"]
+            vec!["quick", "brown", "fox", "jumps", "over", "lazy", "dog"]
         );
     }
 
     #[test]
-    fn standard_drops_short_and_stops() {
+    fn standard_drops_stops_but_keeps_short_non_stop_tokens() {
         let a = standard();
+        // "am" is not a BM25 stop word and min_length is 1, so it survives.
         let tokens = a.analyze("I am a test");
-        assert_eq!(tokens, vec!["test"]);
+        assert_eq!(tokens, vec!["am", "test"]);
     }
 
     #[test]
@@ -97,6 +98,18 @@ mod tests {
     #[test]
     fn keyword_empty() {
         assert!(keyword().analyze("").is_empty());
+    }
+
+    #[test]
+    fn keyword_preserves_long_whole_input_without_hidden_cap() {
+        let input_200 = "a".repeat(200);
+        assert_eq!(keyword().analyze(&input_200), vec![input_200.clone()]);
+
+        let input_201 = "A".repeat(201);
+        assert_eq!(
+            keyword().analyze(&input_201),
+            vec![input_201.to_lowercase()]
+        );
     }
 
     #[test]
@@ -133,10 +146,29 @@ mod tests {
     }
 
     #[test]
-    fn standard_drops_long_tokens() {
+    fn standard_keeps_long_tokens_like_bm25() {
+        // BM25's SimpleTokenizer::default() has no max-length filter, so
+        // standard() must not drop long tokens either.
         let long = "a".repeat(50);
         let input = format!("hello {long} world");
         let tokens = standard().analyze(&input);
-        assert_eq!(tokens, vec!["hello", "world"]);
+        assert_eq!(tokens, vec!["hello".to_string(), long, "world".to_string()]);
+    }
+
+    #[test]
+    fn standard_matches_bm25_default_token_stream() {
+        let bm25 = khive_bm25::SimpleTokenizer::default();
+        let cases = [
+            "may x",
+            "done say might",
+            "against",
+            &"a".repeat(41),
+            "The quick brown fox jumps over the lazy dog",
+        ];
+        for input in cases {
+            let ours = standard().analyze(input);
+            let theirs = khive_bm25::Tokenizer::tokenize(&bm25, input);
+            assert_eq!(ours, theirs, "mismatch for input: {input:?}");
+        }
     }
 }

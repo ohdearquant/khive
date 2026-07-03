@@ -114,11 +114,12 @@ pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
         parts.push(current);
     }
 
-    // Lowercase and filter by min_part_len
+    // Lowercase and filter by min_part_len (character count, not byte length)
+    let min_part_len = min_part_len.max(1);
     parts
         .into_iter()
         .map(|p| p.to_lowercase())
-        .filter(|p| p.len() >= min_part_len.max(1))
+        .filter(|p| p.chars().count() >= min_part_len)
         .collect()
 }
 
@@ -227,6 +228,18 @@ mod tests {
         // "GPT-4": parts ["gpt", "4"] — "4" has len 1, filtered when min=2
         let parts = split_identifier("GPT-4", 2);
         assert_eq!(parts, vec!["gpt"]);
+    }
+
+    #[test]
+    fn split_identifier_filters_unicode_min_part_len_by_chars() {
+        // "\u{4F60}" (你) is 1 char but 3 UTF-8 bytes; must be filtered by
+        // char count, not byte length, when min_part_len == 2.
+        let parts = split_identifier("foo_\u{4F60}", 2);
+        assert_eq!(parts, vec!["foo"]);
+
+        // A two-character non-ASCII part is kept at min_part_len == 2.
+        let parts = split_identifier("foo_\u{4F60}\u{597D}", 2);
+        assert_eq!(parts, vec!["foo", "\u{4F60}\u{597D}"]);
     }
 
     #[test]
