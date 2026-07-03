@@ -853,3 +853,58 @@ fn verify_rejects_duplicate_tombstoned_ids() {
         "verify() must reject duplicate tombstoned_ids, got {result:?}"
     );
 }
+
+/// Regression for #415: the full `serde_json::from_str::<HnswSnapshot>` path
+/// (manual `Deserialize` -> `RawHnswSnapshot` -> `TryFrom`) must return `Err`
+/// for a legacy snapshot whose `tombstoned_ids` exceeds `indexed_ids`,
+/// instead of panicking on unchecked subtraction.
+#[test]
+fn deserialize_rejects_legacy_tombstones_exceed_indexed_without_panic() {
+    let bad_json = r#"{
+        "max_layer": 0,
+        "entry_point": "01010101010101010101010101010101",
+        "config": {"m": 16, "ef_construction": 200, "metric": "cosine"},
+        "indexed_ids": ["01010101010101010101010101010101"],
+        "tombstoned_ids": [
+            "01010101010101010101010101010101",
+            "02020202020202020202020202020202"
+        ],
+        "layers": [[["01010101010101010101010101010101", []]]]
+    }"#;
+
+    let result = serde_json::from_str::<HnswSnapshot>(bad_json);
+    assert!(
+        result.is_err(),
+        "malformed legacy snapshot with more tombstones than indexed ids must deserialize as Err, got {result:?}"
+    );
+}
+
+/// Regression for #415/#416: the full `serde_json::from_str::<HnswSnapshot>`
+/// path must return `Err` when `tombstoned_ids` contains duplicate entries,
+/// so duplicate membership can't be used to satisfy the count check.
+#[test]
+fn deserialize_rejects_duplicate_tombstoned_ids_without_panic() {
+    let bad_json = r#"{
+        "max_layer": 0,
+        "entry_point": "01010101010101010101010101010101",
+        "config": {"m": 16, "ef_construction": 200, "metric": "cosine"},
+        "indexed_ids": [
+            "01010101010101010101010101010101",
+            "02020202020202020202020202020202"
+        ],
+        "tombstoned_ids": [
+            "01010101010101010101010101010101",
+            "01010101010101010101010101010101"
+        ],
+        "layers": [[
+            ["01010101010101010101010101010101", []],
+            ["02020202020202020202020202020202", []]
+        ]]
+    }"#;
+
+    let result = serde_json::from_str::<HnswSnapshot>(bad_json);
+    assert!(
+        result.is_err(),
+        "duplicate tombstoned_ids must deserialize as Err, got {result:?}"
+    );
+}
