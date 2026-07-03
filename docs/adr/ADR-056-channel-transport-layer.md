@@ -210,9 +210,12 @@ it). Until attested, the mailbox is quarantined.
 
 ### Configuration
 
-No new variable. `KHIVE_EMAIL_AUTHSERV_ID` gains the reserved sentinel `!topmost-no-authserv-id`
-(a leading `!` cannot occur in a valid RFC 8601 `authserv-id`, so the sentinel cannot collide with
-a real anchor). Every failure direction remains closed: unset or empty fails construction and the
+No new variable. `KHIVE_EMAIL_AUTHSERV_ID` gains the reserved sentinel `!topmost-no-authserv-id`.
+The sentinel is reserved by convention, not by grammar: RFC 8601's `authserv-id` is a value (RFC
+2045 token or quoted-string) and `!` is not in `tspecials`, so a leading `!` is grammar-legal in a
+token. It is safe here because no real-world domain-form receiving-boundary identifier begins with
+`!` and this config contract reserves the exact string, so it does not collide with a real anchor
+in practice. Every failure direction remains closed: unset or empty fails construction and the
 channel never starts; any non-sentinel value is a literal `authserv-id` (a typo of the sentinel
 matches no header and quarantines all mail); no value silently degrades to trust-topmost.
 
