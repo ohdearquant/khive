@@ -185,6 +185,52 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
     segments
 }
 
+/// Split a single (already comment-stripped, `;`-free) A-R segment into
+/// whitespace-separated tokens, treating an RFC 8601 quoted-string as an
+/// atomic unit so embedded whitespace inside `"..."` never creates a new
+/// token. Empty tokens are dropped. This is the property-level analogue of
+/// `split_top_level_segments`: the same reason a `;` inside a quoted pvalue
+/// must not forge a new segment (codex #496), a space inside a quoted pvalue
+/// must not forge a new property token.
+fn split_top_level_ws(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = segment.chars();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            current.push(c);
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quotes = true;
+                current.push(c);
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Parse one raw `Authentication-Results` header value.
 ///
 /// Detects two shapes for the first `resinfo`-or-authserv-id segment:
@@ -210,14 +256,16 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
     let mut all_segments = split_top_level_segments(raw).into_iter();
     let first_segment = all_segments.next()?;
-    let first_token = first_segment.split_whitespace().next()?;
+    let first_segment_tokens = split_top_level_ws(&first_segment);
+    let first_token = first_segment_tokens.first()?.as_str();
 
-    // A valid RFC 8601 authserv-id can never contain `=`; a resinfo always
-    // begins `method[/version]=result`. An unquoted `=` in the first
-    // whitespace token is therefore unambiguous evidence that this boundary
-    // emits no authserv-id at all, regardless of whether an optional
-    // method-version suffix (`method/version=result`) is also present --
-    // the `=` survives that suffix either way.
+    // A real receiving-boundary authserv-id is a dot-atom host identifier and
+    // never contains `=`; a resinfo always begins `method[/version]=result`.
+    // `first_token` here is a single quote-atomic token (see split_top_level_ws),
+    // so a `=` in it is strong evidence this boundary emits no authserv-id. A
+    // pathological quoted-string id that embeds `=` would misclassify to the
+    // no-id form and fail closed (quarantine in AuthservId mode) -- acceptable,
+    // since no real boundary produces one.
     let is_no_authserv_id_form = first_token.contains('=');
 
     let (authserv_id, method_segments): (Option<String>, Box<dyn Iterator<Item = String>>) =
@@ -241,7 +289,8 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
         if segment.is_empty() || segment.eq_ignore_ascii_case("none") {
             continue;
         }
-        let mut tokens = segment.split_whitespace();
+        let seg_tokens = split_top_level_ws(segment);
+        let mut tokens = seg_tokens.iter().map(String::as_str);
         let Some(methodspec) = tokens.next() else {
             continue;
         };
@@ -653,5 +702,50 @@ mod tests {
         // No authserv-id (first token contains '=') AND no recognized
         // dmarc/spf/dkim method anywhere -- genuine zero signal, must be None.
         assert!(parse_header("evil=x").is_none());
+    }
+
+    #[test]
+    fn parse_header_quoted_space_in_smtp_mailfrom_does_not_forge_spf_alignment() {
+        // A quoted local-part with embedded spaces + an injected
+        // `smtp.mailfrom=khive.ai` must NOT overwrite the real envelope domain.
+        // The whole quoted address is one token; domain_of() reads after the
+        // final `@`, so alignment is to evil.com, never the injected khive.ai.
+        let parsed = parse_header(
+            r#"mx.example.com; spf=pass smtp.mailfrom="attacker smtp.mailfrom=khive.ai "@evil.com"#,
+        )
+        .unwrap();
+        assert!(
+            !parsed.spf_pass_aligned("khive.ai"),
+            "quoted-space property injection must not forge alignment to the spoofed domain"
+        );
+        assert!(
+            parsed.spf_pass_aligned("evil.com"),
+            "the intact quoted address must align to its real domain evil.com"
+        );
+    }
+
+    #[test]
+    fn parse_header_quoted_space_in_header_from_does_not_forge_dmarc_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.com; dmarc=pass header.from="x header.from=khive.ai "@evil.com"#,
+        )
+        .unwrap();
+        assert!(
+            !parsed.dmarc_pass_aligned("khive.ai"),
+            "quoted-space header.from injection must not forge dmarc alignment"
+        );
+    }
+
+    #[test]
+    fn split_top_level_ws_keeps_quoted_whitespace_atomic() {
+        let toks = split_top_level_ws(r#"spf=pass smtp.mailfrom="a b c"@evil.com extra=1"#);
+        assert_eq!(
+            toks,
+            vec![
+                "spf=pass".to_string(),
+                r#"smtp.mailfrom="a b c"@evil.com"#.to_string(),
+                "extra=1".to_string(),
+            ]
+        );
     }
 }
