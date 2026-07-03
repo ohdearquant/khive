@@ -25,21 +25,86 @@ pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
             // `link` writes an edge, not an entity. Use a natural-key format so
             // update(id="X") + link(source_id="X", ...) do NOT conflict (they target
             // different substrates).
-            let src = op.args.get("source_id");
-            let tgt = op.args.get("target_id");
-            let rel = op.args.get("relation");
             if let (
                 Some(ArgValue::Value(Value::String(s))),
                 Some(ArgValue::Value(Value::String(t))),
                 Some(ArgValue::Value(Value::String(r))),
-            ) = (src, tgt, rel)
-            {
-                keys.push(format!("edge-natural:{s}:{t}:{r}"));
+            ) = (
+                op.args.get("source_id"),
+                op.args.get("target_id"),
+                op.args.get("relation"),
+            ) {
+                push_link_key(&mut keys, s, t, r);
+            }
+
+            // Bulk form: `link(links=[{source_id, target_id, relation, ...}, ...])`.
+            // Each contained natural edge must contribute its own key so a bulk
+            // entry conflicts with a colliding singleton `link` (or another bulk
+            // entry) instead of silently racing through storage.
+            if let Some(ArgValue::Value(Value::Array(links))) = op.args.get("links") {
+                for link in links {
+                    let Some(obj) = link.as_object() else {
+                        continue;
+                    };
+                    let (Some(s), Some(t), Some(r)) = (
+                        obj.get("source_id").and_then(Value::as_str),
+                        obj.get("target_id").and_then(Value::as_str),
+                        obj.get("relation").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    push_link_key(&mut keys, s, t, r);
+                }
             }
         }
         _ => {}
     }
     keys
+}
+
+/// Build the substrate-prefixed natural-edge write key for one link entry,
+/// canonicalizing endpoint order for statically-known symmetric relations so
+/// reversed singleton links (e.g. `link(A,B,competes_with)` vs
+/// `link(B,A,competes_with)`) collide on the same key.
+fn push_link_key(keys: &mut Vec<String>, source: &str, target: &str, relation: &str) {
+    let relation_key = canonical_relation_key(relation);
+    let (source_key, target_key) = if is_static_symmetric_relation(&relation_key) && target < source
+    {
+        (target, source)
+    } else {
+        (source, target)
+    };
+    keys.push(format!(
+        "edge-natural:{source_key}:{target_key}:{relation_key}"
+    ));
+}
+
+/// Normalize relation spelling (case/hyphen variants) without depending on
+/// `khive-types`, so bulk and singleton entries produce identical keys.
+fn canonical_relation_key(relation: &str) -> String {
+    let normalized: String = relation
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    match normalized.as_str() {
+        "competeswith" => "competes_with".to_string(),
+        "composedwith" => "composed_with".to_string(),
+        _ => normalized,
+    }
+}
+
+/// Relations known to be symmetric (endpoint order does not matter) without
+/// consulting the full relation registry. Kept conservative and local to
+/// avoid coupling `khive-request` to `khive-types`.
+fn is_static_symmetric_relation(relation: &str) -> bool {
+    matches!(relation, "competes_with" | "composed_with")
 }
 
 /// Scan a parsed batch for write-key conflicts; skips chain mode (sequential by design).
@@ -173,5 +238,62 @@ mod tests {
         let r = parse_request(r#"delete(id="solo-id")"#).unwrap();
         assert_eq!(r.mode, ExecutionMode::Single);
         check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn bulk_link_and_singleton_same_natural_key_conflict() {
+        // A bulk `links=[...]` entry must contribute the same write key as an
+        // equivalent singleton `link` op so they are detected as conflicting.
+        let r = parse_request(
+            r#"[link(links=[{"source_id":"a","target_id":"b","relation":"extends","weight":0.1}]), link(source_id="a", target_id="b", relation="extends", weight=0.9)]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(
+            matches!(&err, DslError::WriteKeyConflict { id, .. }
+                if id == "edge-natural:a:b:extends"),
+            "expected WriteKeyConflict on edge-natural key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_symmetric_links_conflict() {
+        // competes_with is symmetric: A->B and B->A must collide on one key.
+        let r = parse_request(
+            r#"[link(source_id="b", target_id="a", relation="competes_with"), link(source_id="a", target_id="b", relation="competes_with")]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(
+            matches!(&err, DslError::WriteKeyConflict { id, .. }
+                if id == "edge-natural:a:b:competes_with"),
+            "expected WriteKeyConflict on canonicalized symmetric key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_non_symmetric_links_do_not_conflict() {
+        // `extends` is directional: reversed endpoints must NOT collide.
+        let r = parse_request(
+            r#"[link(source_id="b", target_id="a", relation="extends"), link(source_id="a", target_id="b", relation="extends")]"#,
+        )
+        .unwrap();
+        check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn write_keys_for_op_pub_bulk_link_extracts_all_edges() {
+        let r = parse_request(
+            r#"link(links=[{"source_id":"a","target_id":"b","relation":"extends"},{"source_id":"c","target_id":"d","relation":"extends"}])"#,
+        )
+        .unwrap();
+        let keys = write_keys_for_op_pub(&r.ops[0]);
+        assert_eq!(
+            keys,
+            vec![
+                "edge-natural:a:b:extends".to_string(),
+                "edge-natural:c:d:extends".to_string(),
+            ]
+        );
     }
 }
