@@ -18,12 +18,20 @@
 - The audit payload field holds the full `AuditEvent` envelope (not a bare verb result)
 - Top-level event fields follow the ADR-004/ADR-005 schema
 
-### ADR-007: Namespace Strategy
+### ADR-007: Namespace Strategy (Rev 6)
 
-- Every ID-based operation (get, delete, update, merge) verifies `record.namespace == caller_namespace`
-- Wrong-namespace and absent IDs return the same `NotFound` error to prevent timing-oracle attacks
+- Namespace is attribution and gate-policy input, not a storage partition; it is not a
+  by-ID access control boundary
+- By-ID operations (get, delete, update) resolve globally unique UUIDs directly — no
+  `record.namespace == caller_namespace` check at the runtime layer (rule 2; see
+  `operations.rs::get_entity`)
+- `merge_entity` is the one by-ID operation that still requires a namespace match on
+  both sides (it is a same-namespace curation operation, not a generic lookup); it
+  rejects the merge when a record's namespace differs from the caller's token namespace
 - `actor.id` in config must be a valid namespace string; an invalid value is a startup error
-- `NamespaceToken` is the runtime trust boundary; storage is ID-only
+- `NamespaceToken` carries dispatch attribution and the visible-namespace read/write
+  scope produced at the gate boundary; it is not a by-ID access guard (historical:
+  earlier ADR-007 revisions described it as the storage trust boundary — superseded)
 
 ### ADR-009 / ADR-028: Multi-Backend Deployment
 
@@ -165,7 +173,9 @@
 ### ADR-050: Namespace Token Contract
 
 - `NamespaceToken` is sealed to prevent external construction without gate authorization
-- Namespace authority is checked at the runtime layer on every ID-based operation
+- Namespace authority governs which namespace(s) a dispatch can read/write (minted at
+  the gate boundary); it is not consulted again per-record on by-ID operations (ADR-007
+  Rev 6), except `merge_entity`/`merge_note`, which still require a namespace match
 
 ## Consistency Notes
 
