@@ -37,71 +37,8 @@ pub struct MultiBackendRegistry {
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
     let server = build_server(&args)?;
 
-    // Spawn the email channel polling loop when the feature is enabled and the
-    // required environment variables are present. The loop is non-fatal: if
-    // configuration is absent it logs a warning and returns without panicking.
     #[cfg(feature = "channel-email")]
-    {
-        use khive_channel::ChannelRegistry;
-        use khive_channel_email::EmailChannel;
-        use std::sync::Arc;
-
-        match EmailChannel::from_env() {
-            Ok(email_ch) => {
-                let email_ch = Arc::new(email_ch);
-                let mut ch_registry = ChannelRegistry::new();
-                let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
-                ch_registry.register(dyn_ch);
-                let ch_registry = Arc::new(ch_registry);
-                let verb_reg = server.verb_registry_clone();
-                let ingest_ns = ingest_namespace_from_env();
-                let default_actor = default_inbound_actor_from_env();
-                let mut allowlist = allowed_recipients_from_env();
-                if allowlist.is_empty() {
-                    allowlist.push(email_ch.maintainer_address().to_string());
-                }
-                let mailbox = email_ch.mailbox().to_string();
-
-                let ingest_ns_clone = ingest_ns.clone();
-                let default_actor_clone = default_actor.clone();
-                let verb_reg_poll = verb_reg.clone();
-                let verb_reg_outbox = verb_reg.clone();
-                let ingest_ns_outbox = ingest_ns.clone();
-                let allowlist_clone = allowlist.clone();
-                let mailbox_clone = mailbox.clone();
-                let email_ch_clone = Arc::clone(&email_ch);
-
-                let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                    tokio::task::spawn(channel_poll_loop(
-                        ch_registry,
-                        verb_reg_poll,
-                        ingest_ns_clone,
-                        default_actor_clone,
-                    ));
-                    tokio::task::spawn(channel_outbox_loop(
-                        email_ch_clone,
-                        verb_reg_outbox,
-                        ingest_ns_outbox,
-                        mailbox_clone,
-                        allowlist_clone,
-                    ));
-                    tracing::info!("email channel polling and outbox loops started");
-                });
-                if !spawned {
-                    tracing::error!(
-                        namespace = %ingest_ns,
-                        "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "channel-email feature is enabled but configuration is incomplete: {e}; \
-                     email polling is disabled"
-                );
-            }
-        }
-    }
+    spawn_email_channel_loops(&server);
 
     #[cfg(unix)]
     if args.daemon {
@@ -126,6 +63,74 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         bind: args.bind.clone(),
     };
     transport.serve(server, &opts).await
+}
+
+/// Spawn the email channel polling + outbox loops if the `channel-email`
+/// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
+/// warning and returns on incomplete config. Must be called from EVERY serve
+/// entrypoint (both `run` and `serve_server`) — the poll loop is otherwise
+/// silently dropped on the multi-backend path.
+#[cfg(feature = "channel-email")]
+fn spawn_email_channel_loops(server: &KhiveMcpServer) {
+    use khive_channel::ChannelRegistry;
+    use khive_channel_email::EmailChannel;
+    use std::sync::Arc;
+
+    match EmailChannel::from_env() {
+        Ok(email_ch) => {
+            let email_ch = Arc::new(email_ch);
+            let mut ch_registry = ChannelRegistry::new();
+            let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            ch_registry.register(dyn_ch);
+            let ch_registry = Arc::new(ch_registry);
+            let verb_reg = server.verb_registry_clone();
+            let ingest_ns = ingest_namespace_from_env();
+            let default_actor = default_inbound_actor_from_env();
+            let mut allowlist = allowed_recipients_from_env();
+            if allowlist.is_empty() {
+                allowlist.push(email_ch.maintainer_address().to_string());
+            }
+            let mailbox = email_ch.mailbox().to_string();
+
+            let ingest_ns_clone = ingest_ns.clone();
+            let default_actor_clone = default_actor.clone();
+            let verb_reg_poll = verb_reg.clone();
+            let verb_reg_outbox = verb_reg.clone();
+            let ingest_ns_outbox = ingest_ns.clone();
+            let allowlist_clone = allowlist.clone();
+            let mailbox_clone = mailbox.clone();
+            let email_ch_clone = Arc::clone(&email_ch);
+
+            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+                tokio::task::spawn(channel_poll_loop(
+                    ch_registry,
+                    verb_reg_poll,
+                    ingest_ns_clone,
+                    default_actor_clone,
+                ));
+                tokio::task::spawn(channel_outbox_loop(
+                    email_ch_clone,
+                    verb_reg_outbox,
+                    ingest_ns_outbox,
+                    mailbox_clone,
+                    allowlist_clone,
+                ));
+                tracing::info!("email channel polling and outbox loops started");
+            });
+            if !spawned {
+                tracing::error!(
+                    namespace = %ingest_ns,
+                    "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "channel-email feature is enabled but configuration is incomplete: {e}; \
+                 email polling is disabled"
+            );
+        }
+    }
 }
 
 /// Resolve the target namespace for ingested channel messages.
@@ -523,6 +528,9 @@ pub async fn serve_server(
     args: &Args,
     registry: &TransportRegistry,
 ) -> anyhow::Result<()> {
+    #[cfg(feature = "channel-email")]
+    spawn_email_channel_loops(&server);
+
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon(server).await?;
@@ -2609,6 +2617,54 @@ brain_profile = "project-profile"
                 .unwrap()
                 .clone();
             assert!(note_already_delivered(&props));
+        }
+    }
+
+    // --- spawn_email_channel_loops: shared helper regression (multi-backend gap fix) ---
+    //
+    // Both `run` and `serve_server` call this same extracted fn (source-verified —
+    // see serve.rs's `run` and `serve_server` bodies); a Rust unit test cannot assert
+    // "both call sites exist" directly, so this test instead locks in that the
+    // extracted helper itself is safe to call in isolation with no `KHIVE_EMAIL_*`
+    // env present: it must hit the `Err` arm and return without panicking. No
+    // network I/O is exercised (the missing `KHIVE_EMAIL_SMTP_HOST` fails closed
+    // before any socket is opened).
+
+    #[cfg(feature = "channel-email")]
+    mod spawn_email_channel_loops_tests {
+        use super::*;
+
+        #[tokio::test]
+        #[serial]
+        async fn missing_env_hits_err_arm_without_panic() {
+            for var in [
+                "KHIVE_EMAIL_SMTP_HOST",
+                "KHIVE_EMAIL_IMAP_HOST",
+                "KHIVE_EMAIL_USERNAME",
+                "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+                "KHIVE_EMAIL_AUTHSERV_ID",
+                "KHIVE_EMAIL_PASSWORD",
+                "KHIVE_EMAIL_OAUTH_TENANT_ID",
+                "KHIVE_EMAIL_OAUTH_CLIENT_ID",
+                "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            ] {
+                std::env::remove_var(var);
+            }
+
+            let config = RuntimeConfig {
+                db_path: None,
+                default_namespace: Namespace::parse("test").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+            // Must not panic: EmailChannel::from_env() fails closed on the missing
+            // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
+            spawn_email_channel_loops(&server);
         }
     }
 }
