@@ -15,10 +15,14 @@ use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType};
 /// Any `brain.emit` event that predates this rename is treated as Irrelevant so
 /// that old event log entries do not cause spurious feedback updates.
 ///
+/// The runtime dispatch hook (`khive-runtime`) emits the namespaced verb
+/// (e.g. `"memory.recall"`) as the verb it actually dispatched. `"recall"` is
+/// retained as a legacy alias for event-log rows predating namespacing.
+///
 /// To add a new signal source: add one match arm to this function.
 pub fn interpret(event: &Event) -> BrainSignal {
     match event.verb.as_str() {
-        "recall" => match event.outcome {
+        "memory.recall" | "recall" => match event.outcome {
             EventOutcome::Success => match event.target_id {
                 Some(tid) => BrainSignal::RecallHit {
                     target_id: tid,
@@ -126,6 +130,18 @@ mod tests {
     fn recall_success_with_target_is_hit() {
         let id = Uuid::new_v4();
         let e = make_event("recall", EventOutcome::Success, Some(id));
+        match interpret(&e) {
+            BrainSignal::RecallHit { target_id, .. } => assert_eq!(target_id, id),
+            other => panic!("expected RecallHit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_recall_success_with_target_is_hit() {
+        // Namespaced verb, as actually dispatched by the runtime's VerbRegistry
+        // for `memory.recall` — see khive-runtime/src/pack.rs's dispatch hook.
+        let id = Uuid::new_v4();
+        let e = make_event("memory.recall", EventOutcome::Success, Some(id));
         match interpret(&e) {
             BrainSignal::RecallHit { target_id, .. } => assert_eq!(target_id, id),
             other => panic!("expected RecallHit, got {other:?}"),

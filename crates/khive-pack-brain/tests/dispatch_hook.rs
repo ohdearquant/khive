@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use khive_pack_brain::BrainPack;
 use khive_pack_kg::KgPack;
+use khive_pack_memory::MemoryPack;
 use khive_runtime::{DispatchHook, KhiveRuntime, Namespace, PackRuntime, VerbRegistryBuilder};
 use serde_json::json;
 
@@ -404,5 +405,122 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
     assert!(
         err.to_string().to_lowercase().contains("not found"),
         "brain.feedback on an absent target_id must return NotFound; got: {err}"
+    );
+}
+
+// ---- issue #459 regression: real memory.recall through the real VerbRegistry ----
+
+/// #459: a genuine `memory.recall` dispatch — through the real `VerbRegistry`,
+/// with `BrainPack` installed only as the post-dispatch `DispatchHook` (not
+/// constructed as a hand-built bare `"recall"` event) — must move both the
+/// temporal posterior and the hit entity's posterior.
+///
+/// Before the fix, `interpret()` in `event.rs` recognized only the bare
+/// legacy verb `"recall"`. The runtime hook (`khive-runtime/src/pack.rs`
+/// around line 1044) fires with `verb = "memory.recall"` (the verb it
+/// actually dispatched) and attaches the first hit's id as `target_id`
+/// (`:1055-1063`). `interpret` returned `Irrelevant` for the namespaced verb,
+/// so `on_dispatch` applied no signal at all and real production recall
+/// traffic never taught the brain anything. The old regression in
+/// `src/tests.rs` masked this because it built a bare `"recall"` `Event`
+/// directly instead of dispatching through a registry.
+///
+/// This test seeds one real memory via `memory.remember`, recalls it via
+/// `memory.recall` dispatched through `VerbRegistry::dispatch` (the exact
+/// namespaced verb the runtime uses), and asserts:
+///   - the recall actually hit the seeded memory (sanity: proves the signal
+///     path fires on a *real* hit, not a miss);
+///   - `balanced_recall.temporal` moved off its `BetaPosterior::new(1.0, 9.0)`
+///     prior;
+///   - `balanced_recall.entity_posteriors` gained an entry for the hit's id,
+///     and that entry moved off the `BetaPosterior::new(1.0, 1.0)` default.
+#[tokio::test]
+async fn memory_recall_through_real_registry_updates_brain_posteriors() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let brain = Arc::new(BrainPack::new(rt.clone()));
+
+    // BrainPack is installed ONLY as the dispatch hook here — it is not
+    // registered as a verb-serving pack in this registry. The hook fires
+    // purely off the runtime's real post-dispatch machinery.
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let hook: Arc<dyn DispatchHook> = brain.clone();
+    builder.with_dispatch_hook(hook);
+    let registry = builder.build().expect("registry builds");
+
+    // Seed one real, recallable memory.
+    let remembered = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "The attention mechanism in transformers uses Q K V matrices",
+                "memory_type": "semantic",
+                "salience": 0.8,
+                "decay": 0.01
+            }),
+        )
+        .await
+        .expect("memory.remember succeeds");
+    let note_id = remembered["id"]
+        .as_str()
+        .expect("remembered note has id")
+        .to_string();
+
+    // Snapshot BEFORE the real recall dispatch — baseline for the delta assertions.
+    let before = brain.snapshot().balanced_recall;
+
+    // Real memory.recall through the real registry — the exact verb
+    // (`"memory.recall"`, namespaced) and entrypoint (`VerbRegistry::dispatch`,
+    // not a hand-built Event) that production traffic uses.
+    let recall_result = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "attention mechanism transformers", "limit": 1 }),
+        )
+        .await
+        .expect("memory.recall succeeds");
+
+    let hits = recall_result.as_array().expect("recall returns an array");
+    assert!(
+        !hits.is_empty(),
+        "recall must produce a real hit, not a miss"
+    );
+    let hit_id = hits[0]["id"].as_str().expect("hit has id").to_string();
+    assert_eq!(
+        hit_id, note_id,
+        "recall must hit the memory just remembered (sanity check before asserting learning)"
+    );
+
+    // Promote "local" via the production dispatch path so the hook-queued
+    // signal (which landed in PersistenceTracker, cold or active) is drained
+    // into the live BrainState we're about to inspect.
+    promote_namespace(&brain, &rt, "local").await;
+
+    let after = brain.snapshot().balanced_recall;
+
+    assert_ne!(
+        (after.temporal.alpha(), after.temporal.beta()),
+        (before.temporal.alpha(), before.temporal.beta()),
+        "temporal posterior must move on a real memory.recall hit dispatched \
+         through the real VerbRegistry; before={:?} after={:?}",
+        (before.temporal.alpha(), before.temporal.beta()),
+        (after.temporal.alpha(), after.temporal.beta())
+    );
+
+    let hit_uuid: uuid::Uuid = hit_id.parse().expect("hit id is a valid uuid");
+    let entity_posterior = after
+        .entity_posteriors
+        .get(&hit_uuid)
+        .expect("hit entity must have a posterior entry after a real recall hit");
+    assert_ne!(
+        (entity_posterior.alpha(), entity_posterior.beta()),
+        (1.0, 1.0),
+        "hit entity posterior must move off the BetaPosterior::new(1.0, 1.0) default; got {:?}",
+        (entity_posterior.alpha(), entity_posterior.beta())
+    );
+    assert!(
+        !before.entity_posteriors.contains_key(&hit_uuid),
+        "sanity: the hit entity must not have had a posterior before this recall"
     );
 }

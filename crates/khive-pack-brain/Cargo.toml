@@ -38,6 +38,11 @@ lattice-router = ["dep:lattice-fann"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
+# Dev-only: exercises the real memory.recall -> BrainPack dispatch-hook path
+# (issue #459 regression). khive-pack-memory already carries khive-pack-brain
+# as a dev-dependency for its own tests; Cargo permits cyclic dev-dependencies
+# since neither crate's normal (non-dev) dependency graph is affected.
+khive-pack-memory = { version = "0.3.0", path = "../khive-pack-memory" }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 
