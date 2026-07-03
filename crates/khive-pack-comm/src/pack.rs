@@ -302,6 +302,26 @@ mod help_tests {
     }
 
     #[test]
+    fn ingest_declares_optional_metadata_param() {
+        // ADR-084 Rule 3 (help fidelity): comm.ingest's IngestParams.metadata
+        // field (issue #448 Finding 2, quarantine marker passthrough) must be
+        // reflected in the ParamDef/help schema, not just the Rust struct.
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        let metadata_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "metadata")
+            .expect("comm.ingest must declare 'metadata' param");
+        assert!(
+            !metadata_param.required,
+            "metadata must be optional so absent metadata preserves today's behavior exactly"
+        );
+    }
+
+    #[test]
     fn ingest_declares_required_content_params() {
         let h = CommPack::HANDLERS
             .iter()

@@ -777,6 +777,19 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
+    // Generic transport-layer metadata passthrough (issue #448 Finding 2): merged
+    // additively so it can never clobber the identity/routing fields set above --
+    // a key already present (from, to, from_actor, to_actor, direction, read,
+    // thread_id, sent_at, subject, external_id, wire_message_id, wire_references,
+    // channel_kind) always wins. The comm pack does not interpret any metadata
+    // key; the email channel happens to use it for quarantine markers.
+    if let Some(metadata) = p.metadata {
+        if let Some(obj) = props.as_object_mut() {
+            for (k, v) in metadata {
+                obj.entry(k).or_insert(v);
+            }
+        }
+    }
 
     let note = match runtime
         .try_create_note(

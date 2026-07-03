@@ -4765,3 +4765,134 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
          got props={props}"
     );
 }
+
+// --- issue #448 Finding 2: quarantine metadata must survive comm.ingest persistence ---
+
+/// A quarantined envelope (as `EmailChannel::quarantine_envelope` builds it, ADR-056
+/// Amendment 2026-07-02) must persist its `quarantined`/`quarantine_reason`/
+/// `quarantine_claimed_from` markers through `comm.ingest`, and `from`/`from_actor`
+/// must stay the fixed `email:quarantine` marker -- `quarantine_claimed_from` is
+/// carried for maintainer review only, never as an attribution source.
+#[tokio::test]
+async fn ingest_persists_quarantine_metadata_and_never_attributes_claimed_sender() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:quarantine",
+            "to": "email:maintainer@example.com",
+            "content": "spoofed body",
+            "subject": "spoofed, no auth at all",
+            "channel_kind": "email",
+            "external_id": "imap:mail:1:1",
+            "namespace": "local",
+            "metadata": {
+                "quarantined": "true",
+                "quarantine_reason": "auth-absent",
+                "quarantine_claimed_from": "maintainer@example.com",
+            },
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["quarantined"].as_str(),
+        Some("true"),
+        "quarantine marker must reach persisted properties; got props={props}"
+    );
+    assert_eq!(
+        props["quarantine_reason"].as_str(),
+        Some("auth-absent"),
+        "quarantine reason must reach persisted properties; got props={props}"
+    );
+    assert_eq!(
+        props["quarantine_claimed_from"].as_str(),
+        Some("maintainer@example.com"),
+        "the claimed From is preserved in metadata for maintainer review; got props={props}"
+    );
+    assert_eq!(
+        props["from"].as_str(),
+        Some("email:quarantine"),
+        "quarantine_claimed_from must never be used as an authoritative sender: \
+         `from` must stay the fixed quarantine marker"
+    );
+    assert_eq!(
+        props["from_actor"].as_str(),
+        Some("email:quarantine"),
+        "quarantine_claimed_from must never be used as an authoritative sender: \
+         `from_actor` must stay the fixed quarantine marker"
+    );
+}
+
+/// Absent `metadata` must leave persisted properties exactly as before this fix
+/// (no `quarantined`/`quarantine_reason`/`quarantine_claimed_from` keys at all).
+#[tokio::test]
+async fn ingest_without_metadata_persists_no_quarantine_keys() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "ordinary message",
+            "external_id": "imap:mail:2:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert!(
+        props.get("quarantined").is_none(),
+        "absent metadata must not fabricate a quarantined key; got props={props}"
+    );
+    assert!(
+        props.get("quarantine_reason").is_none(),
+        "absent metadata must not fabricate a quarantine_reason key; got props={props}"
+    );
+    assert!(
+        props.get("quarantine_claimed_from").is_none(),
+        "absent metadata must not fabricate a quarantine_claimed_from key; got props={props}"
+    );
+}
+
+/// Metadata must merge additively: it must never be able to override an
+/// identity/routing field the handler already stamped (from, from_actor,
+/// to_actor, direction). This is the safety property that makes the generic
+/// passthrough non-leaky even though the comm pack does not special-case any key.
+#[tokio::test]
+async fn ingest_metadata_cannot_override_stamped_identity_fields() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:quarantine",
+            "to": "email:maintainer@example.com",
+            "content": "spoofed body",
+            "external_id": "imap:mail:3:1",
+            "namespace": "local",
+            "metadata": {
+                "from_actor": "lambda:leo",
+                "to_actor": "lambda:leo",
+                "direction": "outbound",
+            },
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["from_actor"].as_str(),
+        Some("email:quarantine"),
+        "metadata must never override the handler-stamped from_actor; got props={props}"
+    );
+    assert_eq!(
+        props["direction"].as_str(),
+        Some("inbound"),
+        "metadata must never override the handler-stamped direction; got props={props}"
+    );
+}

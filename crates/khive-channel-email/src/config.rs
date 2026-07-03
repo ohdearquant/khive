@@ -85,6 +85,17 @@ pub struct EmailChannelConfig {
     /// `KHIVE_EMAIL_MAINTAINER_ADDRESS`; the first entry is the primary, used for
     /// outbound-allowlist defaulting and envelope `to` fallback. Never empty.
     pub maintainer_addresses: Vec<MailAddress>,
+    /// The `authserv-id` this deployment trusts in inbound `Authentication-Results`
+    /// headers (ADR-056 Amendment 2026-07-02). Required: there is no safe default
+    /// that would not either trust an attacker-controlled id or silently accept
+    /// unauthenticated mail, so a missing value fails config construction rather
+    /// than falling back to an open default.
+    pub authserv_id: String,
+    /// Whether a message that fails the attribution gate (domain authentication
+    /// or sender allowlist) is stored as an unattributed quarantine record
+    /// instead of being dropped. Defaults to `true`. When `false`, such messages
+    /// are dropped with only the IMAP UID and quarantine reason logged.
+    pub quarantine_store: bool,
 }
 
 impl EmailChannelConfig {
@@ -95,6 +106,7 @@ impl EmailChannelConfig {
     /// - `KHIVE_EMAIL_IMAP_HOST`
     /// - `KHIVE_EMAIL_USERNAME`
     /// - `KHIVE_EMAIL_MAINTAINER_ADDRESS`
+    /// - `KHIVE_EMAIL_AUTHSERV_ID`
     ///
     /// Auth-mode selection:
     /// - If `KHIVE_EMAIL_OAUTH_CLIENT_ID` is present → OAuth mode.
@@ -107,6 +119,7 @@ impl EmailChannelConfig {
     /// - `KHIVE_EMAIL_SMTP_PORT` (default `587`)
     /// - `KHIVE_EMAIL_IMAP_PORT` (default `993`)
     /// - `KHIVE_EMAIL_MAILBOX` (default: same as `KHIVE_EMAIL_USERNAME`)
+    /// - `KHIVE_EMAIL_QUARANTINE_STORE` (default `true`)
     pub fn from_env() -> Result<Self, ChannelError> {
         let smtp_host = require_env("KHIVE_EMAIL_SMTP_HOST")?;
         let smtp_port = optional_port("KHIVE_EMAIL_SMTP_PORT", 587)?;
@@ -146,6 +159,9 @@ impl EmailChannelConfig {
             ));
         }
 
+        let authserv_id = require_env("KHIVE_EMAIL_AUTHSERV_ID")?;
+        let quarantine_store = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE", true)?;
+
         Ok(Self {
             smtp_host,
             smtp_port,
@@ -155,6 +171,8 @@ impl EmailChannelConfig {
             mailbox,
             auth,
             maintainer_addresses,
+            authserv_id,
+            quarantine_store,
         })
     }
 }
@@ -217,6 +235,20 @@ fn optional_port(key: &str, default: u16) -> Result<u16, ChannelError> {
                 "environment variable {key:?} must be a valid port number (1-65535), got: {v:?}"
             ))
         }),
+    }
+}
+
+fn optional_bool(key: &str, default: bool) -> Result<bool, ChannelError> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) => match v.to_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Ok(true),
+            "0" | "false" | "off" | "no" => Ok(false),
+            _ => Err(ChannelError::Config(format!(
+                "environment variable {key:?} must be a boolean \
+                 (true/false, 1/0, on/off, yes/no), got: {v:?}"
+            ))),
+        },
     }
 }
 
@@ -481,5 +513,149 @@ mod tests {
             matches!(auth, EmailAuth::Basic { .. }),
             "expected Basic variant"
         );
+    }
+
+    // ── optional_bool tests (env-mutating — serialized with ENV_MUTEX) ────────
+
+    #[test]
+    fn optional_bool_uses_default_when_absent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(&["KHIVE_EMAIL_QUARANTINE_STORE_TEST_DEFAULT"]);
+        std::env::remove_var("KHIVE_EMAIL_QUARANTINE_STORE_TEST_DEFAULT");
+        let v = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE_TEST_DEFAULT", true).unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn optional_bool_parses_true_variants() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let key = "KHIVE_EMAIL_QUARANTINE_STORE_TEST_TRUE";
+        let _snap = EnvSnapshot::capture(&[key]);
+        for v in ["1", "true", "TRUE", "on", "yes"] {
+            std::env::set_var(key, v);
+            assert!(optional_bool(key, false).unwrap(), "{v:?} must parse true");
+        }
+    }
+
+    #[test]
+    fn optional_bool_parses_false_variants() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let key = "KHIVE_EMAIL_QUARANTINE_STORE_TEST_FALSE";
+        let _snap = EnvSnapshot::capture(&[key]);
+        for v in ["0", "false", "FALSE", "off", "no"] {
+            std::env::set_var(key, v);
+            assert!(!optional_bool(key, true).unwrap(), "{v:?} must parse false");
+        }
+    }
+
+    #[test]
+    fn optional_bool_rejects_invalid_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let key = "KHIVE_EMAIL_QUARANTINE_STORE_TEST_INVALID";
+        let _snap = EnvSnapshot::capture(&[key]);
+        std::env::set_var(key, "maybe");
+        assert!(optional_bool(key, true).is_err());
+    }
+
+    // ── from_env: KHIVE_EMAIL_AUTHSERV_ID is required (Amendment 2026-07-02) ──
+
+    #[test]
+    fn from_env_missing_authserv_id_fails_closed() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var("KHIVE_EMAIL_AUTHSERV_ID");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let result = EmailChannelConfig::from_env();
+        assert!(
+            result.is_err(),
+            "missing KHIVE_EMAIL_AUTHSERV_ID must fail closed, not default-open"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("KHIVE_EMAIL_AUTHSERV_ID"), "got: {msg}");
+    }
+
+    #[test]
+    fn from_env_quarantine_store_defaults_true() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var("KHIVE_EMAIL_QUARANTINE_STORE");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert_eq!(config.authserv_id, "mx.example.com");
+        assert!(config.quarantine_store, "must default to true when unset");
+    }
+
+    #[test]
+    fn from_env_quarantine_store_off() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::set_var("KHIVE_EMAIL_QUARANTINE_STORE", "off");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert!(!config.quarantine_store);
     }
 }

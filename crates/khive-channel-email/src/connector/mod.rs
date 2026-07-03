@@ -113,6 +113,15 @@ pub struct RawEmail {
     pub body_html: Option<String>,
     /// All headers as a flat map (lowercase key, first-occurrence value).
     pub headers: HashMap<String, String>,
+    /// Every `Authentication-Results` header value, in document order (topmost
+    /// first), verbatim.
+    ///
+    /// Kept separate from `headers` because that map keeps only the first
+    /// occurrence of a header name, while the attribution gate (ADR-056
+    /// Amendment 2026-07-02) must see every occurrence to find the topmost one
+    /// whose `authserv-id` matches the configured trust anchor -- an MTA can
+    /// legitimately stamp more than one hop's worth of this header.
+    pub authentication_results: Vec<String>,
 }
 
 impl RawEmail {

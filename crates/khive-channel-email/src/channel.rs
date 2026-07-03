@@ -7,11 +7,38 @@ use chrono::{DateTime, Utc};
 use khive_channel::{Channel, ChannelEnvelope, ChannelError};
 use tracing::{debug, warn};
 
+use crate::auth_results;
 use crate::config::{EmailAuth, EmailChannelConfig};
 use crate::connector::imap::ImapFetcher;
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
 use crate::oauth::TokenProvider;
+
+/// Reason a message failed the attribution gate (ADR-056 Amendment
+/// 2026-07-02) and was quarantined instead of attributed to the maintainer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineReason {
+    /// No `Authentication-Results` header was selected: none were present, or
+    /// none carried the configured `authserv-id`.
+    AuthAbsent,
+    /// A trusted header was selected but showed no passing, aligned method.
+    DmarcFail,
+    /// spf or dkim passed, but its alignment domain did not match the From: domain.
+    Unaligned,
+    /// Domain authentication passed, but the sender is not on the maintainer allowlist.
+    OffAllowlist,
+}
+
+impl std::fmt::Display for QuarantineReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            QuarantineReason::AuthAbsent => "auth-absent",
+            QuarantineReason::DmarcFail => "dmarc-fail",
+            QuarantineReason::Unaligned => "unaligned",
+            QuarantineReason::OffAllowlist => "off-allowlist",
+        })
+    }
+}
 
 /// Email channel adapter implementing `Channel` via SMTP + IMAP.
 ///
@@ -156,11 +183,79 @@ impl EmailChannel {
         Ok(())
     }
 
-    /// Convert a `RawEmail` to a `ChannelEnvelope`, validating the sender.
-    fn to_envelope(&self, email: RawEmail) -> Result<ChannelEnvelope, ChannelError> {
-        self.check_sender(&email.from_addrs, email.sender_addr.as_deref())?;
+    /// Evaluate the domain-authentication half of the attribution gate
+    /// (ADR-056 Amendment 2026-07-02): trust only the topmost
+    /// `Authentication-Results` header whose `authserv-id` matches this
+    /// deployment's configured trust anchor, and require `dmarc=pass`, or
+    /// `spf=pass` with an aligned envelope-from, or `dkim=pass` with an
+    /// aligned `d=` domain. Absence of any trusted header fails closed.
+    fn evaluate_auth(&self, email: &RawEmail) -> Result<(), QuarantineReason> {
+        let selected =
+            auth_results::select_trusted(&email.authentication_results, &self.config.authserv_id)
+                .ok_or(QuarantineReason::AuthAbsent)?;
 
-        // Safe: check_sender verified exactly one entry.
+        let from_domain = email
+            .from_addrs
+            .first()
+            .and_then(|addr| addr.rsplit_once('@'))
+            .map(|(_, domain)| domain.to_lowercase())
+            .unwrap_or_default();
+
+        if selected.dmarc_pass()
+            || selected.spf_pass_aligned(&from_domain)
+            || selected.dkim_pass_aligned(&from_domain)
+        {
+            return Ok(());
+        }
+        if selected.has_unaligned_pass(&from_domain) {
+            return Err(QuarantineReason::Unaligned);
+        }
+        Err(QuarantineReason::DmarcFail)
+    }
+
+    /// Run the full attribution gate: domain authentication, then the sender
+    /// allowlist. Both must pass for a message to be attributed to the
+    /// maintainer; either failing quarantines it (never partially attributed).
+    fn gate(&self, email: &RawEmail) -> Result<(), QuarantineReason> {
+        self.evaluate_auth(email)?;
+        self.check_sender(&email.from_addrs, email.sender_addr.as_deref())
+            .map_err(|_| QuarantineReason::OffAllowlist)
+    }
+
+    /// Build the envelope recorded for a message that failed the attribution
+    /// gate. Per ADR-056 Amendment 2026-07-02, a quarantined message must
+    /// never be attributed to (or look like) the maintainer: `from` is the
+    /// fixed `email:quarantine` marker rather than the message's own
+    /// (possibly forged) From address, and no correlation key is set --  an
+    /// unauthenticated message claiming to be a reply must not inherit a
+    /// legitimate thread's context.
+    fn quarantine_envelope(&self, email: &RawEmail, reason: QuarantineReason) -> ChannelEnvelope {
+        let to = format!("email:{}", self.maintainer_address());
+        let mut env = ChannelEnvelope::new("email:quarantine", to, email.best_body());
+
+        if !email.subject.is_empty() {
+            env = env.with_subject(&email.subject);
+        }
+        if let Some(date) = email.date {
+            env = env.with_sent_at(date);
+        }
+        env = env.with_external_id(&email.imap_external_id);
+
+        env.metadata
+            .insert("quarantined".to_string(), "true".to_string());
+        env.metadata
+            .insert("quarantine_reason".to_string(), reason.to_string());
+        if let Some(claimed_from) = email.from_addrs.first() {
+            env.metadata
+                .insert("quarantine_claimed_from".to_string(), claimed_from.clone());
+        }
+
+        env
+    }
+
+    /// Convert a `RawEmail` that has already passed `gate` into a `ChannelEnvelope`.
+    fn to_envelope(&self, email: RawEmail) -> ChannelEnvelope {
+        // Safe: gate() verified exactly one From entry before this is called.
         let from_addr = &email.from_addrs[0];
         let from = format!("email:{from_addr}");
         let to = email
@@ -194,7 +289,7 @@ impl EmailChannel {
             env = env.with_wire_references(refs);
         }
 
-        Ok(env)
+        env
     }
 }
 
@@ -233,13 +328,20 @@ impl Channel for EmailChannel {
         let mut envelopes = Vec::new();
         for email in raw {
             let uid = email.uid;
-            match self.to_envelope(email) {
-                Ok(env) => envelopes.push(env),
-                Err(e) => {
-                    // Log the IMAP UID and the (address-free) error reason so a rejected
-                    // inbound is observable in the daemon log. ChannelError messages are
-                    // constructed without addresses or credentials, so `%e` is log-safe.
-                    warn!(uid, error = %e, "skipping message: validation failed");
+            match self.gate(&email) {
+                Ok(()) => envelopes.push(self.to_envelope(email)),
+                Err(reason) => {
+                    if self.config.quarantine_store {
+                        envelopes.push(self.quarantine_envelope(&email, reason));
+                    } else {
+                        // Address-free: only the IMAP UID and the quarantine reason
+                        // are logged, never the (possibly forged) From address.
+                        warn!(
+                            uid,
+                            reason = %reason,
+                            "quarantine-store disabled: dropping unattributed message"
+                        );
+                    }
                 }
             }
         }
@@ -262,6 +364,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    /// The `authserv-id` this test suite's channels are configured to trust.
+    const TEST_AUTHSERV_ID: &str = "mx.example.com";
+
     fn make_config(maintainer: &str) -> EmailChannelConfig {
         EmailChannelConfig {
             smtp_host: "smtp.example.com".to_string(),
@@ -274,7 +379,20 @@ mod tests {
                 password: "secret".to_string(),
             },
             maintainer_addresses: vec![MailAddress::parse(maintainer).unwrap()],
+            authserv_id: TEST_AUTHSERV_ID.to_string(),
+            quarantine_store: true,
         }
+    }
+
+    /// A trusted `Authentication-Results` header that authenticates cleanly
+    /// for `from_addr`'s own domain, so tests that are exercising allowlist
+    /// logic (not the auth gate) get an attributed baseline by default.
+    fn trusted_auth_header(from_addr: &str) -> String {
+        let domain = from_addr
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .unwrap_or("example.com");
+        format!("{TEST_AUTHSERV_ID}; dmarc=pass header.from={domain}")
     }
 
     struct RecordingSmtp {
@@ -314,7 +432,10 @@ mod tests {
         }
     }
 
-    /// Build a RawEmail with a single-address From and a stable IMAP external ID.
+    /// Build a RawEmail with a single-address From, a stable IMAP external ID,
+    /// and a trusted, self-aligned `Authentication-Results` header -- so
+    /// callers that are exercising allowlist logic (not the auth gate itself)
+    /// get an attributed baseline by default.
     fn make_email(from_addr: &str, imap_id: &str) -> RawEmail {
         RawEmail {
             uid: 1,
@@ -327,11 +448,18 @@ mod tests {
             body_text: Some("body text".to_string()),
             body_html: None,
             headers: HashMap::new(),
+            authentication_results: vec![trusted_auth_header(from_addr)],
         }
     }
 
-    /// Build a RawEmail with an explicit From address list.
+    /// Build a RawEmail with an explicit From address list and a trusted
+    /// `Authentication-Results` header (aligned to the first From address, or
+    /// to `example.com` when the list is empty).
     fn make_email_with_from_addrs(from_addrs: Vec<String>, imap_id: &str) -> RawEmail {
+        let auth_header = from_addrs
+            .first()
+            .map(|addr| trusted_auth_header(addr))
+            .unwrap_or_else(|| format!("{TEST_AUTHSERV_ID}; dmarc=pass header.from=example.com"));
         RawEmail {
             uid: 1,
             imap_external_id: imap_id.to_string(),
@@ -343,6 +471,7 @@ mod tests {
             body_text: Some("body text".to_string()),
             body_html: None,
             headers: HashMap::new(),
+            authentication_results: vec![auth_header],
         }
     }
 
@@ -444,7 +573,8 @@ mod tests {
         // References chain (mail-parser's `HeaderValue::TextList`) -- exercise the
         // REAL byte-parsing path here, not a hand-built RawEmail.headers map, since
         // that hand-built shortcut is exactly what let the live-path bug through.
-        let raw = b"From: maintainer@example.com\r\n\
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
                     To: me@example.com\r\n\
                     Subject: Multi-id References test\r\n\
                     References: <grandparent1@example.com> <grandparent2@example.com>\r\n\
@@ -492,13 +622,29 @@ mod tests {
     // --- Authorization: rejected senders (Fix 1) ---
 
     #[tokio::test]
-    async fn unauthorized_sender_is_silently_skipped() {
+    async fn unauthorized_sender_with_valid_auth_is_quarantined_off_allowlist() {
+        // Domain authentication passes (attacker@example.com's own AR header is
+        // trusted and aligned), but the sender is not on the maintainer
+        // allowlist -- must be quarantined with reason off-allowlist, never
+        // attributed to the (non-maintainer) sender or silently dropped.
         let ch = build_channel(
             "maintainer@example.com",
             vec![make_email("attacker@example.com", "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(envs.is_empty(), "unauthorized From must be dropped");
+        assert_eq!(envs.len(), 1, "must be stored as quarantine, not dropped");
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
+        assert_eq!(
+            envs[0].metadata.get("quarantined").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -524,13 +670,25 @@ mod tests {
     #[tokio::test]
     async fn non_gmail_dots_remain_significant() {
         // Dot-insensitivity is a Gmail-only rule; other providers treat dots as
-        // significant, so a dotted variant of a non-Gmail maintainer is rejected.
+        // significant, so a dotted variant of a non-Gmail maintainer fails the
+        // allowlist half of the gate (quarantined, not attributed).
         let ch = build_channel(
             "sam.rivera@outlook.com",
             vec![make_email("samrivera@outlook.com", "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(envs.is_empty(), "non-gmail dot-variant must NOT authorize");
+        assert_eq!(envs.len(), 1);
+        assert_ne!(
+            envs[0].from, "email:samrivera@outlook.com",
+            "non-gmail dot-variant must NOT authorize"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
     }
 
     #[tokio::test]
@@ -548,7 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn multi_from_addresses_rejected() {
-        // RFC 5322 permits multiple From addresses; we treat it as unauthorized.
+        // RFC 5322 permits multiple From addresses; we treat it as unauthorized
+        // (quarantined off-allowlist, since domain auth on the first address passes).
         let ch = build_channel(
             "maintainer@example.com",
             vec![make_email_with_from_addrs(
@@ -560,7 +719,19 @@ mod tests {
             )],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(envs.is_empty(), "multi-From message must be rejected");
+        assert_eq!(
+            envs.len(),
+            1,
+            "multi-From message must be quarantined, not dropped"
+        );
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
     }
 
     #[tokio::test]
@@ -570,9 +741,17 @@ mod tests {
             vec![make_email_with_from_addrs(vec![], "imap:test:0:1")],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(
-            envs.is_empty(),
-            "message with no From address must be rejected"
+        assert_eq!(
+            envs.len(),
+            1,
+            "message with no From address must be quarantined, not dropped"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
         );
     }
 
@@ -583,7 +762,18 @@ mod tests {
         email.sender_addr = Some("attacker@example.com".to_string());
         let ch = build_channel("maintainer@example.com", vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();
-        assert!(envs.is_empty(), "Sender mismatch must be rejected");
+        assert_eq!(
+            envs.len(),
+            1,
+            "Sender mismatch must be quarantined, not dropped"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
     }
 
     #[tokio::test]
@@ -611,6 +801,215 @@ mod tests {
         );
     }
 
+    // --- Attribution gate: Authentication-Results (ADR-056 Amendment 2026-07-02) ---
+    //
+    // These exercise the REAL byte-parsing path (parse_raw_bytes), not hand-built
+    // RawEmail/authentication_results literals, per the same real-parse discipline
+    // as poll_preserves_multi_id_wire_references_through_real_parse above: a
+    // synthetic header map would not exercise mail-parser's actual header
+    // iteration and could hide a live-path bug the same way it did there.
+
+    #[tokio::test]
+    async fn spoofed_from_no_authentication_results_quarantines_auth_absent() {
+        // The original #448 regression: a message whose From: claims to be the
+        // maintainer, with no Authentication-Results header at all. Must be
+        // quarantined -- and critically, the quarantine envelope's `from` must
+        // NOT be the claimed maintainer address, or the vulnerability persists
+        // one layer up (comm.ingest stamps from_actor straight from envelope.from).
+        let raw = b"From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: spoofed, no auth at all\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_ne!(
+            envs[0].from, "email:maintainer@example.com",
+            "quarantined mail must never carry the claimed maintainer address as `from`"
+        );
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("auth-absent")
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_claimed_from")
+                .map(String::as_str),
+            Some("maintainer@example.com"),
+            "the claimed From is preserved in metadata for review, but not as `from`"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_authentication_results_topmost_trusted_id_wins_over_forged_below() {
+        // Two Authentication-Results headers share the trusted authserv-id: the
+        // genuine one (dmarc=pass) is topmost (added last, by the final trusted
+        // hop); a forged one (dmarc=fail) was injected below it. Topmost wins,
+        // per the ADR's trusted-header selection rule -- the genuine stamp is
+        // used regardless of what a lower, same-id header claims.
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    Authentication-Results: mx.example.com; dmarc=fail header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: genuine on top, forged below\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:maintainer@example.com",
+            "topmost genuine dmarc=pass must win over a same-id forged header below it"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_authresults_with_trusted_id_is_mechanically_trusted_operational_precondition() {
+        // OPERATIONAL-PRECONDITION BOUNDARY, not a bug: when exactly one
+        // Authentication-Results header is present and it carries the
+        // configured trusted authserv-id, the gate has no way to distinguish
+        // "the receiving MTA genuinely stamped this" from "an attacker injected
+        // a single header claiming our trusted id before the (misconfigured or
+        // absent) receiving MTA had a chance to strip it and add its own".
+        // Per ADR-056 Amendment 2026-07-02 ("Trusted-header selection"), that
+        // stripping is a deployment-time responsibility of the receiving
+        // boundary, not something this parser re-verifies from message content
+        // (doing so would mean deriving trust from the very content the header
+        // is supposed to authenticate). Given that precondition holds in
+        // production, this header is mechanically trusted.
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: single AR header, trusted id\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:maintainer@example.com");
+    }
+
+    #[tokio::test]
+    async fn authresults_with_untrusted_authserv_id_is_ignored_quarantines_auth_absent() {
+        // A header is present, but its authserv-id does not match this
+        // deployment's configured trust anchor -- it must be ignored entirely
+        // (never treated as a partial signal), leaving no trusted header, hence
+        // auth-absent.
+        let raw =
+            b"Authentication-Results: forged-mx.evil.com; dmarc=pass header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: wrong authserv-id\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("auth-absent")
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_reason_semicolon_forging_dmarc_pass_does_not_bypass_gate() {
+        // Regression for codex #496 Finding 1, driven through the REAL byte-parsing
+        // path (parse_raw_bytes), not a hand-built AuthResults: a quoted reason=
+        // pvalue containing "; dmarc=pass; " must never be split into a separate
+        // dmarc method -- the gate must see the genuine spf=fail result and
+        // quarantine, never attribute to the maintainer.
+        let raw = b"Authentication-Results: mx.example.com; spf=fail reason=\"remote said; dmarc=pass; still fail\" smtp.mailfrom=attacker.net\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: quoted reason attack\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:quarantine",
+            "a forged dmarc=pass hidden inside a quoted reason pvalue must never attribute mail"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("dmarc-fail")
+        );
+    }
+
+    #[tokio::test]
+    async fn spf_pass_unaligned_envelope_from_quarantines_unaligned() {
+        let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=alice@attacker.net\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: spf pass, mismatched envelope domain\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("unaligned")
+        );
+    }
+
+    #[tokio::test]
+    async fn dkim_pass_aligned_d_domain_is_attributed() {
+        let raw = b"Authentication-Results: mx.example.com; dkim=pass header.d=example.com header.s=sel1\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: dkim pass, aligned d=\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:maintainer@example.com");
+    }
+
+    #[tokio::test]
+    async fn quarantine_store_off_drops_unattributed_message() {
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_store = false;
+        let raw = b"From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: no auth, quarantine store off\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel_from(config, vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(
+            envs.is_empty(),
+            "quarantine_store=false must drop the message, not store it"
+        );
+    }
+
     // --- Batch isolation (Fix 3) ---
 
     #[tokio::test]
@@ -618,23 +1017,33 @@ mod tests {
         let ch = build_channel(
             "maintainer@example.com",
             vec![
-                // First message: unauthorized -- should be skipped.
+                // First message: unauthorized -- must be quarantined, not abort the batch.
                 make_email("attacker@example.com", "imap:test:0:1"),
-                // Second message: authorized -- must be returned.
+                // Second message: authorized -- must be attributed.
                 make_email("maintainer@example.com", "imap:test:0:2"),
             ],
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 2, "both messages must produce an envelope");
+
+        let quarantined = envs
+            .iter()
+            .find(|e| e.external_id.as_deref() == Some("imap:test:0:1"))
+            .expect("unauthorized message must still be present, quarantined");
+        assert_eq!(quarantined.from, "email:quarantine");
         assert_eq!(
-            envs.len(),
-            1,
-            "only the authorized message must be returned"
+            quarantined
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
         );
-        assert_eq!(
-            envs[0].external_id.as_deref(),
-            Some("imap:test:0:2"),
-            "the authorized message must be the one returned"
-        );
+
+        let attributed = envs
+            .iter()
+            .find(|e| e.external_id.as_deref() == Some("imap:test:0:2"))
+            .expect("authorized message must be attributed");
+        assert_eq!(attributed.from, "email:maintainer@example.com");
     }
 
     // --- SMTP send path ---
