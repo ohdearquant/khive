@@ -360,15 +360,17 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
         .unwrap();
     let foreign_id = foreign_note.id.as_hyphenated().to_string();
 
-    // Caller in a different primary namespace (visible-set can read foreign-ns).
-    let tok_vis = rt
-        .authorize_with_visibility(ns_primary.clone(), vec![ns_foreign.clone()])
-        .unwrap();
+    // Caller in a different primary namespace with NO visibility grant for the
+    // foreign ns. resolve_by_id is ID-only (ignores namespace AND visible set),
+    // so feedback must still resolve the foreign target. Using a bare token pins
+    // the FULL ns-agnostic contract: this test fails under the old primary-only
+    // `resolve_primary` AND under any future visible-set-gated `resolve`.
+    let tok_primary = rt.authorize(ns_primary.clone()).unwrap();
 
     let brain = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new().build().unwrap();
     brain
-        .dispatch("brain.profiles", json!({}), &empty_registry, &tok_vis)
+        .dispatch("brain.profiles", json!({}), &empty_registry, &tok_primary)
         .await
         .expect("promote primary namespace");
 
@@ -379,7 +381,7 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
             "brain.feedback",
             json!({ "target_id": foreign_id, "signal": "useful" }),
             &empty_registry,
-            &tok_vis,
+            &tok_primary,
         )
         .await;
     assert!(
@@ -395,7 +397,7 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
             "brain.feedback",
             json!({ "target_id": absent, "signal": "useful" }),
             &empty_registry,
-            &tok_vis,
+            &tok_primary,
         )
         .await
         .unwrap_err();
