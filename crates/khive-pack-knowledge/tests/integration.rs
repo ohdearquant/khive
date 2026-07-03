@@ -1198,6 +1198,128 @@ async fn delete_atoms_returns_zero_for_unknown_slug() {
     assert_eq!(resp["deleted"], 0);
 }
 
+#[tokio::test]
+async fn delete_atoms_rejects_domain_mirror_slug_without_mutation() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "retrieval", "name": "Retrieval", "description": "Dense and sparse retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": ["retrieval"] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // Direct lookup and search must agree: the domain is present on both paths.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": "retrieval" }))
+        .await
+        .expect("get must still resolve the domain");
+    assert_eq!(got["kind"], "domain");
+    assert!(got["members"].is_array());
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "retrieval"),
+        "search must still find the domain: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_rejects_domain_mirror_uuid_without_mutation() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts" }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "embedding-theory" }))
+        .await
+        .expect("get domain by slug");
+    let uuid = by_slug["id"].as_str().expect("id string").to_string();
+
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": [uuid.clone()] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // Direct lookup by UUID must agree with search: both say the domain is present.
+    let got = f
+        .dispatch("knowledge.get", json!({ "id": uuid }))
+        .await
+        .expect("get must still resolve the domain by uuid");
+    assert_eq!(got["kind"], "domain");
+
+    let search = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "embedding", "type": "domain", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+    let results = search["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|r| r["slug"] == "embedding-theory"),
+        "search must still find the domain: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_mixed_request_with_domain_mirror_leaves_normal_atom_live() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "normal-atom", "name": "Normal Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("seed atom");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "mixed-domain", "name": "Mixed Domain", "description": "Mixed domain techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+    )
+    .await
+    .expect("seed domain");
+
+    let err = f
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({ "ids": ["normal-atom", "mixed-domain"] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "normal-atom" }))
+        .await
+        .expect("normal atom must remain live after the rejected mixed request");
+    assert_eq!(atom["kind"], "atom");
+}
+
 // ── stats ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -593,6 +593,50 @@ impl KnowledgeHandlers {
         let now = now_us();
         let mut deleted = 0usize;
 
+        // Preflight the full request before mutating anything: knowledge.delete_atoms
+        // is documented as atom-only. A domain's canonical row and its FTS mirror
+        // atom share an id/slug, so deleting the mirror here would tombstone one
+        // half of the domain while leaving knowledge_domains live — a split-brain
+        // where direct lookup and search/suggest disagree. Domains must go through
+        // the generic delete verb, which deletes both halves together.
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("delete_atoms reader", e))?;
+        for id_or_slug in &p.ids {
+            let key = id_or_slug.trim().to_string();
+            let domain = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT id FROM knowledge_domains WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("delete_atoms domain preflight", e))?;
+            if domain.is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID"
+                )));
+            }
+
+            let mirror = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT tags FROM knowledge_atoms WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
+            if let Some(row) = mirror {
+                let tags = row_str(&row, "tags").unwrap_or_default();
+                if tags.contains("type:domain") {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "knowledge.delete_atoms cannot delete domain mirror {key:?}; use the generic delete verb by domain UUID"
+                    )));
+                }
+            }
+        }
+
         let mut writer = sql
             .writer()
             .await
