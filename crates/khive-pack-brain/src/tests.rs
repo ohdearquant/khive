@@ -2586,6 +2586,48 @@ mod help_tests {
         );
     }
 
+    /// ADR-084 Rule 3 (help-schema fidelity): scorer_run_id/serve_ledger_id are
+    /// accepted params (ADR-081 §6) that must be declared in the help=true
+    /// surface, not just parsed internally — a hidden accepted param is
+    /// exactly the drift Rule 3 exists to catch.
+    #[test]
+    fn brain_feedback_declares_adr081_dedup_key_params() {
+        let h = find_handler("brain.feedback");
+        let scorer_run_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "scorer_run_id")
+            .unwrap_or_else(|| panic!("brain.feedback must declare scorer_run_id"));
+        assert!(
+            !scorer_run_id.required,
+            "scorer_run_id is optional (together-or-rejected with serve_ledger_id, not always required)"
+        );
+        assert!(
+            scorer_run_id.description.contains("dedup")
+                && scorer_run_id.description.contains("together")
+                && scorer_run_id.description.contains("serve_ledger_id"),
+            "scorer_run_id description must document the dedup + together-or-rejected pairing: {:?}",
+            scorer_run_id.description
+        );
+
+        let serve_ledger_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "serve_ledger_id")
+            .unwrap_or_else(|| panic!("brain.feedback must declare serve_ledger_id"));
+        assert!(
+            !serve_ledger_id.required,
+            "serve_ledger_id is optional (together-or-rejected with scorer_run_id)"
+        );
+        assert!(
+            serve_ledger_id.description.contains("dedup")
+                && serve_ledger_id.description.contains("together")
+                && serve_ledger_id.description.contains("scorer_run_id"),
+            "serve_ledger_id description must document the dedup + together-or-rejected pairing: {:?}",
+            serve_ledger_id.description
+        );
+    }
+
     #[test]
     fn brain_auto_feedback_handler_is_declared() {
         let h = find_handler("brain.auto_feedback");
@@ -2596,6 +2638,37 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "results" && p.required),
             "brain.auto_feedback must have required results param"
+        );
+    }
+
+    /// Mirrors `brain_feedback_declares_adr081_dedup_key_params`: auto_feedback
+    /// forwards scorer_run_id/serve_ledger_id verbatim to brain.feedback, so
+    /// its own help surface must document them too (ADR-084 Rule 3).
+    #[test]
+    fn brain_auto_feedback_declares_adr081_dedup_key_params() {
+        let h = find_handler("brain.auto_feedback");
+        let scorer_run_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "scorer_run_id")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare scorer_run_id"));
+        assert!(!scorer_run_id.required);
+        assert!(
+            scorer_run_id.description.contains("serve_ledger_id"),
+            "scorer_run_id description must document the together-or-rejected pairing: {:?}",
+            scorer_run_id.description
+        );
+
+        let serve_ledger_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "serve_ledger_id")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare serve_ledger_id"));
+        assert!(!serve_ledger_id.required);
+        assert!(
+            serve_ledger_id.description.contains("scorer_run_id"),
+            "serve_ledger_id description must document the together-or-rejected pairing: {:?}",
+            serve_ledger_id.description
         );
     }
 
