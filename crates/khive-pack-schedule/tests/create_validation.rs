@@ -50,7 +50,7 @@ async fn schedule_creates_pending_event_with_action() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "create(kind=\"entity\", name=\"test\")",
+                "action": "create(kind=\"concept\", name=\"test\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -685,7 +685,7 @@ async fn schedule_schedule_accepts_create_with_kind() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "create(kind=\"entity\", name=\"x\")",
+                "action": "create(kind=\"concept\", name=\"x\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )
@@ -718,11 +718,21 @@ async fn schedule_schedule_rejects_business_namespace_arg() {
     );
 }
 
+/// Issue #462: omitting `namespace` from the stored action does NOT make
+/// `brain.bind` replayable. `dispatch_action` (`kkernel/src/pending_events.rs`)
+/// unconditionally injects the firing event's routing namespace into every
+/// op's args at trigger time, and the registry passes it straight through to
+/// any handler that declares `namespace` as a param — so an *omitted*
+/// `namespace` (which would otherwise default to `brain.bind`'s wildcard
+/// `"*"`) is silently rebound to the event's routing namespace on replay.
+/// This is exactly as unsafe as an explicitly-stored `namespace` arg, so
+/// `schedule.schedule` must reject any handler whose schema declares
+/// `namespace`, regardless of whether the stored args include the key.
 #[tokio::test]
-async fn schedule_schedule_accepts_verb_without_namespace_arg() {
+async fn schedule_schedule_rejects_verb_declaring_namespace_even_when_omitted() {
     let (registry, _rt) = build_registry_with_brain();
 
-    let result = registry
+    let err = registry
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
@@ -731,9 +741,15 @@ async fn schedule_schedule_accepts_verb_without_namespace_arg() {
             }),
         )
         .await
-        .expect("#461: brain.bind without a namespace arg must be accepted at write time");
+        .unwrap_err();
 
-    assert_eq!(result["status"], "pending");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("brain.bind") && msg.contains("namespace"),
+        "#462: brain.bind must be rejected even without an explicit `namespace` arg — the \
+         verb declares `namespace` as a business param, and replay would inject the event's \
+         routing namespace regardless of what (if anything) was stored; got: {msg}"
+    );
 }
 
 #[tokio::test]

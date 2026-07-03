@@ -61,7 +61,7 @@ async fn schedule_creates_pending_event_with_action() {
         .dispatch(
             "schedule.schedule",
             serde_json::json!({
-                "action": "create(kind=\"entity\", name=\"test\")",
+                "action": "create(kind=\"concept\", name=\"test\")",
                 "at": "2099-06-01T10:00:00Z"
             }),
         )

@@ -215,14 +215,20 @@ fn validate_replayable_single_action(
         }
     }
 
-    // Reject a business `namespace` arg on a scheduled action (issue #461).
-    // Replay unconditionally overwrites `args["namespace"]` with the routing
-    // namespace of the firing event (`pending_events.rs`); for handlers that
-    // declare `namespace` as a business param (e.g. `brain.bind`,
-    // `brain.resolve`), that clobbers the caller's intended profile scope
-    // with whatever namespace the event happens to fire from. Replay cannot
-    // yet carry routing-namespace and arg-namespace as separate concepts, so
-    // reject at write time rather than silently mis-scope on trigger.
+    // Reject any handler whose schema declares `namespace` as a business
+    // param (issue #461/#462). `dispatch_action` in `pending_events.rs`
+    // unconditionally injects the firing event's routing namespace into
+    // every op's args, and the registry passes it through unchanged
+    // whenever the handler declares `namespace` (`khive-runtime/src/pack.rs`).
+    // For handlers that treat `namespace` as a business param (e.g.
+    // `brain.bind`, `brain.resolve`), that silently changes the business
+    // value on replay — even when the *stored* action omitted `namespace`
+    // entirely (e.g. `brain.bind` defaults an omitted `namespace` to the
+    // wildcard `"*"` at write time; replay would instead bind it to
+    // whatever namespace the event happens to fire from). Replay cannot yet
+    // carry routing-namespace and arg-namespace as separate concepts, so
+    // reject at write time based on the handler's schema alone, regardless
+    // of whether the stored args happen to include `namespace`.
     let handler_accepts_namespace =
         help.get("params")
             .and_then(Value::as_array)
@@ -231,18 +237,18 @@ fn validate_replayable_single_action(
                     .iter()
                     .any(|p| p.get("name").and_then(Value::as_str) == Some("namespace"))
             });
-    if handler_accepts_namespace && op.args.contains_key("namespace") {
+    if handler_accepts_namespace {
         return Err(RuntimeError::InvalidInput(format!(
             "schedule.action: verb {:?} treats `namespace` as a business argument; scheduled \
-             replay always overwrites `namespace` with the firing event's routing namespace, \
-             so a stored `namespace` arg would be silently discarded and replaced. Omit \
-             `namespace` from the scheduled action",
+             replay would overwrite it with the event's routing namespace, silently changing \
+             the business value on trigger regardless of whether `namespace` was stored. This \
+             verb cannot be scheduled",
             op.tool
         )));
     }
 
     validate_args_against_help(&op.tool, &op.args, &help)?;
-    validate_conditional_requirements(&op.tool, &op.args)
+    validate_conditional_requirements(&op.tool, &op.args, registry)
 }
 
 /// Reject scheduled actions known to fail a handler's *conditional* required
@@ -257,16 +263,211 @@ fn validate_replayable_single_action(
 /// hard-codes the known cases; it is not a general conditional-requirements
 /// mechanism (there is no metadata surface for that yet), so it does not
 /// guarantee every handler-internal semantic precondition is caught.
+///
+/// For `tool == "create"`, this mirrors the singleton branches of the KG
+/// pack's own `handle_create` (`khive-pack-kg/src/handlers/create.rs`):
+/// entity/granular-entity creates require `name`, note/granular-note creates
+/// require `content`, and a bare `kind="entity"` requires an `entity_kind`
+/// (or a granular entity kind) to resolve a concrete kind. `khive-pack-schedule`
+/// does not depend on `khive-pack-kg` (only as a dev-dependency for tests),
+/// so this reimplements the classification using `VerbRegistry::all_entity_kinds`
+/// / `all_note_kinds` — the same data `resolve_kind_spec` consults — rather
+/// than importing the KG pack's private helpers.
 fn validate_conditional_requirements(
     tool: &str,
     args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
+    registry: &VerbRegistry,
 ) -> Result<(), RuntimeError> {
-    if tool == "create" && !args.contains_key("kind") && !args.contains_key("items") {
+    if tool != "create" {
+        return Ok(());
+    }
+
+    let has_kind = args.contains_key("kind");
+    let has_items = args.contains_key("items");
+
+    if !has_kind && !has_items {
         return Err(RuntimeError::InvalidInput(
             "schedule.action: verb \"create\" requires either `kind` (singleton) or `items` \
              (bulk); neither is present"
                 .into(),
         ));
+    }
+
+    // Bulk path takes priority over `kind`, mirroring `handle_create`'s
+    // early-exit on `items` before the singleton `kind` requirement is even
+    // checked.
+    if has_items {
+        let items_value = args
+            .get("items")
+            .and_then(khive_request::ArgValue::as_value)
+            .cloned()
+            .unwrap_or(Value::Null);
+        return validate_create_bulk_items(&items_value, registry);
+    }
+
+    let kind_str = args
+        .get("kind")
+        .and_then(khive_request::ArgValue::as_value)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let entity_kind_arg = args
+        .get("entity_kind")
+        .and_then(khive_request::ArgValue::as_value)
+        .and_then(Value::as_str);
+
+    match classify_create_kind(kind_str, registry)? {
+        CreateKindClass::Entity { specific } => {
+            if specific.is_none() && entity_kind_arg.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": kind=\"entity\" requires a specific \
+                     kind — use kind=<concept|document|dataset|project|person|org|artifact|\
+                     service|resource> directly, or kind=entity + entity_kind=<…>"
+                        .into(),
+                ));
+            }
+            let name = args
+                .get("name")
+                .and_then(khive_request::ArgValue::as_value)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if name.is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": entity creation requires `name`".into(),
+                ));
+            }
+        }
+        CreateKindClass::Note => {
+            let content = args
+                .get("content")
+                .and_then(khive_request::ArgValue::as_value)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if content.is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": note creation requires `content`".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolved shape of a `create(kind=...)` discriminator, mirroring
+/// `khive-pack-kg`'s `KindSpec` for the two branches that carry a
+/// conditional requirement (`entity` needs `name`, `note` needs `content`).
+enum CreateKindClass {
+    Entity { specific: Option<String> },
+    Note,
+}
+
+/// Classify a `create(kind=...)` value the same way
+/// `khive-pack-kg::handlers::common::resolve_kind_spec` does, using the
+/// registry's merged entity/note-kind vocabulary (the same source
+/// `resolve_kind_spec` falls back to). Returns an error for any `kind` that
+/// is guaranteed to fail replay outright: `edge` (create edges via `link`),
+/// `event` (immutable), `proposal` (create via `propose`), or an
+/// unrecognized kind string.
+fn classify_create_kind(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<CreateKindClass, RuntimeError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "entity" => return Ok(CreateKindClass::Entity { specific: None }),
+        "note" => return Ok(CreateKindClass::Note),
+        "edge" => {
+            return Err(RuntimeError::InvalidInput(
+                "schedule.action: verb \"create\" with kind=\"edge\" always fails at replay; \
+                 edges are created via `link`, not `create`"
+                    .into(),
+            ));
+        }
+        "event" => {
+            return Err(RuntimeError::InvalidInput(
+                "schedule.action: verb \"create\" with kind=\"event\" always fails at replay; \
+                 events are immutable and not creatable via `create`"
+                    .into(),
+            ));
+        }
+        "proposal" => {
+            return Err(RuntimeError::InvalidInput(
+                "schedule.action: verb \"create\" with kind=\"proposal\" always fails at \
+                 replay; use `propose` to create a proposal"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(CreateKindClass::Entity {
+            specific: Some(normalized),
+        });
+    }
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(CreateKindClass::Note);
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "schedule.action: verb \"create\" with kind={raw:?} always fails at replay (unknown \
+         kind; valid: entity | note | edge | event | proposal | {} | {})",
+        registry.all_entity_kinds().join(" | "),
+        registry.all_note_kinds().join(" | "),
+    )))
+}
+
+/// A single entry in a bulk `create(items=[...])` action, mirroring
+/// `khive-pack-kg::handlers::params::BulkCreateEntry`'s exact field set
+/// (including `#[serde(deny_unknown_fields)]`) so schedule-time validation
+/// rejects the same malformed entries the real bulk handler would.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // fields exist only to mirror BulkCreateEntry's deserialize shape
+struct ScheduleBulkCreateEntryCheck {
+    kind: String,
+    name: String,
+    entity_kind: Option<String>,
+    entity_type: Option<String>,
+    description: Option<String>,
+    properties: Option<Value>,
+    tags: Option<Vec<String>>,
+}
+
+/// Validate a `create(items=[...])` bulk payload the way `handle_create`'s
+/// bulk path would: `items` must parse into the same shape as
+/// `BulkCreateEntry` (required `kind` + `name`, deny-unknown-fields), and
+/// bulk create only supports entity kinds (never note kinds).
+fn validate_create_bulk_items(
+    items_value: &Value,
+    registry: &VerbRegistry,
+) -> Result<(), RuntimeError> {
+    let entries: Vec<ScheduleBulkCreateEntryCheck> = serde_json::from_value(items_value.clone())
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!(
+                "schedule.action: verb \"create\": malformed `items` — could not parse bulk \
+             entries: {e}"
+            ))
+        })?;
+    for (idx, entry) in entries.iter().enumerate() {
+        match classify_create_kind(&entry.kind, registry)? {
+            CreateKindClass::Entity { specific } => {
+                if specific.is_none() && entry.entity_kind.is_none() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] kind=\"entity\" \
+                         requires a specific kind — use kind=<concept|…> or kind=entity + \
+                         entity_kind=<…>"
+                    )));
+                }
+            }
+            CreateKindClass::Note => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "schedule.action: verb \"create\": items[{idx}] bulk create only supports \
+                     entity kinds; got kind={:?}",
+                    entry.kind
+                )));
+            }
+        }
     }
     Ok(())
 }
