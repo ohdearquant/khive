@@ -50,6 +50,41 @@ async fn ensure_audit_schema(runtime: &KhiveRuntime) {
             tracing::warn!(error = %e, stmt, "gtd: failed to apply lifecycle_audit schema stmt (non-fatal)");
         }
     }
+
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op on databases that already
+    // have `gtd_lifecycle_audit` from before the `namespace` column existed.
+    // Guard-check and upgrade those tables in place so `write_audit_record`'s
+    // `INSERT ... namespace` doesn't silently fail on legacy schemas.
+    let rows = match w
+        .query_all(SqlStatement {
+            sql: "PRAGMA table_info(gtd_lifecycle_audit)".into(),
+            params: vec![],
+            label: Some("gtd_audit_schema_info".into()),
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "gtd: failed to inspect lifecycle_audit schema (non-fatal)");
+            return;
+        }
+    };
+
+    let has_namespace = rows
+        .iter()
+        .any(|row| matches!(row.get("name"), Some(SqlValue::Text(name)) if name == "namespace"));
+
+    if !has_namespace {
+        if let Err(e) = w
+            .execute_script("ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT".into())
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "gtd: failed to add lifecycle_audit.namespace column (non-fatal)"
+            );
+        }
+    }
 }
 
 /// Append one row to `gtd_lifecycle_audit`.

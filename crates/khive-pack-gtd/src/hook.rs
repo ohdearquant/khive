@@ -58,9 +58,38 @@ impl KindHook for TaskHook {
             )));
         }
 
+        let token = args
+            .get("namespace")
+            .and_then(Value::as_str)
+            .and_then(|s| Namespace::parse(s).ok())
+            .map(|ns| runtime.authorize(ns))
+            .unwrap_or_else(|| runtime.authorize(Namespace::local()))?;
+
+        // Start from any user-supplied `properties` (object only) so foreign
+        // keys survive; task-controlled keys are overwritten with normalized
+        // values. If `properties` is present but not an object, replace it.
+        // Set up `props` before extracting priority/depends_on so both
+        // top-level args and nested `properties` fields are considered —
+        // the ADR-019 generic `create(kind="note", note_kind="task", ...)`
+        // form must accept task-controlled fields nested under `properties`
+        // the same way `gtd.assign` accepts them at the top level.
+        let mut props = args
+            .get("properties")
+            .cloned()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({}));
+        let obj = props
+            .as_object_mut()
+            .expect("props is object by construction");
+
+        // Precedence: top-level wins if present, else nested `properties`,
+        // else the field's default. This matches the documented top-level
+        // API surface taking priority while still letting the generic
+        // properties-only form round-trip without being silently defaulted.
         let priority = args
             .get("priority")
             .and_then(Value::as_str)
+            .or_else(|| obj.get("priority").and_then(Value::as_str))
             .map(str::to_string);
         if let Some(ref p) = priority {
             if !is_valid_priority(p) {
@@ -71,27 +100,32 @@ impl KindHook for TaskHook {
         }
         let salience = priority.as_deref().map(priority_to_salience).unwrap_or(0.5);
 
-        let token = args
-            .get("namespace")
-            .and_then(Value::as_str)
-            .and_then(|s| Namespace::parse(s).ok())
-            .map(|ns| runtime.authorize(ns))
-            .unwrap_or_else(|| runtime.authorize(Namespace::local()))?;
-
         // Resolve depends_on entries (full UUID or 8+ hex prefix) to canonical
         // UUID strings — matches the shape gtd's `assign` produces. Also
-        // pre-validate each target is a task note before the storage write so
-        // the kg-create path matches GTD `assign` and never leaves a task
-        // persisted with a `properties.depends_on` pointing at a non-task
-        // (the GTD pack edge rule only legalises task→task `depends_on`).
+        // pre-validate each target is a task note in the primary namespace
+        // before the storage write, using the same `resolve_primary`
+        // resolver as `gtd.assign` and runtime link-mutation validation, so
+        // this create path never leaves a task persisted with a
+        // `properties.depends_on` pointing at a non-task or a visible-only
+        // (non-primary-namespace) note that runtime link creation would
+        // reject (the GTD pack edge rule only legalises task→task
+        // `depends_on` within the primary namespace).
+        let depends_on_source = args
+            .get("depends_on")
+            .cloned()
+            .or_else(|| obj.get("depends_on").cloned());
+        let depends_on_present = depends_on_source.is_some();
         let mut resolved_deps: Vec<String> = Vec::new();
-        if let Some(arr) = args.get("depends_on").and_then(Value::as_array) {
+        if let Some(value) = depends_on_source {
+            let arr = value.as_array().ok_or_else(|| {
+                RuntimeError::InvalidInput("depends_on must be an array of strings".into())
+            })?;
             for entry in arr {
                 let raw = entry.as_str().ok_or_else(|| {
                     RuntimeError::InvalidInput("depends_on entries must be strings".into())
                 })?;
                 let uuid = resolve_uuid(raw, runtime, &token).await?;
-                match runtime.resolve(&token, uuid).await? {
+                match runtime.resolve_primary(&token, uuid).await? {
                     Some(Resolved::Note(n)) if n.kind == "task" => {}
                     Some(Resolved::Note(n)) => {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -116,17 +150,6 @@ impl KindHook for TaskHook {
             }
         }
 
-        // Start from any user-supplied `properties` (object only) so foreign
-        // keys survive; task-controlled keys are overwritten with normalized
-        // values. If `properties` is present but not an object, replace it.
-        let mut props = args
-            .get("properties")
-            .cloned()
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| json!({}));
-        let obj = props
-            .as_object_mut()
-            .expect("props is object by construction");
         obj.insert("status".into(), json!(status.to_string()));
         let description = args
             .get("description")
@@ -154,8 +177,15 @@ impl KindHook for TaskHook {
         if let Some(v) = args.get("end").and_then(Value::as_str) {
             obj.insert("end".into(), json!(v));
         }
-        if !resolved_deps.is_empty() {
-            obj.insert("depends_on".into(), json!(resolved_deps));
+        // Write back only the canonicalized dependency list (or clear a
+        // stale/invalid nested value) so `after_create` always consumes
+        // validated data regardless of which input location supplied it.
+        if depends_on_present {
+            if resolved_deps.is_empty() {
+                obj.remove("depends_on");
+            } else {
+                obj.insert("depends_on".into(), json!(resolved_deps));
+            }
         }
         if let Some(tags) = args.get("tags").cloned() {
             obj.insert("tags".into(), tags);

@@ -68,11 +68,11 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// IF NOT EXISTS`) and is NOT part of the core versioned migration chain.
 ///
 /// Every statement must be idempotent so the generic boot applier can call them
-/// on any database (fresh or pre-existing) without error. The `namespace` column
-/// is included in the `CREATE TABLE` definition, so no separate `ALTER TABLE`
-/// is needed. Databases that predate the `namespace` column are handled by the
-/// `ensure_audit_schema` lazy-init path in `handlers.rs`, which swallows the
-/// duplicate-column error produced by the in-process `ALTER` on those older DBs.
+/// on any database (fresh or pre-existing) without error. The fresh-table DDL
+/// includes `namespace`. Older databases that already have
+/// `gtd_lifecycle_audit` without that column are upgraded by the guarded
+/// `ensure_audit_schema` path in `handlers.rs` (`PRAGMA table_info` check
+/// followed by `ALTER TABLE ... ADD COLUMN namespace` only when missing).
 pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\
         note_id    TEXT NOT NULL,\
