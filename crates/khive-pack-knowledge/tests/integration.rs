@@ -654,6 +654,83 @@ async fn upsert_domains_rejects_empty_list() {
     assert!(err.to_string().contains("must not be empty"), "got: {err}");
 }
 
+#[tokio::test]
+async fn upsert_domains_rejects_atom_slug_collision_without_partial_domain() {
+    let f = pack(rt());
+
+    // Seed a normal atom that owns the slug the domain upsert will collide on.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "shared-slug",
+            "name": "Original Atom Name",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "tags": ["distinctive-tag"],
+        }] }),
+    )
+    .await
+    .expect("seed atom");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{
+                "slug": "shared-slug",
+                "name": "Colliding Domain",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+
+    // No domain row must exist after the rejected upsert (no partial commit).
+    let domains = f
+        .dispatch("knowledge.list", json!({ "type": "domain" }))
+        .await
+        .expect("list domains ok");
+    let results = domains["results"].as_array().expect("results array");
+    assert!(
+        results
+            .iter()
+            .all(|d| d["slug"].as_str() != Some("shared-slug")),
+        "no domain with slug 'shared-slug' should exist after rejected collision: {results:?}"
+    );
+
+    // Retry — still rejected, and the original atom is untouched.
+    let err2 = f
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{
+                "slug": "shared-slug",
+                "name": "Colliding Domain Retry",
+                "description": "covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques",
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err2, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput on retry, got: {err2:?}"
+    );
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "shared-slug" }))
+        .await
+        .expect("original atom still resolvable");
+    assert_eq!(atom["kind"], "atom");
+    assert_eq!(atom["name"], "Original Atom Name");
+    assert_eq!(
+        atom["content"],
+        "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+    );
+    let tags = atom["tags"].as_array().expect("tags array");
+    assert!(tags.iter().any(|t| t == "distinctive-tag"));
+}
+
 // ── knowledge.get ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
