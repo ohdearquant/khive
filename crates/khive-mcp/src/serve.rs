@@ -2634,22 +2634,62 @@ brain_profile = "project-profile"
     mod spawn_email_channel_loops_tests {
         use super::*;
 
+        const EMAIL_ENV_VARS: [&str; 9] = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            "KHIVE_EMAIL_OAUTH_TENANT_ID",
+            "KHIVE_EMAIL_OAUTH_CLIENT_ID",
+            "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+        ];
+
+        /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
+        /// and restores the original value (or leaves it removed) on drop — including
+        /// on panic, so a failing assertion never leaks env taint to later tests.
+        struct EmailEnvGuard {
+            snapshot: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl EmailEnvGuard {
+            fn clear() -> Self {
+                let snapshot = EMAIL_ENV_VARS
+                    .iter()
+                    .map(|&var| (var, std::env::var(var).ok()))
+                    .collect();
+                for var in EMAIL_ENV_VARS {
+                    std::env::remove_var(var);
+                }
+                Self { snapshot }
+            }
+        }
+
+        impl Drop for EmailEnvGuard {
+            fn drop(&mut self) {
+                for (var, prev) in &self.snapshot {
+                    match prev {
+                        Some(v) => std::env::set_var(var, v),
+                        None => std::env::remove_var(var),
+                    }
+                }
+            }
+        }
+
         #[tokio::test]
         #[serial]
         async fn missing_env_hits_err_arm_without_panic() {
-            for var in [
-                "KHIVE_EMAIL_SMTP_HOST",
-                "KHIVE_EMAIL_IMAP_HOST",
-                "KHIVE_EMAIL_USERNAME",
-                "KHIVE_EMAIL_MAINTAINER_ADDRESS",
-                "KHIVE_EMAIL_AUTHSERV_ID",
-                "KHIVE_EMAIL_PASSWORD",
-                "KHIVE_EMAIL_OAUTH_TENANT_ID",
-                "KHIVE_EMAIL_OAUTH_CLIENT_ID",
-                "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
-            ] {
-                std::env::remove_var(var);
-            }
+            let _env_guard = EmailEnvGuard::clear();
+
+            // Prove the branch the helper depends on is actually taken: with every
+            // KHIVE_EMAIL_* var cleared, EmailChannel::from_env() must fail closed.
+            // Without this, the test below would pass even if from_env() wrongly hit
+            // the Ok arm (it only checks "no panic").
+            assert!(
+                khive_channel_email::EmailChannel::from_env().is_err(),
+                "with KHIVE_EMAIL_* cleared, from_env must fail closed (the Err arm the helper depends on)"
+            );
 
             let config = RuntimeConfig {
                 db_path: None,
