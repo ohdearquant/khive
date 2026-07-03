@@ -1005,9 +1005,23 @@ impl BrainPack {
             }
         }
 
+        // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
+        // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
+        // the fold gate's mass check-and-write (fold_gate.rs) — the `resolve`
+        // check above is a non-atomic fast path only (it still handles the
+        // common sequential case and the NotFound / forced-zero-weight
+        // determination); this is the authoritative correctness mechanism
+        // under concurrent duplicate submissions.
+        let dedup_key: Option<(&str, &str)> =
+            match (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref()) {
+                (Some(r), Some(l)) => Some((r, l)),
+                _ => None,
+            };
+
         // ADR-081 §2: the bounded-mass fold gate applies only to implicit
         // signals. Explicit/correction signals are never gated (they are the
         // clamp's own comparator, ADR-081 §1).
+        let mut deduped_response: Option<Value> = None;
         let gate_stamp: Option<serde_json::Value> =
             if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
                 if matches!(
@@ -1015,36 +1029,55 @@ impl BrainPack {
                     FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative
                 ) {
                     let nominal_weight = event_kind.update_weight();
-                    let (effective_weight, mass_before, mass_after) = if forced_zero_weight {
-                        (0.0, 0.0, 0.0)
+                    if forced_zero_weight {
+                        Some(json!({
+                            "effective_weight": 0.0,
+                            "mass_before": 0.0,
+                            "mass_after": 0.0,
+                            "forced_zero_weight": true,
+                        }))
                     } else {
-                        let outcome = crate::fold_gate::apply_fold_gate(
+                        match crate::fold_gate::apply_fold_gate(
                             sql.as_ref(),
                             token.namespace().as_str(),
                             effective_profile,
                             &target.to_string(),
                             nominal_weight,
                             now_us,
+                            dedup_key,
                         )
-                        .await?;
-                        (
-                            outcome.effective_weight,
-                            outcome.mass_before,
-                            outcome.mass_after,
-                        )
-                    };
-                    Some(json!({
-                        "effective_weight": effective_weight,
-                        "mass_before": mass_before,
-                        "mass_after": mass_after,
-                        "forced_zero_weight": forced_zero_weight,
-                    }))
+                        .await?
+                        {
+                            crate::fold_gate::GateOutcome::Deduped => {
+                                deduped_response = Some(json!({
+                                    "emitted": false,
+                                    "deduped": true,
+                                    "verb": "brain.feedback",
+                                    "signal": signal,
+                                    "target_id": target.to_string(),
+                                    "serve_ledger_id": p.serve_ledger_id,
+                                    "scorer_run_id": p.scorer_run_id,
+                                }));
+                                None
+                            }
+                            crate::fold_gate::GateOutcome::Folded(outcome) => Some(json!({
+                                "effective_weight": outcome.effective_weight,
+                                "mass_before": outcome.mass_before,
+                                "mass_after": outcome.mass_after,
+                                "forced_zero_weight": false,
+                            })),
+                        }
+                    }
                 } else {
                     None
                 }
             } else {
                 None
             };
+
+        if let Some(resp) = deduped_response {
+            return Ok(resp);
+        }
 
         let mut data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {

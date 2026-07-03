@@ -62,3 +62,20 @@ CREATE INDEX IF NOT EXISTS idx_brain_serve_ledger_suppression
 -- brain_implicit_mass accumulator's own primary key.
 CREATE INDEX IF NOT EXISTS idx_brain_serve_ledger_accounting
     ON brain_serve_ledger(accounting_profile_id, namespace, target_id);
+
+-- brain_scorer_dedup: the ADR-081 §2/§6 idempotency claim table. The dedup
+-- key is (scorer_run_id, serve_ledger_id) — one run may legitimately grade
+-- multiple serve rows for the same target, and each row's grade folds as its
+-- own event, but the same (run, row) pair must fold at most once. The fold
+-- gate claims a row here with `INSERT OR IGNORE` inside the same
+-- `BEGIN IMMEDIATE` transaction that checks and writes `brain_implicit_mass`
+-- (fold_gate.rs), so the claim and the fold are atomic together: a
+-- conflicting insert (0 rows affected) means a prior call already claimed
+-- this pair, and the caller must treat this emission as a no-op before
+-- touching mass or appending a feedback event.
+CREATE TABLE IF NOT EXISTS brain_scorer_dedup (
+    scorer_run_id   TEXT NOT NULL,
+    serve_ledger_id TEXT NOT NULL,
+    claimed_at      INTEGER NOT NULL,
+    PRIMARY KEY (scorer_run_id, serve_ledger_id)
+);

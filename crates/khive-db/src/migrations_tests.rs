@@ -425,6 +425,46 @@ fn v6_creates_brain_retune_tables() {
     assert!(is_unique, "idx_brain_serve_ledger_unique must be UNIQUE");
     assert!(index_exists(&conn, "idx_brain_serve_ledger_suppression"));
     assert!(index_exists(&conn, "idx_brain_serve_ledger_accounting"));
+    assert!(
+        table_exists(&conn, "brain_scorer_dedup"),
+        "V6 must create brain_scorer_dedup (ADR-081 §2/§6 dedup claim table)"
+    );
+}
+
+#[test]
+fn v6_scorer_dedup_primary_key_rejects_duplicate() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations");
+    conn.execute(
+        "INSERT INTO brain_scorer_dedup (scorer_run_id, serve_ledger_id, claimed_at) \
+         VALUES ('run-1', 'row-1', 1000)",
+        [],
+    )
+    .expect("first claim");
+    let dup = conn.execute(
+        "INSERT INTO brain_scorer_dedup (scorer_run_id, serve_ledger_id, claimed_at) \
+         VALUES ('run-1', 'row-1', 2000)",
+        [],
+    );
+    assert!(
+        dup.is_err(),
+        "duplicate (scorer_run_id, serve_ledger_id) must be rejected by the primary key"
+    );
+    // A different scorer_run_id grading the same row, or the same run grading
+    // a different row, must both be legal (ADR-081 §2: one run may legitimately
+    // grade multiple serve rows for the same target).
+    conn.execute(
+        "INSERT INTO brain_scorer_dedup (scorer_run_id, serve_ledger_id, claimed_at) \
+         VALUES ('run-2', 'row-1', 3000)",
+        [],
+    )
+    .expect("different scorer_run_id, same row must be legal");
+    conn.execute(
+        "INSERT INTO brain_scorer_dedup (scorer_run_id, serve_ledger_id, claimed_at) \
+         VALUES ('run-1', 'row-2', 4000)",
+        [],
+    )
+    .expect("same scorer_run_id, different row must be legal");
 }
 
 #[test]

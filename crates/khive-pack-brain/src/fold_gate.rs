@@ -52,6 +52,21 @@
 //! and the `INSERT`, reading only the row already fetched on the held connection
 //! — so no other writer can observe or mutate that row between the read and the
 //! write.
+//!
+//! Scorer dedup (ADR-081 §2/§6): a scorer-tagged event additionally claims a
+//! `(scorer_run_id, serve_ledger_id)` key in `brain_scorer_dedup` via
+//! `INSERT OR IGNORE`, inside the SAME held `BEGIN IMMEDIATE` transaction as
+//! the mass check-and-fold. A conflicting insert (0 rows affected) means a
+//! prior call already claimed this exact pair, and this call returns
+//! `GateOutcome::Deduped` before touching `brain_implicit_mass` at all — the
+//! claim and the fold commit or roll back together, so a crash between them
+//! cannot leave a claimed-but-never-folded key. Reading the ledger row's
+//! `scorer_run_id` column first (as `serve_ledger::resolve` does) cannot
+//! provide this guarantee: two concurrent duplicate submissions both observe
+//! the pre-backfill NULL and both pass, since the column is only backfilled
+//! after the fold completes (`backfill_grade`, called from `handlers.rs`
+//! after event append) — that check is a useful non-atomic fast path, not a
+//! correctness mechanism.
 use khive_runtime::RuntimeError;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
@@ -109,16 +124,34 @@ pub struct FoldGateOutcome {
     pub mass_after: f64,
 }
 
+/// Outcome of `apply_fold_gate` when a `dedup_key` is supplied.
+pub enum GateOutcome {
+    /// The `(scorer_run_id, serve_ledger_id)` pair was already claimed by a
+    /// prior call (ADR-081 §2/§6 idempotent replay). Neither
+    /// `brain_implicit_mass` nor the event log were touched by this call —
+    /// the caller must treat this emission as a no-op.
+    Deduped,
+    /// The dedup claim (if any) succeeded, or no `dedup_key` was supplied, and
+    /// the mass check-and-fold ran.
+    Folded(FoldGateOutcome),
+}
+
 /// Apply the ADR-081 §2 bounded-mass fold gate for one implicit feedback event.
 ///
 /// `profile_id`/`namespace`/`target_id` form the accounting key. `weight` is the
 /// nominal implicit weight (`FeedbackEventKind::update_weight()`, ADR-081 §1 —
 /// currently `0.1`). `now_us` is the event's timestamp.
 ///
-/// The mass check and the fold write happen inside one `BEGIN IMMEDIATE`
-/// transaction held on a single `SqlWriter` connection (module doc above), so a
-/// concurrent caller — another daemon process, on the same file-backed database
-/// — cannot observe the pre-fold mass and race the write.
+/// `dedup_key`, when supplied, is `(scorer_run_id, serve_ledger_id)` (ADR-081
+/// §2/§6): claimed atomically, inside the same transaction as the mass
+/// check-and-fold, before either runs. `None` means ordinary non-scorer
+/// implicit feedback — no dedup, folds unconditionally subject to the clamp.
+///
+/// The dedup claim, the mass check, and the fold write happen inside one
+/// `BEGIN IMMEDIATE` transaction held on a single `SqlWriter` connection
+/// (module doc above), so a concurrent caller — another daemon process, on
+/// the same file-backed database — cannot observe the pre-claim/pre-fold
+/// state and race the write.
 pub async fn apply_fold_gate(
     sql: &dyn SqlAccess,
     namespace: &str,
@@ -126,30 +159,40 @@ pub async fn apply_fold_gate(
     target_id: &str,
     weight: f64,
     now_us: i64,
-) -> Result<FoldGateOutcome, RuntimeError> {
+    dedup_key: Option<(&str, &str)>,
+) -> Result<GateOutcome, RuntimeError> {
     let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
 
     exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
         .await
         .map_err(|e| sql_err("begin", e))?;
 
-    let result = fold_within_tx(
+    let result = apply_gate_within_tx(
         writer.as_mut(),
         namespace,
         profile_id,
         target_id,
         weight,
         now_us,
+        dedup_key,
     )
     .await;
 
     match result {
-        Ok(outcome) => {
-            exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit")
-                .await
-                .map_err(|e| sql_err("commit", e))?;
-            Ok(outcome)
-        }
+        Ok(outcome) => match exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit").await {
+            Ok(()) => Ok(outcome),
+            Err(e) => {
+                // Finding 3 (codex round 1): a failed COMMIT must not skip the
+                // rollback. The connection is dropped either way on a
+                // file-backed pool, but an explicit ROLLBACK avoids leaving a
+                // held write lock if the connection is pooled/reused
+                // (in-memory backend) — matching the error-path behavior
+                // below, so every early return rolls back, not just the
+                // fold-body error path.
+                let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
+                Err(sql_err("commit", e))
+            }
+        },
         Err(e) => {
             // Best-effort: the connection is dropped either way, but an explicit
             // ROLLBACK avoids leaving a held write lock if the connection is
@@ -158,6 +201,58 @@ pub async fn apply_fold_gate(
             Err(e)
         }
     }
+}
+
+/// Run the dedup claim (if any) followed by the mass `SELECT` + decision +
+/// `INSERT ... ON CONFLICT ... DO UPDATE` on `writer`, which must already be
+/// inside an open transaction. Does not commit or roll back — the caller owns
+/// transaction boundaries.
+async fn apply_gate_within_tx(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    profile_id: &str,
+    target_id: &str,
+    weight: f64,
+    now_us: i64,
+    dedup_key: Option<(&str, &str)>,
+) -> Result<GateOutcome, RuntimeError> {
+    if let Some((scorer_run_id, serve_ledger_id)) = dedup_key {
+        let claimed = claim_dedup_within_tx(writer, scorer_run_id, serve_ledger_id, now_us).await?;
+        if !claimed {
+            return Ok(GateOutcome::Deduped);
+        }
+    }
+    let outcome = fold_within_tx(writer, namespace, profile_id, target_id, weight, now_us).await?;
+    Ok(GateOutcome::Folded(outcome))
+}
+
+/// Atomically claim `(scorer_run_id, serve_ledger_id)` in `brain_scorer_dedup`
+/// via `INSERT OR IGNORE`, on `writer`, which must already be inside an open
+/// transaction. Returns `true` if this call claimed the key (first time
+/// seen), `false` if a prior call already holds it (0 rows affected — the
+/// primary key rejected the conflicting insert).
+async fn claim_dedup_within_tx(
+    writer: &mut dyn SqlWriter,
+    scorer_run_id: &str,
+    serve_ledger_id: &str,
+    now_us: i64,
+) -> Result<bool, RuntimeError> {
+    let rows_affected = writer
+        .execute(SqlStatement {
+            sql: "INSERT OR IGNORE INTO brain_scorer_dedup \
+                  (scorer_run_id, serve_ledger_id, claimed_at) \
+                  VALUES (?1, ?2, ?3)"
+                .into(),
+            params: vec![
+                SqlValue::Text(scorer_run_id.to_string()),
+                SqlValue::Text(serve_ledger_id.to_string()),
+                SqlValue::Integer(now_us),
+            ],
+            label: Some("brain_scorer_dedup_claim".into()),
+        })
+        .await
+        .map_err(|e| sql_err("claim scorer dedup", e))?;
+    Ok(rows_affected > 0)
 }
 
 /// Run the mass `SELECT` + decision + `INSERT ... ON CONFLICT ... DO UPDATE` on
@@ -205,6 +300,18 @@ async fn fold_within_tx(
     let mass_before = decayed_mass(old_mass, now_us - last_event_at);
     let (effective_weight, mass_after) = gate_decision(mass_before, weight, IMPLICIT_MASS_CAP);
 
+    // Finding 2 (codex round 1): never move `last_event_at` backwards. A
+    // negative `delta_us` above (clock skew) already keeps `mass_before`
+    // undecayed and the event clamps/folds conservatively, but persisting
+    // `now_us` verbatim would still drag the accumulator's clock back to the
+    // skewed caller's earlier time — so the *next* event, even one from a
+    // correctly-clocked caller arriving before the original future
+    // `last_event_at`, would see the row as older than it is and decay mass
+    // that should still be at full weight, letting it pass the clamp early.
+    // Persisting `max(last_event_at, now_us)` keeps the accumulator's clock
+    // monotonic regardless of how skewed an individual writer's `now_us` is.
+    let persisted_last_event_at = last_event_at.max(now_us);
+
     writer
         .execute(SqlStatement {
             sql: "INSERT INTO brain_implicit_mass \
@@ -220,7 +327,7 @@ async fn fold_within_tx(
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(target_id.to_string()),
                 SqlValue::Float(mass_after),
-                SqlValue::Integer(now_us),
+                SqlValue::Integer(persisted_last_event_at),
                 SqlValue::Float(effective_weight),
             ],
             label: Some("brain_implicit_mass_upsert".into()),
@@ -367,16 +474,23 @@ mod tests {
         for _ in 0..N {
             let sql = Arc::clone(&sql);
             handles.push(tokio::spawn(async move {
-                apply_fold_gate(
+                let outcome = apply_fold_gate(
                     sql.as_ref(),
                     "local",
                     "concurrency-profile",
                     "concurrency-target",
                     WEIGHT,
                     now_us,
+                    None,
                 )
                 .await
-                .expect("apply_fold_gate must not error under concurrent access")
+                .expect("apply_fold_gate must not error under concurrent access");
+                match outcome {
+                    GateOutcome::Folded(outcome) => outcome,
+                    GateOutcome::Deduped => {
+                        panic!("no dedup_key was supplied; must never dedup")
+                    }
+                }
             }));
         }
 
@@ -427,5 +541,293 @@ mod tests {
             (persisted_mass - 15.0 * WEIGHT).abs() < 1e-6,
             "persisted mass must equal 15*{WEIGHT}, got {persisted_mass}"
         );
+    }
+
+    /// Shared setup for the file-backed concurrency/skew tests below: only a
+    /// real file-backed pool opens a standalone `rusqlite::Connection` per
+    /// `writer()` call (module doc above) — the property production needs
+    /// and the in-memory pool cannot exercise.
+    fn file_backed_runtime(db_name: &str) -> (khive_runtime::KhiveRuntime, tempfile::TempDir) {
+        use khive_runtime::{BackendId, KhiveRuntime, Namespace, RuntimeConfig};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("file-backed runtime");
+        (rt, dir)
+    }
+
+    /// Proves the Finding-1 fix (codex round 1): concurrent duplicate scorer
+    /// submissions — identical `(scorer_run_id, serve_ledger_id)` — fold
+    /// exactly once, regardless of scheduling order.
+    ///
+    /// Mirrors `fold_gate_concurrent_writers_never_exceed_cap`'s shape (real
+    /// file-backed runtime, standalone writer connections per task, no
+    /// artificial time separation) but targets the dedup claim rather than
+    /// the mass cap: `N` concurrent tasks call `apply_fold_gate` with the
+    /// SAME dedup key. Before the fix, the dedup check
+    /// (`serve_ledger::resolve`, reading the ledger row's `scorer_run_id`
+    /// column) ran outside any transaction the fold gate holds, so every
+    /// concurrent caller could observe "not yet graded" and all `N` would
+    /// fold. With the fix, the claim on `brain_scorer_dedup` and the fold
+    /// share one `BEGIN IMMEDIATE` transaction, so SQLite's own primary-key
+    /// enforcement under the held write lock allows exactly one claim to
+    /// succeed.
+    #[tokio::test]
+    async fn fold_gate_concurrent_duplicate_scorer_submissions_fold_once() {
+        use std::sync::Arc;
+
+        let (rt, _dir) = file_backed_runtime("fold-gate-dedup-concurrency.db");
+        let sql = rt.sql();
+        const N: usize = 30;
+        const WEIGHT: f64 = 0.1;
+        let now_us: i64 = 1_700_000_000_000_000;
+        let scorer_run_id = "dup-scorer-run";
+        let serve_ledger_id = "dup-serve-ledger-row";
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let sql = Arc::clone(&sql);
+            handles.push(tokio::spawn(async move {
+                apply_fold_gate(
+                    sql.as_ref(),
+                    "local",
+                    "dedup-profile",
+                    "dedup-target",
+                    WEIGHT,
+                    now_us,
+                    Some((scorer_run_id, serve_ledger_id)),
+                )
+                .await
+                .expect("apply_fold_gate must not error under concurrent access")
+            }));
+        }
+
+        let mut folded_count = 0;
+        let mut deduped_count = 0;
+        let mut sum = 0.0;
+        for h in handles {
+            match h.await.expect("fold gate task must not panic") {
+                GateOutcome::Folded(outcome) => {
+                    folded_count += 1;
+                    sum += outcome.effective_weight;
+                }
+                GateOutcome::Deduped => deduped_count += 1,
+            }
+        }
+
+        assert_eq!(
+            folded_count, 1,
+            "exactly one of {N} concurrent identical (scorer_run_id, serve_ledger_id) \
+             submissions must fold; got {folded_count} folded, {deduped_count} deduped"
+        );
+        assert_eq!(deduped_count, N - 1);
+        assert!(
+            (sum - WEIGHT).abs() < 1e-9,
+            "the one folded event must move the posterior by exactly {WEIGHT}, got {sum}"
+        );
+
+        // The persisted mass must reflect exactly one fold — proving the
+        // claim and the fold committed together, not that N races happened
+        // to net out to the same total.
+        let mut reader = sql.reader().await.expect("reader");
+        let row = khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT mass FROM brain_implicit_mass \
+                      WHERE profile_id = 'dedup-profile' AND namespace = 'local' \
+                      AND target_id = 'dedup-target'"
+                    .into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await
+        .expect("read persisted mass")
+        .expect("accumulator row must exist after the one successful fold");
+        let persisted_mass = match row.get("mass") {
+            Some(SqlValue::Float(v)) => *v,
+            Some(SqlValue::Integer(v)) => *v as f64,
+            other => panic!("unexpected mass column value: {other:?}"),
+        };
+        assert!(
+            (persisted_mass - WEIGHT).abs() < 1e-9,
+            "persisted mass must equal {WEIGHT} (one fold only), got {persisted_mass}"
+        );
+
+        // Exactly one row claimed the dedup key.
+        let claim_count: i64 = match khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) AS n FROM brain_scorer_dedup \
+                      WHERE scorer_run_id = ?1 AND serve_ledger_id = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(scorer_run_id.to_string()),
+                    SqlValue::Text(serve_ledger_id.to_string()),
+                ],
+                label: None,
+            },
+        )
+        .await
+        .expect("read claim count")
+        .expect("count row must exist")
+        .get("n")
+        {
+            Some(SqlValue::Integer(v)) => *v,
+            other => panic!("unexpected count column value: {other:?}"),
+        };
+        assert_eq!(
+            claim_count, 1,
+            "the primary key must admit exactly one claim row for this dedup key"
+        );
+    }
+
+    /// Proves the Finding-2 fix (codex round 1): a negative-clock-skew event
+    /// must never drag the accumulator's `last_event_at` backwards, or a
+    /// later, correctly-ordered event would decay mass that should still be
+    /// at full weight and pass the clamp early.
+    ///
+    /// Reproduces the exact scenario from the review: a fast-clock daemon has
+    /// already written `mass=1.5` (at cap) with `last_event_at = t+7d`. A
+    /// slow-clock daemon emits an event at `t` (`now_us < last_event_at`,
+    /// negative delta): `decayed_mass` correctly returns the mass undecayed,
+    /// so the event clamps (mass already at cap) rather than amplifying —
+    /// but before the fix, persisting `last_event_at = now_us` verbatim would
+    /// still drag the row's clock back to `t`. A second, later event at
+    /// `t+1d` (still `< t+7d`, so still legitimately in "the future" from
+    /// that first future write's perspective) must ALSO clamp — under the
+    /// bug, it would instead see the row as one day old, decay 1.5 toward
+    /// ~1.357, and let `+0.1` pass, breaching the ADR-081 §2 invariant.
+    #[tokio::test]
+    async fn fold_gate_negative_clock_skew_never_moves_last_event_at_backwards() {
+        let (rt, _dir) = file_backed_runtime("fold-gate-clock-skew.db");
+        let sql = rt.sql();
+
+        let namespace = "local";
+        let profile_id = "clock-skew-profile";
+        let target_id = "clock-skew-target";
+
+        let slow_now_us: i64 = 1_700_000_000_000_000; // "t"
+        let future_last_event_at = slow_now_us + IMPLICIT_MASS_HALF_LIFE_US as i64; // "t+7d"
+
+        // Seed the row as a fast-clock daemon would have left it: at the cap,
+        // stamped with a `last_event_at` seven days ahead of the slow
+        // daemon's clock.
+        {
+            let mut writer = sql.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO brain_implicit_mass \
+                          (profile_id, namespace, target_id, mass, last_event_at, \
+                           last_effective_weight) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(profile_id.to_string()),
+                        SqlValue::Text(namespace.to_string()),
+                        SqlValue::Text(target_id.to_string()),
+                        SqlValue::Float(IMPLICIT_MASS_CAP),
+                        SqlValue::Integer(future_last_event_at),
+                        SqlValue::Float(0.1),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("seed future row");
+        }
+
+        // The slow-clock daemon's skewed event: now_us < last_event_at.
+        let outcome = apply_fold_gate(
+            sql.as_ref(),
+            namespace,
+            profile_id,
+            target_id,
+            0.1,
+            slow_now_us,
+            None,
+        )
+        .await
+        .expect("apply_fold_gate must not error");
+        let GateOutcome::Folded(outcome) = outcome else {
+            panic!("no dedup_key was supplied; must never dedup");
+        };
+        assert_eq!(
+            outcome.effective_weight, 0.0,
+            "skewed event at an already-capped mass must clamp, not amplify"
+        );
+        assert!((outcome.mass_after - IMPLICIT_MASS_CAP).abs() < 1e-9);
+
+        // THE FIX: `last_event_at` persisted after the skewed event must
+        // still be the future timestamp, not `slow_now_us`.
+        let persisted_last_event_at = {
+            let mut reader = sql.reader().await.expect("reader");
+            let row = khive_storage::SqlReader::query_row(
+                reader.as_mut(),
+                SqlStatement {
+                    sql: "SELECT last_event_at FROM brain_implicit_mass \
+                          WHERE profile_id = ?1 AND namespace = ?2 AND target_id = ?3"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(profile_id.to_string()),
+                        SqlValue::Text(namespace.to_string()),
+                        SqlValue::Text(target_id.to_string()),
+                    ],
+                    label: None,
+                },
+            )
+            .await
+            .expect("read last_event_at")
+            .expect("row must still exist");
+            match row.get("last_event_at") {
+                Some(SqlValue::Integer(v)) => *v,
+                other => panic!("unexpected last_event_at column value: {other:?}"),
+            }
+        };
+        assert_eq!(
+            persisted_last_event_at, future_last_event_at,
+            "last_event_at must never move backwards under clock skew"
+        );
+
+        // A later event, still before the future last_event_at, must ALSO
+        // clamp — the bug this reproduces would instead let it pass because
+        // the row's clock had been dragged back to slow_now_us.
+        let one_day_us: i64 = 24 * 3600 * 1_000_000;
+        let later_now_us = slow_now_us + one_day_us; // "t+1d", still < "t+7d"
+        assert!(later_now_us < future_last_event_at);
+
+        let outcome2 = apply_fold_gate(
+            sql.as_ref(),
+            namespace,
+            profile_id,
+            target_id,
+            0.1,
+            later_now_us,
+            None,
+        )
+        .await
+        .expect("apply_fold_gate must not error");
+        let GateOutcome::Folded(outcome2) = outcome2 else {
+            panic!("no dedup_key was supplied; must never dedup");
+        };
+        assert_eq!(
+            outcome2.effective_weight, 0.0,
+            "later pre-future event must still clamp; the fix must prevent the mass from \
+             decaying as if the row's clock had been dragged back to t"
+        );
+        assert!((outcome2.mass_after - IMPLICIT_MASS_CAP).abs() < 1e-9);
     }
 }
