@@ -397,6 +397,10 @@ fn v6_creates_brain_retune_tables() {
         "V6 must create brain_implicit_mass"
     );
     assert!(
+        column_exists(&conn, "brain_implicit_mass", "last_effective_weight"),
+        "V6 must add last_effective_weight to brain_implicit_mass"
+    );
+    assert!(
         table_exists(&conn, "brain_serve_ledger"),
         "V6 must create brain_serve_ledger"
     );
@@ -524,30 +528,37 @@ fn v6_implicit_mass_upsert_on_conflict() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations");
     conn.execute(
-        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at) \
-         VALUES ('p1', 'local', 't1', 0.1, 1000) \
+        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at, last_effective_weight) \
+         VALUES ('p1', 'local', 't1', 0.1, 1000, 0.1) \
          ON CONFLICT(profile_id, namespace, target_id) \
-         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at",
+         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at, \
+                       last_effective_weight = excluded.last_effective_weight",
         [],
     )
     .expect("first insert");
     conn.execute(
-        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at) \
-         VALUES ('p1', 'local', 't1', 0.2, 2000) \
+        "INSERT INTO brain_implicit_mass (profile_id, namespace, target_id, mass, last_event_at, last_effective_weight) \
+         VALUES ('p1', 'local', 't1', 0.2, 2000, 0.0) \
          ON CONFLICT(profile_id, namespace, target_id) \
-         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at",
+         DO UPDATE SET mass = excluded.mass, last_event_at = excluded.last_event_at, \
+                       last_effective_weight = excluded.last_effective_weight",
         [],
     )
     .expect("conflicting upsert");
-    let (mass, last_event_at): (f64, i64) = conn
+    let (mass, last_event_at, last_effective_weight): (f64, i64, f64) = conn
         .query_row(
-            "SELECT mass, last_event_at FROM brain_implicit_mass WHERE profile_id='p1' AND namespace='local' AND target_id='t1'",
+            "SELECT mass, last_event_at, last_effective_weight FROM brain_implicit_mass \
+             WHERE profile_id='p1' AND namespace='local' AND target_id='t1'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read row");
     assert_eq!(mass, 0.2);
     assert_eq!(last_event_at, 2000);
+    assert_eq!(
+        last_effective_weight, 0.0,
+        "last_effective_weight must reflect the second (conflicting) upsert's value"
+    );
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM brain_implicit_mass WHERE profile_id='p1' AND namespace='local' AND target_id='t1'",

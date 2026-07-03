@@ -3,14 +3,22 @@
 --
 -- brain_implicit_mass: per-accounting-key (profile_id, namespace, target_id)
 -- decayed implicit feedback mass accumulator (ADR-081 §2). One row per key;
--- read-decayed-written by the fold gate on each implicit feedback event so the
--- decayed mass is not re-derived from the full brain_event_log on every fold.
+-- read-decayed-written by the fold gate, inside one BEGIN IMMEDIATE
+-- transaction per event, so the decayed mass is not re-derived from the full
+-- brain_event_log on every fold.
+--
+-- last_effective_weight is the weight the most recent event at this key
+-- actually folded (0 or the nominal implicit weight) — an audit/observability
+-- column distinct from mass (whose value alone cannot disambiguate a passed
+-- event from a clamped one: both a fold and a clamp can leave mass at or
+-- below the cap).
 CREATE TABLE IF NOT EXISTS brain_implicit_mass (
-    profile_id    TEXT NOT NULL,
-    namespace     TEXT NOT NULL DEFAULT 'default',
-    target_id     TEXT NOT NULL,
-    mass          REAL NOT NULL,
-    last_event_at INTEGER NOT NULL,
+    profile_id            TEXT NOT NULL,
+    namespace             TEXT NOT NULL DEFAULT 'default',
+    target_id             TEXT NOT NULL,
+    mass                  REAL NOT NULL,
+    last_event_at         INTEGER NOT NULL,
+    last_effective_weight REAL NOT NULL DEFAULT 0.0,
     PRIMARY KEY (profile_id, namespace, target_id)
 );
 

@@ -32,6 +32,7 @@ lattice-router = ["dep:lattice-fann"]
 tokio = { workspace = true, features = ["test-util"] }
 khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "brain_pack_bench"
