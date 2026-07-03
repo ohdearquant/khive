@@ -1016,3 +1016,46 @@ fn load_or_build_rebuilds_when_v2_commit_config_invalid() {
     assert_eq!(loaded.config(), &fallback);
     assert_eq!(loaded.num_vectors(), vectors.len() / dim);
 }
+
+// ---- Issue #435: v2 lifecycle parser must reject tombstone bits past num_vectors ----
+
+/// Regression: parse_lifecycle resized the tombstone bitvec up to `needed_words` when it was
+/// too short but never rejected (or masked) extra set bits at or beyond `num_vectors` when the
+/// persisted word count already covered `needed_words`. Those out-of-range set bits were
+/// counted into `tombstone_count` and silently treated as tombstoned nodes past the valid
+/// node-id domain. With the fix, `parse_lifecycle` rejects tombstone bits set beyond
+/// `num_vectors` with `InvalidFormat` instead of accepting the corrupt state.
+#[test]
+fn v2_parse_lifecycle_rejects_tombstone_bits_past_num_vectors_not_panic() {
+    let dim = 4usize;
+    let n = 9usize;
+    let vectors = rand_unit_vectors(n, dim, 0xA6_35);
+    let cfg = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    idx.save_atomic(dir.path()).unwrap();
+
+    let mut lifecycle_body = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+    assert_eq!(&lifecycle_body[..8], b"KHVVLIF1");
+    assert_eq!(
+        u64::from_le_bytes(lifecycle_body[8..16].try_into().unwrap()),
+        1
+    );
+    // For num_vectors = 9, valid tombstone bits are 0..=8; this word sets only bits 9..=63.
+    lifecycle_body[16..24].copy_from_slice(&0xffff_ffff_ffff_fe00u64.to_le_bytes());
+    install_corrupt_lifecycle(dir.path(), &lifecycle_body);
+
+    let load_result = std::panic::catch_unwind(|| VamanaIndex::load(dir.path()));
+    assert!(matches!(
+        load_result,
+        Ok(Err(VamanaError::InvalidFormat { .. }))
+    ));
+
+    let fallback = VamanaConfig::with_dimensions(dim)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let rebuilt = VamanaIndex::load_or_build(dir.path(), &vectors, fallback).unwrap();
+    assert_eq!(rebuilt.num_vectors(), n);
+}
