@@ -1,7 +1,7 @@
 //! Idempotent file tail + upsert into the session mirror tables.
 //!
 //! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`,
-//! parses complete lines using the parser selected by `MirrorSource`, and writes
+//! parses complete lines using the parser selected by `LineTailSource`, and writes
 //! them to the session mirror tables in a single transaction.  It is safe to call
 //! repeatedly on the same file; `INSERT OR IGNORE` keyed by the event UUID ensures
 //! idempotency.
@@ -16,22 +16,22 @@ use khive_storage::SqlTransaction;
 
 use super::parse;
 
-/// The `sessions.source` value written by [`mirror_chatgpt_export_file`].
+/// The full ADR-080 mirror-source contract — the closed set of sources
+/// `sessions.source` can hold (`docs/adr/ADR-080-session-pack-oss-storage-mechanism.md`,
+/// "Mirror sources — closed set"). Adding a source requires amending that ADR
+/// section and this enum together.
 ///
-/// Not a `MirrorSource` variant: ChatGPT export ingestion is whole-file, not
-/// line-tail, so it does not share `mirror_file`'s per-line dispatch and does
-/// not need a place in that closed enum.
-const CHATGPT_EXPORT_SOURCE: &str = "chatgpt_export";
-
-/// Identifies which CLI produced the JSONL file being mirrored.
-///
-/// The value is written to `sessions.source` and selects the line parser.
+/// This is a superset of [`LineTailSource`]: `ChatGptExport` ingests via
+/// whole-file re-parse (`mirror_chatgpt_export_file`), not the per-line
+/// dispatch `LineTailSource` selects, so it has no `LineTailSource` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
     ClaudeCode,
     /// Codex CLI (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`).
     Codex,
+    /// ChatGPT data export (`<exports dir>/**/conversations.json`).
+    ChatGptExport,
 }
 
 impl MirrorSource {
@@ -40,8 +40,33 @@ impl MirrorSource {
         match self {
             MirrorSource::ClaudeCode => "claude_code",
             MirrorSource::Codex => "codex",
+            MirrorSource::ChatGptExport => "chatgpt_export",
         }
     }
+}
+
+impl From<LineTailSource> for MirrorSource {
+    fn from(source: LineTailSource) -> Self {
+        match source {
+            LineTailSource::ClaudeCode => MirrorSource::ClaudeCode,
+            LineTailSource::Codex => MirrorSource::Codex,
+        }
+    }
+}
+
+/// Identifies which CLI produced the JSONL file being mirrored, for the
+/// purpose of selecting `mirror_file`'s per-line parser.
+///
+/// This is narrower than [`MirrorSource`]: it covers only the line-tail
+/// sources (append-only JSONL, tailed by byte offset). ChatGPT export
+/// ingestion is whole-file re-parse, not line-tail, so it has no variant
+/// here — see [`mirror_chatgpt_export_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineTailSource {
+    /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
+    ClaudeCode,
+    /// Codex CLI (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`).
+    Codex,
 }
 
 /// Statistics returned by a single `mirror_file` call.
@@ -59,10 +84,10 @@ pub struct MirrorStats {
 /// using the parser selected by `source`, and upsert them idempotently into the
 /// session mirror tables.
 ///
-/// For `MirrorSource::Codex`, `codex_session_id` must be the session UUID
+/// For `LineTailSource::Codex`, `codex_session_id` must be the session UUID
 /// derived from the filename; it is used both to key the `sessions` row and to
 /// synthesise per-line event UUIDs (`"{session_id}:{abs_byte_offset}"`).
-/// For `MirrorSource::ClaudeCode`, `codex_session_id` is ignored (the session
+/// For `LineTailSource::ClaudeCode`, `codex_session_id` is ignored (the session
 /// UUID is embedded in each line).
 ///
 /// Returns stats including the advanced byte offset.  A partial trailing line
@@ -76,7 +101,7 @@ pub async fn mirror_file(
     runtime: &KhiveRuntime,
     path: &Path,
     start_offset: u64,
-    source: MirrorSource,
+    source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
     // ── read new bytes ────────────────────────────────────────────────────────
@@ -128,12 +153,12 @@ pub async fn mirror_file(
     // the synthesised event UUID is stable across re-tails.  Compute line
     // boundaries once, then iterate with offsets.
     let events: Vec<parse::ParsedEvent> = match source {
-        MirrorSource::ClaudeCode => complete_content
+        LineTailSource::ClaudeCode => complete_content
             .split('\n')
             .filter(|l| !l.is_empty())
             .filter_map(parse::parse_cc_line)
             .collect(),
-        MirrorSource::Codex => {
+        LineTailSource::Codex => {
             let sid = codex_session_id.unwrap_or("");
             let mut line_start: u64 = start_offset;
             let mut evs = Vec::new();
@@ -168,7 +193,15 @@ pub async fn mirror_file(
 
     // ── write in one transaction ──────────────────────────────────────────────
 
-    write_events_and_cursor(runtime, path, source.as_str(), &events, scanned, new_offset).await
+    write_events_and_cursor(
+        runtime,
+        path,
+        MirrorSource::from(source).as_str(),
+        &events,
+        scanned,
+        new_offset,
+    )
+    .await
 }
 
 /// Read the whole ChatGPT export `conversations.json` at `path`, parse every
@@ -220,7 +253,7 @@ pub async fn mirror_chatgpt_export_file(
     write_events_and_cursor(
         runtime,
         path,
-        CHATGPT_EXPORT_SOURCE,
+        MirrorSource::ChatGptExport.as_str(),
         &events,
         scanned,
         file_len,
@@ -649,7 +682,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First call: should insert all 3 rows.
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file first call");
         assert_eq!(stats.inserted, 3, "should insert 3 new messages");
@@ -663,16 +696,22 @@ mod tests {
         assert_eq!(session_count, 1, "1 session row");
 
         // Idempotency: second call over the SAME range inserts 0 rows.
-        let stats2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file second call");
         assert_eq!(stats2.inserted, 0, "second pass must insert 0 rows");
         assert_eq!(count_rows(&rt, "session_messages").await, 3);
 
         // Offset-aware: calling from the advanced offset finds nothing new.
-        let stats3 = mirror_file(&rt, &path, stats.new_offset, MirrorSource::ClaudeCode, None)
-            .await
-            .expect("mirror_file from new_offset");
+        let stats3 = mirror_file(
+            &rt,
+            &path,
+            stats.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("mirror_file from new_offset");
         assert_eq!(stats3.inserted, 0, "no new data past advanced offset");
         assert_eq!(stats3.new_offset, stats.new_offset);
 
@@ -697,7 +736,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let full_len = std::fs::metadata(&path).unwrap().len();
 
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .expect("mirror_file partial");
 
@@ -710,9 +749,15 @@ mod tests {
         );
 
         // The partial bytes remain; calling again from new_offset finds no complete lines.
-        let stats2 = mirror_file(&rt, &path, stats.new_offset, MirrorSource::ClaudeCode, None)
-            .await
-            .expect("second call");
+        let stats2 = mirror_file(
+            &rt,
+            &path,
+            stats.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("second call");
         assert_eq!(
             stats2.inserted, 0,
             "partial line must not be consumed on re-poll"
@@ -735,7 +780,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First call inserts.
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -744,14 +789,14 @@ mod tests {
         writeln!(file, "{line}").unwrap();
 
         // Second call from offset 0 should see both lines but insert 0 new rows.
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "duplicate uuid must not be re-inserted");
         assert_eq!(count_rows(&rt, "session_messages").await, 1);
 
         // Incremental: call from first call's new_offset; the second line is the dup.
-        let s3 = mirror_file(&rt, &path, s1.new_offset, MirrorSource::ClaudeCode, None)
+        let s3 = mirror_file(&rt, &path, s1.new_offset, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s3.inserted, 0, "incremental dup must also insert 0");
@@ -770,7 +815,7 @@ mod tests {
         writeln!(file, "{line}").unwrap();
         let path = file.path().to_path_buf();
 
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -780,7 +825,7 @@ mod tests {
 
         // Replay from offset 0: re-scans the same line, inserts 0, and must
         // leave last_seen_at byte-identical even though now_us has advanced.
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "replay must insert 0 rows");
@@ -798,7 +843,7 @@ mod tests {
         let file = NamedTempFile::new().expect("tmpfile");
         let path = file.path().to_path_buf();
 
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::ClaudeCode, None)
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 0);
@@ -810,7 +855,7 @@ mod tests {
     async fn test_missing_file_returns_error() {
         let (rt, _dir) = setup().await;
         let bad_path = std::path::PathBuf::from("/nonexistent/path/session.jsonl");
-        let result = mirror_file(&rt, &bad_path, 0, MirrorSource::ClaudeCode, None).await;
+        let result = mirror_file(&rt, &bad_path, 0, LineTailSource::ClaudeCode, None).await;
         assert!(
             matches!(result, Err(RuntimeError::Internal(_))),
             "missing file should return Internal error"
@@ -864,7 +909,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // Mirror the file as Codex source.
-        let stats = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .expect("codex mirror_file");
 
@@ -949,7 +994,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         // First pass.
-        let s1 = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let s1 = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .unwrap();
         assert_eq!(s1.inserted, 1);
@@ -978,7 +1023,7 @@ mod tests {
         );
 
         // Second pass from offset 0: same lines, 0 new rows (idempotent).
-        let s2 = mirror_file(&rt, &path, 0, MirrorSource::Codex, Some(session_id))
+        let s2 = mirror_file(&rt, &path, 0, LineTailSource::Codex, Some(session_id))
             .await
             .unwrap();
         assert_eq!(s2.inserted, 0, "second pass must be idempotent");
@@ -989,7 +1034,7 @@ mod tests {
             &rt,
             &path,
             s1.new_offset,
-            MirrorSource::Codex,
+            LineTailSource::Codex,
             Some(session_id),
         )
         .await
@@ -1011,7 +1056,7 @@ mod tests {
         let mut cdx_file = NamedTempFile::new().expect("cdx tmpfile");
         writeln!(cdx_file, "{cdx_msg}").unwrap();
 
-        mirror_file(&rt, cc_file.path(), 0, MirrorSource::ClaudeCode, None)
+        mirror_file(&rt, cc_file.path(), 0, LineTailSource::ClaudeCode, None)
             .await
             .unwrap();
 
@@ -1019,7 +1064,7 @@ mod tests {
             &rt,
             cdx_file.path(),
             0,
-            MirrorSource::Codex,
+            LineTailSource::Codex,
             Some(cdx_session_id),
         )
         .await

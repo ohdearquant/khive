@@ -18,17 +18,18 @@ use std::time::Duration;
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::ingest::{self, MirrorSource};
+use super::ingest::{self, LineTailSource};
 
 /// How a discovered file should be ingested.
 ///
-/// `ChatGptExport` is deliberately not a `MirrorSource` variant: ChatGPT
-/// export ingestion is whole-file (`mirror_chatgpt_export_file`), not
-/// line-tail, so it does not belong in that closed line-tail dispatch enum.
+/// `ChatGptExport` is a `MirrorSource` variant (ADR-080's closed mirror-source
+/// set) but deliberately not a `LineTailSource` variant: ChatGPT export
+/// ingestion is whole-file (`mirror_chatgpt_export_file`), not line-tail, so
+/// it does not belong in that narrower per-line dispatch enum.
 enum DiscoveredKind {
     LineTail {
-        source: MirrorSource,
-        /// Set for `MirrorSource::Codex`; `None` for `MirrorSource::ClaudeCode`.
+        source: LineTailSource,
+        /// Set for `LineTailSource::Codex`; `None` for `LineTailSource::ClaudeCode`.
         session_id: Option<String>,
     },
     ChatGptExport,
@@ -171,7 +172,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 discovered.push(DiscoveredFile {
                     path,
                     kind: DiscoveredKind::LineTail {
-                        source: MirrorSource::ClaudeCode,
+                        source: LineTailSource::ClaudeCode,
                         session_id: None,
                     },
                 });
@@ -378,7 +379,7 @@ fn scan_codex_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>
                 out.push(DiscoveredFile {
                     path,
                     kind: DiscoveredKind::LineTail {
-                        source: MirrorSource::Codex,
+                        source: LineTailSource::Codex,
                         session_id: Some(session_id),
                     },
                 });
