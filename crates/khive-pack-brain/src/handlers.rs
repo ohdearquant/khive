@@ -21,8 +21,8 @@ use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
 use khive_brain_core::BetaPosterior;
 use khive_brain_core::{
-    ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
-    DEFAULT_ESS_CAP,
+    FeedbackEventKind, ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState,
+    SectionType, DEFAULT_ESS_CAP,
 };
 
 // ── Adapter revision sentinel ─────────────────────────────────────────────────
@@ -197,6 +197,18 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: false,
                 description: "Per-section feedback signals: {\"section_name\": \"useful\"|\"not_useful\"|\"wrong\"}. For knowledge_compose profiles.",
             },
+            khive_types::ParamDef {
+                name: "scorer_run_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+            },
+            khive_types::ParamDef {
+                name: "serve_ledger_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+            },
         ],
     },
     HandlerDef {
@@ -230,6 +242,18 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the recall. Defaults like brain.feedback.",
+            },
+            khive_types::ParamDef {
+                name: "scorer_run_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+            },
+            khive_types::ParamDef {
+                name: "serve_ledger_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
             },
         ],
     },
@@ -852,9 +876,23 @@ impl BrainPack {
             signal: String,
             served_by_profile_id: Option<String>,
             section_signals: Option<serde_json::Value>,
+            // ADR-081 §6: scorer provenance, additive and optional. Must be
+            // supplied together (validated just below) — one without the other
+            // is rejected rather than silently coerced.
+            scorer_run_id: Option<String>,
+            serve_ledger_id: Option<String>,
         }
         let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        // ADR-081 §6: together-or-rejected. Absent-both is the unchanged,
+        // ordinary feedback path; present-both enables dedup + ledger backfill
+        // below. Exactly one present is invalid input.
+        if p.scorer_run_id.is_some() != p.serve_ledger_id.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "scorer_run_id and serve_ledger_id must be supplied together".to_string(),
+            ));
+        }
 
         let target: uuid::Uuid =
             resolve_auto_feedback_target(&self.runtime, token, &p.target_id).await?;
@@ -925,12 +963,104 @@ impl BrainPack {
             crate::validate_section_signals(ss)?;
         }
 
+        let sql = self.runtime.sql();
+        let now_us = Utc::now().timestamp_micros();
+
+        // ADR-081 §6: when both scorer_run_id and serve_ledger_id are supplied,
+        // resolve dedup + the accounting_profile_id fail-safe against the serve
+        // ledger before the fold gate runs.
+        let mut forced_zero_weight = false;
+        if let (Some(scorer_run_id), Some(serve_ledger_id)) =
+            (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
+        {
+            match crate::serve_ledger::resolve(sql.as_ref(), serve_ledger_id, scorer_run_id).await?
+            {
+                crate::serve_ledger::ServeLedgerResolution::AlreadyGraded => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": serve_ledger_id,
+                        "scorer_run_id": scorer_run_id,
+                    }));
+                }
+                crate::serve_ledger::ServeLedgerResolution::NotFound => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "serve_ledger_id {:?} not found",
+                        serve_ledger_id
+                    )));
+                }
+                crate::serve_ledger::ServeLedgerResolution::Proceed {
+                    accounting_profile_id,
+                } => {
+                    // ADR-081 §4 fail-safe: an implicit event whose serve row has
+                    // no resolvable profile is recorded at zero weight — never
+                    // folded under a guessed profile.
+                    if accounting_profile_id.is_none() {
+                        forced_zero_weight = true;
+                    }
+                }
+            }
+        }
+
+        // ADR-081 §2: the bounded-mass fold gate applies only to implicit
+        // signals. Explicit/correction signals are never gated (they are the
+        // clamp's own comparator, ADR-081 §1).
+        let gate_stamp: Option<serde_json::Value> =
+            if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
+                if matches!(
+                    event_kind,
+                    FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative
+                ) {
+                    let nominal_weight = event_kind.update_weight();
+                    let (effective_weight, mass_before, mass_after) = if forced_zero_weight {
+                        (0.0, 0.0, 0.0)
+                    } else {
+                        let outcome = crate::fold_gate::apply_fold_gate(
+                            sql.as_ref(),
+                            token.namespace().as_str(),
+                            effective_profile,
+                            &target.to_string(),
+                            nominal_weight,
+                            now_us,
+                        )
+                        .await?;
+                        (
+                            outcome.effective_weight,
+                            outcome.mass_before,
+                            outcome.mass_after,
+                        )
+                    };
+                    Some(json!({
+                        "effective_weight": effective_weight,
+                        "mass_before": mass_before,
+                        "mass_after": mass_after,
+                        "forced_zero_weight": forced_zero_weight,
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let mut data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {
             data["served_by_profile_id"] = json!(profile_id);
         }
         if let Some(ref ss) = p.section_signals {
             data["section_signals"] = ss.clone();
+        }
+        if let Some(gate) = gate_stamp {
+            data["gate"] = gate;
+        }
+        if let (Some(ref scorer_run_id), Some(ref serve_ledger_id)) =
+            (p.scorer_run_id.as_ref(), p.serve_ledger_id.as_ref())
+        {
+            data["scorer_run_id"] = json!(scorer_run_id);
+            data["serve_ledger_id"] = json!(serve_ledger_id);
         }
 
         let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
@@ -1061,6 +1191,25 @@ impl BrainPack {
             eprintln!("[brain] persistence failed (non-fatal): {e}");
         }
 
+        // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
+        // the fold itself so a ledger-write failure never blocks the feedback
+        // event from landing; non-fatal like the persistence call above.
+        if let (Some(scorer_run_id), Some(serve_ledger_id)) =
+            (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
+        {
+            if let Err(e) = crate::serve_ledger::backfill_grade(
+                sql.as_ref(),
+                serve_ledger_id,
+                signal,
+                now_us,
+                scorer_run_id,
+            )
+            .await
+            {
+                eprintln!("[brain] serve ledger grade backfill failed (non-fatal): {e}");
+            }
+        }
+
         Ok(json!({
             "emitted": true,
             "event_id": event.id.to_string(),
@@ -1085,6 +1234,10 @@ impl BrainPack {
             results: Vec<AutoFeedbackResult>,
             signal: Option<String>,
             served_by_profile_id: Option<String>,
+            // ADR-081 §6: forwarded verbatim to brain.feedback, which owns the
+            // together-or-rejected validation and the dedup/fold-gate logic.
+            scorer_run_id: Option<String>,
+            serve_ledger_id: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -1116,6 +1269,12 @@ impl BrainPack {
         });
         if let Some(ref profile_id) = p.served_by_profile_id {
             feedback_params["served_by_profile_id"] = json!(profile_id);
+        }
+        if let Some(ref scorer_run_id) = p.scorer_run_id {
+            feedback_params["scorer_run_id"] = json!(scorer_run_id);
+        }
+        if let Some(ref serve_ledger_id) = p.serve_ledger_id {
+            feedback_params["serve_ledger_id"] = json!(serve_ledger_id);
         }
 
         let mut out = self.handle_feedback(token, feedback_params).await?;
