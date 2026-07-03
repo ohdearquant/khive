@@ -4,16 +4,18 @@
 //! Builds atomically into a `.tmp` file then renames. Also supports remote archive
 //! fetch with SHA-256 pin verification via [`run_sync_remote`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
-use khive_types::EdgeRelation;
+use khive_types::{EdgeRelation, EntityKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -694,6 +696,119 @@ fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
     Ok(())
 }
 
+/// Full ADR-020 structural validation of parsed NDJSON records (#476).
+///
+/// Checks entity kind validity, entity/edge timestamp validity, entity/edge
+/// sort order (matching `write_sorted_entities`/`write_sorted_edges`), duplicate
+/// entity ids, duplicate edge ids, duplicate semantic edge triples
+/// (source, target, relation), dangling edge endpoints, and edge relation/weight
+/// validity. Called before any temp DB is created so a violation here leaves
+/// the existing target DB completely untouched.
+fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> Result<()> {
+    let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(entities.len());
+    let mut prev_entity_key: Option<String> = None;
+    for (i, e) in entities.iter().enumerate() {
+        EntityKind::from_str(&e.kind)
+            .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+
+        if !entity_ids.insert(e.id) {
+            bail!("entity {i}: duplicate entity id {}", e.id);
+        }
+
+        for (field, value) in [("created_at", &e.created_at), ("updated_at", &e.updated_at)] {
+            if let Some(s) = value {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .with_context(|| format!("entity {i} ({}): invalid {field} {s:?}", e.id))?;
+            }
+        }
+
+        let key = e.id.to_string().to_ascii_lowercase();
+        if let Some(prev) = &prev_entity_key {
+            if key < *prev {
+                bail!(
+                    "entities.ndjson is not sorted: entity {i} ({}) is out of order",
+                    e.id
+                );
+            }
+        }
+        prev_entity_key = Some(key);
+    }
+
+    let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
+    let mut triples: HashSet<(Uuid, Uuid, EdgeRelation)> = HashSet::with_capacity(edges.len());
+    let mut prev_edge_key: Option<(String, String, String)> = None;
+    for (i, r) in edges.iter().enumerate() {
+        let relation = r.relation.parse::<EdgeRelation>().with_context(|| {
+            format!(
+                "invalid edge relation {:?} at record {} — sync aborted before any DB write",
+                r.relation,
+                i + 1
+            )
+        })?;
+
+        if !r.weight.is_finite() || !(0.0..=1.0).contains(&r.weight) {
+            bail!(
+                "edge {i} ({}): weight {} out of range; must be finite and in [0.0, 1.0]",
+                r.edge_id,
+                r.weight
+            );
+        }
+
+        if !edge_ids.insert(r.edge_id) {
+            bail!("edge {i}: duplicate edge id {}", r.edge_id);
+        }
+
+        if !triples.insert((r.source, r.target, relation)) {
+            bail!(
+                "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",
+                r.edge_id,
+                r.source,
+                r.target,
+                relation
+            );
+        }
+
+        if !entity_ids.contains(&r.source) {
+            bail!(
+                "edge {i} ({}): dangling source {} — no matching entity",
+                r.edge_id,
+                r.source
+            );
+        }
+        if !entity_ids.contains(&r.target) {
+            bail!(
+                "edge {i} ({}): dangling target {} — no matching entity",
+                r.edge_id,
+                r.target
+            );
+        }
+
+        for (field, value) in [("created_at", &r.created_at), ("updated_at", &r.updated_at)] {
+            if let Some(s) = value {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .with_context(|| format!("edge {i} ({}): invalid {field} {s:?}", r.edge_id))?;
+            }
+        }
+
+        let key = (
+            r.source.to_string(),
+            r.target.to_string(),
+            r.relation.clone(),
+        );
+        if let Some(prev) = &prev_edge_key {
+            if key < *prev {
+                bail!(
+                    "edges.ndjson is not sorted: edge {i} ({}) is out of order",
+                    r.edge_id
+                );
+            }
+        }
+        prev_edge_key = Some(key);
+    }
+
+    Ok(())
+}
+
 /// Rebuild `db_path` from `.khive/kg/{entities,edges}.ndjson` under `repo_root`.
 ///
 /// The operation is atomic: the database is built in a `.tmp` sibling file and
@@ -713,18 +828,12 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     let edge_records =
         read_edges(&edges_path).with_context(|| format!("reading {}", edges_path.display()))?;
 
-    // ── Validate-first gate ──────────────────────────────────────────────────────
-    // Parse every edge relation before creating the temp DB so that an invalid
-    // relation causes a clean error that leaves the existing DB intact.
-    for (i, r) in edge_records.iter().enumerate() {
-        r.relation.parse::<EdgeRelation>().with_context(|| {
-            format!(
-                "invalid edge relation {:?} at record {} — sync aborted before any DB write",
-                r.relation,
-                i + 1
-            )
-        })?;
-    }
+    // ── Validate-first gate (#476) ────────────────────────────────────────────
+    // Run the full ADR-020 structural validation before creating the temp DB,
+    // so any violation leaves the existing DB completely untouched.
+    validate_ndjson_records(&entity_records, &edge_records).context(
+        "validating ADR-020 KG NDJSON before DB rebuild — sync aborted before any DB write",
+    )?;
 
     let tmp_path = with_extension_suffix(db_path, ".tmp");
     let _ = std::fs::remove_file(&tmp_path);
@@ -1114,31 +1223,56 @@ mod tests {
 
         // Generate N synthetic entity lines with predictable UUIDs.
         let ids: Vec<uuid::Uuid> = (0..N).map(|_| uuid::Uuid::new_v4()).collect();
-        let entity_lines: Vec<String> = ids
+        // #476 requires entities.ndjson to be in canonical ascending-by-id
+        // order (matching `write_sorted_entities`), so sort the lines below
+        // even though `ids` itself stays in generation order (used to build
+        // the wrap-around edges and to spot-check the last-generated entity).
+        let mut entity_lines: Vec<(uuid::Uuid, String)> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                format!(
-                    r#"{{"id":"{id}","kind":"concept","name":"SyntheticEntity{i}","description":"Synthetic test entity {i} for chunk-boundary coverage","properties":{{}},"tags":["bench","synthetic"]}}"#
+                (
+                    *id,
+                    format!(
+                        r#"{{"id":"{id}","kind":"concept","name":"SyntheticEntity{i}","description":"Synthetic test entity {i} for chunk-boundary coverage","properties":{{}},"tags":["bench","synthetic"]}}"#
+                    ),
                 )
             })
             .collect();
-        let entities_ndjson = entity_lines.join("\n");
+        entity_lines.sort_by(|a, b| {
+            a.0.to_string()
+                .to_ascii_lowercase()
+                .cmp(&b.0.to_string().to_ascii_lowercase())
+        });
+        let entities_ndjson = entity_lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Generate N synthetic edges: each entity points at the next one via
-        // "extends". The last entity wraps back to the first.
-        let edge_lines: Vec<String> = ids
+        // "extends". The last entity wraps back to the first. #476 requires
+        // edges.ndjson sorted by (source, target, relation), matching
+        // `write_sorted_edges`.
+        let mut edge_lines: Vec<((String, String, String), String)> = ids
             .iter()
             .enumerate()
             .map(|(i, &src)| {
                 let tgt = ids[(i + 1) % N];
                 let eid = uuid::Uuid::new_v4();
-                format!(
+                let key = (src.to_string(), tgt.to_string(), "extends".to_string());
+                let line = format!(
                     r#"{{"edge_id":"{eid}","source":"{src}","target":"{tgt}","relation":"extends","weight":0.9,"properties":{{}}}}"#
-                )
+                );
+                (key, line)
             })
             .collect();
-        let edges_ndjson = edge_lines.join("\n");
+        edge_lines.sort_by(|a, b| a.0.cmp(&b.0));
+        let edges_ndjson = edge_lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         write_repo(repo, &entities_ndjson, &edges_ndjson);
 
@@ -1240,6 +1374,291 @@ mod tests {
         let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
         assert_eq!(report.entities, 0);
         assert_eq!(report.edges, 0);
+    }
+
+    // ── #476: validate-first gate — one test per violation type ─────────────────
+    //
+    // Each test writes a sentinel DB file, runs `run_sync` against NDJSON that
+    // violates exactly one structural rule, asserts `run_sync` returns `Err`,
+    // and asserts the sentinel DB file is byte-unchanged: the violation must be
+    // caught before the temp DB is even created, let alone renamed over the
+    // target.
+
+    async fn assert_sync_rejected_before_db_write(
+        repo: &Path,
+        db_path: &Path,
+        entities_ndjson: &str,
+        edges_ndjson: &str,
+        expected_substr: &str,
+    ) {
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(db_path, b"SENTINEL").unwrap();
+        write_repo(repo, entities_ndjson, edges_ndjson);
+
+        let err = run_sync(repo, db_path, "test-ns")
+            .await
+            .expect_err("run_sync must reject invalid NDJSON");
+        assert!(
+            err.chain().any(|e| e.to_string().contains(expected_substr)),
+            "error must mention {expected_substr:?}, got: {err:#}"
+        );
+
+        let after = std::fs::read(db_path).unwrap();
+        assert_eq!(
+            after, b"SENTINEL",
+            "rejected sync must leave the target DB completely untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unknown_entity_kind_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = format!(
+            r#"{{"id":"{id}","kind":"not-a-real-kind","name":"Bad","properties":{{}},"tags":[]}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_out_of_range_edge_weight_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":1.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "out of range")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_entity_ids_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = [
+            format!(r#"{{"id":"{id}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id}","kind":"concept","name":"A2","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "duplicate entity id")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_edge_ids_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let id_c = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_c}","kind":"concept","name":"C","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "44444444-4444-4444-4444-444444444444";
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_c}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "duplicate edge id",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_duplicate_edge_triples_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "33333333-3333-3333-3333-333333333333";
+        let edge_id_2 = "44444444-4444-4444-4444-444444444444";
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.9,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "duplicate edge triple",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_dangling_edge_source_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let missing_source = "99999999-9999-9999-9999-999999999999";
+        let entities =
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#);
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{missing_source}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "dangling source")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_dangling_edge_target_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let missing_target = "99999999-9999-9999-9999-999999999999";
+        let entities =
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#);
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{missing_target}","relation":"extends","weight":0.5,"properties":{{}}}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, &edges, "dangling target")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_invalid_entity_timestamp_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = format!(
+            r#"{{"id":"{id}","kind":"concept","name":"A","properties":{{}},"tags":[],"created_at":"not-a-timestamp"}}"#
+        );
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "invalid created_at")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_invalid_edge_timestamp_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}},"updated_at":"not-a-timestamp"}}"#
+        );
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "invalid updated_at",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unsorted_entities_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        // "b..." sorts after "a...", so writing it first violates the
+        // ascending-by-lowercase-id order that `write_sorted_entities` enforces.
+        let id_hi = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let id_lo = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let entities = [
+            format!(
+                r#"{{"id":"{id_hi}","kind":"concept","name":"Hi","properties":{{}},"tags":[]}}"#
+            ),
+            format!(
+                r#"{{"id":"{id_lo}","kind":"concept","name":"Lo","properties":{{}},"tags":[]}}"#
+            ),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            "",
+            "entities.ndjson is not sorted",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unsorted_edges_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let id_c = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_c}","kind":"concept","name":"C","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "44444444-4444-4444-4444-444444444444";
+        let edge_id_2 = "55555555-5555-5555-5555-555555555555";
+        // (source=c, target=a) sorts after (source=a, target=b) lexicographically
+        // by UUID string, so writing it first violates edge sort order.
+        let edges = [
+            format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_c}","target":"{id_a}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+            format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{}}}}"#),
+        ]
+        .join("\n");
+
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edges,
+            "edges.ndjson is not sorted",
+        )
+        .await;
     }
 
     /// #473: `run_sync` must preserve `entity_type` from NDJSON into the
