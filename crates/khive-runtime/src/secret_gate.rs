@@ -22,12 +22,22 @@
 //!    apikey, api_key, access_key, private_key).  The word `token` alone is NOT
 //!    a trigger to avoid blocking `tokenizer_*`, `token_count`, etc.
 //!
-//! Allowlist (false-positive suppression):
-//! - Pure hex strings (sha256, git SHA) — passed unconditionally.
-//! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed.
+//! Allowlist (false-positive suppression) — **all of the following are
+//! prose-context exemptions, not unconditional passes: a credential trigger
+//! word in the surrounding window always dominates.** A UUID or a
+//! sha-prefixed content hash sitting directly beside "api_key"/"secret"/"auth"
+//! is exactly as ambiguous as any other high-entropy candidate and falls
+//! through to explicit detection instead of being silently allowed. A corpus
+//! replay of ~19k real notes and docs measured exactly one benign token newly
+//! blocked under this rule (an internal task UUID field incidentally
+//! co-occurring with the word "auth") — accepted as a small, traced tradeoff
+//! rather than leaving the allowlists unconditionally bypassable.
+//! - Pure hex strings (sha256, git SHA) — passed when not near a trigger.
+//! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
 //! - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI
-//!   hashes, npm lockfile integrity) — passed when not preceded by a known-vendor
-//!   prefix.  Bare base64 tokens without the `sha<N>-` prefix are NOT passed.
+//!   hashes, npm lockfile integrity) — passed when not near a trigger and not
+//!   preceded by a known-vendor prefix.  Bare base64 tokens without the
+//!   `sha<N>-` prefix are NOT passed.
 //! - Strings that are entirely ASCII punctuation/whitespace (e.g. code) — not
 //!   subject to the entropy heuristic, only the literal-prefix checks apply.
 //! - Non-ASCII characters (CJK prose, accented text, emoji) act as token
@@ -42,6 +52,49 @@
 //!   non-ASCII-alphanumeric char (CJK, accented text, emoji) as a token
 //!   boundary, so a known-prefix secret is caught whether the adjacent
 //!   non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
+//! - Structured identifiers: a token is only considered for this exemption
+//!   when it contains at least one of `/`, `-`, `_`, or `.` (the gate); it is
+//!   then decomposed into maximal alphanumeric runs by splitting on *every*
+//!   non-alphanumeric character (not just the four gating separators — any
+//!   other ASCII punctuation glued into the same whitespace token, e.g. a
+//!   stray `:` or `,`, also acts as a run boundary).  A token exempts when it
+//!   decomposes into two or more such runs and every run is letters-then-digits
+//!   or pure digits, at most 24 chars long, with a low case-transition density.
+//!   This covers content like `fable-ops/ADR-DRAFT-adr079.md` or
+//!   `.khive/workspaces/20260701/adr079/PACKET.md`, which is otherwise
+//!   indistinguishable from a high-entropy secret once glued into one
+//!   whitespace token.  Random base64/base62 secrets do not decompose this
+//!   way: their case and digit placement is effectively uniform rather than
+//!   word-shaped, so a hyphenated or underscored secret still fails this
+//!   check and remains subject to the entropy heuristic below.
+//!
+//!   **This exemption applies ONLY outside an explicit credential trigger
+//!   context (round-4 decision).** Two narrower attempts to keep some form of
+//!   this exemption alive inside `near_trigger` context were tried and both
+//!   defeated: a trailing file-extension check (`.md`/`.rs`; codex round-2
+//!   Critical — appending an extension to any random credential re-enabled
+//!   the exemption), and a dual-signal check requiring both a run-shape count
+//!   and an average per-run letters-only Shannon entropy below a threshold
+//!   (codex round-3 Critical — an attacker who splits a credential into short
+//!   runs, or pads it with extra short/digit-bearing runs, drives the
+//!   reported entropy for every run toward `log2(run_len)`, which ordinary
+//!   short English path segments already sit at or near; e.g. a 9-char
+//!   all-distinct-letter run and the word `relations` are numerically
+//!   identical Shannon entropy). Because the attacker fully controls where
+//!   the token's separators fall, no aggregation (mean, max, or otherwise)
+//!   over per-run or whole-token letters-only entropy can be made sound —
+//!   the measure only sees a character-frequency histogram, never word
+//!   semantics, so it cannot be pinned to reject "chopped credential" while
+//!   admitting "real short word" at the same run length. Rather than ship
+//!   another attacker-suppliable signal, the exemption is dropped entirely in
+//!   trigger context: near a trigger word, a structured-identifier-shaped
+//!   token falls through to the entropy heuristic like any other token. This
+//!   is an accepted false-positive tradeoff on a small number of genuine
+//!   paths/doc-slugs that happen to sit near a trigger word AND read above
+//!   the entropy threshold on their own — see
+//!   `accepted_false_positive_adr_draft_path_near_trigger` and its siblings
+//!   for the specific repro cases this now blocks, and the call site in
+//!   `check_entropy_heuristic`.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -578,16 +631,12 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // `token` is ASCII here (non-ASCII was split out at tokenization), so
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
-        // UUID and sha-prefixed base64 content hashes (SRI / npm lockfile) are
-        // unconditionally allowlisted: their forms are unambiguous regardless of
-        // surrounding context.
-        if is_uuid_canonical(token) || is_base64_content_hash(token) {
-            continue;
-        }
-
-        // Compute the trigger window before deciding whether to allowlist hex
-        // tokens.  A pure-hex token near a credential trigger word cannot be
-        // safely assumed to be a non-secret hash and must be entropy-checked.
+        // Compute the trigger window BEFORE any shape-based allowlist decision.
+        // Every allowlist below (UUID, base64 content-hash, pure-hex) is a
+        // prose-context exemption, not an unconditional one: a credential
+        // trigger word dominates shape allowlists, because attacker-suppliable
+        // shapes (a UUID, a sha-prefixed hash) are exactly as ambiguous near a
+        // trigger word as any other high-entropy candidate.
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
@@ -596,6 +645,46 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let near_trigger = TRIGGER_WORDS.iter().any(|tw| low_window.contains(tw))
             || has_standalone_token(&low_window)
             || has_token_assignment(&low_window);
+
+        // UUID canonical form and sha-prefixed base64 content hashes (SRI /
+        // npm lockfile integrity) are allowlisted only outside trigger
+        // context. Near a trigger, both shapes fall through to detection
+        // below instead of being silently passed.
+        //
+        // A UUID's own character entropy cannot be relied on to catch it once
+        // it falls through: hex digits cap at log2(16) = 4.0 bits/char, which
+        // never reaches ENTROPY_THRESHOLD (4.5) regardless of token length.
+        // The explicit checks immediately below are what actually block a
+        // UUID-shaped or hash-shaped token in trigger context; letting it run
+        // into the generic entropy computation at the bottom of this loop
+        // would silently readmit it. A corpus replay of ~19k real notes/docs
+        // measured exactly one benign token (an internal task `area_id` UUID
+        // co-occurring with the word "auth" inside `authorized_write`) newly
+        // blocked by this rule — an accepted false positive, not a systemic
+        // regression.
+        //
+        // Both exact-shape checkers require the WHOLE token to match, so a
+        // credential glued to ordinary storage syntax (`api_key=<uuid>`,
+        // `(<uuid>)`, `{"api_key":"<uuid>"}`, a trailing sentence period,
+        // a doubled assignment, or a label itself containing `:`/`=`)
+        // would otherwise never reach them: `strip_delimiters` above only
+        // trims `"'`:=,;` at the token's OUTER ends, not braces/parens, and
+        // not an internal `=`/`:` from an assignment form. `value_candidates`
+        // enumerates every plausible value extraction from those glued forms
+        // specifically for this pair of checks — it does not replace `token`
+        // for any other check in this loop (entropy, hex, structured-
+        // identifier), none of which require an exact shape match. This is a
+        // small bounded iteration over separator positions in one token, not
+        // an allocation-heavy scan.
+        if near_trigger && value_candidates(token).any(is_uuid_canonical) {
+            return Some((token, "uuid-near-trigger"));
+        }
+        if near_trigger && value_candidates(token).any(is_base64_content_hash) {
+            return Some((token, "content-hash-near-trigger"));
+        }
+        if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
+            continue;
+        }
 
         // Pure hex tokens (git SHA, checksum digests) are allowlisted only when
         // they are NOT near a credential trigger.
@@ -616,6 +705,40 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
         if near_trigger && is_pure_hex(token) && HEX_CREDENTIAL_LENGTHS.contains(&token.len()) {
             return Some((token, "hex-credential-token"));
+        }
+
+        // Structured identifiers (file paths, branch names, ADR/doc slugs,
+        // snake_case identifiers) are exempted from the entropy check — see
+        // the module doc and `is_structured_identifier`. This must come after
+        // the UUID/content-hash allowlist and the hex-credential-token check
+        // above (neither of which it weakens) and before the entropy
+        // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
+        // on Shannon entropy alone.
+        //
+        // Round-4 decision (codex round-3 Critical): this exemption applies
+        // ONLY outside an explicit credential trigger context. Two prior
+        // attempts to narrow it for `near_trigger` instead of dropping it
+        // — a trailing file-extension check (round 1→2 bypass) and a
+        // dual-signal run-shape + average-per-run-letter-entropy check
+        // (round 2→3 bypass) — were both defeated, because every variant
+        // measured Shannon entropy over an attacker-CHOSEN run boundary, and
+        // entropy over a run of length `k` has a hard ceiling of `log2(k)`
+        // that ordinary short English words already sit at or near: a 9-char
+        // all-distinct-letter run (`relations`) and a 9-char chunk chopped
+        // out of a random credential are numerically IDENTICAL Shannon
+        // entropy, because the measure only sees the character-frequency
+        // histogram, never word semantics. An attacker who controls the
+        // token can always pick run lengths that drive per-run entropy at or
+        // below whatever a genuine short path segment reads at — no
+        // aggregation function (mean, max, or otherwise) over that
+        // attacker-chosen-boundary measure is sound. In trigger context,
+        // therefore, `is_structured_identifier` grants NO exemption: the
+        // token falls through to the entropy heuristic below unconditionally.
+        // This is an accepted false-positive tradeoff — see
+        // `accepted_false_positive_adr_draft_path_near_trigger` and its two
+        // sibling tests for the specific repro paths this now blocks.
+        if !near_trigger && is_structured_identifier(token) {
+            continue;
         }
 
         let entropy = shannon_entropy(token.as_bytes());
@@ -783,6 +906,100 @@ fn is_base64_content_hash(token: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_')
 }
 
+/// Structural separators that gate entry into [`is_structured_identifier`]
+/// (rule 1: the token must contain at least one of these). The actual run
+/// decomposition (rule 2) splits on every non-alphanumeric character, not
+/// just these four — see the doc comment on `is_structured_identifier`.
+const STRUCTURAL_SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
+
+/// Largest length a single path/branch/identifier segment (a "run" between
+/// separators) may have and still be considered word-shaped.
+const MAX_RUN_LEN: usize = 24;
+
+/// Runs whose letter portion is at or below this length skip the
+/// case-transition-density check: density is not a meaningful signal on very
+/// short runs (e.g. `R1`, `v2`, `ADR`).
+const DENSITY_EXEMPT_LETTER_LEN: usize = 4;
+
+/// Maximum case-transition density (transitions divided by letter_count - 1)
+/// a run's letter portion may have and still be considered word-shaped.
+const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
+
+/// Returns `true` when `token` is shaped like a file path, branch name, or
+/// other structured identifier rather than a high-entropy secret.
+///
+/// A structured identifier decomposes into two or more maximal
+/// ASCII-alphanumeric "runs" separated by `/`, `-`, `_`, or `.`, where every
+/// run is word-shaped: letters-then-digits (`adr079`, `slices234`, `R1`) or
+/// pure digits (`20260701`), at most [`MAX_RUN_LEN`] chars, with a low
+/// case-transition density in the letter portion. Random base64/base62
+/// secrets glued between separators reliably fail this shape check: their
+/// case and digit placement is essentially uniform rather than word-like, so
+/// a run either exceeds the length cap or mixes case too densely to pass.
+///
+/// Outside credential-trigger context this shape check alone is sufficient to
+/// exempt a token from the entropy heuristic. In trigger context the caller
+/// grants NO exemption at all — see the round-4 decision in the module doc
+/// comment and the call site in [`check_entropy_heuristic`].
+fn is_structured_identifier(token: &str) -> bool {
+    if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
+        return false;
+    }
+    let runs: Vec<&str> = token
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|r| !r.is_empty())
+        .collect();
+    runs.len() >= 2 && runs.iter().all(|run| is_word_shaped_run(run))
+}
+
+/// A single run (segment between structural separators) is word-shaped when
+/// it matches `[A-Za-z]+[0-9]*` or `[0-9]+`, is at most [`MAX_RUN_LEN`] chars,
+/// and (for the letters-then-digits form) its letter portion has a low
+/// case-transition density.
+fn is_word_shaped_run(run: &str) -> bool {
+    if run.is_empty() || run.len() > MAX_RUN_LEN {
+        return false;
+    }
+    let bytes = run.as_bytes();
+    if bytes.iter().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let letter_end = bytes
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(bytes.len());
+    // A run that does not start with a letter, and is not pure digits (ruled
+    // out above), mixes digits and letters in a shape other than
+    // letters-then-digits — not word-shaped.
+    if letter_end == 0 {
+        return false;
+    }
+    // Everything after the leading letters must be digits only (no further
+    // letters), else the run is not the `[A-Za-z]+[0-9]*` shape.
+    if !bytes[letter_end..].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    case_transition_density_ok(&run[..letter_end])
+}
+
+/// `true` when the case-transition density of `letters` (an all-ASCII-letter
+/// string) is at or below [`MAX_CASE_TRANSITION_DENSITY`]. A transition is an
+/// adjacent letter pair where one side is uppercase and the other is not.
+/// Runs with few enough letters pass automatically (see
+/// [`DENSITY_EXEMPT_LETTER_LEN`]) since density is noisy on short strings.
+fn case_transition_density_ok(letters: &str) -> bool {
+    let chars: Vec<char> = letters.chars().collect();
+    if chars.len() <= DENSITY_EXEMPT_LETTER_LEN {
+        return true;
+    }
+    let transitions = chars
+        .windows(2)
+        .filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase())
+        .count();
+    let density = transitions as f64 / (chars.len() - 1) as f64;
+    density <= MAX_CASE_TRANSITION_DENSITY
+}
+
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 fn is_uuid_canonical(s: &str) -> bool {
     let b = s.as_bytes();
@@ -803,6 +1020,71 @@ fn is_uuid_canonical(s: &str) -> bool {
 /// Strip common wrapping characters (`"`, `'`, `` ` ``, `:`, `=`) from both ends.
 fn strip_delimiters(s: &str) -> &str {
     s.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ':' | '=' | ',' | ';'))
+}
+
+/// Strip `{}()[]"'.,;` from both ends of `s`, repeatedly (JSON nests one
+/// wrapper inside another).
+fn strip_wrappers(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        matches!(
+            c,
+            '{' | '}' | '(' | ')' | '[' | ']' | '"' | '\'' | '`' | '.' | ',' | ';'
+        )
+    })
+}
+
+fn wrapper_strip_repeated(token: &str) -> &str {
+    let mut cur = token;
+    loop {
+        let next = strip_wrappers(cur);
+        if next == cur {
+            return cur;
+        }
+        cur = next;
+    }
+}
+
+/// Yield every candidate value that an assignment/wrapper-glued whitespace
+/// token could contain, so shape allowlists that require an EXACT match
+/// (`is_uuid_canonical`, `is_base64_content_hash`) still recognize the
+/// credential once it is glued to normal storage syntax: `key=value`,
+/// `(value)`, `{"key":"value"}`, `key1=key2=value`, a trailing sentence
+/// period, or a label itself containing `:`/`=` (`{"api:key":"value"}`).
+/// Used only to derive candidates for the near-trigger UUID/content-hash
+/// checks in `check_entropy_heuristic` — it does NOT replace `token` for
+/// the entropy, hex, or structured-identifier paths, none of which require
+/// an exact shape match and so are unaffected by this extraction.
+///
+/// Strips wrapper punctuation from both ends first, then yields the
+/// wrapper-stripped whole token, plus the wrapper-stripped suffix after
+/// EVERY internal `=`/`:` occurrence (skipping empty suffixes). No single
+/// separator position can be assumed correct: the true key/value or
+/// JSON-label boundary might be the first separator (`secret=sha256-...`),
+/// but a base64/base64url value can itself end in `=` padding — for a
+/// padded content hash that padding IS the last `=` in the token, so a
+/// last-separator split would land on the padding boundary instead. A
+/// label can also itself contain `:`/`=` (`{"api:key":"<uuid>"}`) or the
+/// assignment can be doubled (`key=label=<uuid>`), so neither "first" nor
+/// "last" is a sound single choice. Emitting every suffix and letting the
+/// caller test each one is the only choice that is sound in all these
+/// shapes: the true value always appears as *some* suffix, and a `=`/`:`
+/// that lands inside padding or a label simply yields a non-matching
+/// suffix that the caller's shape check harmlessly rejects.
+///
+/// Byte-scan via `char_indices` over an already-short token (whitespace-
+/// delimited, so bounded by realistic line length) — no allocation, since
+/// this runs in the hot scan path.
+fn value_candidates(token: &str) -> impl Iterator<Item = &str> {
+    let cur = wrapper_strip_repeated(token);
+    std::iter::once(cur).chain(cur.char_indices().filter_map(move |(i, c)| {
+        if c == '=' || c == ':' {
+            let after = strip_wrappers(&cur[i + c.len_utf8()..]);
+            if !after.is_empty() {
+                return Some(after);
+            }
+        }
+        None
+    }))
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -853,8 +1135,6 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Catch suite ──────────────────────────────────────────────────────────
 
     #[test]
     fn blocks_aws_akia() {
@@ -1445,14 +1725,18 @@ mod tests {
     // ── False-positive: SRI / tokenizer hash metadata ────────────────────────
 
     #[test]
-    fn allows_sri_hash() {
-        // SRI hash as used in HTML integrity attributes (sha384, base64-encoded).
-        // Placed near the word "key" to test the entropy heuristic allowlist.
+    fn blocks_sri_hash_near_key_word_accepted_fp() {
+        // SRI hash as used in HTML integrity attributes (sha384, base64-encoded),
+        // placed directly beside the trigger word "key". The content-hash
+        // allowlist is a prose-context exemption, not unconditional: near a
+        // credential trigger, a sha-prefixed hash falls through to the explicit
+        // near-trigger content-hash detector like any other high-entropy
+        // candidate. This is an accepted false positive on a real but rare
+        // shape (an integrity hash literally next to the word "key").
         let line = "integrity key: sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC";
         assert!(
-            scan(line).is_none(),
-            "SRI hash must pass; fired: {:?}",
-            scan(line)
+            scan(line).is_some(),
+            "SRI hash near trigger word 'key' must now be blocked (accepted FP); passed unexpectedly"
         );
     }
 
@@ -2142,6 +2426,686 @@ mod tests {
         assert!(
             check(&masked).is_ok(),
             "masked output must pass the gate: {masked}"
+        );
+    }
+
+    // ── Structured-identifier exemption: file paths / branch names ──────────
+    //
+    // Root cause (production false positives, 2026-07-01): the entropy
+    // heuristic tokenizes on whitespace, so a full file path is one long
+    // token; trigger detection is substring-based, so "auth"/"key" match
+    // inside ordinary words; and mixed-case+digit+punctuation paths
+    // legitimately exceed the Shannon-entropy threshold. The exemption
+    // originally applied in trigger context too, but round-4 (see the module
+    // doc comment) dropped it there entirely — no sound signal separates a
+    // real path from an attacker-chopped/padded credential once Shannon
+    // entropy is the only measure and the attacker controls run boundaries.
+    // The three cases below are accepted false positives post round-4: their
+    // own full-token entropy exceeds ENTROPY_THRESHOLD, so they now block
+    // near a trigger word (see `accepted_false_positive_*` for the
+    // authoritative "must block" assertions; kept here renamed to document
+    // the flip rather than silently deleted).
+
+    #[test]
+    fn blocks_file_path_near_secret_word_accepted_fp_round4() {
+        // Was `allows_file_path_near_secret_word` pre round-4 (structured-
+        // identifier exemption applied in trigger context). Full-token
+        // entropy 4.5994 > ENTROPY_THRESHOLD (4.5) — now an accepted FP.
+        let content =
+            "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
+        assert!(
+            check(content).is_err(),
+            "accepted FP post round-4: structured file path near 'secret' is now \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
+        // Was `allows_workspace_path_near_key_word` pre round-4. Full-token
+        // entropy 4.7938 > 4.5 — now an accepted FP.
+        let content = "key: see .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP post round-4: workspace path near 'key' is now blocked; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_short_run_path_near_auth_word_accepted_fp_round4() {
+        // Was `allows_short_run_path_near_auth_word` pre round-4. Full-token
+        // entropy 4.5955 > 4.5 — now an accepted FP.
+        let content =
+            "auth work saved at .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP post round-4: path with a short 'R1' run near 'auth' is \
+             now blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_branch_and_review_filename_near_key_word() {
+        let content = "branch feat-session-codex-mirror pushed, see codex_review_pr335_round2.md for the key findings";
+        assert!(
+            check(content).is_ok(),
+            "branch name and review filename near 'key' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_adr_doc_path_near_password_word() {
+        let content = "password reset doc: docs/adr/ADR-055-epistemic-edge-relations.md";
+        assert!(
+            check(content).is_ok(),
+            "ADR doc path near 'password' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_source_file_path_near_credential_word() {
+        let content = "credential handling code crates/khive-pack-session/src/mirror/ingest.rs";
+        assert!(
+            check(content).is_ok(),
+            "source file path near 'credential' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_long_snake_case_identifier_near_key_word() {
+        let content = "api key handling lives in check_entropy_heuristic_impl";
+        assert!(
+            check(content).is_ok(),
+            "snake_case identifier near 'key' must not be blocked; fired: {:?}",
+            scan(content)
+        );
+    }
+
+    // ── Structured-identifier exemption: catch-suite regression ─────────────
+
+    #[test]
+    fn hyphenated_random_secret_is_not_a_structured_identifier() {
+        // Same token as `blocks_bare_base64url_43chars_near_key`: hyphenated
+        // but not word-shaped. The second run exceeds the 24-char run cap,
+        // and the first run's case-transition density (~0.42) exceeds the
+        // 0.3 threshold on its own, so this must not be exempted and the
+        // existing catch-suite test must keep blocking it.
+        assert!(!is_structured_identifier(
+            "wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123"
+        ));
+        let line = "api key wJalrXUtnFEMI-K7MDENGbPxRfiCYEXAMPLEKEYX123";
+        assert!(
+            scan(line).is_some(),
+            "hyphenated random secret must still be blocked; got: {:?}",
+            scan(line)
+        );
+    }
+
+    // ── Structured-identifier exemption: direct unit tests ───────────────────
+
+    #[test]
+    fn structured_identifier_true_for_repro_paths() {
+        let paths = [
+            "fable-ops/ADR-DRAFT-adr079-slices234.md",
+            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
+            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+            "codex_review_pr335_round2.md",
+            "docs/adr/ADR-055-epistemic-edge-relations.md",
+            "crates/khive-pack-session/src/mirror/ingest.rs",
+            "check_entropy_heuristic_impl",
+        ];
+        for p in paths {
+            assert!(
+                is_structured_identifier(p),
+                "expected structured identifier: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_identifier_false_without_separator() {
+        // No `/`, `-`, `_`, or `.` present — fails rule 1 outright.
+        assert!(!is_structured_identifier(
+            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM"
+        ));
+    }
+
+    #[test]
+    fn structured_identifier_false_for_leetspeak_digit_interleaving() {
+        // Digits interleaved with letters within a run (not a trailing digit
+        // suffix) fail the `[A-Za-z]+[0-9]*` / `[0-9]+` shape check.
+        assert!(!is_structured_identifier("S3cr3t-P4ssw0rd-t0ken-here!"));
+    }
+
+    #[test]
+    fn structured_identifier_false_for_run_over_length_cap() {
+        // A 26-char single alphabetic run between separators fails the
+        // 24-char per-run length cap even though it is otherwise trivially
+        // word-shaped (uniform lowercase, zero case transitions).
+        let long_run = "a".repeat(26);
+        let token = format!("prefix-{long_run}-suffix");
+        assert!(!is_structured_identifier(&token));
+    }
+
+    // ── Round-4 decision: drop the structured-identifier exemption entirely
+    //    in trigger context (codex round-3 Critical) ─────────────────────────
+    //
+    // Two narrower fixes were tried in trigger context and both defeated:
+    //   round 1: required a trailing file-extension run       -> bypassed by
+    //            appending `.md`/`.rs` to any random credential (round-2).
+    //   round 2: required >= 2 path-shaped runs AND average
+    //            per-run letters-only entropy below a threshold -> bypassed
+    //            by padding with extra short/digit runs (dilutes the mean) or
+    //            by splitting the credential itself into short runs (drives
+    //            every run's own entropy toward its length ceiling,
+    //            log2(run_len), which real short path words already sit at)
+    //            (round-3).
+    // Root cause: Shannon entropy over an attacker-chosen run boundary cannot
+    // distinguish "distinct letters that spell an English word" from
+    // "distinct letters chosen adversarially" — both hit the same
+    // log2(length) ceiling. No aggregation is sound. The exemption is now
+    // dropped unconditionally in trigger context: a structured-identifier
+    // shaped token near a trigger word is entropy-checked like any other
+    // token, with 3 known false positives accepted (see
+    // `accepted_false_positive_*` below).
+
+    #[test]
+    fn blocks_codex_repro_secret_access_key_bypass() {
+        // The exact bypass string from the codex round-1 Critical finding.
+        let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk";
+        assert!(
+            check(content).is_err(),
+            "AWS Secret Access Key shaped bypass must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_lowercase_only_separator_token_near_access_key() {
+        let content = "access_key qrstuvwxyz/abcdefghij/klmnopqrst/uvwxyzab";
+        assert!(
+            check(content).is_err(),
+            "lowercase-only separator-delimited high-entropy token near \
+             'access_key' must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_digit_and_word_mixed_token_near_api_key() {
+        // A mix of pure-digit runs and letters-then-digits runs (both
+        // individually word-shaped) whose combined alphabet diversity crosses
+        // the entropy threshold.
+        let content = "api_key attaycofrsm827/festwqjhc493/8261947350/qwikjzx982";
+        assert!(
+            check(content).is_err(),
+            "digit-and-word-mixed high-entropy token near 'api_key' must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_adversarial_token_assignment_separator_delimited_secret() {
+        let content = "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk";
+        assert!(
+            check(content).is_err(),
+            "token= with lowercase-only separator-delimited high-entropy value \
+             must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_codex_round2_extension_suffix_bypass_secret_access_key() {
+        // The round-1 bypass string with `.md` appended — this is what
+        // slipped through the round-1 extension-based exemption.
+        let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
+        assert!(
+            check(content).is_err(),
+            "extension-suffixed AWS Secret Access Key shaped bypass must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_codex_round2_extension_suffix_bypass_token_assignment() {
+        let content = "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk.rs";
+        assert!(
+            check(content).is_err(),
+            "extension-suffixed token= bypass must be blocked: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_round1_bypass_strings_still_without_extension() {
+        let cases = [
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk",
+            "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "round-1 bypass string must still be blocked: {content:?}, got: {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_digit_run_suffix_bypass_attempt() {
+        let cases = [
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk2024",
+            "secret_access_key abcdefghij2024/klmnopqrst/uvwxyzabcd/efghijk.md",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "digit-run-suffixed bypass attempt must be blocked: {content:?}, got: {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_round3_padding_run_bypass_attempts() {
+        // Codex round-3 Critical repro: a low-entropy padding run (`aaaa`)
+        // inserted before short/digit-shaped runs used to drag the round-2
+        // AVERAGE per-run letters-only entropy below its threshold while
+        // `has_low_entropy_run_signal` was satisfied by the trailing
+        // `R1`/extension runs. With the exemption dropped entirely, these
+        // must be blocked purely on full-token entropy, same as any other
+        // near-trigger high-entropy token.
+        let cases = [
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk/aaaa/R1.md",
+            "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz/mnbvcxzlk/aaaa/R1.rs",
+            "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk/aaaa/bbbb/R1.md",
+            "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz/mnbvcxzlk/aaaa/bbbb/R1.rs",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "round-3 padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_run_splitting_bypass_attempts() {
+        // A further adversarial construction found while stress-testing the
+        // round-3 fix (not itself a codex finding, but proves the general
+        // unsoundness): splitting a credential into short (4-6 char) runs
+        // drives EVERY run's own letters-only entropy toward log2(run_len),
+        // which ordinary short English path words already sit at or near —
+        // this is exactly why round 3 (and any per-run entropy ceiling) is
+        // unfixable. With the exemption dropped, these are blocked on
+        // full-token entropy regardless of run shape.
+        let cases = [
+            "secret_access_key abcd/efgh/ijkl/mnop/qrst/uvwx/yzab/cdef.md",
+            "secret_access_key abcde/fghij/klmno/pqrst/uvwxy/zabcd.md",
+            "secret_access_key abcdef/ghijkl/mnopqr/stuvwx/yzabcd.md",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_err(),
+                "run-splitting bypass attempt must be blocked: {content:?}, got: {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_fp_paths_whose_full_token_entropy_is_already_below_threshold() {
+        // 4 of the 7 original FP-repro paths stay OK near a trigger word even
+        // with NO structured-identifier exemption at all, because their own
+        // full-token Shannon entropy already reads below ENTROPY_THRESHOLD
+        // (4.5) — the exemption was never load-bearing for these regardless
+        // of which version of it existed.
+        let paths = [
+            "codex_review_pr335_round2.md",
+            "docs/adr/ADR-055-epistemic-edge-relations.md",
+            "crates/khive-pack-session/src/mirror/ingest.rs",
+            "check_entropy_heuristic_impl",
+        ];
+        for p in paths {
+            let content = format!("api_key handling in {p}");
+            assert!(
+                check(&content).is_ok(),
+                "{p} must stay allowed near 'api_key' (full-token entropy already \
+                 below threshold): fired {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_false_positive_adr_draft_path_near_trigger() {
+        // Round-4 accepted tradeoff: this path's full-token Shannon entropy
+        // (4.5994) exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
+        // structured-identifier exemption dropped in trigger context, it is
+        // now blocked near an explicit credential trigger word. This is a
+        // deliberate, documented false positive — not a regression to fix —
+        // per the round-4 decision that no sound signal exists to
+        // distinguish this from a chopped/padded credential of the same
+        // shape.
+        let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked post round-4; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_workspace_packet_path_near_trigger() {
+        // Same tradeoff as above: full-token entropy 4.7938 > 4.5.
+        let content = "api_key handling in .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
+             post round-4; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_r1_repo_audit_path_near_trigger() {
+        // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
+        let content =
+            "api_key handling in .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
+             round-4; got {:?}",
+            scan(content)
+        );
+    }
+
+    // ── UUID / content-hash allowlists are prose-context only ───────────────
+
+    #[test]
+    fn blocks_uuid_directly_labeled_as_api_key() {
+        let content = "api_key 550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_err(),
+            "UUID-shaped token labeled api_key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha256_content_hash_labeled_as_secret() {
+        let content = "secret sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash labeled secret must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha384_content_hash_labeled_as_api_key() {
+        let content =
+            "api_key sha384-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        assert!(
+            check(content).is_err(),
+            "sha384-prefixed hash labeled api_key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_sha512_content_hash_labeled_as_auth() {
+        let content = "auth sha512-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUV";
+        assert!(
+            check(content).is_err(),
+            "sha512-prefixed hash labeled auth must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_uuid_with_no_trigger_within_window() {
+        // Common benign shape: a UUID (e.g. an internal record id) with no
+        // credential trigger word anywhere in the surrounding window stays
+        // allowed — the allowlist still applies outside trigger context.
+        let content =
+            "task 550e8400-e29b-41d4-a716-446655440000 was created and assigned to the team";
+        assert!(
+            check(content).is_ok(),
+            "UUID with no nearby trigger word must stay allowed; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_internal_area_id_uuid_near_auth_substring() {
+        // Measured corpus regression (1 of ~19,300 real notes/docs replayed):
+        // an internal task `area_id` UUID field that happens to sit within
+        // the trigger window of the substring "auth" inside
+        // `authorized_write_requires_dominance` elsewhere in the same note.
+        // This is a deliberate, accepted false positive — the allowlist no
+        // longer distinguishes this from a UUID-shaped credential directly
+        // labeled by a trigger word, and no additional signal separates the
+        // two without reintroducing an attacker-suppliable shape check.
+        let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
+        assert!(
+            check(content).is_err(),
+            "accepted FP: internal area_id UUID near 'authorized_write' substring \
+             is now blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    // ── UUID/hash value extraction from assignment and wrapper syntax ───────
+
+    #[test]
+    fn blocks_uuid_glued_to_assignment_equals() {
+        let content = "api_key=550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_err(),
+            "UUID glued via '=' to a trigger word must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_with_trailing_sentence_period() {
+        let content = "api_key 550e8400-e29b-41d4-a716-446655440000.";
+        assert!(
+            check(content).is_err(),
+            "UUID with a trailing sentence period near a trigger must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_wrapped_in_parens() {
+        let content = "api_key (550e8400-e29b-41d4-a716-446655440000)";
+        assert!(
+            check(content).is_err(),
+            "UUID wrapped in parens near a trigger must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_in_json_object() {
+        let content = "{\"api_key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID in a JSON-ish object near a trigger key must be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_glued_to_assignment_equals() {
+        let content = "secret=sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash glued via '=' to a trigger word must be blocked; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_with_trailing_sentence_period() {
+        let content = "secret sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq.";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash with a trailing period near a trigger must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_wrapped_in_parens() {
+        let content = "secret (sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq)";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash wrapped in parens near a trigger must be blocked; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_content_hash_in_json_object() {
+        let content = "{\"secret\":\"sha256-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq\"}";
+        assert!(
+            check(content).is_err(),
+            "sha256-prefixed hash in a JSON-ish object near a trigger key must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_uuid_wrapped_in_parens_with_no_trigger_nearby() {
+        // Control: the prose allowlist must survive for wrapper syntax when
+        // there is no credential trigger word anywhere in the window — only
+        // the trigger-context extraction changed, not the outside-context
+        // allowlist itself.
+        let content = "wrapper (550e8400-e29b-41d4-a716-446655440000) present";
+        assert!(
+            check(content).is_ok(),
+            "UUID wrapped in parens with no trigger word nearby must stay allowed; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_glued_to_assignment_with_trailing_period() {
+        // A padded base64 value ends in its own `=`, which is also a valid
+        // separator character — `value_candidates` must enumerate the
+        // suffix after every `=`/`:`, not assume any single separator
+        // position, so the true value is recovered regardless of which
+        // separator happens to sit where.
+        let content = "secret=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded sha256 hash glued via '=' with a trailing period must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_in_json_object() {
+        let content = "{\"secret\":\"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}";
+        assert!(
+            check(content).is_err(),
+            "padded sha256 hash in a JSON-ish object near a trigger key must be \
+             blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_when_json_label_itself_contains_colon() {
+        // The label can itself contain the separator character
+        // (`"api:key"` rather than `"api_key"`); the first `:` after
+        // wrapper-stripping then lands inside the label, not at the
+        // label/value boundary. value_candidates must still surface the
+        // bare UUID as a later suffix candidate.
+        let content = "{\"api:key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked even when the JSON label contains ':'; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_when_json_label_itself_contains_equals() {
+        let content = "{\"api=key\":\"550e8400-e29b-41d4-a716-446655440000\"}";
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked even when the JSON label contains '='; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_uuid_behind_doubled_assignment() {
+        // key=label=value: the first `=` lands between two labels, not at
+        // the true value boundary.
+        let content = "api_key=label=550e8400-e29b-41d4-a716-446655440000"; // gitleaks:allow
+        assert!(
+            check(content).is_err(),
+            "UUID must be blocked behind a doubled assignment; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_behind_doubled_assignment_equals() {
+        let content = "secret=label=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded content hash must be blocked behind a doubled '=' assignment; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_padded_content_hash_behind_doubled_assignment_colon() {
+        let content = "secret:label=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=.";
+        assert!(
+            check(content).is_err(),
+            "padded content hash must be blocked behind a doubled ':'+'=' \
+             assignment; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn allows_benign_url_with_scheme_and_path_separators() {
+        // Adversarial self-check (codex round-8 guidance): any-suffix
+        // semantics must not newly block ordinary URLs, whose `://` and
+        // `/` characters produce several suffix candidates but none of
+        // them are UUID- or content-hash-shaped. Placed near a real
+        // trigger word ("key") so the check actually exercises the
+        // trigger-context path rather than being skipped outright.
+        let content = "api_key endpoint=https://example.test/resource/for/testing";
+        assert!(
+            check(content).is_ok(),
+            "a benign URL near a trigger word must stay allowed; got {:?}",
+            scan(content)
         );
     }
 }

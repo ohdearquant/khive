@@ -106,8 +106,10 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-076](ADR-076-relation-calculability-and-system-role.md) | Relation-Set Calculability — System Role and the Non-Redundancy Certificate (Proposed)                          |
 | [ADR-078](ADR-078-output-format-shape-aware-rendering.md)    | Output Format and Shape-Aware Rendering (Proposed)                                                              |
 | [ADR-079](ADR-079-ann-persistence-warm-path-integration.md)  | ANN Persistence Warm-Path Integration — Wiring v2 Persistence into the Daemon (Proposed)                        |
-| [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md)     | Session Pack — OSS Storage Mechanism (Proposed)                                                                 |
-| [ADR-081](ADR-081-recall-retune-driver.md)                   | Recall Retune Driver — Governed Ingestion of Implicit Feedback (Proposed)                                       |
+| [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md)     | Session Pack — OSS Storage Mechanism (Accepted, amended 2026-07-02)                                             |
+| [ADR-082](ADR-082-retrieval-quality-measurement-loop.md)     | Retrieval Quality Measurement Loop (Proposed)                                                                   |
+| [ADR-083](ADR-083-session-pack-t1-verbs.md)                  | Session Pack T1 Verb Surface (Accepted)                                                                         |
+| [ADR-084](ADR-084-verb-surface-consistency.md)               | Verb-Surface Consistency Contract and Live Ontology Introspection (Proposed)                                    |
 
 ## Closed Taxonomies — Quick Reference
 

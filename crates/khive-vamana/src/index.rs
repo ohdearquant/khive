@@ -956,6 +956,12 @@ impl VamanaIndex {
             .map(|w| w.count_ones() as usize)
             .sum();
 
+        if tombstone_count > num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
+            )));
+        }
+
         let (gs_codec, gs_codes) = train_codec_and_encode(storage.as_slice()?, dimensions);
 
         Ok(Self {
@@ -2144,6 +2150,20 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
         ));
     }
 
+    VamanaConfig {
+        dimensions,
+        max_degree,
+        search_list_size,
+        alpha,
+    }
+    .validate()
+    .map_err(|err| match err {
+        VamanaError::InvalidConfig { reason } => {
+            VamanaError::invalid_format(format!("v2 commit invalid config: {reason}"))
+        }
+        other => other,
+    })?;
+
     Ok(V2Commit {
         vectors_hash,
         graph_hash,
@@ -2263,10 +2283,30 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
         tombstones.push(word);
         offset += 8;
     }
-    // Ensure tombstone bitvec covers all nodes.
+    // Ensure tombstone bitvec covers exactly the valid node-id domain.
     let needed_words = num_vectors.div_ceil(64);
     if tombstones.len() < needed_words {
         tombstones.resize(needed_words, 0);
+    } else if tombstones.len() > needed_words {
+        if tombstones[needed_words..].iter().any(|&word| word != 0) {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin tombstone words exceed num_vectors".into(),
+            ));
+        }
+        tombstones.truncate(needed_words);
+    }
+
+    let valid_bits_in_last_word = num_vectors % 64;
+    if valid_bits_in_last_word != 0 {
+        let valid_mask = (1u64 << valid_bits_in_last_word) - 1;
+        if tombstones
+            .last()
+            .is_some_and(|last_word| last_word & !valid_mask != 0)
+        {
+            return Err(VamanaError::invalid_format(
+                "lifecycle.bin tombstone bits outside num_vectors".into(),
+            ));
+        }
     }
 
     // Free slots.

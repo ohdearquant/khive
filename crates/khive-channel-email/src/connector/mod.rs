@@ -113,6 +113,15 @@ pub struct RawEmail {
     pub body_html: Option<String>,
     /// All headers as a flat map (lowercase key, first-occurrence value).
     pub headers: HashMap<String, String>,
+    /// Every `Authentication-Results` header value, in document order (topmost
+    /// first), verbatim.
+    ///
+    /// Kept separate from `headers` because that map keeps only the first
+    /// occurrence of a header name, while the attribution gate (ADR-056
+    /// Amendment 2026-07-02) must see every occurrence to find the topmost one
+    /// whose `authserv-id` matches the configured trust anchor -- an MTA can
+    /// legitimately stamp more than one hop's worth of this header.
+    pub authentication_results: Vec<String>,
 }
 
 impl RawEmail {
@@ -124,6 +133,25 @@ impl RawEmail {
     /// Return the `In-Reply-To` header value if present.
     pub fn in_reply_to(&self) -> Option<&str> {
         self.headers.get("in-reply-to").map(|s| s.as_str())
+    }
+
+    /// Return this email's own `Message-ID` header value if present.
+    ///
+    /// Distinct from `imap_external_id` (the IMAP UIDVALIDITY/UID dedup key):
+    /// this is the RFC 822 identifier the sending MUA minted, needed so a
+    /// reply can set `In-Reply-To`/`References` for native MUA threading.
+    pub fn message_id(&self) -> Option<&str> {
+        self.headers.get("message-id").map(|s| s.as_str())
+    }
+
+    /// Return this email's own `References` header value if present, verbatim.
+    ///
+    /// RFC 5322 reply construction requires a reply's `References` to be the
+    /// parent's existing `References` chain (this value) followed by the
+    /// parent's `Message-ID`; capturing it here lets a later reply extend the
+    /// full ancestor chain instead of truncating it to the immediate parent.
+    pub fn references(&self) -> Option<&str> {
+        self.headers.get("references").map(|s| s.as_str())
     }
 
     /// Resolve the best available correlation key: `X-Khive-Thread-ID` first,

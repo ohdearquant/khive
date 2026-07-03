@@ -24,13 +24,27 @@ pub fn fuse<Id: Eq + Hash + Clone + Ord>(
         FusionStrategy::Rrf { k } => reciprocal_rank_fusion(sources, *k),
         FusionStrategy::Weighted { weights } => weighted_fusion(sources, weights),
         FusionStrategy::Union => union_fusion(sources),
-        FusionStrategy::VectorOnly | FusionStrategy::KeywordOnly => union_fusion(sources),
+        FusionStrategy::VectorOnly => passthrough_source(sources, 0),
+        FusionStrategy::KeywordOnly => passthrough_source(sources, 1),
         FusionStrategy::Custom { name, .. } => {
             return Err(FuseError::CustomRequiresRuntime(name.clone()));
         }
     };
 
     Ok(fused.into_iter().take(top_k).collect())
+}
+
+/// Select a single source by index, treating a lone source as authoritative
+/// regardless of the requested index (e.g. vector-only search with no keyword source).
+fn passthrough_source<Id>(
+    sources: Vec<Vec<(Id, DeterministicScore)>>,
+    source_index: usize,
+) -> Vec<(Id, DeterministicScore)> {
+    if sources.len() == 1 {
+        return sources.into_iter().next().unwrap_or_default();
+    }
+
+    sources.into_iter().nth(source_index).unwrap_or_default()
 }
 
 /// Error from the [`fuse`] entry point.
@@ -156,6 +170,24 @@ mod tests {
 
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].0, 1);
+    }
+
+    #[test]
+    fn vector_only_two_sources_returns_only_vector_source() {
+        let vector = make_results(vec![("vec_only", 0.9)]);
+        let keyword = make_results(vec![("kw_only", 1.0)]);
+        let out = fuse(vec![vector, keyword], &FusionStrategy::VectorOnly, 10).unwrap();
+        let ids: Vec<_> = out.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["vec_only"]);
+    }
+
+    #[test]
+    fn keyword_only_two_sources_returns_only_keyword_source() {
+        let vector = make_results(vec![("vec_only", 0.9)]);
+        let keyword = make_results(vec![("kw_only", 1.0)]);
+        let out = fuse(vec![vector, keyword], &FusionStrategy::KeywordOnly, 10).unwrap();
+        let ids: Vec<_> = out.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["kw_only"]);
     }
 
     #[test]

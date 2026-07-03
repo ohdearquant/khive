@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::event::{Event, EventFilter, EventObservation, ObservationRole, ReferentKind};
-use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
+use khive_storage::types::{BatchWriteSummary, Page, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EventStore;
+use khive_storage::SqlWriter;
 use khive_storage::StorageCapability;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
@@ -314,6 +315,98 @@ fn insert_event_with_observations(
                 observation.position as i64,
             ],
         )?;
+    }
+
+    Ok(())
+}
+
+/// Insert `event` (and any derived `event_observations` rows) through the
+/// `khive-storage` `SqlWriter` seam, on a transaction the CALLER already
+/// opened and controls the commit/rollback boundary for. Issues no
+/// `BEGIN`/`COMMIT`/`ROLLBACK` of its own.
+///
+/// This exists alongside `insert_event_with_observations` (the raw
+/// `rusqlite::Connection` path `SqlEventStore::append_event` uses, which
+/// opens its own `BEGIN IMMEDIATE`/`COMMIT` for the ordinary
+/// caller-owns-nothing case) rather than replacing it: the two run on
+/// different connection abstractions — a standalone `rusqlite::Connection`
+/// vs. a `Box<dyn SqlWriter>` — so they cannot share one function body. What
+/// they DO share is `decode_event_observations` (reused verbatim below) and
+/// the fact that this crate remains the only place that knows the
+/// `events`/`event_observations` insert shape. Callers that need the event
+/// append to be part of a larger atomic unit — e.g. ADR-081's brain fold
+/// gate (`khive-pack-brain/src/fold_gate.rs`), which holds its own
+/// `BEGIN IMMEDIATE` transaction on a `SqlWriter` for the dedup claim + mass
+/// fold and needs the feedback event to land in that same transaction — call
+/// this instead of duplicating the insert shape into their own crate.
+pub async fn append_event_on_writer(
+    writer: &mut dyn SqlWriter,
+    event: &Event,
+) -> Result<(), StorageError> {
+    let id_str = event.id.to_string();
+    let substrate_str = event.substrate.name().to_string();
+    let kind_str = event.kind.name().to_string();
+    let outcome_str = event.outcome.name().to_string();
+    let payload_str = event.payload.to_string();
+    let target_str = event.target_id.map(|u| u.to_string());
+    let session_str = event.session_id.map(|u| u.to_string());
+    let aggregate_str = event.aggregate_id.map(|u| u.to_string());
+    let profile_state_version = event.profile_state_version.map(|v| v as i64);
+
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO events \
+                  (id, namespace, verb, substrate, actor, kind, outcome, payload, payload_schema_version, \
+                   profile_state_version, duration_us, target_id, session_id, aggregate_kind, aggregate_id, created_at) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+                .into(),
+            params: vec![
+                SqlValue::Text(id_str),
+                SqlValue::Text(event.namespace.clone()),
+                SqlValue::Text(event.verb.clone()),
+                SqlValue::Text(substrate_str),
+                SqlValue::Text(event.actor.clone()),
+                SqlValue::Text(kind_str),
+                SqlValue::Text(outcome_str),
+                SqlValue::Text(payload_str),
+                SqlValue::Integer(event.payload_schema_version as i64),
+                profile_state_version
+                    .map(SqlValue::Integer)
+                    .unwrap_or(SqlValue::Null),
+                SqlValue::Integer(event.duration_us),
+                target_str.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                session_str.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                event
+                    .aggregate_kind
+                    .clone()
+                    .map(SqlValue::Text)
+                    .unwrap_or(SqlValue::Null),
+                aggregate_str.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                SqlValue::Integer(event.created_at),
+            ],
+            label: Some("event_insert_on_writer".into()),
+        })
+        .await?;
+
+    for observation in
+        decode_event_observations(event).map_err(|e| map_err(e, "decode_event_observations"))?
+    {
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO event_observations \
+                      (event_id, entity_id, referent_kind, role, position) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(observation.event_id.to_string()),
+                    SqlValue::Text(observation.entity_id.to_string()),
+                    SqlValue::Text(observation.referent_kind.name().to_string()),
+                    SqlValue::Text(observation.role.name().to_string()),
+                    SqlValue::Integer(observation.position as i64),
+                ],
+                label: Some("event_observation_insert_on_writer".into()),
+            })
+            .await?;
     }
 
     Ok(())

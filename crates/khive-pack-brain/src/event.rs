@@ -65,10 +65,24 @@ pub fn interpret(event: &Event) -> BrainSignal {
             // Issue #268: try semantic event kind names first, then fall back to
             // legacy FeedbackSignal (useful / not_useful / wrong).
             if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal_str) {
+                // ADR-081 §2: the fold gate (handlers::handle_feedback) computes the
+                // actually-applied weight once, at emit time, and stamps it onto the
+                // event payload under "gate.effective_weight" before persisting. Replay
+                // reads the same stamp so the posterior update is reproduced exactly,
+                // rather than re-evaluating the gate against present-day mass state.
+                // Events without the stamp (pre-ADR-081 history, or non-gated signals)
+                // fall back to the nominal weight.
+                let effective_weight = event
+                    .payload
+                    .get("gate")
+                    .and_then(|g| g.get("effective_weight"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| event_kind.update_weight());
                 BrainSignal::SemanticFeedback {
                     target_id: target,
                     event_kind,
                     served_by_profile_id: served_by,
+                    effective_weight,
                 }
             } else {
                 let signal = serde_json::from_value::<FeedbackSignal>(serde_json::Value::String(
@@ -355,8 +369,8 @@ mod tests {
         assert!((FeedbackEventKind::Correction.update_weight() - 2.0).abs() < 1e-12);
         assert!((FeedbackEventKind::ExplicitPositive.update_weight() - 1.5).abs() < 1e-12);
         assert!((FeedbackEventKind::ExplicitNegative.update_weight() - 1.5).abs() < 1e-12);
-        assert!((FeedbackEventKind::ImplicitPositive.update_weight() - 0.5).abs() < 1e-12);
-        assert!((FeedbackEventKind::ImplicitNegative.update_weight() - 0.5).abs() < 1e-12);
+        assert!((FeedbackEventKind::ImplicitPositive.update_weight() - 0.1).abs() < 1e-12);
+        assert!((FeedbackEventKind::ImplicitNegative.update_weight() - 0.1).abs() < 1e-12);
     }
 
     #[test]
@@ -378,10 +392,12 @@ mod tests {
                 target_id,
                 event_kind,
                 served_by_profile_id,
+                effective_weight,
             } => {
                 assert_eq!(target_id, id);
                 assert_eq!(event_kind, FeedbackEventKind::ExplicitPositive);
                 assert!(served_by_profile_id.is_none());
+                assert!((effective_weight - 1.5).abs() < 1e-12);
             }
             other => panic!("expected SemanticFeedback, got {other:?}"),
         }
@@ -427,6 +443,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ExplicitPositive,
             served_by_profile_id: None,
+            effective_weight: FeedbackEventKind::ExplicitPositive.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, true)));
     }
@@ -438,6 +455,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ImplicitNegative,
             served_by_profile_id: None,
+            effective_weight: FeedbackEventKind::ImplicitNegative.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
     }
@@ -449,6 +467,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::Correction,
             served_by_profile_id: None,
+            effective_weight: FeedbackEventKind::Correction.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
     }

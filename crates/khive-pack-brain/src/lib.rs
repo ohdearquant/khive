@@ -1,8 +1,10 @@
 //! pack-brain — profile management registry for khive.
 
 pub mod fold;
+pub mod fold_gate;
 pub mod handlers;
 pub mod persist;
+pub mod serve_ledger;
 pub mod tunable;
 
 mod event;

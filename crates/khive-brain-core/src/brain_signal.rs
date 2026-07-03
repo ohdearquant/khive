@@ -35,6 +35,16 @@ pub enum BrainSignal {
         // Retained for replay/backtest completeness per ADR-032 §3.
         #[allow(dead_code)]
         served_by_profile_id: Option<String>,
+        /// The weight actually folded into posteriors for this event.
+        ///
+        /// Normally `event_kind.update_weight()`, but the ADR-081 §2 fold gate can
+        /// clamp an implicit event to `0.0` when the decayed per-key implicit mass
+        /// would exceed the cap. The decision is made once, at fold time, and
+        /// persisted on the event payload (`interpret` reads it back) so that
+        /// replay reproduces the exact same posterior update deterministically
+        /// rather than re-evaluating the gate against current (already-mutated)
+        /// mass-table state.
+        effective_weight: f64,
     },
     /// A note record was accessed; counts as a positive signal for its entity.
     NoteAccessed { target_id: Uuid },

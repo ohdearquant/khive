@@ -143,19 +143,30 @@ impl BalancedRecallState {
             }
         }
 
-        // Semantic feedback: weighted posterior updates
+        // Semantic feedback: weighted posterior updates.
+        //
+        // ADR-081 §2: `effective_weight` can be `0.0` when the fold gate clamps
+        // an over-cap implicit event. `update_*_weighted` requires a strictly
+        // positive weight (it asserts), so a zero-weight event still counts
+        // toward `total_events` (above) — it happened and was folded — but
+        // contributes no posterior movement at all, matching "folded at zero
+        // weight" literally rather than passing 0 into the weighted update.
         if let BrainSignal::SemanticFeedback {
-            event_kind: ref ek, ..
+            event_kind: ref ek,
+            effective_weight,
+            ..
         } = signal
         {
-            let w = ek.update_weight();
-            if ek.is_positive() {
-                self.salience.update_success_weighted(w);
-            } else {
-                self.salience.update_failure_weighted(w);
-            }
-            if *ek == FeedbackEventKind::Correction {
-                self.relevance.update_failure_weighted(w);
+            let w = *effective_weight;
+            if w > 0.0 {
+                if ek.is_positive() {
+                    self.salience.update_success_weighted(w);
+                } else {
+                    self.salience.update_failure_weighted(w);
+                }
+                if *ek == FeedbackEventKind::Correction {
+                    self.relevance.update_failure_weighted(w);
+                }
             }
         }
 
@@ -177,17 +188,20 @@ impl BalancedRecallState {
         if let BrainSignal::SemanticFeedback {
             target_id: eid,
             event_kind: ref ek,
+            effective_weight,
             ..
         } = signal
         {
-            let posterior = self
-                .entity_posteriors
-                .get_or_insert(*eid, || BetaPosterior::new(1.0, 1.0));
-            let w = ek.update_weight();
-            if ek.is_positive() {
-                posterior.update_success_weighted(w);
-            } else {
-                posterior.update_failure_weighted(w);
+            let w = *effective_weight;
+            if w > 0.0 {
+                let posterior = self
+                    .entity_posteriors
+                    .get_or_insert(*eid, || BetaPosterior::new(1.0, 1.0));
+                if ek.is_positive() {
+                    posterior.update_success_weighted(w);
+                } else {
+                    posterior.update_failure_weighted(w);
+                }
             }
         } else if let Some((entity_id, positive)) = entity_signal(signal) {
             let posterior = self

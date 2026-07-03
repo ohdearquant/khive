@@ -2747,15 +2747,17 @@ impl KhiveRuntime {
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
     ///
     /// Searches entities, notes, and edges tables for a UUID starting with the
-    /// given prefix, scoped to the caller's namespace. Returns `Ok(Some(uuid))`
-    /// if exactly one match is found, `Ok(None)` if no matches, or an error if
-    /// ambiguous (multiple matches).
+    /// given prefix, scoped to the caller's primary namespace only. Returns
+    /// `Ok(Some(uuid))` if exactly one match is found, `Ok(None)` if no
+    /// matches, or an error if ambiguous (multiple matches).
     pub async fn resolve_prefix(
         &self,
         token: &NamespaceToken,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(token, prefix, false).await
+        let namespaces = [token.namespace().as_str().to_owned()];
+        self.resolve_prefix_inner(Some(&namespaces), prefix, false)
+            .await
     }
 
     pub async fn resolve_prefix_including_deleted(
@@ -2763,18 +2765,51 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(token, prefix, true).await
+        let namespaces = [token.namespace().as_str().to_owned()];
+        self.resolve_prefix_inner(Some(&namespaces), prefix, true)
+            .await
     }
 
+    /// Resolve a short UUID prefix (8+ hex chars) to a full UUID with NO
+    /// namespace filter at all — mirrors `resolve_by_id`'s by-ID contract
+    /// (ADR-007 Rev 6: by-ID resolution is namespace-agnostic; the Gate, not
+    /// storage-layer filtering, is the authz seam). Used by the four by-ID
+    /// CRUD verbs (get/update/delete/merge) so their prefix path matches
+    /// their already-unfiltered full-UUID path (#391 §3). No token param:
+    /// unlike `resolve_prefix`, there is no
+    /// namespace to derive from one.
+    pub async fn resolve_prefix_unfiltered(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(None, prefix, false).await
+    }
+
+    /// `resolve_prefix_unfiltered`, including soft-deleted rows — used by the
+    /// hard-delete by-ID path (#391 §3).
+    pub async fn resolve_prefix_unfiltered_including_deleted(
+        &self,
+        prefix: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(None, prefix, true).await
+    }
+
+    /// Shared prefix-scan implementation over an explicit namespace set.
+    ///
+    /// `namespaces` selects the scan scope: `Some(&[ns])` reproduces the
+    /// historical primary-only behaviour (`resolve_prefix` /
+    /// `resolve_prefix_including_deleted`); `None` applies
+    /// no namespace predicate at all (`resolve_prefix_unfiltered*`).
+    /// Ambiguity (a prefix matching more than one UUID, even across
+    /// different namespaces in the set, or across all namespaces when
+    /// unfiltered) is still an error: UUIDs are globally unique, so two
+    /// distinct rows sharing a prefix always requires caller disambiguation —
+    /// no cross-namespace dedup is needed or performed.
     async fn resolve_prefix_inner(
         &self,
-        token: &NamespaceToken,
+        namespaces: Option<&[String]>,
         prefix: &str,
         include_deleted: bool,
     ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
-        let ns = token.namespace().as_str().to_owned();
         let pattern = format!("{}%", prefix);
 
         let tables = [
@@ -2783,6 +2818,11 @@ impl KhiveRuntime {
             ("events", false),
             ("graph_edges", false),
         ];
+
+        let ns_clause = namespaces.map(|ns| {
+            let placeholders: Vec<String> = (0..ns.len()).map(|i| format!("?{}", i + 2)).collect();
+            format!(" AND namespace IN ({})", placeholders.join(", "))
+        });
 
         let mut matches: Vec<String> = Vec::new();
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
@@ -2793,14 +2833,16 @@ impl KhiveRuntime {
             } else {
                 ""
             };
+            let mut params = vec![SqlValue::Text(pattern.clone())];
+            if let Some(ns) = namespaces {
+                params.extend(ns.iter().map(|n| SqlValue::Text(n.clone())));
+            }
             let sql = SqlStatement {
                 sql: format!(
-                    "SELECT id FROM {table} WHERE id LIKE ?1 AND namespace = ?2{deleted_filter} LIMIT 2"
+                    "SELECT id FROM {table} WHERE id LIKE ?1{ns_clause}{deleted_filter} LIMIT 2",
+                    ns_clause = ns_clause.as_deref().unwrap_or("")
                 ),
-                params: vec![
-                    SqlValue::Text(pattern.clone()),
-                    SqlValue::Text(ns.clone()),
-                ],
+                params,
                 label: Some("resolve_prefix".into()),
             };
             match reader.query_all(sql).await {

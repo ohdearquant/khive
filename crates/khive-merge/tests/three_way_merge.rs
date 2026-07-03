@@ -37,6 +37,12 @@ fn entity(id: Uuid, name: &str) -> ExportedEntity {
     }
 }
 
+fn entity_with_type(id: Uuid, name: &str, entity_type: Option<&str>) -> ExportedEntity {
+    let mut e = entity(id, name);
+    e.entity_type = entity_type.map(|s| s.to_string());
+    e
+}
+
 fn edge(src: Uuid, tgt: Uuid) -> ExportedEdge {
     ExportedEdge {
         edge_id: Uuid::new_v4(),
@@ -922,6 +928,243 @@ fn diff_weight_modified_edge() {
         relation: "extends".into(),
     };
     assert!(matches!(diff[&key], EdgeChange::WeightModified { .. }));
+}
+
+// ── #454: entity_type must participate in diff and merge ───────────────────
+
+#[test]
+fn diff_entity_type_change_is_modified() {
+    use khive_merge::diff_local::{diff_entities, EntityChange};
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "FlashAttention", None)]);
+    let branch = archive_with_entities(vec![entity_with_type(
+        id,
+        "FlashAttention",
+        Some("algorithm"),
+    )]);
+    let diff = diff_entities(&base, &branch);
+    assert!(
+        matches!(diff[&id], EntityChange::Modified { .. }),
+        "entity_type-only change must be classified Modified, got: {:?}",
+        diff[&id]
+    );
+}
+
+#[test]
+fn auto_merge_preserves_single_sided_entity_type_change() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    if let MergeResult::Clean { merged } = result {
+        assert_eq!(
+            merged.entities[0].entity_type,
+            Some("algorithm".to_string()),
+            "single-sided entity_type change must survive the merge"
+        );
+    } else {
+        panic!("expected Clean, got Conflicts");
+    }
+}
+
+#[test]
+fn auto_merge_conflicts_on_divergent_entity_type_changes() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![entity_with_type(id, "U", None)]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", Some("technique"))]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    assert!(matches!(result, MergeResult::Conflicts { .. }));
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::PropertyMismatch { key, .. } if key == "entity_type")
+            ),
+            "expected PropertyMismatch{{key: \"entity_type\"}}, got: {conflicts:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_uuid_different_entity_type_is_conflict() {
+    let id = Uuid::new_v4();
+    let base = archive_with_entities(vec![]);
+    let ours = archive_with_entities(vec![entity_with_type(id, "U", Some("algorithm"))]);
+    let theirs = archive_with_entities(vec![entity_with_type(id, "U", Some("technique"))]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    assert!(matches!(result, MergeResult::Conflicts { .. }));
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(|c| matches!(
+                c,
+                MergeConflict::DuplicateAddition { differing_fields, .. }
+                    if differing_fields.contains(&"entity_type".to_string())
+            )),
+            "expected DuplicateAddition with entity_type in differing_fields, got: {conflicts:?}"
+        );
+    }
+}
+
+// ── #455: duplicate edge_id and symmetric duplicate identity validation ────
+
+#[test]
+fn rejects_duplicate_edge_ids_in_archive() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let d = Uuid::new_v4();
+    let dup_id = Uuid::new_v4();
+
+    let entities = vec![
+        entity(a, "A"),
+        entity(b, "B"),
+        entity(c, "C"),
+        entity(d, "D"),
+    ];
+    let base = archive_full(vec![], vec![]);
+    let mut ours = archive_full(entities, vec![]);
+    ours.edges = vec![
+        ExportedEdge {
+            edge_id: dup_id,
+            source: a,
+            target: b,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+        },
+        ExportedEdge {
+            edge_id: dup_id,
+            source: c,
+            target: d,
+            relation: EdgeRelation::DependsOn,
+            weight: 1.0,
+        },
+    ];
+    let theirs = archive_full(vec![], vec![]);
+
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
+    match err {
+        MergeError::Internal(msg) => {
+            assert!(
+                msg.contains("duplicate edge IDs") && msg.contains(&dup_id.to_string()),
+                "expected message mentioning duplicate edge IDs and the UUID, got: {msg}"
+            );
+        }
+        other => panic!("expected MergeError::Internal, got: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
+    let (lo, hi) = {
+        let x = Uuid::new_v4();
+        let y = Uuid::new_v4();
+        if x < y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    };
+
+    let entities = vec![entity(lo, "A"), entity(hi, "B")];
+    let base = archive_full(vec![], vec![]);
+    let ours = archive_full(
+        entities,
+        vec![
+            ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: lo,
+                target: hi,
+                relation: EdgeRelation::CompetesWith,
+                weight: 1.0,
+            },
+            ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: hi,
+                target: lo,
+                relation: EdgeRelation::CompetesWith,
+                weight: 1.0,
+            },
+        ],
+    );
+    let theirs = archive_full(vec![], vec![]);
+
+    let err = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap_err();
+    match err {
+        MergeError::DuplicateEdgeKey {
+            edge_source,
+            edge_target,
+            edge_relation,
+        } => {
+            assert_eq!(
+                edge_source, lo,
+                "canonical source must be min(source, target)"
+            );
+            assert_eq!(
+                edge_target, hi,
+                "canonical target must be max(source, target)"
+            );
+            assert_eq!(edge_relation, "competes_with");
+        }
+        other => panic!("expected MergeError::DuplicateEdgeKey, got: {other:?}"),
+    }
+}
+
+// ── #456: shortcut strategies must not report dangling edges as Clean ──────
+
+#[test]
+fn ours_strategy_reports_dangling_edge_after_shortcut() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let base = archive_full(vec![entity(a, "A")], vec![]);
+    // ours deletes A and has no edges.
+    let ours = archive_full(vec![], vec![]);
+    // theirs retains A, adds B, and adds edge B -> A.
+    let theirs = archive_full(vec![entity(a, "A"), entity(b, "B")], vec![edge(b, a)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
+    assert!(
+        matches!(result, MergeResult::Conflicts { .. }),
+        "shortcut merge with a dangling edge must not be Clean"
+    );
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::DanglingEdge { missing_endpoint, .. } if *missing_endpoint == a)
+            ),
+            "expected DanglingEdge for missing entity A, got: {conflicts:?}"
+        );
+    }
+}
+
+#[test]
+fn theirs_strategy_reports_dangling_edge_after_shortcut() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let base = archive_full(vec![entity(a, "A")], vec![]);
+    // theirs deletes A and has no edges.
+    let theirs = archive_full(vec![], vec![]);
+    // ours retains A, adds B, and adds edge B -> A.
+    let ours = archive_full(vec![entity(a, "A"), entity(b, "B")], vec![edge(b, a)]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
+    assert!(
+        matches!(result, MergeResult::Conflicts { .. }),
+        "shortcut merge with a dangling edge must not be Clean"
+    );
+    if let MergeResult::Conflicts { conflicts } = result {
+        assert!(
+            conflicts.iter().any(
+                |c| matches!(c, MergeConflict::DanglingEdge { missing_endpoint, .. } if *missing_endpoint == a)
+            ),
+            "expected DanglingEdge for missing entity A, got: {conflicts:?}"
+        );
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

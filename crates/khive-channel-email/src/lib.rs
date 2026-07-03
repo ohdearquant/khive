@@ -15,6 +15,8 @@
 //! | `KHIVE_EMAIL_USERNAME` | yes | — | SMTP/IMAP login username (email address) |
 //! | `KHIVE_EMAIL_MAILBOX` | no | same as username | Mailbox used as sender address |
 //! | `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes | — | Single authorized maintainer address |
+//! | `KHIVE_EMAIL_AUTHSERV_ID` | yes | — | `authserv-id` this deployment trusts in `Authentication-Results` headers (ADR-056 Amendment 2026-07-02) |
+//! | `KHIVE_EMAIL_QUARANTINE_STORE` | no | `true` | Store messages that fail the attribution gate (unattributed) instead of dropping them |
 //!
 //! ## Auth variables
 //!
@@ -32,6 +34,7 @@
 //! | `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` | maintainer address | Comma-separated allowlist of recipient addresses the outbox loop may deliver to; defaults to the single maintainer address |
 //! | `KHIVE_EMAIL_INGEST_NAMESPACE` | `local` | Namespace used when persisting inbound and outbound messages |
 
+pub(crate) mod auth_results;
 pub mod channel;
 pub mod config;
 pub mod connector;

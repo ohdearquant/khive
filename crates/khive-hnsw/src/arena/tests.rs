@@ -436,3 +436,19 @@ fn test_arena_default_capacity() {
     let arena = SearchArena::with_default_capacity();
     assert!(arena.capacity() >= super::arena::DEFAULT_ARENA_SIZE);
 }
+
+#[test]
+fn arena_vec_growth_after_slab_growth_preserves_existing_elements() {
+    // Regression for #412: a second push that triggers arena growth must not
+    // read from a dangling pointer into a since-moved backing allocation.
+    let arena = SearchArena::new(1024);
+    let mut vec: ArenaVec<[u8; 1024]> = ArenaVec::new(&arena, 1);
+
+    vec.push([0xAB; 1024]);
+    vec.push([0xCD; 1024]);
+
+    assert_eq!(vec.len(), 2);
+    assert_eq!(vec[0], [0xAB; 1024]);
+    assert_eq!(vec[1], [0xCD; 1024]);
+    assert!(arena.capacity() >= 2048);
+}
