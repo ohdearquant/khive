@@ -21,8 +21,8 @@ use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
 use khive_brain_core::BetaPosterior;
 use khive_brain_core::{
-    ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
-    DEFAULT_ESS_CAP,
+    FeedbackEventKind, ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState,
+    SectionType, DEFAULT_ESS_CAP,
 };
 
 // ── Adapter revision sentinel ─────────────────────────────────────────────────
@@ -197,6 +197,18 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: false,
                 description: "Per-section feedback signals: {\"section_name\": \"useful\"|\"not_useful\"|\"wrong\"}. For knowledge_compose profiles.",
             },
+            khive_types::ParamDef {
+                name: "scorer_run_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+            },
+            khive_types::ParamDef {
+                name: "serve_ledger_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+            },
         ],
     },
     HandlerDef {
@@ -230,6 +242,18 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the recall. Defaults like brain.feedback.",
+            },
+            khive_types::ParamDef {
+                name: "scorer_run_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+            },
+            khive_types::ParamDef {
+                name: "serve_ledger_id",
+                param_type: "string",
+                required: false,
+                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
             },
         ],
     },
@@ -852,9 +876,23 @@ impl BrainPack {
             signal: String,
             served_by_profile_id: Option<String>,
             section_signals: Option<serde_json::Value>,
+            // ADR-081 §6: scorer provenance, additive and optional. Must be
+            // supplied together (validated just below) — one without the other
+            // is rejected rather than silently coerced.
+            scorer_run_id: Option<String>,
+            serve_ledger_id: Option<String>,
         }
         let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        // ADR-081 §6: together-or-rejected. Absent-both is the unchanged,
+        // ordinary feedback path; present-both enables dedup + ledger backfill
+        // below. Exactly one present is invalid input.
+        if p.scorer_run_id.is_some() != p.serve_ledger_id.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "scorer_run_id and serve_ledger_id must be supplied together".to_string(),
+            ));
+        }
 
         let target: uuid::Uuid =
             resolve_auto_feedback_target(&self.runtime, token, &p.target_id).await?;
@@ -930,31 +968,186 @@ impl BrainPack {
             crate::validate_section_signals(ss)?;
         }
 
-        let mut data = json!({"signal": signal});
+        let sql = self.runtime.sql();
+        let now_us = Utc::now().timestamp_micros();
+
+        // ADR-081 §6: when both scorer_run_id and serve_ledger_id are supplied,
+        // resolve dedup + the accounting_profile_id fail-safe against the serve
+        // ledger before the fold gate runs.
+        let mut forced_zero_weight = false;
+        if let (Some(scorer_run_id), Some(serve_ledger_id)) =
+            (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
+        {
+            match crate::serve_ledger::resolve(sql.as_ref(), serve_ledger_id, scorer_run_id).await?
+            {
+                crate::serve_ledger::ServeLedgerResolution::AlreadyGraded => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": serve_ledger_id,
+                        "scorer_run_id": scorer_run_id,
+                    }));
+                }
+                crate::serve_ledger::ServeLedgerResolution::NotFound => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "serve_ledger_id {:?} not found",
+                        serve_ledger_id
+                    )));
+                }
+                crate::serve_ledger::ServeLedgerResolution::Proceed {
+                    accounting_profile_id,
+                } => {
+                    // ADR-081 §4 fail-safe: an implicit event whose serve row has
+                    // no resolvable profile is recorded at zero weight — never
+                    // folded under a guessed profile.
+                    if accounting_profile_id.is_none() {
+                        forced_zero_weight = true;
+                    }
+                }
+            }
+        }
+
+        // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
+        // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
+        // the fold gate's mass check-and-write AND (Finding 1, codex round 2)
+        // the durable feedback event append (fold_gate.rs) — the `resolve`
+        // check above is a non-atomic fast path only (it still handles the
+        // common sequential case and the NotFound / forced-zero-weight
+        // determination); this is the authoritative correctness mechanism
+        // under concurrent duplicate submissions.
+        let dedup_key: Option<(&str, &str)> =
+            match (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref()) {
+                (Some(r), Some(l)) => Some((r, l)),
+                _ => None,
+            };
+
+        // Base feedback payload, shared by every signal kind. The gated
+        // (implicit) path below adds a "gate" key inside the atomic unit;
+        // the ungated path (explicit/correction) adds nothing further.
+        let mut base_data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {
-            data["served_by_profile_id"] = json!(profile_id);
+            base_data["served_by_profile_id"] = json!(profile_id);
         }
         if let Some(ref ss) = p.section_signals {
-            data["section_signals"] = ss.clone();
+            base_data["section_signals"] = ss.clone();
+        }
+        if let (Some(ref scorer_run_id), Some(ref serve_ledger_id)) =
+            (p.scorer_run_id.as_ref(), p.serve_ledger_id.as_ref())
+        {
+            base_data["scorer_run_id"] = json!(scorer_run_id);
+            base_data["serve_ledger_id"] = json!(serve_ledger_id);
         }
 
-        let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
-        let event = Event::new(
-            token.namespace().as_str().to_string(),
-            "brain.feedback",
-            khive_types::EventKind::FeedbackExplicit,
-            khive_types::SubstrateKind::Event,
-            "brain",
-        )
-        .with_target(target)
-        .with_payload(data)
-        .with_duration_us(duration_us);
+        // ADR-081 §2: the bounded-mass fold gate applies only to implicit
+        // signals. Explicit/correction signals are never gated (they are the
+        // clamp's own comparator, ADR-081 §1) and — ADR-081 §6 — need not
+        // join the event append into the fold transaction: there is no
+        // dedup claim to keep consistent for them, so their append path
+        // below is unchanged from before this fix.
+        let is_gated_implicit = matches!(
+            FeedbackEventKind::from_signal_str(signal),
+            Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
+        );
 
-        let store = self.runtime.events(token)?;
-        store
-            .append_event(event.clone())
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let event = if is_gated_implicit {
+            let nominal_weight = FeedbackEventKind::from_signal_str(signal)
+                .expect("is_gated_implicit implies from_signal_str is Some")
+                .update_weight();
+            // Finding 2 (codex round 2): the forced-zero fail-safe path now
+            // runs through the SAME atomic claim+append unit as the nominal
+            // path below — only the mass fold write itself is skipped — so
+            // it participates in the dedup claim instead of bypassing it.
+            let gate_mode = if forced_zero_weight {
+                crate::fold_gate::FeedbackGateMode::ForcedZero
+            } else {
+                crate::fold_gate::FeedbackGateMode::Nominal(nominal_weight)
+            };
+
+            let namespace = token.namespace().as_str().to_string();
+            let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
+                sql.as_ref(),
+                &namespace,
+                effective_profile,
+                &target.to_string(),
+                gate_mode,
+                now_us,
+                dedup_key,
+                |fold_outcome, forced_zero| {
+                    let mut data = base_data.clone();
+                    let (effective_weight, mass_before, mass_after) = match fold_outcome {
+                        Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
+                        None => (0.0, 0.0, 0.0),
+                    };
+                    data["gate"] = json!({
+                        "effective_weight": effective_weight,
+                        "mass_before": mass_before,
+                        "mass_after": mass_after,
+                        "forced_zero_weight": forced_zero,
+                    });
+                    let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
+                    Event::new(
+                        namespace.clone(),
+                        "brain.feedback",
+                        khive_types::EventKind::FeedbackExplicit,
+                        khive_types::SubstrateKind::Event,
+                        "brain",
+                    )
+                    .with_target(target)
+                    .with_payload(data)
+                    .with_duration_us(duration_us)
+                },
+            )
+            .await?;
+
+            match outcome {
+                // Finding 1 fix: this is now the ONLY place a scorer-tagged
+                // implicit call returns `deduped` — reached only when the
+                // atomic unit's claim conflicted, meaning either a prior call
+                // already committed claim+fold+event together, or (never)
+                // a partially-failed prior attempt, since a failed attempt
+                // rolls back its claim too.
+                crate::fold_gate::GateAndAppendOutcome::Deduped => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": p.serve_ledger_id,
+                        "scorer_run_id": p.scorer_run_id,
+                    }));
+                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
+            }
+        } else {
+            // Unchanged: explicit/correction signals (and non-scorer implicit
+            // feedback would also land here if it ever reached this branch,
+            // but `is_gated_implicit` already routes all implicit signals
+            // above) append through the ordinary `EventStore` path, in its
+            // own transaction — ADR-081 §6 does not require these to join
+            // the fold gate's atomic unit.
+            let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
+            let event = Event::new(
+                token.namespace().as_str().to_string(),
+                "brain.feedback",
+                khive_types::EventKind::FeedbackExplicit,
+                khive_types::SubstrateKind::Event,
+                "brain",
+            )
+            .with_target(target)
+            .with_payload(base_data)
+            .with_duration_us(duration_us);
+
+            let store = self.runtime.events(token)?;
+            store
+                .append_event(event.clone())
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+            event
+        };
 
         let serving_profile_owned = p
             .served_by_profile_id
@@ -1066,6 +1259,25 @@ impl BrainPack {
             eprintln!("[brain] persistence failed (non-fatal): {e}");
         }
 
+        // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
+        // the fold itself so a ledger-write failure never blocks the feedback
+        // event from landing; non-fatal like the persistence call above.
+        if let (Some(scorer_run_id), Some(serve_ledger_id)) =
+            (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
+        {
+            if let Err(e) = crate::serve_ledger::backfill_grade(
+                sql.as_ref(),
+                serve_ledger_id,
+                signal,
+                now_us,
+                scorer_run_id,
+            )
+            .await
+            {
+                eprintln!("[brain] serve ledger grade backfill failed (non-fatal): {e}");
+            }
+        }
+
         Ok(json!({
             "emitted": true,
             "event_id": event.id.to_string(),
@@ -1090,6 +1302,10 @@ impl BrainPack {
             results: Vec<AutoFeedbackResult>,
             signal: Option<String>,
             served_by_profile_id: Option<String>,
+            // ADR-081 §6: forwarded verbatim to brain.feedback, which owns the
+            // together-or-rejected validation and the dedup/fold-gate logic.
+            scorer_run_id: Option<String>,
+            serve_ledger_id: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -1121,6 +1337,12 @@ impl BrainPack {
         });
         if let Some(ref profile_id) = p.served_by_profile_id {
             feedback_params["served_by_profile_id"] = json!(profile_id);
+        }
+        if let Some(ref scorer_run_id) = p.scorer_run_id {
+            feedback_params["scorer_run_id"] = json!(scorer_run_id);
+        }
+        if let Some(ref serve_ledger_id) = p.serve_ledger_id {
+            feedback_params["serve_ledger_id"] = json!(serve_ledger_id);
         }
 
         let mut out = self.handle_feedback(token, feedback_params).await?;
