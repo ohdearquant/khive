@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
@@ -457,7 +457,7 @@ pub(crate) async fn handle_thread(
     // Resolve and validate the passed ID.
     let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
 
-    let canonical_thread_id: String = {
+    let (canonical_thread_id, root_note): (String, Note) = {
         let store = runtime.notes(token)?;
         let note = store
             .get_note(passed_uuid)
@@ -484,7 +484,12 @@ pub(crate) async fn handle_thread(
         // canonical thread_id.  This handles the case where the caller holds an
         // inbound copy UUID (id_B) but the canonical root is the outbound UUID (id_A).
         // Both copies were written with the same canonical thread_id by dual_write_message.
-        match note
+        //
+        // Missing/invalid `thread_id` (issue #479b -- e.g. a legacy/imported root
+        // written before the canonical field existed) falls back to the passed
+        // note's own UUID, matching ADR-040: a target with no `thread_id` becomes
+        // the root for its chain.
+        let canonical = match note
             .properties
             .as_ref()
             .and_then(|p| p.get("thread_id"))
@@ -496,7 +501,8 @@ pub(crate) async fn handle_thread(
                 stored_root.as_hyphenated().to_string()
             }
             _ => passed_uuid.as_hyphenated().to_string(),
-        }
+        };
+        (canonical, note)
     };
 
     // Push thread_id predicate into SQL so idx_comm_message_thread can be used.
@@ -536,6 +542,21 @@ pub(crate) async fn handle_thread(
             break;
         }
         db_offset += PAGE_SIZE;
+    }
+
+    // Practical equivalent of `id == root OR properties.thread_id == root`
+    // (issue #479b): the SQL filter above only matches `properties.thread_id ==
+    // canonical_thread_id`, which misses a root note that lacks a `thread_id`
+    // property at all (e.g. legacy/imported data). Explicitly include the
+    // already-validated root note when the query didn't already return it, so
+    // `comm.thread(id=root)` never reports an empty/incomplete thread for a
+    // root that exists but predates the canonical `thread_id` field.
+    let root_full_id = root_note.id.as_hyphenated().to_string();
+    let root_already_present = messages
+        .iter()
+        .any(|m| m.get("full_id").and_then(Value::as_str) == Some(root_full_id.as_str()));
+    if !root_already_present {
+        messages.push(note_to_message_json(&root_note));
     }
 
     // Sort chronologically ascending (earliest first).
@@ -596,6 +617,23 @@ pub(crate) async fn handle_ingest(
             "ingest: `content` must not be empty".into(),
         ));
     }
+    // Reject a malformed caller-supplied thread_id at the boundary (issue #479a):
+    // a present, non-empty `thread_id` that is not a valid UUID must fail closed
+    // rather than being silently dropped and replaced with a fresh UUID, which
+    // would split the message into the wrong conversation. A blank/absent value
+    // is not an error -- it just means "no caller-supplied thread_id".
+    if let Some(tid) = p
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if tid.parse::<Uuid>().is_err() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "ingest: `thread_id` must be a valid UUID, got: {tid:?}"
+            )));
+        }
+    }
 
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
@@ -646,19 +684,31 @@ pub(crate) async fn handle_ingest(
                         },
                     )
                     .await?;
-                pass1 = corr_page.items.first().and_then(|n| {
-                    let props = n.properties.as_ref()?;
-                    let thread_id = props
-                        .get("thread_id")
+                pass1 = corr_page.items.first().map(|n| {
+                    // Fall back to the matched note's own UUID as the canonical
+                    // root (issue #479b) when it carries no valid `thread_id` --
+                    // e.g. a legacy/imported outbound row written before the
+                    // canonical `thread_id` field existed. Per ADR-040, a
+                    // target message with no `thread_id` becomes the root for
+                    // the new chain, so replies stay attached to the right
+                    // conversation/actor instead of splitting into a fresh
+                    // thread routed to the default inbound actor.
+                    let thread_id = n
+                        .properties
+                        .as_ref()
+                        .and_then(|props| props.get("thread_id"))
                         .and_then(Value::as_str)
                         .filter(|s| s.parse::<Uuid>().is_ok())
-                        .map(|s| s.to_string())?;
-                    let from_actor = props
-                        .get("from_actor")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| n.id.as_hyphenated().to_string());
+                    let from_actor = n
+                        .properties
+                        .as_ref()
+                        .and_then(|props| props.get("from_actor"))
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    Some((thread_id, from_actor))
+                    (thread_id, from_actor)
                 });
                 if pass1.is_some() {
                     break;
@@ -716,10 +766,12 @@ pub(crate) async fn handle_ingest(
     };
 
     // Determine thread_id: caller-supplied > resolved from correlation > new root.
+    // `p.thread_id` was already validated above (present+non-empty implies valid UUID).
     let thread_id: String = p
         .thread_id
         .as_deref()
-        .filter(|s| s.parse::<Uuid>().is_ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| resolved.as_ref().map(|(tid, _)| tid.clone()))
         .unwrap_or_else(|| Uuid::new_v4().as_hyphenated().to_string());
