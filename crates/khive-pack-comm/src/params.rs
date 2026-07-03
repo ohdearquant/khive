@@ -99,6 +99,16 @@ pub(crate) struct IngestParams {
     /// own Message-ID (issue #403).
     #[serde(default)]
     pub wire_references: Option<String>,
+    /// Optional transport-layer metadata passthrough, merged verbatim into the
+    /// stored note's properties alongside the fields above. Generic and
+    /// channel-agnostic: the comm pack does not interpret any key in this map,
+    /// it only persists it. A channel adapter that needs to attach adapter-specific
+    /// markers (e.g. the email channel's quarantine flags, ADR-056 Amendment
+    /// 2026-07-02) sets `ChannelEnvelope.metadata`; the MCP poll loop forwards it
+    /// here unchanged. Absent metadata is today's behavior exactly (issue #448
+    /// Finding 2).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {

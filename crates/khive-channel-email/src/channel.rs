@@ -926,6 +926,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quoted_reason_semicolon_forging_dmarc_pass_does_not_bypass_gate() {
+        // Regression for codex #496 Finding 1, driven through the REAL byte-parsing
+        // path (parse_raw_bytes), not a hand-built AuthResults: a quoted reason=
+        // pvalue containing "; dmarc=pass; " must never be split into a separate
+        // dmarc method -- the gate must see the genuine spf=fail result and
+        // quarantine, never attribute to the maintainer.
+        let raw = b"Authentication-Results: mx.example.com; spf=fail reason=\"remote said; dmarc=pass; still fail\" smtp.mailfrom=attacker.net\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: quoted reason attack\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:quarantine",
+            "a forged dmarc=pass hidden inside a quoted reason pvalue must never attribute mail"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("dmarc-fail")
+        );
+    }
+
+    #[tokio::test]
     async fn spf_pass_unaligned_envelope_from_quarantines_unaligned() {
         let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=alice@attacker.net\r\n\
                     From: maintainer@example.com\r\n\

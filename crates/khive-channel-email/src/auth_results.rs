@@ -5,11 +5,23 @@
 //! `HeaderValue::Text` (or `TextList` when duplicated) via the generic `Other`
 //! header path. This module hand-parses only what the attribution gate needs:
 //! the `authserv-id`, and the `dmarc`/`spf`/`dkim` method verdicts plus the
-//! `header.d` / `smtp.mailfrom` / `header.from` alignment properties. It does
-//! not attempt full ABNF conformance (CFWS comments, quoted-string pvalues,
-//! `ptype.property` values containing `=`) -- those are tolerated as harmless
-//! unmatched tokens, never as false positives against the three keys this
-//! module actually reads.
+//! `header.d` / `smtp.mailfrom` / `header.from` alignment properties.
+//!
+//! The top-level split into `resinfo` segments is CFWS-aware: it walks the raw
+//! header value once, tracking quoted-string state (honoring `\` escapes) and
+//! `(...)` comment nesting (RFC 5322 comments nest), and only treats a `;` as a
+//! segment boundary when it appears outside both. Comments are stripped
+//! entirely before segment text is retained; quoted-string content is kept
+//! verbatim (including any `;` or `=` it contains) as part of the single
+//! segment it belongs to. This guarantees a `;` inside a `reason="..."`
+//! quoted pvalue or inside a `(...)` comment can never manufacture an
+//! additional, unintended `method=result` segment -- see
+//! `parse_header_reason_quoted_semicolon_does_not_forge_dmarc_pass` and
+//! `parse_header_comment_semicolon_does_not_forge_dmarc_pass` below. It does
+//! not attempt full ABNF conformance beyond that (e.g. `ptype.property`
+//! values containing bare `=`) -- those are tolerated as harmless unmatched
+//! tokens, never as false positives against the three keys this module
+//! actually reads.
 
 use std::collections::HashMap;
 
@@ -87,6 +99,66 @@ fn domain_of(value: &str) -> String {
     }
 }
 
+/// Split a raw `Authentication-Results` header value into top-level
+/// `resinfo` segments on `;`, tracking RFC 5322 quoted-string state (with `\`
+/// escapes) and `(...)` comment nesting so a `;` inside either is never
+/// treated as a segment boundary. Comment text is stripped entirely (CFWS is
+/// insignificant for token purposes); quoted-string text -- including any `;`
+/// or `=` inside it -- is preserved verbatim as part of its enclosing
+/// segment.
+fn split_top_level_segments(raw: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut comment_depth: u32 = 0;
+    let mut chars = raw.chars();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            current.push(c);
+            match c {
+                '\\' => {
+                    // Quoted-pair: the following character is escaped and never
+                    // terminates the quoted string, regardless of what it is.
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        if comment_depth > 0 {
+            match c {
+                '\\' => {
+                    // Quoted-pair inside a comment: consume and discard the
+                    // escaped character without altering comment depth.
+                    chars.next();
+                }
+                '(' => comment_depth += 1,
+                ')' => comment_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+
+        match c {
+            '"' => {
+                in_quotes = true;
+                current.push(c);
+            }
+            '(' => comment_depth += 1,
+            ';' => segments.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    segments.push(current);
+
+    segments
+}
+
 /// Parse one raw `Authentication-Results` header value.
 ///
 /// Returns `None` only when no `authserv-id` token can be extracted at all
@@ -95,7 +167,7 @@ fn domain_of(value: &str) -> String {
 /// to an `AuthResults` with empty method vectors -- the gate treats "no
 /// recognized passing method" uniformly regardless of which of those it was.
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
-    let mut segments = raw.split(';');
+    let mut segments = split_top_level_segments(raw).into_iter();
     let authserv_id = segments.next()?.split_whitespace().next()?.to_string();
     if authserv_id.is_empty() {
         return None;
@@ -118,6 +190,10 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
         let Some((method, result)) = methodspec.split_once('=') else {
             continue;
         };
+        // RFC 8601 permits an optional "/version" suffix on the method name
+        // (e.g. `dkim/1=pass`). Strip it before matching so a versioned method
+        // is recognized the same as its unversioned form.
+        let method = method.split_once('/').map_or(method, |(base, _)| base);
 
         let mut props = HashMap::new();
         for token in tokens {
@@ -189,6 +265,76 @@ mod tests {
     fn parse_header_empty_value_returns_none() {
         assert!(parse_header("").is_none());
         assert!(parse_header("   ").is_none());
+    }
+
+    // --- Finding 1: quoted-string / CFWS-comment semicolons must not forge a method ---
+
+    #[test]
+    fn parse_header_reason_quoted_semicolon_does_not_forge_dmarc_pass() {
+        // codex #496 repro: a `;` inside a quoted reason= pvalue must never be
+        // treated as a top-level segment boundary, so this must NOT produce a
+        // dmarc method result at all -- the real result here is spf=fail.
+        let parsed = parse_header(
+            r#"mx.example.com; spf=fail reason="remote said; dmarc=pass; still fail" smtp.mailfrom=attacker.net"#,
+        )
+        .unwrap();
+        assert!(
+            parsed.dmarc.is_empty(),
+            "quoted text must never manufacture a dmarc method entry; got {:?}",
+            parsed.dmarc
+        );
+        assert!(!parsed.dmarc_pass());
+    }
+
+    #[test]
+    fn parse_header_comment_semicolon_does_not_forge_dmarc_pass() {
+        // Same attack shape via a `(...)` CFWS comment instead of a quoted pvalue.
+        let parsed = parse_header(
+            "mx.example.com; spf=fail smtp.mailfrom=attacker.net (comment; dmarc=pass; end)",
+        )
+        .unwrap();
+        assert!(
+            parsed.dmarc.is_empty(),
+            "comment text must never manufacture a dmarc method entry; got {:?}",
+            parsed.dmarc
+        );
+        assert!(!parsed.dmarc_pass());
+    }
+
+    #[test]
+    fn parse_header_legitimate_quoted_reason_does_not_hide_a_real_later_dmarc_pass() {
+        // A quoted pvalue with a harmless embedded `;` must not prevent a genuine,
+        // separate top-level dmarc=pass segment later in the same header from
+        // being recognized -- the tokenizer must not over-fail-close.
+        let parsed = parse_header(
+            r#"mx.example.com; spf=fail reason="passed; ok" smtp.mailfrom=attacker.net; dmarc=pass header.from=example.com"#,
+        )
+        .unwrap();
+        assert!(
+            parsed.dmarc_pass(),
+            "a genuine top-level dmarc=pass after a quoted reason must still be recognized"
+        );
+    }
+
+    // --- Finding 3: RFC 8601 method "/version" suffix must not fail closed ---
+
+    #[test]
+    fn parse_header_dkim_version_suffix_is_stripped_before_matching() {
+        let parsed = parse_header("mx.example.com; dkim/1=pass header.d=example.com").unwrap();
+        assert!(parsed.dkim_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn parse_header_spf_version_suffix_is_stripped_before_matching() {
+        let parsed =
+            parse_header("mx.example.com; spf/1=pass smtp.mailfrom=alice@example.com").unwrap();
+        assert!(parsed.spf_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn parse_header_dmarc_version_suffix_is_stripped_before_matching() {
+        let parsed = parse_header("mx.example.com; dmarc/1=pass header.from=example.com").unwrap();
+        assert!(parsed.dmarc_pass());
     }
 
     #[test]

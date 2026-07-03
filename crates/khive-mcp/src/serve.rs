@@ -261,6 +261,7 @@ async fn channel_poll_loop(
                             "default_inbound_actor": default_inbound_actor,
                             "wire_message_id": env.wire_message_id,
                             "wire_references": env.wire_references,
+                            "metadata": env.metadata,
                         });
                         if let Err(e) = registry.dispatch("comm.ingest", params).await {
                             tracing::warn!(
