@@ -802,6 +802,101 @@ mod tests {
         let _ = props_bad2["status"].as_str(); // just verify it's accessible
     }
 
+    /// Issue #461: a `schedule.schedule` payload that write-time validation
+    /// now accepts (single op, exactly-registered handler name, literal args,
+    /// all required params present) must actually dispatch successfully at
+    /// trigger time — proving write-time acceptance and trigger-time replay
+    /// agree. Before the fix, a bare-shorthand payload could pass write-time
+    /// checks yet fail replay as an unknown verb; this asserts the *positive*
+    /// case: a canonical payload produces zero dispatch failures.
+    #[tokio::test]
+    async fn replayable_action_dispatches_without_failure_at_trigger_time() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            past,
+            Some("schedule.remind(content=\"ping\", at=\"2099-01-01T00:00:00Z\")"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            summary.failed, 0,
+            "a write-time-replayable action must dispatch cleanly at trigger time"
+        );
+        assert!(
+            summary.fired >= 1 || summary.advanced >= 1,
+            "the event must be processed"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"].as_str(), Some("fired"));
+    }
+
+    /// Issue #461: a legacy stored action containing a `$prev` reference
+    /// (impossible to create through the handler after this fix, but
+    /// representative of a row written before the write-time guard existed)
+    /// must be rejected by `dispatch_action` with an error naming the
+    /// non-literal argument, not silently dropped and dispatched with
+    /// missing/wrong data. Asserting the specific error text (rather than
+    /// just "some failure occurred") matters here: a downstream handler
+    /// might independently reject a dropped-but-required argument as
+    /// "missing", which would make a weaker assertion pass even if the
+    /// silent-drop bug were reintroduced.
+    #[tokio::test]
+    async fn dispatch_action_rejects_non_literal_prev_reference() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not replayable"),
+            "expected the specific non-literal-argument rejection message, got: {msg}"
+        );
+    }
+
+    /// Same scenario end-to-end through the drain: confirms the rejection
+    /// surfaces as a counted failure rather than aborting the drain or being
+    /// swallowed, and that the drain still completes.
+    #[tokio::test]
+    async fn dispatch_rejects_legacy_prev_reference_instead_of_dropping_it() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let _id = create_scheduled_event(
+            &rt,
+            "local",
+            past,
+            Some("stats() | get(id=$prev.id)"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain must not abort or panic on a legacy $prev row");
+
+        assert!(
+            summary.failed >= 1,
+            "a legacy $prev reference must surface as a dispatch failure, not a silent drop"
+        );
+    }
+
     // Unit tests for next_trigger_at
 
     #[test]
