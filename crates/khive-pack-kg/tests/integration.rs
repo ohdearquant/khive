@@ -6289,10 +6289,11 @@ async fn hard_delete_soft_deleted_note_cross_namespace_succeeds() {
 // namespace than the record got `NotFound` for a prefix that would have
 // resolved fine as a full UUID — the outage's by-ID-adjacent half. These
 // tests lock in the fix: prefix resolution is now unfiltered too, matching
-// the full-UUID contract. Distinct from feedback's visible-set policy
-// (`brain_feedback_accepts_visible_only_target_id` in
-// `khive-pack-brain/tests/dispatch_hook.rs`) — by-ID CRUD has no visibility
-// boundary at all; the Gate is the authz seam.
+// the full-UUID contract. by-ID CRUD has no visibility boundary at all; the
+// Gate is the authz seam (ADR-007 Rev 6). This shares the namespace-agnostic
+// by-ID contract that `brain.feedback` now follows
+// (`brain_feedback_accepts_foreign_namespace_target_id` in
+// `khive-pack-brain/tests/dispatch_hook.rs`, #498).
 
 /// `get` by short prefix from a caller in a DIFFERENT namespace than the
 /// record must now succeed (was `NotFound` pre-#391).

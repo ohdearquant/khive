@@ -320,84 +320,89 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     );
 }
 
-// ---- #391 supersedes "Finding 3" (PR #127): brain.feedback resolves over ----
-// ---- the caller's VISIBLE set, not primary-only                         ----
+// ---- bfbb65d1 regression: brain.feedback target_id is namespace-agnostic ----
 
-/// `brain.feedback` must ACCEPT a `target_id` that lives in a visible
-/// (non-primary) namespace.
+/// `brain.feedback` must ACCEPT a `target_id` that lives in another namespace.
 ///
-/// PR #127 originally locked feedback to primary-only resolution
-/// (`resolve_primary`) under a general "mutation reference validation must be
-/// primary-only" principle, reasoning that feedback mutates its target.
-/// Issue #391 (Leo-ruled, 2026-07-01) corrected that framing: `brain.feedback`
-/// appends a NEW ledger event that *references* the target — it does not
-/// mutate the target row — so target resolution is read-class, the same
-/// class as `memory.recall`. Under ADR-007 Rev 6, EPISODIC memory notes are
-/// stamped with the caller's actor-id namespace, so primary-only resolution
-/// made every episodic memory feedback-unreachable the moment it was written
-/// under an actor-id namespace different from the caller's session-primary —
-/// a fleet-wide feedback-discipline outage. The fix moved feedback's target
-/// resolution from `resolve_primary` to `resolve` (visible-set-aware),
-/// mirroring the visibility recall already uses. This test (formerly
-/// `brain_feedback_rejects_visible_only_target_id`) now asserts the
-/// corrected contract; see `khive-pack-brain/src/tests.rs` `test_391_*` for
-/// the full 3-shape + negative regression suite (including the still-strict
-/// `resolve_primary` contract used by mutation-validation callers elsewhere).
+/// ADR-007 Rule 2 / PR-A1: by-ID ops (get / update / delete / merge — and
+/// feedback) resolve a globally-unique UUID with no namespace check; the Gate
+/// owns authorization, not a post-fetch namespace comparison. Rule 3b recall
+/// fans out actor-stamped memories from other namespaces by design (a lambda's
+/// episodic memories carry its actor namespace), so a primary-only check
+/// rejected the flywheel's own recalled targets — exactly the fleet-wide
+/// feedback-discipline breakage this fixes.
+///
+/// This reverses the earlier "Finding 3" primary-only behavior, which cited
+/// ADR-007 for a rule the document does not contain (the word "feedback" never
+/// appears in ADR-007; lines 213-221 are the dispatch-boundary token-minting
+/// paragraph, unrelated to targeting foreign records).
 #[tokio::test]
-async fn brain_feedback_accepts_visible_only_target_id() {
+async fn brain_feedback_accepts_foreign_namespace_target_id() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
     let ns_primary = Namespace::parse("brain-primary-ns").unwrap();
     let ns_foreign = Namespace::parse("brain-foreign-ns").unwrap();
 
-    // Create a KG entity in the foreign (visible-only) namespace.
+    // A recalled note (the episodic-memory analog) stamped in the foreign
+    // namespace — the Rule 3b fanout target class.
     let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
-    let foreign_entity = rt
-        .create_entity(
+    let foreign_note = rt
+        .create_note(
             &tok_foreign,
-            "concept",
+            "observation",
             None,
-            "ForeignTarget",
+            "foreign-namespace recalled memory",
             None,
             None,
             vec![],
         )
         .await
         .unwrap();
-    let foreign_id = foreign_entity.id.as_hyphenated().to_string();
+    let foreign_id = foreign_note.id.as_hyphenated().to_string();
 
-    // Build a visible-set token: primary-ns can read (but not mutate) foreign-ns.
-    let tok_vis = rt
-        .authorize_with_visibility(ns_primary.clone(), vec![ns_foreign.clone()])
-        .unwrap();
+    // Caller in a different primary namespace with NO visibility grant for the
+    // foreign ns. resolve_by_id is ID-only (ignores namespace AND visible set),
+    // so feedback must still resolve the foreign target. Using a bare token pins
+    // the FULL ns-agnostic contract: this test fails under the old primary-only
+    // `resolve_primary` AND under any future visible-set-gated `resolve`.
+    let tok_primary = rt.authorize(ns_primary.clone()).unwrap();
 
-    // Verify the visible-set token CAN read the foreign entity (control check).
-    let found = rt.get_entity(&tok_vis, foreign_entity.id).await;
-    assert!(
-        found.is_ok(),
-        "visible-set token must be able to read the foreign entity; got: {found:?}"
-    );
-
-    // brain.feedback with the foreign entity as target_id must now succeed:
-    // feedback is downstream of recall and follows recall's visibility.
     let brain = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new().build().unwrap();
-
-    // First promote the primary namespace.
     brain
-        .dispatch("brain.profiles", json!({}), &empty_registry, &tok_vis)
+        .dispatch("brain.profiles", json!({}), &empty_registry, &tok_primary)
         .await
         .expect("promote primary namespace");
 
-    let result = brain
+    // Feedback on the foreign-namespace target now RESOLVES and emits
+    // (previously returned NotFound under the primary-only check).
+    let out = brain
         .dispatch(
             "brain.feedback",
             json!({ "target_id": foreign_id, "signal": "useful" }),
             &empty_registry,
-            &tok_vis,
+            &tok_primary,
+        )
+        .await;
+    assert!(
+        out.is_ok(),
+        "brain.feedback on a foreign-namespace target must succeed \
+         (ADR-007 Rule 2 by-ID resolution); got: {out:?}"
+    );
+
+    // A genuinely absent UUID still returns NotFound.
+    let absent = "00000000-0000-4000-8000-000000000000";
+    let err = brain
+        .dispatch(
+            "brain.feedback",
+            json!({ "target_id": absent, "signal": "useful" }),
+            &empty_registry,
+            &tok_primary,
         )
         .await
-        .expect("#391: brain.feedback with a visible-only target_id must resolve");
-
-    assert_eq!(result["emitted"], json!(true), "emitted must be true");
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("not found"),
+        "brain.feedback on an absent target_id must return NotFound; got: {err}"
+    );
 }

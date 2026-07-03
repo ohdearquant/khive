@@ -1,7 +1,8 @@
 # ADR-080: Session Pack — OSS Storage Mechanism
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-06-28
+**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context)
 **Authors**: Ocean, lambda:khive
 
 ## Context
@@ -18,6 +19,11 @@ The scope boundary moves, not the underlying design.
 JSONL parsers, summarization, transcript processing, and any aggregation logic that derives
 structured output from raw session content — is not in scope for this repository or this
 ADR. The OSS pack ships storage and retrieval verbs only.
+
+> **Amended 2026-07-02**: partially superseded. Transcript _format parsers_ and idempotent
+> _ingestion_ are now in scope, shipped as the pack's read-only background mirror (§6).
+> Summarization, digestion, and any aggregation that derives structured output from raw
+> session content remain out of scope, unchanged.
 
 ### The pack system already supports the required extension points
 
@@ -103,6 +109,19 @@ returns `RuntimeError::UnknownNoteKind` if the pack is not loaded.
 
 All four verbs have `visibility: Visibility::Verb`. Speech-act categories follow ADR-025.
 
+> **Amended 2026-07-02** — shipped-surface record. The implementation that landed diverges
+> from this section in three ways, all deliberate:
+>
+> 1. **Three handlers, not four.** `session.resume` was renamed `session.get` before ship
+>    (consistency with the substrate-wide `get`). `session.export` was never registered as
+>    a verb: serialization is an internal helper (`handle_export`) called in-process, with
+>    no `HandlerDef` entry.
+> 2. **`Visibility::Subhandler`, not `Verb`.** All three handlers ship operator-only:
+>    dispatchable through the runtime and `kkernel exec`, withheld from the agent-facing
+>    MCP `request` surface until the session-continuity query UX is designed.
+> 3. **The pack's active feature is the background mirror** (§6), which runs from the
+>    `warm()` hook independent of verb visibility.
+
 #### `session.store` (Directive)
 
 Store a session blob: transcript, context snapshot, accumulated agent state, or arbitrary
@@ -157,6 +176,11 @@ Implementation: fetch via `runtime.get_note(id)`, then serialize to the requeste
 `session.import` is **not in scope** for this pack. Ingestion and processing of external
 session content belongs to layers outside this repository.
 
+> **Amended 2026-07-02**: still no `session.import` verb — ingestion is not caller-driven.
+> It ships instead as the read-only background mirror (§6), which tails known transcript
+> locations on a poll loop. The digestion half of the original exclusion (summarization,
+> derived aggregation) remains out of scope.
+
 ### 4. Storage phasing: M1 (substrate-native) and M2 (optional auxiliary index)
 
 The two phases share the same verb surface. The difference is where auxiliary index data
@@ -174,6 +198,11 @@ M1 requires no schema migration and no auxiliary tables. It is the complete ship
 implementation for the first PR.
 
 #### M2 — optional dedicated `session_metadata` index (deferred)
+
+> **Amended 2026-07-02**: the pack now ships a schema plan, but it carries the mirror's
+> auxiliary tables (`sessions`, `session_messages`, `session_mirror_cursor` — §6), not the
+> `session_metadata` index sketched below. That index remains deferred and unshipped; the
+> paragraphs below stay as the upgrade sketch for a measured list-query bottleneck.
 
 When list-query performance over large session corpora becomes the constraint, the pack
 may introduce a dedicated `session_metadata` auxiliary table via `PackSchemaPlan` — the
@@ -209,6 +238,103 @@ Session verb handlers call only the public `KhiveRuntime` API methods (`create_n
 They do not hold a direct reference to `Arc<StorageBackend>` or any `khive-db` type. When
 ADR-071 Phase 4 replaces `Arc<StorageBackend>` with `BackendHandle`, the session pack
 requires no modification. This is an explicit constraint on the implementation.
+
+### 6. The session mirror (Amendment, 2026-07-02)
+
+The pack's shipped ingestion surface is a **read-only background mirror**: a poll loop,
+spawned from `PackRuntime::warm()` when enabled, that tails known transcript locations on
+the local filesystem and lands their content in the pack's auxiliary tables. It shipped as
+the M2 milestone of the session pack build (issue #350, PR #368) with the Claude Code
+source, gained the Codex CLI source in PR #375, and gains the ChatGPT export source with
+this amendment. The mirror is disabled by default and never writes to, moves, or deletes
+the files it reads.
+
+#### Mirror sources — closed set
+
+`MirrorSource` is a closed enum. Adding a source requires amending this section.
+
+| Source         | `source` value   | Input shape                                        | Ingestion mode |
+| -------------- | ---------------- | -------------------------------------------------- | -------------- |
+| Claude Code    | `claude_code`    | `<projects dir>/**/<session-uuid>.jsonl`           | line-tail      |
+| Codex CLI      | `codex`          | `<sessions dir>/**/rollout-*-<session-uuid>.jsonl` | line-tail      |
+| ChatGPT export | `chatgpt_export` | `<exports dir>/**/conversations.json` (JSON array) | whole-file     |
+
+**Line-tail** (append-only JSONL): each pass reads from the file's stored byte offset,
+parses complete lines, and advances the cursor to the last complete line boundary. A file
+whose length has not grown past the cursor is skipped without being opened.
+
+**Whole-file** (export archives): the file is parsed as a single JSON document. On success
+the cursor is set to the file's byte length, so an unchanged export is skipped by the same
+length fast-path on every later pass. On parse failure — including a partially downloaded
+export — the cursor does not advance and the file is retried on the next pass.
+
+#### Auxiliary schema
+
+The shipped schema plan (ADR-028 mechanism, applied at boot) declares three tables and
+three indexes: `sessions` (one row per session or conversation: provider id, source, cwd,
+git branch, slug, message count, first/last seen), `session_messages` (one row per
+transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechain flag,
+role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
+watched file: byte offset, session id, updated-at).
+
+#### Invariants (normative for every source)
+
+1. **Sessions are create-only.** The session row inserts with `ON CONFLICT(id) DO NOTHING`;
+   later passes only touch metadata, monotonically (`last_seen_at = MAX(...)`) with
+   `COALESCE` backfill of nullable fields, and only when the pass actually inserted rows.
+2. **Message inserts are idempotent.** `INSERT OR IGNORE` keyed on the event UUID;
+   re-mirroring any file, in whole or in part, changes nothing already stored. `seq` is
+   assigned per session at insert time.
+3. **Secret masking is unconditional.** Every `text` and `raw` value passes through
+   `khive_runtime::secret_gate` masking before storage, for every source.
+4. **Errors never advance the cursor.** A per-file parse or IO error leaves that file's
+   cursor untouched (the file is retried next pass) and does not block other files.
+5. **One transaction per file pass.** Message rows, the metadata touch, the message-count
+   refresh, and the cursor upsert commit atomically.
+
+#### ChatGPT export mapping
+
+The ChatGPT source ingests the `conversations.json` from a ChatGPT data export: a JSON
+array of conversation objects, each carrying a `mapping` of message nodes forming a tree
+(regenerations and edits create sibling branches; `current_node` marks the active leaf).
+
+- One conversation object becomes one `sessions` row. `id` and `provider_session_id` are
+  the conversation UUID; `slug` carries the conversation title; `cwd` and `git_branch` are
+  null (no workspace context exists in the export).
+- The `mapping` tree is traversed depth-first preorder from the root, following each
+  node's `children` order. Every node with a non-null message and non-empty extracted text
+  becomes a `session_messages` row keyed on the ChatGPT message UUID, with `parent_uuid`
+  taken from the tree.
+- `is_sidechain` is set for nodes not on the root-to-`current_node` path. Branches are
+  ingested, not dropped: the data layer preserves history; selecting the active thread is
+  a view concern.
+- Timestamps fall back per message: `message.create_time`, else the conversation's
+  `create_time`, else zero — converted to microseconds.
+- Content extraction covers the `text` (parts array), `code`, and `execution_output`
+  content types. System scaffolding nodes with empty parts are skipped.
+- Discovery is a recursive scan of the configured directory for files named exactly
+  `conversations.json`, so both a bare file and unpacked export archives work.
+
+#### Configuration
+
+All configuration is environment-driven, read once when `warm()` starts the service:
+
+| Variable                       | Default                  |
+| ------------------------------ | ------------------------ |
+| `KHIVE_MIRROR_ENABLED`         | `false`                  |
+| `KHIVE_MIRROR_PROJECTS_DIR`    | `$HOME/.claude/projects` |
+| `KHIVE_MIRROR_CODEX_ENABLED`   | `false`                  |
+| `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`  |
+| `KHIVE_MIRROR_CHATGPT_ENABLED` | `false`                  |
+| `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports` |
+| `KHIVE_MIRROR_POLL_SECS`       | `2`                      |
+| `KHIVE_MIRROR_BACKFILL`        | `true`                   |
+
+#### What remains out of scope
+
+Summarization, transcript digestion, and any aggregation that derives structured output
+from mirrored rows. The mirror lands faithful, masked, idempotent copies; everything that
+interprets them lives outside this repository.
 
 ## Rationale
 

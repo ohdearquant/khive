@@ -2586,6 +2586,48 @@ mod help_tests {
         );
     }
 
+    /// ADR-084 Rule 3 (help-schema fidelity): scorer_run_id/serve_ledger_id are
+    /// accepted params (ADR-081 §6) that must be declared in the help=true
+    /// surface, not just parsed internally — a hidden accepted param is
+    /// exactly the drift Rule 3 exists to catch.
+    #[test]
+    fn brain_feedback_declares_adr081_dedup_key_params() {
+        let h = find_handler("brain.feedback");
+        let scorer_run_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "scorer_run_id")
+            .unwrap_or_else(|| panic!("brain.feedback must declare scorer_run_id"));
+        assert!(
+            !scorer_run_id.required,
+            "scorer_run_id is optional (together-or-rejected with serve_ledger_id, not always required)"
+        );
+        assert!(
+            scorer_run_id.description.contains("dedup")
+                && scorer_run_id.description.contains("together")
+                && scorer_run_id.description.contains("serve_ledger_id"),
+            "scorer_run_id description must document the dedup + together-or-rejected pairing: {:?}",
+            scorer_run_id.description
+        );
+
+        let serve_ledger_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "serve_ledger_id")
+            .unwrap_or_else(|| panic!("brain.feedback must declare serve_ledger_id"));
+        assert!(
+            !serve_ledger_id.required,
+            "serve_ledger_id is optional (together-or-rejected with scorer_run_id)"
+        );
+        assert!(
+            serve_ledger_id.description.contains("dedup")
+                && serve_ledger_id.description.contains("together")
+                && serve_ledger_id.description.contains("scorer_run_id"),
+            "serve_ledger_id description must document the dedup + together-or-rejected pairing: {:?}",
+            serve_ledger_id.description
+        );
+    }
+
     #[test]
     fn brain_auto_feedback_handler_is_declared() {
         let h = find_handler("brain.auto_feedback");
@@ -2596,6 +2638,37 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "results" && p.required),
             "brain.auto_feedback must have required results param"
+        );
+    }
+
+    /// Mirrors `brain_feedback_declares_adr081_dedup_key_params`: auto_feedback
+    /// forwards scorer_run_id/serve_ledger_id verbatim to brain.feedback, so
+    /// its own help surface must document them too (ADR-084 Rule 3).
+    #[test]
+    fn brain_auto_feedback_declares_adr081_dedup_key_params() {
+        let h = find_handler("brain.auto_feedback");
+        let scorer_run_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "scorer_run_id")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare scorer_run_id"));
+        assert!(!scorer_run_id.required);
+        assert!(
+            scorer_run_id.description.contains("serve_ledger_id"),
+            "scorer_run_id description must document the together-or-rejected pairing: {:?}",
+            scorer_run_id.description
+        );
+
+        let serve_ledger_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "serve_ledger_id")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare serve_ledger_id"));
+        assert!(!serve_ledger_id.required);
+        assert!(
+            serve_ledger_id.description.contains("scorer_run_id"),
+            "serve_ledger_id description must document the together-or-rejected pairing: {:?}",
+            serve_ledger_id.description
         );
     }
 
@@ -3952,270 +4025,6 @@ async fn feedback_accepts_short_prefix_target_id() {
     assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
 }
 
-// ── #391: feedback target resolution over the caller's VISIBLE set ──────────
-//
-// Root cause: ADR-007 Rev 6 stamps EPISODIC memory notes with the caller's
-// actor-id namespace (memory pack `remember.rs`), but `brain.feedback` /
-// `brain.auto_feedback` resolved targets against the caller's PRIMARY
-// namespace only (`resolve_primary` / `resolve_prefix`). Every episodic
-// memory written after the Rev-6 rollout became feedback-unreachable. The
-// fix widens resolution to the caller's full visible set (`resolve` /
-// `resolve_prefix_visible`), mirroring how `memory.recall` already surfaces
-// records across the visible set. Strict `resolve_primary` / `resolve_prefix`
-// remain untouched for mutation-validation callers (gtd depends_on, link
-// endpoints, and non-KG prefix validators). KG by-ID CRUD
-// (get/update/delete/merge) is the OTHER policy in this fix: its prefix
-// resolution intentionally moved to `resolve_uuid_unfiltered` — no namespace
-// boundary at all, matching the full-UUID by-ID contract — see
-// `khive-pack-gtd/tests/dependencies.rs::resolve_primary_rejects_visible_only_*`
-// and `khive-runtime/tests/integration.rs` visible-set tests.
-//
-// khive-pack-brain has no dependency on khive-pack-memory, so these tests
-// create notes directly via `rt.create_note(token, "memory", ...)` to
-// reproduce the actor-ns-stamped shape without pulling in the memory pack.
-// Note-kind validation is a no-op on a bare `KhiveRuntime::memory()` runtime
-// (no packs installed → `validate_note_kind` allows any kind), so "memory"
-// here behaves exactly like a real episodic memory row for resolution
-// purposes — the bug is about namespace visibility, not note kind.
-
-/// Shape 1 (baseline, must stay green): a note in the caller's own `local`
-/// primary namespace resolves via `brain.feedback` today and after the fix.
-#[tokio::test]
-async fn test_391_feedback_resolves_note_in_local_namespace_baseline() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-    let token = rt.authorize(Namespace::local()).unwrap();
-
-    let note = rt
-        .create_note(
-            &token,
-            "memory",
-            None,
-            "local baseline memory",
-            None,
-            None,
-            vec![],
-        )
-        .await
-        .expect("create baseline memory note");
-
-    let result = pack
-        .dispatch(
-            "brain.feedback",
-            json!({
-                "target_id": note.id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "balanced-recall-v1"
-            }),
-            &registry,
-            &token,
-        )
-        .await
-        .expect("baseline: feedback on a local-namespace memory note must resolve");
-    assert_eq!(result["emitted"], json!(true));
-}
-
-/// Shape 2, full-UUID form (leg C): an episodic-shaped note stamped with the
-/// caller's actor-id namespace (`lambda:test-391`, not `local`) must resolve
-/// via `brain.feedback`'s exact-UUID path once the caller's visible set
-/// includes that namespace. Before the fix (`resolve_primary`, primary-only)
-/// this returned NotFound; after the fix (`resolve`, visible-set-aware) it
-/// must succeed.
-#[tokio::test]
-async fn test_391_feedback_resolves_actor_namespace_note_full_uuid() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-
-    let actor_ns = Namespace::parse("lambda:test-391").unwrap();
-    let writer_token = rt.authorize(actor_ns.clone()).unwrap();
-    let note = rt
-        .create_note(
-            &writer_token,
-            "memory",
-            None,
-            "actor-ns memory",
-            None,
-            None,
-            vec![],
-        )
-        .await
-        .expect("create actor-ns memory note");
-
-    // Caller's primary is `local`; visible set additionally covers the actor ns
-    // (ADR-007 Rev 6 visible set = {local} ∪ {actor.id} ∪ {actor.visible_namespaces}).
-    let caller_token = rt
-        .authorize_with_visibility(Namespace::local(), vec![actor_ns])
-        .unwrap();
-
-    let result = pack
-        .dispatch(
-            "brain.feedback",
-            json!({
-                "target_id": note.id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "balanced-recall-v1"
-            }),
-            &registry,
-            &caller_token,
-        )
-        .await
-        .expect(
-            "#391 leg C: feedback on an actor-ns memory note visible to the caller must resolve",
-        );
-    assert_eq!(result["emitted"], json!(true));
-}
-
-/// Shape 2, 8-char-prefix form (leg B, cascading into leg C): the same
-/// actor-ns note, targeted by hex prefix via `brain.auto_feedback` (the
-/// `memory.recall` → `brain.auto_feedback` calling convention). Exercises
-/// `resolve_auto_feedback_target`'s prefix branch (`resolve_prefix_visible`)
-/// feeding into `handle_feedback`'s visible-aware `resolve`.
-#[tokio::test]
-async fn test_391_auto_feedback_resolves_actor_namespace_note_prefix() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-
-    let actor_ns = Namespace::parse("lambda:test-391b").unwrap();
-    let writer_token = rt.authorize(actor_ns.clone()).unwrap();
-    let note = rt
-        .create_note(
-            &writer_token,
-            "memory",
-            None,
-            "actor-ns memory (prefix)",
-            None,
-            None,
-            vec![],
-        )
-        .await
-        .expect("create actor-ns memory note");
-    let full_id = note.id.to_string();
-    let prefix = &full_id[..8];
-
-    let caller_token = rt
-        .authorize_with_visibility(Namespace::local(), vec![actor_ns])
-        .unwrap();
-
-    let result = pack
-        .dispatch(
-            "brain.auto_feedback",
-            json!({
-                "query": "#391 actor-ns prefix regression",
-                "results": [{ "id": prefix }]
-            }),
-            &registry,
-            &caller_token,
-        )
-        .await
-        .expect(
-            "#391 leg B: auto_feedback prefix-resolving an actor-ns memory note visible to the caller must resolve",
-        );
-    assert_eq!(result["emitted"], json!(true));
-    assert_eq!(
-        result["target_id"].as_str().unwrap_or(""),
-        full_id,
-        "resolved target_id must match the full actor-ns note UUID"
-    );
-}
-
-/// Shape 3: a note under an explicit namespace override (a cross-agent grant
-/// via `authorize_with_visibility`'s `extra_visible`, not the caller's own
-/// actor id) must also resolve — proving the fix widens to the general
-/// visible set, not just the actor-id special case.
-#[tokio::test]
-async fn test_391_feedback_resolves_note_under_explicit_namespace_override() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-
-    let shared_ns = Namespace::parse("explicit-shared-ns-391").unwrap();
-    let writer_token = rt.authorize(shared_ns.clone()).unwrap();
-    let note = rt
-        .create_note(
-            &writer_token,
-            "memory",
-            None,
-            "explicit-ns memory",
-            None,
-            None,
-            vec![],
-        )
-        .await
-        .expect("create explicit-namespace memory note");
-
-    let caller_token = rt
-        .authorize_with_visibility(Namespace::local(), vec![shared_ns])
-        .unwrap();
-
-    let result = pack
-        .dispatch(
-            "brain.feedback",
-            json!({
-                "target_id": note.id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "balanced-recall-v1"
-            }),
-            &registry,
-            &caller_token,
-        )
-        .await
-        .expect(
-            "#391 shape 3: feedback on a note under an explicit visible-namespace override must resolve",
-        );
-    assert_eq!(result["emitted"], json!(true));
-}
-
-/// Negative: a note in a namespace that is NOT in the caller's visible set
-/// (neither primary nor an extra-visible grant) must still fail `NotFound`.
-/// The fix widens resolution to the visible set — it must not widen to every
-/// namespace in the database.
-#[tokio::test]
-async fn test_391_feedback_rejects_note_outside_visible_set() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-
-    let hidden_ns = Namespace::parse("invisible-ns-391").unwrap();
-    let writer_token = rt.authorize(hidden_ns).unwrap();
-    let note = rt
-        .create_note(
-            &writer_token,
-            "memory",
-            None,
-            "hidden memory",
-            None,
-            None,
-            vec![],
-        )
-        .await
-        .expect("create hidden-namespace memory note");
-
-    // Caller's visible set covers local + a DIFFERENT extra namespace — not the
-    // note's namespace.
-    let caller_token = rt
-        .authorize_with_visibility(
-            Namespace::local(),
-            vec![Namespace::parse("some-other-visible-ns-391").unwrap()],
-        )
-        .unwrap();
-
-    let err = pack
-        .dispatch(
-            "brain.feedback",
-            json!({
-                "target_id": note.id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "balanced-recall-v1"
-            }),
-            &registry,
-            &caller_token,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, RuntimeError::NotFound(_)),
-        "#391: feedback on a note outside the caller's visible set must return NotFound, got {err:?}"
-    );
-}
-
 // ── #354: brain.register_adapter ─────────────────────────────────────────────
 
 // ACCEPT: matching base_model_revision registers the adapter and persists the artifact.
@@ -4581,6 +4390,499 @@ mod router_section_tests {
             replayed_og_mean > default_og_mean,
             "OperationalGuidance mean must increase after useful replay signal; \
              default={default_og_mean:.4} replayed={replayed_og_mean:.4}"
+        );
+    }
+}
+
+// ── ADR-081: recall retune driver — fold gate + scorer provenance ────────────
+
+mod adr081_retune_driver_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn implicit_weight_is_0_1_not_0_5() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let sal_beta_before = pack.snapshot().balanced_recall.salience.beta();
+
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "implicit_negative"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let sal_beta_after = pack.snapshot().balanced_recall.salience.beta();
+        assert!(
+            (sal_beta_after - (sal_beta_before + 0.1)).abs() < 1e-9,
+            "ADR-081 §1: a single fresh-target implicit_negative must fold at 0.1, \
+             not 0.5; before={sal_beta_before}, after={sal_beta_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scorer_params_together_or_rejected_scorer_run_id_alone() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "run-1",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "scorer_run_id alone must be rejected as invalid input, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scorer_params_together_or_rejected_serve_ledger_id_alone() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "serve_ledger_id": "row-1",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "serve_ledger_id alone must be rejected as invalid input, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scorer_params_absent_both_is_unchanged_behavior() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "implicit_positive"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("ordinary feedback with neither scorer param must succeed");
+        assert_eq!(result["emitted"], json!(true));
+    }
+
+    /// ADR-081 §2: fold gate saturation. 16 implicit_negative events against the
+    /// same fresh target (weight 0.1 each, no decay since they land at the same
+    /// instant) must fold the first 15 at full weight (summing to the cap, 1.5)
+    /// and clamp the 16th to zero — salience.beta() must not move past the cap's
+    /// contribution, and the raw event log must still record all 16 (audit
+    /// preserved, never dropped).
+    #[tokio::test]
+    async fn fold_gate_clamps_after_cap_history_preserved() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let sal_beta_before = pack.snapshot().balanced_recall.salience.beta();
+
+        for _ in 0..16 {
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "implicit_negative"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+
+        let sal_beta_after = pack.snapshot().balanced_recall.salience.beta();
+        assert!(
+            (sal_beta_after - (sal_beta_before + 1.5)).abs() < 1e-6,
+            "16 events at weight 0.1 must fold at most 1.5 total into salience.beta(); \
+             before={sal_beta_before}, after={sal_beta_after}"
+        );
+
+        // Audit preserved: all 16 raw events land in brain_event_log regardless
+        // of the gate's fold decision (data-vs-view — never dropped).
+        let events = crate::persist::load_events_since(rt.sql().as_ref(), "local", 0)
+            .await
+            .expect("load events");
+        let feedback_count = events
+            .events
+            .iter()
+            .filter(|e| e.verb == "brain.feedback")
+            .count();
+        assert_eq!(
+            feedback_count, 16,
+            "all 16 implicit events must remain in the audit log, clamped or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_gate_exempts_explicit_and_correction_signals() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // 20 explicit_positive events (weight 1.5 each) must all fold at full
+        // weight — the clamp applies only to implicit signals (ADR-081 §2).
+        for _ in 0..20 {
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "explicit_positive"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ep = pack
+            .snapshot()
+            .balanced_recall
+            .entity_posteriors
+            .get(&uuid::Uuid::parse_str(&target).unwrap())
+            .cloned()
+            .expect("entity posterior must exist");
+        assert!(
+            (ep.alpha() - (1.0 + 20.0 * 1.5)).abs() < 1e-6,
+            "20 explicit_positive events must each fold at 1.5, unclamped; got alpha={}",
+            ep.alpha()
+        );
+    }
+
+    /// Half-life decay arithmetic, exercised through the live handler: two
+    /// implicit events separated by exactly one half-life (7 days) should NOT
+    /// clamp even when their un-decayed sum would exceed the cap, because the
+    /// first event's contribution has decayed to half by the time the second
+    /// lands. This pins `fold_gate::decayed_mass`'s formula end to end (not
+    /// just the pure-function unit tests in fold_gate.rs) by manipulating the
+    /// mass row's `last_event_at` directly between two live dispatches.
+    #[tokio::test]
+    async fn fold_gate_half_life_decay_prevents_premature_clamp() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // First implicit event: mass becomes 0.1 at "now".
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "implicit_negative"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Rewrite last_event_at to 7 days in the past, and bump mass to just
+        // under the cap (1.45), simulating 14 prior events that have not yet
+        // decayed. Without decay, 1.45 + 0.1 = 1.55 > 1.5 would clamp. With one
+        // half-life of decay, 1.45 decays to 0.725, so 0.725 + 0.1 <= 1.5 passes.
+        let half_life_us = crate::fold_gate::IMPLICIT_MASS_HALF_LIFE_US as i64;
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE brain_implicit_mass SET mass = ?1, last_event_at = ?2 \
+                      WHERE namespace = 'local'"
+                    .into(),
+                params: vec![
+                    SqlValue::Float(1.45),
+                    SqlValue::Integer(now_us - half_life_us),
+                ],
+                label: None,
+            })
+            .await
+            .unwrap();
+
+        let sal_beta_before = pack.snapshot().balanced_recall.salience.beta();
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "implicit_negative"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        let sal_beta_after = pack.snapshot().balanced_recall.salience.beta();
+
+        assert!(
+            (sal_beta_after - (sal_beta_before + 0.1)).abs() < 1e-6,
+            "decayed mass (0.725) + 0.1 must pass the cap; event must fold at full \
+             weight, not clamp. before={sal_beta_before}, after={sal_beta_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_dedup_second_emit_is_no_op() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-1",
+            "local",
+            "recall",
+            Some("balanced-recall-v1"),
+            None,
+            None,
+            &target,
+            "class-1",
+            "raw query",
+            1_000,
+        )
+        .await
+        .expect("record_serve");
+
+        let first = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-1",
+                    "serve_ledger_id": "ledger-row-1",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("first emit must succeed");
+        assert_eq!(first["emitted"], json!(true));
+
+        let sal_beta_after_first = pack.snapshot().balanced_recall.salience.beta();
+
+        let second = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-1",
+                    "serve_ledger_id": "ledger-row-1",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("duplicate emit must be a no-op, not an error");
+        assert_eq!(
+            second["deduped"],
+            json!(true),
+            "second emit with the same (scorer_run_id, serve_ledger_id) must be deduped"
+        );
+        assert_eq!(second["emitted"], json!(false));
+
+        let sal_beta_after_second = pack.snapshot().balanced_recall.salience.beta();
+        assert_eq!(
+            sal_beta_after_first, sal_beta_after_second,
+            "deduped emit must not fold a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_accounting_profile_id_prefers_served_by() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-2",
+            "local",
+            "recall",
+            Some("balanced-recall-v1"),
+            Some("some-other-profile"),
+            Some(500),
+            &target,
+            "class-2",
+            "raw query",
+            1_000,
+        )
+        .await
+        .expect("record_serve");
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-2",
+                    "serve_ledger_id": "ledger-row-2",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("resolved accounting profile must fold normally");
+        assert_eq!(result["emitted"], json!(true));
+
+        let row = crate::serve_ledger::get_serve_row(rt.sql().as_ref(), "ledger-row-2")
+            .await
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(row.grade.as_deref(), Some("implicit_positive"));
+        assert_eq!(row.scorer_run_id.as_deref(), Some("scorer-run-2"));
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_unresolved_profile_forces_zero_weight_failsafe() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // Neither served_by_profile_id nor resolved_profile_id set — the ledger
+        // row has no resolvable accounting profile.
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-3",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-3",
+            "raw query",
+            1_000,
+        )
+        .await
+        .expect("record_serve");
+
+        let sal_beta_before = pack.snapshot().balanced_recall.salience.beta();
+
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "implicit_positive",
+                "scorer_run_id": "scorer-run-3",
+                "serve_ledger_id": "ledger-row-3",
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("unresolved profile must still succeed, just at zero weight");
+
+        let sal_beta_after = pack.snapshot().balanced_recall.salience.beta();
+        assert_eq!(
+            sal_beta_after, sal_beta_before,
+            "ADR-081 §4 fail-safe: unresolved accounting profile must fold at zero weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_missing_row_returns_not_found() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-4",
+                    "serve_ledger_id": "does-not-exist",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::NotFound(_)));
+    }
+
+    /// Replay determinism: a gated (zero-weight) event, once replayed from the
+    /// event log against a fresh BrainPack, must reproduce the exact same
+    /// (zero) posterior effect — not re-evaluate the gate against present-day
+    /// mass-table state (ADR-081 §2 replay-determinism design, see
+    /// `BrainSignal::SemanticFeedback::effective_weight` doc comment).
+    #[tokio::test]
+    async fn replay_reproduces_gated_zero_weight_deterministically() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        // Saturate the cap: 15 events at 0.1 = 1.5.
+        for _ in 0..15 {
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "implicit_negative"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+        // 16th event must clamp to zero weight live.
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "implicit_negative"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let live_sal_beta = pack.snapshot().balanced_recall.salience.beta();
+
+        // Fresh pack over the same namespace: ensure_loaded will replay all 16
+        // events from brain_event_log. If replay re-evaluated the gate instead
+        // of reading the persisted effective_weight, it would see an empty
+        // brain_implicit_mass table (or diverge from the live mass) and could
+        // fold differently than the live run did.
+        let pack2 = crate::BrainPack::new(rt.clone());
+        pack2
+            .dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("dispatch triggers ensure_loaded");
+        let replayed_sal_beta = pack2.snapshot().balanced_recall.salience.beta();
+
+        assert!(
+            (replayed_sal_beta - live_sal_beta).abs() < 1e-9,
+            "replay must reproduce the live gated outcome exactly; \
+             live={live_sal_beta}, replayed={replayed_sal_beta}"
         );
     }
 }

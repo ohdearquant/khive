@@ -289,6 +289,36 @@ mod help_tests {
             h.params.iter().any(|p| p.name == "correlation_external_id"),
             "comm.ingest must declare correlation_external_id param for thread resolution"
         );
+        assert!(
+            h.params.iter().any(|p| p.name == "wire_message_id"),
+            "comm.ingest must declare wire_message_id param (IngestParams carries it; \
+             metadata must stay in sync per issue #403 finding 2)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "wire_references"),
+            "comm.ingest must declare wire_references param (IngestParams carries it; \
+             metadata must stay in sync per issue #403 finding 2)"
+        );
+    }
+
+    #[test]
+    fn ingest_declares_optional_metadata_param() {
+        // ADR-084 Rule 3 (help fidelity): comm.ingest's IngestParams.metadata
+        // field (issue #448 Finding 2, quarantine marker passthrough) must be
+        // reflected in the ParamDef/help schema, not just the Rust struct.
+        let h = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.ingest")
+            .expect("comm.ingest must be declared");
+        let metadata_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "metadata")
+            .expect("comm.ingest must declare 'metadata' param");
+        assert!(
+            !metadata_param.required,
+            "metadata must be optional so absent metadata preserves today's behavior exactly"
+        );
     }
 
     #[test]

@@ -87,6 +87,28 @@ pub(crate) struct IngestParams {
     /// When absent and no correlation match is found, falls back to `p.to.trim()`.
     #[serde(default)]
     pub default_inbound_actor: Option<String>,
+    /// This message's own RFC 822 Message-ID (including angle brackets), when the
+    /// channel adapter captured one. Distinct from `external_id` (the transport
+    /// dedup key). Persisted so a later reply to this note can set In-Reply-To /
+    /// References for native MUA conversation grouping.
+    #[serde(default)]
+    pub wire_message_id: Option<String>,
+    /// This message's own RFC 822 References header value, verbatim, when the
+    /// channel adapter captured one. Persisted so a later reply to this note can
+    /// extend the full ancestor chain instead of truncating it to this message's
+    /// own Message-ID (issue #403).
+    #[serde(default)]
+    pub wire_references: Option<String>,
+    /// Optional transport-layer metadata passthrough, merged verbatim into the
+    /// stored note's properties alongside the fields above. Generic and
+    /// channel-agnostic: the comm pack does not interpret any key in this map,
+    /// it only persists it. A channel adapter that needs to attach adapter-specific
+    /// markers (e.g. the email channel's quarantine flags, ADR-056 Amendment
+    /// 2026-07-02) sets `ChannelEnvelope.metadata`; the MCP poll loop forwards it
+    /// here unchanged. Absent metadata is today's behavior exactly (issue #448
+    /// Finding 2).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {

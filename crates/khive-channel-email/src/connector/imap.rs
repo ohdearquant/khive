@@ -356,14 +356,55 @@ pub(crate) fn parse_raw_bytes(
 
     let body_html = msg.body_html(0).map(|s| s.to_string());
 
-    // Collect headers into a flat lowercase map (first occurrence wins).
+    // Collect headers into a flat lowercase map (first occurrence wins). Id-list
+    // headers (Message-ID, In-Reply-To, References, ...) route through
+    // mail-parser's `parse_id`, which returns `HeaderValue::Text` for exactly one
+    // id but `HeaderValue::TextList` for two or more (mail-parser 0.9.4
+    // `parsers/fields/id.rs`) -- a `References` chain with an ancestor beyond the
+    // immediate parent is exactly that shape. Both variants are joined into a
+    // single RFC 5322 whitespace-separated value here so the chain survives;
+    // every other header shape (addresses, dates, ...) is dropped exactly as
+    // before.
     let mut headers: HashMap<String, String> = HashMap::new();
     for header in msg.headers() {
         let key = header.name().to_lowercase();
         if let std::collections::hash_map::Entry::Vacant(e) = headers.entry(key) {
-            if let mail_parser::HeaderValue::Text(v) = header.value() {
-                e.insert(v.to_string());
+            match header.value() {
+                mail_parser::HeaderValue::Text(v) => {
+                    e.insert(v.to_string());
+                }
+                mail_parser::HeaderValue::TextList(list) => {
+                    e.insert(
+                        list.iter()
+                            .map(|v| v.as_ref())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                _ => {}
             }
+        }
+    }
+
+    // Every Authentication-Results occurrence, in document order (topmost
+    // first), verbatim. Collected separately from `headers` above because that
+    // map keeps only the first occurrence of a header name; the attribution
+    // gate needs every occurrence to find the topmost one carrying the
+    // configured trust anchor (ADR-056 Amendment 2026-07-02).
+    let mut authentication_results: Vec<String> = Vec::new();
+    for header in msg.headers() {
+        if !header.name().eq_ignore_ascii_case("authentication-results") {
+            continue;
+        }
+        match header.value() {
+            mail_parser::HeaderValue::Text(v) => authentication_results.push(v.to_string()),
+            mail_parser::HeaderValue::TextList(list) => authentication_results.push(
+                list.iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => {}
         }
     }
 
@@ -378,6 +419,7 @@ pub(crate) fn parse_raw_bytes(
         body_text,
         body_html,
         headers,
+        authentication_results,
     })
 }
 
@@ -461,6 +503,7 @@ mod tests {
             body_text: Some("body".to_string()),
             body_html: None,
             headers: HashMap::new(),
+            authentication_results: Vec::new(),
         }
     }
 
@@ -501,6 +544,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_bytes_preserves_multi_id_references() {
+        // mail-parser 0.9.4's `parse_id` returns `HeaderValue::TextList` (not
+        // `Text`) once a header holds 2+ ids -- a `References` chain with an
+        // ancestor beyond the immediate parent is exactly that shape. The raw
+        // parse path must not drop it down to a single (or zero) ids.
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Multi-id References test\r\n\
+                    References: <grandparent1@example.com> <grandparent2@example.com>\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(9, raw, "imap.example.com", 4242).unwrap();
+        assert_eq!(
+            email.references(),
+            Some("grandparent1@example.com grandparent2@example.com"),
+            "both ancestor ids must survive the raw IMAP parse, not just the first"
+        );
+    }
+
+    #[test]
     fn parse_raw_bytes_extracts_sender_header() {
         let raw = b"From: alice@example.com\r\n\
                     Sender: sender@example.com\r\n\
@@ -526,6 +589,105 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_bytes_strips_angle_brackets_from_real_in_reply_to() {
+        // Real RFC 822 bytes routed through mail_parser (not a synthetic
+        // RawEmail/headers map like the tests below) — pins the bracket-
+        // stripping behavior that comm.ingest's bracket-toggle matching
+        // depends on. mail_parser's id parser (used for
+        // In-Reply-To/Message-ID/References) strips the `<...>` envelope
+        // for the single-ancestor case, so the headers map must carry the
+        // bracket-free form.
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Re: original thread\r\n\
+                    Message-ID: <reply-id@khive.ai>\r\n\
+                    In-Reply-To: <some-id@khive.ai>\r\n\
+                    Date: Wed, 1 Jul 2026 10:00:00 +0000\r\n\
+                    \r\n\
+                    This is a reply.";
+        let email = parse_raw_bytes(11, raw, "imap.example.com", 42).unwrap();
+        assert_eq!(
+            email.headers.get("in-reply-to").map(String::as_str),
+            Some("some-id@khive.ai"),
+            "mail_parser must strip angle brackets for the single-ancestor case"
+        );
+        assert_eq!(
+            email.correlation(),
+            Some("some-id@khive.ai"),
+            "correlation() falls through to in_reply_to when X-Khive-Thread-ID is absent"
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_correlation_prefers_khive_thread_id_when_present() {
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Re: original thread\r\n\
+                    Message-ID: <reply-id@khive.ai>\r\n\
+                    In-Reply-To: <some-id@khive.ai>\r\n\
+                    X-Khive-Thread-ID: thread-uuid-123\r\n\
+                    Date: Wed, 1 Jul 2026 10:00:00 +0000\r\n\
+                    \r\n\
+                    This is a reply.";
+        let email = parse_raw_bytes(12, raw, "imap.example.com", 42).unwrap();
+        assert_eq!(
+            email.correlation(),
+            Some("thread-uuid-123"),
+            "correlation() must prefer X-Khive-Thread-ID over In-Reply-To"
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_collects_single_authentication_results_header() {
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: single AR header\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(
+            email.authentication_results,
+            vec!["mx.example.com; dmarc=pass header.from=example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_preserves_all_authentication_results_in_document_order() {
+        // The general `headers` map keeps only the first occurrence of a header
+        // name; Authentication-Results needs every occurrence, in the order an
+        // MTA stamps them (topmost = most recently added), to support the
+        // "topmost trusted authserv-id wins" attribution gate.
+        let raw = b"Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    Authentication-Results: mx.example.com; dmarc=fail header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: two AR headers\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(
+            email.authentication_results,
+            vec![
+                "mx.example.com; dmarc=pass header.from=example.com".to_string(),
+                "mx.example.com; dmarc=fail header.from=example.com".to_string(),
+            ],
+            "both occurrences must survive, topmost first"
+        );
+    }
+
+    #[test]
+    fn parse_raw_bytes_no_authentication_results_header_yields_empty_vec() {
+        let raw = b"From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: no auth header\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert!(email.authentication_results.is_empty());
+    }
+
+    #[test]
     fn raw_email_khive_thread_id_header() {
         let mut headers = HashMap::new();
         headers.insert("x-khive-thread-id".to_string(), "some-uuid".to_string());
@@ -540,6 +702,7 @@ mod tests {
             body_text: None,
             body_html: None,
             headers,
+            authentication_results: Vec::new(),
         };
         assert_eq!(email.khive_thread_id(), Some("some-uuid"));
         assert_eq!(email.correlation(), Some("some-uuid"));
@@ -636,6 +799,7 @@ mod tests {
             body_text: Some("reply body".to_string()),
             body_html: None,
             headers,
+            authentication_results: Vec::new(),
         };
         assert_eq!(email.in_reply_to(), Some("<orig@example.com>"));
         assert_eq!(email.correlation(), Some("<orig@example.com>"));

@@ -1,11 +1,232 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted\
-**Date**: 2026-06-14\
+**Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+-- Exchange Online no-authserv-id boundary; see
+[§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
+[§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03)\
 **Authors**: Ocean, lambda:khive\
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
 and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
-**Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter)
+**Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
+#448 (inbound header spoofing -- resolved by this amendment)
+
+## Amendment 2026-07-02 -- Inbound authentication hardening
+
+This amendment supersedes the original OQ-2 resolution (env-var `From:` addr-spec comparison as
+the authoritative inbound check). That resolution is retained below, marked superseded, as the
+historical decision.
+
+### Motivation
+
+The original OQ-2 model authenticates a sender by comparing the `From:` (and `Sender:`) addr-spec
+against `KHIVE_EMAIL_MAINTAINER_ADDRESS`. RFC 5322 originator headers (`From:`, `Sender:`,
+`Return-Path:`) are asserted by the sending client and are not authenticated by SMTP transport.
+Any party that can reach the receiving mailbox can set `From:` to the maintainer address and pass
+the allowlist. The addr-spec comparison therefore authenticates nothing on its own.
+
+This is not a low-severity gap. An inbound `message` note attributed to the maintainer lands in a
+lambda's `comm.inbox` and is surfaced by the inbox wake-up monitor with the highest trust tier a
+lambda has: maintainer-directed, principal-priority instructions. A spoofed `From:` is a direct
+prompt-injection vector into the autonomous loop -- an attacker who can email the ingest mailbox
+can inject instructions that a lambda treats as coming from its principal. Attribution, not
+delivery, is the trust boundary that must be earned.
+
+### Decision
+
+Inbound email attribution requires cryptographic path authentication in addition to the sender
+allowlist. Attribution is granted only when both hold:
+
+1. **Domain authentication with alignment.** The message carries an `Authentication-Results`
+   header, inserted by the adapter's own trusted receiving boundary (matched by a configured
+   `authserv-id` -- _amended 2026-07-03: the boundary is matched by a configured trust anchor
+   that is either an `authserv-id` or, for a boundary that emits no `authserv-id`, the topmost
+   no-`authserv-id` position; see [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary)_),
+   that shows `dmarc=pass` _with `header.from` alignment_ (amended 2026-07-03), or equivalently at least one of SPF-pass with
+   RFC 7208 envelope-from alignment to the `From:` domain or DKIM-pass with an RFC 6376 `d=`
+   signing domain aligned to the `From:` domain. Alignment is mandatory: an unaligned SPF or
+   DKIM pass (a pass for a domain other than the `From:` domain) does not satisfy this check.
+2. **Sender allowlist.** The single `From:` addr-spec matches the maintainer allowlist, under the
+   existing OQ-2 addr-spec rules (single From, `Sender:` must also match if present).
+
+A message satisfying both is attributed to the maintainer actor identity. A message failing
+either is **quarantined**: it is never attributed, never surfaced as a trusted actor, and never
+triggers principal-priority handling.
+
+### Trusted-header selection (the load-bearing detail)
+
+`Authentication-Results` is an ordinary header and can appear multiple times, including copies
+forged by the sender before the message reached the receiving server. The adapter MUST NOT trust
+an arbitrary `Authentication-Results` header. It MUST:
+
+- select only `Authentication-Results` headers whose `authserv-id` equals the configured
+  `KHIVE_EMAIL_AUTHSERV_ID` (the receiving MTA's own identifier, e.g. the Exchange Online host
+  that delivers to the ingest mailbox); _(amended 2026-07-03: this equality clause applies to a
+  boundary that emits an `authserv-id`. Exchange Online emits none on its plain
+  `Authentication-Results`; for that class of boundary the configured trust anchor is the reserved
+  sentinel `!topmost-no-authserv-id` and selection is positional -- see
+  [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary).)_
+- when several such headers are present, use the topmost (most recently prepended by the trusted
+  boundary), and ignore all `Authentication-Results` headers bearing any other `authserv-id`;
+- treat the absence of any trusted-authserv-id `Authentication-Results` header as a failed
+  authentication (quarantine), not as a pass;
+- never derive, learn, or select the trusted `authserv-id` from message content. It comes from
+  configuration only.
+
+**Operational precondition (RFC 8601 §1.6, §5).** `Authentication-Results` carries no integrity
+mechanism; the topmost-wins rule is sound only when the receiving boundary itself makes it so.
+Configuring `KHIVE_EMAIL_AUTHSERV_ID` is therefore only valid for a receiving boundary that is
+verified to prepend its own `Authentication-Results` on every delivered message and to remove or
+rename inbound headers claiming that same `authserv-id` (the ADMD-entry scrubbing RFC 8601
+requires). A deployment MUST verify this behavior against the live mailbox before enabling
+attribution: send a probe message carrying a forged `Authentication-Results` with the trusted
+`authserv-id` and confirm the boundary strips it or that the boundary's genuine stamp lands above
+it. If the boundary does neither, attribution MUST NOT be enabled for that mailbox; all inbound
+mail is quarantined until it is. The observed `authserv-id` string from a real delivered message,
+not provider documentation, is the source of the configured value.
+
+Re-verifying SPF/DKIM inside the adapter is out of scope for v1. The adapter is a downstream IMAP
+consumer; the receiving MTA has already performed SPF/DKIM/DMARC at delivery and recorded the
+result. The adapter's job is to trust that record only from its own boundary and to enforce
+alignment, not to recompute it.
+
+### Quarantine semantics (quarantine is itself an injection surface)
+
+Quarantined mail may be stored so the maintainer can review what arrived, but storage must not
+reintroduce the injection it prevents:
+
+- A quarantined message is written with no `from_actor` (or an explicit anonymous/quarantine
+  actor). It carries a property marking it quarantined and the reason (auth-absent,
+  dmarc-fail, unaligned, or off-allowlist). It is never stamped with the maintainer actor.
+- Quarantined notes MUST NOT trigger the inbox wake-up monitor's trusted-sender path and MUST be
+  distinguishable by agents so their content is never treated as principal instructions. Content
+  of a quarantined message is data to be shown, never a command to be followed -- the same
+  instruction-source boundary the loop applies to all untrusted observed content.
+- Storing quarantined mail is a configurable behavior (`KHIVE_EMAIL_QUARANTINE_STORE`, default
+  on so that legitimate mail failing a transient auth check is not silently lost). When off, a
+  failed message is dropped with only the IMAP UID logged, matching the prior behavior.
+
+### Configuration additions
+
+| Variable                       | Required | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_EMAIL_AUTHSERV_ID`      | yes      | --      | The trusted receiving boundary's trust anchor. A literal `authserv-id`: only `Authentication-Results` headers bearing this id are trusted. The reserved sentinel `!topmost-no-authserv-id` (amended 2026-07-03): the boundary emits no `authserv-id` (e.g. Exchange Online) and the topmost no-`authserv-id` header is trusted positionally. Unset/empty fails construction (channel never starts); a typo of the sentinel is treated as a literal id, matches nothing, and quarantines all mail. No value silently degrades to trust-topmost. |
+| `KHIVE_EMAIL_QUARANTINE_STORE` | no       | `on`    | When `on`, unauthenticated mail is stored as an unattributed quarantined note; when `off`, it is dropped.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+`KHIVE_EMAIL_MAINTAINER_ADDRESS` remains the sender allowlist. It stays a single addr-spec for
+v1; a multi-entry allowlist is a compatible later extension.
+
+### Scope
+
+This amendment governs the email adapter (#114, #448). The Telegram adapter's numeric `chat.id`
+authentication (§8) is a stable transport-authenticated identifier and is unaffected. The
+`comm.ingest` dispatch path, the single-dispatch-site gate invariant, and the dedup model are
+unchanged; the amendment adds an attribution gate in front of them and a quarantine disposition
+beside them. Implementation (#448) follows this accepted revision.
+
+## Amendment 2026-07-03 -- Exchange Online no-authserv-id boundary
+
+This amendment refines the [§Trusted-header selection](#trusted-header-selection-the-load-bearing-detail)
+rule of the 2026-07-02 amendment. That rule made "select only `Authentication-Results` headers
+whose `authserv-id` equals the configured `KHIVE_EMAIL_AUTHSERV_ID`" the normative selector. The
+2026-07-02 clauses above are retained, marked amended in place; the rule below governs where they
+are amended.
+
+### Finding
+
+The trusted receiving boundary for the production ingest mailbox (`leo@khive.ai`, Microsoft
+Exchange Online) emits **no `authserv-id`** on the plain `Authentication-Results` header it
+stamps. This is a known Microsoft deviation from RFC 8601 §2.2, which requires the header to begin
+with an `authserv-id` token. The observed header from a real delivered message begins directly
+with the first method verdict:
+
+```
+Authentication-Results: spf=pass (sender IP is ...) smtp.mailfrom=gmail.com;
+  dkim=pass (signature was verified) header.d=gmail.com;
+  dmarc=pass action=none header.from=gmail.com; compauth=pass reason=100
+```
+
+The only `authserv-id` present anywhere in the message is on the `ARC-Authentication-Results`
+variant (`i=2; mx.microsoft.com`), a distinct header carrying a distinct trust semantics.
+
+Consequence: a strict RFC 8601 selector can never match a configured `authserv-id` against a
+header that has none, so every Exchange Online delivery fails selection and is quarantined. This
+is a defect in the trust-anchor model for no-`authserv-id` boundaries, not a misconfiguration; no
+environment value can identify a token the boundary does not emit.
+
+### Decision
+
+The configured trust anchor `KHIVE_EMAIL_AUTHSERV_ID` selects one of two modes, chosen only from
+configuration, never inferred from message content:
+
+1. **`authserv-id` mode** (RFC-compliant boundary): unchanged. Select the topmost
+   `Authentication-Results` whose `authserv-id` equals the configured value; ignore all others;
+   absence quarantines.
+2. **Topmost-no-`authserv-id` mode** (boundary emitting no `authserv-id`, e.g. Exchange Online):
+   selected by the reserved sentinel value `!topmost-no-authserv-id`. Select the **topmost**
+   `Authentication-Results` header and trust it **only if it carries no `authserv-id`**. If the
+   topmost header unexpectedly carries any `authserv-id`, quarantine (fail closed): under this
+   mode the trusted boundary is defined to emit none at the top, so an `authserv-id` at the top
+   signals either a boundary behavior change or an injected header that has floated above the
+   boundary's own stamp. Absence of any `Authentication-Results` quarantines, unchanged.
+
+In topmost-no-`authserv-id` mode **position is the sole discriminator** between the boundary's own
+verdict and a sender-forged one. This is sound only under the operational precondition below.
+
+### Domain-authentication alignment hardening
+
+The domain-authentication leg (Decision §1) requires `dmarc=pass` **with `header.from` alignment**
+to the message `From:` domain that will be attributed, not a bare `dmarc=pass`. The prior
+implementation trusted `dmarc=pass` without confirming its `header.from` equalled the attributed
+`From:` domain; that gap was closed only by conjunction with the sender-allowlist leg. Because
+positional trust makes the auth leg more load-bearing, the auth leg is made self-sufficient: a
+`dmarc=pass` whose `header.from` domain does not match the message `From:` domain does not satisfy
+the check (SPF-with-envelope-alignment and DKIM-with-`d=`-alignment already required alignment and
+are unchanged).
+
+### Operational precondition (sharpened)
+
+The RFC 8601 §5 operational precondition of the 2026-07-02 amendment becomes strictly
+load-bearing in topmost-no-`authserv-id` mode, where no `authserv-id` string participates in the
+decision. Enabling this mode for a mailbox requires that the receiving boundary prepend its own
+`Authentication-Results` above all sender-supplied content on **every** delivered message, and
+that the ingest mailbox have **no path that bypasses that prepend** -- no internal
+tenant-authenticated submitter, no distribution list, and no forwarding or journaling rule that
+could deliver a message whose topmost `Authentication-Results` is not the boundary's own. This is
+an operational fact about the live tenant that code cannot verify; it MUST be attested before
+attribution is enabled, via the issue #448 live probe (send a message carrying a forged topmost
+`Authentication-Results: ...; dmarc=pass` and confirm the boundary's genuine stamp lands above
+it). Until attested, the mailbox is quarantined.
+
+### Rejected alternatives (do not re-open without new evidence)
+
+- **Match the `ARC-Authentication-Results` `authserv-id` (`mx.microsoft.com`).** Rejected.
+  `mx.microsoft.com` is shared by every Microsoft 365 tenant and its ARC chain is signed by one
+  shared `d=microsoft.com` key, so neither the string nor ARC-Seal verification identifies _this_
+  boundary; only position (highest ARC instance) discriminates, which is what topmost-no-
+  `authserv-id` mode already does without a connector change or a false anchor.
+- **Verify ARC-Seal cryptography.** Rejected: out of the v1 re-verification scope, and a valid
+  seal proves only that some Microsoft 365 tenant sealed the message, not that this boundary did.
+
+### Configuration
+
+No new variable. `KHIVE_EMAIL_AUTHSERV_ID` gains the reserved sentinel `!topmost-no-authserv-id`.
+The sentinel is reserved by convention, not by grammar: RFC 8601's `authserv-id` is a value (RFC
+2045 token or quoted-string) and `!` is not in `tspecials`, so a leading `!` is grammar-legal in a
+token. It is safe here because no real-world domain-form receiving-boundary identifier begins with
+`!` and this config contract reserves the exact string, so it does not collide with a real anchor
+in practice. Every failure direction remains closed: unset or empty fails construction and the
+channel never starts; any non-sentinel value is a literal `authserv-id` (a typo of the sentinel
+matches no header and quarantines all mail); no value silently degrades to trust-topmost.
+
+### Consequences
+
+The production Exchange Online mailbox can be attributed once the operational precondition is
+attested. The security posture is unchanged for RFC-compliant boundaries. The change is confined
+to `parse_header` (recognize the no-`authserv-id` header form), `select_trusted` (mode dispatch),
+the auth-leg alignment check, and the config trust-anchor parse; the connector, dedup, quarantine
+disposition, and dispatch-gate invariants are untouched. Implementation follows this accepted
+revision.
 
 ## Context
 
@@ -320,17 +541,25 @@ URL exists.
 ### 8. Inbound authentication
 
 Each adapter validates the external sender identity on every update before returning an
-envelope. Updates from unauthorized senders return `ChannelError::UnauthorizedSender` and are
-dropped. No note is written. This mirrors the `isSenderAllowed` pattern from the openclaw
-reference (`bot-access.ts:46-66`), simplified for the single-maintainer case.
+envelope. For Telegram, updates from unauthorized senders return
+`ChannelError::UnauthorizedSender` and are dropped with no note written. This mirrors the
+`isSenderAllowed` pattern from the openclaw reference (`bot-access.ts:46-66`), simplified for
+the single-maintainer case.
+
+> **Email disposition amended 2026-07-02.** For the email adapter, drop-with-no-note is
+> superseded: mail that fails authentication or the allowlist is quarantined (stored
+> unattributed by default) rather than dropped. See
+> [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening). The
+> Telegram drop behavior is unchanged.
 
 For Telegram, authentication is by numeric `chat.id` (stable across username changes),
 configured via env var. Username matching is a fallback only, as usernames can be reassigned.
 The maintainer identity is never stored in the KG.
 
 The exact identity model (which identity claim is authoritative and how it ties to the ADR-053
-actor model) is an open question requiring maintainer sign-off before implementation (see
-§OQ-2).
+actor model) was an open question at the original Proposed status; it is resolved by OQ-2 as
+hardened by the 2026-07-02 amendment (domain authentication with alignment plus allowlist
+before attribution; quarantined mail carries no trusted actor identity).
 
 ### 9. No secrets in the store
 
@@ -429,6 +658,13 @@ crash.
 
 #### Inbound authentication (OQ-2 resolved)
 
+> **Superseded 2026-07-02.** The addr-spec allowlist described here is necessary but not
+> sufficient: `From:`/`Sender:` are spoofable, so this check alone authenticates nothing. See
+> [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening), which
+> requires `Authentication-Results` domain authentication with alignment before attribution and
+> quarantines everything else. The allowlist rules below remain in force as one of the two
+> required conditions.
+
 The adapter enforces a single-maintainer allowlist at the adapter boundary, before any note is
 written. Authentication rules:
 
@@ -442,12 +678,17 @@ written. Authentication rules:
 4. Error messages intentionally omit the actual address values to avoid leaking sender
    addresses to logs.
 
-Messages that fail any check are skipped with a warning that logs only the IMAP UID. No note
-is written for unauthorized or malformed senders.
+_(Superseded 2026-07-02)_ ~~Messages that fail any check are skipped with a warning that logs
+only the IMAP UID. No note is written for unauthorized or malformed senders.~~ Failed messages
+are now quarantined per the amendment (stored unattributed when `KHIVE_EMAIL_QUARANTINE_STORE`
+is on; dropped with only the IMAP UID logged when it is off).
 
-This resolves OQ-2: env-var addr-spec comparison is the authoritative check for v1. The
-anonymous actor default for `VerbRegistry::dispatch` is acceptable. No `ActorRef` mapping to
-ADR-053 is required at this layer; the adapter pre-filters before dispatch.
+_(Superseded 2026-07-02)_ ~~This resolves OQ-2: env-var addr-spec comparison is the
+authoritative check for v1.~~ The addr-spec comparison is retained only as the allowlist
+condition; it is not authoritative on its own. The anonymous actor default for
+`VerbRegistry::dispatch` remains acceptable for quarantined mail specifically -- quarantined
+notes are exactly the ones that must not carry a trusted actor identity. Attributed mail
+requires both amendment conditions before the maintainer identity is stamped.
 
 #### Sender address format (OQ-1 resolved)
 
@@ -493,9 +734,11 @@ the email adapter implementation (#114).
 **OQ-1 (from field format)** -- resolved: Option A (channel-prefixed form, e.g.,
 `email:sender@example.com`) is the normative choice. See §14.
 
-**OQ-2 (inbound auth identity model)** -- resolved: env-var RFC 5322 addr-spec comparison at
-the adapter boundary is sufficient for v1. The anonymous actor default for dispatch is
-acceptable. See §14.
+**OQ-2 (inbound auth identity model)** -- resolved 2026-06-14, **hardened 2026-07-02**: the
+env-var addr-spec comparison is retained as the sender allowlist but is no longer sufficient on
+its own. Attribution now also requires `Authentication-Results` domain authentication with
+alignment from the trusted receiving boundary; unauthenticated mail is quarantined and never
+attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening).
 
 ## Consequences
 
@@ -514,8 +757,9 @@ acceptable. See §14.
   `"namespace"` param on each call.
 - No credentials appear in any note, entity, or KG store.
 - `CommPack` construction and `PackFactory` wiring are unchanged.
-- `khive-channel` and `khive-channel-telegram` are new crates at the platform layer (blocked on
-  OQ-1 and OQ-2 above).
+- `khive-channel` and `khive-channel-telegram` are new crates at the platform layer. (OQ-1 and
+  OQ-2 are resolved; OQ-2 as hardened by the 2026-07-02 amendment. The email adapter's
+  attribution gate and quarantine disposition follow that amendment.)
 
 ## Related ADRs
 
@@ -526,5 +770,7 @@ acceptable. See §14.
 - ADR-053: Authorization Gate (ActorStore / SessionStore extension) -- extends ADR-018's actor
   model. `KhiveRuntime::authorize` (the public gate-checked door) and
   `NamespaceToken::mint_authorized` (`pub(crate)`, unreachable externally) are introduced here.
-  OQ-2 above requires a ruling on how the ingest loop's identity interacts with this model.
+  The ruling on how the ingest loop's identity interacts with this model is delivered by the
+  2026-07-02 amendment: attribution requires the two-part authentication gate, and quarantined
+  mail is written without a trusted actor identity.
 - ADR-028: Pack-Scoped Backends -- offset/cursor persistence pattern for channel adapters.

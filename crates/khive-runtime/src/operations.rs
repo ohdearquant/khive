@@ -2770,37 +2770,13 @@ impl KhiveRuntime {
             .await
     }
 
-    /// Resolve a short UUID prefix (8+ hex chars) to a full UUID, scanning the
-    /// caller's full **visible** namespace set (`{local} ∪ {actor.id} ∪
-    /// {actor.visible_namespaces}`, i.e. `token.visible_namespaces()`) rather
-    /// than the primary namespace alone.
-    ///
-    /// Feedback targets are recall outputs, and recall is visible-set-aware;
-    /// this keeps prefix resolution on the same visibility recall uses so
-    /// that any record recall can surface is also feedback-targetable
-    /// (#391). Only the non-deleted variant is provided — auto_feedback's
-    /// prefix path never needs to resolve soft-deleted rows.
-    pub async fn resolve_prefix_visible(
-        &self,
-        token: &NamespaceToken,
-        prefix: &str,
-    ) -> RuntimeResult<Option<Uuid>> {
-        let namespaces: Vec<String> = token
-            .visible_namespaces()
-            .iter()
-            .map(|ns| ns.as_str().to_owned())
-            .collect();
-        self.resolve_prefix_inner(Some(&namespaces), prefix, false)
-            .await
-    }
-
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID with NO
     /// namespace filter at all — mirrors `resolve_by_id`'s by-ID contract
     /// (ADR-007 Rev 6: by-ID resolution is namespace-agnostic; the Gate, not
     /// storage-layer filtering, is the authz seam). Used by the four by-ID
     /// CRUD verbs (get/update/delete/merge) so their prefix path matches
     /// their already-unfiltered full-UUID path (#391 §3). No token param:
-    /// unlike `resolve_prefix`/`resolve_prefix_visible`, there is no
+    /// unlike `resolve_prefix`, there is no
     /// namespace to derive from one.
     pub async fn resolve_prefix_unfiltered(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
         self.resolve_prefix_inner(None, prefix, false).await
@@ -2819,8 +2795,7 @@ impl KhiveRuntime {
     ///
     /// `namespaces` selects the scan scope: `Some(&[ns])` reproduces the
     /// historical primary-only behaviour (`resolve_prefix` /
-    /// `resolve_prefix_including_deleted`); `Some(&visible_set)` scans the
-    /// caller's full visible set (`resolve_prefix_visible`); `None` applies
+    /// `resolve_prefix_including_deleted`); `None` applies
     /// no namespace predicate at all (`resolve_prefix_unfiltered*`).
     /// Ambiguity (a prefix matching more than one UUID, even across
     /// different namespaces in the set, or across all namespaces when
