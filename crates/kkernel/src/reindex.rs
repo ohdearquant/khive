@@ -958,8 +958,15 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
         return;
     };
     for table in &to_drop {
-        let ddl = format!("DROP TABLE IF EXISTS \"{table}\"");
-        match writer.execute_script(ddl).await {
+        let ddl = format!("DROP TABLE IF EXISTS {}", quote_sqlite_identifier(table));
+        match writer
+            .execute(SqlStatement {
+                sql: ddl,
+                params: vec![],
+                label: Some("sweep_stale_fts_partitions_drop".into()),
+            })
+            .await
+        {
             Ok(_) => {
                 tracing::info!(table, "dropped stale FTS partition table");
             }
@@ -968,6 +975,13 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
             }
         }
     }
+}
+
+/// Quote a SQLite identifier for safe interpolation into generated DDL,
+/// doubling any embedded double quotes so the identifier cannot terminate
+/// early and inject additional statements.
+fn quote_sqlite_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
@@ -1156,6 +1170,70 @@ mod tests {
         assert!(
             !remaining.contains(&"local::vamana::model-b".to_string()),
             "local vamana model-b must be deleted: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_fts_sweep_quotes_malicious_table_name_and_preserves_entities() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
+
+        // Seed a base row so `distinct_base_namespaces` returns only `local`
+        // and the sweep guard does not skip the drop loop.
+        rt.create_entity(&token, "concept", None, "seed", None, None, vec![])
+            .await
+            .expect("seed entity");
+
+        let sql = rt.sql();
+        let malicious = "fts_entities_x\"; DROP TABLE entities; --";
+        {
+            let mut w = sql.writer().await.expect("writer");
+            let ddl = format!(
+                "CREATE TABLE {} (rowid INTEGER)",
+                quote_sqlite_identifier(malicious)
+            );
+            w.execute(SqlStatement {
+                sql: ddl,
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("create malicious stale table");
+        }
+
+        sweep_stale_fts_partitions(&rt, "local").await;
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT COUNT(*) AS c FROM entities".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("entities table must still exist and be queryable");
+        let count = rows
+            .first()
+            .and_then(|row| row.get("c"))
+            .map(|v| matches!(v, SqlValue::Integer(n) if *n >= 1))
+            .unwrap_or(false);
+        assert!(
+            count,
+            "entities table must survive the sweep with its seeded row intact"
+        );
+
+        let survivors = r
+            .query_all(SqlStatement {
+                sql: "SELECT name FROM sqlite_master WHERE name = ?1".into(),
+                params: vec![SqlValue::Text(malicious.to_string())],
+                label: None,
+            })
+            .await
+            .expect("query sqlite_master");
+        assert!(
+            survivors.is_empty(),
+            "malicious stale table should have been dropped"
         );
     }
 
