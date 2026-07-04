@@ -253,7 +253,7 @@ signals.
         { "source_pack": "memory", "kind": "memory", "id": "…", "score": 0.78,
           "score_semantics": "decay_weighted", "content": "…" }
       ],
-      "served_by_profile_id": "…",
+      "served_by_profile_id": null,
       "consumer_kind": "prefetch",
       "truncated": false,
       "dropped": { "slices": 0 },
