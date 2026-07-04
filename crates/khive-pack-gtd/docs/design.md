@@ -56,7 +56,7 @@
   the pack registry by name (`"gtd"`) without a hard compile-time dependency in the MCP binary.
 - Requires `"kg"` pack as a dependency (`REQUIRES = &["kg"]`).
 
-### ADR-030: Non-propagating after_create failures
+### ADR-019: Non-propagating after_create failures
 
 - If `depends_on` edge creation fails after the task note is successfully written,
   the error is logged and swallowed. A `properties["depends_on"]` key captures the same

@@ -5949,7 +5949,7 @@ async fn withdraw_cas_divergence_after_approval() {
 
 // ---- KG pack edge endpoint extensions (ADR-002 v0.2.4) ----
 //
-// These tests verify the 7 new endpoint pairs declared in KG_EDGE_RULES.
+// These tests verify the 9 new endpoint pairs declared in KG_EDGE_RULES.
 // Each test constructs a fixture with edge rules installed (mirroring what the
 // MCP transport does at startup per ADR-031) before calling link().
 
@@ -5996,6 +5996,78 @@ async fn link_person_to_org_part_of_succeeds() {
     );
     let edge = result.unwrap();
     assert_eq!(edge["relation"], "part_of");
+}
+
+/// person→project with part_of must succeed after edge rules are installed (#60).
+#[tokio::test]
+async fn link_person_to_project_part_of_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let person = f
+        .dispatch(
+            "create",
+            json!({ "kind": "person", "name": "Alice Researcher" }),
+        )
+        .await
+        .expect("create person");
+    let project = f
+        .dispatch("create", json!({ "kind": "project", "name": "khive" }))
+        .await
+        .expect("create project");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": person["id"],
+                "target_id": project["id"],
+                "relation": "part_of",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "person→project part_of must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "part_of");
+}
+
+/// person→project with instance_of must succeed after edge rules are installed (#60).
+#[tokio::test]
+async fn link_person_to_project_instance_of_succeeds() {
+    let (f, _rt) = pack_with_edge_rules();
+
+    let person = f
+        .dispatch(
+            "create",
+            json!({ "kind": "person", "name": "Bob Engineer" }),
+        )
+        .await
+        .expect("create person");
+    let project = f
+        .dispatch("create", json!({ "kind": "project", "name": "lattice" }))
+        .await
+        .expect("create project");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": person["id"],
+                "target_id": project["id"],
+                "relation": "instance_of",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "person→project instance_of must succeed with KG edge rules installed; got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(edge["relation"], "instance_of");
 }
 
 /// org→org with depends_on must succeed after edge rules are installed.
