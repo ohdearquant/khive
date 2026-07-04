@@ -684,11 +684,18 @@ impl GraphStore for SqlGraphStore {
                     }
 
                     // Wrap combined inner with per-source ROW_NUMBER limit if needed.
+                    //
+                    // Deterministic weight-descending order, tie-broken by node_id
+                    // ascending, applied INSIDE the window's ORDER BY — otherwise a
+                    // per-origin cap can silently drop high-weight neighbors in favor
+                    // of arbitrary SQLite row order (mirrors neighbors(), ADR-089
+                    // context-verb review codex round-1 High-1; issue #589).
                     let full_sql = if let Some(lim) = query_clone.limit {
                         all_params.push(Box::new(lim as i64));
                         format!(
                             "SELECT origin_id, node_id, edge_id, relation, weight \
-                             FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY origin_id) AS rn \
+                             FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY origin_id \
+                                   ORDER BY weight DESC, node_id ASC) AS rn \
                                    FROM ({combined_inner})) WHERE rn <= ?{limit_param_idx}",
                         )
                     } else {
