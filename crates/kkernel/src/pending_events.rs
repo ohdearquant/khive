@@ -1073,36 +1073,36 @@ mod tests {
     ///
     /// Issue #575: a single drain pass can legitimately report `failed >= 1`
     /// for this exact payload with no logic bug involved. `claim_pending_event`
-    /// (and the writer used inside `dispatch_action`'s `schedule.remind` call)
-    /// check out the pool's single writer connection via
+    /// checks out the pool's single writer connection via
     /// `WriterPool::writer()`, which is `parking_lot::Mutex::try_lock_for(
     /// checkout_timeout)` (default 5s, `khive-db/src/pool.rs`) — a bounded
     /// wait, not a logic gate. On a CPU-oversubscribed CI runner (`cargo test
     /// --workspace` runs dozens of test binaries, each further parallelized,
     /// against 2-4 physical cores), a task can be scheduled off-CPU for longer
     /// than the checkout timeout while queued for that mutex, so the checkout
-    /// times out and `claim_pending_event`/`dispatch_action` return `Err`,
-    /// which the drain loop correctly counts as `summary.failed += 1` and
-    /// leaves the row in `status="pending"` (the claim CAS never ran, so
-    /// nothing was mutated) — this was confirmed live: this test passed 100/100
-    /// serial runs, 8/8 full-suite runs, and 3/3 `cargo llvm-cov` runs on a
-    /// 12-core box (no reproduction), yet failed on CI (macOS + the
-    /// coverage-ratchet job) on a commit whose kkernel source did not change
-    /// from a passing run, which is the signature of scheduler contention, not
-    /// a deterministic dispatch defect.
+    /// times out *before the claim's SQL `UPDATE` ever runs*: the drain loop
+    /// counts `summary.failed += 1` and the row stays in `status="pending"`,
+    /// retryable on the next cron drain. (This retryability is specific to
+    /// claim-time checkout failure. Once a claim succeeds, a later
+    /// dispatch-time error is counted as failed but the event is still
+    /// finalized — a non-repeating event is marked fired, not returned to
+    /// pending.) Confirmed live: this test passed 100/100 serial runs, 8/8
+    /// full-suite runs, and 3/3 `cargo llvm-cov` runs on a 12-core box, yet
+    /// failed on CI on a commit whose kkernel source did not change from a
+    /// passing run — the signature of scheduler contention, not a
+    /// deterministic dispatch defect.
     ///
-    /// This is precisely the condition the checkout-timeout mechanism exists
-    /// to handle gracefully: a row that fails to claim under contention is
-    /// simply retried on the next drain pass (this CLI is documented as a
-    /// cron-friendly one-shot drain, never a single guaranteed-success call —
-    /// see the module doc comment). So the *test's* single-attempt zero-
-    /// failure assertion was stricter than the actual product contract.
-    /// Mirror the real operational contract here: retry the drain a bounded
-    /// number of times, exactly as a `* * * * * kkernel exec --pending-events`
-    /// cron entry would on its next tick, and only fail the test if the event
-    /// never dispatches cleanly across all attempts.
+    /// Rather than weakening the assertion (retries could mask a genuine
+    /// first-drain dispatch regression), remove the contention boundary
+    /// deterministically: run serially and raise the checkout timeout for
+    /// the duration of the test, keeping the original single-drain
+    /// zero-failure contract intact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
+        let prev_timeout = std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok();
+        std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "120");
+
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
@@ -1117,29 +1117,18 @@ mod tests {
         )
         .await;
 
-        const MAX_ATTEMPTS: u32 = 5;
-        let mut last_summary = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            let summary = run_pending_events(Some(&db_path), "local", false)
-                .await
-                .expect("drain");
-            let done = summary.failed == 0 && (summary.fired >= 1 || summary.advanced >= 1);
-            let exhausted_attempts = attempt + 1 == MAX_ATTEMPTS;
-            last_summary = Some(summary);
-            if done || exhausted_attempts {
-                break;
-            }
-            // A failed claim/dispatch under transient writer-mutex contention
-            // (issue #575) leaves the row in "pending" — retry immediately,
-            // exactly as the next cron tick would.
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        match prev_timeout {
+            Some(v) => std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", v),
+            None => std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS"),
         }
-        let summary = last_summary.expect("at least one drain attempt ran");
 
         assert_eq!(
             summary.failed, 0,
-            "a write-time-replayable action must dispatch cleanly at trigger time \
-             (after {MAX_ATTEMPTS} retries — transient writer-checkout contention, \
-             issue #575, should have cleared)"
+            "a write-time-replayable action must dispatch cleanly at trigger time"
         );
         assert!(
             summary.fired >= 1 || summary.advanced >= 1,
