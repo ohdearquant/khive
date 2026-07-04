@@ -87,27 +87,73 @@ closure and cannot explain a multi-hour pin**, unless that closure itself runs
 pathologically long (see (3)).
 
 **(2) `SqlBridge::begin_tx`'s explicit transactions: a genuine live-connection-duration
-risk, but not demonstrated as the incident's cause.** `sql_bridge.rs:848-894` opens a
-**standalone** connection and issues an explicit `BEGIN` (`BEGIN DEFERRED` for read-only,
-`BEGIN IMMEDIATE` for read-write, `BEGIN EXCLUSIVE` for serializable;
-`sql_bridge.rs:869-882`) that stays open, on that one connection, for exactly as long as
-the caller holds the returned `SqliteTransaction` before calling `commit()` or letting it
-drop. This is the one place in the codebase where transaction duration is fully
-caller-controlled rather than bounded by a single synchronous closure. However:
-tracing every production call site of `begin_tx` (`grep -rn "begin_tx(" crates`) finds
-exactly two non-test callers, `khive-pack-session/src/mirror/ingest.rs:615` and `:2416`,
-both `SqlTxOptions::default()` (`read_only: false`, `SqlIsolation` not `Serializable`),
-which resolves to `BEGIN IMMEDIATE`, a **write** transaction, not the read-only
-`BEGIN DEFERRED` path. Both call sites are bounded batch loops (one mirror-ingest pass
-over a file's new events) that commit at the end of the function; neither is held across
-a poll-loop sleep (`mirror/service.rs` sleeps at `service.rs:348` with no open
-transaction or connection carried across that await; every tick reopens what it needs).
-The read-only `BEGIN DEFERRED` branch requires either an explicit
-`SqlTxOptions { read_only: true, .. }` caller (none exists in the tree today) or the
-entire backend opened via `StorageBackend::sqlite_read_only` (`backend.rs:46-70`, an
-opt-in config path via `cfg.read_only` in `serve.rs:1209`, not the default `khive.db`
-backend construction). **This mechanism is real and worth bounding defensively, but it
-is a latent risk under today's call graph, not a proven explanation for #580.**
+risk, but not demonstrated as the incident's cause, and NOT the only such risk (see
+(2b)).** `sql_bridge.rs:848-894` opens a **standalone** connection and issues an explicit
+`BEGIN` (`BEGIN DEFERRED` for read-only, `BEGIN IMMEDIATE` for read-write,
+`BEGIN EXCLUSIVE` for serializable; `sql_bridge.rs:869-882`) that stays open, on that one
+connection, for exactly as long as the caller holds the returned `SqliteTransaction`
+before calling `commit()` or letting it drop. Tracing every call site of `begin_tx`
+(`grep -rn "begin_tx(" crates`) finds exactly **one production caller**,
+`khive-pack-session/src/mirror/ingest.rs:615`; the other match, `ingest.rs:2416`, is
+inside `#[tokio::test] test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced`
+and is not reachable from production code. The one production caller uses
+`SqlTxOptions::default()` (`read_only: false`, `SqlIsolation` not `Serializable`), which
+resolves to `BEGIN IMMEDIATE`, a **write** transaction, not the read-only
+`BEGIN DEFERRED` path. It is a bounded batch loop (one mirror-ingest pass over a file's
+new events) that commits at the end of the function; it is not held across a poll-loop
+sleep (`mirror/service.rs` sleeps at `service.rs:348` with no open transaction or
+connection carried across that await; every tick reopens what it needs). The read-only
+`BEGIN DEFERRED` branch requires either an explicit `SqlTxOptions { read_only: true, .. }`
+caller (none exists in the tree today) or the entire backend opened via
+`StorageBackend::sqlite_read_only` (`backend.rs:46-70`, an opt-in config path via
+`cfg.read_only` in `serve.rs:1209`, not the default `khive.db` backend construction).
+**This mechanism is real and worth bounding defensively, but it is a latent risk under
+today's call graph, not a proven explanation for #580.**
+
+**(2b) Raw `SqlWriter`-held transactions: a second, separate caller-controlled-duration
+mechanism that bypasses `begin_tx` entirely (missed in the round-1 revision, confirmed by
+a full-workspace grep for `BEGIN (IMMEDIATE|DEFERRED|EXCLUSIVE)` across every crate).**
+`begin_tx`/`SqliteTransaction` is not, in fact, "the one place in the codebase where
+transaction duration is fully caller-controlled." A separate, more common pattern
+acquires a plain `Box<dyn SqlWriter>` (via `sql.writer()`, either the standalone
+file-backed writer or the pooled/in-memory writer) and issues `BEGIN IMMEDIATE`/`COMMIT`/
+`ROLLBACK` as ordinary SQL statements through `execute`/`execute_batch`, entirely outside
+`SqliteTransaction`'s tracking. Confirmed sites:
+
+- `khive-pack-brain/src/fold_gate.rs:165-183` (`apply_fold_gate`): acquires a writer,
+  issues raw `BEGIN IMMEDIATE`, runs the fold-gate dedup/mass-check/write, then `COMMIT`
+  with a `ROLLBACK` fallback on failed commit.
+- `khive-pack-brain/src/persist.rs:330-400` (`persist_brain_state_mutation`): its own doc
+  comment states this "deliberately does NOT use `SqlAccess::begin_tx`" because, per
+  `fold_gate.rs`'s module doc, `begin_tx` "requires a file-backed database and errors for
+  in-memory pools" used throughout this crate's test suite and by `KhiveRuntime::memory()`.
+  This is a real architectural constraint, not an oversight: `begin_tx`'s standalone-
+  connection design (`sql_bridge.rs:848-894`) has no in-memory-pool-compatible path today.
+- `khive-db/src/sql_bridge.rs` itself: `SqliteWriter::execute_batch` (~340-380, standalone
+  file-backed writer) and `PoolBackedWriter::execute_batch` (~715-745, pooled/in-memory
+  writer) both issue raw `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` strings as part of their own
+  batch-execution implementation, a second flavor of the same bypass.
+- `khive-runtime/src/curation.rs` (`merge_entity`, ~270-300, 865, 1289): its doc comment
+  states the whole merge (entity reads/writes, edge rewires, FTS updates, vec-index
+  delete) "runs on a single pool connection inside one `BEGIN IMMEDIATE` transaction via
+  `merge_entity_sql`."
+- Every store's own batch-upsert method: `entity.rs:325`, `text.rs:298/363/1111`,
+  `note.rs:433`, `graph.rs:352`, `vectors.rs:356`, `event.rs:707/722`, `sparse.rs:249` each
+  wrap a batch write in its own raw `BEGIN IMMEDIATE`/`COMMIT`.
+- `khive-vcs/src/sync.rs:970-1010`: per-chunk entity and FTS-doc writes during KG
+  sync/merge, each "one `BEGIN IMMEDIATE` / `COMMIT` per chunk," routed through the store
+  batch methods above.
+
+Every one of these is, today, a **short, function-scoped** batch (one fold-gate decision,
+one brain-state mutation, one entity merge, one chunk of a sync). None is demonstrated to
+be held across an await or a multi-hour span. But the same category of risk that
+motivates bounding `begin_tx` applies here: nothing currently prevents a future change
+(an error path that returns before `COMMIT`/`ROLLBACK`, a batch loop that grows unbounded,
+a nested call that holds the writer across an external call) from turning one of these
+into a long-held write transaction. Since production traffic overwhelmingly goes through
+this pattern rather than `begin_tx`, **excluding it from Plank 1 would leave the
+instrumentation and caps blind to the majority of the codebase's actual caller-controlled
+transaction surface.**
 
 **(3) A pathologically long single closure inside (1).** Because (1)'s connections are
 provably bounded to the closure's own execution, an ANN/vector search, graph traversal,
@@ -139,11 +185,12 @@ snapshot and are **not a candidate**.
 
 Static code reading does not conclusively identify a Rust-level mechanism that holds a
 read transaction open for the incident's observed timescale (processes live >24h). The
-strongest remaining candidates, in order of plausibility, are: (2) if a future or
-missed caller ever holds a `begin_tx` transaction across a long idle span (not currently
-demonstrated), (4) `vec0`'s internal behavior (unverified, native code, needs targeted
-instrumentation or upstream documentation review), and (3) a pathologically long bounded
-query (self-terminating, doesn't match the ">24h idle process" shape well). Per
+strongest remaining candidates, in order of plausibility, are: (2)/(2b) if a future or
+missed caller ever holds a `begin_tx` or raw-`SqlWriter` transaction across a long idle
+span (not currently demonstrated for either), (4) `vec0`'s internal behavior (unverified,
+native code, needs targeted instrumentation or upstream documentation review), and (3) a
+pathologically long bounded query (self-terminating, doesn't match the ">24h idle
+process" shape well). Per
 讲事实摆道理: rather than assert an unproven mechanism and design enforcement around it,
 this ADR now leads with instrumentation to let production telemetry identify the actual
 pin source before tuning any enforcement threshold, and separately bounds the one
@@ -161,11 +208,27 @@ contention and multi-writer scaling are tracked separately.
 
 Three parts. Plank 0 instruments the checkpoint task to name what is actually pinning
 the boundary in production, since static reading could not conclusively identify it.
-Plank 1 bounds the one mechanism proven to allow caller-controlled read-transaction
-duration (`begin_tx`), plus the in-memory/test pooled-reader path the original draft
-targeted, narrowed to the surface it actually covers. Plank 2 (TRUNCATE escalation)
-carries over from the original draft largely unchanged, with an explicit flap/backoff
-statement added per Leo's request.
+Plank 1 bounds every mechanism proven to allow caller-controlled transaction duration:
+`begin_tx` (2) **and** raw `SqlWriter`-held transactions (2b), via one shared tracking
+mechanism, plus the in-memory/test pooled-reader path the original draft targeted,
+narrowed to the surface it actually covers. Plank 2 (TRUNCATE escalation) carries over
+from the original draft largely unchanged, with an explicit flap/backoff statement added
+per Leo's request.
+
+**Migrate-vs-instrument decision for (2b):** this ADR does **not** propose migrating the
+raw-`SqlWriter` call sites (`fold_gate.rs`, `persist.rs`, `sql_bridge.rs`'s own writer
+impls, `curation.rs`, every store's batch methods, `khive-vcs/src/sync.rs`) onto
+`begin_tx`. `persist.rs`'s own doc comment names a real constraint: `begin_tx`'s
+standalone-connection design has no in-memory-pool-compatible path, and in-memory pools
+are load-bearing for this crate's test suite and for `KhiveRuntime::memory()`. Migrating
+would mean either breaking that test-pool compatibility or first building a pooled
+variant of `begin_tx`, both larger and riskier than the WAL-pinning problem this ADR is
+fixing. Instead, Plank 1 extends the same age-tracking/enforcement mechanism to cover
+raw `SqlWriter` transactions **in place**, via a small shared open-transaction registry
+that both `SqliteTransaction::begin_tx` and the raw-BEGIN call sites register with. This
+keeps each call site's existing connection-acquisition strategy (standalone vs. pooled,
+file-backed vs. in-memory) untouched and adds only a `register`/`deregister` pair around
+each existing `BEGIN`/`COMMIT`-or-`ROLLBACK` span.
 
 ### Plank 0: instrumentation before enforcement tuning
 
@@ -176,49 +239,99 @@ not an optional nice-to-have:
 - On every `run_checkpoint_task` tick (`checkpoint.rs:141-183`), in addition to the
   existing `wal_pages` observation, log (`tracing::debug!` normally, escalating to
   `tracing::warn!` once `wal_pages` crosses `warn_pages`, matching the existing
-  rate-limited crossing pattern) the age of the oldest currently-open `begin_tx`
-  transaction, if any (see Plank 1's tracking below), and the current WAL frame count.
+  rate-limited crossing pattern) the age of the oldest currently-open transaction in the
+  shared open-transaction registry (Plank 1, covering both `begin_tx` and raw
+  `SqlWriter`-held transactions), if any, and the current WAL frame count.
 - On a TRUNCATE attempt (Plank 2) that fails to make progress (`wal_pages_after` within a
-  small epsilon of `wal_pages_before`), enumerate and log every currently-open `begin_tx`
-  transaction's start time, elapsed duration, and (if the caller supplied one) a label,
-  extending `SqlTxOptions` with an optional `label: Option<&'static str>` mirroring the
-  `SqlStatement::label` convention already used elsewhere (`ingest.rs`'s
-  `label: Some("session_mirror_insert_message")` pattern). This directly answers the
-  question this ADR could not answer from static reading: which specific caller, if any,
-  is holding the pin, the next time this happens in production.
+  small epsilon of `wal_pages_before`), enumerate and log every currently-open registry
+  entry's start time, elapsed duration, and (if the caller supplied one) a label, reusing
+  the **existing** `label: Option<String>` field already present on both `SqlTxOptions`
+  and `SqlStatement` (`khive-storage/src/types/sql.rs:66-69`; no schema/type change
+  needed, e.g. `ingest.rs`'s `label: Some("session_mirror_insert_message")` pattern, and a
+  new label passed at each raw-`SqlWriter` call site, e.g.
+  `label: Some("fold_gate_apply")`, `label: Some("brain_persist_mutation")`,
+  `label: Some("merge_entity")`, `label: Some("entity_upsert_batch")`). This directly
+  answers the question this ADR could not answer from static reading: which specific
+  caller, if any, is holding the pin, the next time this happens in production.
 - This data gates Plank 1's threshold tuning: `KHIVE_TX_MAX_AGE_SECS` (below) ships with
   a conservative default and is explicitly called out as provisional pending one cycle
   of production telemetry from this plank.
 
-### Plank 1: bound the one caller-controllable read-transaction path, retarget the rest
+### Plank 1: bound every caller-controllable transaction path via a shared registry, retarget the rest
 
-**`begin_tx` transaction age bound (new, replaces the original Plank 1's primary
-mechanism).** `SqliteTransaction` (`sql_bridge.rs:401-407`) gains an `opened_at: Instant`
-field, set when `begin_tx` issues its `BEGIN` (`sql_bridge.rs:882-883`). Two enforcement
-points, both because a transaction on a standalone connection cannot be safely
-force-rolled-back from a different thread than the one holding it:
+**Shared open-transaction registry (new, covers both `begin_tx` and raw `SqlWriter`
+transactions).** A process-wide registry (a `Mutex<HashMap<TxId, TxMeta>>` or equivalent;
+`TxMeta { opened_at: Instant, label: Option<String> }`) is the single place both
+mechanisms register:
 
-- **Soft cap (logging only):** every `execute`/`query_row`/`query_all` call on the
-  transaction (`sql_bridge.rs:411-538`) checks `opened_at.elapsed()` and logs a
-  rate-limited `tracing::warn!` (same edge-triggered pattern as `crossing_warn`,
-  `checkpoint.rs:224-228`) once it exceeds `KHIVE_TX_WARN_SECS` (default **30s**;
-  provisional, see Plank 0). Includes the transaction's `label` if the caller supplied
-  one.
-- **Hard cap (fail-closed):** once `opened_at.elapsed()` exceeds
-  `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see Plank 0), subsequent
-  `execute`/`query_row`/`query_all` calls on that transaction return an error instead of
-  running the statement, forcing the caller's own error-handling path to abort and drop
-  the transaction. `SqliteTransaction` has no `Drop` impl today (`sql_bridge.rs:401-407`);
-  dropping the struct drops its `Option<Connection>`, and `rusqlite::Connection::drop`
-  closes the connection, which SQLite auto-rolls-back on close. This is already correct
-  behavior; the hard cap makes sure a caller that ignores the soft-cap WARN and keeps
-  looping cannot hold the transaction open indefinitely. No committed work is lost that
-  the caller didn't already fail to commit; this is strictly a bound on worst-case
-  duration, not a change to commit semantics.
+- `SqliteTransaction::begin_tx` (`sql_bridge.rs:848-894`) registers on `BEGIN`
+  (`sql_bridge.rs:882-883`) and deregisters on `commit()`/`drop`.
+- Each raw-`SqlWriter` call site identified in Inventory (2b) (`fold_gate.rs:165-183`,
+  `persist.rs:330-400`, `sql_bridge.rs`'s `SqliteWriter`/`PoolBackedWriter::execute_batch`,
+  `curation.rs`'s `merge_entity`, every store's batch-upsert method, `khive-vcs/sync.rs`'s
+  per-chunk writes) wraps its existing `BEGIN IMMEDIATE` / `COMMIT`-or-`ROLLBACK` span with
+  a `register(label)` call immediately after `BEGIN` succeeds and a `deregister(id)` call
+  in both the commit and rollback paths (including error paths that currently return
+  before reaching `COMMIT`, which this change forces to be explicit about). This is
+  additive at each site: it does not change connection acquisition, isolation level, or
+  commit/rollback logic, only adds a bookkeeping call around the existing span.
+
+Two enforcement points read the registry, applied uniformly to every registered
+transaction regardless of which mechanism created it:
+
+- **Soft cap (logging only):** on every `execute`/`query_row`/`query_all` call routed
+  through a registered `SqliteTransaction`, and on every checkpoint tick (Plank 0) for
+  raw-`SqlWriter` entries (which have no per-statement hook to piggyback on), check the
+  registry entry's `opened_at.elapsed()` and log a rate-limited `tracing::warn!` (same
+  edge-triggered pattern as `crossing_warn`, `checkpoint.rs:224-228`) once it exceeds
+  `KHIVE_TX_WARN_SECS` (default **30s**; provisional, see Plank 0), including the entry's
+  `label` if supplied.
+- **Cooperative stale-operation guard, not a lifetime bound (reworded per codex round-2:
+  the original "hard cap" language overclaimed).** Once a registry entry's
+  `opened_at.elapsed()` exceeds `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see
+  Plank 0):
+  - For `SqliteTransaction`: subsequent `execute`/`query_row`/`query_all` calls on that
+    transaction return an error instead of running the statement, forcing the caller's own
+    error-handling path to abort and drop the transaction. This is a **guard against a
+    caller that keeps issuing statements past the cap**, not a bound on how long an
+    already-open, currently-idle transaction can sit un-acted-upon: a transaction that
+    opens, runs one statement, and is then held across a long await with no further
+    `execute`/`query_row`/`query_all` call never trips this check, because there is no
+    subsequent call for it to intercept. Fixing that gap requires either (a) an active
+    background sweep of the registry that force-drops entries past a harder ceiling
+    (deferred, see below) or (b) the closure-scoped transaction API (see Plank 1's
+    follow-up note) that makes "held past the return of an async function" structurally
+    impossible. This ADR ships (a) as an explicit, separate mechanism rather than folding
+    it into the per-statement check:
+    - **`commit()` past the cap:** `SqliteTransaction::commit()` checks `opened_at.elapsed()`
+      before issuing `COMMIT`; past `KHIVE_TX_MAX_AGE_SECS` it issues `ROLLBACK` instead and
+      returns an error to the caller, rather than silently committing a transaction that
+      has already been flagged as stale. This closes the previously unspecified
+      "`commit()` after the cap" gap: legitimate long-running batches that hit this will
+      have their work rolled back and must retry in smaller chunks (see Failure modes).
+    - **Background registry sweep (Plank 0's checkpoint tick, extended):** on each
+      `run_checkpoint_task` tick, any registry entry whose `opened_at.elapsed()` exceeds
+      `KHIVE_TX_MAX_AGE_SECS` is logged at `tracing::warn!` (escalating in severity the
+      longer it persists, matching Plank 2's multi-tier WARN pattern) even if the owning
+      caller never issues another statement or calls `commit()`. This does **not**
+      force-close the connection (that would require unsafe cross-thread manipulation of
+      a connection another task owns); it makes a stuck transaction visible to an
+      operator via the checkpoint tick's existing log line, which is the same mitigation
+      Plank 2 already uses for sustained TRUNCATE failure.
+  - For raw `SqlWriter` sites, the same `commit()`-past-cap and background-sweep behavior
+    apply at the registry level; each site's existing commit call is wrapped to check the
+    registry entry's age before issuing `COMMIT` and to `ROLLBACK` instead past the cap,
+    matching `SqliteTransaction`'s behavior.
 - `KHIVE_TX_WARN_SECS` / `KHIVE_TX_MAX_AGE_SECS` are deliberately generous relative to
-  the two known production callers (bounded per-file mirror-ingest batches, expected to
-  complete in well under a second per file in normal operation) so this cap is a safety
-  net for a runaway loop or a future caller, not a routine limit.
+  every known production caller (the one bounded `begin_tx` mirror-ingest batch, and the
+  (2b) sites' function-scoped fold-gate/persist/merge/batch-upsert spans, all expected to
+  complete in well under a second in normal operation) so this guard is a safety net for a
+  runaway loop or a future caller, not a routine limit.
+- **Follow-up, not designed here:** a closure-scoped transaction API (`with_tx(|tx| { ...
+  })` that structurally cannot outlive the closure, eliminating the "held across an await"
+  class of risk entirely) is named as a candidate for a future ADR, once Plank 0's
+  telemetry shows whether this class of bug actually occurs in practice. This ADR does not
+  design it now.
 
 **Pooled `ReaderGuard` recycling: keep, narrow the claim.** The original draft's
 age/op-count recycling on `return_reader` (`pool.rs:434-454`) is retained exactly as
@@ -267,21 +380,22 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   require blocking writer acquisition (rejected, see original Alternatives).
 - Observability: unchanged from the original draft (`tracing::info!` per attempt with
   before/after page counts and elapsed time; `tracing::warn!` after three consecutive
-  attempts fail to clear `warn_pages`), extended per Plank 0 to also log open `begin_tx`
-  transactions when an attempt fails to make progress.
+  attempts fail to clear `warn_pages`), extended per Plank 0 to also log every open entry
+  in the shared transaction registry (both `begin_tx` and raw `SqlWriter` transactions)
+  when an attempt fails to make progress.
 
 ### Config summary
 
-| Key                                    | Default | Plank | Purpose                                                                                      | Status                                     |
-| -------------------------------------- | ------- | ----- | -------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Soft-cap WARN on an open `begin_tx` transaction's age                                        | New, provisional pending Plank 0 telemetry |
-| `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Hard-cap: reject further statements on a transaction past this age                           | New, provisional pending Plank 0 telemetry |
-| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)        | Carried over, scope narrowed               |
-| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)   | Carried over, scope narrowed               |
-| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only) | Carried over, scope narrowed               |
-| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                  | Carried over                               |
-| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                         | Carried over                               |
-| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                    | Carried over                               |
+| Key                                    | Default | Plank | Purpose                                                                                       | Status                                     |
+| -------------------------------------- | ------- | ----- | --------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Soft-cap WARN on a registry entry's age (`begin_tx` or raw `SqlWriter` transaction)           | New, provisional pending Plank 0 telemetry |
+| `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Cooperative stale-op guard: reject further statements / roll back on `commit()` past this age | New, provisional pending Plank 0 telemetry |
+| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)         | Carried over, scope narrowed               |
+| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)    | Carried over, scope narrowed               |
+| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only)  | Carried over, scope narrowed               |
+| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                   | Carried over                               |
+| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                          | Carried over                               |
+| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                     | Carried over                               |
 
 Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES` (2000),
 `KHIVE_WAL_HIGH_WATER_PAGES` (6000), `KHIVE_JOURNAL_SIZE_LIMIT_BYTES` (64MiB),
@@ -312,18 +426,30 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
    requires an MCP transport change (stdio sessions proxying reads through the daemon
    socket) beyond a bounded-lifetime fix, and per this ADR's inventory, production reads
    are already bounded per-call, so this alternative would not by itself have prevented
-   #580 unless the actual pin turns out to be a `begin_tx` write path that a
-   daemon-mediated design would also need to serialize correctly.
+   #580 unless the actual pin turns out to be a `begin_tx` or raw-`SqlWriter` write path
+   that a daemon-mediated design would also need to serialize correctly.
 
 ## Failure modes
 
-- **`begin_tx` hard-cap rejection during a legitimate long-running batch.** If a future
-  caller legitimately needs a transaction open longer than `KHIVE_TX_MAX_AGE_SECS`
-  (120s default), the hard cap forces it to fail and retry in smaller batches. This is
-  an intentional trade: no code path in the tree today needs a transaction anywhere near
-  that long (mirror-ingest batches are per-file and complete well under a second in
-  normal operation); if this becomes a real constraint, raise the cap rather than remove
-  it, using Plank 0's telemetry to confirm the caller's real needs first.
+- **Stale-op guard rejection / commit-time rollback during a legitimate long-running
+  batch.** If a future caller (via `begin_tx` or a raw `SqlWriter` transaction)
+  legitimately needs a transaction open longer than `KHIVE_TX_MAX_AGE_SECS` (120s
+  default), the guard forces its next `execute`/`query_row`/`query_all` call to fail, and
+  a `commit()` past the cap is rolled back instead of committed, forcing the caller to
+  retry in smaller batches. This is an intentional trade: no code path in the tree today
+  needs a transaction anywhere near that long (the one `begin_tx` mirror-ingest batch and
+  the (2b) raw-`SqlWriter` sites are all bounded per-file/per-chunk/per-mutation spans
+  expected to complete well under a second in normal operation); if this becomes a real
+  constraint, raise the cap rather than remove it, using Plank 0's telemetry to confirm
+  the caller's real needs first.
+- **Idle-held transaction between statements, never re-checked.** As stated in Plank 1,
+  the per-statement guard cannot catch a transaction that opens, runs one statement, and
+  is then held idle (no further `execute`/`query_row`/`query_all`, no `commit()`) across a
+  long await. The background registry sweep (Plank 0's checkpoint tick) surfaces this via
+  a WARN, but does not force-close the connection. This is an accepted gap in this ADR's
+  first iteration, not a silent one: the closure-scoped transaction API follow-up (Plank 1)
+  is the structural fix, deferred pending Plank 0 telemetry showing whether this actually
+  occurs.
 - **TRUNCATE contention**: bounded to `truncate_busy_timeout` (default 2s) per attempt,
   at most once per `truncate_min_interval` under normal conditions (see the flap/backoff
   note: a skipped attempt due to writer contention does not consume the interval).
@@ -344,9 +470,15 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
 - The false premise from the original draft (idle pooled readers pin production WAL) is
   retracted; this ADR no longer claims a fix for a mechanism that does not exist in the
   production code path.
-- WAL growth now has one new, real, caller-controllable bound: no `begin_tx` transaction
-  can hold a connection open past `KHIVE_TX_MAX_AGE_SECS`, closing the one mechanism this
-  review confirmed is both live and fully under a single caller's control.
+- WAL growth now has a cooperative age guard covering every caller-controllable
+  transaction mechanism this review confirmed exists: `begin_tx`'s `SqliteTransaction`
+  **and** the raw `SqlWriter`-held transactions in `khive-pack-brain` (`fold_gate.rs`,
+  `persist.rs`), `sql_bridge.rs`'s own writer implementations, `curation.rs`'s
+  `merge_entity`, every store's batch-upsert method, and `khive-vcs`'s chunked sync
+  writes, all sharing one open-transaction registry. This guard rejects further
+  statements and rolls back a stale `commit()` past `KHIVE_TX_MAX_AGE_SECS`; it does not
+  (yet) force-close a transaction held idle across an await with no further calls, an
+  accepted gap tracked as a follow-up (see Failure modes).
 - Plank 0's instrumentation is the load-bearing deliverable of this ADR's first
   iteration: it converts "we don't know what's pinning the WAL" into a concrete,
   loggable answer the next time sustained WAL pressure occurs, which Plank 1's
@@ -355,11 +487,17 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   `warn_pages`/`high_water_pages` WARN semantics are unchanged; TRUNCATE escalation is
   additive to `checkpoint.rs`, not a rewrite, with an explicit accepted-worst-case
   statement for sustained writer contention.
-- Two new config knobs for the `begin_tx` bound (Plank 1), three carried-over knobs
-  narrowed in scope, three for TRUNCATE escalation (Plank 2); the two new keys are
-  explicitly marked provisional pending one cycle of production telemetry rather than
-  presented as tuned defaults.
+- Two new config knobs for the shared transaction-registry guard (Plank 1), covering both
+  `begin_tx` and raw `SqlWriter` transactions, three carried-over knobs narrowed in scope,
+  three for TRUNCATE escalation (Plank 2); the two new keys are explicitly marked
+  provisional pending one cycle of production telemetry rather than presented as tuned
+  defaults.
+- `SqlTxOptions`/`SqlStatement`'s existing `label: Option<String>` field
+  (`khive-storage/src/types/sql.rs:66-69`) is reused for registry entries; no new field or
+  schema change is introduced by this ADR.
 - Follow-up (tracked separately, not blocking this ADR): once Plank 0 telemetry
-  identifies whether `vec0`'s internal cursor behavior, a missed `begin_tx` caller, or
-  something else entirely is the actual #580 mechanism, file a short ADR amendment
-  narrowing or retuning Plank 1 rather than re-guessing from static code reading again.
+  identifies whether `vec0`'s internal cursor behavior, a missed `begin_tx`/raw-`SqlWriter`
+  caller, or something else entirely is the actual #580 mechanism, file a short ADR
+  amendment narrowing or retuning Plank 1 rather than re-guessing from static code reading
+  again. The closure-scoped transaction API (Plank 1's named follow-up) is also tracked
+  here as a candidate future ADR.
