@@ -153,10 +153,12 @@ Two cases:
   pass --db :memory: to force all backends in-memory for this invocation.
   ```
 
-  (Source: `build_registry_for_multi_backend`, `crates/khive-mcp/src/serve.rs`.
-  Verified live against the 0.3.0 binary: a config declaring two `[[backends]]`
-  entries plus a concrete `--db`/`KHIVE_DB` override exits with this exact
-  message and process exit code 1.)
+  (Representative message: `<path>` and `N` stand in for the source template's
+  `{other:?}` and `{backend_count}` placeholders, and line breaks are rewrapped
+  here. Source: `build_registry_for_multi_backend`,
+  `crates/khive-mcp/src/serve.rs`. Verified live against the 0.3.0 binary: a
+  config declaring two `[[backends]]` entries plus a concrete `--db`/`KHIVE_DB`
+  override exits with this message and process exit code 1.)
 
 **Why this fails loud instead of silently applying `--db` to `main` only, or
 to every backend:** with two or more distinct declared backend files, a
@@ -238,7 +240,7 @@ If you passed `--db` in any of the above configs before upgrading to 0.3.0
 and your config file now declares `[[backends]]`, remove the `--db` argument
 (and unset `KHIVE_DB` if it is set in the client's environment). Leaving it in
 place is what produces the connect failure in
-[Troubleshooting](#troubleshooting-a-32000-connect-failure) below. The config
+[Troubleshooting](#troubleshooting-a-connect-failure) below. The config
 file's `[[backends]]` paths are authoritative once declared; there is no
 partial-override mode.
 
