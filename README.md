@@ -136,12 +136,12 @@ records what's connected, in which direction, and why.
 │  khive-pack-comm:      threaded messaging (5 verbs)           │
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-knowledge: atom KB + embedding rerank (19 verbs)  │
-│  khive-pack-session:   session record persistence (4 verbs)  │
+│  khive-pack-session:   session record persistence (4 verbs)   │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-runtime, khive-request, khive-query, khive-db,        │
-│  khive-storage, khive-score, khive-types                     │
+│  khive-runtime, khive-request, khive-query, khive-db,         │
+│  khive-storage, khive-score, khive-types                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
