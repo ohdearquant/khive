@@ -38,7 +38,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     let server = build_server(&args)?;
 
     #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops(&server);
+    spawn_email_channel_loops_if_daemon(&server, &args);
 
     #[cfg(unix)]
     if args.daemon {
@@ -65,11 +65,48 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     transport.serve(server, &opts).await
 }
 
+/// Whether this process owns the email channel loops (#602).
+///
+/// Channel loops (IMAP poll + outbox scan) are a daemon-role responsibility:
+/// before this gate, `spawn_email_channel_loops` was called unconditionally
+/// from EVERY serve entrypoint, so every stdio `kkernel mcp` client process
+/// (one per Claude Code session, agent, etc.) spawned its own independent IMAP
+/// poll loop against the same mailbox. Nine concurrent pollers exhausted
+/// Exchange Online's per-mailbox connection slots and took inbound email down
+/// for ~19h on 2026-07-04. `args.daemon` is the same flag `run`/`serve_server`
+/// already use to decide whether to hand off to
+/// `khive_runtime::daemon::run_daemon`, so gating on it keeps daemon-role
+/// detection in one place shared by both boot paths, matching the
+/// `checkpoint_pool_for` pattern (#601/#604).
+#[cfg(feature = "channel-email")]
+fn is_daemon_role(args: &Args) -> bool {
+    args.daemon
+}
+
+/// Spawn the email channel loops if — and only if — `args` indicates this
+/// process is the daemon (#602). Shared by both serve entrypoints (`run` and
+/// `serve_server`) so the role gate lives in exactly one place instead of
+/// being duplicated at each call site. Emits one `tracing::info!` line either
+/// way so the decision is visible at startup (seeds #606's health surface).
+///
+/// If no daemon is running, mail is simply not polled until one starts — that
+/// is the intended behavior, not a silent failure; the log line makes it
+/// observable.
+#[cfg(feature = "channel-email")]
+fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+    if is_daemon_role(args) {
+        tracing::info!("email channel loops: spawning (daemon role)");
+        spawn_email_channel_loops(server);
+    } else {
+        tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
+    }
+}
+
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
-/// warning and returns on incomplete config. Must be called from EVERY serve
-/// entrypoint (both `run` and `serve_server`) — the poll loop is otherwise
-/// silently dropped on the multi-backend path.
+/// warning and returns on incomplete config. Only call this when
+/// [`is_daemon_role`] is true — use [`spawn_email_channel_loops_if_daemon`],
+/// which both serve entrypoints (`run` and `serve_server`) call.
 #[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(server: &KhiveMcpServer) {
     use khive_channel::ChannelRegistry;
@@ -529,7 +566,7 @@ pub async fn serve_server(
     registry: &TransportRegistry,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops(&server);
+    spawn_email_channel_loops_if_daemon(&server, args);
 
     #[cfg(unix)]
     if args.daemon {
@@ -3288,6 +3325,81 @@ brain_profile = "project-profile"
             // Must not panic: EmailChannel::from_env() fails closed on the missing
             // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
             spawn_email_channel_loops(&server);
+        }
+
+        /// Regression for #602: `spawn_email_channel_loops_if_daemon` is the
+        /// SAME wrapper `run` and `serve_server` call (source-verified — see
+        /// those fns' bodies above) — no reimplementation of the role check
+        /// here. Actual tokio task spawning cannot be observed from a unit
+        /// test, so this pair instead exercises `is_daemon_role` (the pure
+        /// predicate) directly against real `Args` values, and drives the
+        /// production wrapper through both roles to prove neither branch
+        /// panics — the same "no-panic" scope the sibling test above uses.
+        #[test]
+        fn is_daemon_role_true_for_daemon_args() {
+            use clap::Parser;
+            let args = Args::parse_from(["mcp", "--daemon"]);
+            assert!(
+                is_daemon_role(&args),
+                "--daemon must resolve to daemon role"
+            );
+        }
+
+        #[test]
+        fn is_daemon_role_false_for_client_args() {
+            use clap::Parser;
+            let args = Args::parse_from(["mcp"]);
+            assert!(
+                !is_daemon_role(&args),
+                "a plain stdio client (no --daemon) must not resolve to daemon role"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn daemon_role_gate_spawns_without_panic() {
+            use clap::Parser;
+            let _env_guard = EmailEnvGuard::clear();
+            let args = Args::parse_from(["mcp", "--daemon"]);
+
+            let config = RuntimeConfig {
+                db_path: None,
+                default_namespace: Namespace::parse("test").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+            // Daemon role: the wrapper must take the spawn branch (still fails
+            // closed on missing KHIVE_EMAIL_* — no network I/O — but must not
+            // panic reaching it).
+            spawn_email_channel_loops_if_daemon(&server, &args);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn client_role_gate_skips_without_panic() {
+            use clap::Parser;
+            let _env_guard = EmailEnvGuard::clear();
+            let args = Args::parse_from(["mcp"]);
+
+            let config = RuntimeConfig {
+                db_path: None,
+                default_namespace: Namespace::parse("test").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+            // Client role: the wrapper must take the skip branch and never
+            // attempt to construct an EmailChannel at all.
+            spawn_email_channel_loops_if_daemon(&server, &args);
         }
     }
 }
