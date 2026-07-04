@@ -36,7 +36,7 @@ pub use types::{
     TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
     TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind,
     VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo,
+    VectorStoreCapabilities, VectorStoreInfo, MAX_SPARSE_SEARCH_TOP_K,
 };
 
 pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};

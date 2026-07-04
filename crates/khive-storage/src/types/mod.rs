@@ -17,7 +17,9 @@ pub use graph::{
     PathNode, SortDirection, SortOrder, TimeRange, TraversalOptions, TraversalRequest,
 };
 pub use pagination::{Page, PageRequest};
-pub use sparse::{SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector};
+pub use sparse::{
+    SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, MAX_SPARSE_SEARCH_TOP_K,
+};
 pub use sql::{SqlColumn, SqlIsolation, SqlRow, SqlStatement, SqlTxOptions, SqlValue};
 pub use text::{
     IndexRebuildScope, TextDocument, TextFilter, TextGatherMode, TextIndexStats, TextQueryMode,
