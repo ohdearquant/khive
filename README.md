@@ -325,6 +325,9 @@ khive mcp --log debug                         # Log level (default: warn)
 
 Environment variables: `KHIVE_DB`, `KHIVE_NAMESPACE`, `KHIVE_NO_EMBED`, `KHIVE_LOG`.
 
+For config file discovery order, the `[[backends]]` model, and how `--db` interacts
+with a declared backend topology, see [docs/configuration.md](docs/configuration.md).
+
 ### Development
 
 ```bash

@@ -10,6 +10,10 @@ References: [ADR-028](adr/ADR-028-pack-scoped-backends.md) (per-pack backend
 config), [ADR-029](adr/ADR-029-substrate-coordinator.md) (SubstrateCoordinator
 and cross-backend operations).
 
+See also [docs/configuration.md](configuration.md) for the `--db` / `[[backends]]`
+interaction (including the fail-loud rejection when both are combined), MCP
+client configuration, and troubleshooting a connect failure.
+
 ---
 
 ## What it is and when to use it
