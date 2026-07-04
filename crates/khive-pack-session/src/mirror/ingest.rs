@@ -20,6 +20,20 @@
 //! a pass durably advances the offset even if it scanned zero parseable
 //! events — a long run of blank or oversized lines can no longer read to EOF
 //! unbounded, nor lose its cursor advance.
+//!
+//! A line that crosses `max_line_bytes` with no terminating `\n` yet — a
+//! still-growing file's in-progress final line, or a genuinely truncated /
+//! corrupt tail — is its own bounded case, distinct from the complete
+//! (terminated) oversized-line skip above: `read_line_bounded` reports
+//! [`LineRead::OversizedUnterminated`] as soon as one bounded read window
+//! crosses the cap without finding `\n`, instead of scanning onward to EOF
+//! looking for one. The cursor is intentionally left at that line's start
+//! (like an ordinary `Partial`), so the next poll — or the next daemon
+//! start — repeats the same bounded read rather than an unbounded tail
+//! scan; once the line eventually terminates (or the file stops growing and
+//! reaches true EOF mid-line), it resolves to the normal `Oversized`
+//! skip-and-advance path or stays a bounded `Partial`/`OversizedUnterminated`
+//! retry, never a full-file read in one call (PACKSESSION-AUD-003 round 2).
 
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
@@ -178,6 +192,7 @@ struct MirrorChunk {
 }
 
 /// Outcome of [`read_line_bounded`] for one line.
+#[derive(Debug)]
 enum LineRead {
     /// EOF with nothing read at all.
     Eof,
@@ -197,6 +212,17 @@ enum LineRead {
     /// without buffering — so the caller must skip it, not parse `buf`.
     /// `bytes` is the total bytes consumed from the reader.
     Oversized { bytes: usize },
+    /// The line has already exceeded `max_line_bytes` and no terminating
+    /// `\n` has been found yet, but this is NOT end-of-file — there may be
+    /// more bytes (a still-growing file) or a genuinely unterminated tail.
+    /// Unlike `Oversized`, the caller must not advance past it: `bytes` is
+    /// reported for logging only, and the reader is intentionally not
+    /// exhausted any further this call. This is the hard bound behind
+    /// PACKSESSION-AUD-003 round 2 — the loop below returns as soon as one
+    /// `fill_buf` window crosses the cap without a `\n`, instead of looping
+    /// `fill_buf`/`consume` all the way to EOF searching for a terminator
+    /// that may never come.
+    OversizedUnterminated { bytes: usize },
 }
 
 /// Read one line from `reader` into `buf`, never buffering more than
@@ -213,6 +239,20 @@ enum LineRead {
 /// dropped immediately, bounding this function's own resident memory to
 /// `max_line_bytes` (plus one `BufRead` internal buffer) no matter how long
 /// the real line is.
+///
+/// The same bound applies to the number of bytes *read* per call, not just
+/// buffered (PACKSESSION-AUD-003 round 2): once a line has crossed
+/// `max_line_bytes` without a terminating `\n`, the very next `fill_buf`
+/// window that still has no `\n` returns `OversizedUnterminated` immediately
+/// rather than looping `fill_buf`/`consume` onward in search of one. A line
+/// that is oversized but DOES terminate within that same window still comes
+/// back as `Oversized` (the existing skip-and-advance path) — only the
+/// no-terminator-in-this-window case is capped early. This means one call to
+/// `read_line_bounded` never reads more than `max_line_bytes` plus one
+/// `BufRead` internal buffer for a line with no discoverable `\n`, whether
+/// that line is still growing (append-in-progress) or truly unterminated at
+/// EOF — instead of scanning the remainder of the file (or forever, on a
+/// still-growing file) in a single pass.
 fn read_line_bounded(
     reader: &mut impl BufRead,
     buf: &mut Vec<u8>,
@@ -252,8 +292,16 @@ fn read_line_bounded(
                 LineRead::Complete { bytes: total }
             });
         }
-        // No `\n` in this fill_buf window yet; loop for more data (buffering
-        // normally, or discarding once `oversized` is set).
+
+        if oversized {
+            // Already over the cap and this fill_buf window had no `\n`:
+            // stop here rather than looping onward toward EOF (or forever,
+            // if the file keeps growing). See the PACKSESSION-AUD-003
+            // round-2 bound above.
+            return Ok(LineRead::OversizedUnterminated { bytes: total });
+        }
+        // No `\n` in this fill_buf window yet, and still under the cap;
+        // loop for more data, buffering normally.
     }
 }
 
@@ -307,6 +355,27 @@ fn read_bounded_chunk(
         match read_line_bounded(&mut reader, &mut line, limits.max_line_bytes)? {
             LineRead::Eof => break,
             LineRead::Partial => break, // leave partial trailing line for next pass
+            LineRead::OversizedUnterminated { bytes } => {
+                // Already over max_line_bytes with no `\n` found in this
+                // bounded read (see `read_line_bounded`'s round-2 bound):
+                // do NOT advance new_offset past line_offset. The next call
+                // re-reads from the same line_offset and is bounded the
+                // same way — cheap and repeatable, whether the file is
+                // still growing (a later pass will eventually see the
+                // terminator and fall into the `Oversized` skip-and-advance
+                // arm below) or genuinely corrupt/truncated (every later
+                // poll or daemon restart repeats this same bounded read,
+                // never the unbounded tail scan PACKSESSION-AUD-003 flagged).
+                tracing::warn!(
+                    path = %path.display(),
+                    offset = line_offset,
+                    line_bytes = bytes,
+                    max_line_bytes = limits.max_line_bytes,
+                    "session mirror: oversized JSONL line has no terminator in this bounded read; \
+                     leaving cursor at line start for a bounded retry"
+                );
+                break;
+            }
             LineRead::Oversized { bytes } => {
                 tracing::warn!(
                     path = %path.display(),
@@ -1180,6 +1249,226 @@ mod tests {
             "offset must advance past both lines, including the skipped oversized one"
         );
         assert_eq!(count_rows(&rt, "session_messages").await, 1);
+    }
+
+    /// Counts every byte pulled through `Read::read`, so a test can assert a
+    /// hard ceiling on how much of the underlying source `read_line_bounded`
+    /// ever touches in one call — independent of how large the backing
+    /// buffer actually is.
+    struct CountingReader<R> {
+        inner: R,
+        total_read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.total_read.set(self.total_read.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_read_line_bounded_oversized_unterminated_reads_are_capped_per_call() {
+        // Regression for PACKSESSION-AUD-003 round 2 (High): a huge final
+        // line with no trailing `\n` used to be scanned all the way to EOF
+        // in one `read_line_bounded` call (`fill_buf`/`consume` looped until
+        // the reader ran dry), even though the discarded bytes past the cap
+        // were never buffered. The READ itself must be bounded too, not just
+        // the buffered memory. Use a small, explicit `BufReader` capacity so
+        // the bound is provable independent of the platform default (8KiB).
+        let max_line_bytes: usize = 64;
+        let buf_capacity: usize = 256;
+        // Far larger than max_line_bytes + a handful of buffer refills, and
+        // containing NO '\n' anywhere — the pathological unterminated case.
+        let data = vec![b'x'; 200_000];
+
+        let total_read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counting = CountingReader {
+            inner: std::io::Cursor::new(data),
+            total_read: total_read.clone(),
+        };
+        let mut reader = std::io::BufReader::with_capacity(buf_capacity, counting);
+        let mut buf = Vec::new();
+
+        let outcome =
+            read_line_bounded(&mut reader, &mut buf, max_line_bytes).expect("read must not error");
+
+        match outcome {
+            LineRead::OversizedUnterminated { bytes } => {
+                assert!(
+                    bytes > max_line_bytes,
+                    "must have detected the crossing of the cap, got {bytes}"
+                );
+            }
+            other => panic!("expected OversizedUnterminated, got {other:?}"),
+        }
+        assert!(
+            buf.is_empty(),
+            "buf must never buffer anything once the line is flagged oversized"
+        );
+
+        // The load-bearing assertion: total bytes ever pulled from the
+        // underlying 200,000-byte source must be bounded to roughly
+        // max_line_bytes plus a small, constant number of buffer refills —
+        // never anywhere close to scanning the whole remaining file.
+        let read_bytes = total_read.get();
+        assert!(
+            read_bytes <= max_line_bytes + buf_capacity * 4,
+            "read_line_bounded pulled {read_bytes} bytes from the source for an \
+             unterminated oversized line — expected at most {} (bounded to the \
+             cap plus a few buffer refills), not an unbounded scan toward EOF",
+            max_line_bytes + buf_capacity * 4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_unterminated_line_leaves_cursor_at_line_start_and_is_bounded_on_retry()
+    {
+        // Regression for PACKSESSION-AUD-003 round 2 (High): a single huge
+        // line with NO trailing newline (a still-growing or corrupt final
+        // line) must not advance the cursor, and repeated calls from the
+        // same persisted offset must each be bounded, not replay an
+        // unbounded scan of the whole file every poll.
+        let (rt, _dir) = setup().await;
+
+        let max_line_bytes: usize = 256;
+        // One line, far larger than the cap, with no terminating '\n' at all.
+        let huge_unterminated = "z".repeat(max_line_bytes * 20);
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        file.write_all(huge_unterminated.as_bytes())
+            .expect("write unterminated line");
+        let path = file.path().to_path_buf();
+
+        let limits = MirrorLimits {
+            max_bytes_per_pass: MIRROR_MAX_BYTES_PER_PASS,
+            max_events_per_pass: MIRROR_MAX_EVENTS_PER_PASS,
+            max_line_bytes,
+        };
+
+        // First pass: the oversized-unterminated line must not advance the
+        // cursor at all (same policy as an ordinary `Partial`).
+        let stats1 =
+            mirror_file_with_limits(&rt, &path, 0, LineTailSource::ClaudeCode, None, limits)
+                .await
+                .expect("first pass over an unterminated oversized line");
+        assert_eq!(
+            stats1.new_offset, 0,
+            "cursor must stay at the line start — nothing was durably consumed"
+        );
+        assert_eq!(stats1.scanned, 0);
+        assert_eq!(stats1.inserted, 0);
+        assert_eq!(
+            count_rows(&rt, "session_messages").await,
+            0,
+            "no partial/garbage row may be written for an unterminated oversized line"
+        );
+
+        // Second pass from the persisted (unchanged) offset behaves
+        // identically — a durable, bounded retry, never a wedge that grows
+        // unboundedly worse, and no replay of previously-seen bytes as new
+        // events (there were none).
+        let stats2 = mirror_file_with_limits(
+            &rt,
+            &path,
+            stats1.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+            limits,
+        )
+        .await
+        .expect("second pass (simulated daemon restart) over the same unterminated line");
+        assert_eq!(stats2.new_offset, 0);
+        assert_eq!(stats2.scanned, 0);
+        assert_eq!(stats2.inserted, 0);
+        assert_eq!(count_rows(&rt, "session_messages").await, 0);
+
+        // Now the line completes (append a terminating '\n' and a bit more,
+        // simulating the file finishing its write): it must be recognized
+        // as the ordinary complete-oversized-line skip, advance past it, and
+        // ingest anything that follows normally.
+        let small_after = user_line("uuid-after-huge", "sess-UNTERM", "after");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopen for append");
+            writeln!(f).unwrap(); // terminate the huge line
+            writeln!(f, "{small_after}").unwrap();
+        }
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats3 = mirror_file_with_limits(
+            &rt,
+            &path,
+            stats2.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+            limits,
+        )
+        .await
+        .expect("third pass once the huge line terminates");
+        assert_eq!(
+            stats3.new_offset, file_len,
+            "once terminated, the skip-and-advance path must clear past the whole \
+             oversized line plus the following valid line"
+        );
+        assert_eq!(stats3.scanned, 1, "only the small trailing line is scanned");
+        assert_eq!(stats3.inserted, 1);
+        assert_eq!(count_rows(&rt, "session_messages").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_still_growing_partial_line_under_cap_is_unaffected() {
+        // Guard: an ordinary still-growing file whose latest line is under
+        // `max_line_bytes` and has no newline YET must still behave as a
+        // plain `Partial` — cursor does not advance past it, and once the
+        // line completes on a later pass it is picked up normally. This
+        // must not regress from the new oversized-unterminated handling.
+        let (rt, _dir) = setup().await;
+
+        let small1 = user_line("uuid-g1", "sess-GROW", "first");
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        writeln!(file, "{small1}").unwrap();
+        // Partial trailing line: valid JSON-shaped prefix, no newline yet.
+        let partial_prefix = user_line("uuid-g2", "sess-GROW", "second");
+        file.write_all(partial_prefix.as_bytes())
+            .expect("write partial line, no trailing newline");
+        let path = file.path().to_path_buf();
+
+        let limits = MirrorLimits::production();
+
+        let stats1 =
+            mirror_file_with_limits(&rt, &path, 0, LineTailSource::ClaudeCode, None, limits)
+                .await
+                .expect("first pass: complete line + partial trailing line");
+        assert_eq!(stats1.scanned, 1, "only the complete first line is scanned");
+        assert_eq!(stats1.inserted, 1);
+        assert_eq!(
+            stats1.new_offset,
+            (small1.len() + 1) as u64,
+            "cursor must stop right after the first complete line, not consume the partial tail"
+        );
+
+        // The file "grows": the trailing line now gets its newline.
+        writeln!(file).unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats2 = mirror_file_with_limits(
+            &rt,
+            &path,
+            stats1.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+            limits,
+        )
+        .await
+        .expect("second pass: the previously-partial line now completes");
+        assert_eq!(stats2.new_offset, file_len);
+        assert_eq!(stats2.scanned, 1);
+        assert_eq!(stats2.inserted, 1);
+        assert_eq!(count_rows(&rt, "session_messages").await, 2);
     }
 
     #[tokio::test]

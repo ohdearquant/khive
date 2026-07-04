@@ -263,6 +263,18 @@ the files it reads.
 parses complete lines, and advances the cursor to the last complete line boundary. A file
 whose length has not grown past the cursor is skipped without being opened.
 
+A single line is never buffered past a hard per-line byte cap (`MirrorLimits::max_line_bytes`,
+PACKSESSION-AUD-003): a complete line (terminated by `\n`) over the cap is skipped —
+`tracing::warn!`-logged with the file and byte offset, never parsed — and the cursor advances
+past it so ingestion cannot wedge on one oversized line. A line that crosses the cap with **no**
+terminating `\n` yet (a still-growing file's in-progress final line, or a truncated/corrupt tail)
+is a distinct, bounded case: the read for that line stops as soon as one bounded read window
+crosses the cap without finding `\n`, instead of scanning onward to EOF searching for one that may
+never come. The cursor is left at that line's start — the same as an ordinary incomplete trailing
+line — so the next pass, or the next daemon start, repeats the same bounded read rather than an
+unbounded tail scan; once the line eventually terminates (or growth stops and the file reaches
+true EOF mid-line), it resolves through the ordinary skip-and-advance path above.
+
 **Whole-file** (export archives): the file is parsed as a single JSON document. On success
 the cursor is set to the file's byte length, so an unchanged export is skipped by the same
 length fast-path on every later pass. On parse failure — including a partially downloaded
