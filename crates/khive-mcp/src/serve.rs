@@ -267,6 +267,14 @@ fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegist
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
+/// #605: the 5s cadence is the happy-path default only. A connect/auth
+/// failure (classified by `khive_channel_email::is_backoff_eligible`) starts
+/// a per-channel-kind jittered exponential backoff (`ImapBackoff`,
+/// 5s -> 10s -> ... capped at ~10min) instead of retrying flat every 5s; a
+/// success resets that channel's backoff to base, and the loop returns to
+/// the normal 5s cadence. This is process-side pressure relief on top of the
+/// per-credential single-flight guard inside `LiveImap` itself.
+///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
 async fn channel_poll_loop(
@@ -276,12 +284,23 @@ async fn channel_poll_loop(
     default_inbound_actor: String,
 ) {
     use chrono::Utc;
+    use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
 
     let mut last_poll = Utc::now();
+    // One backoff state per channel kind, i.e. per credential — a given
+    // channel kind (e.g. "email") maps to exactly one configured credential
+    // in this process, so failures on one credential never throttle another.
+    let mut backoffs: HashMap<String, ImapBackoff> = HashMap::new();
+    let mut next_interval = HAPPY_PATH_INTERVAL;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(next_interval).await;
+        next_interval = HAPPY_PATH_INTERVAL;
 
         let since = last_poll;
         last_poll = Utc::now();
@@ -289,6 +308,9 @@ async fn channel_poll_loop(
         for (kind, channel) in channels.iter() {
             match channel.poll(since).await {
                 Ok(envelopes) => {
+                    if let Some(backoff) = backoffs.get_mut(kind) {
+                        backoff.record_success();
+                    }
                     for env in envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
@@ -315,6 +337,19 @@ async fn channel_poll_loop(
                 }
                 Err(e) => {
                     tracing::warn!(channel = kind, "channel poll failed: {e}");
+                    if is_backoff_eligible(&e) {
+                        let backoff = backoffs.entry(kind.to_string()).or_default();
+                        let tick = backoff.record_failure();
+                        if tick.should_warn {
+                            tracing::warn!(
+                                channel = kind,
+                                attempt = tick.attempt,
+                                delay_secs = tick.delay.as_secs_f64(),
+                                "IMAP poll backoff escalating after connect/auth failure"
+                            );
+                        }
+                        next_interval = next_interval.max(tick.delay);
+                    }
                 }
             }
         }

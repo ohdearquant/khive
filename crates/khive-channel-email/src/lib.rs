@@ -35,10 +35,12 @@
 //! | `KHIVE_EMAIL_INGEST_NAMESPACE` | `local` | Namespace used when persisting inbound and outbound messages |
 
 pub(crate) mod auth_results;
+pub mod backoff;
 pub mod channel;
 pub mod config;
 pub mod connector;
 pub(crate) mod oauth;
 
+pub use backoff::{is_backoff_eligible, BackoffTick, ImapBackoff, ImapSingleFlight};
 pub use channel::EmailChannel;
 pub use config::EmailChannelConfig;
