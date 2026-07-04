@@ -179,8 +179,9 @@ jobs:
           # Per-guide-page assembly: inject nav_order/title/description front matter,
           # rewrite in-repo relative links to the site's flat .html layout (links
           # outside docs/guide go to their GitHub blob URL; external links untouched),
-          # and drop a raw copy (no front matter, so Jekyll copies it verbatim as a
-          # static file) under $SRC/md/ for agent-fetchable raw markdown.
+          # and stage a raw copy in _raw_md/ (outside the Jekyll source so the theme
+          # never promotes it to a nav page); a post-build step copies these into
+          # _site/md/ for agent-fetchable raw markdown.
           for f in docs/guide/*.md; do
             base=$(basename "$f" .md)
             [ "$base" = "README" ] && continue
