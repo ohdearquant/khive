@@ -60,20 +60,41 @@ is null for reminders and a JSON-encoded verb call string for scheduled dispatch
 | `"daily"` | Repeat every 24 hours from `trigger_at` |
 | `"weekly"` | Repeat every 7 days |
 | `"monthly"` | Repeat on the same day-of-month each month |
-| 5-field cron expression | Standard cron: `"0 9 * * 1"` (Monday 09:00) |
+| limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
 
-Cron field ranges:
+Field ranges:
 - $\text{MIN} \in [0, 59]$
 - $\text{HOUR} \in [0, 23]$
 - $\text{DOM} \in [1, 31]$
 - $\text{MON} \in [1, 12]$
 - $\text{DOW} \in [0, 7]$
 
-**`action` payload security.** The `action` string accepted by `schedule` is
-validated at write time by the request DSL parser. Garbage inputs are rejected
-before entering storage. At dispatch time, the payload runs with the permissions
-of the namespace that created the event — no privilege escalation is possible
-via stored payloads.
+This is **not** standard cron: operators such as steps (`*/15`), ranges
+(`9-17`), and lists (`0,30`) are rejected (issue #481). `kkernel`'s
+pending-events runner also does not yet compute next-fire times for the
+5-field form — it is stored and validated, but fires one-shot rather than
+advancing to its next occurrence, until next-occurrence computation lands.
+
+**`action` payload security and replayability (issue #461).** The `action`
+string accepted by `schedule` is validated at write time in two stages, not
+just DSL parseability: (1) `khive_request::parse_request` rejects garbage
+before it enters storage, and (2) `validate_replayable_single_action` further
+requires a single call (no chains, no `$prev` references) against an
+exactly-registered, pack-prefixed verb name, with only literal argument
+values, every metadata-`required:true` argument present, and — for the small
+set of verbs with a *conditional* requirement not expressible in metadata
+(currently: `create`, which needs `kind` or `items`) — that alternative
+present too. This second stage exists because `kkernel`'s pending-events
+runner re-parses and re-dispatches the exact stored string at trigger time;
+anything that would fail there must be rejected here instead. It is not
+exhaustive: handler-internal semantic preconditions beyond the known
+conditional-required cases are not all guaranteed to be caught (residual gap,
+tracked as a known limitation — see `COMPLETION.md`). Stored actions may also
+not declare a business `namespace` argument for a verb that accepts one (e.g.
+`brain.bind`); replay always injects the firing event's own namespace, so a
+stored `namespace` value would be silently overwritten. At dispatch time, the
+payload runs with the permissions of the namespace that created the event —
+no privilege escalation is possible via stored payloads.
 
 **Pack-auxiliary index.** The `idx_schedule_trigger` index is declared via
 `SchemaPlan` as idempotent DDL (`CREATE INDEX IF NOT EXISTS`) outside the core
@@ -96,8 +117,10 @@ chain. It is declared via `schema_plan()` on `PackRuntime`.
 ### ADR-016: Request DSL
 
 The `action` parameter of `schedule.schedule` is validated at write time using
-`khive_request::parse_request`. This catches malformed DSL before it enters
-storage, rather than at trigger time when no observer is present.
+`khive_request::parse_request` plus the stricter replayability contract
+described above (issue #461). This catches malformed DSL, and DSL that would
+fail trigger-time replay, before it enters storage, rather than at trigger
+time when no observer is present.
 
 ### ADR-017: Pack Standard
 
