@@ -18,12 +18,17 @@ use rand::Rng;
 pub const DEFAULT_BASE: Duration = Duration::from_secs(5);
 
 /// Default cap: backoff never waits longer than this between attempts.
+/// This is a hard ceiling on `BackoffTick::delay` too -- jitter is clamped
+/// so the post-jitter sleep can never exceed `max` (see
+/// [`ImapBackoff::record_failure`]).
 pub const DEFAULT_MAX: Duration = Duration::from_secs(600);
 
 /// Outcome of recording one backoff-eligible failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackoffTick {
     /// The jittered delay the caller should sleep before the next attempt.
+    /// Always `<= max` (jitter is clamped, never allowed to push the sleep
+    /// past the configured cap).
     pub delay: Duration,
     /// The unjittered step this attempt landed on (used to detect escalation
     /// edges; stable across jitter so it never flaps the `should_warn` bit).
@@ -98,13 +103,20 @@ impl ImapBackoff {
     /// Advances the attempt counter, computes the next capped exponential
     /// step, and returns a [`BackoffTick`] carrying the jittered delay to
     /// sleep plus whether this is a new escalation edge worth a `warn!` log.
+    ///
+    /// The jittered `delay` is clamped to `max` (codex round-1 finding
+    /// 2026-07-04): jitter is additive noise on top of `step`, but `step`
+    /// itself can already equal `max` once escalation saturates, so an
+    /// unclamped `step + jitter` would let a "~10min cap" reach 750s at the
+    /// default 25% jitter window. Clamping here keeps `delay <= max` as a
+    /// hard invariant regardless of where jitter lands.
     pub fn record_failure(&mut self) -> BackoffTick {
         self.attempt = self.attempt.saturating_add(1);
         let step = self.step_for(self.attempt);
         let should_warn = self.last_step != Some(step);
         self.last_step = Some(step);
         BackoffTick {
-            delay: jitter(step),
+            delay: jitter(step).min(self.max),
             step,
             attempt: self.attempt,
             should_warn,
@@ -225,13 +237,39 @@ mod tests {
 
     #[test]
     fn caps_at_max_and_never_exceeds_it() {
-        let mut b = ImapBackoff::new(Duration::from_secs(5), Duration::from_secs(600));
+        let max = Duration::from_secs(600);
+        let mut b = ImapBackoff::new(Duration::from_secs(5), max);
         for _ in 0..50 {
             let tick = b.record_failure();
-            assert!(tick.step <= Duration::from_secs(600));
-            // Jittered delay must never exceed step by more than the 25% window.
-            assert!(tick.delay >= tick.step);
-            assert!(tick.delay <= tick.step + tick.step / 4 + Duration::from_millis(1));
+            assert!(tick.step <= max);
+            assert!(tick.delay >= tick.step.min(max));
+            // Codex round-1 finding: the post-jitter delay must never exceed
+            // `max`, even once `step` itself has saturated at `max` (an
+            // unclamped 25% jitter window on a capped 600s step would reach
+            // 750s otherwise).
+            assert!(
+                tick.delay <= max,
+                "post-jitter delay {:?} exceeded the {max:?} cap",
+                tick.delay
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_jittered_delay_never_exceeds_default_max() {
+        // Explicitly drive the DEFAULT_BASE/DEFAULT_MAX config to the cap and
+        // assert both the unjittered step and the jittered delay respect
+        // DEFAULT_MAX -- the exact scenario codex flagged (750s > 600s cap).
+        let mut b = ImapBackoff::default();
+        for _ in 0..20 {
+            let tick = b.record_failure();
+            assert!(tick.step <= DEFAULT_MAX);
+            assert!(
+                tick.delay <= DEFAULT_MAX,
+                "post-jitter delay {:?} exceeded DEFAULT_MAX {:?}",
+                tick.delay,
+                DEFAULT_MAX
+            );
         }
     }
 

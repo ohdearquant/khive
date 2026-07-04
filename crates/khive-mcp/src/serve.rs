@@ -273,7 +273,10 @@ fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegist
 /// 5s -> 10s -> ... capped at ~10min) instead of retrying flat every 5s; a
 /// success resets that channel's backoff to base, and the loop returns to
 /// the normal 5s cadence. This is process-side pressure relief on top of the
-/// per-credential single-flight guard inside `LiveImap` itself.
+/// per-credential single-flight guard inside `LiveImap` itself. Eligible
+/// failures log via [`log_eligible_poll_failure`]: `warn!` only on an
+/// escalation edge, `debug!` while riding the same capped step — never one
+/// `warn!` per retry.
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
@@ -336,23 +339,53 @@ async fn channel_poll_loop(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(channel = kind, "channel poll failed: {e}");
                     if is_backoff_eligible(&e) {
                         let backoff = backoffs.entry(kind.to_string()).or_default();
                         let tick = backoff.record_failure();
-                        if tick.should_warn {
-                            tracing::warn!(
-                                channel = kind,
-                                attempt = tick.attempt,
-                                delay_secs = tick.delay.as_secs_f64(),
-                                "IMAP poll backoff escalating after connect/auth failure"
-                            );
-                        }
+                        log_eligible_poll_failure(kind, &e, &tick);
                         next_interval = next_interval.max(tick.delay);
+                    } else {
+                        // Non-eligible failures (config/gate errors, never
+                        // produced by poll/connect in practice) are not
+                        // connectivity pressure, so they keep the pre-#605
+                        // warn-every-retry behavior at the normal cadence.
+                        tracing::warn!(channel = kind, "channel poll failed: {e}");
                     }
                 }
             }
         }
+    }
+}
+
+/// Log a backoff-eligible poll failure at the level ADR-091's `crossing_warn`
+/// discipline calls for: `warn!` only on an escalation edge
+/// (`tick.should_warn`, i.e. the computed step just changed), `debug!` on a
+/// repeat at the same step. Codex round-1 finding (2026-07-04): the poll loop
+/// previously emitted a generic `warn!` on every eligible retry in addition
+/// to the escalation-edge warn, so sustained pressure spammed warn-level logs
+/// once per retry instead of once per escalation. Extracted to a standalone
+/// function so the level decision is unit-testable without driving the full
+/// poll loop.
+#[cfg(feature = "channel-email")]
+fn log_eligible_poll_failure(
+    kind: &str,
+    err: &khive_channel::ChannelError,
+    tick: &khive_channel_email::BackoffTick,
+) {
+    if tick.should_warn {
+        tracing::warn!(
+            channel = kind,
+            attempt = tick.attempt,
+            delay_secs = tick.delay.as_secs_f64(),
+            "IMAP poll backoff escalating after connect/auth failure: {err}"
+        );
+    } else {
+        tracing::debug!(
+            channel = kind,
+            attempt = tick.attempt,
+            delay_secs = tick.delay.as_secs_f64(),
+            "channel poll failed, holding at current backoff step: {err}"
+        );
     }
 }
 
@@ -2921,6 +2954,186 @@ brain_profile = "project-profile"
             assert_eq!(
                 spawn_count, 0,
                 "spawn must not be called when namespace is invalid"
+            );
+        }
+    }
+
+    // --- log_eligible_poll_failure: edge-triggered warn (codex round-1 finding 2) ---
+
+    #[cfg(feature = "channel-email")]
+    mod eligible_poll_failure_log_tests {
+        use super::*;
+        use khive_channel::ChannelError;
+        use khive_channel_email::BackoffTick;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tracing::field::{Field, Visit};
+
+        #[derive(Clone, Debug, Default)]
+        struct CapturedEvent {
+            level: Option<tracing::Level>,
+            message: Option<String>,
+        }
+
+        #[derive(Default)]
+        struct CapturedEventVisitor(Option<String>);
+
+        impl Visit for CapturedEventVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let formatted = format!("{value:?}");
+                    self.0 = Some(
+                        formatted
+                            .trim_start_matches('"')
+                            .trim_end_matches('"')
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        /// Minimal `tracing::Subscriber` capturing (level, message) pairs into
+        /// a thread-local vec, installed via `tracing::subscriber::with_default`.
+        /// Mirrors `khive-db/src/checkpoint.rs`'s `CaptureSubscriber` (same
+        /// ADR-091 `crossing_warn` test discipline: prove the log fires on
+        /// the escalation edge and stays silent on a same-step repeat).
+        struct CaptureSubscriber {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl tracing::Subscriber for CaptureSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = CapturedEventVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(CapturedEvent {
+                    level: Some(*event.metadata().level()),
+                    message: visitor.0,
+                });
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        fn tick(should_warn: bool, attempt: u32) -> BackoffTick {
+            BackoffTick {
+                delay: Duration::from_secs(10),
+                step: Duration::from_secs(10),
+                attempt,
+                should_warn,
+            }
+        }
+
+        #[test]
+        fn escalation_edge_logs_warn_not_debug() {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber {
+                events: Arc::clone(&buffer),
+            };
+            let err = ChannelError::Transport("boom".into());
+
+            tracing::subscriber::with_default(subscriber, || {
+                log_eligible_poll_failure("email", &err, &tick(true, 1));
+            });
+
+            let events = buffer.lock().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one log event, got {events:?}"
+            );
+            assert_eq!(events[0].level, Some(tracing::Level::WARN));
+        }
+
+        #[test]
+        fn same_step_repeat_logs_debug_not_warn() {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber {
+                events: Arc::clone(&buffer),
+            };
+            let err = ChannelError::Transport("boom".into());
+
+            tracing::subscriber::with_default(subscriber, || {
+                log_eligible_poll_failure("email", &err, &tick(false, 2));
+            });
+
+            let events = buffer.lock().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one log event, got {events:?}"
+            );
+            assert_eq!(events[0].level, Some(tracing::Level::DEBUG));
+        }
+
+        #[test]
+        fn sustained_capped_pressure_produces_exactly_one_warn() {
+            // Simulate one escalation edge followed by several repeats at the
+            // same (capped) step, as the poll loop would emit them across
+            // consecutive ticks -- exactly the "riding the cap" scenario
+            // codex round-1 flagged as spamming a WARN per retry.
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber {
+                events: Arc::clone(&buffer),
+            };
+            let err = ChannelError::Auth("authenticated but not connected".into());
+
+            tracing::subscriber::with_default(subscriber, || {
+                log_eligible_poll_failure("email", &err, &tick(true, 8)); // escalation edge
+                for attempt in 9..=15 {
+                    log_eligible_poll_failure("email", &err, &tick(false, attempt));
+                    // repeats at cap
+                }
+            });
+
+            let events = buffer.lock().unwrap();
+            let warn_count = events
+                .iter()
+                .filter(|e| e.level == Some(tracing::Level::WARN))
+                .count();
+            let debug_count = events
+                .iter()
+                .filter(|e| e.level == Some(tracing::Level::DEBUG))
+                .count();
+            assert_eq!(
+                warn_count, 1,
+                "exactly one WARN expected across the whole sequence, got {warn_count} in {events:?}"
+            );
+            assert_eq!(
+                debug_count, 7,
+                "the 7 same-step repeats must log at debug, not warn"
+            );
+        }
+
+        #[test]
+        fn warn_message_contains_error_text() {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber {
+                events: Arc::clone(&buffer),
+            };
+            let err = ChannelError::Auth("IMAP LOGIN failed: slot exhausted".into());
+
+            tracing::subscriber::with_default(subscriber, || {
+                log_eligible_poll_failure("email", &err, &tick(true, 1));
+            });
+
+            let events = buffer.lock().unwrap();
+            let message = events[0].message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("slot exhausted"),
+                "escalation warn must carry the underlying error text, got: {message}"
             );
         }
     }
