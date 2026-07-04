@@ -85,7 +85,7 @@ impl ProfileRecord {
         Self {
             id: "balanced-recall-v1".into(),
             description: "Default recall profile: three-scalar Beta posteriors".into(),
-            consumer_kind: "recall".into(),
+            consumer_kind: ConsumerKind::Recall.as_str().into(),
             state_class: "Bayesian".into(),
             lifecycle: ProfileLifecycle::Active,
             created_at: Utc::now(),
