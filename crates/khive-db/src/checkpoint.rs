@@ -162,6 +162,10 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
         };
 
         let in_warn_band = wal_pages >= config.warn_pages && wal_pages < config.high_water_pages;
+        let above_high_water = wal_pages >= config.high_water_pages;
+
+        log_tx_registry_pressure(wal_pages, config.warn_pages, config.high_water_pages);
+
         if crossing_warn(in_warn_band, &mut was_above_warn) {
             tracing::warn!(
                 wal_pages,
@@ -170,13 +174,54 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             );
         }
 
-        let above_high_water = wal_pages >= config.high_water_pages;
         if crossing_warn(above_high_water, &mut was_above_high_water) {
             tracing::warn!(
                 wal_pages,
                 high_water = config.high_water_pages,
                 "WAL high-water mark exceeded; sustained WAL pressure — \
                  a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
+            );
+        }
+    }
+}
+
+/// ADR-091 Plank 0: log the oldest open transaction registry entry alongside
+/// the WAL frame count on every tick (`debug!` normally, escalating to
+/// `warn!` once `wal_pages` crosses `warn_pages`), and, once `wal_pages`
+/// reaches `high_water_pages`, enumerate every open registry entry at `warn!`
+/// — the "which caller is holding the pin" answer this ADR's static reading
+/// could not produce. Observe only: this never enforces or force-closes
+/// anything.
+fn log_tx_registry_pressure(wal_pages: u64, warn_pages: u64, high_water_pages: u64) {
+    let oldest = khive_storage::tx_registry::oldest();
+    if wal_pages >= warn_pages {
+        if let Some((age, label)) = &oldest {
+            tracing::warn!(
+                wal_pages,
+                oldest_tx_age_secs = age.as_secs_f64(),
+                oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+                "WAL checkpoint tick: oldest open transaction registry entry"
+            );
+        }
+    } else if let Some((age, label)) = &oldest {
+        tracing::debug!(
+            wal_pages,
+            oldest_tx_age_secs = age.as_secs_f64(),
+            oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+            "WAL checkpoint tick: oldest open transaction registry entry"
+        );
+    }
+
+    if wal_pages >= high_water_pages {
+        // This is the load-bearing deliverable — enumerate every open registry
+        // entry so an operator can see which caller(s), if any, are pinning
+        // the WAL tail during sustained pressure.
+        for (age, label) in khive_storage::tx_registry::snapshot() {
+            tracing::warn!(
+                wal_pages,
+                tx_age_secs = age.as_secs_f64(),
+                tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+                "WAL high-water: open transaction registry entry"
             );
         }
     }
@@ -250,6 +295,93 @@ mod tests {
     use super::*;
     use crate::pool::PoolConfig;
     use serial_test::serial;
+    use tracing::field::{Field, Visit};
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedEvent {
+        message: Option<String>,
+        oldest_tx_label: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct CapturedEventVisitor(CapturedEvent);
+
+    impl Visit for CapturedEventVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "message" => self.0.message = Some(value.to_string()),
+                "oldest_tx_label" => self.0.oldest_tx_label = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let formatted = format!("{value:?}");
+            let cleaned = formatted
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .to_string();
+            match field.name() {
+                "message" => self.0.message = Some(cleaned),
+                "oldest_tx_label" => self.0.oldest_tx_label = Some(cleaned),
+                _ => {}
+            }
+        }
+    }
+
+    /// Minimal `tracing::Subscriber` that captures events into a thread-local
+    /// vec, installed as the thread-local default for the duration of one
+    /// test closure via `tracing::subscriber::with_default`. Mirrors the
+    /// capture subscriber in `khive-runtime/src/pack.rs`'s gate-dispatch tests.
+    struct CaptureSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CapturedEventVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// ADR-091 Plank 0: `log_tx_registry_pressure` emits a debug-level log
+    /// naming the oldest open registry entry's label when WAL pressure is
+    /// below `warn_pages`, and escalates to warn-level once at/above it.
+    #[test]
+    fn log_tx_registry_pressure_reports_oldest_open_entry() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        let _handle =
+            khive_storage::tx_registry::register(Some("checkpoint_tick_test".to_string()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_tx_registry_pressure(100, 2000, 6000);
+        });
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.message.as_deref()
+                    == Some("WAL checkpoint tick: oldest open transaction registry entry")
+                    && e.oldest_tx_label.as_deref() == Some("checkpoint_tick_test")
+            }),
+            "expected a log line naming the open registry entry's label, got: {events:?}"
+        );
+    }
 
     fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
         let cfg = PoolConfig {

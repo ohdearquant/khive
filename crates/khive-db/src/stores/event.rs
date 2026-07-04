@@ -705,6 +705,7 @@ impl EventStore for SqlEventStore {
     async fn append_event(&self, event: Event) -> Result<(), StorageError> {
         self.with_writer("append_event", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle = khive_storage::tx_registry::register(Some("event_append".to_string()));
             if let Err(e) = insert_event_with_observations(conn, &event) {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
@@ -720,6 +721,8 @@ impl EventStore for SqlEventStore {
 
         self.with_writer("append_events", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("event_append_batch".to_string()));
             let mut affected = 0u64;
 
             for event in &events {

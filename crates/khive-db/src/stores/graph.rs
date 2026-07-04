@@ -350,6 +350,8 @@ impl GraphStore for SqlGraphStore {
 
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("graph_upsert_edges".to_string()));
             let mut affected = 0u64;
 
             for edge in &edges {

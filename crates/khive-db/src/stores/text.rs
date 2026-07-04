@@ -296,6 +296,8 @@ impl TextSearch for Fts5TextSearch {
 
         self.with_writer("fts_upsert", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("text_upsert_document".to_string()));
 
             let del_sql = format!(
                 "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
@@ -361,6 +363,8 @@ impl TextSearch for Fts5TextSearch {
             );
 
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("text_upsert_batch".to_string()));
             let mut affected = 0u64;
             let mut failed = 0u64;
             let mut first_error = String::new();
@@ -1109,6 +1113,8 @@ impl Fts5TextSearch {
             }
 
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("text_rename_namespace".to_string()));
 
             let del_sql = format!("DELETE FROM {} WHERE namespace = ?1", table);
             if let Err(e) = conn.execute(&del_sql, rusqlite::params![&old_ns]) {

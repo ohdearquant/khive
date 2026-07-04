@@ -354,6 +354,8 @@ impl VectorStore for SqliteVecStore {
             );
 
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("vector_insert_batch".to_string()));
             let mut affected = 0u64;
             let mut failed = 0u64;
             let mut first_error = String::new();

@@ -358,6 +358,8 @@ impl khive_storage::SqlWriter for SqliteWriter {
         let (conn, result) = tokio::task::spawn_blocking(move || {
             let result = (|| -> Result<u64, rusqlite::Error> {
                 conn.execute_batch("BEGIN IMMEDIATE")?;
+                let _tx_handle =
+                    khive_storage::tx_registry::register(Some("execute_batch".to_string()));
                 let mut total: u64 = 0;
                 for statement in &statements {
                     let mut stmt = conn.prepare(&statement.sql)?;
@@ -404,6 +406,8 @@ struct SqliteTransaction {
     /// Must be reset to OFF before COMMIT/ROLLBACK so the connection can
     /// be returned cleanly (defensive; connection is dropped after use anyway).
     read_only: bool,
+    /// Open-transaction registry entry (ADR-091 Plank 0); deregisters on Drop.
+    _tx_handle: khive_storage::tx_registry::TxHandle,
 }
 
 #[async_trait]
@@ -736,6 +740,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             guard
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("pool_writer.execute_batch".to_string()));
             let result = (|| -> Result<u64, StorageError> {
                 let mut total = 0u64;
                 for statement in &statements {
@@ -885,6 +891,7 @@ impl khive_storage::SqlAccess for SqlBridge {
         };
         conn.execute_batch(begin_stmt)
             .map_err(|e| map_rusqlite_err(e, "begin_tx"))?;
+        let tx_handle = khive_storage::tx_registry::register(options.label.clone());
 
         // Honor read_only: block all writes via PRAGMA query_only.
         // The connection is opened as read-write so COMMIT still works, but
@@ -897,6 +904,7 @@ impl khive_storage::SqlAccess for SqlBridge {
         Ok(Box::new(SqliteTransaction {
             conn: Some(conn),
             read_only: effective_read_only,
+            _tx_handle: tx_handle,
         }))
     }
 }
@@ -953,5 +961,46 @@ mod tests {
 
         // Rollback should succeed regardless.
         tx.rollback().await.unwrap();
+    }
+
+    /// ADR-091 Plank 0: `begin_tx` registers with the shared open-transaction
+    /// registry under its caller-supplied label, and `commit()` deregisters it.
+    #[tokio::test]
+    async fn begin_tx_registers_and_commit_deregisters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx_registry.db");
+        let config = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let tx = bridge
+            .begin_tx(SqlTxOptions {
+                read_only: false,
+                isolation: SqlIsolation::Default,
+                label: Some("begin_tx_registry_test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let snapshot = khive_storage::tx_registry::snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|(_, label)| label.as_deref() == Some("begin_tx_registry_test")),
+            "expected the labeled tx to be visible in the registry while open"
+        );
+
+        tx.commit().await.unwrap();
+
+        let snapshot_after = khive_storage::tx_registry::snapshot();
+        assert!(
+            !snapshot_after
+                .iter()
+                .any(|(_, label)| label.as_deref() == Some("begin_tx_registry_test")),
+            "expected the labeled tx to be gone from the registry after commit"
+        );
     }
 }

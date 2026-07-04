@@ -9,6 +9,7 @@ pub mod note;
 pub mod sparse;
 pub mod sql;
 pub mod text;
+pub mod tx_registry;
 pub mod types;
 pub mod vectors;
 

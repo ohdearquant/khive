@@ -375,6 +375,8 @@ pub async fn persist_brain_state_mutation<R>(
     let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
 
     exec_raw(writer.as_mut(), "BEGIN IMMEDIATE", "begin mutation tx").await?;
+    let _tx_handle =
+        khive_storage::tx_registry::register(Some("brain_persist_mutation".to_string()));
 
     let write_result: Result<(), RuntimeError> = async {
         append_brain_event_on_writer(

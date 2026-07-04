@@ -179,6 +179,7 @@ impl<'pool> WriterGuard<'pool> {
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        let _tx_handle = khive_storage::tx_registry::register(Some("writer_guard_tx".to_string()));
 
         match f(&self.guard) {
             Ok(result) => {
@@ -725,5 +726,38 @@ mod tests {
         let _writer2 = pool
             .writer()
             .expect("second writer checkout should succeed");
+    }
+
+    /// ADR-091 Plank 0: `WriterGuard::transaction` registers an entry with the
+    /// shared open-transaction registry for the duration of the closure, and
+    /// deregisters it once the closure (and its commit/rollback) completes.
+    #[test]
+    fn writer_guard_transaction_registers_during_closure_only() {
+        let cfg = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        let guard = pool.writer().unwrap();
+
+        let mut seen_during_closure = false;
+        let result: Result<(), SqliteError> = guard.transaction(|_conn| {
+            seen_during_closure = khive_storage::tx_registry::snapshot()
+                .iter()
+                .any(|(_, label)| label.as_deref() == Some("writer_guard_tx"));
+            Ok(())
+        });
+        result.expect("transaction should commit");
+
+        assert!(
+            seen_during_closure,
+            "expected a writer_guard_tx entry visible inside the closure"
+        );
+        assert!(
+            !khive_storage::tx_registry::snapshot()
+                .iter()
+                .any(|(_, label)| label.as_deref() == Some("writer_guard_tx")),
+            "expected the entry to be gone after the transaction completes"
+        );
     }
 }
