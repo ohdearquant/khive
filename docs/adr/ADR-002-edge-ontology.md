@@ -302,7 +302,7 @@ Event and edge endpoints are invalid for `supports`/`refutes`.
 #### KG pack extensions (added v0.2.4)
 
 The KG pack extends the base endpoint contract via `EDGE_RULES` to cover
-person→org and org→org relationships common in research KGs:
+person→org, person→project, and org→org relationships common in research KGs:
 
 | Source   | Relation      | Target    | Added      |
 | -------- | ------------- | --------- | ---------- |

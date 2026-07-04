@@ -5949,7 +5949,7 @@ async fn withdraw_cas_divergence_after_approval() {
 
 // ---- KG pack edge endpoint extensions (ADR-002 v0.2.4) ----
 //
-// These tests verify the 7 new endpoint pairs declared in KG_EDGE_RULES.
+// These tests verify the 9 new endpoint pairs declared in KG_EDGE_RULES.
 // Each test constructs a fixture with edge rules installed (mirroring what the
 // MCP transport does at startup per ADR-031) before calling link().
 
