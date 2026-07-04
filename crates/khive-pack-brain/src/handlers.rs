@@ -257,6 +257,46 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             },
         ],
     },
+    HandlerDef {
+        name: "brain.record_serve",
+        description: "ADR-081 §4/§5: append cross-session serve-ledger rows for a batch of \
+            recall targets. Internal-only — memory.recall dispatches this off its response \
+            path after resolving served_by_profile_id via the ADR-035 three-tier discipline.",
+        visibility: khive_types::Visibility::Subhandler,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            khive_types::ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: true,
+                description: "Consumer kind that served these results, e.g. \"recall\".",
+            },
+            khive_types::ParamDef {
+                name: "served_by_profile_id",
+                param_type: "string",
+                required: false,
+                description: "Profile ID resolved at serve time. Omitted when unresolved.",
+            },
+            khive_types::ParamDef {
+                name: "target_ids",
+                param_type: "array",
+                required: true,
+                description: "Note/entity ids that were served; one ledger row per id.",
+            },
+            khive_types::ParamDef {
+                name: "query_raw",
+                param_type: "string",
+                required: true,
+                description: "Raw query text; query_class is derived from this deterministically.",
+            },
+            khive_types::ParamDef {
+                name: "served_at",
+                param_type: "integer",
+                required: false,
+                description: "Serve timestamp in epoch microseconds. Defaults to now.",
+            },
+        ],
+    },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
         name: "brain.bind",
@@ -1420,6 +1460,82 @@ impl BrainPack {
         Ok(out)
     }
 
+    // ── brain.record_serve ────────────────────────────────────────────────
+
+    /// ADR-081 §4/§5 (#394): append one serve-ledger row per target id. Never
+    /// propagates a per-target write failure as a batch error — a serve-ledger
+    /// append is best-effort accounting, not the recall response itself, so a
+    /// single row's failure (or an exact-key duplicate, tolerated as `skipped`)
+    /// must not poison the rest of the batch.
+    pub(crate) async fn handle_record_serve(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RecordServeParams {
+            consumer_kind: String,
+            served_by_profile_id: Option<String>,
+            target_ids: Vec<String>,
+            query_raw: String,
+            served_at: Option<i64>,
+        }
+        let p: RecordServeParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        if p.target_ids.is_empty() {
+            return Ok(json!({
+                "ok": true,
+                "written": 0,
+                "skipped": 0,
+                "verb": "brain.record_serve",
+            }));
+        }
+
+        let namespace = token.namespace().as_str().to_string();
+        let query_class = crate::serve_ledger::compute_query_class(&p.query_raw);
+        let served_at = p.served_at.unwrap_or_else(|| Utc::now().timestamp_micros());
+        let sql = self.runtime.sql();
+
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        for target_id in &p.target_ids {
+            let row_id = uuid::Uuid::new_v4().to_string();
+            match crate::serve_ledger::record_serve(
+                sql.as_ref(),
+                &row_id,
+                &namespace,
+                &p.consumer_kind,
+                p.served_by_profile_id.as_deref(),
+                None,
+                None,
+                target_id,
+                &query_class,
+                &p.query_raw,
+                served_at,
+            )
+            .await
+            {
+                Ok(true) => written += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    eprintln!(
+                        "[brain] serve ledger write failed for target {target_id} (non-fatal): {e}"
+                    );
+                }
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "written": written,
+            "skipped": skipped,
+            "query_class": query_class,
+            "verb": "brain.record_serve",
+        }))
+    }
+
     // ── brain.emit (deprecated) ───────────────────────────────────────────
 
     /// Deprecated alias for `brain.feedback`; routes to `handle_feedback`.
@@ -2114,6 +2230,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.reset" => self.handle_reset(token, params).await,
             "brain.feedback" => self.handle_feedback(token, params).await,
             "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
+            "brain.record_serve" => self.handle_record_serve(token, params).await,
             // Declaration
             "brain.bind" => self.handle_bind(token, params).await,
             "brain.unbind" => self.handle_unbind(token, params).await,

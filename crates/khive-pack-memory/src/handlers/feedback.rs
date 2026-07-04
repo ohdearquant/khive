@@ -40,21 +40,11 @@ impl MemoryPack {
             ))
         })?;
 
-        // Tier 1: explicit profile from config.
-        if let Some(ref profile_id) = self.brain_profile {
-            return route_to_brain(registry, token, &p.target_id, &p.signal, profile_id).await;
-        }
-
-        // Tier 2: namespace-bound profile via brain.resolve.
-        // consumer_kind=Recall — the brain contract keys recall bindings/defaults
-        // under "recall" (brain.resolve(consumer_kind="recall") returns balanced-recall-v1).
-        let ns = token.namespace().as_str().to_string();
-        if let Some(profile_id) = khive_brain_core::resolve_consumer_profile(
-            registry,
-            &ns,
-            khive_brain_core::ConsumerKind::Recall,
-        )
-        .await
+        // Tiers 1-2: explicit config profile, then namespace-bound profile via
+        // brain.resolve(consumer_kind="recall") — shared with memory.recall's
+        // serve-time stamp so the two resolution paths cannot drift apart.
+        if let Some(profile_id) =
+            super::common::resolve_serving_profile(&self.brain_profile, token, registry).await
         {
             return route_to_brain(registry, token, &p.target_id, &p.signal, &profile_id).await;
         }

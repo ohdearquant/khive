@@ -164,6 +164,42 @@ impl StorageError {
             || msg.contains("fts5: phrase queries are not supported (detail")
             || msg.contains("fts5: NEAR queries are not supported (detail")
     }
+
+    /// Whether this error is a UNIQUE constraint violation from a raw SQL
+    /// `execute` (e.g. an `INSERT` racing an existing row under the ledger's
+    /// natural key). Callers that treat exact-key duplicates as a tolerated
+    /// no-op (ADR-081 §4 serve-ledger idempotency) MUST gate on this
+    /// predicate rather than swallowing every `Driver` error at `execute` —
+    /// that would also hide genuine write failures (disk full, corruption).
+    ///
+    /// Only applies to `Driver` errors from the `Sql` capability at a single-
+    /// statement execute operation. `khive-db`'s `sql_bridge` labels this
+    /// operation differently depending on which `SqlAccess` seam produced the
+    /// writer — a bare transaction's `execute` vs. a pooled `writer()`'s
+    /// `pool_writer.execute` vs. an explicit `tx.execute` — so all three are
+    /// accepted; batch/script variants are intentionally excluded since a
+    /// UNIQUE violation partway through a multi-statement batch is not the
+    /// same single-row-duplicate case this predicate exists to tolerate.
+    pub fn is_unique_constraint_violation(&self) -> bool {
+        let Self::Driver {
+            capability,
+            operation,
+            source,
+        } = self
+        else {
+            return false;
+        };
+        if *capability != StorageCapability::Sql {
+            return false;
+        }
+        if !matches!(
+            operation.as_ref(),
+            "execute" | "pool_writer.execute" | "tx.execute"
+        ) {
+            return false;
+        }
+        source.to_string().contains("UNIQUE constraint failed")
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +330,59 @@ mod tests {
             source: Box::new(FakeSource("fts5: syntax error near \"@\"".into())),
         };
         assert!(!e.is_fts5_syntax_error());
+    }
+
+    fn driver_err_sql(operation: &'static str, message: &str) -> StorageError {
+        StorageError::driver(
+            StorageCapability::Sql,
+            operation,
+            FakeSource(message.into()),
+        )
+    }
+
+    #[test]
+    fn unique_constraint_failure_at_execute_sql_capability_is_classified() {
+        let e = driver_err_sql(
+            "execute",
+            "UNIQUE constraint failed: brain_serve_ledger.namespace, \
+             brain_serve_ledger.target_id, brain_serve_ledger.query_class, \
+             brain_serve_ledger.served_at",
+        );
+        assert!(e.is_unique_constraint_violation());
+    }
+
+    #[test]
+    fn unique_constraint_failure_at_pool_writer_execute_is_classified() {
+        // khive-db's pooled writer seam (`SqlAccess::writer()`) labels its
+        // single-statement execute operation "pool_writer.execute", not bare
+        // "execute" — this is the exact seam brain.record_serve writes through.
+        let e = driver_err_sql("pool_writer.execute", "UNIQUE constraint failed: t.id");
+        assert!(e.is_unique_constraint_violation());
+    }
+
+    #[test]
+    fn unique_constraint_message_at_non_execute_operation_is_not_classified() {
+        let e = driver_err_sql("query_row", "UNIQUE constraint failed: t.id");
+        assert!(!e.is_unique_constraint_violation());
+    }
+
+    #[test]
+    fn non_unique_driver_error_at_execute_is_not_classified() {
+        let e = driver_err_sql("execute", "disk I/O error");
+        assert!(!e.is_unique_constraint_violation());
+    }
+
+    #[test]
+    fn non_sql_capability_is_not_classified_as_unique_violation() {
+        let e = driver_err("execute", "UNIQUE constraint failed: t.id");
+        assert!(!e.is_unique_constraint_violation());
+    }
+
+    #[test]
+    fn timeout_is_not_classified_as_unique_violation() {
+        let e = StorageError::Timeout {
+            operation: "execute".into(),
+        };
+        assert!(!e.is_unique_constraint_violation());
     }
 }
