@@ -1145,11 +1145,7 @@ fn build_server_multi_backend(
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
-    let pool: Option<Arc<ConnectionPool>> = if main_backend.is_file_backed() {
-        Some(main_backend.pool_arc())
-    } else {
-        None
-    };
+    let pool = checkpoint_pool_for(main_backend.as_ref());
 
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
     let server =
@@ -1161,6 +1157,24 @@ fn build_server_multi_backend(
     } else {
         server
     })
+}
+
+/// Derive the checkpoint pool for a multi-backend boot's `main` backend
+/// (ADR-091 Planks 0+2). The pool is only present for file-backed databases;
+/// in-memory backends must never drive `checkpoint_once` on a non-WAL
+/// connection.
+///
+/// Shared by both multi-backend boot paths — `build_server_multi_backend`
+/// (this file) and the `kkernel mcp` daemon branch (`crates/kkernel/src/main.rs`,
+/// which builds its server from `MultiBackendRegistry` directly rather than via
+/// `build_server_multi_backend`) — so the derivation lives in exactly one
+/// place instead of being hand-copied at each call site (#601, #604).
+pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<ConnectionPool>> {
+    if main_backend.is_file_backed() {
+        Some(main_backend.pool_arc())
+    } else {
+        None
+    }
 }
 
 /// Construct one per-pack runtime, wiring `core_backend` for secondary-backend packs.
@@ -1830,6 +1844,104 @@ brain_profile = "project-profile"
             first_comm_ok,
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// Regression for #601: the `kkernel mcp` multi-backend daemon path builds its
+    /// server from `MultiBackendRegistry` via `from_registry_with_meta` +
+    /// `with_coordinator`, NOT via `build_server_multi_backend` — so it must wire
+    /// the main backend's pool itself, mirroring what `build_server_multi_backend`
+    /// already does (serve.rs `build_server_multi_backend`, the sibling boot path).
+    ///
+    /// Before the fix, that wiring step was missing on the kkernel branch: the server
+    /// had `pool == None` unconditionally, `pool_for_checkpoint()` returned `None`, and
+    /// `khive_runtime::daemon` never spawned `run_checkpoint_task` — ADR-091 Planks 0+2
+    /// were dead code in the live daemon.
+    ///
+    /// This test calls `checkpoint_pool_for` — the SAME helper both boot paths call
+    /// (`build_server_multi_backend` in this file, and `Command::Mcp` in
+    /// `crates/kkernel/src/main.rs`) — rather than re-deriving the `is_file_backed`/
+    /// `pool_arc` logic inline. That keeps the test coupled to the production
+    /// derivation: deleting or bypassing the `checkpoint_pool_for` call in
+    /// `main.rs` breaks compilation there, and any regression in the derivation
+    /// itself (this helper) fails here directly.
+    #[test]
+    fn kkernel_multi_backend_path_wires_pool_for_file_backed_main() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main_path = dir.path().join("main.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        let pool = checkpoint_pool_for(multi.main_backend.as_ref());
+        let server = KhiveMcpServer::from_registry_with_meta(
+            multi.registry,
+            &multi.default_namespace,
+            &multi.config_id,
+        );
+        let server = if let Some(p) = pool {
+            server.with_pool(p)
+        } else {
+            server
+        };
+
+        assert!(
+            server.pool().is_some(),
+            "file-backed multi-backend main must wire a checkpoint pool onto the server"
+        );
+    }
+
+    /// Sibling guard: an in-memory main backend must never carry a checkpoint pool
+    /// (checkpoint_once must never run on a non-WAL, in-memory connection). Also
+    /// exercises `checkpoint_pool_for` — see the note on the sibling test above.
+    #[test]
+    fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        let pool = checkpoint_pool_for(multi.main_backend.as_ref());
+        let server = KhiveMcpServer::from_registry_with_meta(
+            multi.registry,
+            &multi.default_namespace,
+            &multi.config_id,
+        );
+        let server = if let Some(p) = pool {
+            server.with_pool(p)
+        } else {
+            server
+        };
+
+        assert!(
+            server.pool().is_none(),
+            "in-memory multi-backend main must never carry a checkpoint pool"
         );
     }
 
