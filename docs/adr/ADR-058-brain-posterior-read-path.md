@@ -318,6 +318,83 @@ The mapping of posteriors to tunables is the three-to-three identity already enc
 22-variable calibration inventory referenced in #85 is out of scope here and remains a tuning
 surface ([ADR-021](ADR-021-memory-pack.md) §Scope: weights are starting values, not invariants).
 
+### Amendment (2026-07-03): typed consumer-kind vocabulary
+
+Issue #542 (closed-issue audit consolidation pass) surfaced that `consumer_kind` is a bare,
+unvalidated `String` at every call site — `ProfileRecord`/`BindingRecord`
+(`crates/khive-brain-core/src/profile.rs:29,61`) type it as `String`, and every caller hand-types
+the literal, including this ADR's own §Exact change list #3 sample (`"consumer_kind": "recall"`
+above). Three values exist across the ADR corpus today, at three different states of wiring:
+
+| Value                 | Declared in                                                                                                          | Status                                                                                                                  |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `"recall"`            | this ADR / [ADR-035](ADR-035-cli-config-and-auto-embed.md)                                                           | Live — the only consumer_kind actually wired to a resolver call site                                                    |
+| `"knowledge_compose"` | [ADR-048](ADR-048-knowledge-section-profiles.md) §"New brain verb" (line 396)                                        | **Gap** — declared but never wired; the knowledge pack's feedback handler still resolves against `"recall"` (see below) |
+| `"rerank"`            | [ADR-032](ADR-032-brain-profile-orchestration.md) §934, [ADR-042](ADR-042-local-rerank-via-lattice-inference.md) §71 | Deferred — no resolver call site exists yet                                                                             |
+
+The knowledge pack's mis-binding is a real bug, not just a naming gap:
+`crates/khive-pack-knowledge/src/handlers.rs:395-400` and `:459` call `brain.resolve` with the
+literal `"recall"`, meaning knowledge-pack feedback today updates the SAME posterior bucket as
+memory-pack recall feedback instead of the independently-tunable bucket ADR-048 specified. The
+inline comment at handlers.rs:397 documents this as if deliberate ("brain contract registers
+recall bindings under consumer_kind=\"recall\"") — that comment is an artifact of the gap, not
+evidence it was intentional at the ADR-048 level.
+
+**Decision**: introduce a closed `ConsumerKind` enum in `crates/khive-brain-core/src/profile.rs`
+(the crate both `khive-pack-memory` and `khive-pack-knowledge` already depend on directly, and
+which already depends on `khive-runtime` — no new dependency edge), mirroring the closed-vocabulary
+discipline this codebase already applies to entity kinds and edge relations:
+
+```rust
+/// Closed vocabulary of brain profile consumers. Adding a new consumer requires
+/// adding a variant here — never a bare string literal at a new call site.
+pub enum ConsumerKind {
+    Recall,           // "recall" — memory pack recall ranking (live)
+    KnowledgeCompose, // "knowledge_compose" — knowledge pack compose ranking (ADR-048, not yet wired)
+    Rerank,           // "rerank" — lattice-inference rerank profile (ADR-032/042, deferred)
+}
+```
+
+with `as_str()` (and `FromStr` where a caller needs to parse the wire-level string back) — the MCP
+`consumer_kind` param stays a JSON string at the wire boundary; the enum is the Rust-side internal
+vocabulary, not a wire schema change. The #542 implementation PR MUST: (a) replace every existing
+bare `"recall"` literal — this ADR's own §3 sample included — with `ConsumerKind::Recall.as_str()`,
+and (b) correct `khive-pack-knowledge`'s handlers.rs:400/459 call sites from `"recall"` to
+`ConsumerKind::KnowledgeCompose.as_str()`, closing the ADR-048 gap.
+
+This does **not** expand Q4's scope below. Q4 (open, deferred to a follow-up ADR) asks whether
+`knowledge.compose` ranking should CONSUME posteriors at read time. This amendment only fixes which
+bucket the knowledge pack's EXISTING feedback write path resolves against — a correctness fix
+available now, independent of whether Q4's read-path wiring ever lands.
+
+### Amendment (2026-07-03): feedback-path resolver consolidation
+
+`crates/khive-pack-memory/src/handlers/feedback.rs:43-` and
+`crates/khive-pack-knowledge/src/handlers.rs:375-` each implement their own tier-1/tier-2/tier-3
+profile resolution ladder (explicit config profile → namespace-bound `brain.resolve` lookup gated
+on `matched_binding` → pack-local fallback), and each pack additionally hand-rolls its own private
+helper to perform tier 2 — `resolve_namespace_profile` (`feedback.rs:113-`) and
+`knowledge_resolve_namespace_profile` (`handlers.rs:523-`). The two implementations are
+structurally identical (same `brain.resolve` dispatch, same `matched_binding` gate, same
+`Option<String>` return), maintained as independent copies with no shared source.
+
+**Decision**: the #542 implementation PR MUST extract one shared resolver into
+`khive-brain-core` (same crate as the new `ConsumerKind` enum, same dependency justification):
+
+```rust
+pub async fn resolve_consumer_profile(
+    registry: &khive_runtime::VerbRegistry,
+    namespace: &str,
+    consumer_kind: ConsumerKind,
+) -> Option<String>
+```
+
+and both packs' tier-2 call sites MUST call this shared function instead of maintaining private
+copies. This is a MUST, not a nice-to-have: two independently-maintained copies of the same
+matched_binding-gated resolution logic is exactly the kind of silent-divergence risk this ADR's
+read path exists to eliminate at the ranking layer — the same discipline applies to the write-path
+resolver underneath it.
+
 ---
 
 ## Consequences
@@ -600,6 +677,33 @@ must add `brain.serve_weights` to that table with:
 - Purpose: resolve the caller's recall profile and return projected weights with `change_counter`
   for the memory pack's weights cache.
 
+### 6. Consumer-kind vocabulary and resolver consolidation (amendment, 2026-07-03)
+
+**File: `crates/khive-brain-core/src/profile.rs`**
+
+- Add the `ConsumerKind` enum (see amendment above) with `Recall` / `KnowledgeCompose` / `Rerank`
+  variants and `as_str(&self) -> &'static str`.
+- Add `resolve_consumer_profile(registry, namespace, consumer_kind) -> Option<String>` as the
+  single shared implementation of the tier-2 namespace-bound-profile lookup, replacing the bodies
+  of `resolve_namespace_profile` (`khive-pack-memory/src/handlers/feedback.rs:113-`) and
+  `knowledge_resolve_namespace_profile` (`khive-pack-knowledge/src/handlers.rs:523-`).
+
+**File: `crates/khive-pack-memory/src/handlers/feedback.rs`**
+
+- Line 52: call `khive_brain_core::resolve_consumer_profile(registry, &ns, ConsumerKind::Recall)`
+  in place of the private `resolve_namespace_profile` helper; delete the now-dead private fn.
+- §Exact change list #3's `resolve_brain_weights` sample (line 529 above): use
+  `ConsumerKind::Recall.as_str()` in place of the bare `"recall"` literal.
+
+**File: `crates/khive-pack-knowledge/src/handlers.rs`**
+
+- Lines 400 and 459: call the shared resolver with `ConsumerKind::KnowledgeCompose`, not
+  `ConsumerKind::Recall` — this is the ADR-048 gap fix, not a rename. Delete the private
+  `knowledge_resolve_namespace_profile` (line 523-).
+
+This item is the implementer checklist for the (separate) #542 implementation PR — no `.rs` files
+change in this spec-delta PR itself.
+
 ---
 
 ## Determinism and test plan
@@ -682,10 +786,13 @@ See §Binding semantics above for rationale.
 ### Q4 — Open (Ocean): knowledge pack read-path scope
 
 **The gemini mirror flagged this independently.** The `knowledge.compose` verb also lacks read-path
-wiring: it routes feedback correctly through `brain.resolve(consumer_kind="recall")`
-(`crates/khive-pack-knowledge/src/handlers.rs:362-403`) but does not consume posteriors when
-ranking compose output. This ADR scopes the memory-pack path. Should the knowledge pack be brought
-to the same spec in a follow-up ADR, or in this one?
+wiring: it routes feedback through `brain.resolve(consumer_kind="recall")`
+(`crates/khive-pack-knowledge/src/handlers.rs:362-403`) — **note: as of the 2026-07-03 amendment
+above, this is a known gap, not a correct baseline; it should resolve against
+`consumer_kind="knowledge_compose"` per ADR-048, and the #542 implementation PR fixes it** — but
+does not consume posteriors when ranking compose output, which remains this question's actual
+scope. This ADR scopes the memory-pack path. Should the knowledge pack's read-path ranking be
+brought to the same spec in a follow-up ADR, or in this one?
 
 **Recommendation**: follow-up ADR. The knowledge pack's recall path is structurally different
 (compose ranking over atoms vs. note retrieval); a separate ADR can reference ADR-058 as the
