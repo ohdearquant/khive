@@ -2,7 +2,7 @@
 //!
 //! Tier order (exclusive flow per ADR-035):
 //! 1. Explicit brain profile in pack config → route via `brain.feedback`, return early
-//! 2. Namespace-bound profile via `brain.resolve(consumer_kind="recall")`, matched_binding=true → return early
+//! 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")`, matched_binding=true → return early
 //! 3. Global section_posteriors → update pack-local prior (only when tiers 1 and 2 do not resolve)
 
 use khive_pack_brain::BrainPack;
@@ -104,7 +104,7 @@ async fn feedback_tier1_explicit_wins_over_bound_profile() {
     registry
         .dispatch(
             "brain.create_profile",
-            json!({"namespace": ns.as_str(), "name": "alt-profile", "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "name": "alt-profile", "consumer_kind": "knowledge_compose"}),
         )
         .await
         .expect("create alt profile");
@@ -118,7 +118,7 @@ async fn feedback_tier1_explicit_wins_over_bound_profile() {
     registry
         .dispatch(
             "brain.bind",
-            json!({"namespace": ns.as_str(), "profile_id": "alt-profile", "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "profile_id": "alt-profile", "consumer_kind": "knowledge_compose"}),
         )
         .await
         .expect("bind alt profile");
@@ -180,25 +180,25 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
 
     let atom_id = make_entity(&registry, ns.as_str()).await;
 
-    // Create a secondary profile and bind it explicitly for consumer_kind="recall".
+    // Create a secondary profile and bind it explicitly for consumer_kind="knowledge_compose".
     registry
         .dispatch(
             "brain.create_profile",
-            json!({"namespace": ns.as_str(), "name": "ns-bound-recall", "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "name": "ns-bound-compose", "consumer_kind": "knowledge_compose"}),
         )
         .await
         .expect("create ns-bound profile");
     registry
         .dispatch(
             "brain.activate",
-            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-recall"}),
+            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-compose"}),
         )
         .await
         .expect("activate ns-bound profile");
     registry
         .dispatch(
             "brain.bind",
-            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-recall", "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-compose", "consumer_kind": "knowledge_compose"}),
         )
         .await
         .expect("bind ns-bound profile");
@@ -207,12 +207,12 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
     let resolve = registry
         .dispatch(
             "brain.resolve",
-            json!({"namespace": ns.as_str(), "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "consumer_kind": "knowledge_compose"}),
         )
         .await
         .expect("brain.resolve");
     assert_eq!(
-        resolve["resolved_profile_id"], "ns-bound-recall",
+        resolve["resolved_profile_id"], "ns-bound-compose",
         "brain.resolve must return the bound profile"
     );
     assert_eq!(
@@ -220,7 +220,7 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
         "must be matched_binding=true for an explicit binding"
     );
 
-    // Send feedback — tier-2 must route to ns-bound-recall.
+    // Send feedback — tier-2 must route to ns-bound-compose.
     let r = registry
         .dispatch(
             "knowledge.feedback",
@@ -237,18 +237,18 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
         "tier-2 feedback must route to brain pack: {r:?}"
     );
 
-    // ns-bound-recall must have total_events == 1.
+    // ns-bound-compose must have total_events == 1.
     let prof = registry
         .dispatch(
             "brain.profile",
-            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-recall"}),
+            json!({"namespace": ns.as_str(), "profile_id": "ns-bound-compose"}),
         )
         .await
         .expect("brain.profile");
     assert_eq!(
         prof["total_events"].as_u64().unwrap_or(0),
         1,
-        "ns-bound-recall must receive the feedback event"
+        "ns-bound-compose must receive the feedback event"
     );
 }
 
@@ -276,18 +276,26 @@ async fn feedback_tier3_global_fallback_no_explicit_binding() {
 
     let atom_id = make_entity(&registry, ns.as_str()).await;
 
-    // Confirm brain.resolve returns a system-default (matched_binding=false).
-    let resolve = registry
+    // Confirm brain.resolve reports no explicit binding for consumer_kind=
+    // "knowledge_compose". Unlike "recall" (which always has the seeded
+    // balanced-recall-v1 system default to fall back to), no default profile is
+    // registered for "knowledge_compose" yet, so brain.resolve legitimately
+    // errors here rather than returning matched_binding=false. Both outcomes mean
+    // "no tier-2 hit" to `khive_brain_core::resolve_consumer_profile` (ADR-058
+    // amendment, #542), which folds an Err the same as matched_binding=false —
+    // hence nothing to assert in the Err arm below.
+    if let Ok(resolve) = registry
         .dispatch(
             "brain.resolve",
-            json!({"namespace": ns.as_str(), "consumer_kind": "recall"}),
+            json!({"namespace": ns.as_str(), "consumer_kind": "knowledge_compose"}),
         )
         .await
-        .expect("brain.resolve");
-    assert_eq!(
-        resolve["matched_binding"], false,
-        "no explicit binding: matched_binding must be false (system default)"
-    );
+    {
+        assert_eq!(
+            resolve["matched_binding"], false,
+            "no explicit binding: matched_binding must be false (system default)"
+        );
+    }
 
     // Tier-3 must fire: section_posteriors updated, ok=true, no emitted key.
     let r = registry

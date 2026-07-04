@@ -13,7 +13,8 @@ pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal};
 pub use brain_state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
 pub use posterior::{BetaPosterior, EntityPosteriors};
 pub use profile::{
-    BalancedRecallSnapshot, BalancedRecallState, ProfileBinding, ProfileLifecycle, ProfileRecord,
+    resolve_consumer_profile, BalancedRecallSnapshot, BalancedRecallState, ConsumerKind,
+    ProfileBinding, ProfileLifecycle, ProfileRecord,
 };
 pub use section_state::{
     derive_deterministic_weights, derive_weights, SectionPosteriorSnapshot, SectionPosteriorState,

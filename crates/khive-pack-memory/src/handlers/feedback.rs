@@ -46,10 +46,16 @@ impl MemoryPack {
         }
 
         // Tier 2: namespace-bound profile via brain.resolve.
-        // Use consumer_kind="recall" — the brain contract keys recall bindings/defaults
+        // consumer_kind=Recall — the brain contract keys recall bindings/defaults
         // under "recall" (brain.resolve(consumer_kind="recall") returns balanced-recall-v1).
         let ns = token.namespace().as_str().to_string();
-        if let Some(profile_id) = resolve_namespace_profile(registry, &ns, "recall").await {
+        if let Some(profile_id) = khive_brain_core::resolve_consumer_profile(
+            registry,
+            &ns,
+            khive_brain_core::ConsumerKind::Recall,
+        )
+        .await
+        {
             return route_to_brain(registry, token, &p.target_id, &p.signal, &profile_id).await;
         }
 
@@ -100,42 +106,6 @@ async fn route_to_brain(
         "served_by_profile_id": profile_id,
     });
     registry.dispatch("brain.feedback", brain_params).await
-}
-
-/// Try to resolve the profile bound to `namespace` for `consumer_kind` via
-/// `brain.resolve`. Returns `None` when the brain pack is absent, the verb
-/// errors, no binding matches, or the result is only a system-default fallback
-/// (`matched_binding = false`).
-///
-/// Per ADR-035, tier-2 fires only on a real binding match. A system-default
-/// fallback (e.g. `balanced-recall-v1` active with no explicit binding) must
-/// fall through to tier-3 (pack-local global prior).
-async fn resolve_namespace_profile(
-    registry: &VerbRegistry,
-    namespace: &str,
-    consumer_kind: &str,
-) -> Option<String> {
-    let resolve_params = json!({
-        "namespace": namespace,
-        "consumer_kind": consumer_kind,
-    });
-    match registry.dispatch("brain.resolve", resolve_params).await {
-        Ok(v) => {
-            // Only treat as a tier-2 hit when brain.resolve confirms an explicit binding.
-            let matched_binding = v
-                .get("matched_binding")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            if matched_binding {
-                v.get("resolved_profile_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_owned)
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -560,7 +530,7 @@ mod tests {
             .expect("activate ns-bound profile");
 
         // Bind ns-bound-recall to the "local" namespace for consumer_kind="recall".
-        // resolve_namespace_profile calls brain.resolve(namespace="local", consumer_kind="recall"),
+        // resolve_consumer_profile calls brain.resolve(namespace="local", consumer_kind="recall"),
         // which must match this binding when the consumer_kind fix is in place.
         registry
             .dispatch(
@@ -631,7 +601,7 @@ mod tests {
     /// namespace binding exists, feedback falls through to the pack-local global
     /// tuning prior — even when the brain pack is loaded and balanced-recall-v1 is active.
     ///
-    /// Before the matched_binding fix, resolve_namespace_profile treated the system-default
+    /// Before the matched_binding fix, resolve_consumer_profile treated the system-default
     /// fallback (balanced-recall-v1 active, no binding rows) as a tier-2 hit. This test
     /// verifies that the deactivation workaround is no longer needed: tier-3 fires in
     /// the normal case (brain loaded, no explicit binding).
@@ -661,7 +631,7 @@ mod tests {
 
         // Load brain pack but do NOT create any explicit bindings.
         // brain.resolve returns balanced-recall-v1 as system-default (matched_binding=false).
-        // With the fix, resolve_namespace_profile returns None for matched_binding=false,
+        // With the fix, resolve_consumer_profile returns None for matched_binding=false,
         // so tier-2 is skipped and tier-3 fires WITHOUT needing to deactivate the default profile.
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
