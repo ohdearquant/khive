@@ -94,9 +94,9 @@ risk, but not demonstrated as the incident's cause, and NOT the only such risk (
 connection, for exactly as long as the caller holds the returned `SqliteTransaction`
 before calling `commit()` or letting it drop. Tracing every call site of `begin_tx`
 (`grep -rn "begin_tx(" crates`) finds exactly **one production caller**,
-`khive-pack-session/src/mirror/ingest.rs:615`; the other match, `ingest.rs:2416`, is
-inside `#[tokio::test] test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced`
-and is not reachable from production code. The one production caller uses
+`khive-pack-session/src/mirror/ingest.rs:615`, plus test-only callers (including
+`ingest.rs:2416`'s mid-transaction-error test, `khive-db/src/sql_bridge.rs:934`, and
+`khive-db/src/backend.rs:754`), none reachable from production code. The one production caller uses
 `SqlTxOptions::default()` (`read_only: false`, `SqlIsolation` not `Serializable`), which
 resolves to `BEGIN IMMEDIATE`, a **write** transaction, not the read-only
 `BEGIN DEFERRED` path. It is a bounded batch loop (one mirror-ingest pass over a file's
@@ -122,7 +122,16 @@ file-backed writer or the pooled/in-memory writer) and issues `BEGIN IMMEDIATE`/
 
 - `khive-pack-brain/src/fold_gate.rs:165-183` (`apply_fold_gate`): acquires a writer,
   issues raw `BEGIN IMMEDIATE`, runs the fold-gate dedup/mass-check/write, then `COMMIT`
-  with a `ROLLBACK` fallback on failed commit.
+  with a `ROLLBACK` fallback on failed commit. Its sibling
+  `apply_fold_gate_and_append_event` (`fold_gate.rs:278-310`) issues its own
+  `BEGIN IMMEDIATE`/`COMMIT` span and is a production path, called from the feedback
+  handler (`khive-pack-brain/src/handlers.rs:1139`).
+- `khive-db/src/pool.rs:175-181` (`WriterGuard::transaction`): a pooled-writer helper
+  that issues `BEGIN IMMEDIATE`, runs the caller's closure, then commits or rolls back.
+  Production callers include `khive-runtime/src/operations.rs:3610` (edge update) and
+  the curation merge paths below. Because every `guard.transaction(...)` caller flows
+  through this one helper, the helper itself is the instrumentation point; its callers
+  need no per-site edits.
 - `khive-pack-brain/src/persist.rs:330-400` (`persist_brain_state_mutation`): its own doc
   comment states this "deliberately does NOT use `SqlAccess::begin_tx`" because, per
   `fold_gate.rs`'s module doc, `begin_tx` "requires a file-backed database and errors for
@@ -136,7 +145,8 @@ file-backed writer or the pooled/in-memory writer) and issues `BEGIN IMMEDIATE`/
 - `khive-runtime/src/curation.rs` (`merge_entity`, ~270-300, 865, 1289): its doc comment
   states the whole merge (entity reads/writes, edge rewires, FTS updates, vec-index
   delete) "runs on a single pool connection inside one `BEGIN IMMEDIATE` transaction via
-  `merge_entity_sql`."
+  `merge_entity_sql`." These spans flow through `WriterGuard::transaction` above, so
+  instrumenting the helper covers them.
 - Every store's own batch-upsert method: `entity.rs:325`, `text.rs:298/363/1111`,
   `note.rs:433`, `graph.rs:352`, `vectors.rs:356`, `event.rs:707/722`, `sparse.rs:249` each
   wrap a batch write in its own raw `BEGIN IMMEDIATE`/`COMMIT`.
@@ -266,10 +276,14 @@ mechanisms register:
 
 - `SqliteTransaction::begin_tx` (`sql_bridge.rs:848-894`) registers on `BEGIN`
   (`sql_bridge.rs:882-883`) and deregisters on `commit()`/`drop`.
-- Each raw-`SqlWriter` call site identified in Inventory (2b) (`fold_gate.rs:165-183`,
-  `persist.rs:330-400`, `sql_bridge.rs`'s `SqliteWriter`/`PoolBackedWriter::execute_batch`,
-  `curation.rs`'s `merge_entity`, every store's batch-upsert method, `khive-vcs/sync.rs`'s
-  per-chunk writes) wraps its existing `BEGIN IMMEDIATE` / `COMMIT`-or-`ROLLBACK` span with
+- Each raw-`SqlWriter` transaction span identified in Inventory (2b) (`fold_gate.rs`'s
+  `apply_fold_gate` and `apply_fold_gate_and_append_event`, `persist.rs:330-400`,
+  `sql_bridge.rs`'s `SqliteWriter`/`PoolBackedWriter::execute_batch`,
+  `pool.rs`'s `WriterGuard::transaction` — one instrumentation point covering all
+  `guard.transaction(...)` callers, including `curation.rs`'s merge paths and
+  `operations.rs:3610`'s edge update — every store's batch-upsert method, and
+  `khive-vcs/sync.rs`'s per-chunk writes) wraps its existing
+  `BEGIN IMMEDIATE` / `COMMIT`-or-`ROLLBACK` span with
   a `register(label)` call immediately after `BEGIN` succeeds and a `deregister(id)` call
   in both the commit and rollback paths (including error paths that currently return
   before reaching `COMMIT`, which this change forces to be explicit about). This is
@@ -366,12 +380,10 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   task does not retry within the same tick or spin-wait. `last_truncate_attempt` is
   **not** updated on a skip (only on an attempt that actually acquired the writer), so
   the next tick where the writer is free is eligible immediately rather than waiting out
-  the full `truncate_min_interval` again. If the writer is busy for a sustained period
-  (multiple consecutive ticks), each tick's ordinary PASSIVE attempt still runs
-  (`try_writer_nowait` failing for TRUNCATE doesn't preclude a separate successful
-  PASSIVE elsewhere in the same tick loop, since both share the one `try_writer_nowait`
-  call per tick, and a busy writer skips both simultaneously per the current tick
-  design). **Accepted worst case, stated explicitly:** if the writer is continuously busy
+  the full `truncate_min_interval` again. **One writer checkout per tick** (matching the
+  current loop shape, `checkpoint.rs:196-214`): if `try_writer_nowait()` fails, both the
+  PASSIVE observation and any due TRUNCATE are skipped for that tick; if it succeeds, the
+  tick runs PASSIVE first and then, if due, TRUNCATE under that same guard. **Accepted worst case, stated explicitly:** if the writer is continuously busy
   for the entire observation window, TRUNCATE never runs and the WAL keeps growing past
   `truncate_high_water_pages`; the mitigation is the existing rate-limited WARN
   escalating in severity at higher multiples of the threshold (e.g. WARN at 1x, a second
