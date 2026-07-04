@@ -242,9 +242,13 @@ mod serde_tests {
     }
 
     /// Regression for #487: a details map with 9-10 entries must deserialize
-    /// successfully (the visitor must keep draining MapAccess until None,
-    /// not stop reading once 8 entries have been retained), and must retain
-    /// exactly the first 8 insertion-order pairs.
+    /// successfully (the visitor must keep draining MapAccess until None, not
+    /// stop reading once 8 entries have been retained).
+    ///
+    /// Follow-up (PR #549 review): truncation must be observable, not silent.
+    /// The bounded wire shape stays at 8 entries, but the 8th slot is now the
+    /// `details_truncated` indicator carrying the dropped-pair count, so only
+    /// the first 7 insertion-order client pairs are retained verbatim.
     #[test]
     fn details_drains_oversized_map_retains_8() {
         let json = serde_json::json!({
@@ -256,15 +260,24 @@ mod serde_tests {
         let details: Details =
             serde_json::from_str(&json).expect("oversized map must deserialize successfully");
         let pairs: Vec<(&str, &str)> = details.iter().collect();
-        assert_eq!(pairs.len(), 8, "must retain exactly 8 pairs");
-        for i in 0..8 {
+        assert_eq!(
+            pairs.len(),
+            8,
+            "must retain exactly 8 pairs (7 client + indicator)"
+        );
+        for i in 0..7 {
             let key = format!("k{i}");
             assert_eq!(
                 details.get(&key),
                 Some(format!("v{i}").as_str()),
-                "entry {key} must be one of the first 8 insertion-order pairs"
+                "entry {key} must be one of the first 7 insertion-order pairs"
             );
         }
+        assert_eq!(
+            details.dropped_count(),
+            Some(3),
+            "10 supplied pairs - 7 retained = 3 dropped, must be observable"
+        );
     }
 
     /// Nine-pair variant embedded inside a full `KhiveError` envelope, proving
@@ -284,6 +297,15 @@ mod serde_tests {
         let deserialized: KhiveError =
             serde_json::from_str(&json).expect("envelope with 9 details pairs must deserialize");
         let got = deserialized.details().unwrap();
-        assert_eq!(got.iter().count(), 8, "must retain exactly 8 pairs");
+        assert_eq!(
+            got.iter().count(),
+            8,
+            "must retain exactly 8 pairs (7 client + truncation indicator)"
+        );
+        assert_eq!(
+            got.dropped_count(),
+            Some(2),
+            "9 supplied pairs - 7 retained = 2 dropped, must be observable"
+        );
     }
 }

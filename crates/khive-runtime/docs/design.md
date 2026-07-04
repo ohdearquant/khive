@@ -4,10 +4,12 @@
 
 ### ADR-002: Edge Ontology
 
-- 15 closed edge relations; endpoint contract enforced at the runtime layer in `operations.rs`
+- 17 closed edge relations (15 base relations plus 2 epistemic relations added by ADR-055);
+  endpoint contract enforced at the runtime layer in `operations.rs`
 - Symmetric relations (`competes_with`, `composed_with`) are stored with `source_uuid < target_uuid`
 - `annotates` is the only cross-substrate relation: source must be a note, target may be anything
-- All 13 base relations require entity→entity; notes cannot be source/target except via `annotates`
+- All base relations other than `annotates` require entity→entity; notes cannot be source/target
+  except via `annotates`
 - `supersedes` is same-substrate only: entity→entity or note→note, never cross-substrate
 - `dependency_kind` metadata key is only valid on `depends_on` edges
 - Pack-declared edge endpoint rules are additive only; packs cannot tighten the base contract
@@ -56,7 +58,9 @@
 ### ADR-014: Curation Operations
 
 - `merge_entity` enforces same-kind constraint at the runtime layer, not storage
-- Namespace isolation is enforced during merge: only records in the caller namespace can be merged
+- Merge is a same-namespace curation constraint: only records in the caller namespace can be
+  merged (this is the one by-ID operation with a namespace check — see ADR-007 below; it is
+  not general namespace isolation)
 - Symmetric relations are canonicalized (source_uuid < target_uuid) before merge conflict checks
 - Soft-delete preserves existing edges; queries filter by `deleted_at IS NULL`
 - Entity tombstone records preserve provenance for audit

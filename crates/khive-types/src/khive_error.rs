@@ -184,11 +184,23 @@ pub enum RetryHint {
 
 // ---- Details ----
 
+/// Reserved key inserted in place of the 8th slot when a `Details` source
+/// (constructor input or a deserialized wire map) supplies more than 8 pairs.
+/// Its value is the count of dropped pairs, so truncation is observable
+/// instead of silently discarding data (RUNTIME-AUD-002 / #487 follow-up).
+pub const DETAILS_TRUNCATED_KEY: &str = "details_truncated";
+
 /// Bounded key/value metadata attached to a `KhiveError` (max 8 pairs).
 ///
 /// Stored as `Cow<'static, str>` pairs: zero-alloc for static string literals
 /// (the common construction path) and owned strings on deserialization (no
 /// memory leak). Both paths are `no_std` + `alloc` compatible.
+///
+/// When the source supplies more than 8 pairs, the wire shape stays bounded
+/// at 8 entries, but the truncation is observable: the first 7 pairs are
+/// retained and the 8th slot becomes [`DETAILS_TRUNCATED_KEY`] mapped to the
+/// dropped-pair count. Callers that need the drop count without guessing the
+/// reserved key can use [`Details::dropped_count`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Details {
     entries: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)>,
@@ -196,16 +208,40 @@ pub struct Details {
 
 impl Details {
     /// Build `Details` from an iterable of `(&'static str, &'static str)` pairs.
-    /// Silently truncates to 8 entries.
+    ///
+    /// Up to 8 pairs are kept as-is. When more than 8 are supplied, the first
+    /// 7 client pairs are kept and the 8th slot is replaced with
+    /// [`DETAILS_TRUNCATED_KEY`] carrying the dropped-pair count, so the
+    /// truncation is observable rather than silent.
     pub fn new<I>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (&'static str, &'static str)>,
     {
-        let entries: alloc::vec::Vec<_> = pairs
-            .into_iter()
-            .take(8)
-            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-            .collect();
+        let all: alloc::vec::Vec<(&'static str, &'static str)> = pairs.into_iter().collect();
+        Self::from_owned(
+            all.into_iter()
+                .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v))),
+        )
+    }
+
+    /// Shared bounding/truncation logic for both the constructor and the
+    /// deserializer: keep the first 8 pairs verbatim, or — when more than 8
+    /// are supplied — keep the first 7 and append a `details_truncated`
+    /// indicator carrying the dropped-pair count.
+    fn from_owned<I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (Cow<'static, str>, Cow<'static, str>)>,
+    {
+        let all: alloc::vec::Vec<_> = pairs.into_iter().collect();
+        if all.len() <= 8 {
+            return Self { entries: all };
+        }
+        let dropped = all.len() - 7;
+        let mut entries: alloc::vec::Vec<_> = all.into_iter().take(7).collect();
+        entries.push((
+            Cow::Borrowed(DETAILS_TRUNCATED_KEY),
+            Cow::Owned(alloc::format!("{dropped}")),
+        ));
         Self { entries }
     }
 
@@ -220,6 +256,15 @@ impl Details {
     /// Iterate over (key, value) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.entries.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
+    }
+
+    /// Number of pairs dropped due to the 8-entry bound, if any were.
+    ///
+    /// Returns `None` when the source supplied 8 or fewer pairs (no
+    /// truncation occurred). Returns `Some(dropped_count)` when truncation
+    /// occurred, parsed from the [`DETAILS_TRUNCATED_KEY`] indicator entry.
+    pub fn dropped_count(&self) -> Option<usize> {
+        self.get(DETAILS_TRUNCATED_KEY)?.parse().ok()
     }
 }
 
@@ -250,12 +295,30 @@ impl<'de> Deserialize<'de> for Details {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Details, A::Error> {
+                // Drain to completion regardless of size (#487: a naive early-exit
+                // once 8 entries are collected leaves trailing map bytes unconsumed
+                // and corrupts the surrounding deserializer). Only the first 8
+                // pairs are retained in memory as they arrive; entries beyond that
+                // are counted, not stored, so an adversarially large map can't
+                // inflate memory. Bounding + the observable-truncation indicator
+                // (RUNTIME-AUD-002 / #487 follow-up) are applied afterward via the
+                // same logic `Details::new` uses.
                 let mut entries: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
                     alloc::vec::Vec::new();
+                let mut total: usize = 0;
                 while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    total += 1;
                     if entries.len() < 8 {
                         entries.push((Cow::Owned(k), Cow::Owned(v)));
                     }
+                }
+                if total > 8 {
+                    let dropped = total - 7;
+                    entries.truncate(7);
+                    entries.push((
+                        Cow::Borrowed(DETAILS_TRUNCATED_KEY),
+                        Cow::Owned(alloc::format!("{dropped}")),
+                    ));
                 }
                 Ok(Details { entries })
             }

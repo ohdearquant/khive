@@ -62,10 +62,10 @@ pub use operations::{
 };
 pub use operations::{EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
-    DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,
-    PackFactory, PackLoadError, PackRegistration, PackRegistry, PackRuntime,
-    PackSchemaCollisionError, PackSchemaPlan, ParamDef, SchemaPlan, VerbCategory,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
+    resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
+    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackLoadError, PackRegistration,
+    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, SchemaPlan,
+    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{

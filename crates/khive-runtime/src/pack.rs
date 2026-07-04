@@ -887,25 +887,11 @@ impl VerbRegistry {
         // `namespace` are different cases. A present non-string value (null,
         // number, bool, array, object) is explicit caller input that failed to
         // parse — ADR-018 requires it fail closed, not silently coerce to the
-        // default namespace. Only a genuinely absent key defaults.
-        let (ns, explicit_namespace) = match params.get("namespace") {
-            None => {
-                let ns = Namespace::parse(&self.default_namespace)
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-                (ns, false)
-            }
-            Some(Value::String(ns_str)) => {
-                let ns = Namespace::parse(ns_str)
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-                (ns, true)
-            }
-            Some(other) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "invalid namespace: expected string when present, got {}",
-                    json_type_name(other),
-                )));
-            }
-        };
+        // default namespace. Only a genuinely absent key defaults. Shared with
+        // the multi-backend coordinator intercept via `resolve_explicit_namespace`
+        // so every MCP ingress path applies the same fail-closed rule.
+        let explicit_namespace = params.get("namespace").is_some_and(Value::is_string);
+        let ns = resolve_explicit_namespace(&params, &self.default_namespace)?;
         // ADR-057: thread the configured actor identity into the gate request so
         // the gate can distinguish human vs agent callers at the dispatch seam.
         // Mirrors the actor resolution used by the token-minting path below.
@@ -1667,9 +1653,39 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
 
+/// Resolve and validate a caller-supplied `namespace` argument the same way
+/// on every MCP ingress path (RUNTIME-AUD-002 / #433).
+///
+/// - Absent `namespace` key → parse `default_namespace`.
+/// - Present `namespace: "<string>"` → parse the caller's value.
+/// - Present non-string `namespace` (null, number, bool, array, object) →
+///   fail closed with `RuntimeError::InvalidInput`. ADR-018 requires this:
+///   a malformed explicit value must never be silently coerced to the
+///   default namespace.
+///
+/// This is the single chokepoint both `VerbRegistry::dispatch` (single-backend
+/// and JSON-form ingress) and the multi-backend coordinator intercept
+/// (`dispatch_via_coordinator_inner` in `khive-mcp`) call into, so no ingress
+/// path can bypass the fail-closed rule by routing around `dispatch`.
+pub fn resolve_explicit_namespace(
+    params: &Value,
+    default_namespace: &str,
+) -> Result<Namespace, RuntimeError> {
+    match params.get("namespace") {
+        None => Namespace::parse(default_namespace)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
+        Some(Value::String(ns_str)) => Namespace::parse(ns_str)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "invalid namespace: expected string when present, got {}",
+            json_type_name(other),
+        ))),
+    }
+}
+
 /// JSON type name for error messages (RUNTIME-AUD-002 / #433): describes a
 /// present-but-malformed `namespace` value without echoing its contents.
-fn json_type_name(v: &Value) -> &'static str {
+pub fn json_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "boolean",

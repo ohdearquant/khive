@@ -392,6 +392,135 @@ pub(crate) mod tests {
         );
     }
 
+    /// T6e / PR #549 blocker: a multi-backend `search` with a present-but-malformed
+    /// `namespace` (null/number/bool/array/object) must fail closed — `ok: false`,
+    /// an error naming the namespace — and the coordinator must NEVER be invoked
+    /// under the server's default namespace.
+    ///
+    /// Before the fix, `dispatch_via_coordinator_inner` never inspected
+    /// `args_value["namespace"]` at all: it always parsed the server's
+    /// `default_namespace` and called `coord.fan_out_search` under it, silently
+    /// substituting the default for a caller value that failed to parse. This
+    /// test FAILS against that code (coordinator IS called, `ok: true`) and
+    /// PASSES once the coordinator intercept shares `resolve_explicit_namespace`
+    /// with `VerbRegistry::dispatch` (RUNTIME-AUD-002 / #433).
+    #[tokio::test]
+    async fn t6e_multi_backend_search_malformed_namespace_fails_closed() {
+        let cases: [(&str, &str); 5] = [
+            ("null", "null"),
+            ("number", "42"),
+            ("boolean", "true"),
+            ("array", r#"["local"]"#),
+            ("object", r#"{"ns":"local"}"#),
+        ];
+
+        for (label, ns_literal) in cases {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let ops = format!(r#"search(kind="entity", query="anything", namespace={ns_literal})"#);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops,
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("T6e case {label}: dispatch must not MCP-error: {e}"));
+
+            let result_val: serde_json::Value =
+                serde_json::from_str(&raw).expect("T6e: response must be valid JSON");
+            let first = result_val
+                .get("results")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("T6e case {label}: results array must be non-empty"));
+
+            assert_eq!(
+                first.get("ok").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "T6e case {label}: malformed namespace must fail closed; got {first:?}"
+            );
+            let err_text = first.get("error").map(|e| e.to_string().to_lowercase());
+            assert!(
+                err_text.as_deref().is_some_and(|e| e.contains("namespace")),
+                "T6e case {label}: error must name the namespace; got {first:?}"
+            );
+            assert!(
+                !coord
+                    .search_called
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "T6e case {label}: coordinator.fan_out_search must NOT be called for a malformed namespace"
+            );
+        }
+    }
+
+    /// T6f / PR #549 blocker: a multi-backend UUID-form `link` with a
+    /// present-but-malformed `namespace` must fail closed the same way T6e does
+    /// for `search`, and the coordinator must never be invoked.
+    #[tokio::test]
+    async fn t6f_multi_backend_link_malformed_namespace_fails_closed() {
+        let cases: [(&str, &str); 5] = [
+            ("null", "null"),
+            ("number", "42"),
+            ("boolean", "true"),
+            ("array", r#"["local"]"#),
+            ("object", r#"{"ns":"local"}"#),
+        ];
+
+        for (label, ns_literal) in cases {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let src_id = Uuid::new_v4();
+            let tgt_id = Uuid::new_v4();
+            let ops = format!(
+                r#"link(source_id="{src_id}", target_id="{tgt_id}", relation="implements", namespace={ns_literal})"#
+            );
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops,
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("T6f case {label}: dispatch must not MCP-error: {e}"));
+
+            let result_val: serde_json::Value =
+                serde_json::from_str(&raw).expect("T6f: response must be valid JSON");
+            let first = result_val
+                .get("results")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("T6f case {label}: results array must be non-empty"));
+
+            assert_eq!(
+                first.get("ok").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "T6f case {label}: malformed namespace must fail closed; got {first:?}"
+            );
+            let err_text = first.get("error").map(|e| e.to_string().to_lowercase());
+            assert!(
+                err_text.as_deref().is_some_and(|e| e.contains("namespace")),
+                "T6f case {label}: error must name the namespace; got {first:?}"
+            );
+            assert!(
+                !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "T6f case {label}: coordinator.link must NOT be called for a malformed namespace"
+            );
+        }
+    }
+
     /// T6c: A single-backend server must NOT route through the coordinator.
     ///
     /// When the coordinator reports `is_single_backend() == true`, the zero-change
