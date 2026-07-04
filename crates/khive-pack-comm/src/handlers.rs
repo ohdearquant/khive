@@ -16,7 +16,8 @@ use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{
-    deser, InboxParams, IngestParams, ReadParams, ReplyParams, SendParams, ThreadParams,
+    deser, HeartbeatParams, InboxParams, IngestParams, ReadParams, ReplyParams, SendParams,
+    ThreadParams,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
@@ -873,6 +874,243 @@ pub(crate) async fn handle_ingest(
         "thread_id": thread_id,
         "external_id": p.external_id,
         "deduplicated": false,
+    }))
+}
+
+/// Deterministic UUID identifying the `channel_health` row for one
+/// `(namespace, channel_kind, channel_slug)` triple (khive #606).
+///
+/// Deterministic (not `Uuid::new_v4`) so `handle_heartbeat` can compute the
+/// same id on every poll tick and `upsert_note`'s `INSERT OR REPLACE` updates
+/// the same row instead of accumulating a new one per tick. Keying by slug in
+/// addition to kind is the point of #606's amendment 2: two accounts of the
+/// same kind (e.g. two mailboxes, both `kind() == "email"`) must not collapse
+/// into a single row.
+fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("khive:channel_health:{namespace}:{channel_kind}:{channel_slug}").as_bytes(),
+    )
+}
+
+/// `heartbeat` — persist one poll attempt's outcome into the channel's
+/// heartbeat row (khive #606). Subhandler — only the daemon's channel poll
+/// loop (`crates/khive-mcp/src/serve.rs::channel_poll_loop`) calls this.
+///
+/// Read-modify-write against the existing row (if any) so that:
+/// - `created_at` is preserved across updates (first-seen time), not reset
+///   every tick.
+/// - `last_error` is RETAINED across a subsequent success (spec-gate
+///   amendment 3): callers compare `last_error.at` against
+///   `last_success_at`/`last_failure_at` to tell a resolved issue from a live
+///   one, so a success must never clear it.
+/// - `consecutive_failures` resets to 0 on success and increments on failure,
+///   read from the prior row rather than any in-process counter, so it is
+///   correct even across a daemon restart.
+pub(crate) async fn handle_heartbeat(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    // Note: HeartbeatParams does not use deny_unknown_fields — mirrors
+    // IngestParams, since the poll loop passes `namespace` alongside these
+    // fields for VerbRegistry::dispatch to consume before the handler runs.
+    let p: HeartbeatParams = serde_json::from_value(params)
+        .map_err(|e| RuntimeError::InvalidInput(format!("heartbeat: bad params: {e}")))?;
+
+    if p.channel_kind.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `channel_kind` must not be empty".into(),
+        ));
+    }
+    if p.channel_slug.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `channel_slug` must not be empty".into(),
+        ));
+    }
+    let outcome = match p.outcome.as_str() {
+        s @ ("success" | "failure") => s,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "heartbeat: invalid `outcome` {other:?}; expected \"success\" or \"failure\""
+            )));
+        }
+    };
+    if outcome == "failure"
+        && p.error_class
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `error_class` is required when outcome is \"failure\"".into(),
+        ));
+    }
+
+    let ns = token.namespace().as_str();
+    let store = runtime.notes(token)?;
+    let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
+
+    let existing = store
+        .get_note(id)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
+
+    let now = Utc::now();
+    let at = p.at.clone().unwrap_or_else(|| now.to_rfc3339());
+
+    let mut props = existing
+        .as_ref()
+        .and_then(|n| n.properties.clone())
+        .unwrap_or_else(|| json!({}));
+
+    props["channel_kind"] = json!(p.channel_kind);
+    props["channel_slug"] = json!(p.channel_slug);
+    props["last_poll_attempt_at"] = json!(at);
+
+    match outcome {
+        "success" => {
+            props["last_success_at"] = json!(at);
+            props["consecutive_failures"] = json!(0);
+            // last_error is intentionally left untouched — spec-gate amendment 3.
+        }
+        "failure" => {
+            props["last_failure_at"] = json!(at);
+            let prev_failures = props
+                .get("consecutive_failures")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            props["consecutive_failures"] = json!(prev_failures + 1);
+            props["last_error"] = json!({
+                "class": p.error_class.clone().unwrap_or_default(),
+                "message": p.error_message.clone().unwrap_or_default(),
+                "at": at,
+            });
+        }
+        _ => unreachable!("outcome already validated above"),
+    }
+
+    khive_runtime::secret_gate::check_json(&props)?;
+
+    let content = format!("channel heartbeat: {}:{}", p.channel_kind, p.channel_slug);
+    khive_runtime::secret_gate::check(&content)?;
+
+    let created_at = existing
+        .as_ref()
+        .map(|n| n.created_at)
+        .unwrap_or_else(|| now.timestamp_micros());
+
+    let note = Note {
+        id,
+        namespace: ns.to_string(),
+        kind: "channel_health".to_string(),
+        status: "active".to_string(),
+        name: Some(format!("{}:{}", p.channel_kind, p.channel_slug)),
+        content,
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(props),
+        created_at,
+        updated_at: now.timestamp_micros(),
+        deleted_at: None,
+    };
+
+    store
+        .upsert_note(note)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("heartbeat: upsert_note: {e}")))?;
+
+    Ok(json!({
+        "ok": true,
+        "channel_kind": p.channel_kind,
+        "channel_slug": p.channel_slug,
+        "outcome": outcome,
+    }))
+}
+
+/// Project a persisted `channel_health` note into the `comm.health()` channel
+/// entry shape. Missing fields (a row written before a given property existed)
+/// default to `null`/`0` rather than panicking — forward-compatible with rows
+/// written by an older heartbeat writer.
+fn channel_health_to_json(note: &Note) -> Value {
+    let props = note.properties.clone().unwrap_or_else(|| json!({}));
+    json!({
+        "channel_kind": props.get("channel_kind").cloned().unwrap_or(Value::Null),
+        "channel_slug": props.get("channel_slug").cloned().unwrap_or(Value::Null),
+        "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
+        "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
+        "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
+        "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
+        "consecutive_failures": props.get("consecutive_failures").cloned().unwrap_or(json!(0)),
+    })
+}
+
+/// `health` — read-only per-channel health snapshot (khive #606).
+///
+/// Reads the daemon-persisted `channel_health` rows for the caller's
+/// namespace. Cross-process read is the point of this verb (spec-gate
+/// amendment 1): a client-role process (stdio MCP without `--daemon`) has no
+/// in-memory poll-loop state of its own, so it must read what the daemon
+/// already wrote. `role` answers "who owns the loops", not "whose memory
+/// answered": any persisted row means some daemon owns the channel loops, so
+/// `role` is reported as `"daemon"` with `source: "daemon-heartbeat"`
+/// regardless of whether THIS process is that daemon. `role: "client"` with
+/// an empty `channels` array is correct only when no daemon heartbeat state
+/// exists at all (fresh install, or a daemon that has never completed a poll
+/// tick) — the comm pack has no visibility into which channels are
+/// configured (that lives in `khive-mcp`/`khive-channel-email`), so an empty
+/// result is the only fact-based response available at this layer.
+///
+/// Never returns a computed `healthy: bool` (spec-gate amendment: "report
+/// timestamps only") — staleness/alerting judgment belongs to the caller.
+pub(crate) async fn handle_health(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let has_args = match params.as_object() {
+        Some(obj) => !obj.is_empty(),
+        None => !params.is_null(),
+    };
+    if has_args {
+        return Err(RuntimeError::InvalidInput(
+            "health: takes no arguments".into(),
+        ));
+    }
+
+    let store = runtime.notes(token)?;
+    const MAX_CHANNELS: u32 = 200;
+    let filter = NoteFilter {
+        kind: Some("channel_health".to_string()),
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered(
+            token.namespace().as_str(),
+            &filter,
+            PageRequest {
+                limit: MAX_CHANNELS,
+                offset: 0,
+            },
+        )
+        .await?;
+
+    let channels: Vec<Value> = page.items.iter().map(channel_health_to_json).collect();
+    let as_of = Utc::now().to_rfc3339();
+
+    let (role, source) = if channels.is_empty() {
+        ("client", None::<&str>)
+    } else {
+        ("daemon", Some("daemon-heartbeat"))
+    };
+
+    Ok(json!({
+        "role": role,
+        "source": source,
+        "as_of": as_of,
+        "channels": channels,
     }))
 }
 

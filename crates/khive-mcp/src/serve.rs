@@ -309,11 +309,20 @@ async fn channel_poll_loop(
         last_poll = Utc::now();
 
         for (kind, channel) in channels.iter() {
+            let slug = channel.slug();
             match channel.poll(since).await {
                 Ok(envelopes) => {
                     if let Some(backoff) = backoffs.get_mut(kind) {
                         backoff.record_success();
                     }
+                    record_channel_heartbeat(
+                        &registry,
+                        &ingest_namespace,
+                        kind,
+                        &slug,
+                        HeartbeatOutcome::Success,
+                    )
+                    .await;
                     for env in envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
@@ -339,6 +348,18 @@ async fn channel_poll_loop(
                     }
                 }
                 Err(e) => {
+                    let class = channel_error_class(&e);
+                    record_channel_heartbeat(
+                        &registry,
+                        &ingest_namespace,
+                        kind,
+                        &slug,
+                        HeartbeatOutcome::Failure {
+                            class,
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                     if is_backoff_eligible(&e) {
                         let backoff = backoffs.entry(kind.to_string()).or_default();
                         let tick = backoff.record_failure();
@@ -354,6 +375,72 @@ async fn channel_poll_loop(
                 }
             }
         }
+    }
+}
+
+/// One poll attempt's outcome, as reported to `comm.heartbeat` (#606).
+#[cfg(feature = "channel-email")]
+enum HeartbeatOutcome {
+    Success,
+    Failure {
+        class: &'static str,
+        message: String,
+    },
+}
+
+/// Map a [`khive_channel::ChannelError`] to the `comm.heartbeat` `error_class`
+/// open string enum (#606 spec-gate amendment 4: `auth | transport | config`
+/// in v1, callers must tolerate unknown classes). `Auth`/`Transport` are the
+/// connectivity classes `is_backoff_eligible` already distinguishes;
+/// `Config`/`UnauthorizedSender`/`InvalidEnvelope` are static/attribution
+/// failures, never produced by `poll`/`connect` in practice (see
+/// `is_backoff_eligible`'s doc comment), so they all map to `"config"`.
+#[cfg(feature = "channel-email")]
+fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
+    match err {
+        khive_channel::ChannelError::Auth(_) => "auth",
+        khive_channel::ChannelError::Transport(_) => "transport",
+        khive_channel::ChannelError::Config(_)
+        | khive_channel::ChannelError::UnauthorizedSender(_)
+        | khive_channel::ChannelError::InvalidEnvelope(_) => "config",
+    }
+}
+
+/// Persist one poll attempt's outcome via the `comm.heartbeat` subhandler
+/// (#606). Best-effort: a failed heartbeat write is logged and does not
+/// interrupt the poll loop — the heartbeat row is an observability surface,
+/// not a correctness dependency for message delivery.
+#[cfg(feature = "channel-email")]
+async fn record_channel_heartbeat(
+    registry: &khive_runtime::VerbRegistry,
+    namespace: &str,
+    channel_kind: &str,
+    channel_slug: &str,
+    outcome: HeartbeatOutcome,
+) {
+    use serde_json::json;
+
+    let params = match outcome {
+        HeartbeatOutcome::Success => json!({
+            "namespace": namespace,
+            "channel_kind": channel_kind,
+            "channel_slug": channel_slug,
+            "outcome": "success",
+        }),
+        HeartbeatOutcome::Failure { class, message } => json!({
+            "namespace": namespace,
+            "channel_kind": channel_kind,
+            "channel_slug": channel_slug,
+            "outcome": "failure",
+            "error_class": class,
+            "error_message": message,
+        }),
+    };
+    if let Err(e) = registry.dispatch("comm.heartbeat", params).await {
+        tracing::warn!(
+            channel = channel_kind,
+            "comm.heartbeat failed to persist poll outcome: {e}"
+        );
     }
 }
 
@@ -3306,6 +3393,100 @@ brain_profile = "project-profile"
             "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
              (no party-line risk even without actor)"
         );
+    }
+
+    // --- channel_error_class / record_channel_heartbeat (khive #606) ---
+
+    #[cfg(feature = "channel-email")]
+    mod channel_heartbeat_tests {
+        use super::*;
+        use khive_channel::ChannelError;
+        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+        #[test]
+        fn auth_maps_to_auth_class() {
+            assert_eq!(channel_error_class(&ChannelError::Auth("x".into())), "auth");
+        }
+
+        #[test]
+        fn transport_maps_to_transport_class() {
+            assert_eq!(
+                channel_error_class(&ChannelError::Transport("x".into())),
+                "transport"
+            );
+        }
+
+        #[test]
+        fn config_maps_to_config_class() {
+            assert_eq!(
+                channel_error_class(&ChannelError::Config("x".into())),
+                "config"
+            );
+        }
+
+        #[test]
+        fn unauthorized_sender_and_invalid_envelope_map_to_config_class() {
+            // Never produced by poll/connect in practice (see is_backoff_eligible's doc
+            // comment), but the mapping must still be total and defensible if it ever
+            // does surface from a future adapter.
+            assert_eq!(
+                channel_error_class(&ChannelError::UnauthorizedSender("x".into())),
+                "config"
+            );
+            assert_eq!(
+                channel_error_class(&ChannelError::InvalidEnvelope("x".into())),
+                "config"
+            );
+        }
+
+        /// `record_channel_heartbeat` must be best-effort: a heartbeat dispatch
+        /// failure (comm pack not loaded) must not panic the poll loop.
+        #[tokio::test]
+        async fn record_heartbeat_is_best_effort_when_comm_pack_absent() {
+            let registry = VerbRegistryBuilder::new()
+                .build()
+                .expect("empty registry builds");
+
+            // comm pack is not loaded, so "comm.heartbeat" is an unknown verb — this
+            // must return without panicking (the caller only logs a warning).
+            record_channel_heartbeat(
+                &registry,
+                "local",
+                "email",
+                "leo@khive.ai",
+                HeartbeatOutcome::Success,
+            )
+            .await;
+        }
+
+        /// End-to-end: a successful poll outcome persists via `comm.heartbeat` and
+        /// is readable via `comm.health` — the same wiring the live poll loop uses.
+        #[tokio::test]
+        async fn record_heartbeat_success_is_visible_via_comm_health() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            record_channel_heartbeat(
+                &registry,
+                "local",
+                "email",
+                "leo@khive.ai",
+                HeartbeatOutcome::Success,
+            )
+            .await;
+
+            let health = registry
+                .dispatch("comm.health", serde_json::json!({}))
+                .await
+                .expect("health succeeds");
+            let channels = health["channels"].as_array().expect("channels array");
+            assert_eq!(channels.len(), 1);
+            assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
+            assert_eq!(channels[0]["channel_slug"].as_str(), Some("leo@khive.ai"));
+        }
     }
 
     // --- note_already_delivered: outbox defensive-guard regression (round-2 finding 1) ---

@@ -301,6 +301,13 @@ impl Channel for EmailChannel {
         "email"
     }
 
+    /// khive #606: the mailbox address distinguishes multiple configured
+    /// email accounts (all `kind() == "email"`) so their channel health
+    /// rows never collapse into one.
+    fn slug(&self) -> String {
+        self.config.mailbox.clone()
+    }
+
     async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
         let from = strip_kind_prefix(&envelope.from, "email");
         let to = strip_kind_prefix(&envelope.to, "email");

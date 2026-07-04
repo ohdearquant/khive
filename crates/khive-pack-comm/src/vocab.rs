@@ -34,7 +34,7 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
         WHERE deleted_at IS NULL",
 ];
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -224,5 +224,67 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 6] = [
                 description: "Optional transport-layer metadata passthrough, merged additively into the stored note's properties (never overrides an already-set field). Generic and channel-agnostic; the email channel uses it for quarantine markers (quarantined, quarantine_reason, quarantine_claimed_from — ADR-056 Amendment 2026-07-02).",
             },
         ],
+    },
+    HandlerDef {
+        name: "comm.heartbeat",
+        description: "Persist a per-channel-credential heartbeat row after a poll attempt. \
+                       Subhandler — not callable on the MCP wire; only the daemon's channel \
+                       poll loop calls this (khive #606).",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: true,
+                description: "Target namespace for the heartbeat row.",
+            },
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: true,
+                description: "Channel kind identifier (e.g. `email`).",
+            },
+            ParamDef {
+                name: "channel_slug",
+                param_type: "string",
+                required: true,
+                description: "Stable per-credential identifier distinguishing accounts of the same kind (e.g. the mailbox address). Never `channel_kind` alone — two accounts of the same kind must not collapse into one row.",
+            },
+            ParamDef {
+                name: "outcome",
+                param_type: "string",
+                required: true,
+                description: "Poll outcome for this attempt: \"success\" or \"failure\".",
+            },
+            ParamDef {
+                name: "error_class",
+                param_type: "string",
+                required: false,
+                description: "Error class, required when outcome is \"failure\". Open string enum; v1 values: auth | transport | config. Callers must tolerate unknown classes.",
+            },
+            ParamDef {
+                name: "error_message",
+                param_type: "string",
+                required: false,
+                description: "Human-readable error detail when outcome is \"failure\". Must carry a message class, never raw secrets or wire headers.",
+            },
+            ParamDef {
+                name: "at",
+                param_type: "string",
+                required: false,
+                description: "RFC 3339 timestamp of this poll attempt. Defaults to now.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.health",
+        description: "Read-only per-channel health snapshot (khive #606). Returns the \
+                       daemon-persisted heartbeat row for every known channel: timestamps \
+                       and consecutive-failure counts only — never a computed healthy bool. \
+                       Health judgment belongs to the caller.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[],
     },
 ];

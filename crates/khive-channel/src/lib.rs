@@ -179,6 +179,20 @@ pub trait Channel: Send + Sync + 'static {
     /// Short stable identifier for this transport (e.g. `"email"`, `"telegram"`).
     fn kind(&self) -> &'static str;
 
+    /// Stable per-credential identifier distinguishing multiple configured
+    /// accounts of the same `kind` (e.g. two mailboxes both polled via the
+    /// `"email"` channel). khive #606: channel health rows are keyed by
+    /// `(kind, slug)`, never `kind` alone, so two accounts of the same kind
+    /// never collapse into a single heartbeat row.
+    ///
+    /// The default implementation returns `kind()` — correct for any
+    /// transport that only ever has a single configured credential per
+    /// process. Adapters that can have distinct per-credential identity
+    /// (e.g. email's mailbox address) should override this.
+    fn slug(&self) -> String {
+        self.kind().to_string()
+    }
+
     /// Return `true` when this adapter has sufficient configuration to operate.
     ///
     /// The default implementation returns `true`; adapters with optional config
