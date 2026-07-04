@@ -795,8 +795,34 @@ mod tests {
     #[test]
     #[serial]
     fn multi_backend_boot_paths_share_identical_non_default_output_format() {
-        let prev_env = std::env::var("KHIVE_OUTPUT_FORMAT").ok();
-        std::env::remove_var("KHIVE_OUTPUT_FORMAT");
+        // RAII guard: snapshots KHIVE_OUTPUT_FORMAT, clears it, and restores the
+        // original value (or leaves it removed) on drop — including on panic, so
+        // a failing assertion or an unexpected constructor error never leaks the
+        // cleared env var to later #[serial] tests. Mirrors `EmailEnvGuard` in
+        // `khive-mcp/src/serve.rs` (round 2 of the #603 codex review, PR #613:
+        // the prior manual save/clear/restore only ran on the success path).
+        struct OutputFormatEnvGuard {
+            prev: Option<String>,
+        }
+
+        impl OutputFormatEnvGuard {
+            fn clear() -> Self {
+                let prev = std::env::var("KHIVE_OUTPUT_FORMAT").ok();
+                std::env::remove_var("KHIVE_OUTPUT_FORMAT");
+                Self { prev }
+            }
+        }
+
+        impl Drop for OutputFormatEnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var("KHIVE_OUTPUT_FORMAT", v),
+                    None => std::env::remove_var("KHIVE_OUTPUT_FORMAT"),
+                }
+            }
+        }
+
+        let _env_guard = OutputFormatEnvGuard::clear();
 
         let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
         khive_cfg.runtime.default_output_format = Some(khive_runtime::OutputFormat::Table);
@@ -818,11 +844,6 @@ mod tests {
         let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
         let coordinator_surface = khive_mcp::serve::WiringSurface::capture(&coordinator_server);
 
-        match prev_env {
-            Some(v) => std::env::set_var("KHIVE_OUTPUT_FORMAT", v),
-            None => std::env::remove_var("KHIVE_OUTPUT_FORMAT"),
-        }
-
         assert_eq!(
             plain_surface, coordinator_surface,
             "the plain multi-backend boot path and kkernel's coordinator-attached \
@@ -835,5 +856,8 @@ mod tests {
              (Table), not silently fall back to the builtin Json default — this is the exact \
              ADR-078 regression class the parity test exists to catch"
         );
+
+        // `_env_guard` is dropped here (or on unwind, whichever comes first),
+        // restoring KHIVE_OUTPUT_FORMAT regardless of assertion outcome.
     }
 }
