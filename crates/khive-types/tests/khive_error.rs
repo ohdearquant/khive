@@ -3,7 +3,9 @@
 //! Covers: Display, Error trait, serde wire shape stability, RetryHint,
 //! Details, and the ErrorCode domain-scoped code model.
 
-use khive_types::khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
+use khive_types::khive_error::{
+    Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint, DETAILS_TRUNCATED_KEY,
+};
 
 // ---- ErrorKind Display ----
 
@@ -307,5 +309,100 @@ mod serde_tests {
             Some(2),
             "9 supplied pairs - 7 retained = 2 dropped, must be observable"
         );
+    }
+
+    /// PR #549 round-2 Medium finding: a client-supplied `details_truncated`
+    /// pair must never be retained as an ordinary entry, even when the total
+    /// pair count is within the 8-entry bound. Retaining it verbatim let a
+    /// client-controlled value flow straight into `dropped_count()` via
+    /// first-match `get()` and falsely report truncation that never
+    /// happened. The fix reserves the key unconditionally: the colliding
+    /// pair is dropped and counted, never stored and never trusted as-is.
+    #[test]
+    fn details_client_collision_within_bound_is_dropped_not_trusted() {
+        let details = Details::new([("a", "1"), (DETAILS_TRUNCATED_KEY, "not_a_real_count")]);
+        // The collision is stripped, not stored verbatim — the client's
+        // bogus value never appears as the indicator's value.
+        assert_eq!(details.get(DETAILS_TRUNCATED_KEY), Some("1"));
+        assert_eq!(details.get("a"), Some("1"));
+        // Exactly one pair was dropped (the collision) — a true report,
+        // not a spoofed one derived from the client's supplied value.
+        assert_eq!(details.dropped_count(), Some(1));
+        assert_eq!(details.iter().count(), 2);
+    }
+
+    /// Companion to the above: a `details_truncated` collision supplied
+    /// alongside more than 8 ordinary pairs must not shadow the real
+    /// indicator (first-match `get()` previously could return the client's
+    /// pair instead of ours) and must not serialize as a duplicate JSON key.
+    #[test]
+    fn details_client_collision_with_overflow_not_shadowed_no_duplicate_keys() {
+        let details = Details::new([
+            ("k0", "v0"),
+            ("k1", "v1"),
+            ("k2", "v2"),
+            ("k3", "v3"),
+            ("k4", "v4"),
+            ("k5", "v5"),
+            ("k6", "v6"),
+            (DETAILS_TRUNCATED_KEY, "not_a_real_count"),
+            ("k7", "v7"),
+        ]);
+        // 8 ordinary pairs (k0..k7) + 1 reserved-key collision supplied by
+        // the client = 2 dropped: k7 (past the 7-pair keep bound) and the
+        // collision itself.
+        assert_eq!(details.dropped_count(), Some(2));
+        assert_eq!(details.iter().count(), 8);
+        for i in 0..7 {
+            let key = format!("k{i}");
+            assert_eq!(details.get(&key), Some(format!("v{i}").as_str()));
+        }
+        assert_eq!(details.get("k7"), None, "8th ordinary pair must be dropped");
+
+        let serialized = serde_json::to_value(&details).unwrap();
+        let obj = serialized.as_object().unwrap();
+        assert_eq!(
+            obj.keys()
+                .filter(|k| k.as_str() == DETAILS_TRUNCATED_KEY)
+                .count(),
+            1,
+            "must serialize exactly one details_truncated key, never a duplicate"
+        );
+        assert_eq!(
+            obj.get(DETAILS_TRUNCATED_KEY).and_then(|v| v.as_str()),
+            Some("2")
+        );
+    }
+
+    /// Serde round-trip of a truncated `Details`: serializing our own
+    /// truncation output and reading it back must restore the same drop
+    /// count via the internal flag, not silently lose it because the
+    /// reserved key on the wire looks like a fresh client collision.
+    #[test]
+    fn details_truncated_serde_roundtrip_restores_dropped_count() {
+        let details = Details::new([
+            ("k0", "v0"),
+            ("k1", "v1"),
+            ("k2", "v2"),
+            ("k3", "v3"),
+            ("k4", "v4"),
+            ("k5", "v5"),
+            ("k6", "v6"),
+            ("k7", "v7"),
+            ("k8", "v8"),
+        ]);
+        assert_eq!(details.dropped_count(), Some(2));
+
+        let serialized = serde_json::to_string(&details).unwrap();
+        let roundtripped: Details = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            roundtripped.dropped_count(),
+            Some(2),
+            "truncation state must survive a serialize/deserialize round trip"
+        );
+        for i in 0..7 {
+            let key = format!("k{i}");
+            assert_eq!(roundtripped.get(&key), Some(format!("v{i}").as_str()));
+        }
     }
 }

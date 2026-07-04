@@ -5,7 +5,7 @@
 The runtime protocol defines how verb dispatches are routed from the MCP `request` surface
 through the `VerbRegistry` to individual pack handlers, and how security, auditing, and
 namespace attribution are enforced at each step (ADR-007 Rev 6: namespace is gate-policy
-input, not a storage isolation boundary).
+input, not a storage access boundary).
 
 ## ADR Links
 

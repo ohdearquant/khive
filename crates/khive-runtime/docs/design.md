@@ -60,7 +60,7 @@
 - `merge_entity` enforces same-kind constraint at the runtime layer, not storage
 - Merge is a same-namespace curation constraint: only records in the caller namespace can be
   merged (this is the one by-ID operation with a namespace check — see ADR-007 below; it is
-  not general namespace isolation)
+  not a general by-ID access rule)
 - Symmetric relations are canonicalized (source_uuid < target_uuid) before merge conflict checks
 - Soft-delete preserves existing edges; queries filter by `deleted_at IS NULL`
 - Entity tombstone records preserve provenance for audit

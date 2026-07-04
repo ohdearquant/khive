@@ -199,11 +199,23 @@ pub const DETAILS_TRUNCATED_KEY: &str = "details_truncated";
 /// When the source supplies more than 8 pairs, the wire shape stays bounded
 /// at 8 entries, but the truncation is observable: the first 7 pairs are
 /// retained and the 8th slot becomes [`DETAILS_TRUNCATED_KEY`] mapped to the
-/// dropped-pair count. Callers that need the drop count without guessing the
-/// reserved key can use [`Details::dropped_count`].
+/// dropped-pair count. [`DETAILS_TRUNCATED_KEY`] is a *reserved* key: a
+/// client-supplied pair using that name is never retained as an ordinary
+/// entry (PR #549 round-2 review) — it is stripped and folded into the
+/// drop count instead, so a client can neither fake truncation on a small
+/// map nor shadow the real indicator on an oversized one. The drop count
+/// itself is tracked in an internal, non-serialized field
+/// ([`Details::dropped_count`]) rather than parsed back out of the entry
+/// list, so a same-shaped client map can't spoof it either.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Details {
     entries: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    /// Internal truncation flag — `Some(dropped_count)` when this instance
+    /// was built by dropping pairs (8-entry overflow and/or a reserved-key
+    /// collision), `None` otherwise. Not serialized directly; the wire
+    /// shape communicates truncation via the [`DETAILS_TRUNCATED_KEY`]
+    /// entry, this field is the trusted, non-spoofable read side.
+    dropped: Option<usize>,
 }
 
 impl Details {
@@ -212,7 +224,10 @@ impl Details {
     /// Up to 8 pairs are kept as-is. When more than 8 are supplied, the first
     /// 7 client pairs are kept and the 8th slot is replaced with
     /// [`DETAILS_TRUNCATED_KEY`] carrying the dropped-pair count, so the
-    /// truncation is observable rather than silent.
+    /// truncation is observable rather than silent. A client-supplied pair
+    /// named [`DETAILS_TRUNCATED_KEY`] is always treated as reserved: it is
+    /// dropped (never stored as an ordinary entry) and counted, even when
+    /// the remaining pairs fit within the 8-entry bound.
     pub fn new<I>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (&'static str, &'static str)>,
@@ -224,25 +239,57 @@ impl Details {
         )
     }
 
-    /// Shared bounding/truncation logic for both the constructor and the
-    /// deserializer: keep the first 8 pairs verbatim, or — when more than 8
-    /// are supplied — keep the first 7 and append a `details_truncated`
-    /// indicator carrying the dropped-pair count.
+    /// Shared bounding/truncation logic for the constructor: partition the
+    /// source into ordinary pairs and reserved-key collisions, then hand
+    /// off to [`Details::build`] for the bound + indicator logic.
     fn from_owned<I>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (Cow<'static, str>, Cow<'static, str>)>,
     {
-        let all: alloc::vec::Vec<_> = pairs.into_iter().collect();
-        if all.len() <= 8 {
-            return Self { entries: all };
+        let mut ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
+            alloc::vec::Vec::new();
+        let mut total_ordinary: usize = 0;
+        let mut collisions: usize = 0;
+        for (k, v) in pairs {
+            if k.as_ref() == DETAILS_TRUNCATED_KEY {
+                collisions += 1;
+            } else {
+                total_ordinary += 1;
+                if ordinary.len() < 8 {
+                    ordinary.push((k, v));
+                }
+            }
         }
-        let dropped = all.len() - 7;
-        let mut entries: alloc::vec::Vec<_> = all.into_iter().take(7).collect();
+        Self::build(ordinary, total_ordinary, collisions)
+    }
+
+    /// Bound `ordinary` (already capped at 8 entries, `total_ordinary` the
+    /// true count before capping) plus a reserved-key `collisions` count to
+    /// the wire shape: at most 8 entries, with a [`DETAILS_TRUNCATED_KEY`]
+    /// indicator appended whenever anything was dropped (either overflow
+    /// past 7 ordinary pairs, or a stripped reserved-key collision).
+    fn build(
+        ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)>,
+        total_ordinary: usize,
+        collisions: usize,
+    ) -> Self {
+        if total_ordinary <= 8 && collisions == 0 {
+            return Self {
+                entries: ordinary,
+                dropped: None,
+            };
+        }
+        let keep = total_ordinary.min(7);
+        let dropped = (total_ordinary - keep) + collisions;
+        let mut entries: alloc::vec::Vec<_> = ordinary.into_iter().take(keep).collect();
         entries.push((
             Cow::Borrowed(DETAILS_TRUNCATED_KEY),
             Cow::Owned(alloc::format!("{dropped}")),
         ));
-        Self { entries }
+        Self {
+            entries,
+            dropped: Some(dropped),
+        }
     }
 
     /// Look up a value by key.
@@ -258,13 +305,16 @@ impl Details {
         self.entries.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
     }
 
-    /// Number of pairs dropped due to the 8-entry bound, if any were.
+    /// Number of pairs dropped due to the 8-entry bound and/or a
+    /// reserved-key collision, if any were.
     ///
-    /// Returns `None` when the source supplied 8 or fewer pairs (no
-    /// truncation occurred). Returns `Some(dropped_count)` when truncation
-    /// occurred, parsed from the [`DETAILS_TRUNCATED_KEY`] indicator entry.
+    /// Returns `None` when nothing was dropped. Returns
+    /// `Some(dropped_count)` otherwise, read from the internal truncation
+    /// flag set at construction/deserialization time — never re-parsed from
+    /// the entry list, so a client-supplied `details_truncated` pair can't
+    /// spoof this value.
     pub fn dropped_count(&self) -> Option<usize> {
-        self.get(DETAILS_TRUNCATED_KEY)?.parse().ok()
+        self.dropped
     }
 }
 
@@ -298,29 +348,59 @@ impl<'de> Deserialize<'de> for Details {
                 // Drain to completion regardless of size (#487: a naive early-exit
                 // once 8 entries are collected leaves trailing map bytes unconsumed
                 // and corrupts the surrounding deserializer). Only the first 8
-                // pairs are retained in memory as they arrive; entries beyond that
-                // are counted, not stored, so an adversarially large map can't
-                // inflate memory. Bounding + the observable-truncation indicator
-                // (RUNTIME-AUD-002 / #487 follow-up) are applied afterward via the
-                // same logic `Details::new` uses.
-                let mut entries: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
+                // ordinary pairs are retained in memory as they arrive; pairs
+                // beyond that are counted, not stored, so an adversarially
+                // large map can't inflate memory.
+                //
+                // `DETAILS_TRUNCATED_KEY` is reserved (PR #549 round-2 review):
+                // it is never stored as an ordinary entry. Instead we track
+                // whether the wire map looks exactly like our own truncated
+                // serialization — the reserved key appears exactly once, as
+                // the very last pair, immediately after exactly 7 ordinary
+                // pairs, with a value that parses as a count — and if so,
+                // restore that as the trusted drop count (round-trip of a
+                // `Details` we truncated ourselves). Any other occurrence
+                // (wrong position, duplicated, or paired with an ordinary
+                // count that isn't 7) is treated as a client-supplied
+                // collision: stripped and folded into `Details::build`'s
+                // drop accounting like any other reserved-key collision.
+                let mut ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
                     alloc::vec::Vec::new();
-                let mut total: usize = 0;
+                let mut total_ordinary: usize = 0;
+                let mut reserved_count: usize = 0;
+                let mut reserved_is_trailing = false;
+                let mut reserved_follows_seven = false;
+                let mut last_reserved_value: Option<String> = None;
                 while let Some((k, v)) = map.next_entry::<String, String>()? {
-                    total += 1;
-                    if entries.len() < 8 {
-                        entries.push((Cow::Owned(k), Cow::Owned(v)));
+                    if k == DETAILS_TRUNCATED_KEY {
+                        reserved_count += 1;
+                        reserved_is_trailing = true;
+                        reserved_follows_seven = total_ordinary == 7;
+                        last_reserved_value = Some(v);
+                    } else {
+                        reserved_is_trailing = false;
+                        total_ordinary += 1;
+                        if ordinary.len() < 8 {
+                            ordinary.push((Cow::Owned(k), Cow::Owned(v)));
+                        }
                     }
                 }
-                if total > 8 {
-                    let dropped = total - 7;
-                    entries.truncate(7);
-                    entries.push((
-                        Cow::Borrowed(DETAILS_TRUNCATED_KEY),
-                        Cow::Owned(alloc::format!("{dropped}")),
-                    ));
+                if reserved_count == 1 && reserved_is_trailing && reserved_follows_seven {
+                    if let Some(dropped) =
+                        last_reserved_value.as_deref().and_then(|s| s.parse().ok())
+                    {
+                        let mut entries = ordinary;
+                        entries.push((
+                            Cow::Borrowed(DETAILS_TRUNCATED_KEY),
+                            Cow::Owned(alloc::format!("{dropped}")),
+                        ));
+                        return Ok(Details {
+                            entries,
+                            dropped: Some(dropped),
+                        });
+                    }
                 }
-                Ok(Details { entries })
+                Ok(Details::build(ordinary, total_ordinary, reserved_count))
             }
         }
 
