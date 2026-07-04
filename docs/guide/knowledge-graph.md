@@ -1,6 +1,6 @@
 # Knowledge Graph Modeling
 
-This guide covers how to think about modeling in khive — when to use each entity
+This guide covers how to think about modeling in khive: when to use each entity
 kind, which edge relation fits, when something belongs as a note versus an
 entity, and common modeling patterns for research work.
 
@@ -21,7 +21,7 @@ it is a note.
 
 ## Entity kinds
 
-khive has 9 entity kinds. This is a closed set — you cannot add new kinds
+khive has 9 entity kinds. This is a closed set: you cannot add new kinds
 without an ADR.
 
 ### concept
@@ -135,9 +135,15 @@ khive has 5 base note kinds (also a closed set):
 
 `observation` is the default if you omit `note_kind`.
 
-Packs add their own note kinds: `task` (GTD pack), `memory` (Memory pack),
-`message` (Comm pack), `scheduled_event` (Schedule pack). These are created
-through their respective pack verbs, not through `create(kind="note")`.
+Packs add their own note kinds too: `task` (GTD pack), `memory` (Memory pack),
+`message` (Comm pack), `scheduled_event` (Schedule pack), and `session`
+(Session pack). The generic `create(kind="note", note_kind="...")` path accepts
+all of these directly (verified against a scratch DB: `note_kind="task"`,
+`"memory"`, `"message"`, `"scheduled_event"`, and `"session"` all succeed;
+`task` additionally requires a `title` field). Prefer the pack-specific verbs
+(`gtd.assign`, `memory.remember`, `comm.send`, `schedule.remind`,
+`session.store`) when you need their defaults, validation, or side effects.
+Use the generic path only when you need a raw note write without those extras.
 
 ## Edge relations
 
@@ -145,7 +151,7 @@ khive has 17 edge relations (15 base + 2 epistemic via ADR-055). This is a close
 
 ### When to use each relation
 
-**Structure** — parent/child and classification:
+**Structure**: parent/child and classification
 
 | Relation      | Direction           | When to use                                            |
 | ------------- | ------------------- | ------------------------------------------------------ |
@@ -153,7 +159,7 @@ khive has 17 edge relations (15 base + 2 epistemic via ADR-055). This is a close
 | `part_of`     | child to parent     | Inverse of contains. A module is part of a system.     |
 | `instance_of` | specific to general | GQA is an instance of multi-query attention.           |
 
-**Derivation** — how ideas build on each other:
+**Derivation**: how ideas build on each other
 
 | Relation        | Direction           | When to use                                   |
 | --------------- | ------------------- | --------------------------------------------- |
@@ -162,45 +168,45 @@ khive has 17 edge relations (15 base + 2 epistemic via ADR-055). This is a close
 | `introduced_by` | concept to source   | LoRA was introduced by the LoRA paper.        |
 | `supersedes`    | new to old          | FlashAttention-3 supersedes FlashAttention-2. |
 
-**Provenance** — where things come from:
+**Provenance**: where things come from
 
 | Relation       | Direction       | When to use                                |
 | -------------- | --------------- | ------------------------------------------ |
 | `derived_from` | output to input | A model checkpoint derived from a dataset. |
 
-**Temporal** — ordering:
+**Temporal**: ordering
 
 | Relation   | Direction        | When to use                           |
 | ---------- | ---------------- | ------------------------------------- |
 | `precedes` | earlier to later | Paper A was published before Paper B. |
 
-**Dependency** — runtime/build relationships:
+**Dependency**: runtime/build relationships
 
 | Relation     | Direction               | When to use                                       |
 | ------------ | ----------------------- | ------------------------------------------------- |
 | `depends_on` | consumer to dependency  | Project A depends on Project B at runtime.        |
 | `enables`    | prerequisite to outcome | BPE tokenization enables subword-level attention. |
 
-**Implementation** — code realizes concept:
+**Implementation**: code realizes concept
 
 | Relation     | Direction       | When to use                                  |
 | ------------ | --------------- | -------------------------------------------- |
 | `implements` | code to concept | lattice-inference implements FlashAttention. |
 
-**Lateral** — peer relationships:
+**Lateral**: peer relationships
 
 | Relation        | Direction        | When to use                                          |
 | --------------- | ---------------- | ---------------------------------------------------- |
 | `competes_with` | either direction | LoRA competes with full fine-tuning.                 |
 | `composed_with` | either direction | FlashAttention composed with GQA in a serving stack. |
 
-**Annotation** — notes observing entities:
+**Annotation**: notes observing entities
 
 | Relation    | Direction        | When to use                                                 |
 | ----------- | ---------------- | ----------------------------------------------------------- |
 | `annotates` | note to anything | An observation about a concept, a decision about a project. |
 
-**Epistemic** — evidence relationships (added by ADR-055):
+**Epistemic**: evidence relationships (added by ADR-055)
 
 | Relation   | Direction         | When to use                                         |
 | ---------- | ----------------- | --------------------------------------------------- |
@@ -221,12 +227,12 @@ for each relation. Key rules:
 - `supersedes`, `supports`, and `refutes` are same-substrate only: entity to
   entity, or note to note.
 - All other 13 relations require entity-to-entity endpoints.
-- `competes_with` and `composed_with` are symmetric — the system canonicalizes
+- `competes_with` and `composed_with` are symmetric: the system canonicalizes
   direction internally.
 
 Packs can add endpoint pairs through the `EDGE_RULES` mechanism (ADR-017). The
 KG pack adds person-to-org and org-to-org pairs. The GTD pack allows task-to-task
-`depends_on` edges. These are additive — packs cannot tighten the base contract.
+`depends_on` edges. These are additive; packs cannot tighten the base contract.
 
 ### Why a closed ontology
 
@@ -325,13 +331,13 @@ Sparse graphs are useless for traversal. Target minimums:
 | project             | 3         | `implements` (concepts), `depends_on` (deps), `contains`/`part_of` (structure)               |
 | person              | 1         | `introduced_by` edges from their work                                                        |
 
-Overall target: 5+ edges per entity average. Check with `stats()` — if
+Overall target: 5+ edges per entity average. Check with `stats()`; if
 `total_edges / total_entities` is below 4, the graph needs polish.
 
 ## See also
 
-- [Prompt Cookbook](prompt-cookbook.md) — concrete verb patterns for all the
+- [Prompt Cookbook](prompt-cookbook.md): concrete verb patterns for all the
   operations described here
-- [Search and Retrieval](search.md) — how to find things in the graph
-- [AGENTS.md](../../AGENTS.md) — the full agent reference with GQL/SPARQL
+- [Search and Retrieval](search.md): how to find things in the graph
+- [AGENTS.md](../../AGENTS.md): the full agent reference with GQL/SPARQL
   examples

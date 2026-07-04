@@ -1,6 +1,6 @@
-# Demo: research ingest — entities, edges, search, traverse
+# Demo: research ingest, entities, edges, search, traverse
 
-This is the transcript behind the README's ["Why typed edges, not just vector similarity"](../README.md#why-typed-edges-not-just-vector-similarity) section. It was run
+This is the transcript behind the README's ["What typed edges add beyond vector similarity"](../README.md#what-typed-edges-add-beyond-vector-similarity) section. It was run
 against a scratch database (`KHIVE_DB=/tmp/khive-demo-research.db`), never the production
 `khive.db`. Output is captured verbatim from `kkernel` 0.3.0.
 
@@ -44,8 +44,8 @@ kkernel exec 'create(kind="entity", entity_kind="concept", name="FlashAttention"
 }
 ```
 
-Note: object literals in the DSL need quoted keys — `properties={"domain": "attention"}`, not
-`properties={domain: "attention"}`. The latter fails to parse.
+Note: object literals in the DSL need quoted keys: `properties={"domain": "attention"}` parses,
+`properties={domain: "attention"}` does not.
 
 ## 2. Create a document entity (the paper that introduced it)
 
@@ -219,9 +219,9 @@ kkernel exec 'search(kind="entity", query="memory efficient attention")'
 ```
 
 Search returns a ranked list of all three entities by relevance. It has no notion of which
-entity came first or how they're related — that's what the graph is for.
+entity came first or how they're related; that's what the graph is for.
 
-## 6. Traverse the graph — this is what search cannot do
+## 6. Traverse the graph to see what search cannot show
 
 ```bash
 kkernel exec "traverse(roots=[\"$FLASH\"], max_depth=2, include_roots=true)"

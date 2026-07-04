@@ -31,7 +31,7 @@ npm install -g @khive-ai/cli
 ```
 
 The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`. The npm
-release can lag the crates.io release — run `khive --version` after install and compare against
+release can lag the crates.io release, so run `khive --version` after install and compare against
 [crates.io/crates/khive-mcp](https://crates.io/crates/khive-mcp) if you need the latest verbs
 documented here.
 
@@ -39,9 +39,9 @@ documented here.
 
 ```bash
 git clone https://github.com/ohdearquant/khive
-cd khive
-cargo build --workspace --release
-# Binary at crates/target/release/kkernel
+cd khive/crates
+cargo build --release -p kkernel
+# Binary at target/release/kkernel (relative to crates/)
 ```
 
 ## Connect to your MCP client
@@ -77,7 +77,7 @@ Add to `claude_desktop_config.json`:
 ```
 
 khive auto-spawns a background daemon on first request to keep the ANN index and
-embedding model warm. You do not need to manage this — it starts automatically
+embedding model warm. You do not need to manage this: it starts automatically
 and cleans up on exit.
 
 ## The single-tool interface
@@ -152,7 +152,7 @@ request(ops="neighbors(node_id=\"<flash_id>\", direction=\"both\")")
 
 ### 6. Create a note
 
-Notes are temporal observations about your work — what you noticed, concluded,
+Notes are temporal observations about your work: what you noticed, concluded,
 or decided. They can annotate entities:
 
 ```
@@ -188,8 +188,8 @@ Both compile to the same SQL backend.
 
 ## What to read next
 
-- [Knowledge Graph Modeling](knowledge-graph.md) — how to think about entity
+- [Knowledge Graph Modeling](knowledge-graph.md): how to think about entity
   kinds, edge relations, and modeling decisions
-- [Prompt Cookbook](prompt-cookbook.md) — 20+ ready-to-use verb patterns
-- [Search and Retrieval](search.md) — how hybrid search, reranking, and
+- [Prompt Cookbook](prompt-cookbook.md): 20+ ready-to-use verb patterns
+- [Search and Retrieval](search.md): how hybrid search, reranking, and
   decompose work

@@ -42,7 +42,7 @@ kkernel exec 'gtd.assign(title="Benchmark FlashAttention-3 on H100", priority="p
 }
 ```
 
-Tasks are notes with `kind="task"` — the GTD pack adds a status lifecycle
+Tasks are notes with `kind="task"`. The GTD pack adds a status lifecycle
 (`inbox` → `next` → `active` → `done`/`cancelled`) on top of the same note substrate everything
 else in khive uses.
 
@@ -109,7 +109,7 @@ kkernel exec 'gtd.next(limit=5)'
 }
 ```
 
-`gtd.next` lists tasks with `status` in `[next, active]`, sorted by priority — this is the "what
+`gtd.next` lists tasks with `status` in `[next, active]`, sorted by priority. This is the "what
 should I do now" query.
 
 ## 4. Recall the memory
@@ -144,7 +144,7 @@ kkernel exec 'memory.recall(query="hybrid search scoring", limit=5)'
 ```
 
 Recall ranking combines the query-relevance score with the memory's stored salience and its
-decay factor — a highly salient memory outranks a marginally more relevant but low-salience one.
+decay factor, so a highly salient memory outranks a marginally more relevant but low-salience one.
 
 ## 5. Check graph health
 
@@ -159,9 +159,9 @@ kkernel exec 'stats()'
 }
 ```
 
-Two notes: the task and the memory. No entities or edges in this database — this demo doesn't
-touch the KG substrate at all, which is the point: GTD and memory work standalone if that's all
-an agent needs.
+Two notes: the task and the memory. No entities or edges in this database, because this demo
+doesn't touch the KG substrate at all. That's the point: GTD and memory work standalone if
+that's all an agent needs.
 
 ## See also
 

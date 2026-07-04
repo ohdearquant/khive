@@ -17,8 +17,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
@@ -55,8 +53,8 @@ jobs:
 
           # khive
 
-          A research knowledge graph runtime. Typed substrates, closed taxonomies, and a
-          verb-consolidated MCP surface — built for agents that need structure, not just vectors.
+          A research knowledge graph runtime for agents that need structure: typed substrates,
+          closed taxonomies, and a verb-consolidated MCP surface.
 
           Vector search finds similar text. A knowledge graph finds structure: lineages,
           dependencies, contradictions, gaps. khive gives an agent a typed, queryable graph that
@@ -68,20 +66,20 @@ jobs:
 
           ## Documentation
 
-          - [Getting Started](getting-started.html) — install, connect, first session
-          - [Knowledge Graph Modeling](knowledge-graph.html) — entity kinds, edge relations, modeling patterns
-          - [Prompt Cookbook](prompt-cookbook.html) — ready-to-use verb patterns
-          - [Search and Retrieval](search.html) — FTS, vector, hybrid fusion, reranking
-          - [Memory and Recall](memory.html) — episodic vs semantic, salience, decay
-          - [GTD Task Management](tasks.html) — task lifecycle, priorities, dependencies
+          - [Getting Started](getting-started.html): install, connect, first session
+          - [Knowledge Graph Modeling](knowledge-graph.html): entity kinds, edge relations, modeling patterns
+          - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns
+          - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking
+          - [Memory and Recall](memory.html): episodic vs semantic, salience, decay
+          - [GTD Task Management](tasks.html): task lifecycle, priorities, dependencies
 
           ## Demos
 
           Runnable transcripts, captured against a scratch database, in the repo's
           [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
 
-          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md) — create entities, link them, search, and traverse the graph
-          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md) — task lifecycle and salience-weighted memory recall
+          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md): create entities, link them, search, and traverse the graph
+          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md): task lifecycle and salience-weighted memory recall
 
           ## Install
 
@@ -94,8 +92,8 @@ jobs:
 
           ## Reference
 
-          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md) — full verb reference for agents using khive
-          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr) — the design contract
+          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md): full verb reference for agents using khive
+          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
           EOF
 
           for f in docs/guide/*.md; do
@@ -139,6 +137,9 @@ jobs:
           path: _site
 
   deploy:
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
