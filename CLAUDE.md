@@ -1,7 +1,7 @@
 # khive — Developer Guide
 
 **What this is**: A research knowledge graph runtime. Typed entities, closed edge ontology,
-hybrid search, GQL/SPARQL queries — all in a single 7.7MB Rust binary over MCP stdio.
+hybrid search, GQL/SPARQL queries — all in a single 18MB Rust binary over MCP stdio.
 
 **v0.3.0** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
 
