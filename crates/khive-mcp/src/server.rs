@@ -23,9 +23,9 @@ use serde_json::{json, Value};
 use khive_db::ConnectionPool;
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, render_format, KhiveRuntime, Namespace, OutputFormat, PackLoadError, PackRegistry,
-    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
-    VerbRegistryBuilder,
+    present, render_format, resolve_explicit_namespace, KhiveRuntime, OutputFormat, PackLoadError,
+    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
+    VerbRegistry, VerbRegistryBuilder,
 };
 
 use khive_storage::EdgeRelation;
@@ -897,15 +897,44 @@ impl KhiveMcpServer {
 /// function so closures that don't have access to `&self` can call it.
 ///
 /// Returns `Some(Ok(Value))` when the coordinator handled the op successfully.
-/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error.
+/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error,
+/// including when a caller-supplied `namespace` argument fails fail-closed
+/// validation (see below).
 /// Returns `None` to indicate fall-through (caller should dispatch through the registry).
+///
+/// RUNTIME-AUD-002 (#433, PR #549 blocker): this coordinator intercept runs
+/// *before* `VerbRegistry::dispatch`, so it must apply the exact same
+/// fail-closed namespace rule `dispatch` applies — a present-but-non-string
+/// `namespace` (null/number/bool/array/object) must be rejected, never
+/// silently substituted with the server default. Both call sites route
+/// through `resolve_explicit_namespace` (the same chokepoint `dispatch` uses)
+/// so this can't drift out of sync again.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
     tool: &str,
     args_value: &Value,
-    namespace_str: &str,
+    default_namespace_str: &str,
 ) -> Option<Result<Value, (String, Value)>> {
-    let namespace = Namespace::parse(namespace_str).unwrap_or_else(|_| Namespace::local());
+    // Only link/search are ever intercepted here — resolve/validate the
+    // namespace only for those verbs so unrelated verbs (which always
+    // fall through to `None` below) don't pay for a parse they don't need.
+    if !matches!(tool, "link" | "search") {
+        return None;
+    }
+
+    let namespace = match resolve_explicit_namespace(args_value, default_namespace_str) {
+        Ok(ns) => ns,
+        Err(e) => {
+            return Some(Err(match e {
+                RuntimeError::Khive(k) => {
+                    let error_payload = serde_json::to_value(&k)
+                        .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+                    (tool.to_string(), error_payload)
+                }
+                other => (tool.to_string(), json!(other.to_string())),
+            }));
+        }
+    };
 
     match tool {
         "link" => {

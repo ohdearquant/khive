@@ -767,6 +767,15 @@ impl EventStore for SqlEventStore {
         page: PageRequest,
     ) -> Result<Page<Event>, StorageError> {
         let namespace = self.namespace.clone();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Events,
+            operation: "query_events".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
 
         self.with_reader("query_events", move |conn| {
             let (where_clause, filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
@@ -781,8 +790,8 @@ impl EventStore for SqlEventStore {
 
             let (_, data_filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
             let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
-            all_params.push(Box::new(page.limit as i64));
-            all_params.push(Box::new(page.offset as i64));
+            all_params.push(Box::new(limit_i64));
+            all_params.push(Box::new(offset_i64));
 
             let limit_idx = all_params.len() - 1;
             let offset_idx = all_params.len();

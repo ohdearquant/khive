@@ -591,6 +591,15 @@ impl NoteStore for SqlNoteStore {
     ) -> Result<Page<Note>, StorageError> {
         let namespace = namespace.to_string();
         let kind = kind.map(|k| k.to_string());
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
 
         self.with_reader("query_notes", move |conn| {
             let (count_sql, count_params) = build_note_where(&namespace, kind.as_deref());
@@ -603,8 +612,8 @@ impl NoteStore for SqlNoteStore {
             };
 
             let (where_sql, mut data_params) = build_note_where(&namespace, kind.as_deref());
-            data_params.push(Box::new(page.limit as i64));
-            data_params.push(Box::new(page.offset as i64));
+            data_params.push(Box::new(limit_i64));
+            data_params.push(Box::new(offset_i64));
 
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();
@@ -650,6 +659,15 @@ impl NoteStore for SqlNoteStore {
 
         let namespace = namespace.to_string();
         let filter = filter.clone();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes_filtered".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
 
         self.with_reader("query_notes_filtered", move |conn| {
             let (count_sql, count_params) = build_note_filter_where(&namespace, &filter)?;
@@ -662,8 +680,8 @@ impl NoteStore for SqlNoteStore {
             };
 
             let (where_sql, mut data_params) = build_note_filter_where(&namespace, &filter)?;
-            data_params.push(Box::new(page.limit as i64));
-            data_params.push(Box::new(page.offset as i64));
+            data_params.push(Box::new(limit_i64));
+            data_params.push(Box::new(offset_i64));
 
             let order_clause = match &filter.order_by {
                 Some((path, dir)) => {

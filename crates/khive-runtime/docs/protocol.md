@@ -4,7 +4,8 @@
 
 The runtime protocol defines how verb dispatches are routed from the MCP `request` surface
 through the `VerbRegistry` to individual pack handlers, and how security, auditing, and
-namespace isolation are enforced at each step.
+namespace attribution are enforced at each step (ADR-007 Rev 6: namespace is gate-policy
+input, not a storage access boundary).
 
 ## ADR Links
 
@@ -12,7 +13,7 @@ namespace isolation are enforced at each step.
 - [ADR-023](../../../docs/adr/ADR-023-declarative-pack-format.md) — Declarative pack format and verb visibility
 - [ADR-027](../../../docs/adr/ADR-027-dynamic-pack-loading.md) — Dynamic pack loading via self-registration
 - [ADR-028](../../../docs/adr/ADR-028-pack-scoped-backends.md) — Pack-scoped backends and schema declaration
-- [ADR-007](../../../docs/adr/ADR-007-namespace.md) — Namespace strategy and isolation requirements
+- [ADR-007](../../../docs/adr/ADR-007-namespace.md) — Namespace attribution and read visibility
 - [ADR-050](../../../docs/adr/ADR-050-kg-token-namespace-contract.md) — NamespaceToken authority contract
 
 ## Dispatch Flow
@@ -33,8 +34,12 @@ MCP request(ops=...) → khive_request::parse_request → Vec<ParsedOp>
 ## Verb Visibility Contract
 
 - `Visibility::Verb` — callable via MCP `request` surface, advertised in `help=true` envelopes.
-- `Visibility::Subhandler` — internal only; `dispatch` returns `PermissionDenied`. `help=true`
-  returns an envelope with `callable_via_mcp: false`.
+- `Visibility::Subhandler` — internal / operator-only. `help=true` returns an envelope with
+  `callable_via_mcp: false`.
+- Subhandler blocking is enforced at the **MCP wire boundary** (`khive-mcp`'s request
+  handling rejects non-help `Visibility::Subhandler` calls before they reach the runtime).
+  `VerbRegistry::dispatch` itself does not block on visibility — direct/operator dispatch
+  (e.g. `khived` local calls, tests) may invoke internal subhandlers.
 
 ## Request Schema
 
@@ -59,17 +64,27 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 
 - One pack per verb at boot: duplicate verb names across packs produce `RuntimeError::VerbCollision`.
 - Gate is consulted before every dispatch. Gate infrastructure errors are fail-open (ADR-018).
-- Namespace token authority is checked in every ID-based operation at the runtime layer.
-  Storage is ID-only; the runtime is the trust boundary (ADR-007, ADR-050).
+- Namespace is attribution and gate-policy input (ADR-007 Rev 6, ADR-050): it is minted into
+  the dispatch `NamespaceToken`'s read/write scope, not re-checked per record. By-ID
+  operations (get, delete, update) resolve globally unique UUIDs without a namespace
+  equality check; `merge_entity`/`merge_note` are the exception and still require a
+  namespace match.
+- A present but non-string `namespace` request param (`null`, number, boolean, array,
+  object) is rejected with `RuntimeError::InvalidInput` before the gate is consulted —
+  it is never coerced to the default namespace (RUNTIME-AUD-002 / #433, ADR-018 fail-closed).
 
 ## Failure Modes
 
-| Condition          | Error                                                              |
-| ------------------ | ------------------------------------------------------------------ |
-| Unknown verb       | `RuntimeError::InvalidInput("unknown verb ...")`                   |
-| Gate deny          | `RuntimeError::PermissionDenied { verb, reason }`                  |
-| Pack not loaded    | `RuntimeError::InvalidInput` (unknown verb path)                   |
-| Namespace mismatch | `RuntimeError::NamespaceMismatch` (reported as NotFound to caller) |
+| Condition                        | Error                                              |
+| --------------------------------- | --------------------------------------------------- |
+| Unknown verb                      | `RuntimeError::InvalidInput("unknown verb ...")`   |
+| Gate deny                         | `RuntimeError::PermissionDenied { verb, reason }`  |
+| Pack not loaded                   | `RuntimeError::InvalidInput` (unknown verb path)   |
+| Malformed explicit namespace      | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
+
+`RuntimeError::NamespaceMismatch` is a historical/rejected variant from a pre-Rev-6
+design where by-ID lookups compared `record.namespace == caller_namespace`; it is not
+part of the current by-ID contract described above.
 
 ## Extension Points
 

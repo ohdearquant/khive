@@ -12,7 +12,7 @@ use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, StorageResult,
-    VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
     VectorStoreCapabilities, VectorStoreInfo,
 };
 
@@ -47,10 +47,12 @@ pub trait VectorStore: Send + Sync + 'static {
 
     /// Declare what this backend supports (called at runtime policy construction).
     ///
-    /// Default returns a conservative baseline with all optional features disabled,
-    /// preserving backward compatibility for existing implementations. Backends that
-    /// support filter pushdown, batch search, quantization, or in-place update should
-    /// override this and return their own `&'static VectorStoreCapabilities`.
+    /// Default returns a conservative, backend-neutral baseline with all optional
+    /// features disabled and no advertised dimension ceiling or index kind
+    /// (STORAGE-AUD-001, ADR-044, ADR-071 Phase 1). Backends that support filter
+    /// pushdown, batch search, quantization, in-place update, or that have a known
+    /// dimension ceiling or index kind should override this and return their own
+    /// `&'static VectorStoreCapabilities`.
     fn capabilities(&self) -> &'static VectorStoreCapabilities {
         static BASELINE: OnceLock<VectorStoreCapabilities> = OnceLock::new();
         BASELINE.get_or_init(|| VectorStoreCapabilities {
@@ -60,11 +62,11 @@ pub trait VectorStore: Send + Sync + 'static {
             supports_update: false,
             supports_orphan_sweep: false,
             supports_multi_field: false,
-            // sqlite-vec 0.1.9 enforces SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
-            // The baseline uses the same value so generic callers that have not
-            // overridden capabilities() report the correct ceiling.
-            max_dimensions: Some(8192),
-            index_kinds: vec![VectorIndexKind::SqliteVec],
+            // Backend-neutral baseline: unknown dimension ceiling and no
+            // advertised index kind. Backends with a concrete limit (e.g.
+            // SqliteVecStore) must override capabilities().
+            max_dimensions: None,
+            index_kinds: vec![],
         })
     }
 

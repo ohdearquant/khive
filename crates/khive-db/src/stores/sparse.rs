@@ -331,6 +331,14 @@ impl SqliteSparseStore {
         &self,
         request: SparseSearchRequest,
     ) -> Result<Vec<SparseSearchHit>, StorageError> {
+        request
+            .validate()
+            .map_err(|message| StorageError::InvalidInput {
+                capability: StorageCapability::Sparse,
+                operation: "sparse_search".into(),
+                message,
+            })?;
+
         let table = self.table_name.clone();
         let ns = request
             .namespace
@@ -338,7 +346,18 @@ impl SqliteSparseStore {
             .unwrap_or_else(|| self.namespace.clone());
         let kind_filter = request.kind.map(|k| k.to_string());
         let query = request.query;
-        let top_k = request.top_k as usize;
+        let top_k = usize::try_from(request.top_k).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Sparse,
+            operation: "sparse_search".into(),
+            message: "SparseSearchRequest: top_k does not fit usize".into(),
+        })?;
+        let heap_capacity = top_k
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidInput {
+                capability: StorageCapability::Sparse,
+                operation: "sparse_search".into(),
+                message: "SparseSearchRequest: top_k capacity overflow".into(),
+            })?;
 
         self.with_reader("sparse_search", move |conn| {
             // Load candidate rows for namespace (and optional kind).
@@ -378,7 +397,7 @@ impl SqliteSparseStore {
 
             // Bounded min-heap for top-k selection (KDB-AUD-003).
             let mut heap: BinaryHeap<Reverse<ScoredCandidate>> =
-                BinaryHeap::with_capacity(top_k + 1);
+                BinaryHeap::with_capacity(heap_capacity);
 
             for row_result in rows {
                 let (id_str, indices_json, values_blob) = row_result?;
@@ -685,6 +704,38 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].subject_id, id1, "id1 should rank first");
         assert_eq!(hits[0].rank, 1);
+    }
+
+    /// STORAGE-AUD-002 / #470: top_k = u32::MAX must return InvalidInput
+    /// without allocating a multi-hundred-GB heap.
+    #[tokio::test]
+    async fn sparse_top_k_u32_max_rejected() {
+        let store = make_store("test_top_k_max");
+        let id = Uuid::new_v4();
+        store
+            .insert_sparse(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                sv(vec![0], vec![1.0]),
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .search_sparse(SparseSearchRequest {
+                query: sv(vec![0], vec![1.0]),
+                top_k: u32::MAX,
+                namespace: Some("ns:test".into()),
+                kind: None,
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(StorageError::InvalidInput { .. })),
+            "expected InvalidInput, got {result:?}"
+        );
     }
 
     #[tokio::test]

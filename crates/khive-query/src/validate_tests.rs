@@ -103,6 +103,24 @@ fn rejects_unknown_relation_in_where() {
     assert!(err.to_string().contains("related_to"), "msg: {err}");
 }
 
+#[test]
+fn query_edge_relation_bang_rejected() {
+    // Regression for #471: relation filters with punctuation must be
+    // rejected as Validation errors, not silently normalised into a
+    // canonical relation.
+    for bad in ["supports!", "part/of", "depends.on", "competes with"] {
+        let mut q = gql::parse(&format!(
+            "MATCH (a)-[e:extends]->(b) WHERE e.relation = '{bad}' RETURN a"
+        ))
+        .unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "relation {bad:?} must be QueryError::Validation, got: {err:?}"
+        );
+    }
+}
+
 fn first_condition_string_value(q: &GqlQuery) -> String {
     match q.where_clause.conditions().next().unwrap().value {
         ConditionValue::String(ref s) => s.clone(),

@@ -1726,3 +1726,59 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
         );
     }
 }
+
+/// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
+/// InvalidInput instead of silently narrowing to a negative i64 offset.
+#[tokio::test]
+async fn page_offset_over_i64max_rejected() {
+    let store = setup_memory_store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    store
+        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let result = store
+        .query_edges(
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: (i64::MAX as u64) + 1,
+                limit: 10,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+}
+
+/// STORAGE-AUD-003 / #485: TraversalOptions.max_depth > i64::MAX must return
+/// InvalidInput from the backend instead of silently narrowing to a negative
+/// i64 depth and returning an empty/wrong traversal.
+#[tokio::test]
+async fn traverse_max_depth_over_i64max_rejected() {
+    let store = setup_memory_store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    store
+        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+
+    let request = TraversalRequest {
+        roots: vec![a],
+        options: TraversalOptions::new((i64::MAX as usize) + 1).with_direction(Direction::Out),
+        include_roots: false,
+        include_properties: false,
+    };
+
+    let result = store.traverse(request).await;
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+}
