@@ -328,6 +328,9 @@ Environment variables: `KHIVE_DB`, `KHIVE_NAMESPACE`, `KHIVE_NO_EMBED`, `KHIVE_L
 For config file discovery order, the `[[backends]]` model, and how `--db` interacts
 with a declared backend topology, see [docs/configuration.md](docs/configuration.md).
 
+For the `kkernel` admin CLI (migrations, reindexing, data import/export, diagnostics), see
+[docs/operations.md](docs/operations.md).
+
 ### Development
 
 ```bash
