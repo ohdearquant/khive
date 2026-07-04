@@ -77,11 +77,8 @@ pub fn is_meaningful_query(query: &str) -> bool {
         return false;
     }
 
-    // All non-whitespace are ASCII but not alphanumeric => symbols only
-    if non_ws
-        .iter()
-        .all(|c| c.is_ascii() && !c.is_ascii_alphanumeric())
-    {
+    // Symbol/punctuation/emoji-only queries are not meaningful, including Unicode symbols.
+    if !non_ws.iter().any(|c| c.is_alphanumeric()) {
         return false;
     }
 
@@ -300,6 +297,18 @@ mod tests {
     #[test]
     fn single_digit_is_meaningful() {
         // Only single ASCII letter is blocked, not digit
+        assert!(is_meaningful_query("5"));
+    }
+
+    #[test]
+    fn unicode_symbol_only_queries_are_not_meaningful() {
+        assert!(!is_meaningful_query("\u{FF0C}")); // fullwidth comma
+        assert!(!is_meaningful_query("\u{3001}")); // ideographic comma
+        assert!(!is_meaningful_query("\u{FF01}\u{FF1F}")); // fullwidth ! ?
+        assert!(!is_meaningful_query("\u{1F600}")); // emoji-only
+
+        assert!(is_meaningful_query("\u{4F60}\u{597D}\u{4E16}\u{754C}")); // 你好世界
+        assert!(is_meaningful_query("BM25"));
         assert!(is_meaningful_query("5"));
     }
 }

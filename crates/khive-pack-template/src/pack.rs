@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Visibility};
+use khive_types::{HandlerDef, ParamDef, Visibility};
 
 use crate::{handlers, TemplatePack, PACK_NAME};
 
@@ -20,7 +20,12 @@ pub(crate) static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     description: "Example pack-prefixed verb. Non-kg packs must use pack.verb naming.",
     visibility: Visibility::Verb,
     category: khive_types::VerbCategory::Directive,
-    params: &[],
+    params: &[ParamDef {
+        name: "name",
+        param_type: "string",
+        required: true,
+        description: "Non-empty string field to echo in the template response.",
+    }],
 }];
 
 // ── Inventory self-registration ───────────────────────────────────────────────

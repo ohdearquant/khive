@@ -148,6 +148,44 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
     Ok(conn)
 }
 
+/// Open a standalone connection for a transaction, honoring `effective_read_only`.
+///
+/// When `effective_read_only` is set, the connection is opened with
+/// `SQLITE_OPEN_READ_ONLY` (so writes fail at the SQLite level even if the
+/// `PRAGMA query_only` toggle were ever bypassed) instead of `READ_WRITE`.
+fn open_standalone_tx_conn(
+    pool: &ConnectionPool,
+    effective_read_only: bool,
+) -> Result<rusqlite::Connection, StorageError> {
+    let config = pool.config();
+    let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
+        operation: "begin_tx".into(),
+        message: "in-memory databases do not support standalone writer; use pool-backed".into(),
+    })?;
+
+    let flags = if effective_read_only {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+    };
+
+    let conn = rusqlite::Connection::open_with_flags(path, flags)
+        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
+
+    conn.busy_timeout(config.busy_timeout)
+        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
+    conn.pragma_update(None, "cache_size", "-65536")
+        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
+    conn.pragma_update(None, "mmap_size", "1073741824")
+        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
+
+    Ok(conn)
+}
+
 // =============================================================================
 // File-backed: SqliteReader (standalone connection)
 // =============================================================================
@@ -792,6 +830,12 @@ impl khive_storage::SqlAccess for SqlBridge {
         &self,
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlWriter>> {
         if self.is_file_backed {
+            if self.pool.config().read_only {
+                return Err(StorageError::Pool {
+                    operation: "writer".into(),
+                    message: "backend is read-only".into(),
+                });
+            }
             let conn = open_standalone_writer(&self.pool)?;
             Ok(Box::new(SqliteWriter { conn: Some(conn) }))
         } else {
@@ -808,8 +852,13 @@ impl khive_storage::SqlAccess for SqlBridge {
         // Transactions need a standalone connection so the BEGIN/COMMIT state
         // is not shared with other operations. For in-memory DBs we still
         // open a standalone writer since the pool writer would conflict.
+        // A read-only backend forces the transaction read-only even if the
+        // caller did not ask for it, so writes cannot bypass the backend's
+        // read-only mode via `SqlTxOptions::default()`.
+        let effective_read_only = self.pool.config().read_only || options.read_only;
+
         let conn = if self.is_file_backed {
-            open_standalone_writer(&self.pool)?
+            open_standalone_tx_conn(&self.pool, effective_read_only)?
         } else {
             return Err(StorageError::Pool {
                 operation: "begin_tx".into(),
@@ -821,11 +870,10 @@ impl khive_storage::SqlAccess for SqlBridge {
         // SQLite WAL mode gives snapshot isolation for readers automatically;
         // IMMEDIATE acquires the write lock early (prevents writer starvation),
         // EXCLUSIVE prevents any concurrent readers for full serializability.
-        let read_only = options.read_only;
         let begin_stmt = match options.isolation {
             SqlIsolation::Serializable => "BEGIN EXCLUSIVE",
             _ => {
-                if read_only {
+                if effective_read_only {
                     // DEFERRED acquires no lock at BEGIN time, compatible with
                     // read-only transactions (no write-intent needed).
                     "BEGIN DEFERRED"
@@ -841,14 +889,14 @@ impl khive_storage::SqlAccess for SqlBridge {
         // Honor read_only: block all writes via PRAGMA query_only.
         // The connection is opened as read-write so COMMIT still works, but
         // any INSERT/UPDATE/DELETE executed inside the transaction will error.
-        if read_only {
+        if effective_read_only {
             conn.pragma_update(None, "query_only", "ON")
                 .map_err(|e| map_rusqlite_err(e, "begin_tx"))?;
         }
 
         Ok(Box::new(SqliteTransaction {
             conn: Some(conn),
-            read_only,
+            read_only: effective_read_only,
         }))
     }
 }

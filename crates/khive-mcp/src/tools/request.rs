@@ -54,6 +54,12 @@ pub struct RequestParams {
     /// rows) in one call rather than after a downstream judgment fleet has graded
     /// blind. Parent directories are created if absent.
     ///
+    /// The resolved destination MUST stay within the allowed export root
+    /// (default `~/.khive/exports`, overridable via `KHIVE_SAVE_TO_ROOT`).
+    /// Relative paths are joined under the root; absolute paths are accepted
+    /// only if they resolve inside it. Paths containing `..` traversal
+    /// components and symlinked destinations are rejected.
+    ///
     /// When omitted, results are returned inline (default behaviour).
     #[serde(default)]
     #[schemars(

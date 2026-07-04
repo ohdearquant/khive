@@ -56,19 +56,15 @@ impl StorageBackend {
         let resolved = path.as_ref().to_path_buf();
         let config = PoolConfig {
             path: Some(resolved.clone()),
+            read_only: true,
             ..PoolConfig::default()
         };
+        // `ConnectionPool::new` opens the writer slot with `SQLITE_OPEN_READ_ONLY`
+        // (no `SQLITE_OPEN_CREATE`) and sets `PRAGMA query_only = ON` on it, so a
+        // missing path is rejected instead of created, and any write attempt is
+        // rejected at the SQLite level regardless of which code path reaches the
+        // writer.
         let pool = ConnectionPool::new(config)?;
-        // Set PRAGMA query_only = ON on the writer connection so that any write
-        // attempt is rejected at the SQLite level regardless of which code path
-        // reaches the writer.
-        {
-            let writer = pool.try_writer()?;
-            writer
-                .conn()
-                .pragma_update(None, "query_only", "ON")
-                .map_err(SqliteError::Rusqlite)?;
-        }
         Ok(Self {
             pool: Arc::new(pool),
             is_file_backed: true,
@@ -689,6 +685,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sqlite_read_only_missing_path_does_not_create_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_ro.db");
+        assert!(!path.exists());
+
+        let result = StorageBackend::sqlite_read_only(&path);
+        assert!(
+            result.is_err(),
+            "opening a missing path read-only must fail"
+        );
+        assert!(
+            !path.exists(),
+            "opening a missing path read-only must not create the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_sql_writer_rejects_ddl_and_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_writer.db");
+
+        // Create the database and a table while writable.
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            let sql = writable.sql();
+            let mut writer = sql.writer().await.unwrap();
+            writer
+                .execute_script("CREATE TABLE ro_existing (id INTEGER PRIMARY KEY)".into())
+                .await
+                .unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let sql = ro.sql();
+
+        // Writer acquisition itself must fail for a read-only backend.
+        let writer_result = sql.writer().await;
+        assert!(
+            writer_result.is_err(),
+            "sql().writer() must be rejected on a read-only backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_default_transaction_rejects_writes() {
+        use khive_storage::types::SqlTxOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_tx.db");
+
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            let sql = writable.sql();
+            let mut writer = sql.writer().await.unwrap();
+            writer
+                .execute_script("CREATE TABLE ro_tx_test (id INTEGER PRIMARY KEY)".into())
+                .await
+                .unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let sql = ro.sql();
+
+        // `SqlTxOptions::default()` has `read_only: false`; the read-only
+        // backend must still force the transaction to reject writes.
+        let mut tx = sql.begin_tx(SqlTxOptions::default()).await.unwrap();
+        let result = tx
+            .execute(SqlStatement {
+                sql: "INSERT INTO ro_tx_test (id) VALUES (?1)".into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "INSERT inside a default tx on a read-only backend must fail"
+        );
+        tx.rollback().await.unwrap();
+    }
+
     #[tokio::test]
     #[cfg(feature = "vectors")]
     async fn vectors_roundtrip_via_public_api() {
@@ -828,6 +905,121 @@ mod tests {
         let backend = StorageBackend::memory().unwrap();
         assert!(backend.text("bad key!").is_err());
         assert!(backend.text("").is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_graph_store_rejects_upsert_edge() {
+        use khive_storage::types::Edge;
+        use khive_types::EdgeRelation;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_graph.db");
+
+        // Create the database and the graph schema while writable.
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.graph().unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.graph() {
+            Ok(store) => store,
+            // Failing to even open the store on a read-only backend is an
+            // acceptable rejection — the write path never becomes reachable.
+            Err(_) => return,
+        };
+
+        let now = chrono::Utc::now();
+        let edge = Edge {
+            id: uuid::Uuid::new_v4().into(),
+            namespace: "local".to_string(),
+            source_id: uuid::Uuid::new_v4(),
+            target_id: uuid::Uuid::new_v4(),
+            relation: EdgeRelation::Extends,
+            weight: 0.8,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+
+        let result = store.upsert_edge(edge).await;
+        assert!(
+            result.is_err(),
+            "upsert_edge on a read-only backend must reject, not silently no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_event_store_rejects_append_event() {
+        use khive_types::{EventKind, EventOutcome, SubstrateKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_events.db");
+
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.events().unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.events() {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+
+        let event = khive_storage::event::Event::new(
+            "local",
+            "test.verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test-actor",
+        )
+        .with_outcome(EventOutcome::Success);
+
+        let result = store.append_event(event).await;
+        assert!(
+            result.is_err(),
+            "append_event on a read-only backend must reject, not silently no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_text_store_rejects_upsert_document() {
+        use khive_storage::types::TextDocument;
+        use khive_types::SubstrateKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_text.db");
+
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.text("ro_test").unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.text("ro_test") {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+
+        let doc = TextDocument {
+            subject_id: uuid::Uuid::new_v4(),
+            kind: SubstrateKind::Entity,
+            title: Some("Title".to_string()),
+            body: "Body text.".to_string(),
+            tags: vec![],
+            namespace: "local".to_string(),
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        };
+
+        let result = store.upsert_document(doc).await;
+        assert!(
+            result.is_err(),
+            "upsert_document on a read-only backend must reject, not silently no-op"
+        );
     }
 
     #[test]

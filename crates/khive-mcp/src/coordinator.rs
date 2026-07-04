@@ -167,6 +167,10 @@ pub(crate) mod tests {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
+        /// Records the `limit` value `fan_out_search` was last called with, so
+        /// callers can assert the coordinator received the already-capped value
+        /// (MCP-AUD-003 regression).
+        pub last_limit: std::sync::atomic::AtomicU32,
     }
 
     impl MockCoordinator {
@@ -175,6 +179,7 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
+                last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
 
@@ -183,6 +188,7 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
+                last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
     }
@@ -218,13 +224,15 @@ pub(crate) mod tests {
             _kind: &str,
             _query: &str,
             _namespace: &Namespace,
-            _limit: u32,
+            limit: u32,
             _kind_filter: Option<&str>,
             _props_filter: Option<&serde_json::Value>,
             _tags: &[String],
         ) -> CoordSearchResult {
             self.search_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.last_limit
+                .store(limit, std::sync::atomic::Ordering::SeqCst);
             CoordSearchResult {
                 entity_hits: vec![],
                 note_hits: vec![],
@@ -432,6 +440,95 @@ pub(crate) mod tests {
         assert!(
             !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
             "T6c: coordinator.link must NOT be called for a single-backend server"
+        );
+    }
+
+    /// T6e: A multi-backend `search` limit beyond `u32::MAX` must be rejected
+    /// with a per-op error, not silently wrapped by `as u32` and passed through.
+    ///
+    /// Before the fix, `limit=4294967297` (`u32::MAX as u64 + 2`) was parsed as
+    /// `u64`, cast with `as u32` (wrapping to `1`), then `.min(100)` left `1` —
+    /// the coordinator was called with a near-empty limit instead of rejecting
+    /// the out-of-range input (MCP-AUD-003).
+    #[tokio::test]
+    async fn t6e_multi_backend_search_limit_matches_single_backend_u32_contract() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let too_large: u64 = u64::from(u32::MAX) + 2;
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"search(kind="entity", query="anything", limit={too_large})"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("T6e: dispatch must not return an MCP-level error");
+
+        let result_val: serde_json::Value =
+            serde_json::from_str(&raw).expect("T6e: response must be valid JSON");
+        let first = result_val
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .expect("T6e: results array must be non-empty");
+        assert_eq!(
+            first.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "T6e: an out-of-range limit must produce ok=false; got {:?}",
+            first
+        );
+        assert!(
+            !coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6e: coordinator must not be called with an out-of-range limit \
+             (it must not silently wrap to a small value); recorded last_limit={}",
+            coord.last_limit.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// T6e companion: a valid-but-huge `u32` limit (`u32::MAX`) must still reach
+    /// the coordinator, capped at 100 — proving the strict parser doesn't
+    /// over-reject in-range values.
+    #[tokio::test]
+    async fn t6e_multi_backend_search_limit_u32_max_is_capped_at_100() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"search(kind="entity", query="anything", limit={})"#,
+                    u32::MAX
+                ),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("T6e: dispatch must not return an MCP-level error");
+        let _ = raw;
+
+        assert!(
+            coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6e: coordinator.fan_out_search must be called for a valid in-range limit"
+        );
+        assert_eq!(
+            coord.last_limit.load(std::sync::atomic::Ordering::SeqCst),
+            100,
+            "T6e: u32::MAX must be capped at 100 before reaching the coordinator"
         );
     }
 }

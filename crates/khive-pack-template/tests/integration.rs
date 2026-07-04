@@ -74,6 +74,33 @@ async fn my_verb_errors_on_empty_name() {
 }
 
 #[tokio::test]
+async fn my_verb_help_declares_required_name_param() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch("template.my_verb", serde_json::json!({ "help": true }))
+        .await
+        .expect("template.my_verb help dispatches");
+
+    let params = result["params"].as_array().expect("params is an array");
+    assert_eq!(
+        params.len(),
+        1,
+        "params should declare the name field; got: {params:?}"
+    );
+    assert_eq!(params[0]["name"], "name");
+    assert_eq!(params[0]["type"], "string");
+    assert_eq!(params[0]["required"], true);
+    assert!(
+        params[0]["description"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "description should be a non-empty string; got: {:?}",
+        params[0]["description"]
+    );
+}
+
+#[tokio::test]
 async fn unknown_verb_returns_error() {
     let (registry, _rt) = build_registry();
 

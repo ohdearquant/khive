@@ -297,6 +297,18 @@ mod tests {
         assert_eq!(got, vec!["lora", "lo", "ra"]);
     }
 
+    #[test]
+    fn identifier_tokenizer_filters_unicode_min_part_len_by_chars() {
+        // "\u{4F60}" (你) is 1 char / 3 bytes; min_part_len: 2 must drop it
+        // by character count, not keep it via byte length.
+        let t = IdentifierTokenizer { min_part_len: 2 };
+        let got = t.tokenize("foo_\u{4F60}");
+        assert!(
+            !got.contains(&"\u{4F60}".to_string()),
+            "expected unicode single-char part to be filtered; got: {got:?}"
+        );
+    }
+
     // --- UnicodeWordTokenizer ---
 
     #[cfg(feature = "unicode")]
