@@ -115,7 +115,11 @@ def main():
         })
         init = recv(proc)
         assert init["result"]["serverInfo"]["name"] == "khive-mcp", f"unexpected: {init}"
-        print("  [ok] initialize")
+        instructions = init["result"].get("instructions") or ""
+        assert "https://ohdearquant.github.io/khive/" in instructions, (
+            f"initialize instructions missing docs address; got:\n{instructions}"
+        )
+        print("  [ok] initialize — instructions carry docs address")
 
         # Send initialized notification
         notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
