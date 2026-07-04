@@ -396,6 +396,51 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   in the shared transaction registry (both `begin_tx` and raw `SqlWriter` transactions)
   when an attempt fails to make progress.
 
+### 2026-07-04 amendment: severity ladder + `wal_pages` units (spec-gate ruling, lambda:leo)
+
+**Severity ladder (this corrects Plank 0's crossing-severity wording above).** Plank 0's
+description of the `warn_pages` crossing (`escalating to tracing::warn! once wal_pages
+crosses warn_pages`, matching the currently-shipped `crossing_warn` gate at
+`checkpoint.rs:277-291`) is superseded: crossing `warn_pages` (default 2000,
+`KHIVE_WAL_WARN_PAGES`) on its own is **INFO**, not WARN, because it is an expected,
+self-resolving event under ordinary write bursts, not an operator-actionable condition.
+The ladder is:
+
+- **INFO**: `wal_pages` crosses `warn_pages` (a single tick observation).
+- **WARN**: `wal_pages` fails to drain back below `warn_pages` across **N = 3** consecutive
+  checkpoint cycles. N is owned by lambda:khive and tunable. This tier is already shipped
+  as `note_truncate_outcome`'s escalation (`checkpoint.rs:508-528`), which fires
+  `tracing::warn!` exactly once at the third consecutive TRUNCATE attempt that fails to
+  clear `warn_pages` and resets the counter on any attempt that clears it.
+- **ALARM**: Plank 2 escalation, i.e. sustained pressure past `high_water_pages` (default
+  6000, `KHIVE_WAL_HIGH_WATER_PAGES`) driving the daemon-side TRUNCATE attempt path
+  (`checkpoint.rs:296-304`, `run_truncate_attempt`), the tier above ordinary WARN-level
+  drain failure.
+
+Bringing the shipped `warn_pages`-crossing log call (`checkpoint.rs:288`, currently
+`tracing::warn!`) down to `tracing::info!` to match this ladder is an implementation
+follow-up tracked separately; it is out of scope for this docs-only amendment.
+
+**Units: `wal_pages` is an instantaneous frame count, not a cumulative counter.**
+`query_wal_pages` (`checkpoint.rs:545-561`) reads it from `PRAGMA wal_checkpoint`'s
+3-column row `(busy, log, checkpointed)`: `log` (column index 1) is the number of frames
+currently sitting in the WAL file at the moment of the call, not frames accumulated over
+time. A frame is one page (khive.db's page size is SQLite's unconfigured default, 4096
+bytes; no `PRAGMA page_size` override exists in `pool.rs`'s connection setup) plus a
+24-byte WAL frame header. The pragma's own side effect (a PASSIVE checkpoint) means two
+consecutive calls can observe a falling count with no explicit checkpoint in between.
+
+Separately, the WAL file's _resting_ on-disk size is capped by the pool's
+`journal_size_limit_bytes` (`pool.rs:44-49`, default 64MiB,
+`DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 67_108_864`, overridable via
+`KHIVE_JOURNAL_SIZE_LIMIT_BYTES`, `pool.rs:85`): SQLite truncates the WAL file back down
+after a log-resetting (TRUNCATE-mode) checkpoint, which is exactly the mechanism Plank 2's
+`run_truncate_attempt` invokes. `wal_pages` and `journal_size_limit_bytes` are not the
+same quantity: one is a live frame count sampled per tick, the other is a byte ceiling
+enforced only at TRUNCATE time, and this ADR's thresholds (`warn_pages`,
+`high_water_pages`, `truncate_high_water_pages`) are all expressed in the former, page-count,
+unit.
+
 ### Config summary
 
 | Key                                    | Default | Plank | Purpose                                                                                       | Status                                     |
@@ -420,7 +465,7 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
    mean vendoring a patched SQLite build for a config-and-scheduling-level fix. Revisit
    only if WAL2 reaches upstream stable and the config-level fix proves insufficient.
 2. **External checkpointer process** (litestream-style out-of-process WAL manager).
-   Rejected: khive embeds SQLite in-process by design (single 7.7MB binary); an external
+   Rejected: khive embeds SQLite in-process by design (single 18MB binary); an external
    process reintroduces an operational dependency and IPC surface for a problem a
    background `tokio::spawn` task (already present, `checkpoint.rs`) solves in-process.
 3. **Kill long-lived reader sessions at the OS level** (SIGKILL `kkernel mcp` processes
@@ -495,10 +540,12 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   iteration: it converts "we don't know what's pinning the WAL" into a concrete,
   loggable answer the next time sustained WAL pressure occurs, which Plank 1's
   provisional thresholds and any follow-up ADR amendment can then be tuned against.
-- The existing periodic PASSIVE checkpoint tick, its skip-on-busy behavior, and its
-  `warn_pages`/`high_water_pages` WARN semantics are unchanged; TRUNCATE escalation is
-  additive to `checkpoint.rs`, not a rewrite, with an explicit accepted-worst-case
-  statement for sustained writer contention.
+- The existing periodic PASSIVE checkpoint tick and its skip-on-busy behavior are
+  unchanged; TRUNCATE escalation is additive to `checkpoint.rs`, not a rewrite, with an
+  explicit accepted-worst-case statement for sustained writer contention. The severity of
+  the `warn_pages` crossing itself is amended (see "2026-07-04 amendment" above): crossing
+  is INFO, WARN is reserved for a 3-consecutive-cycle drain failure, and `high_water_pages`
+  driving TRUNCATE is the ALARM tier.
 - Two new config knobs for the shared transaction-registry guard (Plank 1), covering both
   `begin_tx` and raw `SqlWriter` transactions, three carried-over knobs narrowed in scope,
   three for TRUNCATE escalation (Plank 2); the two new keys are explicitly marked

@@ -79,6 +79,57 @@ request(ops="comm.thread(id=\"<root_message_id_or_prefix>\", limit=50)")
 
 `limit` defaults to 100 and caps at 500.
 
+### Health
+
+`comm.health()` is a read-only, no-argument verb that reports per-channel
+polling state, keyed by `(channel_kind, channel_slug)`. It never returns a
+computed `healthy` boolean: staleness and alerting judgment stay with the
+caller, not the pack.
+
+```
+request(ops="comm.health()")
+```
+
+Each entry in the returned `channels` array carries:
+
+| Field                  | Notes                                                                                                                                                    |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `channel_kind`         | e.g. `"email"`.                                                                                                                                          |
+| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.          |
+| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                         |
+| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                             |
+| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                         |
+| `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values). |
+| `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                           |
+
+`last_error` is retained after a later success: a success updates
+`last_success_at` and resets `consecutive_failures` to 0 but never clears
+`last_error`. Compare `last_error.at` against `last_success_at` to tell a
+resolved failure from one that is still live.
+
+Heartbeat rows are always persisted to, and read from, the local operational
+namespace, regardless of the caller's own namespace or
+`KHIVE_EMAIL_INGEST_NAMESPACE`. These rows are an operational surface, not
+message data, so they must be visible to a no-arg `comm.health()` call
+independent of where the caller's own messages happen to be ingested.
+
+The `role` field is `"daemon"` (with `source: "daemon-heartbeat"`) whenever
+any persisted heartbeat row exists, and `"client"` with an empty `channels`
+array otherwise. This distinguishes who owns the channel loops, not which
+process answered the call: any persisted row means some daemon owns the
+loops, even when this particular call was served by a different, non-daemon
+process.
+
+**Known ambiguity:** an empty `channels` array cannot distinguish "no daemon
+has ever run" from "channels are configured but a poll has never completed."
+The comm pack has no visibility into channel configuration (that lives in
+`khive-mcp` / `khive-channel-email`), so `role: "client"` with an empty
+`channels` array means only "no daemon heartbeat state exists," not "nothing
+is configured."
+
+Results are capped at 200 channels. A full page logs a `tracing::debug!`
+line noting that results may be silently truncated.
+
 ## The email channel
 
 The email channel (`crates/khive-channel-email/`) bridges `comm.send` /
@@ -205,6 +256,17 @@ email channel loops NOT started: ingest namespace authorization failed (fail-clo
 
 If no daemon is running, mail is simply not polled until one starts. That is
 the intended behavior, not a silent failure.
+
+## Limitations
+
+Actor addressing (`to_actor` filtering on `comm.send`/`comm.inbox`) is a
+view-layer convention for cooperating, co-located actors, not a security
+boundary ([ADR-063](../adr/ADR-063-comm-principal-model.md)). Any process
+with access to the underlying SQLite store can read every message row
+regardless of `to_actor`, and there is no per-principal storage partition on
+the local backend. Where authorization is enforced, it lives at a single
+seam, the Gate ([ADR-018](../adr/ADR-018-authorization-gate.md)), not at the
+comm pack's inbox filter.
 
 ## See also
 
