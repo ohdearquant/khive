@@ -2,15 +2,24 @@
 //!
 //! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`
 //! via a buffered, line-at-a-time reader bounded by an internal per-pass
-//! byte/event cap, parses complete lines using the parser selected by
-//! [`LineTailSource`] (mapped
-//! internally to [`MirrorSource`]), and writes the resulting bounded chunk to
-//! the session mirror tables in a single transaction.  A single call
-//! processes at most one bounded chunk — never the whole file at once — so
-//! the caller's polling loop advances the persisted cursor incrementally
-//! across multiple calls for large deltas.  It is safe to call repeatedly on
-//! the same file; `INSERT OR IGNORE` keyed by the event UUID ensures
-//! idempotency.
+//! byte/event cap AND a per-line byte cap, parses complete lines using the
+//! parser selected by [`LineTailSource`] (mapped internally to
+//! [`MirrorSource`]), and writes the resulting bounded chunk to the session
+//! mirror tables in a single transaction.  A single call processes at most
+//! one bounded chunk — never the whole file at once — so the caller's
+//! polling loop advances the persisted cursor incrementally across multiple
+//! calls for large deltas.  It is safe to call repeatedly on the same file;
+//! `INSERT OR IGNORE` keyed by the event UUID ensures idempotency.
+//!
+//! No single line, complete or partial, is ever buffered past
+//! `MirrorLimits::max_line_bytes` (see [`read_line_bounded`]): a complete
+//! line over that cap is skipped with a `tracing::warn!` naming the file and
+//! byte offset, and the offset advances past it so ingestion never wedges on
+//! one oversized line. The pass cap is gated on at least one complete line
+//! (blank or not) having been consumed, and the cursor is persisted whenever
+//! a pass durably advances the offset even if it scanned zero parseable
+//! events — a long run of blank or oversized lines can no longer read to EOF
+//! unbounded, nor lose its cursor advance.
 
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
@@ -94,6 +103,13 @@ const MIRROR_MAX_BYTES_PER_PASS: usize = 8 * 1024 * 1024;
 /// Ceiling on parsed events collected per `mirror_file` call in production.
 const MIRROR_MAX_EVENTS_PER_PASS: usize = 1024;
 
+/// Hard ceiling on a single JSONL line's buffered size in production. This is
+/// enforced by `read_line_bounded` itself (never appended to past this many
+/// bytes), independently of `max_bytes_per_pass` — a single oversized line
+/// must not be able to allocate past this bound even as the very first line
+/// of a pass (PACKSESSION-AUD-003).
+const MIRROR_MAX_LINE_BYTES: usize = MIRROR_MAX_BYTES_PER_PASS;
+
 /// Per-call caps on how much of a file's delta `mirror_file` will read and
 /// parse before writing a bounded chunk. Production always uses
 /// [`MirrorLimits::production`]; tests use a much smaller cap to force
@@ -102,6 +118,7 @@ const MIRROR_MAX_EVENTS_PER_PASS: usize = 1024;
 struct MirrorLimits {
     max_bytes_per_pass: usize,
     max_events_per_pass: usize,
+    max_line_bytes: usize,
 }
 
 impl MirrorLimits {
@@ -109,6 +126,7 @@ impl MirrorLimits {
         Self {
             max_bytes_per_pass: MIRROR_MAX_BYTES_PER_PASS,
             max_events_per_pass: MIRROR_MAX_EVENTS_PER_PASS,
+            max_line_bytes: MIRROR_MAX_LINE_BYTES,
         }
     }
 }
@@ -153,18 +171,102 @@ pub async fn mirror_file(
 /// line boundary.
 struct MirrorChunk {
     events: Vec<parse::ParsedEvent>,
+    /// Complete, nonblank, non-oversized lines that were handed to the
+    /// per-source parser (whether or not the parser returned an event).
     scanned: u64,
     new_offset: u64,
 }
 
+/// Outcome of [`read_line_bounded`] for one line.
+enum LineRead {
+    /// EOF with nothing read at all.
+    Eof,
+    /// EOF reached before a terminating `\n`: an incomplete trailing line,
+    /// left for the next pass. No bytes are considered consumed by the
+    /// caller (the offset does not advance), regardless of how large the
+    /// partial line has already grown.
+    Partial,
+    /// A complete line (through the terminating `\n`) fit within
+    /// `max_line_bytes`; `buf` holds the full line including the `\n`.
+    /// `bytes` is the total bytes consumed from the reader, used to advance
+    /// the caller's byte offset.
+    Complete { bytes: usize },
+    /// A complete line (through the terminating `\n`) exceeded
+    /// `max_line_bytes` before the newline was found. `buf` was never fully
+    /// populated — bytes past the cap were scanned for `\n` and discarded
+    /// without buffering — so the caller must skip it, not parse `buf`.
+    /// `bytes` is the total bytes consumed from the reader.
+    Oversized { bytes: usize },
+}
+
+/// Read one line from `reader` into `buf`, never buffering more than
+/// `max_line_bytes` regardless of how long the underlying line turns out to
+/// be.
+///
+/// This is the hard bound behind PACKSESSION-AUD-003: `BufRead::read_until`
+/// alone appends an entire line to its buffer before any cap check can run,
+/// so a single arbitrarily large complete line (or a line that starts below
+/// a per-pass threshold and ends far beyond it) can still allocate without
+/// limit before the calling loop ever inspects it. Reading via `fill_buf`/
+/// `consume` directly means a line longer than `max_line_bytes` is never
+/// appended to `buf` past the cap — bytes beyond it are scanned for `\n` and
+/// dropped immediately, bounding this function's own resident memory to
+/// `max_line_bytes` (plus one `BufRead` internal buffer) no matter how long
+/// the real line is.
+fn read_line_bounded(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    max_line_bytes: usize,
+) -> std::io::Result<LineRead> {
+    let mut total: usize = 0;
+    let mut oversized = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if total == 0 {
+                LineRead::Eof
+            } else {
+                LineRead::Partial
+            });
+        }
+
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let take = newline_pos.map_or(available.len(), |pos| pos + 1);
+
+        if !oversized {
+            if total + take > max_line_bytes {
+                oversized = true;
+            } else {
+                buf.extend_from_slice(&available[..take]);
+            }
+        }
+
+        total += take;
+        reader.consume(take);
+
+        if newline_pos.is_some() {
+            return Ok(if oversized {
+                LineRead::Oversized { bytes: total }
+            } else {
+                LineRead::Complete { bytes: total }
+            });
+        }
+        // No `\n` in this fill_buf window yet; loop for more data (buffering
+        // normally, or discarding once `oversized` is set).
+    }
+}
+
 /// Read at most one bounded chunk of `path` starting at `start_offset`, one
 /// complete line at a time via a buffered reader — never allocating more than
-/// the file's current line. A partial trailing line (no terminating `\n`) is
-/// left for the next call.
+/// `limits.max_line_bytes` for any single line. A partial trailing line (no
+/// terminating `\n`) is left for the next call.
 ///
-/// The first complete line of a pass is always consumed even if it alone
-/// exceeds `limits.max_bytes_per_pass`, so an unusually long single line
-/// cannot livelock the pass.
+/// A complete line whose buffered size would exceed `limits.max_line_bytes`
+/// is rejected outright: it is never parsed, its bytes are counted and the
+/// offset advances past it (so ingestion does not wedge on it forever), and
+/// a `tracing::warn!` names the file and starting byte offset so an operator
+/// can find and inspect it (PACKSESSION-AUD-003 — no silent coercion).
 fn read_bounded_chunk(
     path: &Path,
     start_offset: u64,
@@ -187,11 +289,12 @@ fn read_bounded_chunk(
     let mut line = Vec::new();
     let mut events = Vec::new();
     let mut scanned: u64 = 0;
+    let mut lines_consumed: u64 = 0;
     let mut new_offset = start_offset;
     let mut bytes_this_pass: usize = 0;
 
     loop {
-        if scanned > 0
+        if lines_consumed > 0
             && (bytes_this_pass >= limits.max_bytes_per_pass
                 || events.len() >= limits.max_events_per_pass)
         {
@@ -199,37 +302,49 @@ fn read_bounded_chunk(
         }
 
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break; // EOF
-        }
-        if !line.ends_with(b"\n") {
-            break; // partial trailing line: leave for the next pass
-        }
+        let line_offset = new_offset;
 
-        new_offset += read as u64;
-        bytes_this_pass += read;
-        let line_start = new_offset - read as u64;
-
-        let raw = String::from_utf8_lossy(&line[..line.len() - 1]);
-        if raw.is_empty() {
-            continue; // blank line: bytes consumed, but not counted as scanned
-        }
-
-        match source {
-            LineTailSource::ClaudeCode => {
-                if let Some(ev) = parse::parse_cc_line(&raw) {
-                    events.push(ev);
-                }
+        match read_line_bounded(&mut reader, &mut line, limits.max_line_bytes)? {
+            LineRead::Eof => break,
+            LineRead::Partial => break, // leave partial trailing line for next pass
+            LineRead::Oversized { bytes } => {
+                tracing::warn!(
+                    path = %path.display(),
+                    offset = line_offset,
+                    line_bytes = bytes,
+                    max_line_bytes = limits.max_line_bytes,
+                    "session mirror: skipping oversized JSONL line"
+                );
+                new_offset += bytes as u64;
+                bytes_this_pass += bytes;
+                lines_consumed += 1;
             }
-            LineTailSource::Codex => {
-                let sid = codex_session_id.unwrap_or("");
-                if let Some(ev) = parse::parse_codex_line(&raw, sid, line_start) {
-                    events.push(ev);
+            LineRead::Complete { bytes } => {
+                new_offset += bytes as u64;
+                bytes_this_pass += bytes;
+                lines_consumed += 1;
+
+                let raw = String::from_utf8_lossy(&line[..line.len() - 1]);
+                if raw.is_empty() {
+                    continue; // blank line: bytes consumed, but not counted as scanned
                 }
+
+                match source {
+                    LineTailSource::ClaudeCode => {
+                        if let Some(ev) = parse::parse_cc_line(&raw) {
+                            events.push(ev);
+                        }
+                    }
+                    LineTailSource::Codex => {
+                        let sid = codex_session_id.unwrap_or("");
+                        if let Some(ev) = parse::parse_codex_line(&raw, sid, line_offset) {
+                            events.push(ev);
+                        }
+                    }
+                }
+                scanned += 1;
             }
         }
-        scanned += 1;
     }
 
     Ok(MirrorChunk {
@@ -256,7 +371,9 @@ async fn mirror_file_with_limits(
             ))
         })?;
 
-    if chunk.scanned == 0 {
+    if chunk.new_offset == start_offset {
+        // Nothing was consumed this pass (EOF, or only a partial trailing
+        // line was seen) — there is no advanced cursor to persist.
         return Ok(MirrorStats {
             inserted: 0,
             scanned: 0,
@@ -265,10 +382,14 @@ async fn mirror_file_with_limits(
     }
 
     if chunk.events.is_empty() {
-        // Apply cursor update even when there are no parseable events so we
-        // don't re-read the same bytes on the next call. A failure here must
-        // propagate — silently swallowing it would let the cursor and the
-        // already-consumed bytes drift apart.
+        // Apply cursor update even when there are no parseable events — e.g.
+        // a chunk made entirely of blank lines, unparseable lines, or
+        // skipped oversized lines — so we don't re-read the same bytes on
+        // the next call. `chunk.new_offset > start_offset` here (checked
+        // above), so real bytes were durably consumed even though
+        // `chunk.scanned` may be 0. A failure here must propagate — silently
+        // swallowing it would let the cursor and the already-consumed bytes
+        // drift apart.
         write_cursor_only(runtime, path, &None, chunk.new_offset).await?;
         return Ok(MirrorStats {
             inserted: 0,
@@ -288,6 +409,32 @@ async fn mirror_file_with_limits(
     .await
 }
 
+/// Default ceiling on the byte length of a ChatGPT export `conversations.json`
+/// file read in one [`mirror_chatgpt_export_file`] pass. Overridable via
+/// `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (see [`chatgpt_max_bytes`]).
+///
+/// Unlike the JSONL line-tail sources, a ChatGPT export has no incremental
+/// "new bytes" boundary — it is always read and parsed whole (see the
+/// function doc below) — so this is a ceiling on the *entire file*, not a
+/// per-pass delta. An export over this size is skipped for that pass
+/// (loudly logged via `tracing::warn!`, never a crash or an unbounded
+/// `read_to_string`), and the cursor is left untouched so the oversized
+/// source keeps being retried — and re-warned — on every later tick instead
+/// of silently dropping forever (PACKSESSION-AUD-003).
+const DEFAULT_CHATGPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Resolve the ChatGPT export size ceiling from `KHIVE_MIRROR_CHATGPT_MAX_BYTES`,
+/// falling back to [`DEFAULT_CHATGPT_MAX_BYTES`] for missing, non-numeric, or
+/// zero values (a zero ceiling would skip every export unconditionally,
+/// which is never useful, so it is treated the same as unset).
+fn chatgpt_max_bytes() -> u64 {
+    std::env::var("KHIVE_MIRROR_CHATGPT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CHATGPT_MAX_BYTES)
+}
+
 /// Read the whole ChatGPT export `conversations.json` at `path`, parse every
 /// conversation's mapping tree via [`parse::parse_chatgpt_export`], and upsert
 /// every message-bearing event idempotently into the session mirror tables in
@@ -301,10 +448,28 @@ async fn mirror_file_with_limits(
 /// length only after a successful parse and commit — any IO, parse, or DB
 /// error leaves the persisted cursor untouched, so a partially-downloaded
 /// export is retried whole on the next tick, never half-consumed.
+///
+/// Before reading, the file is checked against [`chatgpt_max_bytes`]: an
+/// export over that ceiling is skipped (warn-logged) without ever calling
+/// `read_to_string`, so a very large export cannot materialize its full
+/// content (and, downstream, a full `Vec` of parsed events) in one pass.
 pub async fn mirror_chatgpt_export_file(
     runtime: &KhiveRuntime,
     path: &Path,
     start_offset: u64,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_chatgpt_export_file_with_max_bytes(runtime, path, start_offset, chatgpt_max_bytes())
+        .await
+}
+
+/// Implementation behind [`mirror_chatgpt_export_file`], taking an explicit
+/// `max_bytes` ceiling so tests can exercise the oversized-skip path without
+/// a giant fixture or racing on process-global environment variables.
+async fn mirror_chatgpt_export_file_with_max_bytes(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    max_bytes: u64,
 ) -> Result<MirrorStats, RuntimeError> {
     let file_len = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
         RuntimeError::Internal(format!(
@@ -313,6 +478,20 @@ pub async fn mirror_chatgpt_export_file(
     })?;
 
     if file_len <= start_offset {
+        return Ok(MirrorStats {
+            inserted: 0,
+            scanned: 0,
+            new_offset: start_offset,
+        });
+    }
+
+    if file_len > max_bytes {
+        tracing::warn!(
+            path = %path.display(),
+            file_bytes = file_len,
+            max_bytes,
+            "session mirror: skipping oversized ChatGPT export (exceeds KHIVE_MIRROR_CHATGPT_MAX_BYTES)"
+        );
         return Ok(MirrorStats {
             inserted: 0,
             scanned: 0,
@@ -818,6 +997,7 @@ mod tests {
         let limits = MirrorLimits {
             max_bytes_per_pass: cap_bytes,
             max_events_per_pass: 1024,
+            max_line_bytes: MIRROR_MAX_LINE_BYTES,
         };
 
         let stats1 =
@@ -889,6 +1069,193 @@ mod tests {
         .expect("fourth pass at EOF");
         assert_eq!(stats4.inserted, 0);
         assert_eq!(stats4.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_line_is_skipped_and_offset_advances() {
+        // Regression for PACKSESSION-AUD-003 (High): a single complete line
+        // larger than `max_line_bytes` must never be fully buffered and
+        // parsed — it must be rejected outright, with the offset advancing
+        // past it so ingestion does not wedge, and surrounding valid lines
+        // in the same pass still land.
+        let (rt, _dir) = setup().await;
+
+        let small1 = user_line("uuid-small1", "sess-OV", "ok");
+        let huge_text = "x".repeat(2000);
+        let huge = user_line("uuid-huge", "sess-OV", &huge_text);
+        let small2 = user_line("uuid-small2", "sess-OV", "after");
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        writeln!(file, "{small1}").unwrap();
+        writeln!(file, "{huge}").unwrap();
+        writeln!(file, "{small2}").unwrap();
+        let path = file.path().to_path_buf();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let max_line_bytes: usize = 256;
+        assert!(
+            huge.len() + 1 > max_line_bytes,
+            "fixture huge line must exceed the cap"
+        );
+        assert!(
+            small1.len() + 1 < max_line_bytes && small2.len() + 1 < max_line_bytes,
+            "fixture small lines must fit under the cap"
+        );
+
+        let limits = MirrorLimits {
+            max_bytes_per_pass: MIRROR_MAX_BYTES_PER_PASS,
+            max_events_per_pass: MIRROR_MAX_EVENTS_PER_PASS,
+            max_line_bytes,
+        };
+
+        let stats =
+            mirror_file_with_limits(&rt, &path, 0, LineTailSource::ClaudeCode, None, limits)
+                .await
+                .expect("mirror with a small line cap");
+
+        assert_eq!(stats.inserted, 2, "only the two small lines are inserted");
+        assert_eq!(
+            stats.scanned, 2,
+            "the oversized line must not count toward scanned"
+        );
+        assert_eq!(
+            stats.new_offset, file_len,
+            "offset must advance past the oversized line, not wedge on it"
+        );
+        assert_eq!(count_rows(&rt, "session_messages").await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_line_just_under_cap_then_oversized_next_line_is_bounded() {
+        // Regression for PACKSESSION-AUD-003 (High): the old bound only
+        // checked the pass cap before reading another line, so a line that
+        // starts under the cap but is followed by one that balloons far
+        // beyond it could still get fully buffered via `read_until` before
+        // any check ran. The per-line bound must catch this regardless of
+        // where in the pass it happens.
+        let (rt, _dir) = setup().await;
+
+        let max_line_bytes: usize = 256;
+        let shell_len = user_line("uuid-a", "sess-BND", "").len() + 1; // + '\n'
+        let pad = max_line_bytes.saturating_sub(shell_len).saturating_sub(4);
+        let text_a = "y".repeat(pad);
+        let line_a = user_line("uuid-a", "sess-BND", &text_a);
+
+        let huge_text = "z".repeat(max_line_bytes * 4);
+        let line_b = user_line("uuid-b", "sess-BND", &huge_text);
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        writeln!(file, "{line_a}").unwrap();
+        writeln!(file, "{line_b}").unwrap();
+        let path = file.path().to_path_buf();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        assert!(
+            line_a.len() + 1 < max_line_bytes,
+            "fixture line A must land just under the cap"
+        );
+        assert!(
+            line_b.len() + 1 > max_line_bytes,
+            "fixture line B must land over the cap"
+        );
+
+        let limits = MirrorLimits {
+            max_bytes_per_pass: MIRROR_MAX_BYTES_PER_PASS,
+            max_events_per_pass: MIRROR_MAX_EVENTS_PER_PASS,
+            max_line_bytes,
+        };
+
+        let stats =
+            mirror_file_with_limits(&rt, &path, 0, LineTailSource::ClaudeCode, None, limits)
+                .await
+                .expect("mirror with a boundary line cap");
+
+        assert_eq!(stats.inserted, 1, "only the under-cap line is inserted");
+        assert_eq!(
+            stats.scanned, 1,
+            "the oversized line must not count toward scanned"
+        );
+        assert_eq!(
+            stats.new_offset, file_len,
+            "offset must advance past both lines, including the skipped oversized one"
+        );
+        assert_eq!(count_rows(&rt, "session_messages").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_large_run_of_blank_lines_is_bounded_and_persists_cursor() {
+        // Regression for PACKSESSION-AUD-003 (Medium): a run of blank lines
+        // used to bypass the pass cap (only nonblank `scanned` lines tripped
+        // it) and, when a chunk scanned zero events, the cursor was never
+        // persisted even though bytes had durably advanced. Both must be
+        // fixed: the cap must trip on blank lines too, and the cursor must
+        // be written whenever the pass consumed any bytes.
+        let (rt, _dir) = setup().await;
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        for _ in 0..500 {
+            writeln!(file).unwrap(); // blank line: just "\n"
+        }
+        let path = file.path().to_path_buf();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(file_len, 500, "500 one-byte blank lines");
+
+        // A tiny per-pass byte cap forces the blank-line run across multiple
+        // passes instead of reading straight to EOF in one call.
+        let limits = MirrorLimits {
+            max_bytes_per_pass: 50,
+            max_events_per_pass: MIRROR_MAX_EVENTS_PER_PASS,
+            max_line_bytes: MIRROR_MAX_LINE_BYTES,
+        };
+
+        let stats1 =
+            mirror_file_with_limits(&rt, &path, 0, LineTailSource::ClaudeCode, None, limits)
+                .await
+                .expect("first blank-line pass");
+
+        assert_eq!(stats1.inserted, 0);
+        assert_eq!(stats1.scanned, 0, "blank lines never count toward scanned");
+        assert!(
+            stats1.new_offset > 0,
+            "the pass cap must trip after at least one blank line, not read unbounded"
+        );
+        assert!(
+            stats1.new_offset < file_len,
+            "a bounded pass over an all-blank file must not reach EOF in one call"
+        );
+
+        // The cursor must be durably persisted even though `scanned == 0`.
+        let stored_offset = cursor_offset(&rt, &path.to_string_lossy()).await;
+        assert_eq!(
+            stored_offset,
+            Some(stats1.new_offset as i64),
+            "cursor must be persisted even when the pass scanned zero events"
+        );
+
+        // Repeated calls continue from the persisted offset (not from 0) and
+        // eventually reach EOF, never re-reading already-consumed blanks.
+        let mut offset = stats1.new_offset;
+        loop {
+            let stats = mirror_file_with_limits(
+                &rt,
+                &path,
+                offset,
+                LineTailSource::ClaudeCode,
+                None,
+                limits,
+            )
+            .await
+            .expect("subsequent blank-line pass");
+            assert_eq!(stats.inserted, 0);
+            if stats.new_offset == offset {
+                break; // EOF reached, no further progress
+            }
+            offset = stats.new_offset;
+        }
+        assert_eq!(
+            offset, file_len,
+            "all blank lines eventually consumed to EOF"
+        );
     }
 
     #[tokio::test]
@@ -1619,6 +1986,42 @@ mod tests {
             seeded_messages,
             "no new message rows on parse failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_export_over_max_bytes_is_skipped_without_reading() {
+        // Regression for PACKSESSION-AUD-003 (Medium, "adjacent unbounded
+        // external-file path"): an export over the configured ceiling must
+        // be skipped (not `read_to_string`'d, not parsed, not erroring) and
+        // the cursor must stay untouched so the oversized source is retried
+        // — and re-warned — on the next tick rather than silently dropped.
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file("[]");
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let max_bytes = 1u64; // smaller than even an empty-array export
+        assert!(
+            file_len > max_bytes,
+            "fixture export must exceed the tiny ceiling"
+        );
+
+        let stats = mirror_chatgpt_export_file_with_max_bytes(&rt, &path, 0, max_bytes)
+            .await
+            .expect("an oversized export must be skipped, not error");
+
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.scanned, 0);
+        assert_eq!(
+            stats.new_offset, 0,
+            "cursor must not advance past a skipped oversized export"
+        );
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            None,
+            "no cursor row should be written for a skipped pass"
+        );
+        assert_eq!(count_rows(&rt, "sessions").await, 0);
+        assert_eq!(count_rows(&rt, "session_messages").await, 0);
     }
 
     #[tokio::test]

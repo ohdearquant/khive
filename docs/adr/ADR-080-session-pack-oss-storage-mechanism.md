@@ -317,7 +317,8 @@ array of conversation objects, each carrying a `mapping` of message nodes formin
 
 #### Configuration
 
-All configuration is environment-driven, read once when `warm()` starts the service:
+Most configuration is environment-driven, read once into `MirrorConfig` when `warm()`
+starts the service:
 
 | Variable                       | Default                  |
 | ------------------------------ | ------------------------ |
@@ -329,6 +330,14 @@ All configuration is environment-driven, read once when `warm()` starts the serv
 | `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports` |
 | `KHIVE_MIRROR_POLL_SECS`       | `2`                      |
 | `KHIVE_MIRROR_BACKFILL`        | `true`                   |
+
+`KHIVE_MIRROR_CHATGPT_MAX_BYTES` (default `268435456`, 256 MiB) is read separately, per
+pass, by `mirror_chatgpt_export_file` itself rather than through `MirrorConfig`. It is a
+hard ceiling on a `conversations.json` export's _whole_ file length (whole-file ingestion
+has no incremental delta to bound the way the line-tail sources do): an export over the
+ceiling is skipped for that pass — `tracing::warn!`-logged, never `read_to_string`'d — and
+its cursor is left untouched, so it is retried (and re-warned) on every later tick rather
+than silently dropped forever. A zero or non-numeric value falls back to the default.
 
 #### What remains out of scope
 
