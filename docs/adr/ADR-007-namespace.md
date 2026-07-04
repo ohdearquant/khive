@@ -25,18 +25,24 @@ isolation. Rule 8 leaves the Rev 6 amendment to Rule 0, and every other rule, un
 
 ## Context (Rev 7 addition)
 
+_(Fact-refreshed 2026-07-04: this Context was authored 2026-06-19 against a codebase where
+issue #75 had not yet landed. It has since shipped — see ADR-063 "Current State" for the
+shipped behavior. The paragraph below is retained for the design rationale that motivated
+Rule 8; it no longer describes the current runtime.)_
+
 ADR-057 resolved the comm pack's party-line inbox problem by implementing actor-addressed
 delivery within the shared "local" namespace: both copies of a message stay in the caller's
 namespace, and `comm.inbox` filters by `to_actor` when the caller's actor label is not
 "local". This is correct for the current single-machine, single-namespace OSS deployment.
 
-However, ADR-057 also identified issue #75 (actor identity on every request) as the
-prerequisite for per-actor inbox filtering to work when multiple lambdas share the "local"
-namespace. The current code reads the actor label from `token.namespace().as_str()`, which
-is "local" for every undecorated MCP session, causing the `to_actor` filter to be skipped
-(the `caller_actor != "local"` branch in `handle_inbox` is dormant for the default
-deployment). Party-line inbox leakage therefore persists for the common case until issue
-#75 lands.
+At the time of drafting, ADR-057 had also identified issue #75 (actor identity on every
+request) as the prerequisite for per-actor inbox filtering to work when multiple lambdas
+share the "local" namespace: the code read the actor label from `token.namespace().as_str()`,
+which was "local" for every undecorated MCP session, causing the `to_actor` filter to be
+skipped. Issue #75 has since shipped (commit `f1061d27`): `RuntimeConfig` now carries an
+`actor_id` field and the comm handlers read `token.actor().id` directly. PR #213 (commit
+`091231cd`) additionally closed the anonymous-caller leak by making the `to_actor` filter
+unconditional. Full detail in ADR-063 "Current State."
 
 A second, larger issue is cross-machine delivery. Lambda-to-lambda coordination across
 machines or sandboxes — the roadmap item Ocean identified — requires a transport that is
@@ -104,10 +110,12 @@ The following constraints apply:
 
 6. **Actor identity plumbing is a shared prerequisite.** For both the local view-layer
    scope and the remote authenticated broker to work correctly, the runtime must carry a
-   distinct actor identity per caller beyond the namespace string. This is tracked in issue
-   #75 and the forthcoming ADR-053 implementation. Until that lands, the local view-layer
-   scope for comm is dormant for callers whose actor label is "local" (the undecorated
-   default).
+   distinct actor identity per caller beyond the namespace string. This shipped as issue #75
+   (commit `f1061d27`); `RuntimeConfig.actor_id` and the token-mint sites now carry a
+   configured `ActorRef` per lambda, falling back to `ActorRef::anonymous()`'s `"local"` id
+   for undecorated callers. The forthcoming ADR-053 implementation is the broader
+   ActorStore/SessionStore extension of this same identity model, not the prerequisite for
+   the local view-layer scope, which is already active (see ADR-063 "Current State").
 
 **The comm pack is the first pack invoking this carve-out.** Its isolation contract is
 specified in ADR-063.
@@ -166,7 +174,9 @@ specified in ADR-063.
 - ADR-063 — Comm Pack Principal Model and Remote Backend Isolation; the pack ADR that this
   rule authorizes.
 - Issue #75 — Actor identity on every request; the prerequisite for the local view-layer
-  scope to activate in the shared namespace.
+  scope to activate in the shared namespace. SHIPPED, commit `f1061d27`.
+- PR #213 (issues #199/#200) — closed the anonymous-caller inbox leak by making the
+  `to_actor` filter unconditional; commit `091231cd`.
 
 ---
 

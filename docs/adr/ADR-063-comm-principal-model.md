@@ -14,6 +14,11 @@ ADR-057 (Comm Actor-Addressed Delivery) | ADR-053 (ActorStore / SessionStore —
 
 ## Context
 
+_(Historical: this Context section, and the "Current State / Bug" code excerpt originally
+following it, describe the codebase as of 2026-06-19, before issue #75 and PR #213 shipped.
+See "Current State (fact-refreshed 2026-07-04)" below for the shipped behavior. Retained here
+for the design rationale that motivated the Decision section.)_
+
 ### The inbox leakage problem
 
 The comm pack stores messages in the shared "local" SQLite namespace alongside all other pack
@@ -78,49 +83,76 @@ surface. The pack interface (`comm.send`, `comm.inbox`, `comm.reply`, `comm.thre
 
 ---
 
-## Current State / Bug
+## Current State (fact-refreshed 2026-07-04 against shipped `main`)
 
-The following lines document the current behavior that produces the inbox leak. They are quoted
-from the shipped source as of 2026-06-19 and represent the state before issue #75 lands.
+This ADR was drafted on 2026-06-19 against a codebase that lacked actor identity plumbing.
+Both Step 1 and Step 2 below have since shipped. This section describes the state as of
+`main`, superseding the original "Current State / Bug" framing that described a still-open
+issue #75. The Decision and Alternatives sections were authored against the pre-fix state and
+are retained below for their design rationale; the Migration and Sequencing section (§5) has
+been updated to mark Steps 1-2 as shipped.
 
-**`crates/khive-pack-comm/src/handlers.rs`, `handle_inbox`, lines 131 and 160:**
-
-```rust
-let caller_actor = token.namespace().as_str().to_string();
-// ...
-if caller_actor != "local" {
-    property_filters.push(PropertyFilter {
-        json_path: "$.to_actor".to_string(),
-        op: FilterOp::EqOrMissing,
-        value: SqlValue::Text(caller_actor.clone()),
-    });
-}
-```
-
-The actor label is derived from `token.namespace().as_str()`. In the default deployment,
-every session's namespace is `"local"`, so `caller_actor == "local"` and the `to_actor`
-filter is skipped. All inbound messages in the "local" namespace are returned to every caller.
-
-**`crates/khive-pack-comm/src/handlers.rs`, `handle_send`, lines 72-74:**
+Issue #75 landed in commit `f1061d27` ("thread authenticated actor identity into request
+token"). `RuntimeConfig` (`crates/khive-runtime/src/config.rs:267`) now carries:
 
 ```rust
-let caller_ns = token.namespace().as_str().to_string();
-let from_actor = caller_ns.clone();
-let to_actor = p.to.trim().to_string();
+pub actor_id: Option<String>,
 ```
 
-`from_actor` is set to the namespace string. For every undecorated session, `from_actor` is
-`"local"`. Messages sent by `lambda:khive` and `lambda:leo` within a default deployment are
-both stamped `from_actor="local"`, making sender attribution ineffective.
+populated from the `KHIVE_ACTOR` environment variable or `[actor] id` in `khive.toml`
+(`config.rs:316-318`, `config.rs:479`). At token-mint time (`crates/khive-runtime/src/pack.rs`
+and `runtime.rs:423-425`), the runtime builds the `ActorRef` from this field:
 
-**`crates/khive-runtime/src/config.rs`, `RuntimeConfig` struct:**
+```rust
+let actor = match self.config.actor_id.as_deref() {
+    Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
+    _ => ActorRef::anonymous(),
+};
+```
 
-`RuntimeConfig` has no `actor_id` field. The token carries an `ActorRef` (line 77) but the
-`mint_authorized` constructor takes an `ActorRef::anonymous()` everywhere the token is minted
-in the current code. There is no per-lambda authenticated principal in the token at this time.
+`ActorRef::anonymous()` (`crates/khive-gate/src/actor.rs:65`) still resolves to
+`id: "local"` when no actor is configured, so the undecorated single-actor deployment keeps
+its original behavior. The comm handlers no longer derive the caller's actor label from the
+namespace string; they read it directly off the token:
 
-The fix for the leak — making the `to_actor` filter activate — requires the token to carry a
-distinct, non-`"local"` actor label per lambda. That is issue #75.
+**`crates/khive-pack-comm/src/handlers.rs`, `handle_inbox` (line 154):**
+
+```rust
+let caller_actor = token.actor().id.clone();
+```
+
+**`crates/khive-pack-comm/src/handlers.rs`, `handle_send` (line 77):**
+
+```rust
+let from_actor = token.actor().id.clone();
+```
+
+Sender attribution (`from_actor`) is therefore effective for any deployment that configures
+`actor_id`; it degrades to `"local"` only in the undecorated default, which is the documented
+degenerate case, not a bug.
+
+Commit `091231cd` ("close anonymous inbox read leak and warn on unattributed addressed send",
+issues #199/#200, PR #213) then removed the `if caller_actor != "local"` conditional entirely.
+The `to_actor` filter in `handle_inbox` is now unconditional
+(`crates/khive-pack-comm/src/handlers.rs:188-192`):
+
+```rust
+property_filters.push(PropertyFilter {
+    json_path: "$.to_actor".to_string(),
+    op: FilterOp::EqOrMissing,
+    value: SqlValue::Text(caller_actor.clone()),
+});
+```
+
+For an anonymous caller (`caller_actor == "local"`), this applies `EqOrMissing("local")`
+instead of skipping the filter, so the caller sees only party-line messages (`to_actor` equal
+to `"local"` or absent). This closes the #199 multi-actor read leak described in this ADR's
+original "Current State / Bug" section: an anonymous caller can no longer read messages
+explicitly addressed to a different configured actor.
+
+This state supersedes the "dormant until issue #75 lands" framing throughout the rest of this
+document. Where later sections describe the filter as forward-deployed-but-inactive, read
+that as historical context for the design decision, not the current runtime behavior.
 
 ---
 
@@ -136,10 +168,13 @@ The principal model has two implementations, selected by the backend the comm pa
 
 **1a. Local SQLite backend (current, degenerate):**
 
-Principal identity is the actor label derived from the runtime context. The actor label is
-currently `token.namespace().as_str()` — a proxy that collapses when multiple actors share the
-same namespace. The per-actor inbox filter (`to_actor`) is forward-deployed but dormant until
-issue #75 lands and the token carries a distinct actor identity per lambda.
+Principal identity is the actor label derived from the runtime context. As shipped
+(`f1061d27`, `091231cd` — see "Current State" above), the actor label is `token.actor().id`,
+sourced from `RuntimeConfig.actor_id` (configured via `KHIVE_ACTOR` / `[actor] id`) and
+falling back to `ActorRef::anonymous()`'s `"local"` id when unconfigured. The per-actor inbox
+filter (`to_actor`) is active unconditionally: configured actors see only messages addressed
+to them (plus legacy messages with no `to_actor`), and anonymous (`"local"`) callers see only
+party-line messages, closing the multi-actor read leak that motivated this ADR.
 
 This implementation is correctness-for-now. It is explicitly NOT a security boundary. Any
 process with SQLite store access can read any message row regardless of the `to_actor`
@@ -196,40 +231,40 @@ ADR-028's multi-backend machinery landing first; the remote broker work is separ
 
 ### 5. Migration and sequencing
 
-The work to close the inbox leak and enable remote delivery proceeds in three steps:
+The work to close the inbox leak and enable remote delivery proceeds in three steps. Steps 1
+and 2 are SHIPPED (fact-refreshed 2026-07-04); only Step 3 remains future work.
 
-**Step 1 — Actor identity plumbing (issue #75, prerequisite for both Step 2 and Step 3):**
+**Step 1 — Actor identity plumbing (issue #75, prerequisite for both Step 2 and Step 3):
+SHIPPED (commit `f1061d27`).**
 
-The `NamespaceToken` must carry a distinct, non-anonymous `ActorRef` per lambda. This requires
-`RuntimeConfig` to gain an `actor_id` field (or equivalent) that is populated from the
-`[actor] id` configuration and threaded through `VerbRegistry::dispatch` into the token at
-mint time. Until this lands, the `caller_actor == "local"` condition in `handle_inbox` is
-always true and the `to_actor` filter cannot activate.
+The `NamespaceToken` now carries a distinct, non-anonymous `ActorRef` per lambda when
+configured. `RuntimeConfig` gained an `actor_id: Option<String>` field
+(`crates/khive-runtime/src/config.rs:267`), populated from `KHIVE_ACTOR` / `[actor] id` and
+threaded through the token-mint sites in `runtime.rs` and `pack.rs` into the `ActorRef`.
 
-Changes implied by Step 1:
+Changes landed as Step 1:
 
-- `RuntimeConfig`: add `actor_id: Option<String>` or equivalent.
-- `VerbRegistry::dispatch` (or the token mint site): populate `ActorRef` from `actor_id`
-  rather than always `ActorRef::anonymous()`.
-- `comm` handlers: derive actor label from `token.actor().id` when it is non-anonymous,
-  falling back to `token.namespace().as_str()` for undecorated sessions (backward
-  compatibility).
+- `RuntimeConfig`: `actor_id: Option<String>` (`config.rs:267`).
+- Token-mint sites (`runtime.rs:423-425`, `pack.rs:854-856, 898-900, 990-992`): populate
+  `ActorRef::new("actor", id)` from `actor_id` when configured, else `ActorRef::anonymous()`.
+- `comm` handlers: derive actor label from `token.actor().id` directly
+  (`handlers.rs:77, 154`) rather than from `token.namespace().as_str()`.
 
-Step 1 is shared infrastructure. It is not comm-specific. The comm pack is the primary
-beneficiary for inbox filtering, but the actor identity is useful for attribution across all
-packs (ADR-053).
+Step 1 shipped as shared infrastructure, not comm-specific — the actor identity is available
+for attribution across all packs, per the original design intent (ADR-053).
 
-**Step 2 — Local inbox scope (fix the leak):**
+**Step 2 — Local inbox scope (fix the leak): SHIPPED (commit `091231cd`, PR #213, issues
+#199/#200).**
 
-Once Step 1 is in place, the `comm.inbox` filter activates automatically: `caller_actor` is
-no longer always `"local"`, and messages addressed to a specific actor are returned only to
-that actor. No additional code change is required in the handlers beyond Step 1. The
-`to_actor` filter, the `idx_comm_message_to_actor` index, and the `EqOrMissing` filter are
-already forward-deployed in the current code.
+The `comm.inbox` filter is active: `caller_actor` is `token.actor().id`, and messages
+addressed to a specific configured actor are returned only to that actor. PR #213 additionally
+made the `to_actor` filter unconditional (removed the `if caller_actor != "local"` gate), so
+even anonymous (`"local"`) callers now get an explicit `EqOrMissing("local")` scope rather than
+an unfiltered read — closing the #199 multi-actor read leak on the anonymous path as well.
 
 This resolves the inbox leak for the single-machine deployment. The security model remains
 the local view-layer filter (not a security boundary for adversarial principals, but adequate
-for co-located, cooperating lambdas).
+for co-located, cooperating lambdas), per Decision §1a above.
 
 **Step 3 — Remote broker backend (cross-machine delivery):**
 
@@ -240,10 +275,9 @@ The remote broker backend is a future implementation. It requires:
 - Pack-scoped backend configuration (ADR-028 multi-backend machinery or an equivalent).
 - The same `comm.*` verb surface, unchanged. Callers do not change; only the backend changes.
 
-Step 3 is blocked on Step 1 (actor identity must exist before it can be used as an
-authentication credential basis) and on the transport ADR (which specifies the credential
-format and broker protocol). It is NOT blocked on Step 2; the local fix and remote broker
-can be developed in parallel once Step 1 lands.
+Step 1 has shipped, satisfying that prerequisite. Step 3 remains blocked on the transport ADR
+(which specifies the credential format and broker protocol) and is otherwise unblocked. It was
+never blocked on Step 2; the local fix and remote broker can be developed independently.
 
 ### 6. Pack verb surface
 
@@ -258,8 +292,9 @@ observe the same behavior.
 
 ### Positive
 
-- The party-line inbox leak has a documented root cause (missing actor identity in the token)
-  and a clear fix path (Step 1 above), rather than being an architectural ambiguity.
+- The party-line inbox leak had a documented root cause (missing actor identity in the token)
+  and a clear fix path (Step 1 above), rather than being an architectural ambiguity; both the
+  root-cause fix (Step 1, `f1061d27`) and the leak closure (Step 2, `091231cd`) have shipped.
 - The remote broker roadmap item is specified at the ADR level: the isolation contract, the
   sequencing, and the relationship to existing ADRs are all written down.
 - ADR-007's "namespace = attribution, not isolation" claim is preserved for the shared
@@ -272,8 +307,9 @@ observe the same behavior.
   scope for the remote broker. Contributors must read this ADR to understand which applies.
 - The local model is not a security boundary. This must be documented clearly in operational
   documentation and communicated to any deployment that co-locates mutually untrusting lambdas.
-- Step 1 (issue #75) is a prerequisite that spans multiple packs and the runtime dispatch path.
-  Until it lands, the inbox leak persists.
+- Step 1 (issue #75) spanned multiple packs and the runtime dispatch path; this has shipped
+  (`f1061d27`), so this is no longer an open dependency for Step 2. Step 3 remains dependent on
+  the transport ADR (OQ-1).
 
 ---
 
@@ -354,16 +390,18 @@ The correct choice depends on the broker technology selected for Step 3. This is
 transport ADR. The isolation contract (per-principal scope, server-enforced) is specified here;
 the physical layout is not.
 
-### OQ-3: Legacy message visibility under Step 2
+### OQ-3: Legacy message visibility under Step 2 — RESOLVED as shipped (commit `091231cd`, PR #213)
 
-When Step 1 lands and the `to_actor` filter activates, messages written before Step 1 have no
-`to_actor` field (or have `to_actor="local"` from the stub label). ADR-057 Q3 noted this:
-the `EqOrMissing` filter makes such messages visible to any caller whose actor label matches
-OR where the field is absent. Whether existing party-line messages should be backfilled with
-`to_actor="local"` (to make them visible in single-actor fallback inboxes) or declared
-out-of-scope for actor-scoped inboxes requires Ocean's decision before the Step 2 migration
-story is finalized. This is the same open question as ADR-057 Q3; it is repeated here because
-its answer gates the data migration plan for Step 2.
+This was originally posed as an open question for Ocean's ruling (same question as ADR-057
+Q3): whether legacy messages without a `to_actor` field should be backfilled with
+`to_actor="local"` or declared out-of-scope for actor-scoped inboxes. It was resolved by
+implementation rather than by a separate backfill decision. The shipped `EqOrMissing` filter
+(`handlers.rs:188-192`) makes messages with no `to_actor` field visible to any caller whose
+actor label matches the filter value, including the anonymous `"local"` caller. No backfill
+migration was performed or is required: legacy messages remain visible under the
+`EqOrMissing` semantics as originally implemented in ADR-057, and PR #213's unconditional
+filter (see "Current State" above) extends the same semantics to the anonymous path. This
+question is closed; no further Ocean decision is pending on it.
 
 ---
 
@@ -378,6 +416,15 @@ its answer gates the data migration plan for Step 2.
   this ADR: ADR-056 bridges external channels (Telegram, email) to the comm verb surface;
   this ADR specifies the lambda-to-lambda isolation contract behind that same surface.
 - ADR-057 — Comm Actor-Addressed Delivery (Accepted); the forward-deployed `to_actor` filter
-  that Step 2 activates. ADR-057 Q3 is an open question for this ADR's Step 2 migration plan.
-- Issue #75 — Actor identity on every request; Step 1.
+  that Step 2 activates. ADR-057 Q3 was resolved as shipped by PR #213 (see OQ-3 above).
+- Issue #75 — Actor identity on every request; Step 1. SHIPPED, commit `f1061d27`.
 - Issue #112 — khive-channel umbrella; Step 3 transport work.
+- PR #213 (issues #199/#200) — closed the anonymous inbox read leak by making the `to_actor`
+  filter unconditional; commit `091231cd`. Step 2 as shipped.
+- Issue #448 / PR #496 (commit `4943dbea`) — inbound email attribution on the channel-email
+  connector now requires an authenticated identity, not just a matching From header. Adjacent
+  hardening on the same actor-attribution surface this ADR describes; no design change to the
+  principal model here.
+- Commit `f816c3e6` (PR #526) — dual-write rollback atomicity fix for comm message writes.
+  Adjacent hardening on the comm pack's write path; no design change to the principal model
+  here.
