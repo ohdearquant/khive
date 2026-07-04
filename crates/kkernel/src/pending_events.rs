@@ -1070,8 +1070,48 @@ mod tests {
     /// agree. Before the fix, a bare-shorthand payload could pass write-time
     /// checks yet fail replay as an unknown verb; this asserts the *positive*
     /// case: a canonical payload produces zero dispatch failures.
+    ///
+    /// Issue #575: a single drain pass can legitimately report `failed >= 1`
+    /// for this exact payload with no logic bug involved. `claim_pending_event`
+    /// checks out the pool's single writer connection via
+    /// `WriterPool::writer()`, which is `parking_lot::Mutex::try_lock_for(
+    /// checkout_timeout)` (default 5s, `khive-db/src/pool.rs`) — a bounded
+    /// wait, not a logic gate. On a CPU-oversubscribed CI runner (`cargo test
+    /// --workspace` runs dozens of test binaries, each further parallelized,
+    /// against 2-4 physical cores), a task can be scheduled off-CPU for longer
+    /// than the checkout timeout while queued for that mutex, so the checkout
+    /// times out *before the claim's SQL `UPDATE` ever runs*: the drain loop
+    /// counts `summary.failed += 1` and the row stays in `status="pending"`,
+    /// retryable on the next cron drain. (This retryability is specific to
+    /// claim-time checkout failure. Once a claim succeeds, a later
+    /// dispatch-time error is counted as failed but the event is still
+    /// finalized — a non-repeating event is marked fired, not returned to
+    /// pending.) Confirmed live: this test passed 100/100 serial runs, 8/8
+    /// full-suite runs, and 3/3 `cargo llvm-cov` runs on a 12-core box, yet
+    /// failed on CI on a commit whose kkernel source did not change from a
+    /// passing run — the signature of scheduler contention, not a
+    /// deterministic dispatch defect.
+    ///
+    /// Rather than weakening the assertion (retries could mask a genuine
+    /// first-drain dispatch regression), remove the contention boundary
+    /// deterministically: run serially and raise the checkout timeout for
+    /// the duration of the test, keeping the original single-drain
+    /// zero-failure contract intact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
+        struct RestoreTimeout(Option<String>);
+        impl Drop for RestoreTimeout {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", v),
+                    None => std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS"),
+                }
+            }
+        }
+        let _restore = RestoreTimeout(std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok());
+        std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "120");
+
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
