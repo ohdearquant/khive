@@ -49,6 +49,11 @@ impl<T: Clone + Send + Sync + 'static> ComposePipeline<T> {
             }
 
             candidate.score = effective as f32;
+            // Carry the full f64 precision into selector ranking so rank
+            // comparisons go through the khive-score fixed-point comparators
+            // instead of re-deriving from the narrowed f32 `score` field —
+            // mirrors the RankedIndex pattern in objective/traits.rs.
+            candidate.rank_score = Some(effective);
             scored.push(candidate);
         }
         self.selector.select(scored, budget, weights)
@@ -80,6 +85,7 @@ mod tests {
             score: 0.0,
             category: None,
             information_gain: None,
+            rank_score: None,
         }
     }
 
@@ -123,6 +129,49 @@ mod tests {
             )
             .unwrap();
         assert!(out.selected.is_empty());
+    }
+
+    #[test]
+    fn compose_pipeline_ranks_correctly_within_f32_ulp_around_one() {
+        // 1.0 and 1.00000004 collapse to the identical f32 bit pattern (delta is
+        // below the f32 ulp at magnitude 1.0), but are distinct at the
+        // khive-score 2^32 fixed-point scale. Without carrying the f64
+        // `rank_score` into the selector, both candidates would tie on `score`
+        // and fall back to id ordering (picking "a"); the fix must still rank
+        // "b" ahead since its true effective score is higher.
+        let pipeline = pipeline();
+        let candidates = vec![input("a", 1.0, 1.0), input("b", 1.000_000_04, 1.0)];
+        let out = pipeline
+            .execute(
+                &AnchorGraph::new(),
+                candidates,
+                1,
+                &SelectorWeights::default(),
+                &ObjectiveContext::new(),
+            )
+            .unwrap();
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(out.selected[0].id, "b");
+    }
+
+    #[test]
+    fn compose_pipeline_ranks_score_zero_ties_deterministically() {
+        // Equal effective scores of exactly zero must still tie-break
+        // deterministically (id ascending), same as any other tie.
+        let pipeline = pipeline();
+        let candidates = vec![input("z", 0.0, 1.0), input("a", 0.0, 1.0)];
+        let out = pipeline
+            .execute(
+                &AnchorGraph::new(),
+                candidates,
+                10,
+                &SelectorWeights::default(),
+                &ObjectiveContext::new(),
+            )
+            .unwrap();
+        assert_eq!(out.selected.len(), 2);
+        assert_eq!(out.selected[0].id, "a");
+        assert_eq!(out.selected[1].id, "z");
     }
 
     #[test]

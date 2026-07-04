@@ -6,6 +6,8 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use khive_score::DeterministicScore;
+
 use crate::error::FoldError;
 
 /// A single input item to a selector operation.
@@ -31,6 +33,20 @@ pub struct SelectorInput<T> {
     /// when `SelectorWeights.epistemic_weight > 0.0`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub information_gain: Option<f32>,
+    /// Higher-precision pre-conversion effective score used for rank
+    /// comparisons, when available.
+    ///
+    /// Callers that compute the score in `f64` (e.g. `ComposePipeline`, which
+    /// multiplies an objective score by a precision weight) should set this
+    /// instead of relying solely on the narrowed `score: f32` field — ranking
+    /// widens `score` back through `DeterministicScore::from_f32` when this is
+    /// `None`, but two `f64` scores that differ by less than an `f32` ulp would
+    /// otherwise collapse to the same `f32` bit pattern before the selector
+    /// ever compares them (khive-score contract: ADR fixed-point ranking).
+    /// Does not affect `min_score` filtering or `category_weights`
+    /// multipliers, which continue to operate on `score`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rank_score: Option<f64>,
 }
 
 /// Result of a selector operation.
@@ -97,16 +113,32 @@ pub trait Selector<T>: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GreedySelector;
 
-/// Compute the base pragmatic score adjusted for epistemic weight.
+/// Widen `score` (and any `rank_score` override) into the `f64` domain used
+/// for rank-comparison arithmetic.
 ///
-/// `base` is the pragmatic score (after category-weight multipliers).
-/// `epistemic_weight * information_gain` is the epistemic bonus.
+/// `rank_score`, when present, carries the caller's full-precision effective
+/// score (e.g. `ComposePipeline`'s `objective_score * precision` in `f64`
+/// before it was narrowed to `f32` for the `score` field). Falling back to
+/// `score as f64` for plain callers (e.g. `khive-pack-knowledge`'s direct
+/// JSON-supplied candidates) is lossless — those scores were never more
+/// precise than `f32` to begin with.
 #[inline]
-fn pragmatic_plus_epistemic<T>(item: &SelectorInput<T>, epistemic_weight: f32) -> f32 {
+fn rank_base<T>(item: &SelectorInput<T>) -> f64 {
+    item.rank_score.unwrap_or(item.score as f64)
+}
+
+/// Compute the base pragmatic score adjusted for epistemic weight, in `f64`.
+///
+/// `base` is the pragmatic score (after category-weight multipliers, which
+/// still apply to `score` before this is called). `epistemic_weight *
+/// information_gain` is the epistemic bonus.
+#[inline]
+fn pragmatic_plus_epistemic<T>(item: &SelectorInput<T>, epistemic_weight: f32) -> f64 {
+    let base = rank_base(item);
     if epistemic_weight == 0.0 {
-        return item.score;
+        return base;
     }
-    item.score + epistemic_weight * item.information_gain.unwrap_or(0.0)
+    base + epistemic_weight as f64 * item.information_gain.unwrap_or(0.0) as f64
 }
 
 fn effective_score<T>(
@@ -114,7 +146,7 @@ fn effective_score<T>(
     counts: &std::collections::BTreeMap<String, usize>,
     bias: f32,
     epistemic_weight: f32,
-) -> f32 {
+) -> f64 {
     let base = pragmatic_plus_epistemic(item, epistemic_weight);
     if bias == 0.0 {
         return base;
@@ -125,7 +157,7 @@ fn effective_score<T>(
         .and_then(|c| counts.get(c))
         .copied()
         .unwrap_or(0);
-    base * (1.0 - bias * count as f32 / (count as f32 + 1.0))
+    base * (1.0 - bias as f64 * count as f64 / (count as f64 + 1.0))
 }
 
 fn validate_selector_weights(weights: &SelectorWeights) -> Result<(), FoldError> {
@@ -171,6 +203,14 @@ impl<T: Clone> Selector<T> for GreedySelector {
                     )));
                 }
             }
+            if let Some(rank_score) = input.rank_score {
+                if !rank_score.is_finite() {
+                    return Err(FoldError::InvalidInput(format!(
+                        "rank_score for '{}' must be finite",
+                        input.id
+                    )));
+                }
+            }
         }
 
         // Filter non-finite and below min_score.
@@ -193,6 +233,10 @@ impl<T: Clone> Selector<T> for GreedySelector {
         // Initial sort: effective score (pragmatic + epistemic bonus) desc, size asc, id asc —
         // deterministic across platforms. Non-finite effective scores are rejected rather
         // than silently sorted, since a checked score can still overflow to non-finite.
+        // Comparisons run through `DeterministicScore` (khive-score's i64 fixed-point
+        // contract), not raw `f32::total_cmp` — matches the objective-path ranking
+        // pattern in `objective::traits::RankedIndex` and preserves precision that a
+        // caller-supplied `rank_score` (f64) carries past what `f32` can hold.
         let mut ranked = Vec::with_capacity(inputs.len());
         for input in inputs {
             let effective = pragmatic_plus_epistemic(&input, ew);
@@ -202,11 +246,12 @@ impl<T: Clone> Selector<T> for GreedySelector {
                     input.id
                 )));
             }
-            ranked.push((input, effective));
+            let det_score = DeterministicScore::from_f64(effective);
+            ranked.push((input, det_score));
         }
-        ranked.sort_by(|(a, a_eff), (b, b_eff)| {
-            b_eff
-                .total_cmp(a_eff)
+        ranked.sort_by(|(a, a_det), (b, b_det)| {
+            b_det
+                .cmp(a_det)
                 .then_with(|| a.size.cmp(&b.size))
                 .then_with(|| a.id.cmp(&b.id))
         });
@@ -242,14 +287,14 @@ impl<T: Clone> Selector<T> for GreedySelector {
                             item.id
                         )));
                     }
-                    candidates.push((i, eff));
+                    candidates.push((i, DeterministicScore::from_f64(eff)));
                 }
 
                 let best_idx = candidates
                     .into_iter()
-                    .max_by(|&(i, a_eff), &(j, b_eff)| {
-                        a_eff
-                            .total_cmp(&b_eff)
+                    .max_by(|&(i, a_det), &(j, b_det)| {
+                        a_det
+                            .cmp(&b_det)
                             .then_with(|| remaining[j].size.cmp(&remaining[i].size))
                             .then_with(|| remaining[i].id.cmp(&remaining[j].id))
                     })
@@ -293,6 +338,7 @@ mod tests {
             score,
             category: None,
             information_gain: None,
+            rank_score: None,
         }
     }
 
@@ -304,6 +350,7 @@ mod tests {
             score,
             category: Some(cat.to_string()),
             information_gain: None,
+            rank_score: None,
         }
     }
 
@@ -530,6 +577,7 @@ mod tests {
                 score: 0.9,
                 category: None,
                 information_gain: None,
+                rank_score: None,
             },
             SelectorInput {
                 id: "b".to_string(),
@@ -538,6 +586,7 @@ mod tests {
                 score: 0.8,
                 category: None,
                 information_gain: None,
+                rank_score: None,
             },
         ];
         // Budget is 100 — only item "b" fits.
@@ -573,6 +622,7 @@ mod tests {
             score,
             category: None,
             information_gain: Some(gain),
+            rank_score: None,
         }
     }
 
@@ -733,13 +783,96 @@ mod tests {
     }
 
     #[test]
-    fn greedy_selector_rejects_non_finite_effective_score_before_compare() {
+    fn greedy_selector_handles_extreme_f32_products_without_overflow() {
+        // Ranking now runs in f64/DeterministicScore rather than raw f32
+        // arithmetic: `f32::MAX * f32::MAX` (~1.15e77) no longer overflows to
+        // `f32::INFINITY` the way it did under the old f32-only computation —
+        // it's a large-but-finite f64 value, saturated into DeterministicScore
+        // rather than rejected. This is exactly the precision upgrade FOLD-AUD
+        // (khive-score fixed-point contract) requires: a real magnitude, not a
+        // spurious f32 rounding artifact, decides the outcome.
         let inputs = vec![input_with_gain("a", 100, f32::MAX, f32::MAX)];
         let w = SelectorWeights {
             epistemic_weight: f32::MAX,
             ..Default::default()
         };
-        let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
-        assert!(matches!(err, FoldError::InvalidInput(_)));
+        let out = GreedySelector.select(inputs, 100, &w).unwrap();
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(out.selected[0].id, "a");
+    }
+
+    // ── DeterministicScore rank-comparator tests (fold PR #535 codex round-1) ──
+
+    #[test]
+    fn rejects_non_finite_rank_score() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut item = input("a", 100, 0.5);
+            item.rank_score = Some(bad);
+            let err = GreedySelector
+                .select(vec![item], 100, &weights(0.0))
+                .unwrap_err();
+            assert!(matches!(err, FoldError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn rank_score_saturates_at_deterministic_score_max_without_panic() {
+        // Two candidates whose rank_score both exceed DeterministicScore's
+        // i64/2^32 representable range must both saturate to MAX rather than
+        // panicking or overflowing, then fall back to the deterministic
+        // size/id tie-break — same contract as DeterministicScore's own
+        // saturating arithmetic (khive-score score.rs `from_rounded_arithmetic`).
+        let mut big = input("big", 200, 0.0);
+        big.rank_score = Some(f64::MAX);
+        let mut small = input("small", 50, 0.0);
+        small.rank_score = Some(f64::MAX / 2.0);
+
+        let out = GreedySelector
+            .select(vec![big, small], 1000, &weights(0.0))
+            .unwrap();
+        assert_eq!(out.selected.len(), 2);
+        // Both saturate to DeterministicScore::MAX and tie; size-ascending wins.
+        assert_eq!(out.selected[0].id, "small");
+        assert_eq!(out.selected[1].id, "big");
+    }
+
+    #[test]
+    fn rank_score_distinguishes_values_within_f32_ulp_of_one() {
+        // 1.0 and 1.00000004 collapse to the identical f32 bit pattern (delta
+        // is below the f32 ulp at magnitude 1.0) but are distinct at the
+        // khive-score 2^32 fixed-point scale — `rank_score` must be the value
+        // that decides ranking, not the narrowed `score` field.
+        let a_score = 1.0_f32;
+        let b_score = 1.0_f32; // identical f32 bits to a after narrowing
+        assert_eq!(a_score.to_bits(), b_score.to_bits());
+
+        let mut a = input("a", 100, a_score);
+        a.rank_score = Some(1.0);
+        let mut b = input("b", 100, b_score);
+        b.rank_score = Some(1.000_000_04);
+
+        let out = GreedySelector
+            .select(vec![a, b], 100, &weights(0.0))
+            .unwrap();
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(
+            out.selected[0].id, "b",
+            "higher rank_score must win despite tied f32 score"
+        );
+    }
+
+    #[test]
+    fn rank_score_zero_ties_break_deterministically() {
+        let mut a = input("z", 100, 0.0);
+        a.rank_score = Some(0.0);
+        let mut b = input("a", 100, 0.0);
+        b.rank_score = Some(0.0);
+
+        let out = GreedySelector
+            .select(vec![a, b], 1000, &weights(0.0))
+            .unwrap();
+        assert_eq!(out.selected.len(), 2);
+        assert_eq!(out.selected[0].id, "a");
+        assert_eq!(out.selected[1].id, "z");
     }
 }
