@@ -2203,7 +2203,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg);
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None);
         assert!(
             result.is_err(),
             "an undeclared configured pack backend must be a startup error, not a silent \
@@ -2260,7 +2260,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let result = build_server_multi_backend(base_cfg, &khive_cfg);
+        let result = build_server_multi_backend(base_cfg, &khive_cfg, None);
         assert!(
             result.is_err(),
             "an undeclared configured pack backend must be a startup error, not a silent \
