@@ -302,19 +302,13 @@ async fn main() -> Result<()> {
                     khive_cfg.runtime.default_output_format,
                 );
                 // Wire the main backend's pool for background WAL checkpointing
-                // (ADR-091 Planks 0+2), mirroring `build_server_multi_backend`
-                // (serve.rs). Without this, `KhiveMcpServer.pool` stays `None`,
-                // `pool_for_checkpoint()` returns `None`, and
-                // `khive_runtime::daemon` never spawns `run_checkpoint_task` —
-                // the daemon runs with no periodic WAL checkpointing (#601).
-                // The pool is only present for file-backed databases; in-memory
-                // backends must never drive checkpoint_once on a non-WAL connection.
-                let pool: Option<Arc<khive_runtime::ConnectionPool>> =
-                    if multi.main_backend.is_file_backed() {
-                        Some(multi.main_backend.pool_arc())
-                    } else {
-                        None
-                    };
+                // (ADR-091 Planks 0+2) via the shared helper, mirroring
+                // `build_server_multi_backend` (serve.rs). Without this,
+                // `KhiveMcpServer.pool` stays `None`, `pool_for_checkpoint()`
+                // returns `None`, and `khive_runtime::daemon` never spawns
+                // `run_checkpoint_task` — the daemon runs with no periodic WAL
+                // checkpointing (#601).
+                let pool = khive_mcp::serve::checkpoint_pool_for(multi.main_backend.as_ref());
                 let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
                     multi.registry,
                     &multi.default_namespace,
