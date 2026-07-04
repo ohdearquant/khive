@@ -19,7 +19,7 @@ Mathlib v4.30.0 was ingested as a khive-native graph:
 Every mathlib declaration (theorem, definition, structure, instance, axiom)
 became an entity; every dependency between declarations became a typed
 `depends_on` edge. This is the same edge relation khive uses elsewhere for
-build/runtime/data/artifact/tooling dependency modeling — proof dependency is
+build/runtime/data/artifact/tooling dependency modeling. Proof dependency is
 one more instance of the same closed relation, not a schema extension.
 
 ## Ingestion path
@@ -31,7 +31,7 @@ instead writes straight to a khive-native SQLite database:
 
 1. **Bootstrap the canonical schema.** The same DDL khive's migrations apply
    (`crates/khive-db/sql/`) is applied directly to a fresh database file, so
-   the resulting graph is a valid khive database — every verb (`get`,
+   the resulting graph is a valid khive database: every verb (`get`,
    `neighbors`, `traverse`, `query`) works against it exactly as it would
    against a database built through the MCP surface.
 2. **Deterministic IDs.** Each declaration gets a UUIDv5 id derived from its
@@ -44,14 +44,14 @@ instead writes straight to a khive-native SQLite database:
    structural traversal, not semantic search over declaration text, so the
    ingestion does not populate `sqlite-vec` `vec0` virtual tables. This keeps
    the ingestion path simpler and the resulting database smaller, at the cost
-   of not supporting `search`'s vector-similarity leg over this data — pure
+   of not supporting `search`'s vector-similarity leg over this data. Pure
    graph reads (`get`, `neighbors`, `traverse`, `query`) do not depend on the
    vector store at all.
 
 This direct-write path trades the MCP round-trip and its request-level
 validation for raw insert throughput, and only makes sense at this scale.
-For anything an agent produces interactively — reading a paper, forming a
-concept, linking two ideas — the normal `create`/`link` verbs over `request`
+For anything an agent produces interactively (reading a paper, forming a
+concept, linking two ideas), the normal `create`/`link` verbs over `request`
 are the right tool; see [Prompt Cookbook](prompt-cookbook.md).
 
 ## Traversal at scale
@@ -85,7 +85,7 @@ proof's content:
 Both signals are auditable: a mathematician can walk the same `depends_on`
 edges the signal used and check the claim directly, rather than trusting an
 opaque similarity score. That auditability, not the underlying math, is the
-khive-relevant point — it is a direct consequence of the graph being typed
+khive-relevant point: it is a direct consequence of the graph being typed
 and the edges being traversable, not a property of any embedding.
 
 ## Evidence
