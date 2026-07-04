@@ -1531,6 +1531,7 @@ impl ServerHandler for KhiveMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_runtime::Namespace;
     use serial_test::serial;
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {

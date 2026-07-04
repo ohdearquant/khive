@@ -12,7 +12,7 @@
 //! `INSERT OR IGNORE` keyed by the event UUID ensures idempotency.
 //!
 //! No single line, complete or partial, is ever buffered past
-//! `MirrorLimits::max_line_bytes` (see [`read_line_bounded`]): a complete
+//! `MirrorLimits::max_line_bytes` (see `read_line_bounded`): a complete
 //! line over that cap is skipped with a `tracing::warn!` naming the file and
 //! byte offset, and the offset advances past it so ingestion never wedges on
 //! one oversized line. The pass cap is gated on at least one complete line
@@ -25,7 +25,7 @@
 //! still-growing file's in-progress final line, or a genuinely truncated /
 //! corrupt tail — is its own bounded case, distinct from the complete
 //! (terminated) oversized-line skip above: `read_line_bounded` reports
-//! [`LineRead::OversizedUnterminated`] as soon as one bounded read window
+//! `LineRead::OversizedUnterminated` as soon as one bounded read window
 //! crosses the cap without finding `\n`, instead of scanning onward to EOF
 //! looking for one. The cursor is intentionally left at that line's start
 //! (like an ordinary `Partial`), so the next poll — or the next daemon
@@ -191,7 +191,7 @@ struct MirrorChunk {
     new_offset: u64,
 }
 
-/// Outcome of [`read_line_bounded`] for one line.
+/// Outcome of `read_line_bounded` for one line.
 #[derive(Debug)]
 enum LineRead {
     /// EOF with nothing read at all.
@@ -480,7 +480,7 @@ async fn mirror_file_with_limits(
 
 /// Default ceiling on the byte length of a ChatGPT export `conversations.json`
 /// file read in one [`mirror_chatgpt_export_file`] pass. Overridable via
-/// `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (see [`chatgpt_max_bytes`]).
+/// `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (see `chatgpt_max_bytes`).
 ///
 /// Unlike the JSONL line-tail sources, a ChatGPT export has no incremental
 /// "new bytes" boundary — it is always read and parsed whole (see the
@@ -518,7 +518,7 @@ fn chatgpt_max_bytes() -> u64 {
 /// error leaves the persisted cursor untouched, so a partially-downloaded
 /// export is retried whole on the next tick, never half-consumed.
 ///
-/// Before reading, the file is checked against [`chatgpt_max_bytes`]: an
+/// Before reading, the file is checked against `chatgpt_max_bytes`: an
 /// export over that ceiling is skipped (warn-logged) without ever calling
 /// `read_to_string`, so a very large export cannot materialize its full
 /// content (and, downstream, a full `Vec` of parsed events) in one pass.
