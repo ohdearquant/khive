@@ -3,12 +3,105 @@
 //! Why the manifest matters: a sink that self-reports null counts catches bulk export
 //! corruption (e.g. `content=null` across 10 000 rows) in one second rather than after
 //! a downstream agent fleet has graded blind.
+//!
+//! Why the destination policy matters: `save_to` is a client-supplied string reaching
+//! the filesystem. Without a root + traversal + symlink check, a client could request
+//! `../../etc/cron.d/x` or overwrite an existing symlinked file outside any sandbox.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+/// Environment override for the allowed `save_to` export root.
+const EXPORT_ROOT_ENV: &str = "KHIVE_SAVE_TO_ROOT";
+
+/// Resolve (and create) the allowed export root for `save_to` destinations.
+///
+/// Defaults to `~/.khive/exports`; overridable via `KHIVE_SAVE_TO_ROOT` (used by
+/// tests to scope each case to its own temp directory). Every `save_to` request
+/// must resolve to a path inside this root — see `validate_destination`.
+fn export_root() -> anyhow::Result<PathBuf> {
+    let root = match std::env::var(EXPORT_ROOT_ENV) {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".khive").join("exports")
+        }
+    };
+    std::fs::create_dir_all(&root)
+        .map_err(|e| anyhow::anyhow!("create export root {}: {e}", root.display()))?;
+    root.canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize export root {}: {e}", root.display()))
+}
+
+/// Validate a client-supplied `save_to` path against the allowed export `root`
+/// and return the canonicalized destination.
+///
+/// Rejects:
+/// - `..` traversal components anywhere in the requested path
+/// - a resolved parent directory outside `root` (catches absolute-path escapes
+///   and symlinked intermediate directories, since canonicalization follows them)
+/// - an existing symlink at the destination itself (no-follow: a symlink must
+///   never be silently written through to its target)
+fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf> {
+    if requested.as_os_str().is_empty() {
+        anyhow::bail!("save_to path must not be empty");
+    }
+    if requested
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "save_to path must not contain '..' traversal components: {}",
+            requested.display()
+        );
+    }
+
+    let joined = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+
+    let parent = joined.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = match parent {
+        Some(p) => p,
+        None => anyhow::bail!("save_to path has no parent directory: {}", joined.display()),
+    };
+
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("create save_to parent dir {}: {e}", parent.display()))?;
+
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize save_to parent {}: {e}", parent.display()))?;
+
+    if !canonical_parent.starts_with(root) {
+        anyhow::bail!(
+            "save_to path escapes the allowed export root ({}): {}",
+            root.display(),
+            joined.display()
+        );
+    }
+
+    let file_name = joined
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("save_to path has no file name: {}", joined.display()))?;
+    let dest = canonical_parent.join(file_name);
+
+    if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "save_to destination must not be a symlink: {}",
+                dest.display()
+            );
+        }
+    }
+
+    Ok(dest)
+}
 
 /// Write `results_envelope` as JSONL to `path` and return the self-describing manifest.
 ///
@@ -28,9 +121,34 @@ use sha2::{Digest, Sha256};
 /// }
 /// ```
 ///
+/// `restrict_to_export_root` gates the destination policy (root containment,
+/// `..` traversal rejection, symlink-destination rejection): `true` for the
+/// agent-facing MCP `request` tool, where `path` is a client-supplied string
+/// reaching the filesystem; `false` for the trusted operator CLI path
+/// (`kkernel exec --save-file`, `from_wire = false`), which may write anywhere
+/// the operator points it, matching its documented behavior.
+///
 /// Errors are propagated as `anyhow::Error` so callers can convert to their preferred
 /// error type (`McpError::internal_error` on the MCP path; `anyhow::bail!` on the CLI path).
-pub fn write_and_manifest(results_envelope: &Value, path: &Path) -> anyhow::Result<Value> {
+pub fn write_and_manifest(
+    results_envelope: &Value,
+    path: &Path,
+    restrict_to_export_root: bool,
+) -> anyhow::Result<Value> {
+    let dest = if restrict_to_export_root {
+        let root = export_root()?;
+        validate_destination(&root, path)?
+    } else {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("create parent dir {}: {e}", parent.display()))?;
+            }
+        }
+        path.to_path_buf()
+    };
+    let path = dest.as_path();
+
     // Collect per-op rows from the results array.
     let results_arr = results_envelope
         .get("results")
@@ -47,8 +165,8 @@ pub fn write_and_manifest(results_envelope: &Value, path: &Path) -> anyhow::Resu
         jsonl_bytes.push(b'\n');
     }
 
-    // Write atomically via tmp+rename when the target is on the same filesystem.
-    // Falls back to direct write when the rename crosses filesystems.
+    // Write atomically via a securely-created unique temp file in the same
+    // directory, then rename over the destination.
     write_atomic(path, &jsonl_bytes)?;
 
     // Compute manifest fields.
@@ -99,41 +217,55 @@ fn hex_sha256(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Write `data` to `path` using a tmp+rename strategy when possible.
+/// Write `data` to `path` via a securely-created, randomly-named temp file in
+/// the same directory, then rename over the destination.
+///
+/// Using `tempfile::Builder::tempfile_in` (instead of a predictable
+/// `path.with_extension("tmp")` sibling) closes the symlink-following /
+/// predictable-path race the previous sibling-tmp approach was open to, and
+/// the temp file always lives in the same directory as `path` so the final
+/// rename is same-filesystem and atomic.
 fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    // If the parent doesn't exist, create it.
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("create parent dir {}: {e}", parent.display()))?;
-        }
-    }
+    use std::io::Write;
 
-    // Try tmp+rename for atomicity.
-    // Build the tmp extension without a leading dot so extensionless paths
-    // (e.g. `/tmp/outfile`) don't produce a double-dot (`outfile..tmp`).
-    let tmp_ext = match path.extension() {
-        Some(e) => format!("{}.tmp", e.to_string_lossy()),
-        None => "tmp".to_string(),
-    };
-    let tmp_path = path.with_extension(tmp_ext);
-    if std::fs::write(&tmp_path, data).is_ok() {
-        if std::fs::rename(&tmp_path, path).is_ok() {
-            return Ok(());
-        }
-        // Rename failed (cross-filesystem); clean up tmp and fall through.
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
-    // Direct write fallback.
-    std::fs::write(path, data).map_err(|e| anyhow::anyhow!("write file {}: {e}", path.display()))
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".khive-save-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| anyhow::anyhow!("create temp file in {}: {e}", parent.display()))?;
+
+    tmp.write_all(data)
+        .map_err(|e| anyhow::anyhow!("write temp file: {e}"))?;
+    tmp.flush()
+        .map_err(|e| anyhow::anyhow!("flush temp file: {e}"))?;
+
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("persist temp file to {}: {}", path.display(), e.error))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use tempfile::TempDir;
+
+    /// Scope `KHIVE_SAVE_TO_ROOT` to `root` for the duration of `f`.
+    ///
+    /// Tests are `#[serial]` because `EXPORT_ROOT_ENV` is process-global state.
+    fn with_root<R>(root: &Path, f: impl FnOnce() -> R) -> R {
+        std::env::set_var(EXPORT_ROOT_ENV, root);
+        let result = f();
+        std::env::remove_var(EXPORT_ROOT_ENV);
+        result
+    }
 
     fn make_envelope(results: Vec<Value>) -> Value {
         let total = results.len();
@@ -158,7 +290,7 @@ mod tests {
             json!({ "ok": true, "tool": "list",  "result": { "entities": 3, "notes": 2 } }),
         ]);
 
-        let manifest = write_and_manifest(&envelope, &path).unwrap();
+        let manifest = write_and_manifest(&envelope, &path, false).unwrap();
 
         // File must exist.
         assert!(path.exists());
@@ -206,7 +338,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("empty.jsonl");
         let envelope = make_envelope(vec![]);
-        let manifest = write_and_manifest(&envelope, &path).unwrap();
+        let manifest = write_and_manifest(&envelope, &path, false).unwrap();
 
         assert_eq!(manifest["rows"], json!(0));
         assert!(path.exists());
@@ -222,29 +354,10 @@ mod tests {
             json!({ "ok": true, "tool": "get", "result": { "id": "abc", "name": "foo" } }),
         ]);
 
-        let m1 = write_and_manifest(&envelope, &path).unwrap();
-        let m2 = write_and_manifest(&envelope, &path).unwrap();
+        let m1 = write_and_manifest(&envelope, &path, false).unwrap();
+        let m2 = write_and_manifest(&envelope, &path, false).unwrap();
         assert_eq!(m1["checksum"], m2["checksum"]);
         assert_eq!(m1["schema_fingerprint"], m2["schema_fingerprint"]);
-    }
-
-    #[test]
-    fn extensionless_target_produces_clean_tmp_path() {
-        let tmp = TempDir::new().unwrap();
-        // A target with no extension must not produce a `..tmp` double-dot path.
-        let path = tmp.path().join("outfile");
-        let envelope = make_envelope(vec![
-            json!({ "ok": true, "tool": "stats", "result": { "n": 1 } }),
-        ]);
-        // write_and_manifest must succeed (it uses write_atomic internally).
-        write_and_manifest(&envelope, &path).unwrap();
-        assert!(path.exists());
-        // No double-dot artefact left behind.
-        let double_dot = tmp.path().join("outfile..tmp");
-        assert!(
-            !double_dot.exists(),
-            "double-dot tmp path must not be created"
-        );
     }
 
     #[test]
@@ -260,8 +373,126 @@ mod tests {
             json!({ "ok": true, "tool": "t", "result": { "bar": 1 } }),
         ]);
 
-        let m1 = write_and_manifest(&e1, &p1).unwrap();
-        let m2 = write_and_manifest(&e2, &p2).unwrap();
+        let m1 = write_and_manifest(&e1, &p1, false).unwrap();
+        let m2 = write_and_manifest(&e2, &p2, false).unwrap();
         assert_ne!(m1["schema_fingerprint"], m2["schema_fingerprint"]);
+    }
+
+    #[test]
+    #[serial]
+    fn happy_path_relative_and_absolute_inside_root_both_succeed() {
+        let tmp = TempDir::new().unwrap();
+        let envelope = make_envelope(vec![
+            json!({ "ok": true, "tool": "t", "result": { "n": 1 } }),
+        ]);
+
+        with_root(tmp.path(), || {
+            // Relative path is joined under the root.
+            let m1 = write_and_manifest(&envelope, Path::new("nested/rel.jsonl"), true).unwrap();
+            assert!(tmp.path().join("nested/rel.jsonl").exists());
+            assert_eq!(m1["rows"], json!(1));
+
+            // Absolute path that resolves inside the root also succeeds.
+            let abs = tmp.path().join("abs.jsonl");
+            let m2 = write_and_manifest(&envelope, &abs, true).unwrap();
+            assert!(abs.exists());
+            assert_eq!(m2["rows"], json!(1));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn traversal_component_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let envelope = make_envelope(vec![json!({ "ok": true, "tool": "t", "result": {} })]);
+
+        with_root(tmp.path(), || {
+            let err =
+                write_and_manifest(&envelope, Path::new("../escape.jsonl"), true).unwrap_err();
+            assert!(
+                err.to_string().contains("traversal"),
+                "expected traversal error, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn absolute_path_outside_root_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let envelope = make_envelope(vec![json!({ "ok": true, "tool": "t", "result": {} })]);
+
+        with_root(tmp.path(), || {
+            let target = outside.path().join("outside.jsonl");
+            let err = write_and_manifest(&envelope, &target, true).unwrap_err();
+            assert!(
+                err.to_string().contains("escapes"),
+                "expected escape error, got: {err}"
+            );
+            assert!(!target.exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn symlinked_destination_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let real_target = outside.path().join("real.txt");
+        std::fs::write(&real_target, b"pre-existing").unwrap();
+
+        let link_path = tmp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&real_target, &link_path).unwrap();
+
+        let envelope = make_envelope(vec![json!({ "ok": true, "tool": "t", "result": {} })]);
+
+        with_root(tmp.path(), || {
+            let err = write_and_manifest(&envelope, &link_path, true).unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "expected symlink error, got: {err}"
+            );
+        });
+
+        // The symlink target must be untouched.
+        assert_eq!(std::fs::read(&real_target).unwrap(), b"pre-existing");
+    }
+
+    #[test]
+    #[serial]
+    fn overwrite_of_existing_regular_file_inside_root_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("overwrite.jsonl");
+        std::fs::write(&path, b"stale content").unwrap();
+
+        let envelope = make_envelope(vec![
+            json!({ "ok": true, "tool": "t", "result": { "n": 2 } }),
+        ]);
+
+        with_root(tmp.path(), || {
+            let manifest = write_and_manifest(&envelope, &path, true).unwrap();
+            assert_eq!(manifest["rows"], json!(1));
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"n\":2"));
+        assert!(!content.contains("stale content"));
+    }
+
+    #[test]
+    fn unrestricted_path_outside_any_root_still_succeeds() {
+        // Trusted operator path (`kkernel exec --save-file`, from_wire = false):
+        // no root containment is enforced, matching documented CLI behavior.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("cli.jsonl");
+        let envelope = make_envelope(vec![
+            json!({ "ok": true, "tool": "t", "result": { "n": 3 } }),
+        ]);
+
+        let manifest = write_and_manifest(&envelope, &path, false).unwrap();
+        assert_eq!(manifest["rows"], json!(1));
+        assert!(path.exists());
     }
 }

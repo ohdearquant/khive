@@ -375,6 +375,63 @@ impl ConnectionPool {
         open_reader_connection(path, &self.config)
     }
 
+    /// Open a standalone read-write connection to the same file-backed database.
+    ///
+    /// Stores whose trait methods take `Send + 'static` closures (executed via
+    /// `spawn_blocking`) cannot hold the pooled `WriterGuard`'s `MutexGuard`
+    /// across the call — it opens an independent connection instead. This
+    /// must still honor `PoolConfig::read_only`: opening
+    /// `SQLITE_OPEN_READ_WRITE` unconditionally here would let a read-only
+    /// backend's graph/event/text stores bypass the flag that the pooled
+    /// writer enforces via `query_only`.
+    pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        let path = self.config.path.as_ref().ok_or_else(|| {
+            SqliteError::InvalidData(
+                "in-memory databases do not support standalone connections".to_string(),
+            )
+        })?;
+
+        if self.config.read_only {
+            return Err(SqliteError::InvalidData(
+                "database is read-only: standalone write connections are not permitted".to_string(),
+            ));
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
+    /// Open a standalone read-only connection to the same file-backed database.
+    ///
+    /// Companion to `open_standalone_writer` for stores that also need an
+    /// independent reader connection outside the pooled reader queue.
+    pub fn open_standalone_reader(&self) -> Result<Connection, SqliteError> {
+        let path = self.config.path.as_ref().ok_or_else(|| {
+            SqliteError::InvalidData(
+                "in-memory databases do not support standalone connections".to_string(),
+            )
+        })?;
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
     fn return_reader(&self, conn: Connection) {
         if self.max_readers == 0 {
             return;

@@ -907,6 +907,121 @@ mod tests {
         assert!(backend.text("").is_err());
     }
 
+    #[tokio::test]
+    async fn sqlite_read_only_graph_store_rejects_upsert_edge() {
+        use khive_storage::types::Edge;
+        use khive_types::EdgeRelation;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_graph.db");
+
+        // Create the database and the graph schema while writable.
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.graph().unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.graph() {
+            Ok(store) => store,
+            // Failing to even open the store on a read-only backend is an
+            // acceptable rejection — the write path never becomes reachable.
+            Err(_) => return,
+        };
+
+        let now = chrono::Utc::now();
+        let edge = Edge {
+            id: uuid::Uuid::new_v4().into(),
+            namespace: "local".to_string(),
+            source_id: uuid::Uuid::new_v4(),
+            target_id: uuid::Uuid::new_v4(),
+            relation: EdgeRelation::Extends,
+            weight: 0.8,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+
+        let result = store.upsert_edge(edge).await;
+        assert!(
+            result.is_err(),
+            "upsert_edge on a read-only backend must reject, not silently no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_event_store_rejects_append_event() {
+        use khive_types::{EventKind, EventOutcome, SubstrateKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_events.db");
+
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.events().unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.events() {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+
+        let event = khive_storage::event::Event::new(
+            "local",
+            "test.verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test-actor",
+        )
+        .with_outcome(EventOutcome::Success);
+
+        let result = store.append_event(event).await;
+        assert!(
+            result.is_err(),
+            "append_event on a read-only backend must reject, not silently no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_read_only_text_store_rejects_upsert_document() {
+        use khive_storage::types::TextDocument;
+        use khive_types::SubstrateKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_text.db");
+
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable.text("ro_test").unwrap();
+        }
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = match ro.text("ro_test") {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+
+        let doc = TextDocument {
+            subject_id: uuid::Uuid::new_v4(),
+            kind: SubstrateKind::Entity,
+            title: Some("Title".to_string()),
+            body: "Body text.".to_string(),
+            tags: vec![],
+            namespace: "local".to_string(),
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        };
+
+        let result = store.upsert_document(doc).await;
+        assert!(
+            result.is_err(),
+            "upsert_document on a read-only backend must reject, not silently no-op"
+        );
+    }
+
     #[test]
     fn apply_schema_runs_migrations_idempotently() {
         static MIGRATIONS: &[crate::migrations::Migration] = &[crate::migrations::Migration {

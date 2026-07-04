@@ -38,6 +38,7 @@ async-trait = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
+tempfile = { workspace = true }
 lattice-embed = { workspace = true, optional = true }
 khive-channel = { version = "0.3.0", path = "../khive-channel", optional = true }
 khive-channel-email = { version = "0.3.0", path = "../khive-channel-email", optional = true }
@@ -55,7 +56,6 @@ tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 khive-types = { version = "0.3.0", path = "../khive-types" }
 async-trait = { workspace = true }
-tempfile = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.3.0", path = "../khive-pack-knowledge" }
 rusqlite = { workspace = true, features = ["bundled"] }

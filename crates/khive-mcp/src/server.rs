@@ -1294,7 +1294,12 @@ impl KhiveMcpServer {
 
         if let Some(path_str) = save_to {
             let path = std::path::Path::new(&path_str);
-            let manifest = crate::save_sink::write_and_manifest(&result, path)
+            // `from_wire` gates the destination policy: the agent-facing MCP
+            // `request` tool (`from_wire = true`) restricts `save_to` to the
+            // allowed export root; the trusted operator CLI path
+            // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
+            // matching its documented "write anywhere" behavior.
+            let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
                 .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
@@ -1596,6 +1601,9 @@ mod tests {
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::env::set_var("KHIVE_PID", &pid);
         std::env::remove_var("KHIVE_NO_DAEMON");
+        // save_to destinations must resolve inside the allowed export root
+        // (crate::save_sink); scope it to this test's tempdir.
+        std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
 
         let server = make_daemon_save_to_test_server();
         let daemon_server = server.clone();
@@ -1636,5 +1644,6 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         clear_daemon_env();
+        std::env::remove_var("KHIVE_SAVE_TO_ROOT");
     }
 }
