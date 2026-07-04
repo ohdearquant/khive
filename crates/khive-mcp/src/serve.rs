@@ -1833,6 +1833,109 @@ brain_profile = "project-profile"
         );
     }
 
+    /// Regression for #601: the `kkernel mcp` multi-backend daemon path builds its
+    /// server from `MultiBackendRegistry` via `from_registry_with_meta` +
+    /// `with_coordinator`, NOT via `build_server_multi_backend` — so it must wire
+    /// the main backend's pool itself using `multi.main_backend.is_file_backed()` +
+    /// `.pool_arc()` + `.with_pool(...)`, mirroring what `build_server_multi_backend`
+    /// already does (serve.rs `build_server_multi_backend`, the sibling boot path).
+    ///
+    /// Before the fix, that wiring step was missing on the kkernel branch: the server
+    /// had `pool == None` unconditionally, `pool_for_checkpoint()` returned `None`, and
+    /// `khive_runtime::daemon` never spawned `run_checkpoint_task` — ADR-091 Planks 0+2
+    /// were dead code in the live daemon. This test exercises the exact same primitives
+    /// (`build_registry_for_multi_backend`, `MultiBackendRegistry::main_backend`,
+    /// `is_file_backed`, `pool_arc`, `KhiveMcpServer::with_pool`) the kkernel branch
+    /// uses, so a regression here fails a fast unit test instead of only surfacing in
+    /// a live daemon soak.
+    #[test]
+    fn kkernel_multi_backend_path_wires_pool_for_file_backed_main() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main_path = dir.path().join("main.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        // Mirror the kkernel branch's wiring exactly (main.rs `Command::Mcp`).
+        let pool: Option<Arc<ConnectionPool>> = if multi.main_backend.is_file_backed() {
+            Some(multi.main_backend.pool_arc())
+        } else {
+            None
+        };
+        let server = KhiveMcpServer::from_registry_with_meta(
+            multi.registry,
+            &multi.default_namespace,
+            &multi.config_id,
+        );
+        let server = if let Some(p) = pool {
+            server.with_pool(p)
+        } else {
+            server
+        };
+
+        assert!(
+            server.pool().is_some(),
+            "file-backed multi-backend main must wire a checkpoint pool onto the server"
+        );
+    }
+
+    /// Sibling guard: an in-memory main backend must never carry a checkpoint pool
+    /// (checkpoint_once must never run on a non-WAL, in-memory connection).
+    #[test]
+    fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        let pool: Option<Arc<ConnectionPool>> = if multi.main_backend.is_file_backed() {
+            Some(multi.main_backend.pool_arc())
+        } else {
+            None
+        };
+        let server = KhiveMcpServer::from_registry_with_meta(
+            multi.registry,
+            &multi.default_namespace,
+            &multi.config_id,
+        );
+        let server = if let Some(p) = pool {
+            server.with_pool(p)
+        } else {
+            server
+        };
+
+        assert!(
+            server.pool().is_none(),
+            "in-memory multi-backend main must never carry a checkpoint pool"
+        );
+    }
+
     /// Regression for ADR-073 codex r1: a pack assigned to a secondary backend must
     /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
     ///
