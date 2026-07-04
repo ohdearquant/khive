@@ -1,3 +1,185 @@
+# ADR-007 Rev 7: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
+
+**Status**: Accepted/Ratified (2026-06-19)
+**Date**: 2026-06-19
+**Authors**: lambda:khive, alpha:architect
+**Amends**: ADR-007-namespace.md (adds Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rule 8 is additive)
+**Supersedes (partial)**: None — additive amendment only
+**ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
+| ADR-002 (edge cascade, no dangling refs) | ADR-057 (comm actor-addressed delivery) |
+ADR-063 (comm pack principal model and remote backend isolation)
+
+**Rev 7 summary (2026-06-19)**: Introduces a carve-out for packs whose backend carries its own
+principal-scoped isolation contract. Through Rev 6, ADR-007 stated that namespace is attribution
+for "all packs". That phrasing is correct for the shared local KG substrate (entities, notes,
+memory, tasks) but requires a clarification when a pack's backend is itself a message broker
+rather than a shared data store. Rev 7 adds Rule 8 to state this carve-out without altering any
+of Rules 0 through 7. Rev 6 (the per-actor episodic-memory carve-out) merged to main ahead of
+this revision and is independent: Rev 6 amends the Rev 4 Rule 0 write-default for episodic memory,
+while Rev 7 adds a new additive Rule 8 for principal-scoped pack backends. Both amend the Rev 4
+substrate contract independently and do not conflict — Rev 6 narrows one write default within the
+shared substrate, Rev 7 authorizes a separate backend whose trust model is principal-scoped
+isolation. Rule 8 leaves the Rev 6 amendment to Rule 0, and every other rule, untouched.
+
+---
+
+## Context (Rev 7 addition)
+
+_(Fact-refreshed 2026-07-04: this Context was authored 2026-06-19 against a codebase where
+issue #75 had not yet landed. It has since shipped — see ADR-063 "Current State" for the
+shipped behavior. The paragraph below is retained for the design rationale that motivated
+Rule 8; it no longer describes the current runtime.)_
+
+ADR-057 resolved the comm pack's party-line inbox problem by implementing actor-addressed
+delivery within the shared "local" namespace: both copies of a message stay in the caller's
+namespace, and `comm.inbox` filters by `to_actor` when the caller's actor label is not
+"local". This is correct for the current single-machine, single-namespace OSS deployment.
+
+At the time of drafting, ADR-057 had also identified issue #75 (actor identity on every
+request) as the prerequisite for per-actor inbox filtering to work when multiple lambdas
+share the "local" namespace: the code read the actor label from `token.namespace().as_str()`,
+which was "local" for every undecorated MCP session, causing the `to_actor` filter to be
+skipped. Issue #75 has since shipped (commit `f1061d27`): `RuntimeConfig` now carries an
+`actor_id` field and the comm handlers read `token.actor().id` directly. PR #213 (commit
+`091231cd`) additionally closed the anonymous-caller leak by making the `to_actor` filter
+unconditional. Full detail in ADR-063 "Current State."
+
+A second, larger issue is cross-machine delivery. Lambda-to-lambda coordination across
+machines or sandboxes — the roadmap item Ocean identified — requires a transport that is
+inherently multi-principal: each lambda authenticates independently, sends messages to peers
+by principal, and reads only its own inbox. This is a different trust model from the shared
+local substrate where all actors read the same pool. A remote message broker enforces
+per-principal scope server-side; it is not served by the shared SQLite store with a
+view-layer filter.
+
+The question is whether this remote broker trust model is compatible with ADR-007's
+"namespace = attribution, never a storage boundary, all packs" contract, or whether it
+requires an ADR-007 amendment.
+
+The answer is that it requires a clarification, not a contradiction. ADR-007 Rules 0-7
+describe the shared local substrate. A remote broker is a different backend with a different
+storage profile (ADR-028 permits per-pack backends) and a different trust model. The
+statement "namespace is attribution, not isolation" is correct for the shared store. For a
+remote broker, the correct statement is "principal identity is the storage boundary, enforced
+server-side." These are not in conflict: they are statements about different backends.
+
+Rule 8 below formalizes this relationship.
+
+---
+
+## Decision
+
+### Rule 8 — Pack backends with principal-scoped isolation (additive carve-out)
+
+A pack MAY declare a backend whose correct trust model is principal-scoped isolation rather
+than shared attribution. In such a backend, every read and write is scoped server-side to the
+authenticated principal; storage is partitioned by principal. This is a property of the pack's
+backend, not a global namespace rule.
+
+The following constraints apply:
+
+1. **The shared local substrate is unaffected.** Rules 0 through 7 apply in full to the
+   KG, memory, gtd, brain, schedule, and knowledge packs and to any pack that uses the
+   shared SQLite backend. No post-fetch namespace check is added to by-ID ops. The Gate
+   remains the single enforcement seam for the shared substrate.
+
+2. **A pack with a principal-scoped backend carries its own isolation contract.** That
+   contract is defined in the pack's dedicated ADR, not in ADR-007. ADR-007 authorizes the
+   carve-out; the pack ADR specifies the mechanism, authentication model, migration path, and
+   failure modes.
+
+3. **The broker's server-side principal scope is the Gate for that backend.** ADR-007
+   Rule 4 states that "authorization enforced at one seam: the Gate." A remote broker that
+   enforces per-principal scope server-side is an instance of that Gate for its own backend.
+   This is consistent with Rule 4, not a contradiction of it. The Gate is a replaceable
+   trait; a broker backend is a Gate implementation with a specific authentication protocol.
+
+4. **This does not reintroduce the prior v1 bug pattern.** The v1 bug was post-fetch
+   `record.namespace == caller_namespace` checks on by-ID ops of the shared substrate —
+   inline namespace equality checks scattered through handlers and stores. Rule 8 is about
+   a backend whose isolation is enforced at connection time, not at per-record read time.
+   No by-ID namespace check is added anywhere in the shared substrate layer.
+
+5. **The local degenerate case of such a pack is a view-layer scope, not a security
+   boundary.** When a principal-scoped pack runs against the shared local SQLite backend
+   (the OSS single-machine deployment), per-principal scope is implemented as a view-layer
+   filter on attribution columns (such as `to_actor` in the comm pack). This is correct for
+   single-machine use where all actors are co-located and trusted. It is explicitly NOT the
+   security model for a multi-machine deployment. A deployment that uses the shared substrate
+   for such a pack must document this limitation.
+
+6. **Actor identity plumbing is a shared prerequisite.** For both the local view-layer
+   scope and the remote authenticated broker to work correctly, the runtime must carry a
+   distinct actor identity per caller beyond the namespace string. This shipped as issue #75
+   (commit `f1061d27`); `RuntimeConfig.actor_id` and the token-mint sites now carry a
+   configured `ActorRef` per lambda, falling back to `ActorRef::anonymous()`'s `"local"` id
+   for undecorated callers. The forthcoming ADR-053 implementation is the broader
+   ActorStore/SessionStore extension of this same identity model, not the prerequisite for
+   the local view-layer scope, which is already active (see ADR-063 "Current State").
+
+**The comm pack is the first pack invoking this carve-out.** Its isolation contract is
+specified in ADR-063.
+
+---
+
+## Supersession Map (Rev 7 additions)
+
+| Document                       | Status           | Change from Rev 7                                                                                  |
+| ------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------- |
+| ADR-007 Rev 6 (prior revision) | Retained in full | Rule 8 is additive; Rules 0-7, including the Rev 6 Rule 0 episodic-memory amendment, are unchanged |
+| ADR-057                        | No conflict      | Rev 7 formalizes the isolation model that ADR-057's actor-addressed delivery implies               |
+| ADR-063                        | New companion    | Specifies the comm pack isolation contract authorized by this Rule 8 carve-out                     |
+
+---
+
+## Alternatives Considered
+
+| Alternative                                                            | Disposition                                                                                                                                                            |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Amend ADR-007 Rules 0-7 globally to allow per-pack namespace carry     | Rejected. This would re-open the Rev 3 debate and potentially undo the "all packs no-carry" ruling. Rule 8 is a carve-out for a specific backend type, not a reversal. |
+| Define the comm isolation contract in ADR-007 directly                 | Rejected. ADR-007 is a cross-cutting substrate contract. Per-pack backend contracts belong in their own ADRs (ADR-028 pattern).                                        |
+| Treat the remote broker as a pure platform crate with no ADR           | Rejected. A transport that enforces per-principal scope is an architectural decision; it requires an ADR per the project standard.                                     |
+| Apply Option A (local filter as security model) for both OSS and cloud | Rejected for cloud. See ADR-063 §Alternatives for the full argument; the short form is: a shared store filter is bypassable by any client with store access.           |
+
+---
+
+## Consequences
+
+### Positive
+
+- ADR-007's "namespace = attribution, never a storage boundary" holds for the shared
+  substrate without exception.
+- Packs that need a multi-principal backend (comm, future cloud-tier packs) have a
+  principled home for their isolation contract.
+- The architecture allows the OSS degenerate case (view-layer filter) and the cloud case
+  (authenticated broker) to coexist behind the same pack verb surface.
+
+### Negative
+
+- Two isolation models now exist: attribution-only for the shared substrate; principal-scoped
+  for declared broker backends. Contributors must read the pack's own ADR to know which
+  model applies.
+- The local degenerate case for the comm pack is not a security boundary. This must be
+  documented clearly in ADR-063 and in operational documentation.
+
+---
+
+## References
+
+- ADR-007 Rev 6 — all prior rules (Rules 0-7, including the Rev 6 Rule 0 episodic-memory
+  amendment), fully retained.
+- ADR-028 — Pack-Scoped Backends; the mechanism by which a pack declares a distinct backend.
+- ADR-057 — Comm Actor-Addressed Delivery; the first implementation that exposed the need
+  for this carve-out.
+- ADR-063 — Comm Pack Principal Model and Remote Backend Isolation; the pack ADR that this
+  rule authorizes.
+- Issue #75 — Actor identity on every request; the prerequisite for the local view-layer
+  scope to activate in the shared namespace. SHIPPED, commit `f1061d27`.
+- PR #213 (issues #199/#200) — closed the anonymous-caller inbox leak by making the
+  `to_actor` filter unconditional; commit `091231cd`.
+
+---
+
 # ADR-007 Rev 6: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility, Per-Actor Episodic Memory
 
 **Status**: Accepted/Ratified (2026-06-19)
