@@ -10,7 +10,10 @@ pub mod signal;
 pub mod tunable;
 
 pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal};
-pub use brain_state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot};
+pub use brain_state::{
+    validate_brain_state_snapshot, validate_brain_state_snapshot_with_capacity, BrainState,
+    BrainStateSnapshot,
+};
 pub use posterior::{BetaPosterior, EntityPosteriors};
 pub use profile::{
     resolve_consumer_profile, BalancedRecallSnapshot, BalancedRecallState, ConsumerKind,

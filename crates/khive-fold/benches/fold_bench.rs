@@ -27,6 +27,7 @@ fn make_selector_inputs(n: usize) -> Vec<SelectorInput<()>> {
             score: lcg_next(&mut state),
             category: Some(format!("cat-{}", i % 8)),
             information_gain: None,
+            rank_score: None,
         })
         .collect()
 }
