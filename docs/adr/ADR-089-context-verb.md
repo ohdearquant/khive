@@ -47,6 +47,7 @@ At least one of `query`, `entity_ids` is required; both may be supplied.
 | `relations`  | [string] | all     | Edge-relation filter applied during expansion                     |
 | `direction`  | string   | "both"  | `outgoing` / `incoming` / `both`                                  |
 | `limit`      | int      | 5       | Max anchors taken from `query` search, clamped 1..=20             |
+| `fanout`     | int      | 10      | Max neighbors returned per expanded node per hop, clamped 1..=50  |
 | `namespace`  | string   | "local" | Standard multi-record namespace default (ADR-007)                 |
 
 `direction` defaults to `both` for this verb. The `neighbors` verb's `outgoing` default
@@ -56,21 +57,35 @@ the old default and the divergence is documented in both verbs' help text.
 ### Semantics
 
 1. **Anchor selection.** `entity_ids` resolve directly (each through the standard
-   slug-then-prefix resolution). `query` runs one `hybrid_search` over entities and takes
-   the top `limit` hits. When both are supplied, explicit ids come first and search fills
-   the remainder up to `limit`; duplicates collapse.
+   slug-then-prefix resolution) and are honored in full — caller-supplied ids are never
+   clamped by `limit`. `query` runs one `hybrid_search` over entities and takes the top
+   `limit` hits. When both are supplied, explicit ids come first and search fills up to
+   `limit` additional anchors; duplicates collapse.
 2. **Expansion.** For each anchor, `neighbors_with_query` runs with the verb's
-   `direction`/`relations` filters. When `query` is present it participates in neighbor
-   ranking exactly as in the `neighbors` verb. `hops=2` expands the first hop's nodes
-   once more with the same filters; visited-set dedup prevents cycles.
-3. **Assembly.** The response groups by anchor: anchor record (name, kind, description,
-   properties), then its neighbor list (name, kind, relation, direction, weight, one-line
-   description). Deterministic order: anchors in selection order, neighbors by fused
-   score descending, ties by UUID.
-4. **Budget enforcement.** Assembly appends in the deterministic order until the next
-   record would exceed `budget` characters of serialized output, then stops and sets
-   `truncated: true` with counts of dropped anchors/neighbors. Truncation is a view
-   decision; nothing is mutated or re-queried.
+   `direction`/`relations` filters and a per-call result cap of `fanout`. When `query` is
+   present it participates in neighbor ranking exactly as in the `neighbors` verb.
+   `hops=2` expands each first-hop node once more with the same filters and the same
+   `fanout` cap; visited-set dedup prevents cycles. Work done is therefore bounded
+   independently of `budget`: at most `anchors × (fanout + fanout²)` neighbor records are
+   fetched (defaults: 5 × 110 = 550). `budget` governs output size; `fanout` and `hops`
+   govern expansion work.
+3. **Hop-2 representation.** Second-hop records are flattened into their anchor's single
+   `neighbors` list, marked `hop: 2`, carrying the `relation`/`direction`/`weight` of the
+   edge that discovered them and `via` set to the id of their hop-1 parent (hop-1 records
+   carry `hop: 1`, `via: null`). Under visited-set dedup, a node reachable from multiple
+   anchors or parents appears exactly once: under the first anchor in selection order,
+   via the first discovering parent in the deterministic order below.
+4. **Assembly.** The response groups by anchor: anchor record (name, kind, description,
+   properties), then its neighbor list (name, kind, relation, direction, weight, hop,
+   via, one-line description). Deterministic order: anchors in selection order; within an
+   anchor, hop-1 before hop-2, each stratum by fused score descending, ties by UUID.
+5. **Budget enforcement.** Assembly appends records in the deterministic order until the
+   next record would push the running total past `budget`, then stops and sets
+   `truncated: true` with counts of dropped anchors/neighbors. The counted quantity is
+   the number of Unicode scalar values in the compact (no-whitespace) JSON serialization
+   of each appended record — the same serialization the response returns — so the count
+   is deterministic across clients. Truncation is a view decision; nothing is mutated or
+   re-queried.
 
 ### Response shape
 
@@ -86,6 +101,18 @@ the old default and the divergence is documented in both verbs' help text.
           "relation": "extends",
           "direction": "outgoing",
           "weight": 0.9,
+          "hop": 1,
+          "via": null,
+          "description": "…"
+        },
+        {
+          "id": "…",
+          "name": "…",
+          "relation": "implements",
+          "direction": "incoming",
+          "weight": 0.7,
+          "hop": 2,
+          "via": "<hop-1 parent id>",
           "description": "…"
         }
       ]
