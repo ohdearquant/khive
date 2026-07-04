@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::{FeedbackSignal, SectionType};
+use khive_brain_core::{resolve_consumer_profile, ConsumerKind, FeedbackSignal, SectionType};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::EdgeRelation;
 
@@ -323,7 +323,7 @@ impl KnowledgePack {
     ///
     /// 3-tier profile resolution (ADR-035) — exclusive flow (each tier returns early):
     /// 1. Explicit brain profile in config (`self.brain_profile`) → route via `brain.feedback`
-    /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="recall")` → route via `brain.feedback`
+    /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → route via `brain.feedback`
     /// 3. Global section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
     pub(crate) async fn handle_feedback(
         &self,
@@ -392,12 +392,13 @@ impl KnowledgePack {
             }
         }
 
-        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="recall").
-        // Use "recall" (not "knowledge.search") — the brain contract registers recall
-        // bindings under consumer_kind="recall" (brain pack design.md §34).
+        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
+        // Use "knowledge_compose" (not "recall") — the knowledge pack's compose-ranking
+        // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
+        // longer shares posteriors with the memory pack's recall bucket.
         if let Some(ref tid) = target_id_str {
             if let Some(profile_id) =
-                knowledge_resolve_namespace_profile(registry, &ns, "recall").await
+                resolve_consumer_profile(registry, &ns, ConsumerKind::KnowledgeCompose).await
             {
                 let brain_params = json!({
                     "namespace": ns,
@@ -438,7 +439,7 @@ impl KnowledgePack {
     /// used by `record_feedback`, completing read/write symmetry for section posteriors.
     ///
     /// Tier 1: explicit `brain_profile` config → `brain.profile` → extract `weight` per section.
-    /// Tier 2: namespace-bound profile via `brain.resolve(consumer_kind="recall")` → same.
+    /// Tier 2: namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → same.
     /// Tier 3: pack-local `section_posteriors` mutex → `deterministic_weights()`.
     /// Fallback: `SectionPosteriorState::default()`.
     pub(crate) async fn resolve_compose_type_weights(
@@ -455,8 +456,9 @@ impl KnowledgePack {
             }
         }
 
-        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="recall").
-        if let Some(profile_id) = knowledge_resolve_namespace_profile(registry, &ns, "recall").await
+        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
+        if let Some(profile_id) =
+            resolve_consumer_profile(registry, &ns, ConsumerKind::KnowledgeCompose).await
         {
             if let Some(weights) = load_profile_type_weights(registry, &profile_id).await {
                 return weights;
@@ -509,42 +511,6 @@ async fn load_profile_type_weights(
         None
     } else {
         Some(weights)
-    }
-}
-
-/// Try to resolve the profile bound to `namespace` for `consumer_kind` via
-/// `brain.resolve`. Returns `None` when the brain pack is absent, the verb
-/// errors, no binding matches, or the result is only a system-default fallback
-/// (`matched_binding = false`).
-///
-/// Per ADR-035, tier-2 fires only on a real binding match. A system-default
-/// fallback must fall through to tier-3 (pack-local global prior).
-/// Mirrors `resolve_namespace_profile` in the memory pack handler.
-async fn knowledge_resolve_namespace_profile(
-    registry: &VerbRegistry,
-    namespace: &str,
-    consumer_kind: &str,
-) -> Option<String> {
-    let resolve_params = json!({
-        "namespace": namespace,
-        "consumer_kind": consumer_kind,
-    });
-    match registry.dispatch("brain.resolve", resolve_params).await {
-        Ok(v) => {
-            // Only treat as a tier-2 hit when brain.resolve confirms an explicit binding.
-            let matched_binding = v
-                .get("matched_binding")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            if matched_binding {
-                v.get("resolved_profile_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_owned)
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
     }
 }
 
@@ -709,7 +675,7 @@ mod tests {
     ///
     /// Setup: register a brain profile with `seed_priors` that INVERT the default
     /// ordering (formalism high, operational_guidance low), bind it for
-    /// `namespace="local"` + `consumer_kind="recall"`, then call
+    /// `namespace="local"` + `consumer_kind="knowledge_compose"`, then call
     /// `resolve_compose_type_weights` with a registry that has `BrainPack` wired.
     ///
     /// With Tier 1 absent (`brain_profile=None`) and a real binding in Tier 2,
@@ -739,8 +705,8 @@ mod tests {
             .dispatch(
                 "brain.create_profile",
                 json!({
-                    "name": "recall-tuned-v1",
-                    "consumer_kind": "recall",
+                    "name": "compose-tuned-v1",
+                    "consumer_kind": "knowledge_compose",
                     "seed_priors": {
                         "section_posteriors": {
                             "formalism": {"alpha": 8.0, "beta": 1.0},
@@ -754,25 +720,25 @@ mod tests {
 
         // Activate so the profile leaves the Inactive state (matches proper usage).
         registry
-            .dispatch("brain.activate", json!({"profile_id": "recall-tuned-v1"}))
+            .dispatch("brain.activate", json!({"profile_id": "compose-tuned-v1"}))
             .await
-            .expect("activate recall-tuned-v1");
+            .expect("activate compose-tuned-v1");
 
-        // Bind for namespace="local", consumer_kind="recall".
-        // `knowledge_resolve_namespace_profile` dispatches:
-        //   brain.resolve(namespace="local", consumer_kind="recall")
+        // Bind for namespace="local", consumer_kind="knowledge_compose".
+        // `resolve_consumer_profile` dispatches:
+        //   brain.resolve(namespace="local", consumer_kind="knowledge_compose")
         // which must find this binding with matched_binding=true.
         registry
             .dispatch(
                 "brain.bind",
                 json!({
-                    "profile_id": "recall-tuned-v1",
+                    "profile_id": "compose-tuned-v1",
                     "namespace": "local",
-                    "consumer_kind": "recall"
+                    "consumer_kind": "knowledge_compose"
                 }),
             )
             .await
-            .expect("bind recall-tuned-v1 for namespace=local");
+            .expect("bind compose-tuned-v1 for namespace=local");
 
         // KnowledgePack with brain_profile=None → Tier 1 is skipped.
         let pack = KnowledgePack::new(rt.clone());

@@ -1,6 +1,8 @@
 //! Profile lifecycle, records, bindings, and the BalancedRecall state.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,47 @@ pub enum ProfileLifecycle {
     Active,
     Inactive,
     Archived,
+}
+
+/// Closed vocabulary of brain profile consumers (ADR-058 amendment, #542).
+/// Adding a new consumer requires adding a variant here — never a bare string
+/// literal at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerKind {
+    Recall,
+    KnowledgeCompose,
+    Rerank,
+}
+
+impl ConsumerKind {
+    /// The exact wire-level `consumer_kind` string for this variant.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConsumerKind::Recall => "recall",
+            ConsumerKind::KnowledgeCompose => "knowledge_compose",
+            ConsumerKind::Rerank => "rerank",
+        }
+    }
+}
+
+impl fmt::Display for ConsumerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ConsumerKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "recall" => Ok(ConsumerKind::Recall),
+            "knowledge_compose" => Ok(ConsumerKind::KnowledgeCompose),
+            "rerank" => Ok(ConsumerKind::Rerank),
+            other => Err(format!("unknown ConsumerKind: {other:?}")),
+        }
+    }
 }
 
 /// Profile metadata stored in the registry.
@@ -42,7 +85,7 @@ impl ProfileRecord {
         Self {
             id: "balanced-recall-v1".into(),
             description: "Default recall profile: three-scalar Beta posteriors".into(),
-            consumer_kind: "recall".into(),
+            consumer_kind: ConsumerKind::Recall.as_str().into(),
             state_class: "Bayesian".into(),
             lifecycle: ProfileLifecycle::Active,
             created_at: Utc::now(),
@@ -62,6 +105,41 @@ pub struct ProfileBinding {
     pub profile_id: String,
     pub priority: i32,
     pub created_at: DateTime<Utc>,
+}
+
+/// Resolve the effective profile for a `(namespace, consumer_kind)` pair via
+/// the brain pack's tier-2 binding table. Returns `None` unless `brain.resolve`
+/// reports `matched_binding=true` — the system-default fallback profile it
+/// returns otherwise must not be mistaken for an explicit binding, or each
+/// pack's tier-3 (global tuning prior) would become unreachable.
+///
+/// Shared by the memory pack (`ConsumerKind::Recall`) and the knowledge pack
+/// (`ConsumerKind::KnowledgeCompose`) — ADR-058 amendment, #542.
+pub async fn resolve_consumer_profile(
+    registry: &khive_runtime::VerbRegistry,
+    namespace: &str,
+    consumer_kind: ConsumerKind,
+) -> Option<String> {
+    let resolve_params = serde_json::json!({
+        "namespace": namespace,
+        "consumer_kind": consumer_kind.as_str(),
+    });
+    match registry.dispatch("brain.resolve", resolve_params).await {
+        Ok(v) => {
+            let matched_binding = v
+                .get("matched_binding")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if matched_binding {
+                v.get("resolved_profile_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 // ── BalancedRecallState ─────────────────────────────────────────────────────
@@ -229,6 +307,31 @@ pub struct BalancedRecallSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-058 amendment (#542): each variant's wire string is exact and stable.
+    #[test]
+    fn consumer_kind_as_str_matches_wire_vocabulary() {
+        assert_eq!(ConsumerKind::Recall.as_str(), "recall");
+        assert_eq!(ConsumerKind::KnowledgeCompose.as_str(), "knowledge_compose");
+        assert_eq!(ConsumerKind::Rerank.as_str(), "rerank");
+    }
+
+    /// ADR-058 amendment (#542): `as_str()` and `FromStr` round-trip for every variant.
+    #[test]
+    fn consumer_kind_from_str_round_trips() {
+        for kind in [
+            ConsumerKind::Recall,
+            ConsumerKind::KnowledgeCompose,
+            ConsumerKind::Rerank,
+        ] {
+            assert_eq!(kind.as_str().parse::<ConsumerKind>().unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn consumer_kind_from_str_rejects_unknown() {
+        assert!("bogus".parse::<ConsumerKind>().is_err());
+    }
 
     /// ADR-048 Phase-1 gate: profile save/load round-trip must produce identical
     /// posteriors (snapshot == restored state).
