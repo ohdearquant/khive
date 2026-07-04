@@ -1699,6 +1699,19 @@ impl KhiveRuntime {
         if !deleted.is_empty() {
             hits.retain(|h| !deleted.contains(&h.node_id));
         }
+        // Restore the weight-descending, node_id-ascending order the storage
+        // layer established (khive-db graph.rs `ORDER BY weight DESC, node_id
+        // ASC`) — the (node_id, edge_id) sort above exists only to make
+        // `dedup_by_key` adjacent-comparable and otherwise discards it. This
+        // is the ADR-089 amended neighbor-ordering contract and must hold at
+        // every call site of this op (context and neighbors verb alike),
+        // for every direction (ADR-089 context-verb review, codex round 2, High).
+        hits.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.node_id.cmp(&b.node_id))
+        });
         Ok(hits)
     }
 

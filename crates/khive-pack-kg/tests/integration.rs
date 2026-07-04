@@ -9043,6 +9043,89 @@ async fn context_fanout_caps_neighbors_per_node_per_hop() {
 }
 
 #[tokio::test]
+async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_order() {
+    // Codex round 2, High: khive-runtime's neighbors_with_query re-sorts hits by
+    // (node_id, edge_id) for dedup and, before this fix, never restored the
+    // weight-descending order the storage layer established. That meant
+    // context(direction="outgoing") returned neighbors in arbitrary node_id
+    // order instead of ADR-089's weight-descending, UUID-ascending-tiebreak
+    // contract, so a narrowing `fanout` could keep a low-weight neighbor over
+    // a high-weight one purely because its UUID sorted first.
+    //
+    // Node UUIDs are random v4 and uncorrelated with weight, so if ordering
+    // regresses to node_id order, the top-`fanout` set (and its relative
+    // order) will not match weight-descending with overwhelming probability.
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxOrderA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    let mut created = Vec::new();
+    for i in 0..5 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxOrderN{i}"), "entity_kind": "concept"}),
+            )
+            .await
+            .expect("create neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        let weight = 0.1 + (i as f64) * 0.1;
+        pack.dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": n_id, "relation": "extends", "weight": weight}),
+        )
+        .await
+        .expect("link A->neighbor");
+        created.push((n_id, weight));
+    }
+    // Highest two weights: N4 (0.5) and N3 (0.4).
+    let highest_id = created[4].0.clone();
+    let second_id = created[3].0.clone();
+    let lowest_id = created[0].0.clone();
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing", "fanout": 2}),
+        )
+        .await
+        .expect("context must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 2, "fanout=2 must cap at 2 neighbors");
+
+    let ids: Vec<&str> = neighbors
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&lowest_id.as_str()),
+        "lowest-weight neighbor must be dropped by fanout, not survive via node_id order; got {ids:?}"
+    );
+    assert_eq!(
+        ids[0], highest_id,
+        "highest-weight neighbor must appear first (weight-descending contract); got {ids:?}"
+    );
+    assert_eq!(
+        ids[1], second_id,
+        "second-highest-weight neighbor must appear second; got {ids:?}"
+    );
+    let weights: Vec<f64> = neighbors
+        .iter()
+        .map(|n| n["weight"].as_f64().unwrap())
+        .collect();
+    assert!(
+        weights[0] > weights[1],
+        "neighbor weights must be strictly descending; got {weights:?}"
+    );
+}
+
+#[tokio::test]
 async fn context_budget_truncation_sets_flag_and_dropped_counts() {
     let pack = pack();
     let a = pack
