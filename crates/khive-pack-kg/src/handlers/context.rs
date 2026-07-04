@@ -256,12 +256,60 @@ impl KgPack {
         let t0 = if prof { Some(Instant::now()) } else { None };
         let mut anchor_ids: Vec<Uuid> = Vec::new();
         let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut explicit_ids: Vec<Uuid> = Vec::new();
         if let Some(ids) = &p.entity_ids {
             for s in ids {
                 let uuid = resolve_uuid_async(s, &self.runtime, token).await?;
+                explicit_ids.push(uuid);
                 if seen.insert(uuid) {
                     anchor_ids.push(uuid);
                 }
+            }
+        }
+        // `entity_ids` is an explicit entity-anchor contract (ADR-089 §1: "honored
+        // in full"). `resolve_uuid_async` accepts any syntactically valid UUID
+        // without checking substrate or existence, so a random UUID, a note UUID,
+        // or an edge UUID would otherwise resolve here and then silently vanish
+        // from the response in Stage 4's lenient "missing entity" fallback. Fail
+        // loudly instead: one batch existence check naming every offending id
+        // (codex round 1, High-2).
+        if !explicit_ids.is_empty() {
+            let mut dedup_explicit = explicit_ids.clone();
+            dedup_explicit.sort_unstable();
+            dedup_explicit.dedup();
+            let page = self
+                .runtime
+                .entities(token)?
+                .query_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        ids: dedup_explicit.clone(),
+                        namespaces: token
+                            .visible_namespace_strs()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        ..EntityFilter::default()
+                    },
+                    PageRequest {
+                        offset: 0,
+                        limit: dedup_explicit.len() as u32,
+                    },
+                )
+                .await
+                .map_err(RuntimeError::Storage)?;
+            let found: HashSet<Uuid> = page.items.iter().map(|e| e.id).collect();
+            let missing: Vec<String> = dedup_explicit
+                .iter()
+                .filter(|id| !found.contains(id))
+                .map(|id| id.to_string())
+                .collect();
+            if !missing.is_empty() {
+                return Err(RuntimeError::NotFound(format!(
+                    "entity_ids must name existing, visible entities; not found or not an \
+                     entity: {}",
+                    missing.join(", ")
+                )));
             }
         }
         if let Some(t) = t0 {
@@ -271,13 +319,30 @@ impl KgPack {
         let t1 = if prof { Some(Instant::now()) } else { None };
         if has_query {
             let q = p.query.as_deref().unwrap();
+            // Fetch a larger candidate window than `limit` so that anchors which
+            // collapse into `entity_ids` duplicates don't under-fill the query
+            // leg: ADR-089 §1 promises search "fills up to `limit` additional
+            // anchors" after explicit ids, which requires looking past the first
+            // `limit` hits when some of them overlap explicit anchors (codex
+            // round 1, Medium-1). Bounded by a documented cap so a pathological
+            // overlap can't turn into an unbounded search.
+            const QUERY_FILL_WINDOW_MULTIPLIER: u32 = 4;
+            let fetch_n = limit
+                .saturating_add(explicit_ids.len() as u32)
+                .saturating_mul(QUERY_FILL_WINDOW_MULTIPLIER)
+                .max(limit);
             let hits = self
                 .runtime
-                .hybrid_search(token, q, None, limit, None, None, &[], None)
+                .hybrid_search(token, q, None, fetch_n, None, None, &[], None)
                 .await?;
+            let mut added = 0u32;
             for h in hits {
+                if added >= limit {
+                    break;
+                }
                 if seen.insert(h.entity_id) {
                     anchor_ids.push(h.entity_id);
+                    added += 1;
                 }
             }
         }
@@ -415,11 +480,13 @@ impl KgPack {
 
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
-        // Anchors whose entity vanished between resolution and fetch (deleted
-        // concurrently, or a stale explicit id) are dropped up front — the same
+        // Explicit `entity_ids` anchors are already verified to exist in Stage 1
+        // (codex round 1, High-2), so this only guards the residual race of an
+        // anchor deleted concurrently between resolution and this fetch, or a
+        // neighbor entity that vanished the same way. Neighbors get the same
         // lenient "missing node reads as absent" convention `neighbors_with_query`
         // already applies (it returns an empty Vec rather than erroring on a
-        // nonexistent `node_id`). They never enter the budget accounting below.
+        // nonexistent `node_id`) — they never enter the budget accounting below.
         let mut blocks: Vec<AnchorBlock> = Vec::with_capacity(anchor_ids.len());
         for (i, anchor) in anchor_ids.iter().enumerate() {
             let Some(e) = entity_meta.get(anchor) else {

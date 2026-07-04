@@ -112,6 +112,7 @@ fn pack_verbs_names_are_correct() {
         "review",
         "withdraw",
         "verbs",
+        "context",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -8290,6 +8291,144 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 }
 
 #[tokio::test]
+async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
+    // codex round 1, High-2: a syntactically valid but nonexistent UUID must
+    // error, not silently vanish from the response.
+    let pack = pack();
+    let random_id = uuid::Uuid::new_v4().to_string();
+
+    let err = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [random_id.clone()], "hops": 0}),
+        )
+        .await
+        .expect_err("a nonexistent entity_ids UUID must be rejected");
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "must be NotFound; got: {err:?}"
+    );
+    if let RuntimeError::NotFound(msg) = &err {
+        assert!(
+            msg.contains(&random_id),
+            "error must name the offending id; got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn context_entity_ids_note_uuid_is_rejected_as_non_entity() {
+    // A note's UUID is syntactically a valid UUID but not an entity substrate;
+    // it must be rejected, not silently dropped.
+    let pack = pack();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "a plain observation", "note_kind": "observation"}),
+        )
+        .await
+        .expect("create note");
+    let note_id = note["id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [note_id.clone()], "hops": 0}),
+        )
+        .await
+        .expect_err("a note UUID passed as entity_ids must be rejected");
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "must be NotFound; got: {err:?}"
+    );
+    if let RuntimeError::NotFound(msg) = &err {
+        assert!(
+            msg.contains(&note_id),
+            "error must name the offending id; got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn context_entity_ids_edge_uuid_is_rejected_as_non_entity() {
+    // An edge's UUID is syntactically a valid UUID but not an entity substrate;
+    // it must be rejected, not silently dropped.
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxEdgeIdRejectA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxEdgeIdRejectB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let link_resp = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link A-extends->B");
+    let edge_id = link_resp["id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [edge_id.clone()], "hops": 0}),
+        )
+        .await
+        .expect_err("an edge UUID passed as entity_ids must be rejected");
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "must be NotFound; got: {err:?}"
+    );
+    if let RuntimeError::NotFound(msg) = &err {
+        assert!(
+            msg.contains(&edge_id),
+            "error must name the offending id; got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn context_entity_ids_unresolvable_prefix_is_rejected() {
+    // A hex-looking prefix that matches nothing must error at resolution time
+    // (existing resolve_uuid_async behavior), not fall through silently.
+    let pack = pack();
+    let err = pack
+        .dispatch("context", json!({"entity_ids": ["deadbeef"], "hops": 0}))
+        .await
+        .expect_err("an unresolvable prefix must be rejected");
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+}
+
+#[tokio::test]
+async fn context_entity_ids_unresolvable_name_is_rejected() {
+    // A non-hex string that resolves through the name-lookup fallback and
+    // matches nothing must error, not fall through silently.
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": ["NoSuchEntityCtxNameLookup"], "hops": 0}),
+        )
+        .await
+        .expect_err("an unresolvable name must be rejected");
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "must be NotFound; got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
     let pack = pack();
     let a = pack
@@ -8696,6 +8835,66 @@ async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fil
             .iter()
             .any(|a| a["entity"]["name"] == "CtxComboSearchHit"),
         "query must contribute additional anchors after explicit ids; got: {anchors:?}"
+    );
+}
+
+#[tokio::test]
+async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anchor() {
+    // codex round 1, Medium-1: if the query's top hit is also an explicit anchor,
+    // the query leg must still fill up to `limit` DISTINCT non-explicit anchors
+    // rather than silently returning fewer once the duplicate collapses.
+    let pack = pack();
+    let explicit = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxFillDupExplicit", "entity_kind": "concept", "description": "ctxfilldup shared anchor text"}),
+        )
+        .await
+        .expect("create explicit");
+    let explicit_id = explicit["id"].as_str().unwrap().to_string();
+
+    // A second entity with the SAME distinctive text so it ranks as the top query
+    // hit alongside (or above) the explicit anchor.
+    let extra = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxFillDupExtra", "entity_kind": "concept", "description": "ctxfilldup shared anchor text"}),
+        )
+        .await
+        .expect("create extra");
+    let extra_id = extra["id"].as_str().unwrap().to_string();
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({
+                "entity_ids": [explicit_id.clone()],
+                "query": "ctxfilldup shared anchor text",
+                "limit": 1,
+                "hops": 0,
+            }),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    let anchor_ids: Vec<&str> = anchors
+        .iter()
+        .map(|a| a["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        anchor_ids.contains(&explicit_id.as_str()),
+        "explicit anchor must always be present; got: {anchor_ids:?}"
+    );
+    assert!(
+        anchor_ids.contains(&extra_id.as_str()),
+        "query leg must still deliver 1 distinct non-explicit anchor when its \
+         top hit collapses into the explicit id; got: {anchor_ids:?}"
+    );
+    assert_eq!(
+        anchors.len(),
+        2,
+        "explicit anchor + exactly `limit`=1 distinct query anchor expected"
     );
 }
 
