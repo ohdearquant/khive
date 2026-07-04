@@ -857,6 +857,12 @@ fn validate_create_bulk_items(
              entries: {e}"
             ))
         })?;
+    if entries.len() > 1000 {
+        return Err(RuntimeError::InvalidInput(
+            "schedule.action: verb \"create\": bulk create limited to 1000 entries per request"
+                .into(),
+        ));
+    }
     for (idx, entry) in entries.iter().enumerate() {
         match classify_create_kind(&entry.kind, registry)? {
             CreateKindClass::Entity { specific } => {

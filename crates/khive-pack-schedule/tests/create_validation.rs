@@ -1330,3 +1330,43 @@ async fn schedule_schedule_accepts_every_kg_entity_kind_alias_bulk() {
             });
     }
 }
+
+#[tokio::test]
+async fn schedule_schedule_rejects_create_bulk_over_1000_entries() {
+    let (registry, _rt) = build_registry();
+
+    let entries: Vec<String> = (0..1001)
+        .map(|i| format!("{{\"kind\":\"org\",\"name\":\"x{i}\"}}"))
+        .collect();
+    let action = format!("create(items=[{}])", entries.join(","));
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": action,
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("bulk create limited to 1000 entries per request"),
+        "round-4 gap: schedule must mirror KG's 1000-entry bulk cap at write time; got: {err}"
+    );
+
+    let items: Vec<serde_json::Value> = (0..1001)
+        .map(|i| serde_json::json!({"kind": "org", "name": format!("x{i}")}))
+        .collect();
+    let kg_err = registry
+        .dispatch("create", serde_json::json!({ "items": items }))
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err
+            .to_string()
+            .contains("bulk create limited to 1000 entries per request"),
+        "sanity: the live KG bulk create handler must reject 1001 entries; got: {kg_err}"
+    );
+}
