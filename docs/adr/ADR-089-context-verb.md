@@ -17,8 +17,9 @@ The building blocks exist and are warm-path:
 
 - `hybrid_search` (khive-runtime/src/retrieval.rs) resolves a query to ranked entities
   with one embedding inference against the daemon-warm embedder (ADR-049).
-- `neighbors_with_query` (the runtime op behind `neighbors`) already fuses a query into
-  1-hop neighbor ranking with direction, relation, weight, and limit filters.
+- `neighbors_with_query` (the runtime op behind `neighbors`) provides bounded 1-hop
+  neighbor expansion with direction, relation, weight, and limit filters; query-aware
+  neighbor reranking is a follow-up (see Amendment below).
 - `traverse` provides bounded multi-hop BFS.
 
 No existing verb composes them. `traverse` takes explicit roots without semantic anchor
