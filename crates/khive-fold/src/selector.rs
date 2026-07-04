@@ -43,8 +43,10 @@ pub struct SelectorInput<T> {
     /// `None`, but two `f64` scores that differ by less than an `f32` ulp would
     /// otherwise collapse to the same `f32` bit pattern before the selector
     /// ever compares them (khive-score contract: ADR fixed-point ranking).
-    /// Does not affect `min_score` filtering or `category_weights`
-    /// multipliers, which continue to operate on `score`.
+    /// Does not affect `min_score` filtering, which continues to operate on
+    /// `score`. `category_weights` multipliers DO scale `rank_score` (by the
+    /// same weight applied to `score`) so a caller-supplied high-precision
+    /// rank base still reflects category weighting during rank comparisons.
     #[cfg_attr(feature = "serde", serde(default))]
     pub rank_score: Option<f64>,
 }
@@ -216,12 +218,21 @@ impl<T: Clone> Selector<T> for GreedySelector {
         // Filter non-finite and below min_score.
         inputs.retain(|i| i.score.is_finite() && i.score >= weights.min_score);
 
-        // Apply category_weights multipliers.
+        // Apply category_weights multipliers. `rank_score`, when present, is
+        // the caller's higher-precision f64 rank base (see `rank_base` doc) —
+        // it must be scaled by the same weight or rank comparisons would see
+        // the unweighted value while `min_score` filtering sees the weighted
+        // one, silently defeating `category_weights` for any candidate that
+        // set `rank_score` (khive/PR#535 codex round-2 finding 1).
         if !weights.category_weights.is_empty() {
             for item in &mut inputs {
                 if let Some(ref cat) = item.category {
                     if let Some(&w) = weights.category_weights.get(cat.as_str()) {
-                        item.score *= w.max(0.0);
+                        let w = w.max(0.0);
+                        item.score *= w;
+                        if let Some(rank_score) = item.rank_score {
+                            item.rank_score = Some(rank_score * w as f64);
+                        }
                     }
                 }
             }
@@ -858,6 +869,33 @@ mod tests {
         assert_eq!(
             out.selected[0].id, "b",
             "higher rank_score must win despite tied f32 score"
+        );
+    }
+
+    #[test]
+    fn category_weights_reorder_candidates_when_rank_score_present() {
+        // Same shape as `category_weights_boost_preferred_category`, but both
+        // candidates carry an explicit `rank_score` equal to `score` widened
+        // to f64. Before the fix, rank comparisons read the unweighted
+        // `rank_score` (weights only ever touched `score`), so "a" (raw 0.9,
+        // "low") would win despite "high" carrying a 2.0x weight. The fix
+        // must scale `rank_score` by the same weight so "b" still wins.
+        let mut a = input_cat("a", 100, 0.9, "low");
+        a.rank_score = Some(0.9);
+        let mut b = input_cat("b", 100, 0.5, "high");
+        b.rank_score = Some(0.5);
+
+        let w = SelectorWeights {
+            category_weights: [("high".to_string(), 2.0f32), ("low".to_string(), 1.0f32)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = GreedySelector.select(vec![a, b], 100, &w).unwrap();
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(
+            out.selected[0].id, "b",
+            "category weight must still reorder candidates when rank_score is present"
         );
     }
 

@@ -306,9 +306,12 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
 ///
 /// `entity_posteriors_version` gates how strictly `entity_posterior_order` is
 /// checked:
-/// - version `0` (legacy, pre-ordering snapshots) — order is expected empty;
+/// - version `0` (legacy, pre-ordering snapshots) — order MUST be empty;
 ///   restore falls back to the deterministic ascending-`Uuid` compatibility
-///   path in [`crate::posterior::EntityPosteriors::from_snapshot`].
+///   path in [`crate::posterior::EntityPosteriors::from_snapshot`]. A
+///   version-0 snapshot with a non-empty order is not legacy compatibility
+///   data — it is partial order metadata that `serde(default)` let through
+///   (an omitted or explicit-zero version field) and is rejected here.
 /// - version `1` (current) — order MUST cover every `entity_posteriors` key
 ///   exactly (same length, no duplicates, no unknown ids). A partial order on
 ///   a current-format snapshot is corruption, not a compatibility case, and is
@@ -352,6 +355,22 @@ pub fn validate_brain_state_snapshot_with_capacity(
                     ));
                 }
             }
+        }
+
+        // Version 0 is the legacy, pre-ordering compatibility case and is
+        // only valid with an EMPTY order — restore falls back to the
+        // deterministic ascending-`Uuid` order in that case. A version-0
+        // snapshot with a non-empty (necessarily partial, since full coverage
+        // is only ever written under version 1) order is not legacy
+        // compatibility data; it is corruption that `serde(default)` would
+        // otherwise let through unnoticed (a snapshot with an omitted or
+        // explicit-zero version field), and restore would silently normalize
+        // it by appending the missing keys (posterior.rs `from_snapshot`).
+        // Reject it outright rather than let it round-trip.
+        if br.entity_posteriors_version == 0 && !br.entity_posterior_order.is_empty() {
+            return Err(format!(
+                "{label}.entity_posterior_order: non-empty order requires entity_posteriors_version >= 1 (got version 0, the legacy empty-order compatibility version)",
+            ));
         }
 
         // Non-legacy (version >= 1) snapshots must have an order entry for
@@ -741,6 +760,35 @@ mod tests {
         assert!(
             result.is_ok(),
             "legacy version-0 snapshot with empty order must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_version_zero_with_partial_order() {
+        // PR #535 codex round-2 finding 2: a version-0 snapshot with a
+        // non-empty (here: partial) order is NOT the legacy empty-order
+        // compatibility case. `serde(default)` lets `entity_posteriors_version`
+        // silently resolve to 0 on an omitted field, so this must be rejected
+        // outright rather than passed through to `restore`, which would
+        // silently normalize `[A]` order over `{A, B}` posteriors to `[A, B]`.
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        snapshot.entity_posteriors_version = 0;
+        snapshot.entity_posterior_order.truncate(1);
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "version-0 snapshot with non-empty partial order must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("requires entity_posteriors_version >= 1"),
+            "error must name the version-0-with-non-empty-order reason"
         );
     }
 

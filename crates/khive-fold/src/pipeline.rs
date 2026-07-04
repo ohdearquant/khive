@@ -89,6 +89,18 @@ mod tests {
         }
     }
 
+    fn input_cat(
+        id: &str,
+        score: f64,
+        precision: f64,
+        category: &str,
+    ) -> SelectorInput<(f64, f64)> {
+        SelectorInput {
+            category: Some(category.to_string()),
+            ..input(id, score, precision)
+        }
+    }
+
     fn pipeline() -> ComposePipeline<(f64, f64)> {
         ComposePipeline {
             anchor: Box::new(crate::anchor::BfsAnchor),
@@ -172,6 +184,44 @@ mod tests {
         assert_eq!(out.selected.len(), 2);
         assert_eq!(out.selected[0].id, "a");
         assert_eq!(out.selected[1].id, "z");
+    }
+
+    #[test]
+    fn compose_pipeline_category_weights_still_reorder_with_rank_score() {
+        // Mirrors selector.rs's `category_weights_boost_preferred_category`,
+        // but drives it through `ComposePipeline::execute`, which always sets
+        // `rank_score` (see the `execute` comment above). Before the fix,
+        // `ComposePipeline` candidates carrying `rank_score` were immune to
+        // `SelectorWeights.category_weights`: the comparator read the
+        // unweighted `rank_score` while the weight only touched `score`. "a"
+        // (raw effective 0.9, "low") would beat "b" (raw effective 0.5,
+        // "high", weight 2.0) despite the weight. The fix scales `rank_score`
+        // by the category weight too, so "b" must win.
+        let pipeline = pipeline();
+        let candidates = vec![
+            input_cat("a", 0.9, 1.0, "low"),
+            input_cat("b", 0.5, 1.0, "high"),
+        ];
+        let weights = SelectorWeights {
+            category_weights: [("high".to_string(), 2.0f32), ("low".to_string(), 1.0f32)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = pipeline
+            .execute(
+                &AnchorGraph::new(),
+                candidates,
+                1,
+                &weights,
+                &ObjectiveContext::new(),
+            )
+            .unwrap();
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(
+            out.selected[0].id, "b",
+            "category weight must still reorder ComposePipeline candidates carrying rank_score"
+        );
     }
 
     #[test]
