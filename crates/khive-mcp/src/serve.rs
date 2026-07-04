@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_runtime::{
     config_from_env, run_migrations, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, PackRegistry,
-    RuntimeConfig, StorageBackend, VerbRegistryBuilder,
+    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, RuntimeConfig,
+    StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -973,227 +973,105 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
     Ok(Some(canon_parent.join(file_name)))
 }
 
-/// Open backends, run migrations, build per-pack runtimes, register packs.
+/// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
 ///
-/// Called only when `[[backends]]` is non-empty in `khive.toml`.
+/// Called only when `[[backends]]` is non-empty in `khive.toml`. Delegates
+/// registry assembly to [`build_registry_for_multi_backend`] and finishing
+/// (pool + output format) to [`build_server_from_multi_backend_registry`] —
+/// this function's entire body used to duplicate both (#603); it is now a
+/// thin pass-through so a future wiring addition lands in exactly one place.
 ///
-/// `cli_db_override` is the raw, pre-resolution `--db` / `KHIVE_DB` value (issue
-/// #553). `[[backends]]` in `khive.toml` otherwise wins unconditionally, so an
-/// operator's `--db :memory:` isolation request was silently discarded whenever
-/// any backend was declared. `Some(":memory:")` forces every declared backend to
-/// in-memory for this invocation (loudly logged); any other concrete path is
-/// rejected rather than silently collapsing distinct declared backends onto one
-/// caller-supplied file.
-fn build_server_multi_backend(
+/// `pub` so `kkernel`'s coordinator-attached boot path can be compared
+/// against it directly in the #603 parity regression test — both call sites
+/// must produce servers with an identical wiring surface for the same config.
+pub fn build_server_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
-    let backend_count = khive_cfg.backends.len();
-    let force_memory = match cli_db_override {
-        Some(":memory:") => {
-            tracing::warn!(
-                "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
-                 configured [[backends]] entries to in-memory storage for this invocation; \
-                 khive.toml's declared backend paths will not be used this run"
-            );
-            true
-        }
-        Some(other) => {
-            anyhow::bail!(
-                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
-                 {backend_count} backend(s) are already declared in khive.toml, so applying \
-                 this override here is ambiguous (it could silently collapse distinct \
-                 declared backends onto a single file). Edit khive.toml directly to change \
-                 backend paths, or pass --db :memory: to force all backends in-memory for \
-                 this invocation."
-            );
-        }
-        None => false,
-    };
+    let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
+    Ok(build_server_from_multi_backend_registry(
+        multi, khive_cfg, None,
+    ))
+}
 
-    // Open and migrate each declared backend, deduplicating SQLite backends by
-    // canonical path (ADR-028 §8). Two [[backends]] entries that canonicalize to
-    // the same file share one Arc<StorageBackend> and run migrations once.
-    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let mut path_to_backend: HashMap<PathBuf, Arc<StorageBackend>> = HashMap::new();
-    for backend_cfg in &khive_cfg.backends {
-        let owned_cfg = if force_memory {
-            BackendConfig {
-                kind: BackendKind::Memory,
-                path: None,
-                ..backend_cfg.clone()
-            }
-        } else {
-            backend_cfg.clone()
-        };
-        let backend_cfg = &owned_cfg;
-        let canonical = canonical_backend_path(backend_cfg)?;
-        // Check for an already-opened backend with the same canonical path.
-        if let Some(ref canon) = canonical {
-            if let Some(existing) = path_to_backend.get(canon) {
-                backends.insert(backend_cfg.name.clone(), existing.clone());
-                continue;
-            }
-        }
-
-        let backend = open_backend(backend_cfg)?;
-        // Run migrations before passing backend to any runtime (risk §8 line 433).
-        {
-            let mut writer = backend.pool().try_writer().map_err(|e| {
-                anyhow::anyhow!("backend {}: migration writer: {e}", backend_cfg.name)
-            })?;
-            run_migrations(writer.conn_mut())
-                .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
-        }
-        let arc = Arc::new(backend);
-        if let Some(canon) = canonical {
-            path_to_backend.insert(canon, arc.clone());
-        }
-        backends.insert(backend_cfg.name.clone(), arc);
-    }
-
-    // Ensure the `main` backend exists (required fallback for unconfigured packs).
-    let main_backend = backends
-        .get(BackendId::MAIN)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "[[backends]] is declared but no backend named \"main\" was found; \
-             add a [[backends]] entry with name = \"main\""
-            )
-        })?
-        .clone();
-
-    // Build per-pack runtimes: each pack gets its assigned backend, or `main` as fallback.
-    // Secondary-backend packs have `core_backend` wired so that `rt.core()` returns a
-    // main-bound handle (ADR-073: linkable notes must land in the main backend).
-    let pack_names = &base_config.packs;
-    let mut per_pack_runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
-    for pack_name in pack_names {
-        let (backend_name, backend) = match khive_cfg.packs.get(pack_name.as_str()) {
-            None => (BackendId::MAIN, main_backend.clone()),
-            Some(pack_cfg) => {
-                let backend_name = pack_cfg.backend.as_str();
-                let backend = backends.get(backend_name).cloned().ok_or_else(|| {
-                    let defined = backends.keys().cloned().collect::<Vec<_>>().join(", ");
-                    anyhow::anyhow!(
-                        "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
-                    )
-                })?;
-                (backend_name, backend)
-            }
-        };
-        let mut rt_config = base_config.clone();
-        rt_config.backend_id = BackendId::new(backend_name);
-        per_pack_runtimes.insert(
-            pack_name.clone(),
-            build_pack_runtime(backend, backend_name, rt_config, &main_backend),
-        );
-    }
-
-    // Build the default runtime (for the main backend) — used for EventStore wiring.
-    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
-        let mut cfg = base_config.clone();
-        cfg.backend_id = BackendId::main();
-        cfg
-    });
-
-    #[cfg(feature = "bench-embedder")]
-    {
-        for rt in per_pack_runtimes.values() {
-            for name in rt.registered_embedding_model_names() {
-                rt.register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
-            }
-        }
-        for name in default_runtime.registered_embedding_model_names() {
-            default_runtime
-                .register_embedder(crate::bench_embedder::FeatureHashProvider::new(name));
-        }
-    }
-
-    enforce_strict_actor_mode(
-        default_runtime.config().actor_id.as_deref(),
-        &default_runtime.config().packs,
-    )?;
-    if should_warn_unattributed(
-        default_runtime.config().actor_id.as_deref(),
-        &default_runtime.config().packs,
-    ) {
-        tracing::warn!(
-            "actor identity resolved to \"local\": comm sends will be stamped from \
-             \"local\" (unattributed) and comm.inbox will be unscoped (party-line). \
-             Set KHIVE_ACTOR or --actor to this lambda's id."
-        );
-    }
-
-    // Build the VerbRegistry using per-pack runtimes.
-    let gate = default_runtime.config().gate.clone();
-    let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
-    let visible_namespaces = default_runtime.config().visible_namespaces.clone();
-
-    let mut builder = VerbRegistryBuilder::new();
-    builder.with_gate(gate);
-    builder.with_default_namespace(default_namespace.as_str());
-    builder.with_visible_namespaces(visible_namespaces);
-    // Thread authenticated actor identity (issue #75) into the multi-backend
-    // registry exactly as the single-backend path does (server.rs). Without
-    // this, dispatch mints ActorRef::anonymous() and comm.inbox reverts to
-    // party-line, silently disabling actor-addressed delivery (ADR-057).
-    builder.with_actor_id(default_runtime.config().actor_id.clone());
-
-    // Wire EventStore from the default (main) runtime.
-    if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
-        if let Ok(event_store) = default_runtime.events(&tok) {
-            builder.with_event_store(event_store);
-        }
-    }
-
-    PackRegistry::register_packs_with_runtimes(
-        pack_names,
-        &per_pack_runtimes,
-        &default_runtime,
-        &mut builder,
-    )
-    .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
-
-    let registry = builder
-        .build()
-        .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
-
-    // Install edge rules, embedders, and entity-type validators.
-    default_runtime.install_edge_rules(registry.all_edge_rules());
-    for rt in per_pack_runtimes.values() {
-        rt.install_edge_rules(registry.all_edge_rules());
-    }
-    registry.call_register_embedders(&default_runtime);
-    registry.call_register_entity_type_validators(&default_runtime);
-
-    // Apply schema plans to each pack's assigned backend (ADR-028 §7: collision = boot failure).
-    let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes
-        .iter()
-        .map(|(name, rt)| (name.as_str(), rt.backend()))
-        .collect();
-    let main_ref: &StorageBackend = main_backend.as_ref();
-    registry
-        .apply_schema_plans_with_map(&backend_for_pack, main_ref)
-        .map_err(|e| anyhow::anyhow!("pack schema boot failure: {e}"))?;
-
+/// Finish constructing a `KhiveMcpServer` from an already-built
+/// [`MultiBackendRegistry`] (#603).
+///
+/// This is the ONE place that applies every wiring step a multi-backend boot
+/// needs on top of the registry: the ADR-078 output-format default, the
+/// ADR-091 Planks 0+2 checkpoint pool, and — only for callers that pass one —
+/// the cross-backend coordinator (ADR-029 Phase 2). [`build_server_multi_backend`]
+/// (this file, `coordinator: None`) and `kkernel`'s `Command::Mcp` multi-backend
+/// branch (`crates/kkernel/src/main.rs`, `coordinator: Some(..)`) both call this
+/// instead of hand-assembling the server, so a future wiring addition (the
+/// fourth `pool`-style patch) is a change to this one function, not to two
+/// call sites — #503, ADR-078's inline output-format patch, and #601 each
+/// missed wiring by landing only in the hand-copied kkernel branch.
+pub fn build_server_from_multi_backend_registry(
+    multi: MultiBackendRegistry,
+    khive_cfg: &KhiveConfig,
+    coordinator: Option<Arc<dyn crate::coordinator::CoordinatorService>>,
+) -> KhiveMcpServer {
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
-    let pool = checkpoint_pool_for(main_backend.as_ref());
-
+    let pool = checkpoint_pool_for(multi.main_backend.as_ref());
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-    let server =
-        KhiveMcpServer::from_registry_with_meta(registry, default_namespace.as_str(), &config_id)
-            .with_default_output_format(fmt);
 
-    Ok(if let Some(p) = pool {
-        server.with_pool(p)
-    } else {
-        server
-    })
+    let server = KhiveMcpServer::from_registry_with_meta(
+        multi.registry,
+        &multi.default_namespace,
+        &multi.config_id,
+    )
+    .with_default_output_format(fmt);
+
+    let server = match coordinator {
+        Some(c) => server.with_coordinator(c),
+        None => server,
+    };
+
+    match pool {
+        Some(p) => server.with_pool(p),
+        None => server,
+    }
+}
+
+/// Construction-time facts that every multi-backend boot path must agree on
+/// for identical input config (#603) — the parity contract the shared
+/// [`build_server_from_multi_backend_registry`] constructor exists to
+/// guarantee. Extend this struct (not the call sites) when a future wiring
+/// addition needs its own parity coverage.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WiringSurface {
+    /// Whether a checkpoint pool was wired (#601/#604 — ADR-091 Planks 0+2).
+    pub has_checkpoint_pool: bool,
+    /// The resolved ADR-078 default output format.
+    pub output_format: OutputFormat,
+    /// Whether the default ingest namespace would authorize the email
+    /// channel loops to start if this process runs in the daemon role
+    /// (#503/#602). The actual spawn is arg-driven at `run`/`serve_server`
+    /// (#610), not construction time, but the *authorization* outcome is a
+    /// function of how the registry's gate was wired during construction —
+    /// this field is the construction-time state that decision reads.
+    /// Only meaningful when the `channel-email` feature is compiled in.
+    #[cfg(feature = "channel-email")]
+    pub channel_loop_eligible: bool,
+}
+
+impl WiringSurface {
+    /// Capture the wiring surface of an already-built server.
+    pub fn capture(server: &KhiveMcpServer) -> Self {
+        Self {
+            has_checkpoint_pool: server.pool().is_some(),
+            output_format: server.default_output_format(),
+            #[cfg(feature = "channel-email")]
+            channel_loop_eligible: preflight_ingest_namespace(
+                &ingest_namespace_from_env(),
+                &server.verb_registry_clone(),
+            ),
+        }
+    }
 }
 
 /// Derive the checkpoint pool for a multi-backend boot's `main` backend
@@ -1201,11 +1079,11 @@ fn build_server_multi_backend(
 /// in-memory backends must never drive `checkpoint_once` on a non-WAL
 /// connection.
 ///
-/// Shared by both multi-backend boot paths — `build_server_multi_backend`
-/// (this file) and the `kkernel mcp` daemon branch (`crates/kkernel/src/main.rs`,
-/// which builds its server from `MultiBackendRegistry` directly rather than via
-/// `build_server_multi_backend`) — so the derivation lives in exactly one
-/// place instead of being hand-copied at each call site (#601, #604).
+/// Called from exactly one place now: [`build_server_from_multi_backend_registry`]
+/// (#603) — both multi-backend boot paths (`build_server_multi_backend` in this
+/// file and `kkernel`'s `Command::Mcp` coordinator branch) go through that shared
+/// constructor, so this derivation is no longer hand-copied at each call site
+/// (#601, #604).
 pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<ConnectionPool>> {
     if main_backend.is_file_backed() {
         Some(main_backend.pool_arc())
@@ -1884,24 +1762,19 @@ brain_profile = "project-profile"
         );
     }
 
-    /// Regression for #601: the `kkernel mcp` multi-backend daemon path builds its
-    /// server from `MultiBackendRegistry` via `from_registry_with_meta` +
-    /// `with_coordinator`, NOT via `build_server_multi_backend` — so it must wire
-    /// the main backend's pool itself, mirroring what `build_server_multi_backend`
-    /// already does (serve.rs `build_server_multi_backend`, the sibling boot path).
-    ///
-    /// Before the fix, that wiring step was missing on the kkernel branch: the server
-    /// had `pool == None` unconditionally, `pool_for_checkpoint()` returned `None`, and
-    /// `khive_runtime::daemon` never spawned `run_checkpoint_task` — ADR-091 Planks 0+2
-    /// were dead code in the live daemon.
-    ///
-    /// This test calls `checkpoint_pool_for` — the SAME helper both boot paths call
-    /// (`build_server_multi_backend` in this file, and `Command::Mcp` in
-    /// `crates/kkernel/src/main.rs`) — rather than re-deriving the `is_file_backed`/
-    /// `pool_arc` logic inline. That keeps the test coupled to the production
-    /// derivation: deleting or bypassing the `checkpoint_pool_for` call in
-    /// `main.rs` breaks compilation there, and any regression in the derivation
-    /// itself (this helper) fails here directly.
+    /// Regression for #601, adapted for #603: both multi-backend boot paths —
+    /// `build_server_multi_backend` (this file) and `kkernel`'s `Command::Mcp`
+    /// coordinator branch — now finish through the single
+    /// [`build_server_from_multi_backend_registry`] constructor instead of each
+    /// hand-assembling `from_registry_with_meta` + `with_pool`. This test calls
+    /// that shared constructor directly (`coordinator: None`, the same value
+    /// `build_server_multi_backend` passes) rather than re-deriving the
+    /// `is_file_backed`/`pool_arc` logic inline, so a regression in the shared
+    /// constructor itself — or its callers drifting back to hand-assembly —
+    /// fails here directly. The kkernel-vs-`build_server_multi_backend` parity
+    /// itself is covered end-to-end by `kkernel`'s own
+    /// `multi_backend_boot_paths_share_identical_wiring_surface` test, which
+    /// exercises the actual coordinator branch.
     #[test]
     fn kkernel_multi_backend_path_wires_pool_for_file_backed_main() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1923,18 +1796,7 @@ brain_profile = "project-profile"
 
         let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend registry build must succeed");
-
-        let pool = checkpoint_pool_for(multi.main_backend.as_ref());
-        let server = KhiveMcpServer::from_registry_with_meta(
-            multi.registry,
-            &multi.default_namespace,
-            &multi.config_id,
-        );
-        let server = if let Some(p) = pool {
-            server.with_pool(p)
-        } else {
-            server
-        };
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
 
         assert!(
             server.pool().is_some(),
@@ -1944,7 +1806,8 @@ brain_profile = "project-profile"
 
     /// Sibling guard: an in-memory main backend must never carry a checkpoint pool
     /// (checkpoint_once must never run on a non-WAL, in-memory connection). Also
-    /// exercises `checkpoint_pool_for` — see the note on the sibling test above.
+    /// exercises `build_server_from_multi_backend_registry` — see the note on the
+    /// sibling test above.
     #[test]
     fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
         let khive_cfg = KhiveConfig {
@@ -1963,18 +1826,7 @@ brain_profile = "project-profile"
 
         let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend registry build must succeed");
-
-        let pool = checkpoint_pool_for(multi.main_backend.as_ref());
-        let server = KhiveMcpServer::from_registry_with_meta(
-            multi.registry,
-            &multi.default_namespace,
-            &multi.config_id,
-        );
-        let server = if let Some(p) = pool {
-            server.with_pool(p)
-        } else {
-            server
-        };
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
 
         assert!(
             server.pool().is_none(),

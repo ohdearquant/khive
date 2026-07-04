@@ -241,7 +241,12 @@ async fn main() -> Result<()> {
                 // Single-backend: zero-change path — no coordinator.
                 khive_mcp::serve::run(a, &transport_registry).await
             } else {
-                // Multi-backend: build registry, inject SubstrateCoordinator.
+                // Multi-backend: build registry, attach the SubstrateCoordinator,
+                // and finish server assembly through the shared #603 constructor
+                // (`build_multi_backend_server_with_coordinator`) — this branch
+                // contains no server-assembly logic of its own beyond building
+                // the coordinator inputs (BackendRegistry + note_kinds) and
+                // attaching it.
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -261,74 +266,69 @@ async fn main() -> Result<()> {
                     },
                 )?;
 
-                let multi = khive_mcp::serve::build_registry_for_multi_backend(
+                let server = build_multi_backend_server_with_coordinator(
                     base_cfg,
                     &khive_cfg,
                     a.db.as_deref(),
                 )?;
-
-                // Build BackendRegistry: one entry per unique backend (deduplicated
-                // by backend_name so packs sharing a backend share one runtime).
-                let mut backend_reg = BackendRegistry::new();
-                for (pack_name, rt) in &multi.per_pack_runtimes {
-                    let backend_name = khive_cfg
-                        .packs
-                        .get(pack_name.as_str())
-                        .map(|pc| pc.backend.as_str())
-                        .unwrap_or(BackendId::MAIN);
-                    let backend_id = BackendId::new(backend_name);
-                    // `BackendRegistry::register` is idempotent by backend_id —
-                    // the second registration for the same id is a no-op.
-                    backend_reg.register(backend_id, Arc::clone(rt));
-                }
-
-                let note_kinds: std::collections::HashSet<String> = multi
-                    .registry
-                    .all_note_kinds()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                let coord = SubstrateCoordinatorService::new(
-                    SubstrateCoordinator::new(backend_reg),
-                    note_kinds,
-                );
-                // Resolve the ADR-078 output-format default (env > [runtime] TOML >
-                // builtin json) for this serve path too — the single-backend branch
-                // does this inside `serve::run`, but this multi-backend branch builds
-                // the server directly via `from_registry_with_meta`, which defaults to
-                // Json, so without this the fleet's `default_output_format` opt-in is
-                // silently ignored on the daemon's primary serve surface.
-                let output_format = khive_mcp::serve::apply_env_output_format(
-                    khive_cfg.runtime.default_output_format,
-                );
-                // Wire the main backend's pool for background WAL checkpointing
-                // (ADR-091 Planks 0+2) via the shared helper, mirroring
-                // `build_server_multi_backend` (serve.rs). Without this,
-                // `KhiveMcpServer.pool` stays `None`, `pool_for_checkpoint()`
-                // returns `None`, and `khive_runtime::daemon` never spawns
-                // `run_checkpoint_task` — the daemon runs with no periodic WAL
-                // checkpointing (#601).
-                let pool = khive_mcp::serve::checkpoint_pool_for(multi.main_backend.as_ref());
-                let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
-                    multi.registry,
-                    &multi.default_namespace,
-                    &multi.config_id,
-                )
-                .with_coordinator(
-                    Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>
-                )
-                .with_default_output_format(output_format);
-                let server = if let Some(p) = pool {
-                    server.with_pool(p)
-                } else {
-                    server
-                };
 
                 khive_mcp::serve::serve_server(server, &a, &transport_registry).await
             }
         }
         Command::Backend(b) => cmd_backend(b),
     }
+}
+
+/// Build the coordinator-attached multi-backend server for `kkernel mcp`
+/// (the `Command::Mcp` branch, taken when `[[backends]]` declares more than
+/// one backend).
+///
+/// Extracted out of `main()` (#603) so this is the ONE place that assembles
+/// the `BackendRegistry`/`SubstrateCoordinator` inputs and hands them to the
+/// shared `khive_mcp::serve::build_server_from_multi_backend_registry`
+/// constructor — everything but that coordinator attachment (registry
+/// assembly, the ADR-078 output format, the ADR-091 checkpoint pool) now
+/// lives in exactly one place in `khive-mcp::serve`, not hand-copied here.
+/// Extraction also makes this branch directly comparable, in a test, against
+/// `khive_mcp::serve::build_server_multi_backend` (the sibling boot path) —
+/// see `multi_backend_boot_paths_share_identical_wiring_surface` below.
+fn build_multi_backend_server_with_coordinator(
+    base_cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> Result<khive_mcp::server::KhiveMcpServer> {
+    let multi =
+        khive_mcp::serve::build_registry_for_multi_backend(base_cfg, khive_cfg, cli_db_override)?;
+
+    // Build BackendRegistry: one entry per unique backend (deduplicated
+    // by backend_name so packs sharing a backend share one runtime).
+    let mut backend_reg = BackendRegistry::new();
+    for (pack_name, rt) in &multi.per_pack_runtimes {
+        let backend_name = khive_cfg
+            .packs
+            .get(pack_name.as_str())
+            .map(|pc| pc.backend.as_str())
+            .unwrap_or(BackendId::MAIN);
+        let backend_id = BackendId::new(backend_name);
+        // `BackendRegistry::register` is idempotent by backend_id —
+        // the second registration for the same id is a no-op.
+        backend_reg.register(backend_id, Arc::clone(rt));
+    }
+
+    let note_kinds: std::collections::HashSet<String> = multi
+        .registry
+        .all_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let coord =
+        SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
+
+    Ok(khive_mcp::serve::build_server_from_multi_backend_registry(
+        multi,
+        khive_cfg,
+        Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
+    ))
 }
 
 async fn cmd_db(cmd: DbCommand) -> Result<()> {
@@ -659,5 +659,121 @@ mod tests {
         .expect("db check passes on a current db");
         let after = std::fs::read(&path).expect("read db after check");
         assert_eq!(before, after, "db check must not mutate the database");
+    }
+
+    // --- #603: multi-backend boot path consolidation ---
+    //
+    // Both multi-backend boot paths — `khive_mcp::serve::build_server_multi_backend`
+    // (the plain `kkernel mcp` path, no coordinator) and this crate's
+    // `build_multi_backend_server_with_coordinator` (the `Command::Mcp` coordinator
+    // branch) — now finish through the SAME shared constructor
+    // (`khive_mcp::serve::build_server_from_multi_backend_registry`). Before #603,
+    // the coordinator branch hand-copied registry assembly, the output-format
+    // resolution, and the checkpoint-pool wiring inline in `main()`, and missed
+    // wiring three times as each was patched independently (#503, ADR-078, #601).
+    // This test drives BOTH real production entry points (not a hand-reimplementation
+    // of either) against the same config and asserts their `WiringSurface`s match —
+    // the regression this consolidation exists to prevent is exactly two boot paths
+    // silently drifting apart again.
+
+    fn base_multi_backend_runtime_config() -> RuntimeConfig {
+        use khive_runtime::Namespace;
+        RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("local").expect("valid namespace"),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn single_main_backend_config(
+        kind: khive_runtime::BackendKind,
+        path: Option<PathBuf>,
+    ) -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![khive_runtime::BackendConfig {
+                name: "main".to_string(),
+                kind,
+                path,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        }
+    }
+
+    /// File-backed main: both boot paths must agree on every `WiringSurface`
+    /// field — in particular, both must wire a checkpoint pool (#601/#604).
+    #[test]
+    fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
+        let dir = TempDir::new().expect("temp dir");
+        let main_path = dir.path().join("main.db");
+        let khive_cfg =
+            single_main_backend_config(khive_runtime::BackendKind::Sqlite, Some(main_path));
+
+        let plain_server = khive_mcp::serve::build_server_multi_backend(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("plain multi-backend boot must succeed");
+
+        let coordinator_server = build_multi_backend_server_with_coordinator(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("kkernel coordinator-attached multi-backend boot must succeed");
+
+        let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
+        let coordinator_surface = khive_mcp::serve::WiringSurface::capture(&coordinator_server);
+
+        assert_eq!(
+            plain_surface, coordinator_surface,
+            "the plain multi-backend boot path and kkernel's coordinator-attached \
+             boot path must produce an identical wiring surface for the same config"
+        );
+        assert!(
+            plain_surface.has_checkpoint_pool,
+            "file-backed main must wire a checkpoint pool on both paths"
+        );
+    }
+
+    /// In-memory main: both paths must agree that no checkpoint pool is wired
+    /// (checkpoint_once must never run on a non-WAL connection).
+    #[test]
+    fn multi_backend_boot_paths_share_identical_wiring_surface_in_memory() {
+        let khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+
+        let plain_server = khive_mcp::serve::build_server_multi_backend(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("plain multi-backend boot must succeed");
+
+        let coordinator_server = build_multi_backend_server_with_coordinator(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("kkernel coordinator-attached multi-backend boot must succeed");
+
+        let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
+        let coordinator_surface = khive_mcp::serve::WiringSurface::capture(&coordinator_server);
+
+        assert_eq!(
+            plain_surface, coordinator_surface,
+            "the plain multi-backend boot path and kkernel's coordinator-attached \
+             boot path must produce an identical wiring surface for the same config"
+        );
+        assert!(
+            !plain_surface.has_checkpoint_pool,
+            "in-memory main must never carry a checkpoint pool on either path"
+        );
     }
 }

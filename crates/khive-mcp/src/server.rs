@@ -461,6 +461,12 @@ impl KhiveMcpServer {
         self.pool.clone()
     }
 
+    /// The server-level default output format (ADR-078), as resolved at
+    /// construction by [`crate::serve::apply_env_output_format`].
+    pub fn default_output_format(&self) -> OutputFormat {
+        self.default_output_format
+    }
+
     /// Warm every pack's in-memory state. Called by the daemon in a background
     /// task after the socket is bound.
     pub async fn warm_all(&self) {
