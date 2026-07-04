@@ -27,9 +27,11 @@ fn boxed_tokenizer_is_object_safe() {
 
 #[test]
 fn standard_preset_filters_stops_and_short() {
+    // "am" is not a BM25 default stop word, so it survives under the
+    // BM25-parity contract for preset::standard().
     let a = preset::standard();
     let tokens = a.analyze("I am a test of the standard analyzer");
-    assert_eq!(tokens, vec!["test", "standard", "analyzer"]);
+    assert_eq!(tokens, vec!["am", "test", "standard", "analyzer"]);
 }
 
 #[test]

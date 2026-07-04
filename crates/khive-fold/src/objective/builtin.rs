@@ -134,6 +134,9 @@ where
 
         for (i, candidate) in candidates.iter().take(limit).enumerate() {
             if (self.predicate)(candidate) {
+                if !self.passes_score(1.0, context) {
+                    return Vec::new();
+                }
                 return vec![Selection::new(candidate, 1.0, i)
                     .with_considered(i + 1)
                     .with_passed(1)];
@@ -345,6 +348,17 @@ mod tests {
 
         assert_eq!(*selection.item, 7);
         assert_eq!(selection.index, 2);
+    }
+
+    #[test]
+    fn test_first_match_respects_min_score() {
+        let objective = FirstMatchObjective::new(|n: &i32| *n > 5);
+
+        let candidates = vec![7];
+        let context = ObjectiveContext::new().with_min_score(2.0);
+
+        assert!(!objective.passes(&7, &context));
+        assert!(objective.select(&candidates, &context).is_empty());
     }
 
     #[test]

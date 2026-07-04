@@ -473,3 +473,30 @@ async fn test_same_id_upsert_replaces_row() {
     assert_eq!(count_a, 0);
     assert_eq!(count_b, 1);
 }
+
+/// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
+/// InvalidInput instead of silently narrowing to a negative i64 offset.
+#[tokio::test]
+async fn page_offset_over_i64max_rejected() {
+    let store = setup_memory_store_ns("ns1");
+    store
+        .upsert_entity(make_entity("ns1", "concept", "Alpha"))
+        .await
+        .unwrap();
+
+    let result = store
+        .query_entities(
+            "ns1",
+            EntityFilter::default(),
+            PageRequest {
+                offset: (i64::MAX as u64) + 1,
+                limit: 10,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+}

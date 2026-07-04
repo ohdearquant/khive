@@ -73,8 +73,9 @@ fn main() {
                     "description": format!(
                         "knowledge retrieval embedding reranking benchmark atom {i} tensor neural"
                     ),
+                    // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by the knowledge pack.
                     "content": format!(
-                        "dense sparse retrieval corpus benchmark search latency atom {i} gradient"
+                        "dense sparse retrieval corpus benchmark search latency atom {i} gradient neural transformer embedding semantic index query score rank precision recall vector"
                     ),
                 })
             })
@@ -93,7 +94,7 @@ fn main() {
             .await
             .expect("cold rerank dispatch");
         let cold_us = t_cold.elapsed().as_micros();
-        assert_eq!(cold_resp["status"], "ok");
+        assert!(cold_resp["results"].is_array());
         println!("[#595] cold_rerank_first_query_us: {cold_us}");
 
         const N: usize = 20;
@@ -109,7 +110,7 @@ fn main() {
                 .await
                 .expect("rerank=false dispatch");
             rerank_false_us.push(t.elapsed().as_micros());
-            assert_eq!(resp["status"], "ok");
+            assert!(resp["results"].is_array());
         }
         rerank_false_us.sort_unstable();
 
@@ -124,7 +125,7 @@ fn main() {
                 .await
                 .expect("rerank=true dispatch");
             rerank_true_us.push(t.elapsed().as_micros());
-            assert_eq!(resp["status"], "ok");
+            assert!(resp["results"].is_array());
         }
         rerank_true_us.sort_unstable();
 
@@ -136,7 +137,7 @@ fn main() {
                 .await
                 .expect("default dispatch");
             default_us.push(t.elapsed().as_micros());
-            assert_eq!(resp["status"], "ok");
+            assert!(resp["results"].is_array());
         }
         default_us.sort_unstable();
 

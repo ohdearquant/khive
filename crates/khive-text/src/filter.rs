@@ -200,6 +200,37 @@ impl TokenFilter for StopWordFilter {
     }
 }
 
+/// Drops the same stop words as `khive-bm25`'s `SimpleTokenizer::default()`.
+/// Scoped to `preset::standard()` so the public [`StopWordFilter`] stop list
+/// is unaffected. Assumes input is already lowercased.
+#[derive(Debug, Default, Clone)]
+pub struct Bm25StopWordFilter;
+
+static BM25_STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "did",
+        "do", "does", "doing", "done", "for", "from", "had", "has", "have", "having", "he", "her",
+        "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just",
+        "may", "me", "might", "my", "no", "nor", "not", "of", "on", "or", "our", "out", "own",
+        "say", "she", "should", "so", "some", "such", "than", "that", "the", "their", "them",
+        "then", "there", "these", "they", "this", "those", "through", "to", "too", "up", "us",
+        "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
+        "why", "will", "with", "would", "you", "your",
+    ]
+    .into_iter()
+    .collect()
+});
+
+impl TokenFilter for Bm25StopWordFilter {
+    fn apply(&self, token: String) -> Option<String> {
+        if BM25_STOP_WORDS.contains(token.as_str()) {
+            None
+        } else {
+            Some(token)
+        }
+    }
+}
+
 /// Snowball stemmer. Only stems ASCII-alphabetic tokens; others pass through.
 #[cfg(feature = "stem")]
 pub struct SnowballStemmer(rust_stemmers::Stemmer);

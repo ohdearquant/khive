@@ -17,12 +17,16 @@ identifiers, KG entity names).
 use khive_text::{preset, Analyzer};
 
 let tokens = preset::standard().analyze("The quick brown fox jumps over the lazy dog");
-assert_eq!(tokens, vec!["quick", "brown", "fox", "jumps", "lazy", "dog"]);
+assert_eq!(tokens, vec!["quick", "brown", "fox", "jumps", "over", "lazy", "dog"]);
 ```
 
 `preset::standard()` chains `WhitespaceTokenizer` with `LowercaseFilter`,
-`StopWordFilter`, `MinLengthFilter(2)`, and `MaxLengthFilter(40)`. Other named
-presets: `preset::simple()` (whitespace + lowercase only, keeps stop words),
+a BM25-compatible stop-word filter, and `MinLengthFilter(1)` — producing the
+same token stream as `khive-bm25`'s `SimpleTokenizer::default()` (same stop
+list, no max-length cap). This is intentionally different from the public
+`StopWordFilter` in `khive_text::filter`, which has its own stop list for
+callers building custom pipelines. Other named presets: `preset::simple()`
+(whitespace + lowercase only, keeps stop words),
 `preset::keyword()` (whole input as one token), `preset::cjk()`
 (character-level unigrams for CJK scripts, whitespace for Latin), and
 `preset::kg_name()` (identifier-aware splitting tuned for entity names like

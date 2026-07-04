@@ -21,7 +21,7 @@ integration layer is extended to expose snapshot ancestry for LCA walks.
 - `khive-merge` is not yet registered in any pack; the VCS integration surface must be extended
   before the `ThreeWayMergeEngine` can be wired into production.
 
-### ADR-043: Three-Way Merge Conflict Taxonomy
+### Three-Way Merge Conflict Taxonomy
 
 - The `MergeConflict` enum (in `types.rs`) enumerates the six conflict kinds defined for
   the three-way merge: `NameConflict`, `KindConflict`, `ModifyDelete`, `PropertyMismatch`,
@@ -30,7 +30,7 @@ integration layer is extended to expose snapshot ancestry for LCA walks.
   take that side) are implemented in `entity::merge_properties`.
 - Auto-merge for duplicate-UUID additions uses scalars-ours-wins + tags-union logic.
 
-### ADR-048: Edge Identity
+### Edge Identity
 
 - `edge_id` must be stable across merge/diff cycles; merged edges must not receive a fresh UUID
   when the originating branch's edge is identifiable.

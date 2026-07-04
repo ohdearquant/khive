@@ -82,6 +82,7 @@ impl KnowledgeHandlers {
                 category: c.category.clone(),
                 information_gain: c.information_gain,
                 content: c,
+                rank_score: None,
             })
             .collect();
 

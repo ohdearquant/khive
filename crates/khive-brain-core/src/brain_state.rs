@@ -294,6 +294,116 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
     Ok(())
 }
 
+/// Validate posterior numerics (via [`validate_brain_state_snapshot`]) plus
+/// entity-posterior cache-capacity bounds for a persisted snapshot.
+///
+/// Rejects a snapshot whose `balanced_recall` or any `profile_states` entry
+/// holds more entity posteriors than `entity_capacity`, and rejects
+/// `entity_posterior_order` values that contain duplicate ids or reference
+/// ids absent from `entity_posteriors`. This is the capacity-aware
+/// counterpart used at the persistence load boundary, so a crafted or legacy
+/// oversized snapshot is rejected outright rather than silently truncated.
+///
+/// `entity_posteriors_version` gates how strictly `entity_posterior_order` is
+/// checked:
+/// - version `0` (legacy, pre-ordering snapshots) — order MUST be empty;
+///   restore falls back to the deterministic ascending-`Uuid` compatibility
+///   path in [`crate::posterior::EntityPosteriors::from_snapshot`]. A
+///   version-0 snapshot with a non-empty order is not legacy compatibility
+///   data — it is partial order metadata that `serde(default)` let through
+///   (an omitted or explicit-zero version field) and is rejected here.
+/// - version `1` (current) — order MUST cover every `entity_posteriors` key
+///   exactly (same length, no duplicates, no unknown ids). A partial order on
+///   a current-format snapshot is corruption, not a compatibility case, and is
+///   rejected here rather than silently normalized at restore.
+/// - any other version — rejected outright as unknown.
+pub fn validate_brain_state_snapshot_with_capacity(
+    snapshot: &BrainStateSnapshot,
+    entity_capacity: usize,
+) -> Result<(), String> {
+    validate_brain_state_snapshot(snapshot)?;
+
+    fn check_recall(
+        label: &str,
+        br: &BalancedRecallSnapshot,
+        entity_capacity: usize,
+    ) -> Result<(), String> {
+        if br.entity_posteriors.len() > entity_capacity {
+            return Err(format!(
+                "{label}.entity_posteriors: {} entries exceeds capacity {entity_capacity}",
+                br.entity_posteriors.len()
+            ));
+        }
+
+        if br.entity_posteriors_version > 1 {
+            return Err(format!(
+                "{label}.entity_posteriors_version: unknown version {}",
+                br.entity_posteriors_version
+            ));
+        }
+
+        if !br.entity_posterior_order.is_empty() {
+            let mut seen =
+                std::collections::HashSet::with_capacity(br.entity_posterior_order.len());
+            for id in &br.entity_posterior_order {
+                if !seen.insert(*id) {
+                    return Err(format!("{label}.entity_posterior_order: duplicate id {id}"));
+                }
+                if !br.entity_posteriors.contains_key(id) {
+                    return Err(format!(
+                        "{label}.entity_posterior_order: id {id} not present in entity_posteriors"
+                    ));
+                }
+            }
+        }
+
+        // Version 0 is the legacy, pre-ordering compatibility case and is
+        // only valid with an EMPTY order — restore falls back to the
+        // deterministic ascending-`Uuid` order in that case. A version-0
+        // snapshot with a non-empty (necessarily partial, since full coverage
+        // is only ever written under version 1) order is not legacy
+        // compatibility data; it is corruption that `serde(default)` would
+        // otherwise let through unnoticed (a snapshot with an omitted or
+        // explicit-zero version field), and restore would silently normalize
+        // it by appending the missing keys (posterior.rs `from_snapshot`).
+        // Reject it outright rather than let it round-trip.
+        if br.entity_posteriors_version == 0 && !br.entity_posterior_order.is_empty() {
+            return Err(format!(
+                "{label}.entity_posterior_order: non-empty order requires entity_posteriors_version >= 1 (got version 0, the legacy empty-order compatibility version)",
+            ));
+        }
+
+        // Non-legacy (version >= 1) snapshots must have an order entry for
+        // every entity_posteriors key. Combined with the duplicate/unknown-id
+        // checks above (which already guarantee every order id is a distinct,
+        // valid map key), an equal length here proves the id sets are
+        // identical — no entity_posteriors key is missing from the order.
+        if br.entity_posteriors_version >= 1
+            && br.entity_posterior_order.len() != br.entity_posteriors.len()
+        {
+            return Err(format!(
+                "{label}.entity_posterior_order: length {} does not cover all {} entity_posteriors entries (version {} requires full order coverage)",
+                br.entity_posterior_order.len(),
+                br.entity_posteriors.len(),
+                br.entity_posteriors_version,
+            ));
+        }
+
+        Ok(())
+    }
+
+    check_recall(
+        "balanced_recall",
+        &snapshot.balanced_recall,
+        entity_capacity,
+    )?;
+    for (pid, ps) in &snapshot.profile_states {
+        check_recall(&format!("profile_states[{pid}]"), ps, entity_capacity)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -476,6 +586,261 @@ mod tests {
         assert!(
             restored.adapter_set.is_empty(),
             "adapter_set must default to empty map when absent from JSON"
+        );
+    }
+
+    /// BRAINCORE-AUD-001 regression: oversized-snapshot restore is rejected
+    /// (bounded/rejected) at the capacity-aware validation boundary.
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_entity_posteriors_over_capacity() {
+        use uuid::Uuid;
+
+        let capacity = 2;
+        let mut state = BrainState::new(capacity);
+        for _ in 0..(capacity + 1) {
+            state
+                .balanced_recall
+                .entity_posteriors
+                .get_or_insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default);
+        }
+        // Force an over-capacity snapshot directly, since live inserts already
+        // enforce the bound — this simulates a crafted/legacy oversized snapshot.
+        let mut snapshot = state.to_snapshot();
+        snapshot
+            .balanced_recall
+            .entity_posteriors
+            .insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default());
+
+        let result = validate_brain_state_snapshot_with_capacity(&snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "snapshot with entity_posteriors.len() > capacity must be rejected"
+        );
+    }
+
+    /// BRAINCORE-AUD-001 regression: capacity violation in a named
+    /// `profile_states` entry (not just the default profile) must also be
+    /// rejected.
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_profile_state_over_capacity() {
+        use uuid::Uuid;
+
+        let capacity = 1;
+        let mut state = BrainState::new(capacity);
+        let mut extra = BalancedRecallState::new(capacity);
+        extra
+            .entity_posteriors
+            .get_or_insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default);
+        state
+            .profile_states
+            .insert("extra-profile".to_owned(), extra);
+
+        let mut snapshot = state.to_snapshot();
+        snapshot
+            .profile_states
+            .get_mut("extra-profile")
+            .unwrap()
+            .entity_posteriors
+            .insert(Uuid::new_v4(), crate::posterior::BetaPosterior::default());
+
+        let result = validate_brain_state_snapshot_with_capacity(&snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "profile_states entry with entity_posteriors.len() > capacity must be rejected"
+        );
+    }
+
+    // ── entity_posterior_order strict coverage (PR #535 codex round-1) ────────
+
+    /// Build a fresh version-1 `BalancedRecallSnapshot` with `n` entity
+    /// posteriors and a fully-covering order, for mutation in the tests below.
+    fn make_versioned_recall_snapshot(capacity: usize, n: usize) -> BalancedRecallSnapshot {
+        let mut state = BalancedRecallState::new(capacity);
+        for _ in 0..n {
+            state.entity_posteriors.get_or_insert(
+                uuid::Uuid::new_v4(),
+                crate::posterior::BetaPosterior::default,
+            );
+        }
+        state.to_snapshot()
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_missing_order_ids() {
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        assert_eq!(snapshot.entity_posteriors_version, 1);
+        assert_eq!(snapshot.entity_posterior_order.len(), 2);
+
+        // Drop one id from the order — partial coverage on a current-format
+        // (version 1) snapshot must be rejected, not silently normalized.
+        snapshot.entity_posterior_order.truncate(1);
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "version-1 snapshot with order shorter than entity_posteriors must be rejected"
+        );
+        assert!(
+            result.unwrap_err().contains("does not cover all"),
+            "error must name the missing-coverage reason"
+        );
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_duplicate_order_ids() {
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        let dup = snapshot.entity_posterior_order[0];
+        snapshot.entity_posterior_order[1] = dup;
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "duplicate entity_posterior_order ids must be rejected"
+        );
+        assert!(result.unwrap_err().contains("duplicate id"));
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_unknown_order_ids() {
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        snapshot.entity_posterior_order.push(uuid::Uuid::new_v4());
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "entity_posterior_order id absent from entity_posteriors must be rejected"
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("not present in entity_posteriors"));
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_unknown_version() {
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 1);
+        snapshot.entity_posteriors_version = 2;
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "unknown entity_posteriors_version must be rejected"
+        );
+        assert!(result.unwrap_err().contains("unknown version"));
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_accepts_legacy_empty_order() {
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        // Explicitly-legacy version 0 with no order metadata must still pass —
+        // restore falls back to the deterministic ascending-Uuid path.
+        snapshot.entity_posteriors_version = 0;
+        snapshot.entity_posterior_order.clear();
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_ok(),
+            "legacy version-0 snapshot with empty order must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_rejects_version_zero_with_partial_order() {
+        // PR #535 codex round-2 finding 2: a version-0 snapshot with a
+        // non-empty (here: partial) order is NOT the legacy empty-order
+        // compatibility case. `serde(default)` lets `entity_posteriors_version`
+        // silently resolve to 0 on an omitted field, so this must be rejected
+        // outright rather than passed through to `restore`, which would
+        // silently normalize `[A]` order over `{A, B}` posteriors to `[A, B]`.
+        let capacity = 4;
+        let mut snapshot = make_versioned_recall_snapshot(capacity, 2);
+        snapshot.entity_posteriors_version = 0;
+        snapshot.entity_posterior_order.truncate(1);
+
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = snapshot;
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_err(),
+            "version-0 snapshot with non-empty partial order must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("requires entity_posteriors_version >= 1"),
+            "error must name the version-0-with-non-empty-order reason"
+        );
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_with_capacity_accepts_full_order_current_version() {
+        let capacity = 4;
+        let mut full_snapshot = BrainState::new(capacity).to_snapshot();
+        full_snapshot.balanced_recall = make_versioned_recall_snapshot(capacity, 3);
+
+        let result = validate_brain_state_snapshot_with_capacity(&full_snapshot, capacity);
+        assert!(
+            result.is_ok(),
+            "version-1 snapshot with a fully-covering order must be accepted: {result:?}"
+        );
+    }
+
+    /// A validated snapshot must restore→re-snapshot→restore to the same
+    /// state — the validation gate must not itself introduce drift, and a
+    /// snapshot that passes validation once must keep passing after a
+    /// round-trip through `BrainState`.
+    #[test]
+    fn restore_to_snapshot_restore_idempotency() {
+        let capacity = 4;
+        let mut state = BrainState::new(capacity);
+        for _ in 0..3 {
+            state.balanced_recall.entity_posteriors.get_or_insert(
+                uuid::Uuid::new_v4(),
+                crate::posterior::BetaPosterior::default,
+            );
+        }
+
+        let snapshot_1 = state.to_snapshot();
+        validate_brain_state_snapshot_with_capacity(&snapshot_1, capacity)
+            .expect("first snapshot must validate");
+
+        let restored_1 = BrainState::from_snapshot(snapshot_1, capacity);
+        let snapshot_2 = restored_1.to_snapshot();
+        validate_brain_state_snapshot_with_capacity(&snapshot_2, capacity)
+            .expect("round-tripped snapshot must still validate");
+
+        let restored_2 = BrainState::from_snapshot(snapshot_2.clone(), capacity);
+        let snapshot_3 = restored_2.to_snapshot();
+
+        assert_eq!(
+            snapshot_2.balanced_recall.entity_posteriors,
+            snapshot_3.balanced_recall.entity_posteriors,
+            "entity_posteriors must be stable across a second restore/snapshot cycle"
+        );
+        assert_eq!(
+            snapshot_2.balanced_recall.entity_posterior_order,
+            snapshot_3.balanced_recall.entity_posterior_order,
+            "entity_posterior_order must be stable across a second restore/snapshot cycle"
         );
     }
 }

@@ -167,6 +167,10 @@ pub(crate) mod tests {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
+        /// Records the `limit` value `fan_out_search` was last called with, so
+        /// callers can assert the coordinator received the already-capped value
+        /// (MCP-AUD-003 regression).
+        pub last_limit: std::sync::atomic::AtomicU32,
     }
 
     impl MockCoordinator {
@@ -175,6 +179,7 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
+                last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
 
@@ -183,6 +188,7 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
+                last_limit: std::sync::atomic::AtomicU32::new(0),
             })
         }
     }
@@ -218,13 +224,15 @@ pub(crate) mod tests {
             _kind: &str,
             _query: &str,
             _namespace: &Namespace,
-            _limit: u32,
+            limit: u32,
             _kind_filter: Option<&str>,
             _props_filter: Option<&serde_json::Value>,
             _tags: &[String],
         ) -> CoordSearchResult {
             self.search_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.last_limit
+                .store(limit, std::sync::atomic::Ordering::SeqCst);
             CoordSearchResult {
                 entity_hits: vec![],
                 note_hits: vec![],
@@ -392,6 +400,135 @@ pub(crate) mod tests {
         );
     }
 
+    /// T6e / PR #549 blocker: a multi-backend `search` with a present-but-malformed
+    /// `namespace` (null/number/bool/array/object) must fail closed — `ok: false`,
+    /// an error naming the namespace — and the coordinator must NEVER be invoked
+    /// under the server's default namespace.
+    ///
+    /// Before the fix, `dispatch_via_coordinator_inner` never inspected
+    /// `args_value["namespace"]` at all: it always parsed the server's
+    /// `default_namespace` and called `coord.fan_out_search` under it, silently
+    /// substituting the default for a caller value that failed to parse. This
+    /// test FAILS against that code (coordinator IS called, `ok: true`) and
+    /// PASSES once the coordinator intercept shares `resolve_explicit_namespace`
+    /// with `VerbRegistry::dispatch` (RUNTIME-AUD-002 / #433).
+    #[tokio::test]
+    async fn t6e_multi_backend_search_malformed_namespace_fails_closed() {
+        let cases: [(&str, &str); 5] = [
+            ("null", "null"),
+            ("number", "42"),
+            ("boolean", "true"),
+            ("array", r#"["local"]"#),
+            ("object", r#"{"ns":"local"}"#),
+        ];
+
+        for (label, ns_literal) in cases {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let ops = format!(r#"search(kind="entity", query="anything", namespace={ns_literal})"#);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops,
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("T6e case {label}: dispatch must not MCP-error: {e}"));
+
+            let result_val: serde_json::Value =
+                serde_json::from_str(&raw).expect("T6e: response must be valid JSON");
+            let first = result_val
+                .get("results")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("T6e case {label}: results array must be non-empty"));
+
+            assert_eq!(
+                first.get("ok").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "T6e case {label}: malformed namespace must fail closed; got {first:?}"
+            );
+            let err_text = first.get("error").map(|e| e.to_string().to_lowercase());
+            assert!(
+                err_text.as_deref().is_some_and(|e| e.contains("namespace")),
+                "T6e case {label}: error must name the namespace; got {first:?}"
+            );
+            assert!(
+                !coord
+                    .search_called
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "T6e case {label}: coordinator.fan_out_search must NOT be called for a malformed namespace"
+            );
+        }
+    }
+
+    /// T6f / PR #549 blocker: a multi-backend UUID-form `link` with a
+    /// present-but-malformed `namespace` must fail closed the same way T6e does
+    /// for `search`, and the coordinator must never be invoked.
+    #[tokio::test]
+    async fn t6f_multi_backend_link_malformed_namespace_fails_closed() {
+        let cases: [(&str, &str); 5] = [
+            ("null", "null"),
+            ("number", "42"),
+            ("boolean", "true"),
+            ("array", r#"["local"]"#),
+            ("object", r#"{"ns":"local"}"#),
+        ];
+
+        for (label, ns_literal) in cases {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let src_id = Uuid::new_v4();
+            let tgt_id = Uuid::new_v4();
+            let ops = format!(
+                r#"link(source_id="{src_id}", target_id="{tgt_id}", relation="implements", namespace={ns_literal})"#
+            );
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops,
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("T6f case {label}: dispatch must not MCP-error: {e}"));
+
+            let result_val: serde_json::Value =
+                serde_json::from_str(&raw).expect("T6f: response must be valid JSON");
+            let first = result_val
+                .get("results")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("T6f case {label}: results array must be non-empty"));
+
+            assert_eq!(
+                first.get("ok").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "T6f case {label}: malformed namespace must fail closed; got {first:?}"
+            );
+            let err_text = first.get("error").map(|e| e.to_string().to_lowercase());
+            assert!(
+                err_text.as_deref().is_some_and(|e| e.contains("namespace")),
+                "T6f case {label}: error must name the namespace; got {first:?}"
+            );
+            assert!(
+                !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "T6f case {label}: coordinator.link must NOT be called for a malformed namespace"
+            );
+        }
+    }
+
     /// T6c: A single-backend server must NOT route through the coordinator.
     ///
     /// When the coordinator reports `is_single_backend() == true`, the zero-change
@@ -432,6 +569,95 @@ pub(crate) mod tests {
         assert!(
             !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
             "T6c: coordinator.link must NOT be called for a single-backend server"
+        );
+    }
+
+    /// T6e: A multi-backend `search` limit beyond `u32::MAX` must be rejected
+    /// with a per-op error, not silently wrapped by `as u32` and passed through.
+    ///
+    /// Before the fix, `limit=4294967297` (`u32::MAX as u64 + 2`) was parsed as
+    /// `u64`, cast with `as u32` (wrapping to `1`), then `.min(100)` left `1` —
+    /// the coordinator was called with a near-empty limit instead of rejecting
+    /// the out-of-range input (MCP-AUD-003).
+    #[tokio::test]
+    async fn t6e_multi_backend_search_limit_matches_single_backend_u32_contract() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let too_large: u64 = u64::from(u32::MAX) + 2;
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"search(kind="entity", query="anything", limit={too_large})"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("T6e: dispatch must not return an MCP-level error");
+
+        let result_val: serde_json::Value =
+            serde_json::from_str(&raw).expect("T6e: response must be valid JSON");
+        let first = result_val
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .expect("T6e: results array must be non-empty");
+        assert_eq!(
+            first.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "T6e: an out-of-range limit must produce ok=false; got {:?}",
+            first
+        );
+        assert!(
+            !coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6e: coordinator must not be called with an out-of-range limit \
+             (it must not silently wrap to a small value); recorded last_limit={}",
+            coord.last_limit.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// T6e companion: a valid-but-huge `u32` limit (`u32::MAX`) must still reach
+    /// the coordinator, capped at 100 — proving the strict parser doesn't
+    /// over-reject in-range values.
+    #[tokio::test]
+    async fn t6e_multi_backend_search_limit_u32_max_is_capped_at_100() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"search(kind="entity", query="anything", limit={})"#,
+                    u32::MAX
+                ),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("T6e: dispatch must not return an MCP-level error");
+        let _ = raw;
+
+        assert!(
+            coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "T6e: coordinator.fan_out_search must be called for a valid in-range limit"
+        );
+        assert_eq!(
+            coord.last_limit.load(std::sync::atomic::Ordering::SeqCst),
+            100,
+            "T6e: u32::MAX must be capped at 100 before reaching the coordinator"
         );
     }
 }

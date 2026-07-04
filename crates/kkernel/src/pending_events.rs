@@ -38,9 +38,23 @@ use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter, SortDir};
-use khive_storage::types::{PageRequest, SqlValue};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::dbpath::resolve_db_override;
+
+/// A `scheduled_event` row stuck in `status="firing"` for longer than this is
+/// considered abandoned by a drain process that crashed or was killed between
+/// the `pending -> firing` claim and the post-dispatch finalize write (issue
+/// #462). Such a row is neither retried (the pending scan only looks at
+/// `status="pending"`) nor cancellable (`schedule.cancel` only CAS-matches
+/// `status="pending"`), so it would otherwise be wedged forever. Every drain
+/// pass reclaims rows stuck past this timeout back to `"pending"` so a future
+/// drain (or a `schedule.cancel`) can act on them again.
+///
+/// 5 minutes is comfortably longer than a single dispatch (`dispatch_action`
+/// is a single in-process verb call, not a network round-trip), so a fresh,
+/// still-in-flight claim is never mistaken for an abandoned one.
+const STALE_FIRING_TIMEOUT_MICROS: i64 = 5 * 60 * 1_000_000;
 
 /// Summary of a single drain run.
 #[derive(Debug, Default)]
@@ -50,6 +64,8 @@ pub struct DrainSummary {
     pub advanced: u64,
     pub failed: u64,
     pub skipped_not_due: u64,
+    pub skipped_race: u64,
+    pub reclaimed: u64,
 }
 
 /// One-shot drain: fire all pending, due scheduled events.
@@ -86,6 +102,21 @@ pub async fn run_pending_events(
 
     let now = Utc::now();
     let mut summary = DrainSummary::default();
+
+    // ── Step 0: reclaim rows abandoned mid-fire by a crashed/killed drain ──
+    // Runs before namespace discovery so any row reclaimed here (firing ->
+    // pending) is picked up by the normal pending scan below in this same
+    // pass, in whichever namespace it belongs to.
+    let stale_before = now
+        .timestamp_micros()
+        .saturating_sub(STALE_FIRING_TIMEOUT_MICROS);
+    summary.reclaimed = reclaim_stale_firing_events(&rt, stale_before).await?;
+    if verbose && summary.reclaimed > 0 {
+        eprintln!(
+            "[pending-events] reclaimed {} stale \"firing\" row(s) back to \"pending\"",
+            summary.reclaimed
+        );
+    }
 
     // ── Step 1: discover all distinct namespaces with pending scheduled_event notes ──
     let namespaces = discover_pending_namespaces(&rt, now).await?;
@@ -209,6 +240,37 @@ pub async fn run_pending_events(
                     None
                 };
 
+                // ── Claim the row before dispatch (issue #462, fire side) ──
+                // `note` is a snapshot read by the page query above; a
+                // concurrent `schedule.cancel` could have transitioned the
+                // row to "cancelled" since then. CAS-claim pending -> firing
+                // now so that: (a) a concurrent cancel's own CAS (which only
+                // matches status='pending') fails once we've claimed it, and
+                // (b) if cancel already won the race, our claim fails and we
+                // skip — the drain can no longer clobber a cancel that
+                // landed between the read and this point.
+                let claimed_firing_at = match claim_pending_event(&rt, ns_str, note.id).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("[pending-events] claim failed for note {}: {e}", note.id);
+                        }
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                let Some(claimed_firing_at) = claimed_firing_at else {
+                    if verbose {
+                        eprintln!(
+                            "[pending-events] skip note {}: no longer pending (concurrent \
+                             cancel or claim)",
+                            note.id
+                        );
+                    }
+                    summary.skipped_race += 1;
+                    continue;
+                };
+
                 // ── Dispatch the action ──────────────────────────────────
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result = dispatch_action(dsl, ns_str, &server, verbose).await;
@@ -258,19 +320,52 @@ pub async fn run_pending_events(
                 }
 
                 // ── Persist the updated note ─────────────────────────────
-                if let Err(e) = store.upsert_note(note.clone()).await {
-                    if verbose {
-                        eprintln!("[pending-events] upsert_note failed for {}: {e}", note.id);
+                // Conditional on status='firing' (set by the claim above)
+                // instead of a full-row `upsert_note`, so this write can never
+                // clobber a cancel that (impossibly, given the claim above,
+                // but defensively) raced in after the claim.
+                let final_props = note.properties.clone().unwrap_or_else(|| json!({}));
+                match finalize_fired_event(
+                    &rt,
+                    ns_str,
+                    note.id,
+                    &final_props,
+                    note.updated_at,
+                    claimed_firing_at,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if verbose {
+                            eprintln!(
+                                "[pending-events] finalize no-op for {}: row no longer in \
+                                 \"firing\" state",
+                                note.id
+                            );
+                        }
+                        summary.failed += 1;
+                        if summary.fired > 0 {
+                            summary.fired -= 1;
+                        }
+                        if summary.advanced > 0 {
+                            summary.advanced -= 1;
+                        }
                     }
-                    // Count as failed; drain continues.
-                    summary.failed += 1;
-                    // Undo the advance/fired accounting since persist failed.
-                    // (fired/advanced were already incremented above — adjust back)
-                    if summary.fired > 0 {
-                        summary.fired -= 1;
-                    }
-                    if summary.advanced > 0 {
-                        summary.advanced -= 1;
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("[pending-events] finalize failed for {}: {e}", note.id);
+                        }
+                        // Count as failed; drain continues.
+                        summary.failed += 1;
+                        // Undo the advance/fired accounting since persist failed.
+                        // (fired/advanced were already incremented above — adjust back)
+                        if summary.fired > 0 {
+                            summary.fired -= 1;
+                        }
+                        if summary.advanced > 0 {
+                            summary.advanced -= 1;
+                        }
                     }
                 }
             }
@@ -285,6 +380,170 @@ pub async fn run_pending_events(
     }
 
     Ok(summary)
+}
+
+/// CAS-claim a pending scheduled event for firing: `pending -> firing`.
+///
+/// Returns `Ok(Some(firing_at))` iff exactly one row transitioned, meaning
+/// this drain (and not a concurrent `schedule.cancel`) now owns the row.
+/// The returned `firing_at` (epoch µs) is this drain's **claim token** —
+/// callers MUST thread it through to `finalize_fired_event` so finalization
+/// binds to the specific claim that won, not merely to `status='firing'`
+/// (issue #462 round-2: a stale claimant that resumes after a reclaim +
+/// re-claim must not be able to finalize over the new claimant's row).
+/// Mirrors the `schedule.cancel` CAS in `khive-pack-schedule/src/handlers.rs`
+/// so the two writers share one state machine: cancel only matches
+/// `status='pending'`, so once a row is claimed to `firing` a racing cancel
+/// fails cleanly instead of clobbering (or being clobbered by) this drain's
+/// eventual write.
+///
+/// Also stamps `properties.firing_at` (epoch µs, same instant as
+/// `updated_at`) so a later drain pass can detect and reclaim this row if
+/// this process crashes before `finalize_fired_event` runs (issue #462).
+async fn claim_pending_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+) -> Result<Option<i64>> {
+    let updated_at = Utc::now().timestamp_micros();
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set( \
+                        json_set(COALESCE(properties, '{}'), '$.status', 'firing'), \
+                        '$.firing_at', ?1 \
+                      ), \
+                      updated_at = ?1 \
+                  WHERE id = ?2 \
+                    AND namespace = ?3 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'pending'"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("pending_events_claim_firing".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: claim conditional update: {e}"))?;
+    Ok((rows == 1).then_some(updated_at))
+}
+
+/// Reclaim `scheduled_event` rows stuck in `status="firing"` whose
+/// `firing_at` is older than `stale_before_micros` (epoch µs) back to
+/// `status="pending"` (issue #462).
+///
+/// Runs across all namespaces in one statement (a maintenance sweep, not a
+/// namespace-scoped read) — mirrors `discover_pending_namespaces`, which also
+/// queries `rt.sql()` directly rather than per-namespace tokens.
+///
+/// The `WHERE` clause matches only rows whose `firing_at` predates the
+/// threshold, so a claim made by a still-running drain (fresh `firing_at`)
+/// never matches and is never stolen. Rows claimed by a pre-#462 binary
+/// (missing `firing_at` entirely) are treated as maximally stale and
+/// reclaimed unconditionally, since there is no timestamp to compare against
+/// and leaving them wedged forever is strictly worse.
+///
+/// Returns the number of rows reclaimed.
+async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64) -> Result<u64> {
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set(properties, '$.status', 'pending') \
+                  WHERE kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND ( \
+                      json_extract(properties, '$.firing_at') IS NULL \
+                      OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) < ?1 \
+                    )"
+            .to_string(),
+            params: vec![SqlValue::Integer(stale_before_micros)],
+            label: Some("pending_events_reclaim_stale_firing".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: reclaim stale firing rows: {e}"))?;
+    Ok(rows)
+}
+
+/// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
+/// | pending}` (the latter for an advanced repeat), replacing the full-row
+/// `upsert_note` that could otherwise clobber a concurrent write.
+///
+/// `claimed_firing_at` is the claim token returned by `claim_pending_event`
+/// (or reconstructed from a reclaimed row's own `firing_at`) — the CAS
+/// requires the row's CURRENT `firing_at` to still equal this value, not
+/// merely that `status='firing'`. Without this, a stale claimant that stalls
+/// past `STALE_FIRING_TIMEOUT_MICROS`, gets reclaimed, and is then re-claimed
+/// by a second drain could resume and finalize over the second drain's live
+/// claim purely because both rows share `status='firing'` (issue #462
+/// round-2). Binding to the specific `firing_at` instant closes that gap:
+/// a reclaim always rewrites `firing_at` (via a fresh `claim_pending_event`
+/// call) or clears `status` back to `pending`, so a stale token can never
+/// match the row's current one.
+///
+/// `properties` must NOT already carry a `firing_at` field for the terminal
+/// write — this function clears it (the event has reached a terminal state
+/// for this cycle, `fired` or re-armed `pending`, so no claim token should
+/// survive to be mistaken for a live claim by a future finalize).
+///
+/// Returns `Ok(true)` iff exactly one row (still `firing` under this exact
+/// claim token) was updated.
+async fn finalize_fired_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    properties: &Value,
+    updated_at: i64,
+    claimed_firing_at: i64,
+) -> Result<bool> {
+    let mut properties = properties.clone();
+    if let Some(obj) = properties.as_object_mut() {
+        obj.remove("firing_at");
+    }
+    let props_json = serde_json::to_string(&properties)
+        .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = ?1, updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(props_json),
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(claimed_firing_at),
+            ],
+            label: Some("pending_events_finalize_fired".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: finalize conditional update: {e}"))?;
+    Ok(rows == 1)
 }
 
 /// Compute the next `trigger_at` for a repeating event, given the current
@@ -343,26 +602,30 @@ async fn dispatch_action(
     })?;
 
     // Re-serialize as JSON form with namespace injected.
-    let ops_json: Vec<Value> = parsed
-        .ops
-        .iter()
-        .map(|op| {
-            let mut args = serde_json::Map::new();
-            for (k, v) in &op.args {
-                if let khive_request::ArgValue::Value(val) = v {
-                    args.insert(k.clone(), val.clone());
-                }
-                // $prev references are not supported in stored actions (they were
-                // validated at schedule-creation time). Skip them gracefully.
-            }
-            // Inject the event's namespace so the registry writes to it.
-            args.insert(
-                "namespace".to_string(),
-                Value::String(namespace.to_string()),
-            );
-            json!({ "tool": op.tool, "args": Value::Object(args) })
-        })
-        .collect();
+    //
+    // `$prev` references are rejected at schedule-creation time (issue #461),
+    // but legacy rows written before that guard may still carry one. Reject
+    // rather than silently drop: a dropped arg can dispatch successfully with
+    // missing/wrong data, which is worse than a visible replay failure.
+    let mut ops_json: Vec<Value> = Vec::with_capacity(parsed.ops.len());
+    for op in &parsed.ops {
+        let mut args = serde_json::Map::new();
+        for (k, v) in &op.args {
+            let khive_request::ArgValue::Value(val) = v else {
+                return Err(anyhow::anyhow!(
+                    "pending-events: non-literal scheduled action argument {k:?} is not \
+                     replayable: {action_dsl:?}"
+                ));
+            };
+            args.insert(k.clone(), val.clone());
+        }
+        // Inject the event's namespace so the registry writes to it.
+        args.insert(
+            "namespace".to_string(),
+            Value::String(namespace.to_string()),
+        );
+        ops_json.push(json!({ "tool": op.tool, "args": Value::Object(args) }));
+    }
 
     let ops_str = serde_json::to_string(&ops_json)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize ops: {e}"))?;
@@ -473,6 +736,8 @@ pub fn print_summary(summary: &DrainSummary) {
         "advanced": summary.advanced,
         "failed": summary.failed,
         "skipped_not_due": summary.skipped_not_due,
+        "skipped_race": summary.skipped_race,
+        "reclaimed": summary.reclaimed,
     });
     println!(
         "{}",
@@ -796,6 +1061,514 @@ mod tests {
         // The drain still ran to completion (no panic / early return).
         let props_bad2 = get_note_props(&rt, id_bad2).await;
         let _ = props_bad2["status"].as_str(); // just verify it's accessible
+    }
+
+    /// Issue #461: a `schedule.schedule` payload that write-time validation
+    /// now accepts (single op, exactly-registered handler name, literal args,
+    /// all required params present) must actually dispatch successfully at
+    /// trigger time — proving write-time acceptance and trigger-time replay
+    /// agree. Before the fix, a bare-shorthand payload could pass write-time
+    /// checks yet fail replay as an unknown verb; this asserts the *positive*
+    /// case: a canonical payload produces zero dispatch failures.
+    #[tokio::test]
+    async fn replayable_action_dispatches_without_failure_at_trigger_time() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            past,
+            Some("schedule.remind(content=\"ping\", at=\"2099-01-01T00:00:00Z\")"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            summary.failed, 0,
+            "a write-time-replayable action must dispatch cleanly at trigger time"
+        );
+        assert!(
+            summary.fired >= 1 || summary.advanced >= 1,
+            "the event must be processed"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"].as_str(), Some("fired"));
+    }
+
+    /// Issue #461: a legacy stored action containing a `$prev` reference
+    /// (impossible to create through the handler after this fix, but
+    /// representative of a row written before the write-time guard existed)
+    /// must be rejected by `dispatch_action` with an error naming the
+    /// non-literal argument, not silently dropped and dispatched with
+    /// missing/wrong data. Asserting the specific error text (rather than
+    /// just "some failure occurred") matters here: a downstream handler
+    /// might independently reject a dropped-but-required argument as
+    /// "missing", which would make a weaker assertion pass even if the
+    /// silent-drop bug were reintroduced.
+    #[tokio::test]
+    async fn dispatch_action_rejects_non_literal_prev_reference() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not replayable"),
+            "expected the specific non-literal-argument rejection message, got: {msg}"
+        );
+    }
+
+    /// Same scenario end-to-end through the drain: confirms the rejection
+    /// surfaces as a counted failure rather than aborting the drain or being
+    /// swallowed, and that the drain still completes.
+    #[tokio::test]
+    async fn dispatch_rejects_legacy_prev_reference_instead_of_dropping_it() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let _id = create_scheduled_event(
+            &rt,
+            "local",
+            past,
+            Some("stats() | get(id=$prev.id)"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain must not abort or panic on a legacy $prev row");
+
+        assert!(
+            summary.failed >= 1,
+            "a legacy $prev reference must surface as a dispatch failure, not a silent drop"
+        );
+    }
+
+    /// Deterministic regression for the fire-side of issue #462: simulates
+    /// the exact interleaving the reviewer/critic flagged — a drain claims a
+    /// row for firing (its read-then-act window), and only *after* that does
+    /// a `schedule.cancel` request arrive for the same id. Before this fix,
+    /// the drain read a `pending` snapshot and later did a full-row
+    /// `upsert_note` unconditionally, so a cancel landing in between would be
+    /// silently clobbered back to "fired". With the `pending -> firing` CAS
+    /// claim in place, the drain's claim (standing in for "drain read the row
+    /// before the cancel") must make the *subsequent* cancel fail — proving
+    /// cancel can no longer be lost to a fire that was already in flight.
+    #[tokio::test]
+    async fn fire_claim_wins_race_against_concurrent_cancel() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Simulate the drain's claim (pending -> firing), which in the real
+        // drain happens right after the page read and before dispatch.
+        let claimed_firing_at = claim_pending_event(&rt, "local", id)
+            .await
+            .expect("claim query")
+            .expect("claim must succeed on a fresh pending row");
+
+        // A `schedule.cancel` arriving after the claim (the race window the
+        // reviewer identified) must now fail instead of clobbering the
+        // in-flight fire.
+        let cancel_ops = serde_json::to_string(&serde_json::json!([
+            { "tool": "schedule.cancel", "args": { "id": id.to_string() } }
+        ]))
+        .expect("serialize cancel op");
+        let cancel_result = server
+            .dispatch_request_local(RequestParams {
+                ops: cancel_ops,
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("dispatch_request_local must not error at the RPC layer");
+        let cancel_json: Value = serde_json::from_str(&cancel_result).expect("valid JSON");
+        let op_result = &cancel_json["results"][0];
+        assert_eq!(
+            op_result["ok"], false,
+            "cancel of a claimed (firing) event must fail, not silently succeed: {cancel_json}"
+        );
+        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        assert!(
+            cancel_err.contains("not pending"),
+            "cancel must report the event is no longer pending; got: {cancel_err}"
+        );
+
+        // Finalize the fire as the drain would, then confirm the terminal
+        // state is "fired" — the cancel never got a chance to overwrite it.
+        let finalized = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &serde_json::json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+            claimed_firing_at,
+        )
+        .await
+        .expect("finalize query");
+        assert!(
+            finalized,
+            "finalize must succeed on a row still in \"firing\""
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str().unwrap_or(""),
+            "fired",
+            "terminal state must be \"fired\"; cancel must not have won the race"
+        );
+    }
+
+    /// Directly set a note's `properties` via raw SQL, bypassing the normal
+    /// claim/finalize CAS paths. Used to deterministically fabricate a
+    /// stale-`firing` row (as if a drain claimed it and then crashed before
+    /// finalizing) without depending on wall-clock sleeps.
+    async fn force_set_properties(rt: &KhiveRuntime, id: uuid::Uuid, properties: &Value) {
+        let props_json = serde_json::to_string(properties).expect("serialize");
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".to_string(),
+                params: vec![SqlValue::Text(props_json), SqlValue::Text(id.to_string())],
+                label: Some("test_force_set_properties".into()),
+            })
+            .await
+            .expect("force update");
+        assert_eq!(rows, 1, "test setup: row must exist");
+    }
+
+    /// Issue #462 (stale-`firing` recovery), case (a): a row claimed by a
+    /// drain that then crashed before finalizing — `status="firing"` with a
+    /// `firing_at` older than the documented timeout — must be reclaimed back
+    /// to `pending` and fired on the next drain pass, instead of being
+    /// wedged forever (the old behavior: only `status="pending"` rows are
+    /// ever scanned, so a stranded `firing` row was invisible to every future
+    /// drain).
+    #[tokio::test]
+    async fn stale_firing_row_is_reclaimed_and_fired() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Simulate a drain claiming the row, then crashing before finalize:
+        // status="firing" with a firing_at well past the stale timeout.
+        let stale_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        force_set_properties(
+            &rt,
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "firing",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": null,
+                "cancelled_at": null,
+                "firing_at": stale_firing_at,
+            }),
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert!(
+            summary.reclaimed >= 1,
+            "the stale firing row must be reclaimed, got summary={summary:?}"
+        );
+        assert!(
+            summary.fired >= 1 || summary.advanced >= 1,
+            "the reclaimed row must be fired (or advanced) in the same pass, \
+             got summary={summary:?}"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str(),
+            Some("fired"),
+            "a reclaimed non-repeating event must end in \"fired\", got {props:?}"
+        );
+    }
+
+    /// Issue #462, case (b): a row claimed *recently* (fresh `firing_at`,
+    /// well within the stale timeout) must NOT be reclaimed — a live drain's
+    /// in-flight claim is never stolen by the reclaim sweep.
+    #[tokio::test]
+    async fn fresh_firing_row_is_not_reclaimed() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Fresh claim: firing_at = now, well under the stale threshold.
+        let _claimed_firing_at = claim_pending_event(&rt, "local", id)
+            .await
+            .expect("claim query")
+            .expect("claim must succeed on a fresh pending row");
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            summary.reclaimed, 0,
+            "a fresh firing row must not be reclaimed, got summary={summary:?}"
+        );
+        assert_eq!(
+            summary.fired, 0,
+            "a fresh firing row must not be fired by a drain pass that did not claim it"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str(),
+            Some("firing"),
+            "a fresh firing row must remain firing (owned by the process that claimed it), \
+             got {props:?}"
+        );
+    }
+
+    /// Round-2 regression (codex REJECT, "finalize must be bound to the
+    /// owning claim"): reproduces the exact stale-claimant-resumes
+    /// interleaving. Drain A claims and (simulated) crashes/stalls past the
+    /// stale timeout with its own `firing_at` token recorded. A reclaim pass
+    /// then runs, and drain B re-claims the row, minting a fresh `firing_at`
+    /// token distinct from A's. A now resumes and attempts to finalize using
+    /// its stale token: before this fix, `finalize_fired_event` matched on
+    /// `status='firing'` alone and would have clobbered B's live claim with
+    /// A's stale final state. With the claim-token CAS in place, A's
+    /// finalize must be a no-op and B's claim (and eventual finalize) must
+    /// survive untouched.
+    #[tokio::test]
+    async fn stale_claimant_cannot_finalize_over_a_fresh_reclaim() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        // Drain A claims, then (simulated) stalls: fabricate a status="firing"
+        // row whose firing_at predates the stale threshold — this stands in
+        // for "A really did claim it, then never got back to finalize".
+        let a_claimed_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        force_set_properties(
+            &rt,
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "firing",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": null,
+                "cancelled_at": null,
+                "firing_at": a_claimed_firing_at,
+            }),
+        )
+        .await;
+
+        // A reclaim pass runs (as a live drain's periodic sweep would),
+        // moving the row back to "pending" since A's firing_at is stale.
+        let stale_before = Utc::now().timestamp_micros() - STALE_FIRING_TIMEOUT_MICROS;
+        let reclaimed = reclaim_stale_firing_events(&rt, stale_before)
+            .await
+            .expect("reclaim query");
+        assert_eq!(reclaimed, 1, "A's stale claim must be reclaimed");
+
+        // Drain B re-claims the now-pending row, minting a fresh firing_at
+        // token that differs from A's stale one.
+        let b_claimed_firing_at = claim_pending_event(&rt, "local", id)
+            .await
+            .expect("claim query")
+            .expect("B's claim must succeed on the reclaimed row");
+        assert_ne!(
+            a_claimed_firing_at, b_claimed_firing_at,
+            "B's claim token must differ from A's stale token"
+        );
+
+        // A resumes (unaware it was reclaimed) and attempts to finalize using
+        // its own stale claim token. This must be a no-op: it must NOT match
+        // B's current firing_at, and must NOT clobber B's live claim.
+        let a_finalize_result = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+            a_claimed_firing_at,
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            !a_finalize_result,
+            "A's finalize with a stale claim token must be a no-op, not a successful write"
+        );
+
+        // B's claim must be completely intact: still "firing", still stamped
+        // with B's own firing_at — A's stale finalize must not have touched it.
+        let props_after_a = get_note_props(&rt, id).await;
+        assert_eq!(
+            props_after_a["status"].as_str(),
+            Some("firing"),
+            "B's claim must survive A's stale finalize attempt untouched, got {props_after_a:?}"
+        );
+        assert_eq!(
+            props_after_a["firing_at"].as_i64(),
+            Some(b_claimed_firing_at),
+            "B's firing_at token must be unchanged by A's stale finalize attempt"
+        );
+
+        // B now finalizes with its own (correct) claim token — this must
+        // succeed, proving the fix doesn't wedge legitimate finalization.
+        let b_finalize_result = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "fired",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": Utc::now().to_rfc3339(),
+                "cancelled_at": null,
+            }),
+            Utc::now().timestamp_micros(),
+            b_claimed_firing_at,
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            b_finalize_result,
+            "B's finalize with its own claim token must succeed"
+        );
+
+        let final_props = get_note_props(&rt, id).await;
+        assert_eq!(
+            final_props["status"].as_str(),
+            Some("fired"),
+            "terminal state must be \"fired\" via B's own claim, got {final_props:?}"
+        );
+        assert!(
+            final_props.get("firing_at").is_none() || final_props["firing_at"].is_null(),
+            "firing_at must be cleared on terminal finalize, got {final_props:?}"
+        );
+    }
+
+    /// Issue #462, case (c): `schedule.cancel` on a row that is currently
+    /// `status="firing"` — even a *stale* one — must still fail cleanly.
+    /// Reclaim only happens as part of a drain pass; cancel itself never
+    /// reclaims, so a cancel that races a still-technically-firing (if
+    /// abandoned) row gets the same "not pending" rejection it would against
+    /// a live in-flight fire. This confirms the reclaim path does not weaken
+    /// the fire/cancel CAS contract asserted by
+    /// `fire_claim_wins_race_against_concurrent_cancel`.
+    #[tokio::test]
+    async fn cancel_on_stale_firing_row_still_fails_cleanly() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+
+        let stale_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        force_set_properties(
+            &rt,
+            id,
+            &json!({
+                "trigger_at": past,
+                "repeat": null,
+                "status": "firing",
+                "event_type": "schedule",
+                "payload": "stats()",
+                "fired_at": null,
+                "cancelled_at": null,
+                "firing_at": stale_firing_at,
+            }),
+        )
+        .await;
+
+        let cancel_ops = serde_json::to_string(&serde_json::json!([
+            { "tool": "schedule.cancel", "args": { "id": id.to_string() } }
+        ]))
+        .expect("serialize cancel op");
+        let cancel_result = server
+            .dispatch_request_local(RequestParams {
+                ops: cancel_ops,
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("dispatch_request_local must not error at the RPC layer");
+        let cancel_json: Value = serde_json::from_str(&cancel_result).expect("valid JSON");
+        let op_result = &cancel_json["results"][0];
+        assert_eq!(
+            op_result["ok"], false,
+            "cancel of a stale-but-still-firing event must fail, not silently succeed \
+             (reclaim happens on drain, not cancel): {cancel_json}"
+        );
+        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        assert!(
+            cancel_err.contains("not pending"),
+            "cancel must report the event is no longer pending; got: {cancel_err}"
+        );
+
+        // The row is still "firing" (untouched by the failed cancel attempt).
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str().unwrap_or(""),
+            "firing",
+            "a failed cancel must not alter the row's status"
+        );
     }
 
     // Unit tests for next_trigger_at

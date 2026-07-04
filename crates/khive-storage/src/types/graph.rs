@@ -313,6 +313,12 @@ impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
                 ));
             }
         }
+        if raw.max_depth > i64::MAX as usize {
+            return Err(format!(
+                "TraversalOptions: max_depth must be <= i64::MAX, got {}",
+                raw.max_depth
+            ));
+        }
         Ok(Self {
             max_depth: raw.max_depth,
             direction: raw.direction,
@@ -436,5 +442,39 @@ mod tests {
     #[test]
     fn traversal_options_default_max_depth_is_three() {
         assert_eq!(TraversalOptions::default().max_depth, 3);
+    }
+
+    /// STORAGE-AUD-003 / #485: max_depth > i64::MAX must be rejected by serde
+    /// deserialization instead of silently narrowing to a negative i64 at the
+    /// SQLite traversal boundary.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn traverse_max_depth_over_i64max_rejected() {
+        let raw = serde_json::json!({
+            "max_depth": (i64::MAX as u64) + 1,
+            "direction": "out",
+            "relations": null,
+            "min_weight": null,
+            "limit": null,
+        });
+        let result: Result<TraversalOptions, _> = serde_json::from_value(raw);
+        assert!(
+            result.is_err(),
+            "max_depth > i64::MAX must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn traverse_max_depth_at_i64max_accepted() {
+        let raw = serde_json::json!({
+            "max_depth": i64::MAX as u64,
+            "direction": "out",
+            "relations": null,
+            "min_weight": null,
+            "limit": null,
+        });
+        let result: Result<TraversalOptions, _> = serde_json::from_value(raw);
+        assert!(result.is_ok(), "max_depth == i64::MAX must be accepted");
     }
 }

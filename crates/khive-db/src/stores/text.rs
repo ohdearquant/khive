@@ -78,53 +78,15 @@ impl Fts5TextSearch {
     }
 
     fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "fts_writer".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_fts_writer"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_fts_writer"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_fts_writer"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_fts_writer"))?;
-
-        Ok(conn)
+        self.pool
+            .open_standalone_writer()
+            .map_err(|e| map_sqlite_err(e, "open_fts_writer"))
     }
 
     fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "fts_reader".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_fts_reader"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_fts_reader"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_fts_reader"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_fts_reader"))?;
-
-        Ok(conn)
+        self.pool
+            .open_standalone_reader()
+            .map_err(|e| map_sqlite_err(e, "open_fts_reader"))
     }
 
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>

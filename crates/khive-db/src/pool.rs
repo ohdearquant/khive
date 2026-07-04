@@ -47,6 +47,14 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_JOURNAL_SIZE_LIMIT_BYTES`.
     pub journal_size_limit_bytes: i64,
+    /// Open the database read-only (default: false).
+    ///
+    /// When true, the pool's writer connection is opened with
+    /// `SQLITE_OPEN_READ_ONLY` (no `SQLITE_OPEN_CREATE`, so a missing path is
+    /// rejected instead of created) and `PRAGMA query_only = ON` is set on
+    /// every connection that can execute SQL. Reader connections are already
+    /// opened read-only regardless of this flag.
+    pub read_only: bool,
 }
 
 impl Default for PoolConfig {
@@ -78,6 +86,7 @@ impl Default for PoolConfig {
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
+            read_only: false,
         }
     }
 }
@@ -366,6 +375,63 @@ impl ConnectionPool {
         open_reader_connection(path, &self.config)
     }
 
+    /// Open a standalone read-write connection to the same file-backed database.
+    ///
+    /// Stores whose trait methods take `Send + 'static` closures (executed via
+    /// `spawn_blocking`) cannot hold the pooled `WriterGuard`'s `MutexGuard`
+    /// across the call — it opens an independent connection instead. This
+    /// must still honor `PoolConfig::read_only`: opening
+    /// `SQLITE_OPEN_READ_WRITE` unconditionally here would let a read-only
+    /// backend's graph/event/text stores bypass the flag that the pooled
+    /// writer enforces via `query_only`.
+    pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        let path = self.config.path.as_ref().ok_or_else(|| {
+            SqliteError::InvalidData(
+                "in-memory databases do not support standalone connections".to_string(),
+            )
+        })?;
+
+        if self.config.read_only {
+            return Err(SqliteError::InvalidData(
+                "database is read-only: standalone write connections are not permitted".to_string(),
+            ));
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
+    /// Open a standalone read-only connection to the same file-backed database.
+    ///
+    /// Companion to `open_standalone_writer` for stores that also need an
+    /// independent reader connection outside the pooled reader queue.
+    pub fn open_standalone_reader(&self) -> Result<Connection, SqliteError> {
+        let path = self.config.path.as_ref().ok_or_else(|| {
+            SqliteError::InvalidData(
+                "in-memory databases do not support standalone connections".to_string(),
+            )
+        })?;
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
     fn return_reader(&self, conn: Connection) {
         if self.max_readers == 0 {
             return;
@@ -399,7 +465,14 @@ fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
 
 fn open_writer_connection(config: &PoolConfig) -> Result<Connection, SqliteError> {
     match config.path.as_ref() {
-        Some(path) => Connection::open_with_flags(path, writer_open_flags()).map_err(Into::into),
+        Some(path) => {
+            let flags = if config.read_only {
+                writer_read_only_open_flags()
+            } else {
+                writer_open_flags()
+            };
+            Connection::open_with_flags(path, flags).map_err(Into::into)
+        }
         None => Connection::open_in_memory().map_err(Into::into),
     }
 }
@@ -417,6 +490,12 @@ fn writer_open_flags() -> OpenFlags {
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
+/// Read-only writer-slot open flags: no `SQLITE_OPEN_CREATE`, so a missing
+/// path is rejected rather than silently created.
+fn writer_read_only_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
+}
+
 fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
@@ -425,6 +504,22 @@ fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    if config.read_only {
+        // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
+        // wal_autocheckpoint, journal_size_limit all require write access to
+        // change) and lock the connection down with query_only instead.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(config.busy_timeout)?;
+        conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
+        conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "query_only", "ON")?;
+
+        let wal_enabled =
+            config.wal_mode && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
+        return Ok(wal_enabled);
+    }
+
     let wants_wal = config.path.is_some() && config.wal_mode;
 
     if wants_wal {

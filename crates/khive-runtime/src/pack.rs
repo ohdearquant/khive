@@ -880,15 +880,18 @@ impl VerbRegistry {
         if params.get("help").and_then(Value::as_bool) == Some(true) {
             return self.describe_verb(verb);
         }
-        // Resolve namespace as an owned String before `params` is moved into
-        // pack.dispatch, so the post-dispatch hook can reference it.
-        let ns_str: String = params
-            .get("namespace")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.default_namespace.clone());
-        let ns = Namespace::parse(&ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+        // Resolve namespace before `params` is moved into pack.dispatch, so the
+        // post-dispatch hook can reference it.
+        //
+        // RUNTIME-AUD-002 (#433): absent `namespace` and a present-but-malformed
+        // `namespace` are different cases. A present non-string value (null,
+        // number, bool, array, object) is explicit caller input that failed to
+        // parse — ADR-018 requires it fail closed, not silently coerce to the
+        // default namespace. Only a genuinely absent key defaults. Shared with
+        // the multi-backend coordinator intercept via `resolve_explicit_namespace`
+        // so every MCP ingress path applies the same fail-closed rule.
+        let explicit_namespace = params.get("namespace").is_some_and(Value::is_string);
+        let ns = resolve_explicit_namespace(&params, &self.default_namespace)?;
         // ADR-057: thread the configured actor identity into the gate request so
         // the gate can distinguish human vs agent callers at the dispatch seam.
         // Mirrors the actor resolution used by the token-minting path below.
@@ -896,7 +899,7 @@ impl VerbRegistry {
             Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
             _ => ActorRef::anonymous(),
         };
-        let gate_req = GateRequest::new(gate_actor, ns, verb, params.clone());
+        let gate_req = GateRequest::new(gate_actor, ns.clone(), verb, params.clone());
 
         // Consult the gate.
         //
@@ -994,20 +997,18 @@ impl VerbRegistry {
         // included (mint_with_visibility deduplicates). Writes remain pinned to
         // `'local'`. Per-actor distinctions use view-layer tag filters
         // (assignee, actor_id, from/to), not namespace partitions.
-        let token = match params.get("namespace").and_then(Value::as_str) {
-            Some(ns) => {
-                // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
-                let primary = Namespace::parse(ns)
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-                NamespaceToken::mint_with_visibility(primary, vec![], configured_actor)
-            }
-            None => {
-                // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
-                let primary = Namespace::local();
-                let mut extra_visible = self.visible_namespaces.clone();
-                extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
-                NamespaceToken::mint_with_visibility(primary, extra_visible, configured_actor)
-            }
+        // `ns`/`explicit_namespace` were already validated above (RUNTIME-AUD-002 /
+        // #433) — reuse them instead of re-reading `params["namespace"]` with
+        // `as_str()`, which would silently drop malformed non-string values again.
+        let token = if explicit_namespace {
+            // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
+            NamespaceToken::mint_with_visibility(ns.clone(), vec![], configured_actor)
+        } else {
+            // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
+            let primary = Namespace::local();
+            let mut extra_visible = self.visible_namespaces.clone();
+            extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
+            NamespaceToken::mint_with_visibility(primary, extra_visible, configured_actor)
         };
 
         for pack in self.packs.iter() {
@@ -1040,7 +1041,7 @@ impl VerbRegistry {
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(ref ok_val), Some(hook)) = (&result, &self.dispatch_hook) {
                     let mut dispatch_event = Event::new(
-                        ns_str.as_str(),
+                        ns.as_str(),
                         verb,
                         EventKind::Audit,
                         SubstrateKind::Event,
@@ -1652,6 +1653,49 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
 
+/// Resolve and validate a caller-supplied `namespace` argument the same way
+/// on every MCP ingress path (RUNTIME-AUD-002 / #433).
+///
+/// - Absent `namespace` key → parse `default_namespace`.
+/// - Present `namespace: "<string>"` → parse the caller's value.
+/// - Present non-string `namespace` (null, number, bool, array, object) →
+///   fail closed with `RuntimeError::InvalidInput`. ADR-018 requires this:
+///   a malformed explicit value must never be silently coerced to the
+///   default namespace.
+///
+/// This is the single chokepoint both `VerbRegistry::dispatch` (single-backend
+/// and JSON-form ingress) and the multi-backend coordinator intercept
+/// (`dispatch_via_coordinator_inner` in `khive-mcp`) call into, so no ingress
+/// path can bypass the fail-closed rule by routing around `dispatch`.
+pub fn resolve_explicit_namespace(
+    params: &Value,
+    default_namespace: &str,
+) -> Result<Namespace, RuntimeError> {
+    match params.get("namespace") {
+        None => Namespace::parse(default_namespace)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
+        Some(Value::String(ns_str)) => Namespace::parse(ns_str)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "invalid namespace: expected string when present, got {}",
+            json_type_name(other),
+        ))),
+    }
+}
+
+/// JSON type name for error messages (RUNTIME-AUD-002 / #433): describes a
+/// present-but-malformed `namespace` value without echoing its contents.
+pub fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 // INLINE TEST JUSTIFICATION: tests here exercise VerbRegistry collision detection,
 // gate enforcement, and dispatch ordering that depend on direct access to the
 // registry's private `packs` Vec and gate field. Moving them to tests/ would
@@ -2182,6 +2226,49 @@ mod tests {
         reg.dispatch("list", Value::Null).await.unwrap();
         let seen = gate.seen.lock().unwrap().clone();
         assert_eq!(seen, vec!["local"]);
+    }
+
+    /// RUNTIME-AUD-002 (#433): a present-but-malformed `namespace` value must
+    /// never reach the gate as the default namespace. Table-driven over every
+    /// non-string JSON type; the gate-spy proves no call is ever recorded (the
+    /// dispatch must short-circuit with `InvalidInput` before `GateRequest` is
+    /// built), so the default namespace can never appear as a coerced stand-in.
+    #[tokio::test]
+    async fn namespace_null_rejected_not_coerced() {
+        let cases: Vec<(&str, Value)> = vec![
+            ("null", Value::Null),
+            ("number", serde_json::json!(42)),
+            ("boolean", serde_json::json!(true)),
+            ("array", serde_json::json!(["local"])),
+            ("object", serde_json::json!({"ns": "local"})),
+        ];
+
+        for (label, ns_value) in cases {
+            let gate = Arc::new(NamespaceCapturingGate::default());
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_gate(gate.clone());
+            builder.with_default_namespace("tenant-x");
+            let reg = builder.build().expect("registry builds");
+
+            let err = reg
+                .dispatch("list", serde_json::json!({"namespace": ns_value}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "case {label}: expected InvalidInput, got {err:?}"
+            );
+
+            // The gate must never have been consulted for this malformed input —
+            // proves no Allow decision (and therefore no default-namespace write)
+            // can ever be reached for it.
+            let seen = gate.seen.lock().unwrap().clone();
+            assert!(
+                seen.is_empty(),
+                "case {label}: gate must not be consulted for malformed namespace, saw {seen:?}"
+            );
+        }
     }
 
     // ---- Audit event emission ----

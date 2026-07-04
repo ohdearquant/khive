@@ -1052,3 +1052,35 @@ fn non_reserved_presentation_like_arg_accepted() {
     assert_eq!(r.mode, ExecutionMode::Single);
     assert_eq!(val(&r.ops[0].args["present"]), &json!("yes"));
 }
+
+/// RUNTIME-AUD-002 (#433): the JSON-form parser must preserve a present-but
+/// non-string `namespace` verbatim (as `ArgValue::Value`), never dropping or
+/// coercing it. This is the ingress link that carries the malformed value into
+/// `VerbRegistry::dispatch`, where `namespace_null_rejected_not_coerced` proves
+/// it is rejected with `InvalidInput` before the gate is ever consulted.
+/// Together the two tests cover the full MCP JSON-form path end to end.
+#[test]
+fn json_form_namespace_non_string_preserved_for_dispatch_rejection() {
+    let cases = [
+        json!(null),
+        json!(42),
+        json!(true),
+        json!(["local"]),
+        json!({ "ns": "local" }),
+    ];
+    for ns in cases {
+        let body = json!([{
+            "tool": "create",
+            "args": { "kind": "entity", "entity_kind": "concept", "name": "N", "namespace": ns },
+        }]);
+        let r = req(&body.to_string());
+        assert_eq!(r.ops.len(), 1, "namespace={ns} should parse to one op");
+        // `namespace` is NOT a reserved envelope arg — it survives parsing as a
+        // raw Value and reaches the runtime dispatch chokepoint unchanged.
+        assert_eq!(
+            val(&r.ops[0].args["namespace"]),
+            &ns,
+            "namespace={ns} must be preserved verbatim, not dropped or coerced"
+        );
+    }
+}

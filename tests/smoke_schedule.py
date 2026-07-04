@@ -195,7 +195,7 @@ def main():
         # 2. Happy path schedule: valid DSL action → agenda shows it
         def test_happy_schedule(proc):
             ev = call_verb(proc, "schedule.schedule", {
-                "action": 'remind(content="hello from scheduled")',
+                "action": f'schedule.remind(content="hello from scheduled", at="{FAR_FUTURE_A}")',
                 "at": FAR_FUTURE_B,
             }, presentation="verbose")
             assert ev["event_type"] == "schedule", f"expected event_type=schedule: {ev}"
@@ -276,7 +276,7 @@ def main():
         # 8. Valid DSL action accepted
         def test_valid_dsl(proc):
             ev = call_verb(proc, "schedule.schedule", {
-                "action": 'remind(content="test")',
+                "action": f'schedule.remind(content="test", at="{FAR_FUTURE_C}")',
                 "at": FAR_FUTURE_A,
             })
             assert ev["status"] == "pending", f"expected pending: {ev}"

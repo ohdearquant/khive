@@ -59,53 +59,15 @@ impl SqlGraphStore {
     }
 
     fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "graph_writer".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_graph_writer"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_graph_writer"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_graph_writer"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_graph_writer"))?;
-
-        Ok(conn)
+        self.pool
+            .open_standalone_writer()
+            .map_err(|e| map_sqlite_err(e, "open_graph_writer"))
     }
 
     fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "graph_reader".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_graph_reader"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_graph_reader"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_graph_reader"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_graph_reader"))?;
-
-        Ok(conn)
+        self.pool
+            .open_standalone_reader()
+            .map_err(|e| map_sqlite_err(e, "open_graph_reader"))
     }
 
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -810,6 +772,15 @@ impl GraphStore for SqlGraphStore {
         page: PageRequest,
     ) -> Result<Page<Edge>, StorageError> {
         let namespace = self.namespace.clone();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Graph,
+            operation: "query_edges".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
         self.with_reader("query_edges", move |conn| {
             let (where_clause, filter_params) = build_edge_filter_sql(&namespace, &filter);
 
@@ -839,8 +810,8 @@ impl GraphStore for SqlGraphStore {
 
             let (_, data_filter_params) = build_edge_filter_sql(&namespace, &filter);
             let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
-            all_params.push(Box::new(page.limit as i64));
-            all_params.push(Box::new(page.offset as i64));
+            all_params.push(Box::new(limit_i64));
+            all_params.push(Box::new(offset_i64));
 
             let limit_idx = all_params.len() - 1;
             let offset_idx = all_params.len();
@@ -1008,6 +979,15 @@ impl GraphStore for SqlGraphStore {
         let opts = request.options.clone();
         let include_roots = request.include_roots;
         let namespace = self.namespace.clone();
+        let max_depth_i64 =
+            i64::try_from(opts.max_depth).map_err(|_| StorageError::InvalidInput {
+                capability: StorageCapability::Graph,
+                operation: "traverse".into(),
+                message: format!(
+                    "TraversalOptions: max_depth must be <= i64::MAX, got {}",
+                    opts.max_depth
+                ),
+            })?;
 
         self.with_reader("traverse", move |conn| {
             // Two SQLite limits apply to the seed VALUES clause:
@@ -1147,7 +1127,7 @@ impl GraphStore for SqlGraphStore {
                     all_params.push(Box::new(root_id.to_string()));
                 }
                 all_params.push(Box::new(namespace.clone()));
-                all_params.push(Box::new(opts.max_depth as i64));
+                all_params.push(Box::new(max_depth_i64));
                 all_params.extend(extra_params);
 
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =

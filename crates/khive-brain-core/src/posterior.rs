@@ -218,11 +218,50 @@ impl EntityPosteriors {
         self.map.clone()
     }
 
-    pub fn from_snapshot(snapshot: HashMap<Uuid, BetaPosterior>, capacity: usize) -> Self {
+    /// Current eviction order, oldest (next to evict) first.
+    pub fn order(&self) -> Vec<Uuid> {
+        self.order.iter().copied().collect()
+    }
+
+    /// Rebuild from a persisted map plus an explicit eviction order.
+    ///
+    /// `order` lists ids from least- to most-recently-used, as produced by
+    /// [`Self::order`]. Ids in `order` that are absent from `map` are dropped;
+    /// map entries missing from `order` (legacy snapshots with no order
+    /// metadata, or partially-ordered snapshots) are appended afterward in
+    /// ascending `Uuid` order so restore is deterministic across processes.
+    /// The combined id list is then truncated to `capacity`, so a snapshot
+    /// with more entries than the configured cache capacity restores bounded
+    /// rather than exceeding it.
+    pub fn from_snapshot(
+        map: HashMap<Uuid, BetaPosterior>,
+        order: Vec<Uuid>,
+        capacity: usize,
+    ) -> Self {
+        let mut seen = std::collections::HashSet::with_capacity(map.len());
+        let mut ids: Vec<Uuid> = Vec::with_capacity(map.len());
+
+        for id in order {
+            if map.contains_key(&id) && seen.insert(id) {
+                ids.push(id);
+            }
+        }
+
+        let mut remaining: Vec<Uuid> = map
+            .keys()
+            .copied()
+            .filter(|id| !seen.contains(id))
+            .collect();
+        remaining.sort();
+        ids.extend(remaining);
+        ids.truncate(capacity);
+
         let mut ep = Self::new(capacity);
-        for (id, posterior) in snapshot {
-            ep.map.insert(id, posterior);
-            ep.order.push_back(id);
+        for id in ids {
+            if let Some(posterior) = map.get(&id).cloned() {
+                ep.map.insert(id, posterior);
+                ep.order.push_back(id);
+            }
         }
         ep
     }
@@ -447,5 +486,60 @@ mod tests {
         assert!(ep.get(&id1).is_none());
         assert!(ep.get(&id2).is_some());
         assert!(ep.get(&id3).is_some());
+    }
+
+    /// BRAINCORE-AUD-001 regression: snapshot/restore must be eviction-equivalent
+    /// to uninterrupted execution. Capacity 2, observe A then B, snapshot, restore,
+    /// then observe C — the restored path must evict A (the oldest), not B, exactly
+    /// like the live in-memory path would.
+    #[test]
+    fn snapshot_restore_eviction_equivalence() {
+        let capacity = 2;
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let mut live = EntityPosteriors::new(capacity);
+        live.get_or_insert(id_a, BetaPosterior::default);
+        live.get_or_insert(id_b, BetaPosterior::default);
+
+        let map = live.to_snapshot();
+        let order = live.order();
+        let mut restored = EntityPosteriors::from_snapshot(map, order, capacity);
+
+        restored.get_or_insert(id_c, BetaPosterior::default);
+
+        assert_eq!(restored.len(), 2);
+        assert!(
+            restored.get(&id_a).is_none(),
+            "A must be evicted after restore, matching uninterrupted execution"
+        );
+        assert!(restored.get(&id_b).is_some(), "B must survive eviction");
+        assert!(
+            restored.get(&id_c).is_some(),
+            "C must be present after insert"
+        );
+    }
+
+    /// BRAINCORE-AUD-001 regression: a snapshot with more entries than the
+    /// configured capacity must restore bounded, not exceed it.
+    #[test]
+    fn oversized_snapshot_restore_is_bounded_by_capacity() {
+        let capacity = 2;
+        let mut map = HashMap::new();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = Uuid::new_v4();
+            map.insert(id, BetaPosterior::default());
+            ids.push(id);
+        }
+        // No order metadata supplied — exercises the legacy/deterministic path.
+        let restored = EntityPosteriors::from_snapshot(map, Vec::new(), capacity);
+
+        assert_eq!(
+            restored.len(),
+            capacity,
+            "restore must truncate to capacity, not accept all 5 entries"
+        );
     }
 }

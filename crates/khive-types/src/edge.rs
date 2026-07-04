@@ -177,17 +177,20 @@ impl FromStr for EdgeRelation {
     /// DSL entry; they are **not** stored on the wire, which always uses the
     /// canonical snake_case form produced by [`EdgeRelation::as_str`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let normalised: String = s
-            .chars()
-            .map(|c| {
-                if c == '-' {
-                    '_'
-                } else {
-                    c.to_ascii_lowercase()
+        let mut normalised = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '-' | '_' => normalised.push('_'),
+                c if c.is_ascii_alphanumeric() => normalised.push(c.to_ascii_lowercase()),
+                _ => {
+                    return Err(crate::error::UnknownVariant::new(
+                        "edge_relation",
+                        s,
+                        Self::VALID_NAMES,
+                    ));
                 }
-            })
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
+            }
+        }
 
         match normalised.as_str() {
             "contains" => Ok(Self::Contains),
@@ -306,6 +309,17 @@ mod tests {
         );
         assert!(msg.contains("precedes"), "error should list precedes");
         assert!(msg.contains("annotates"), "error should list all 17");
+    }
+
+    #[test]
+    fn edge_relation_bang_rejected() {
+        for bad in ["supports!", "part/of", "depends.on", "competes with"] {
+            let err = bad
+                .parse::<EdgeRelation>()
+                .expect_err("malformed punctuation/whitespace must be rejected");
+            assert_eq!(err.domain, "edge_relation");
+            assert_eq!(err.value, bad);
+        }
     }
 
     #[test]

@@ -651,15 +651,19 @@ pub fn build_registry_for_multi_backend(
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let backend_name = khive_cfg
-            .packs
-            .get(pack_name.as_str())
-            .map(|pc| pc.backend.as_str())
-            .unwrap_or(BackendId::MAIN);
-        let backend = backends
-            .get(backend_name)
-            .cloned()
-            .unwrap_or_else(|| main_backend.clone());
+        let (backend_name, backend) = match khive_cfg.packs.get(pack_name.as_str()) {
+            None => (BackendId::MAIN, main_backend.clone()),
+            Some(pack_cfg) => {
+                let backend_name = pack_cfg.backend.as_str();
+                let backend = backends.get(backend_name).cloned().ok_or_else(|| {
+                    let defined = backends.keys().cloned().collect::<Vec<_>>().join(", ");
+                    anyhow::anyhow!(
+                        "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
+                    )
+                })?;
+                (backend_name, backend)
+            }
+        };
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::new(backend_name);
         per_pack_runtimes_local.insert(
@@ -1029,15 +1033,19 @@ fn build_server_multi_backend(
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let backend_name = khive_cfg
-            .packs
-            .get(pack_name.as_str())
-            .map(|pc| pc.backend.as_str())
-            .unwrap_or(BackendId::MAIN);
-        let backend = backends
-            .get(backend_name)
-            .cloned()
-            .unwrap_or_else(|| main_backend.clone());
+        let (backend_name, backend) = match khive_cfg.packs.get(pack_name.as_str()) {
+            None => (BackendId::MAIN, main_backend.clone()),
+            Some(pack_cfg) => {
+                let backend_name = pack_cfg.backend.as_str();
+                let backend = backends.get(backend_name).cloned().ok_or_else(|| {
+                    let defined = backends.keys().cloned().collect::<Vec<_>>().join(", ");
+                    anyhow::anyhow!(
+                        "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
+                    )
+                })?;
+                (backend_name, backend)
+            }
+        };
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::new(backend_name);
         per_pack_runtimes.insert(
@@ -2158,6 +2166,119 @@ brain_profile = "project-profile"
             assert!(
                 err.to_string().contains("main"),
                 "error message must mention \"main\"; got: {err}"
+            );
+        }
+    }
+
+    /// Regression for MCP-AUD-001 / #419: a pack explicitly configured to a
+    /// backend that has no matching `[[backends]]` entry must fail closed
+    /// instead of silently falling back to `main`. `build_registry_for_multi_backend`
+    /// must return an `Err` mentioning the pack, the requested backend, and the
+    /// defined backends.
+    #[test]
+    fn multi_backend_registry_rejects_undefined_pack_backend() {
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "archive".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None);
+        assert!(
+            result.is_err(),
+            "an undeclared configured pack backend must be a startup error, not a silent \
+             fallback to main"
+        );
+        // MultiBackendRegistry does not implement Debug, so expect_err/unwrap_err are
+        // unavailable; extract the error via match instead (same pattern as
+        // multi_backend_missing_main_returns_error_mentioning_main above).
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("packs.comm"),
+                "error must name the pack; got: {msg}"
+            );
+            assert!(
+                msg.contains("archive"),
+                "error must name the undeclared backend; got: {msg}"
+            );
+            assert!(
+                msg.contains("main"),
+                "error must list the defined backends; got: {msg}"
+            );
+        }
+    }
+
+    /// Same regression as `multi_backend_registry_rejects_undefined_pack_backend`
+    /// but through the `build_server_multi_backend` public builder, which has its
+    /// own independent per-pack backend resolution loop.
+    #[test]
+    fn multi_backend_server_rejects_undefined_pack_backend() {
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "archive".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_server_multi_backend(base_cfg, &khive_cfg, None);
+        assert!(
+            result.is_err(),
+            "an undeclared configured pack backend must be a startup error, not a silent \
+             fallback to main"
+        );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("packs.comm"),
+                "error must name the pack; got: {msg}"
+            );
+            assert!(
+                msg.contains("archive"),
+                "error must name the undeclared backend; got: {msg}"
+            );
+            assert!(
+                msg.contains("main"),
+                "error must list the defined backends; got: {msg}"
             );
         }
     }

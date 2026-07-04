@@ -4,10 +4,12 @@
 
 ### ADR-002: Edge Ontology
 
-- 15 closed edge relations; endpoint contract enforced at the runtime layer in `operations.rs`
+- 17 closed edge relations (15 base relations plus 2 epistemic relations added by ADR-055);
+  endpoint contract enforced at the runtime layer in `operations.rs`
 - Symmetric relations (`competes_with`, `composed_with`) are stored with `source_uuid < target_uuid`
 - `annotates` is the only cross-substrate relation: source must be a note, target may be anything
-- All 13 base relations require entity→entity; notes cannot be source/target except via `annotates`
+- All base relations other than `annotates` require entity→entity; notes cannot be source/target
+  except via `annotates`
 - `supersedes` is same-substrate only: entity→entity or note→note, never cross-substrate
 - `dependency_kind` metadata key is only valid on `depends_on` edges
 - Pack-declared edge endpoint rules are additive only; packs cannot tighten the base contract
@@ -18,12 +20,20 @@
 - The audit payload field holds the full `AuditEvent` envelope (not a bare verb result)
 - Top-level event fields follow the ADR-004/ADR-005 schema
 
-### ADR-007: Namespace Strategy
+### ADR-007: Namespace Strategy (Rev 6)
 
-- Every ID-based operation (get, delete, update, merge) verifies `record.namespace == caller_namespace`
-- Wrong-namespace and absent IDs return the same `NotFound` error to prevent timing-oracle attacks
+- Namespace is attribution and gate-policy input, not a storage partition; it is not a
+  by-ID access control boundary
+- By-ID operations (get, delete, update) resolve globally unique UUIDs directly — no
+  `record.namespace == caller_namespace` check at the runtime layer (rule 2; see
+  `operations.rs::get_entity`)
+- `merge_entity` is the one by-ID operation that still requires a namespace match on
+  both sides (it is a same-namespace curation operation, not a generic lookup); it
+  rejects the merge when a record's namespace differs from the caller's token namespace
 - `actor.id` in config must be a valid namespace string; an invalid value is a startup error
-- `NamespaceToken` is the runtime trust boundary; storage is ID-only
+- `NamespaceToken` carries dispatch attribution and the visible-namespace read/write
+  scope produced at the gate boundary; it is not a by-ID access guard (historical:
+  earlier ADR-007 revisions described it as the storage trust boundary — superseded)
 
 ### ADR-009 / ADR-028: Multi-Backend Deployment
 
@@ -48,7 +58,9 @@
 ### ADR-014: Curation Operations
 
 - `merge_entity` enforces same-kind constraint at the runtime layer, not storage
-- Namespace isolation is enforced during merge: only records in the caller namespace can be merged
+- Merge is a same-namespace curation constraint: only records in the caller namespace can be
+  merged (this is the one by-ID operation with a namespace check — see ADR-007 below; it is
+  not a general by-ID access rule)
 - Symmetric relations are canonicalized (source_uuid < target_uuid) before merge conflict checks
 - Soft-delete preserves existing edges; queries filter by `deleted_at IS NULL`
 - Entity tombstone records preserve provenance for audit
@@ -165,7 +177,9 @@
 ### ADR-050: Namespace Token Contract
 
 - `NamespaceToken` is sealed to prevent external construction without gate authorization
-- Namespace authority is checked at the runtime layer on every ID-based operation
+- Namespace authority governs which namespace(s) a dispatch can read/write (minted at
+  the gate boundary); it is not consulted again per-record on by-ID operations (ADR-007
+  Rev 6), except `merge_entity`/`merge_note`, which still require a namespace match
 
 ## Consistency Notes
 

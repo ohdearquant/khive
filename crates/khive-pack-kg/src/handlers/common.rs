@@ -472,6 +472,8 @@ pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) ->
         ("artifact", "refutes", "concept"),
         ("person", "part_of", "org"),
         ("person", "instance_of", "org"),
+        ("person", "part_of", "project"),
+        ("person", "instance_of", "project"),
         ("org", "depends_on", "org"),
         ("org", "enables", "org"),
         ("org", "contains", "org"),
