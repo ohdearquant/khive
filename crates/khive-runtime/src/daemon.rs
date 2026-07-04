@@ -308,19 +308,39 @@ fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
     BACKGROUND_TASKS.get_or_init(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
 }
 
+/// Decrements the shared background-task counter from `Drop`, so the count
+/// comes back down whether the tracked future returns normally, panics, or
+/// is cancelled — a plain post-`await` `fetch_sub` only covers the return
+/// path and leaks the count forever on a panic (codex PR #583 round-2
+/// Medium), since unwinding skips every statement after the panic point.
+struct BackgroundTaskGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for BackgroundTaskGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Spawn a fire-and-forget background task that daemon shutdown's `drain()`
 /// waits for, instead of a bare `tokio::spawn` that a SIGTERM can abort
 /// mid-flight with no trace. Only the enqueue (an atomic increment) is
 /// synchronous on the caller's path — the future itself still runs fully
-/// off-path, unawaited.
+/// off-path, unawaited. The decrement happens via `BackgroundTaskGuard`'s
+/// `Drop`, so a panic inside `fut` still restores the count.
 pub fn track_background_task<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     background_tasks().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = BackgroundTaskGuard {
+        counter: background_tasks().clone(),
+    };
     tokio::spawn(async move {
+        let _guard = guard;
         fut.await;
-        background_tasks().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -782,5 +802,35 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(background_task_count(), before);
+    }
+
+    #[tokio::test]
+    async fn track_background_task_count_returns_to_baseline_after_panic() {
+        // codex PR #583 round-2 Medium: a panic inside the tracked future must
+        // still decrement the counter (via BackgroundTaskGuard's Drop), not
+        // leak it forever. tokio::spawn catches the panic in the returned
+        // JoinHandle rather than aborting the process, so we can await it
+        // here and assert the counter recovered.
+        let before = background_task_count();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_background_task(async move {
+            let _ = rx.await;
+            panic!("intentional panic to exercise the Drop-guard decrement path");
+        });
+        assert_eq!(background_task_count(), before + 1);
+
+        tx.send(()).expect("still awaiting");
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            background_task_count(),
+            before,
+            "background task counter must return to baseline after the tracked future panics"
+        );
     }
 }
