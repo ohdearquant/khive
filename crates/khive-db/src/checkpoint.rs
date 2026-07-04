@@ -1,24 +1,30 @@
 //! Periodic WAL checkpoint task for the connection pool.
 //!
 //! Issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — including when the
-//! WAL page count exceeds the high-water mark. PASSIVE is the only mode the
-//! periodic task ever uses.
+//! WAL page count exceeds the high-water mark. Ordinary ticks stay
+//! PASSIVE-only and non-blocking; a rare, separately-gated escalation may
+//! additionally run `PRAGMA wal_checkpoint(TRUNCATE)` under the same writer
+//! guard with a shortened busy timeout — see the ADR-091 Plank 2 doc below
+//! for the escalation's own gating.
 //!
 //! Non-contending design: `checkpoint_once` uses `try_writer_nowait` (zero-wait
 //! `try_lock`) so a tick is skipped immediately when any writer holds the mutex,
 //! rather than blocking for up to `checkout_timeout`. The checkpoint task must
 //! never stall active write traffic — a skipped tick is always preferable.
 //!
-//! Why TRUNCATE is excluded from the periodic path: TRUNCATE inherits RESTART
-//! semantics — it waits for active readers to release their WAL snapshots and
-//! invokes the busy handler before acquiring the exclusive lock needed to reset
-//! the WAL file. With PoolConfig's 30 s busy_timeout, the task could sit inside
-//! SQLite holding the sole writer connection for up to 30 s, stalling all normal
-//! write traffic. PASSIVE never waits for readers; it checkpoints as many frames
-//! as currently possible and returns promptly. When WAL pressure is sustained
-//! (high_water_pages exceeded), the task emits a WARNING so an operator or
-//! scheduler can perform a blocking TRUNCATE at a safe moment outside normal
-//! traffic.
+//! Why TRUNCATE is excluded from *every ordinary* tick: TRUNCATE inherits
+//! RESTART semantics — it waits for active readers to release their WAL
+//! snapshots and invokes the busy handler before acquiring the exclusive lock
+//! needed to reset the WAL file. With PoolConfig's 30 s busy_timeout, blindly
+//! running it every tick could sit inside SQLite holding the sole writer
+//! connection for up to 30 s, stalling all normal write traffic. PASSIVE never
+//! waits for readers; it checkpoints as many frames as currently possible and
+//! returns promptly. When WAL pressure is sustained (high_water_pages
+//! exceeded), the task emits a WARNING; once WAL pressure reaches the much
+//! higher `truncate_high_water_pages` mark, the rare Plank 2 escalation below
+//! may additionally attempt a bounded, rate-limited TRUNCATE under a
+//! deliberately shortened busy timeout — replacing what used to be a purely
+//! operator-scheduled manual step.
 //!
 //! Threshold-crossing WARN semantics: both the `warn_pages` and `high_water_pages`
 //! warnings fire at most once per below→above crossing. Skipped ticks (writer
@@ -229,11 +235,14 @@ pub struct TruncateState {
 /// `tokio::spawn`. It loops until the pool is dropped (the `Arc` count
 /// falls to one, meaning this task holds the last reference).
 ///
-/// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick. PASSIVE is
-/// the only checkpoint mode used; see the module-level doc for why TRUNCATE is
-/// excluded. A WARNING is emitted once on threshold crossing (wal_pages
-/// transitions from below a threshold to at/above) rather than on every tick,
-/// preventing log spam when a long-lived reader pins a WAL snapshot.
+/// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — ordinary
+/// ticks stay PASSIVE-only and non-blocking; see the module-level doc for the
+/// rare Plank 2 TRUNCATE escalation `checkpoint_once` may additionally run
+/// under the same writer guard when WAL pressure is sustained past
+/// `truncate_high_water_pages`. A WARNING is emitted once on threshold
+/// crossing (wal_pages transitions from below a threshold to at/above) rather
+/// than on every tick, preventing log spam when a long-lived reader pins a
+/// WAL snapshot.
 ///
 /// Skipped ticks (writer mutex busy) leave both crossing-state flags unchanged
 /// so that a skip cannot spuriously re-arm the rate limit while WAL pressure is
@@ -401,10 +410,12 @@ pub fn checkpoint_once(
 /// - no prior attempt (`truncate_state.last_attempt.is_none()`) OR at least
 ///   `config.truncate_min_interval` has elapsed since the last attempt.
 ///
-/// `truncate_state.last_attempt` is stamped ONLY on this path (an actual
-/// attempt) — a return before that point (below threshold, interval not
-/// elapsed) never touches it, matching the ADR's "skip must not stamp"
-/// requirement.
+/// `truncate_state.last_attempt` is stamped ONLY immediately before the
+/// TRUNCATE pragma itself runs (writer held, threshold crossed, interval
+/// elapsed, AND the temporary busy_timeout override successfully applied) —
+/// every earlier return (below threshold, interval not elapsed, or the
+/// busy_timeout override failing to apply) is a skip, not an attempt, and
+/// never touches it, matching the ADR's "skip must not stamp" requirement.
 ///
 /// The oldest-pinning-transaction snapshot is logged (reusing Plank 0's
 /// `tx_registry`) before the attempt, so an operator can see what is
@@ -431,8 +442,6 @@ fn maybe_truncate(
         }
     }
 
-    truncate_state.last_attempt = Some(Instant::now());
-
     // Which caller (if any) is pinning the WAL — logged before the attempt so
     // it is available even if the attempt itself succeeds.
     log_tx_registry_snapshot_warn(wal_pages_before);
@@ -441,9 +450,19 @@ fn maybe_truncate(
     let original_busy_timeout = pool.config().busy_timeout;
 
     if let Err(e) = conn.busy_timeout(config.truncate_busy_timeout) {
+        // Setup failed before the TRUNCATE pragma ever ran — this is a skip,
+        // not an attempt. `last_attempt` must NOT advance here (ADR-091
+        // §377-382): stamping now would suppress the next eligible attempt
+        // for the full `truncate_min_interval` on a path that never touched
+        // the WAL at all.
         tracing::warn!(error = %e, "failed to lower busy_timeout for TRUNCATE attempt; skipping");
         return;
     }
+
+    // Only now is this a genuine attempt: the writer is held, the threshold
+    // and interval gates passed, and the busy_timeout override is in effect
+    // immediately before the TRUNCATE pragma itself.
+    truncate_state.last_attempt = Some(Instant::now());
 
     let start = Instant::now();
     let outcome = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
