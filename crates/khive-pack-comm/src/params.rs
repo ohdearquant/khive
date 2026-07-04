@@ -111,6 +111,24 @@ pub(crate) struct IngestParams {
     pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
+/// Parameters for `comm.heartbeat` — persists a per-channel-credential heartbeat row.
+///
+/// `deny_unknown_fields` is intentionally absent, matching `IngestParams`: the
+/// `namespace` routing key is consumed by `VerbRegistry::dispatch` before the
+/// handler sees `params`, not read from this struct.
+#[derive(Deserialize)]
+pub(crate) struct HeartbeatParams {
+    pub channel_kind: String,
+    pub channel_slug: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub error_class: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))

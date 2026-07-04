@@ -20,7 +20,7 @@ pub struct CommPack {
 
 impl Pack for CommPack {
     const NAME: &'static str = "comm";
-    const NOTE_KINDS: &'static [&'static str] = &["message"];
+    const NOTE_KINDS: &'static [&'static str] = &["message", "channel_health"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &COMM_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
@@ -91,6 +91,8 @@ impl PackRuntime for CommPack {
             "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
+            "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
+            "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "comm pack does not handle verb {verb:?}"
             ))),
@@ -195,7 +197,19 @@ mod help_tests {
 
     #[test]
     fn all_comm_handlers_have_non_empty_params() {
+        // comm.health is a legitimate no-args verb (khive #606 spec-gate: "read-only,
+        // NO args") -- same shape as kg's `stats()`. Every other comm verb takes at
+        // least one param, so the invariant still holds for the rest.
+        const NO_ARGS_VERBS: &[&str] = &["comm.health"];
         for handler in CommPack::HANDLERS {
+            if NO_ARGS_VERBS.contains(&handler.name) {
+                assert!(
+                    handler.params.is_empty(),
+                    "comm handler {:?} is declared no-args; params should be empty",
+                    handler.name
+                );
+                continue;
+            }
             assert!(
                 !handler.params.is_empty(),
                 "comm handler {:?} must have non-empty params",

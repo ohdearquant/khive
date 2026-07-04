@@ -40,11 +40,12 @@ fn comm_pack_declares_message_note_kind() {
 }
 
 #[test]
-fn comm_pack_declares_six_handlers() {
+fn comm_pack_declares_eight_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        6,
-        "comm pack must declare 6 handlers: send, inbox, read, reply, thread, ingest"
+        8,
+        "comm pack must declare 8 handlers: send, inbox, read, reply, thread, ingest, \
+         heartbeat, health"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
@@ -58,6 +59,22 @@ fn comm_pack_declares_six_handlers() {
     assert!(
         names.contains(&"comm.ingest"),
         "comm.ingest verb must be registered"
+    );
+    assert!(
+        names.contains(&"comm.heartbeat"),
+        "comm.heartbeat verb must be registered (khive #606)"
+    );
+    assert!(
+        names.contains(&"comm.health"),
+        "comm.health verb must be registered (khive #606)"
+    );
+}
+
+#[test]
+fn comm_pack_declares_channel_health_note_kind() {
+    assert!(
+        CommPack::NOTE_KINDS.contains(&"channel_health"),
+        "khive #606: channel_health must be a pack-owned note kind"
     );
 }
 
@@ -5175,5 +5192,327 @@ async fn thread_includes_root_message_without_thread_id_property() {
     assert!(
         count >= 2,
         "thread must include root + child (at least 2); got count={count}"
+    );
+}
+
+// --- comm.heartbeat / comm.health (khive #606) ---
+
+/// Spec-gate amendment 1 (blocking): a fresh install with no persisted daemon
+/// heartbeat state must report `role: "client"` with an empty channel list —
+/// never fabricate channel entries the comm pack has no evidence for.
+#[tokio::test]
+async fn health_reports_client_role_when_no_heartbeat_state_exists() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+
+    assert_eq!(result["role"].as_str(), Some("client"));
+    assert!(result["source"].is_null());
+    assert!(result["as_of"].as_str().is_some());
+    assert_eq!(
+        result["channels"]
+            .as_array()
+            .expect("channels is array")
+            .len(),
+        0
+    );
+}
+
+/// comm.health() takes no arguments — any caller-supplied args must be rejected
+/// rather than silently ignored (spec: "read-only, NO args").
+#[tokio::test]
+async fn health_rejects_stray_args() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("comm.health", serde_json::json!({ "limit": 10 }))
+        .await
+        .expect_err("health must reject unexpected args");
+    assert!(
+        err.to_string().contains("takes no arguments"),
+        "unexpected error message: {err}"
+    );
+}
+
+/// Core cross-process-read contract (spec-gate amendment 1): once the daemon
+/// persists a successful heartbeat, `comm.health()` returns it annotated
+/// `role: "daemon"`, `source: "daemon-heartbeat"` — this is true even though
+/// the *reading* call is a plain in-process dispatch here, mirroring a
+/// client-role stdio caller reading state it did not write itself.
+#[tokio::test]
+async fn heartbeat_success_is_visible_via_health() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+
+    assert_eq!(health["role"].as_str(), Some("daemon"));
+    assert_eq!(health["source"].as_str(), Some("daemon-heartbeat"));
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert_eq!(channels.len(), 1);
+    let ch = &channels[0];
+    assert_eq!(ch["channel_kind"].as_str(), Some("email"));
+    assert_eq!(ch["channel_slug"].as_str(), Some("leo@khive.ai"));
+    assert!(ch["last_success_at"].as_str().is_some());
+    assert!(ch["last_poll_attempt_at"].as_str().is_some());
+    assert!(ch["last_failure_at"].is_null());
+    assert!(ch["last_error"].is_null());
+    assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
+}
+
+/// Spec-gate amendment 3: `last_error` is RETAINED after a subsequent success
+/// (callers compare `last_error.at` vs `last_success_at`), and
+/// `consecutive_failures` resets to 0 on success.
+#[tokio::test]
+async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failures() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "failure",
+                "error_class": "auth",
+                "error_message": "XOAUTH2 handshake failed",
+            }),
+        )
+        .await
+        .expect("first failure heartbeat succeeds");
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "failure",
+                "error_class": "auth",
+                "error_message": "XOAUTH2 handshake failed",
+            }),
+        )
+        .await
+        .expect("second failure heartbeat succeeds");
+
+    let after_failures = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let ch = &after_failures["channels"][0];
+    assert_eq!(ch["consecutive_failures"].as_u64(), Some(2));
+    assert_eq!(ch["last_error"]["class"].as_str(), Some("auth"));
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("success heartbeat succeeds");
+
+    let after_success = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let ch = &after_success["channels"][0];
+    assert_eq!(
+        ch["consecutive_failures"].as_u64(),
+        Some(0),
+        "consecutive_failures must reset to 0 on success"
+    );
+    assert_eq!(
+        ch["last_error"]["class"].as_str(),
+        Some("auth"),
+        "last_error must be RETAINED after a subsequent success (spec-gate amendment 3)"
+    );
+    assert!(
+        ch["last_success_at"].as_str().is_some(),
+        "last_success_at must be set"
+    );
+}
+
+/// Spec-gate amendment 2: rows are keyed by channel slug + kind, never kind
+/// alone — two accounts of the same kind must not collapse into one row.
+#[tokio::test]
+async fn heartbeat_keys_by_slug_not_kind_alone() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("first account heartbeat succeeds");
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "ops@khive.ai",
+                "outcome": "failure",
+                "error_class": "transport",
+                "error_message": "connect timeout",
+            }),
+        )
+        .await
+        .expect("second account heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert_eq!(
+        channels.len(),
+        2,
+        "two accounts of the same channel_kind must produce two distinct rows; got {channels:?}"
+    );
+    let slugs: std::collections::HashSet<&str> = channels
+        .iter()
+        .map(|c| c["channel_slug"].as_str().unwrap())
+        .collect();
+    assert!(slugs.contains("leo@khive.ai"));
+    assert!(slugs.contains("ops@khive.ai"));
+}
+
+/// Repeated heartbeats for the same (kind, slug) update the same row (via
+/// `upsert_note`'s deterministic id) rather than accumulating duplicates.
+#[tokio::test]
+async fn heartbeat_repeated_calls_update_same_row() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for _ in 0..3 {
+        registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": "local",
+                    "channel_kind": "email",
+                    "channel_slug": "leo@khive.ai",
+                    "outcome": "success",
+                }),
+            )
+            .await
+            .expect("heartbeat succeeds");
+    }
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["channels"].as_array().expect("array").len(),
+        1,
+        "repeated heartbeats for the same channel must update one row, not accumulate"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_requires_error_class_on_failure() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let err = registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "failure",
+            }),
+        )
+        .await
+        .expect_err("failure outcome without error_class must be rejected");
+    assert!(
+        err.to_string().contains("error_class"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_rejects_invalid_outcome() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let err = registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "maybe",
+            }),
+        )
+        .await
+        .expect_err("invalid outcome must be rejected");
+    assert!(
+        err.to_string().contains("outcome"),
+        "unexpected error message: {err}"
+    );
+}
+
+/// Spec: "report TIMESTAMPS only ... never a computed `healthy: bool`" —
+/// the channel entry shape must not carry any boolean health verdict.
+#[tokio::test]
+async fn health_channel_entry_never_carries_a_healthy_bool() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "leo@khive.ai",
+                "outcome": "failure",
+                "error_class": "auth",
+                "error_message": "handshake failed",
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let ch = health["channels"][0]
+        .as_object()
+        .expect("channel entry is an object");
+    assert!(
+        !ch.contains_key("healthy"),
+        "channel entry must never carry a computed healthy bool: {ch:?}"
     );
 }
