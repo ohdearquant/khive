@@ -29,11 +29,32 @@
 //! not independently rate-limited, so they never repeat on consecutive ticks
 //! that remain above a threshold. Only the per-tick `debug!` trace of the
 //! oldest open entry fires unconditionally.
+//!
+//! ADR-091 Plank 2: rare TRUNCATE escalation. The periodic tick above stays
+//! PASSIVE-only and non-blocking; on top of it, `checkpoint_once` also
+//! evaluates a much rarer escalation to `PRAGMA wal_checkpoint(TRUNCATE)`
+//! once the WAL has grown past `truncate_high_water_pages` and at least
+//! `truncate_min_interval` has elapsed since the last TRUNCATE *attempt*
+//! (not the last successful reclaim). This is a **single writer checkout per
+//! tick**: PASSIVE and any due TRUNCATE both run under the one guard
+//! `checkpoint_once` already holds — there is never a second concurrent
+//! checkout for TRUNCATE. If the writer mutex is busy, both PASSIVE and any
+//! due TRUNCATE are skipped for that tick, and `last_truncate_attempt` is
+//! left untouched so the next tick where the writer is free is immediately
+//! eligible rather than waiting out the full interval again.
+//! `last_truncate_attempt` only advances on a tick that actually attempted
+//! TRUNCATE (writer held, threshold crossed, interval elapsed) — never on a
+//! skip for any reason (writer busy, below threshold, interval not yet up).
+//! TRUNCATE runs under a temporarily shortened `busy_timeout`
+//! (`truncate_busy_timeout`), restored on the writer connection immediately
+//! after the attempt, win or lose. No transaction is ever killed or aborted
+//! here — the tx_registry is only read for diagnostics (Plank 1 owns
+//! enforcement).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, WriterGuard};
 
 /// Outcome of a single checkpoint attempt.
 ///
@@ -78,6 +99,37 @@ pub struct CheckpointConfig {
     /// Overridable via `KHIVE_WAL_HIGH_WATER_PAGES`.
     /// Default: 6000 pages (~24 MB at 4 KiB page size).
     pub high_water_pages: u64,
+
+    /// WAL page count above which a TRUNCATE escalation attempt is armed
+    /// (ADR-091 Plank 2).
+    ///
+    /// This is a separate, much higher threshold than `high_water_pages`:
+    /// crossing it does not itself attempt TRUNCATE — it only arms the
+    /// attempt, which additionally requires `truncate_min_interval` to have
+    /// elapsed since the last attempt.
+    ///
+    /// Overridable via `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`.
+    /// Default: 20000 pages.
+    pub truncate_high_water_pages: u64,
+
+    /// Minimum spacing between TRUNCATE *attempts* (not successes).
+    ///
+    /// A skipped tick (writer busy, below threshold, or interval not yet
+    /// elapsed) never advances the "last attempt" clock, so the next tick
+    /// where the writer is free and the threshold is still crossed is
+    /// immediately eligible rather than waiting out the full interval again.
+    ///
+    /// Overridable via `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS`.
+    /// Default: 300 seconds (5 minutes).
+    pub truncate_min_interval: Duration,
+
+    /// Temporary `busy_timeout` used only for the duration of a TRUNCATE
+    /// attempt, restored to the pool's configured busy timeout immediately
+    /// after the attempt completes (win or lose).
+    ///
+    /// Overridable via `KHIVE_WAL_TRUNCATE_BUSY_MS`.
+    /// Default: 2000 ms.
+    pub truncate_busy_timeout: Duration,
 }
 
 impl Default for CheckpointConfig {
@@ -86,6 +138,9 @@ impl Default for CheckpointConfig {
             interval: Duration::from_millis(500),
             warn_pages: 2000,
             high_water_pages: 6000,
+            truncate_high_water_pages: 20_000,
+            truncate_min_interval: Duration::from_secs(300),
+            truncate_busy_timeout: Duration::from_millis(2000),
         }
     }
 }
@@ -121,8 +176,51 @@ impl CheckpointConfig {
             }
         }
 
+        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    cfg.truncate_high_water_pages = n;
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    cfg.truncate_min_interval = Duration::from_secs(n);
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_BUSY_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    cfg.truncate_busy_timeout = Duration::from_millis(n);
+                }
+            }
+        }
+
         cfg
     }
+}
+
+/// Mutable escalation state carried across ticks by the caller (ADR-091 Plank 2).
+///
+/// Kept separate from [`CheckpointConfig`] because it is *state*, not
+/// configuration: `last_attempt` and `consecutive_failures` mutate every tick,
+/// while `CheckpointConfig` is parsed once and held immutable for the life of
+/// the task.
+#[derive(Debug, Default)]
+pub struct TruncateState {
+    /// When the last TRUNCATE *attempt* ran (armed + writer held), regardless
+    /// of whether it succeeded in reclaiming pages. `None` means no attempt
+    /// has ever run, so the first armed tick is immediately eligible.
+    last_attempt: Option<Instant>,
+    /// Count of consecutive TRUNCATE attempts that failed to bring `wal_pages`
+    /// back below `warn_pages`. Resets to 0 the first time an attempt clears
+    /// `warn_pages`; used to fire a one-shot escalated WARN at exactly 3
+    /// consecutive failures (does not repeat every subsequent attempt).
+    consecutive_failures: u32,
 }
 
 /// Run the WAL checkpoint background task.
@@ -148,6 +246,7 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_above_warn = false;
     let mut was_above_high_water = false;
+    let mut truncate_state = TruncateState::default();
 
     loop {
         interval.tick().await;
@@ -158,7 +257,7 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             break;
         }
 
-        let tick = checkpoint_once(&pool);
+        let tick = checkpoint_once(&pool, &config, &mut truncate_state);
         // Skipped ticks leave crossing state unchanged — a busy tick must not
         // re-arm the rate limit while WAL pressure is still elevated.
         let wal_pages = match tick {
@@ -263,7 +362,16 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
 /// be skipped immediately rather than stalling for up to `checkout_timeout`.
 /// The caller (`run_checkpoint_task`) owns all threshold-crossing WARN logging
 /// so that warnings fire at most once per crossing, not every tick.
-pub fn checkpoint_once(pool: &ConnectionPool) -> CheckpointTick {
+///
+/// ADR-091 Plank 2: after the PASSIVE pass, this is also the single point
+/// that may escalate to TRUNCATE (`maybe_truncate`) — under the SAME writer
+/// guard acquired above, never a second checkout. A busy writer (`Skipped`)
+/// short-circuits before either PASSIVE or TRUNCATE run.
+pub fn checkpoint_once(
+    pool: &ConnectionPool,
+    config: &CheckpointConfig,
+    truncate_state: &mut TruncateState,
+) -> CheckpointTick {
     let writer = match pool.try_writer_nowait() {
         Ok(w) => w,
         Err(_) => return CheckpointTick::Skipped,
@@ -280,7 +388,126 @@ pub fn checkpoint_once(pool: &ConnectionPool) -> CheckpointTick {
         tracing::debug!(wal_pages, "WAL checkpoint issued");
     }
 
+    maybe_truncate(pool, &writer, config, wal_pages, truncate_state);
+
     CheckpointTick::Observed(wal_pages)
+}
+
+/// ADR-091 Plank 2: evaluate and, if due, attempt a TRUNCATE escalation.
+///
+/// Runs under the writer guard the caller already holds — never performs its
+/// own checkout. Returns immediately (a no-op) unless BOTH:
+/// - `wal_pages >= config.truncate_high_water_pages`, and
+/// - no prior attempt (`truncate_state.last_attempt.is_none()`) OR at least
+///   `config.truncate_min_interval` has elapsed since the last attempt.
+///
+/// `truncate_state.last_attempt` is stamped ONLY on this path (an actual
+/// attempt) — a return before that point (below threshold, interval not
+/// elapsed) never touches it, matching the ADR's "skip must not stamp"
+/// requirement.
+///
+/// The oldest-pinning-transaction snapshot is logged (reusing Plank 0's
+/// `tx_registry`) before the attempt, so an operator can see what is
+/// (potentially) pinning the WAL even if the attempt goes on to succeed.
+/// `busy_timeout` is temporarily lowered to `config.truncate_busy_timeout` for
+/// the PRAGMA call and restored to the pool's configured value immediately
+/// after, regardless of outcome. No transaction is ever killed here — this is
+/// read-only diagnostics plus the TRUNCATE pragma itself; enforcement is
+/// Plank 1's job, not this one's.
+fn maybe_truncate(
+    pool: &ConnectionPool,
+    writer: &WriterGuard<'_>,
+    config: &CheckpointConfig,
+    wal_pages_before: u64,
+    truncate_state: &mut TruncateState,
+) {
+    if wal_pages_before < config.truncate_high_water_pages {
+        return;
+    }
+
+    if let Some(last) = truncate_state.last_attempt {
+        if last.elapsed() < config.truncate_min_interval {
+            return;
+        }
+    }
+
+    truncate_state.last_attempt = Some(Instant::now());
+
+    // Which caller (if any) is pinning the WAL — logged before the attempt so
+    // it is available even if the attempt itself succeeds.
+    log_tx_registry_snapshot_warn(wal_pages_before);
+
+    let conn = writer.conn();
+    let original_busy_timeout = pool.config().busy_timeout;
+
+    if let Err(e) = conn.busy_timeout(config.truncate_busy_timeout) {
+        tracing::warn!(error = %e, "failed to lower busy_timeout for TRUNCATE attempt; skipping");
+        return;
+    }
+
+    let start = Instant::now();
+    let outcome = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    let elapsed = start.elapsed();
+
+    // Restore the pool's configured busy_timeout immediately after the
+    // attempt, win or lose, before any other logging or bookkeeping.
+    if let Err(e) = conn.busy_timeout(original_busy_timeout) {
+        tracing::warn!(error = %e, "failed to restore busy_timeout after TRUNCATE attempt");
+    }
+
+    match outcome {
+        Ok(()) => {
+            let wal_pages_after = query_wal_pages(conn);
+            tracing::info!(
+                wal_pages_before,
+                wal_pages_after,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "WAL TRUNCATE checkpoint attempted"
+            );
+
+            let made_progress = wal_pages_after < wal_pages_before;
+            if !made_progress {
+                tracing::warn!(
+                    wal_pages_before,
+                    wal_pages_after,
+                    "WAL TRUNCATE attempt made no progress; \
+                     a long-lived reader may still be pinning the WAL snapshot"
+                );
+                log_tx_registry_snapshot_warn(wal_pages_after);
+            }
+
+            note_truncate_outcome(config, wal_pages_after, truncate_state);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, wal_pages_before, "WAL TRUNCATE attempt failed");
+            log_tx_registry_snapshot_warn(wal_pages_before);
+            note_truncate_outcome(config, wal_pages_before, truncate_state);
+        }
+    }
+}
+
+/// ADR-091 Plank 2: track consecutive TRUNCATE attempts that fail to bring
+/// `wal_pages` back below `warn_pages`, firing a one-shot escalated WARN at
+/// exactly the third consecutive failure (does not repeat every attempt
+/// thereafter — mirrors the crossing-WARN debounce used elsewhere in this
+/// module). A single attempt that clears `warn_pages` resets the counter.
+fn note_truncate_outcome(
+    config: &CheckpointConfig,
+    wal_pages_after: u64,
+    state: &mut TruncateState,
+) {
+    if wal_pages_after >= config.warn_pages {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures == 3 {
+            tracing::warn!(
+                wal_pages_after,
+                warn_threshold = config.warn_pages,
+                "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
+            );
+        }
+    } else {
+        state.consecutive_failures = 0;
+    }
 }
 
 /// Evaluate whether a threshold-crossing WARN should fire and advance the
@@ -533,7 +760,11 @@ mod tests {
                 .unwrap();
         }
 
-        checkpoint_once(&pool);
+        checkpoint_once(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        );
     }
 
     #[test]
@@ -544,7 +775,11 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(cfg).expect("in-memory pool"));
-        checkpoint_once(&pool);
+        checkpoint_once(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        );
     }
 
     #[tokio::test]
@@ -581,16 +816,25 @@ mod tests {
         std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "250");
         std::env::set_var("KHIVE_WAL_WARN_PAGES", "1500");
         std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "8000");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "12000");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "60");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "500");
 
         let cfg = CheckpointConfig::from_env();
 
         std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
         std::env::remove_var("KHIVE_WAL_WARN_PAGES");
         std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
 
         assert_eq!(cfg.interval, Duration::from_millis(250));
         assert_eq!(cfg.warn_pages, 1500);
         assert_eq!(cfg.high_water_pages, 8000);
+        assert_eq!(cfg.truncate_high_water_pages, 12000);
+        assert_eq!(cfg.truncate_min_interval, Duration::from_secs(60));
+        assert_eq!(cfg.truncate_busy_timeout, Duration::from_millis(500));
     }
 
     #[test]
@@ -601,16 +845,28 @@ mod tests {
         std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "not_a_number");
         std::env::set_var("KHIVE_WAL_WARN_PAGES", "");
         std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "0");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "not_a_number");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "0");
 
         let cfg = CheckpointConfig::from_env();
 
         std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
         std::env::remove_var("KHIVE_WAL_WARN_PAGES");
         std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
 
         assert_eq!(cfg.interval, default.interval);
         assert_eq!(cfg.warn_pages, default.warn_pages);
         assert_eq!(cfg.high_water_pages, default.high_water_pages);
+        assert_eq!(
+            cfg.truncate_high_water_pages,
+            default.truncate_high_water_pages
+        );
+        assert_eq!(cfg.truncate_min_interval, default.truncate_min_interval);
+        assert_eq!(cfg.truncate_busy_timeout, default.truncate_busy_timeout);
     }
 
     /// Regression: a high-water tick must NOT block behind an active read transaction.
@@ -676,7 +932,11 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        checkpoint_once(&pool);
+        checkpoint_once(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        );
         let elapsed = start.elapsed();
 
         // Commit and release the read snapshot only after checkpoint_once returns.
@@ -702,12 +962,18 @@ mod tests {
         std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "0");
         std::env::set_var("KHIVE_WAL_WARN_PAGES", "0");
         std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "0");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "0");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "0");
+        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "0");
 
         let cfg = CheckpointConfig::from_env();
 
         std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
         std::env::remove_var("KHIVE_WAL_WARN_PAGES");
         std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
+        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
 
         assert_eq!(
             cfg.interval, default.interval,
@@ -720,6 +986,18 @@ mod tests {
         assert_eq!(
             cfg.high_water_pages, default.high_water_pages,
             "zero high_water_pages must fall back to default"
+        );
+        assert_eq!(
+            cfg.truncate_high_water_pages, default.truncate_high_water_pages,
+            "zero truncate_high_water_pages must fall back to default"
+        );
+        assert_eq!(
+            cfg.truncate_min_interval, default.truncate_min_interval,
+            "zero truncate_min_interval must fall back to default"
+        );
+        assert_eq!(
+            cfg.truncate_busy_timeout, default.truncate_busy_timeout,
+            "zero truncate_busy_timeout must fall back to default"
         );
     }
 
@@ -801,6 +1079,223 @@ mod tests {
         assert!(
             fired_reentry,
             "WARN must fire again on re-entry into warn band"
+        );
+    }
+
+    // ADR-091 Plank 2: TRUNCATE escalation state machine tests.
+
+    /// Trigger threshold: once `wal_pages` (as observed by `checkpoint_once`) is
+    /// at/above `truncate_high_water_pages` and no prior attempt has run, the
+    /// escalation fires and stamps `last_attempt`.
+    #[test]
+    #[serial(tx_registry)]
+    fn truncate_attempts_when_high_water_crossed_with_no_prior_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncate_trigger.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        let config = CheckpointConfig {
+            // Force the escalation to arm regardless of the tiny WAL this test
+            // actually produces — isolates the trigger-threshold behavior from
+            // needing to stuff 20,000 real WAL pages.
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::from_secs(300),
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState::default();
+
+        assert!(
+            state.last_attempt.is_none(),
+            "precondition: no attempt has run yet"
+        );
+
+        let tick = checkpoint_once(&pool, &config, &mut state);
+        assert!(matches!(tick, CheckpointTick::Observed(_)));
+        assert!(
+            state.last_attempt.is_some(),
+            "an attempt must be stamped once the high-water threshold is crossed"
+        );
+    }
+
+    /// Below-threshold skip: `wal_pages < truncate_high_water_pages` must never
+    /// stamp `last_attempt` — only an actual attempt advances it.
+    #[test]
+    #[serial(tx_registry)]
+    fn truncate_does_not_attempt_below_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncate_below_threshold.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        // Effectively unreachable threshold for this test's tiny WAL.
+        let config = CheckpointConfig {
+            truncate_high_water_pages: u64::MAX,
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState::default();
+
+        checkpoint_once(&pool, &config, &mut state);
+
+        assert!(
+            state.last_attempt.is_none(),
+            "a below-threshold tick must never stamp last_attempt"
+        );
+    }
+
+    /// Min-interval skip: once an attempt has run, a subsequent tick that is
+    /// still above threshold but within `truncate_min_interval` must skip
+    /// without re-stamping `last_attempt` (the timestamp must not move).
+    #[test]
+    #[serial(tx_registry)]
+    fn truncate_min_interval_skip_does_not_restamp_last_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncate_min_interval.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::from_secs(300),
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState::default();
+
+        checkpoint_once(&pool, &config, &mut state);
+        let first_attempt = state.last_attempt.expect("first tick must attempt");
+
+        // Second tick, immediately after: still above threshold, but the
+        // min-interval has clearly not elapsed — must skip and leave
+        // last_attempt exactly as it was.
+        checkpoint_once(&pool, &config, &mut state);
+        let second_attempt = state.last_attempt.expect("attempt timestamp must persist");
+
+        assert_eq!(
+            first_attempt, second_attempt,
+            "a tick within truncate_min_interval must not re-stamp last_attempt"
+        );
+    }
+
+    /// Busy fallback: when the writer mutex is already held, `checkpoint_once`
+    /// must return `Skipped` and never touch the TRUNCATE state at all — both
+    /// PASSIVE and any due TRUNCATE are skipped together (one writer checkout
+    /// per tick).
+    #[test]
+    #[serial(tx_registry)]
+    fn busy_writer_skips_both_passive_and_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncate_busy_skip.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        // Hold the writer mutex for the duration of the checkpoint_once call so
+        // try_writer_nowait() fails, exactly like a concurrent write in progress.
+        let _held = pool.try_writer().unwrap();
+
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState::default();
+
+        let tick = checkpoint_once(&pool, &config, &mut state);
+
+        assert_eq!(
+            tick,
+            CheckpointTick::Skipped,
+            "a busy writer must skip the tick entirely"
+        );
+        assert!(
+            state.last_attempt.is_none(),
+            "a skipped tick (writer busy) must never stamp last_attempt, \
+             even with a threshold that would otherwise arm immediately"
+        );
+    }
+
+    /// Edge-triggered escalation WARN: `note_truncate_outcome` fires exactly
+    /// once, on the third consecutive attempt that fails to clear
+    /// `warn_pages`, and does not repeat on a fourth consecutive failure. A
+    /// single attempt that clears `warn_pages` resets the counter.
+    #[test]
+    fn note_truncate_outcome_warns_once_at_third_consecutive_failure() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        let config = CheckpointConfig {
+            warn_pages: 2000,
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState::default();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Three consecutive attempts that fail to clear warn_pages.
+            note_truncate_outcome(&config, 5000, &mut state);
+            note_truncate_outcome(&config, 5000, &mut state);
+            note_truncate_outcome(&config, 5000, &mut state);
+            // A fourth consecutive failure must not re-fire the escalation.
+            note_truncate_outcome(&config, 5000, &mut state);
+        });
+
+        assert_eq!(state.consecutive_failures, 4);
+
+        let events = buffer.lock().unwrap();
+        let escalation_count = events
+            .iter()
+            .filter(|e| {
+                e.message.as_deref()
+                    == Some(
+                        "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts",
+                    )
+            })
+            .count();
+        assert_eq!(
+            escalation_count, 1,
+            "escalation WARN must fire exactly once at the 3rd consecutive failure, got: {events:?}"
+        );
+
+        // A clearing attempt resets the counter.
+        note_truncate_outcome(&config, 100, &mut state);
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an attempt that clears warn_pages must reset the consecutive-failure counter"
         );
     }
 }
