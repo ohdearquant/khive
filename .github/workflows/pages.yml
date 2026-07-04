@@ -2,9 +2,21 @@ name: pages
 
 # Builds a static docs site from docs/guide/*.md and README.md using Jekyll's
 # GitHub Pages Actions build (no bundled framework, no npm/node toolchain).
-# NOTE: GitHub Pages is not yet enabled on this repo (Settings > Pages > Build
-# and deployment > Source: GitHub Actions). This workflow will not deploy
-# anything until that source is set; see the PR that introduced this file.
+#
+# Layout: remote_theme just-the-docs (GitHub-Pages-compatible via the
+# jekyll-remote-theme gem bundled in the github-pages gem group that
+# actions/jekyll-build-pages installs) gives every page a left sidebar nav,
+# built-in search, and consistent typography. Sidebar order comes from each
+# page's `nav_order` front matter, injected below from the NAV_ORDER table.
+#
+# Agent-fetchable outputs, generated from the same docs/guide sources so
+# nothing can drift out of sync:
+#   - /llms.txt       — short project summary + linked index of every doc page
+#   - /llms-full.txt  — full concatenated markdown of every doc page
+#   - /md/<name>.md   — raw (unconverted) markdown copy of every doc page
+#
+# GitHub Pages source is set to "GitHub Actions" (Settings > Pages); this
+# workflow deploys on every push that touches docs/guide/**.
 
 on:
   push:
@@ -22,6 +34,9 @@ concurrency:
   group: "pages"
   cancel-in-progress: false
 
+env:
+  SITE_URL: "https://ohdearquant.github.io/khive"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,21 +49,52 @@ jobs:
           set -euo pipefail
           SRC=_site_src
           rm -rf "$SRC"
-          mkdir -p "$SRC"
+          mkdir -p "$SRC/md"
 
           cat > "$SRC/_config.yml" <<'EOF'
           title: khive
           description: "A typed knowledge graph runtime for AI agents, over MCP."
-          theme: jekyll-theme-minimal
+          url: "https://ohdearquant.github.io"
+          baseurl: "/khive"
+          remote_theme: just-the-docs/just-the-docs
+          plugins:
+            - jekyll-remote-theme
           markdown: kramdown
           kramdown:
             input: GFM
+          search_enabled: true
+          heading_anchors: true
+          nav_sort: case_insensitive
+          back_to_top: true
+          back_to_top_text: "Back to top"
+          footer_content: "khive is Apache-2.0 licensed. Agents: fetch <a href=\"/khive/llms.txt\">/llms.txt</a> or <a href=\"/khive/llms-full.txt\">/llms-full.txt</a> for a machine-readable index."
+          aux_links:
+            "GitHub":
+              - "https://github.com/ohdearquant/khive"
+            "crates.io":
+              - "https://crates.io/crates/khive-mcp"
+          aux_links_new_tab: true
           EOF
+
+          # basename -> "nav_order|Title|one-line description used in llms.txt"
+          # Order matches Ocean's requested sidebar: Getting Started, Knowledge
+          # Graph Modeling, Memory, Search, Tasks, Prompt Cookbook, API Reference.
+          declare -A NAV_ORDER=(
+            [getting-started]="2|Getting Started|Install, connect an MCP client, and run your first khive session."
+            [knowledge-graph]="3|Knowledge Graph Modeling|Entity kinds, edge relations, and modeling patterns for the KG substrate."
+            [memory]="4|Memory and Recall|Episodic vs semantic memory, salience, and decay-weighted recall."
+            [search]="5|Search and Retrieval|FTS5, vector search, hybrid fusion, and reranking."
+            [tasks]="6|GTD Task Management|Task lifecycle, priorities, and dependency edges."
+            [prompt-cookbook]="7|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
+            [api-reference]="8|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
+          )
 
           cat > "$SRC/index.md" <<'EOF'
           ---
-          layout: default
+          layout: home
           title: khive
+          nav_order: 1
+          description: "A research knowledge graph runtime for AI agents, over a single MCP tool."
           ---
 
           # khive
@@ -64,14 +110,22 @@ jobs:
           [GitHub](https://github.com/ohdearquant/khive) &middot;
           [License: Apache 2.0](https://github.com/ohdearquant/khive/blob/main/LICENSE)
 
+          ## For AI agents
+
+          - [`/llms.txt`](llms.txt): short project summary + a linked index of every doc page
+          - [`/llms-full.txt`](llms-full.txt): every doc page, concatenated, in one fetch
+          - [`/md/*.md`](md/getting-started.md): raw, unconverted markdown for each page (also
+            linked from the bottom of every page)
+
           ## Documentation
 
           - [Getting Started](getting-started.html): install, connect, first session
           - [Knowledge Graph Modeling](knowledge-graph.html): entity kinds, edge relations, modeling patterns
-          - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns
-          - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking
           - [Memory and Recall](memory.html): episodic vs semantic, salience, decay
+          - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking
           - [GTD Task Management](tasks.html): task lifecycle, priorities, dependencies
+          - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns
+          - [API Reference](api-reference.html): full verb catalog, params, DSL examples
 
           ## Demos
 
@@ -96,31 +150,107 @@ jobs:
           - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
           EOF
 
+          # Per-guide-page assembly: inject nav_order/title/description front matter,
+          # rewrite in-repo relative links to the site's flat .html layout (links
+          # outside docs/guide go to their GitHub blob URL; external links untouched),
+          # and drop a raw copy (no front matter, so Jekyll copies it verbatim as a
+          # static file) under $SRC/md/ for agent-fetchable raw markdown.
           for f in docs/guide/*.md; do
             base=$(basename "$f" .md)
             [ "$base" = "README" ] && continue
-            title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
+
+            entry="${NAV_ORDER[$base]:-}"
+            if [ -n "$entry" ]; then
+              nav_order="${entry%%|*}"
+              rest="${entry#*|}"
+              title="${rest%%|*}"
+              description="${rest#*|}"
+            else
+              nav_order="99"
+              title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
+              description=""
+            fi
+
             {
               echo "---"
               echo "layout: default"
               echo "title: \"${title}\""
+              echo "nav_order: ${nav_order}"
+              [ -n "$description" ] && echo "description: \"${description}\""
               echo "---"
               echo
-              # rewrite in-repo relative links to the site's flat .html layout;
-              # links that point outside docs/guide (repo-root files, ADRs) go
-              # to their GitHub blob URL instead, since they aren't part of
-              # this site. External links are left untouched.
+              echo "<!-- Raw markdown: ${SITE_URL}/md/${base}.md -->"
+              echo
               sed -E \
                 -e 's#\]\(\.\./\.\./([A-Za-z0-9_./-]+)\)#](https://github.com/ohdearquant/khive/blob/main/\1)#g' \
                 -e 's#\]\(\.\./adr/([A-Za-z0-9_./-]+)\)#](https://github.com/ohdearquant/khive/blob/main/docs/adr/\1)#g' \
                 -e 's#\]\(\.\./README\.md([^)]*)\)#](index.html\1)#g' \
                 -e 's#\]\(([A-Za-z0-9_-]+)\.md([^)]*)\)#](\1.html\2)#g' \
                 "$f"
+              echo
+              echo "---"
+              echo
+              echo "Raw markdown for this page: [/md/${base}.md](${SITE_URL}/md/${base}.md)"
             } > "$SRC/$base.md"
+
+            # Raw copy for agents — no front matter, so Jekyll treats this as a
+            # static file and serves it byte-for-byte at /md/<base>.md.
+            cp "$f" "$SRC/md/$base.md"
           done
 
+          # llms.txt — the llms.txt convention: short summary + linked index,
+          # HTML and raw-markdown URLs for every page.
+          {
+            echo "# khive"
+            echo
+            echo "> A research knowledge graph runtime for AI agents: typed entities, a closed"
+            echo "> 17-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
+            echo "> all dispatched through one MCP tool (\`request\`). 72 verbs across 8 packs."
+            echo
+            echo "## Docs"
+            echo
+            echo "- [Home](${SITE_URL}/): project overview, install, demos ([markdown](${SITE_URL}/md/index.md))"
+            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
+              entry="${NAV_ORDER[$base]}"
+              rest="${entry#*|}"
+              title="${rest%%|*}"
+              description="${rest#*|}"
+              echo "- [${title}](${SITE_URL}/${base}.html): ${description} ([markdown](${SITE_URL}/md/${base}.md))"
+            done
+            echo
+            echo "## Reference"
+            echo
+            echo "- [AGENTS.md](https://raw.githubusercontent.com/ohdearquant/khive/main/AGENTS.md): full verb reference for agents using khive"
+            echo "- [llms-full.txt](${SITE_URL}/llms-full.txt): every doc page above, concatenated into one fetch"
+          } > "$SRC/llms.txt"
+
+          # Raw markdown copy of the homepage too, matching the /md/<base>.md
+          # convention for every other page — strip the front matter block.
+          awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$SRC/index.md" > "$SRC/md/index.md"
+
+          # llms-full.txt — full concatenated markdown of every doc page.
+          {
+            echo "# khive — full documentation"
+            echo
+            echo "Concatenated from ${SITE_URL}/ and every page below. Generated from docs/guide/*.md; do not edit directly."
+            echo
+            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
+              entry="${NAV_ORDER[$base]}"
+              rest="${entry#*|}"
+              title="${rest%%|*}"
+              echo
+              echo "---"
+              echo
+              echo "## ${title}"
+              echo
+              echo "Source: ${SITE_URL}/${base}.html"
+              echo
+              cat "docs/guide/${base}.md"
+            done
+          } > "$SRC/llms-full.txt"
+
           echo "Assembled site source:"
-          ls -la "$SRC"
+          find "$SRC" -maxdepth 2 -type f | sort
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
