@@ -79,10 +79,9 @@ and MUST NOT recur.
   Started", "Knowledge Graph Modeling"), not internal component names.
 - **`NAV_ORDER` is the sidebar contract.** The `NAV_ORDER` associative array in `pages.yml` is
   the single authoritative mapping from `docs/guide/<page>.md` basename to `nav_order`, title,
-  and one-line description. A guide page added without a corresponding `NAV_ORDER` entry falls
-  through to `nav_order: 99` with a title derived from its first heading — this is a defect to
-  fix, not an acceptable steady state, since it also means the page has no curated description
-  for `llms.txt`.
+  and one-line description. A guide page added without a corresponding `NAV_ORDER` entry fails
+  the build (§7) — it is never silently assigned a fallback `nav_order` or a heading-derived
+  title, since either would also leave the page without a curated description for `llms.txt`.
 - **Built-in search stays enabled** (`search_enabled: true`) — it is the primary in-page
   navigation aid `just-the-docs` provides and must not be disabled to "simplify" the site.
 - **Homepage is overview, not marketing.** `index.md` carries: a one-paragraph project
@@ -132,6 +131,24 @@ Changes to the information architecture (§3), the color scheme (§4), or the sh
 agent-facing surface (§2 — adding, removing, or renaming one of `llms.txt` / `llm.txt` /
 `llms-full.txt` / `/md/<page>.md`) require amending this ADR. Adding a guide page under the
 existing `NAV_ORDER` scheme, or updating page content, does not.
+
+This standard is enforced at build time, not left as aspirational prose. The "Assemble
+Jekyll source" step in `pages.yml` asserts, and fails the build (`exit 1`) on violation,
+that:
+
+- Every `docs/guide/*.md` page (other than `README.md`) has a `NAV_ORDER` entry — no
+  silent fallback to `nav_order: 99` or a heading-derived title (§3).
+- Every basename produced by the guide-page loop is present in both `llms.txt` and
+  `llms-full.txt` (`grep`-checked after generation) — the regression guard for §2's "one
+  source, no drift" claim if a future change reintroduces a separately maintained page
+  list.
+- Every basename has a corresponding raw-markdown copy in the built site
+  (`_site/md/<page>.md`), checked in the post-build step against a manifest the assemble
+  step writes, covering every page rather than a fixed sample.
+
+A change to `pages.yml` that weakens or removes one of these assertions is itself a
+change to this ADR's enforcement mechanism and needs the same amendment this section
+already requires for IA, color, and agent-surface changes.
 
 ## Alternatives considered
 
