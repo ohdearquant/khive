@@ -326,12 +326,12 @@ transaction regardless of which mechanism created it:
     - **Background registry sweep (Plank 0's checkpoint tick, extended):** on each
       `run_checkpoint_task` tick, any registry entry whose `opened_at.elapsed()` exceeds
       `KHIVE_TX_MAX_AGE_SECS` is logged at `tracing::warn!` (escalating in severity the
-      longer it persists, matching Plank 2's multi-tier WARN pattern) even if the owning
-      caller never issues another statement or calls `commit()`. This does **not**
-      force-close the connection (that would require unsafe cross-thread manipulation of
-      a connection another task owns); it makes a stuck transaction visible to an
-      operator via the checkpoint tick's existing log line, which is the same mitigation
-      Plank 2 already uses for sustained TRUNCATE failure.
+      longer it persists) even if the owning caller never issues another statement or
+      calls `commit()`. This does **not** force-close the connection (that would require
+      unsafe cross-thread manipulation of a connection another task owns); it makes a
+      stuck transaction visible to an operator via the checkpoint tick's existing log
+      line, the same visibility-over-guaranteed-reclamation posture Plank 2 takes for
+      sustained TRUNCATE failure (see the severity ladder amendment below).
   - For raw `SqlWriter` sites, the same `commit()`-past-cap and background-sweep behavior
     apply at the registry level; each site's existing commit call is wrapped to check the
     registry entry's age before issuing `COMMIT` and to `ROLLBACK` instead past the cap,
@@ -385,11 +385,13 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   PASSIVE observation and any due TRUNCATE are skipped for that tick; if it succeeds, the
   tick runs PASSIVE first and then, if due, TRUNCATE under that same guard. **Accepted worst case, stated explicitly:** if the writer is continuously busy
   for the entire observation window, TRUNCATE never runs and the WAL keeps growing past
-  `truncate_high_water_pages`; the mitigation is the existing rate-limited WARN
-  escalating in severity at higher multiples of the threshold (e.g. WARN at 1x, a second
-  distinct WARN at 4x) so sustained failure to reclaim is visible to an operator rather
-  than silently absorbed, rather than promising unconditional reclamation, which would
-  require blocking writer acquisition (rejected, see original Alternatives).
+  `truncate_high_water_pages`. Visibility, not guaranteed reclamation, is the mitigation
+  (see the severity ladder below): sustained pressure surfaces via the WARN tier (a
+  drain-failure counter across N=3 consecutive checkpoint cycles at `warn_pages`, tracked
+  as khive#617 and not yet implemented) and, once `truncate_high_water_pages` is crossed,
+  the shipped ALARM/TRUNCATE-escalation tier in this plank, rather than promising
+  unconditional reclamation, which would require blocking writer acquisition (rejected,
+  see original Alternatives).
 - Observability: unchanged from the original draft (`tracing::info!` per attempt with
   before/after page counts and elapsed time; `tracing::warn!` after three consecutive
   attempts fail to clear `warn_pages`), extended per Plank 0 to also log every open entry
@@ -401,25 +403,37 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
 **Severity ladder (this corrects Plank 0's crossing-severity wording above).** Plank 0's
 description of the `warn_pages` crossing (`escalating to tracing::warn! once wal_pages
 crosses warn_pages`, matching the currently-shipped `crossing_warn` gate at
-`checkpoint.rs:277-291`) is superseded: crossing `warn_pages` (default 2000,
+`checkpoint.rs:277-294`) is superseded: crossing `warn_pages` (default 2000,
 `KHIVE_WAL_WARN_PAGES`) on its own is **INFO**, not WARN, because it is an expected,
 self-resolving event under ordinary write bursts, not an operator-actionable condition.
 The ladder is:
 
 - **INFO**: `wal_pages` crosses `warn_pages` (a single tick observation).
 - **WARN**: `wal_pages` fails to drain back below `warn_pages` across **N = 3** consecutive
-  checkpoint cycles. N is owned by lambda:khive and tunable. This tier is already shipped
-  as `note_truncate_outcome`'s escalation (`checkpoint.rs:508-528`), which fires
-  `tracing::warn!` exactly once at the third consecutive TRUNCATE attempt that fails to
-  clear `warn_pages` and resets the counter on any attempt that clears it.
-- **ALARM**: Plank 2 escalation, i.e. sustained pressure past `high_water_pages` (default
-  6000, `KHIVE_WAL_HIGH_WATER_PAGES`) driving the daemon-side TRUNCATE attempt path
-  (`checkpoint.rs:296-304`, `run_truncate_attempt`), the tier above ordinary WARN-level
-  drain failure.
+  checkpoint cycles (each cycle is one `run_checkpoint_task` tick, default 500ms via
+  `KHIVE_CHECKPOINT_INTERVAL_MS`). N is owned by lambda:khive and tunable. **This tier is
+  not yet implemented.** It is distinct from the shipped `note_truncate_outcome` escalation
+  (`checkpoint.rs:508-530`), which counts consecutive TRUNCATE _attempts_, not checkpoint
+  cycles, and only ever runs once `wal_pages` has already crossed the much higher
+  `truncate_high_water_pages` (default 20000) and `maybe_truncate` (`checkpoint.rs:428-506`)
+  has actually attempted a TRUNCATE, gated by `truncate_min_interval` (default 5 minutes).
+  Pressure that sits at, say, 3000 pages indefinitely (above `warn_pages` but far below
+  `truncate_high_water_pages`) never reaches `maybe_truncate` at all and so never fires
+  `note_truncate_outcome`. Building the ruling's WARN tier (a drain-failure counter keyed to
+  `warn_pages` and ordinary checkpoint ticks, not TRUNCATE attempts) is tracked as khive#617.
+- **ALARM**: the Plank 2 TRUNCATE-escalation tier, armed by `truncate_high_water_pages`
+  (default 20000, `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`, "a separate, much higher threshold
+  than `high_water_pages`", `checkpoint.rs:109-119`) via `maybe_truncate`
+  (`checkpoint.rs:428-506`). Crossing `high_water_pages` (default 6000,
+  `KHIVE_WAL_HIGH_WATER_PAGES`, the crossing-WARN block at `checkpoint.rs:296-304`) remains
+  a shipped intermediate log between the WARN and ALARM tiers, but it is not itself a ladder
+  tier: it neither arms nor performs any TRUNCATE attempt, and must not be conflated with the
+  `truncate_high_water_pages` crossing that actually does.
 
-Bringing the shipped `warn_pages`-crossing log call (`checkpoint.rs:288`, currently
-`tracing::warn!`) down to `tracing::info!` to match this ladder is an implementation
-follow-up tracked separately; it is out of scope for this docs-only amendment.
+Downgrading the shipped `warn_pages`-crossing log call (`checkpoint.rs:289`, currently
+`tracing::warn!`) to `tracing::info!`, and building the N=3 drain-failure WARN tier
+described above, are both tracked as khive#617; neither is implemented by this ADR's
+current code.
 
 **Units: `wal_pages` is an instantaneous frame count, not a cumulative counter.**
 `query_wal_pages` (`checkpoint.rs:545-561`) reads it from `PRAGMA wal_checkpoint`'s
@@ -434,12 +448,12 @@ Separately, the WAL file's _resting_ on-disk size is capped by the pool's
 `journal_size_limit_bytes` (`pool.rs:44-49`, default 64MiB,
 `DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 67_108_864`, overridable via
 `KHIVE_JOURNAL_SIZE_LIMIT_BYTES`, `pool.rs:85`): SQLite truncates the WAL file back down
-after a log-resetting (TRUNCATE-mode) checkpoint, which is exactly the mechanism Plank 2's
-`run_truncate_attempt` invokes. `wal_pages` and `journal_size_limit_bytes` are not the
-same quantity: one is a live frame count sampled per tick, the other is a byte ceiling
-enforced only at TRUNCATE time, and this ADR's thresholds (`warn_pages`,
-`high_water_pages`, `truncate_high_water_pages`) are all expressed in the former, page-count,
-unit.
+after a log-resetting (TRUNCATE-mode) checkpoint, which is exactly the mechanism
+`maybe_truncate` (`checkpoint.rs:428-506`) invokes. `wal_pages` and
+`journal_size_limit_bytes` are not the same quantity: one is a live frame count sampled per
+tick, the other is a byte ceiling enforced only at TRUNCATE time, and this ADR's
+thresholds (`warn_pages`, `high_water_pages`, `truncate_high_water_pages`) are all
+expressed in the former, page-count, unit.
 
 ### Config summary
 
@@ -512,8 +526,9 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   note: a skipped attempt due to writer contention does not consume the interval).
 - **Flap under sustained writer load**: per the explicit backoff statement above, if the
   writer is continuously busy, TRUNCATE never fires and WAL growth continues past
-  `truncate_high_water_pages`; accepted, escalating WARNs are the mitigation, not
-  unconditional reclamation.
+  `truncate_high_water_pages`; visibility via the severity ladder (see the 2026-07-04
+  amendment: the WARN drain-failure tier, khive#617, and the shipped ALARM/TRUNCATE tier)
+  is the accepted mitigation, not unconditional reclamation.
 - **Instrumentation overhead**: Plank 0's per-tick age check and per-attempt transaction
   enumeration are cheap (in-process counters/timestamps, no extra SQL queries beyond
   what TRUNCATE failure logging already requires) and do not change checkpoint task
@@ -544,8 +559,10 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   unchanged; TRUNCATE escalation is additive to `checkpoint.rs`, not a rewrite, with an
   explicit accepted-worst-case statement for sustained writer contention. The severity of
   the `warn_pages` crossing itself is amended (see "2026-07-04 amendment" above): crossing
-  is INFO, WARN is reserved for a 3-consecutive-cycle drain failure, and `high_water_pages`
-  driving TRUNCATE is the ALARM tier.
+  is INFO, WARN (not yet implemented, khive#617) is reserved for a 3-consecutive-cycle
+  drain failure, and `truncate_high_water_pages` arming the TRUNCATE escalation is the
+  ALARM tier. `high_water_pages` crossing remains a shipped intermediate log, not a ladder
+  tier on its own.
 - Two new config knobs for the shared transaction-registry guard (Plank 1), covering both
   `begin_tx` and raw `SqlWriter` transactions, three carried-over knobs narrowed in scope,
   three for TRUNCATE escalation (Plank 2); the two new keys are explicitly marked
