@@ -731,7 +731,16 @@ mod tests {
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers an entry with the
     /// shared open-transaction registry for the duration of the closure, and
     /// deregisters it once the closure (and its commit/rollback) completes.
+    ///
+    /// `#[serial(tx_registry)]`: the open-transaction registry is a
+    /// process-wide singleton (`khive_storage::tx_registry`) shared across
+    /// every test in this binary. This test filters by its own unique label
+    /// so it is not vulnerable to another test's entry being reported as
+    /// "oldest", but it still shares the same `tx_registry` serial group as
+    /// `checkpoint.rs`'s and `sql_bridge.rs`'s registry tests for
+    /// defense-in-depth against cross-test interference.
     #[test]
+    #[serial(tx_registry)]
     fn writer_guard_transaction_registers_during_closure_only() {
         let cfg = PoolConfig {
             path: None,

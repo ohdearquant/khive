@@ -34,28 +34,43 @@ pub struct TxHandle {
 
 impl Drop for TxHandle {
     fn drop(&mut self) {
-        if let Ok(mut registry) = REGISTRY.lock() {
-            registry.remove(&self.id);
-        }
+        let mut registry = REGISTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.remove(&self.id);
     }
 }
 
 /// Register a new open transaction span with an optional diagnostic label.
+///
+/// This is observe-only telemetry: a poisoned lock (some other holder panicked
+/// mid-critical-section) must not make the registry silently stop tracking new
+/// spans, or a subsequent WAL-pressure diagnosis could read a false "no open
+/// transactions" signal. Recovers via `into_inner()` rather than the previous
+/// `if let Ok(..)` pattern, which dropped the write on poison.
 pub fn register(label: Option<String>) -> TxHandle {
     let id = TxId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let meta = TxMeta {
         opened_at: Instant::now(),
         label,
     };
-    if let Ok(mut registry) = REGISTRY.lock() {
-        registry.insert(id, meta);
-    }
+    let mut registry = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.insert(id, meta);
+    drop(registry);
     TxHandle { id }
 }
 
 /// Age and label of the oldest currently-open registry entry, if any.
+///
+/// Recovers a poisoned lock via `into_inner()` (see [`register`]) instead of
+/// returning `None`, which would otherwise read identically to "no open
+/// transactions" — indistinguishable from the genuinely-empty case.
 pub fn oldest() -> Option<(Duration, Option<String>)> {
-    let registry = REGISTRY.lock().ok()?;
+    let registry = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry
         .values()
         .min_by_key(|meta| meta.opened_at)
@@ -63,10 +78,14 @@ pub fn oldest() -> Option<(Duration, Option<String>)> {
 }
 
 /// Age and label of every currently-open registry entry.
+///
+/// Recovers a poisoned lock via `into_inner()` (see [`register`]) instead of
+/// returning an empty `Vec`, which would otherwise read identically to "no
+/// open transactions" during the one moment this diagnostic matters most.
 pub fn snapshot() -> Vec<(Duration, Option<String>)> {
-    let Ok(registry) = REGISTRY.lock() else {
-        return Vec::new();
-    };
+    let registry = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry
         .values()
         .map(|meta| (meta.opened_at.elapsed(), meta.label.clone()))

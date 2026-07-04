@@ -23,7 +23,12 @@
 //! Threshold-crossing WARN semantics: both the `warn_pages` and `high_water_pages`
 //! warnings fire at most once per below→above crossing. Skipped ticks (writer
 //! busy) leave the crossing state unchanged so that a skip cannot spuriously
-//! re-arm the rate limit while WAL pressure is still elevated.
+//! re-arm the rate limit while WAL pressure is still elevated. The ADR-091
+//! Plank 0 open-transaction-registry WARNs (oldest-entry escalation and the
+//! high-water snapshot enumeration) ride the SAME crossing gates — they are
+//! not independently rate-limited, so they never repeat on consecutive ticks
+//! that remain above a threshold. Only the per-tick `debug!` trace of the
+//! oldest open entry fires unconditionally.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,12 +166,18 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             CheckpointTick::Observed(n) => n,
         };
 
-        let in_warn_band = wal_pages >= config.warn_pages && wal_pages < config.high_water_pages;
+        let above_warn = wal_pages >= config.warn_pages;
         let above_high_water = wal_pages >= config.high_water_pages;
 
-        log_tx_registry_pressure(wal_pages, config.warn_pages, config.high_water_pages);
+        // Per-tick debug for the oldest open entry always fires (cheap, single
+        // `oldest()` lookup); the two `warn!`-level registry logs below are
+        // gated on the SAME crossing state as the WAL-threshold WARNs above,
+        // so sustained pressure logs once per crossing, not once per tick.
+        log_tx_registry_oldest_debug(wal_pages);
 
-        if crossing_warn(in_warn_band, &mut was_above_warn) {
+        let warn_crossed = crossing_warn(above_warn, &mut was_above_warn);
+        if warn_crossed {
+            log_tx_registry_oldest_warn(wal_pages);
             tracing::warn!(
                 wal_pages,
                 warn_threshold = config.warn_pages,
@@ -174,7 +185,9 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
             );
         }
 
-        if crossing_warn(above_high_water, &mut was_above_high_water) {
+        let high_water_crossed = crossing_warn(above_high_water, &mut was_above_high_water);
+        if high_water_crossed {
+            log_tx_registry_snapshot_warn(wal_pages);
             tracing::warn!(
                 wal_pages,
                 high_water = config.high_water_pages,
@@ -186,24 +199,15 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
 }
 
 /// ADR-091 Plank 0: log the oldest open transaction registry entry alongside
-/// the WAL frame count on every tick (`debug!` normally, escalating to
-/// `warn!` once `wal_pages` crosses `warn_pages`), and, once `wal_pages`
-/// reaches `high_water_pages`, enumerate every open registry entry at `warn!`
-/// — the "which caller is holding the pin" answer this ADR's static reading
-/// could not produce. Observe only: this never enforces or force-closes
-/// anything.
-fn log_tx_registry_pressure(wal_pages: u64, warn_pages: u64, high_water_pages: u64) {
-    let oldest = khive_storage::tx_registry::oldest();
-    if wal_pages >= warn_pages {
-        if let Some((age, label)) = &oldest {
-            tracing::warn!(
-                wal_pages,
-                oldest_tx_age_secs = age.as_secs_f64(),
-                oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
-                "WAL checkpoint tick: oldest open transaction registry entry"
-            );
-        }
-    } else if let Some((age, label)) = &oldest {
+/// the WAL frame count at `debug!`, on EVERY tick regardless of threshold
+/// state. This is the low-volume per-tick trace; the WARN-level escalations
+/// live in [`log_tx_registry_oldest_warn`] and
+/// [`log_tx_registry_snapshot_warn`], both of which are gated on threshold
+/// *crossing* by the caller (`run_checkpoint_task`) so they fire once per
+/// crossing rather than once per tick. Observe only: this never enforces or
+/// force-closes anything.
+fn log_tx_registry_oldest_debug(wal_pages: u64) {
+    if let Some((age, label)) = khive_storage::tx_registry::oldest() {
         tracing::debug!(
             wal_pages,
             oldest_tx_age_secs = age.as_secs_f64(),
@@ -211,19 +215,40 @@ fn log_tx_registry_pressure(wal_pages: u64, warn_pages: u64, high_water_pages: u
             "WAL checkpoint tick: oldest open transaction registry entry"
         );
     }
+}
 
-    if wal_pages >= high_water_pages {
-        // This is the load-bearing deliverable — enumerate every open registry
-        // entry so an operator can see which caller(s), if any, are pinning
-        // the WAL tail during sustained pressure.
-        for (age, label) in khive_storage::tx_registry::snapshot() {
-            tracing::warn!(
-                wal_pages,
-                tx_age_secs = age.as_secs_f64(),
-                tx_label = label.as_deref().unwrap_or("<unlabeled>"),
-                "WAL high-water: open transaction registry entry"
-            );
-        }
+/// ADR-091 Plank 0: escalate the oldest open registry entry to `warn!`.
+///
+/// Callers MUST gate this on a below→above `warn_pages` crossing (via
+/// `crossing_warn`) — it is not rate-limited internally, so calling it every
+/// tick would reproduce the log-spam bug this rewrite fixes.
+fn log_tx_registry_oldest_warn(wal_pages: u64) {
+    if let Some((age, label)) = khive_storage::tx_registry::oldest() {
+        tracing::warn!(
+            wal_pages,
+            oldest_tx_age_secs = age.as_secs_f64(),
+            oldest_tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+            "WAL checkpoint tick: oldest open transaction registry entry"
+        );
+    }
+}
+
+/// ADR-091 Plank 0: enumerate every open registry entry at `warn!` — the
+/// "which caller is holding the pin" answer this ADR's static reading could
+/// not produce.
+///
+/// Callers MUST gate this on a below→above `high_water_pages` crossing (via
+/// `crossing_warn`) — it is not rate-limited internally, so calling it every
+/// tick would repeat the full snapshot enumeration every tick under
+/// sustained pressure.
+fn log_tx_registry_snapshot_warn(wal_pages: u64) {
+    for (age, label) in khive_storage::tx_registry::snapshot() {
+        tracing::warn!(
+            wal_pages,
+            tx_age_secs = age.as_secs_f64(),
+            tx_label = label.as_deref().unwrap_or("<unlabeled>"),
+            "WAL high-water: open transaction registry entry"
+        );
     }
 }
 
@@ -301,6 +326,7 @@ mod tests {
     struct CapturedEvent {
         message: Option<String>,
         oldest_tx_label: Option<String>,
+        tx_label: Option<String>,
     }
 
     #[derive(Default)]
@@ -311,6 +337,7 @@ mod tests {
             match field.name() {
                 "message" => self.0.message = Some(value.to_string()),
                 "oldest_tx_label" => self.0.oldest_tx_label = Some(value.to_string()),
+                "tx_label" => self.0.tx_label = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -324,6 +351,7 @@ mod tests {
             match field.name() {
                 "message" => self.0.message = Some(cleaned),
                 "oldest_tx_label" => self.0.oldest_tx_label = Some(cleaned),
+                "tx_label" => self.0.tx_label = Some(cleaned),
                 _ => {}
             }
         }
@@ -355,11 +383,29 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// ADR-091 Plank 0: `log_tx_registry_pressure` emits a debug-level log
-    /// naming the oldest open registry entry's label when WAL pressure is
-    /// below `warn_pages`, and escalates to warn-level once at/above it.
+    /// ADR-091 Plank 0: `log_tx_registry_oldest_debug` emits a debug-level log
+    /// naming the oldest open registry entry's label, on every call.
+    ///
+    /// `#[serial(tx_registry)]`: the registry is a process-wide singleton
+    /// shared across every test in this binary — see `pool.rs`'s and
+    /// `sql_bridge.rs`'s registry tests, which share this same serial group
+    /// (round-1 fix: these three were previously unserialized and could
+    /// race, corrupting each other's `oldest()`/`snapshot()` reads).
+    ///
+    /// This test does NOT hardcode "checkpoint_tick_test" as the expected
+    /// label: production write paths elsewhere in this same test binary
+    /// (vectors/graph/text stores) also register short-lived registry
+    /// entries while their own tests run, and `serial(tx_registry)` only
+    /// serializes against the OTHER tests in that same group, not against
+    /// every write path in the crate. Instead it samples `oldest()` itself
+    /// immediately before invoking the function under test and asserts the
+    /// logged label matches whatever the registry considers oldest at that
+    /// instant — deterministic regardless of unrelated concurrent registry
+    /// churn, while still verifying `log_tx_registry_oldest_debug` correctly
+    /// surfaces the registry's own `oldest()` answer.
     #[test]
-    fn log_tx_registry_pressure_reports_oldest_open_entry() {
+    #[serial(tx_registry)]
+    fn log_tx_registry_oldest_debug_reports_oldest_open_entry() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
             events: std::sync::Arc::clone(&buffer),
@@ -368,8 +414,12 @@ mod tests {
         let _handle =
             khive_storage::tx_registry::register(Some("checkpoint_tick_test".to_string()));
 
+        let expected_label = khive_storage::tx_registry::oldest()
+            .and_then(|(_, label)| label)
+            .unwrap_or_else(|| "<unlabeled>".to_string());
+
         tracing::subscriber::with_default(subscriber, || {
-            log_tx_registry_pressure(100, 2000, 6000);
+            log_tx_registry_oldest_debug(100);
         });
 
         let events = buffer.lock().unwrap();
@@ -377,9 +427,82 @@ mod tests {
             events.iter().any(|e| {
                 e.message.as_deref()
                     == Some("WAL checkpoint tick: oldest open transaction registry entry")
-                    && e.oldest_tx_label.as_deref() == Some("checkpoint_tick_test")
+                    && e.oldest_tx_label.as_deref() == Some(expected_label.as_str())
             }),
             "expected a log line naming the open registry entry's label, got: {events:?}"
+        );
+    }
+
+    /// ADR-091 Plank 0 (round-1 fix): the oldest-entry WARN and the
+    /// high-water snapshot-enumeration WARN are gated by `crossing_warn` at
+    /// the call site (mirroring the WAL-threshold WARNs), so driving two
+    /// consecutive above-threshold ticks through that same gate must produce
+    /// exactly one of each — never a repeat on the second tick.
+    #[test]
+    #[serial(tx_registry)]
+    fn registry_warns_fire_on_crossing_and_do_not_repeat() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        let _handle =
+            khive_storage::tx_registry::register(Some("registry_warn_crossing_test".to_string()));
+
+        let mut was_above_warn = false;
+        let mut was_above_high_water = false;
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Tick 1: below→above crossing for both bands — both WARNs fire.
+            if crossing_warn(true, &mut was_above_warn) {
+                log_tx_registry_oldest_warn(6000);
+            }
+            if crossing_warn(true, &mut was_above_high_water) {
+                log_tx_registry_snapshot_warn(6000);
+            }
+
+            // Tick 2: still above both thresholds — neither must repeat.
+            if crossing_warn(true, &mut was_above_warn) {
+                log_tx_registry_oldest_warn(6000);
+            }
+            if crossing_warn(true, &mut was_above_high_water) {
+                log_tx_registry_snapshot_warn(6000);
+            }
+        });
+
+        let events = buffer.lock().unwrap();
+
+        // `tracing::subscriber::with_default` scopes capture to THIS thread for
+        // the duration of the closure, so `events` contains only the two
+        // `log_tx_registry_oldest_warn` calls made above — no concurrent test's
+        // log calls land in this buffer. This lets the crossing/no-repeat
+        // assertion match on message text alone: unlike the "names MY label"
+        // assertion in the sibling test above, WHICH label `oldest()` reports
+        // is irrelevant here (a concurrent write path elsewhere in the binary
+        // may transiently be the registry's genuine oldest entry) — only the
+        // fire-once-per-crossing COUNT is under test.
+        let oldest_warn_count = events
+            .iter()
+            .filter(|e| {
+                e.message.as_deref()
+                    == Some("WAL checkpoint tick: oldest open transaction registry entry")
+            })
+            .count();
+        assert_eq!(
+            oldest_warn_count, 1,
+            "oldest-entry WARN must fire exactly once across two above-threshold ticks, got: {events:?}"
+        );
+
+        let snapshot_warn_count = events
+            .iter()
+            .filter(|e| {
+                e.message.as_deref() == Some("WAL high-water: open transaction registry entry")
+                    && e.tx_label.as_deref() == Some("registry_warn_crossing_test")
+            })
+            .count();
+        assert_eq!(
+            snapshot_warn_count, 1,
+            "high-water snapshot WARN must fire exactly once across two above-threshold ticks, got: {events:?}"
         );
     }
 
