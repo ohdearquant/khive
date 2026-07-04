@@ -565,15 +565,57 @@ pub async fn serve_server(
 ///
 /// This is a refactor-extraction of the registry-building logic from
 /// `build_server_multi_backend`, keeping the existing tests intact.
+///
+/// `cli_db_override` is the raw, pre-resolution `--db` / `KHIVE_DB` value (issue
+/// #553). `[[backends]]` in `khive.toml` otherwise wins unconditionally, so an
+/// operator's `--db :memory:` isolation request was silently discarded whenever
+/// any backend was declared. `Some(":memory:")` forces every declared backend to
+/// in-memory for this invocation (loudly logged); any other concrete path is
+/// rejected rather than silently collapsing distinct declared backends onto one
+/// caller-supplied file.
 pub fn build_registry_for_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    let backend_count = khive_cfg.backends.len();
+    let force_memory = match cli_db_override {
+        Some(":memory:") => {
+            tracing::warn!(
+                "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
+                 configured [[backends]] entries to in-memory storage for this invocation; \
+                 khive.toml's declared backend paths will not be used this run"
+            );
+            true
+        }
+        Some(other) => {
+            anyhow::bail!(
+                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
+                 {backend_count} backend(s) are already declared in khive.toml, so applying \
+                 this override here is ambiguous (it could silently collapse distinct \
+                 declared backends onto a single file). Edit khive.toml directly to change \
+                 backend paths, or pass --db :memory: to force all backends in-memory for \
+                 this invocation."
+            );
+        }
+        None => false,
+    };
+
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8).
     let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
     let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
     for backend_cfg in &khive_cfg.backends {
+        let owned_cfg = if force_memory {
+            BackendConfig {
+                kind: BackendKind::Memory,
+                path: None,
+                ..backend_cfg.clone()
+            }
+        } else {
+            backend_cfg.clone()
+        };
+        let backend_cfg = &owned_cfg;
         let canonical = canonical_backend_path(backend_cfg)?;
         if let Some(ref canon) = canonical {
             if let Some(existing) = path_to_backend.get(canon) {
@@ -848,7 +890,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     }
 
     // Multi-backend path (ADR-028).
-    build_server_multi_backend(config, &khive_cfg)
+    build_server_multi_backend(config, &khive_cfg, args.db.as_deref())
 }
 
 /// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
@@ -893,16 +935,58 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
 /// Open backends, run migrations, build per-pack runtimes, register packs.
 ///
 /// Called only when `[[backends]]` is non-empty in `khive.toml`.
+///
+/// `cli_db_override` is the raw, pre-resolution `--db` / `KHIVE_DB` value (issue
+/// #553). `[[backends]]` in `khive.toml` otherwise wins unconditionally, so an
+/// operator's `--db :memory:` isolation request was silently discarded whenever
+/// any backend was declared. `Some(":memory:")` forces every declared backend to
+/// in-memory for this invocation (loudly logged); any other concrete path is
+/// rejected rather than silently collapsing distinct declared backends onto one
+/// caller-supplied file.
 fn build_server_multi_backend(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    let backend_count = khive_cfg.backends.len();
+    let force_memory = match cli_db_override {
+        Some(":memory:") => {
+            tracing::warn!(
+                "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
+                 configured [[backends]] entries to in-memory storage for this invocation; \
+                 khive.toml's declared backend paths will not be used this run"
+            );
+            true
+        }
+        Some(other) => {
+            anyhow::bail!(
+                "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
+                 {backend_count} backend(s) are already declared in khive.toml, so applying \
+                 this override here is ambiguous (it could silently collapse distinct \
+                 declared backends onto a single file). Edit khive.toml directly to change \
+                 backend paths, or pass --db :memory: to force all backends in-memory for \
+                 this invocation."
+            );
+        }
+        None => false,
+    };
+
     // Open and migrate each declared backend, deduplicating SQLite backends by
     // canonical path (ADR-028 §8). Two [[backends]] entries that canonicalize to
     // the same file share one Arc<StorageBackend> and run migrations once.
     let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
     let mut path_to_backend: HashMap<PathBuf, Arc<StorageBackend>> = HashMap::new();
     for backend_cfg in &khive_cfg.backends {
+        let owned_cfg = if force_memory {
+            BackendConfig {
+                kind: BackendKind::Memory,
+                path: None,
+                ..backend_cfg.clone()
+            }
+        } else {
+            backend_cfg.clone()
+        };
+        let backend_cfg = &owned_cfg;
         let canonical = canonical_backend_path(backend_cfg)?;
         // Check for an already-opened backend with the same canonical path.
         if let Some(ref canon) = canonical {
@@ -1692,7 +1776,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let server = build_server_multi_backend(base_cfg, &khive_cfg)
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend boot must succeed");
 
         // kg round-trip: create an entity on the main backend.
@@ -1787,7 +1871,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg)
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend registry must boot");
 
         let comm_rt = result
@@ -1812,6 +1896,135 @@ brain_profile = "project-profile"
              core().backend_id() returned {:?} — build_pack_runtime wiring missing",
             comm_rt.core().backend_id().as_str()
         );
+    }
+
+    /// Issue #553: `--db :memory:` (or `KHIVE_DB=:memory:`) must not be silently
+    /// ignored just because `[[backends]]` declares real sqlite backends. Passing
+    /// `Some(":memory:")` as `cli_db_override` must force every declared backend
+    /// in-memory for this invocation, and the declared sqlite paths must never be
+    /// created on disk.
+    #[test]
+    fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main_should_never_be_created.db");
+        let secondary_path = dir.path().join("secondary_should_never_be_created.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(":memory:"));
+        if let Err(ref e) = result {
+            panic!(
+                "--db :memory: override must force both declared sqlite backends \
+                 in-memory and boot successfully; got: {e}"
+            );
+        }
+
+        assert!(
+            !main_path.exists(),
+            "main backend's declared sqlite path must never be created on disk when \
+             --db :memory: overrides it; found file at {main_path:?}"
+        );
+        assert!(
+            !secondary_path.exists(),
+            "secondary backend's declared sqlite path must never be created on disk \
+             when --db :memory: overrides it; found file at {secondary_path:?}"
+        );
+    }
+
+    /// Issue #553: a concrete `--db` path override combined with declared
+    /// `[[backends]]` is ambiguous (which of N declared backends should it apply
+    /// to?) and must fail loud, pointing at khive.toml as the place to make the
+    /// change, rather than silently collapsing distinct backends onto one path.
+    #[test]
+    fn concrete_db_override_with_backends_declared_is_rejected() {
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_registry_for_multi_backend(
+            base_cfg,
+            &khive_cfg,
+            Some("/tmp/some-explicit-override.db"),
+        );
+        assert!(
+            result.is_err(),
+            "a concrete --db path override combined with declared [[backends]] must \
+             be rejected as ambiguous"
+        );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("khive.toml"),
+                "error message must point at khive.toml as where to make the change \
+                 instead; got: {msg}"
+            );
+        }
     }
 
     /// Regression for B-BLOCKER-1 (HC-7 critic): the multi-backend boot path
@@ -1865,7 +2078,7 @@ brain_profile = "project-profile"
             ..base_runtime_config_for_multi_backend()
         };
 
-        let server = build_server_multi_backend(base_cfg, &khive_cfg)
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend boot must succeed");
 
         let dispatch = |ops: String| {
@@ -1934,7 +2147,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let result = build_server_multi_backend(base_cfg, &khive_cfg);
+        let result = build_server_multi_backend(base_cfg, &khive_cfg, None);
         assert!(
             result.is_err(),
             "missing main backend must produce an error"
@@ -2024,10 +2237,147 @@ brain_profile = "project-profile"
         let base_cfg = base_runtime_config_for_multi_backend();
 
         // Must boot successfully (dedup prevents double-migration / SQLITE_BUSY).
-        let result = build_server_multi_backend(base_cfg, &khive_cfg);
+        let result = build_server_multi_backend(base_cfg, &khive_cfg, None);
         if let Err(ref e) = result {
             panic!(
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
+            );
+        }
+    }
+
+    /// Issue #553 sibling gap: `build_server_multi_backend` is reachable from
+    /// `build_server` -> `main.rs` whenever `[[backends]]` is non-empty (e.g.
+    /// exactly one declared backend, which still routes through `build_server`'s
+    /// "single-backend, zero-change path" in main.rs since that dispatch only
+    /// checks `backends.len() <= 1`, while `build_server` itself checks
+    /// `is_empty()`). Before this fix, `build_server_multi_backend` took no
+    /// db-override parameter at all, so `--db :memory:` / `KHIVE_DB=:memory:`
+    /// was silently discarded on this path exactly as issue #553 described.
+    /// Passing `Some(":memory:")` as `cli_db_override` must force every
+    /// declared backend in-memory for this invocation, and the declared sqlite
+    /// paths must never be created on disk.
+    #[test]
+    fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file_via_build_server_multi_backend(
+    ) {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main_should_never_be_created.db");
+        let secondary_path = dir.path().join("secondary_should_never_be_created.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_server_multi_backend(base_cfg, &khive_cfg, Some(":memory:"));
+        if let Err(ref e) = result {
+            panic!(
+                "--db :memory: override must force both declared sqlite backends \
+                 in-memory and boot successfully; got: {e}"
+            );
+        }
+
+        assert!(
+            !main_path.exists(),
+            "main backend's declared sqlite path must never be created on disk when \
+             --db :memory: overrides it; found file at {main_path:?}"
+        );
+        assert!(
+            !secondary_path.exists(),
+            "secondary backend's declared sqlite path must never be created on disk \
+             when --db :memory: overrides it; found file at {secondary_path:?}"
+        );
+    }
+
+    /// Issue #553 sibling gap: a concrete `--db` path override combined with
+    /// declared `[[backends]]` is ambiguous (which of N declared backends
+    /// should it apply to?) and must fail loud on the `build_server_multi_backend`
+    /// path too, pointing at khive.toml as the place to make the change, rather
+    /// than silently collapsing distinct backends onto one path.
+    #[test]
+    fn concrete_db_override_with_backends_declared_is_rejected_via_build_server_multi_backend() {
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let result = build_server_multi_backend(
+            base_cfg,
+            &khive_cfg,
+            Some("/tmp/some-explicit-override.db"),
+        );
+        assert!(
+            result.is_err(),
+            "a concrete --db path override combined with declared [[backends]] must \
+             be rejected as ambiguous"
+        );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("khive.toml"),
+                "error message must point at khive.toml as where to make the change \
+                 instead; got: {msg}"
             );
         }
     }
@@ -2172,7 +2522,7 @@ brain_profile = "project-profile"
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
-        let server = build_server_multi_backend(base_cfg, &khive_cfg)
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
             .expect("multi-backend boot must succeed");
 
         let dispatch = |ops: String| {
