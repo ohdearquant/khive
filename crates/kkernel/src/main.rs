@@ -615,6 +615,7 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // A schema check must be read-only: it must not create a missing database,
@@ -774,6 +775,65 @@ mod tests {
         assert!(
             !plain_surface.has_checkpoint_pool,
             "in-memory main must never carry a checkpoint pool on either path"
+        );
+    }
+
+    /// Codex round 1 (#613) finding: the two sibling tests above never configure
+    /// a non-default output format, so `output_format` parity was vacuous —
+    /// both paths landing on the built-in `Json` default would pass even if one
+    /// path silently dropped `apply_env_output_format(khive_cfg.runtime.default_output_format)`
+    /// (the exact ADR-078 regression class this consolidation exists to prevent).
+    ///
+    /// This case sets `[runtime].default_output_format = Table` (a non-default
+    /// value, `khive_runtime::engine_config::RuntimeSectionConfig::default_output_format`)
+    /// in the SAME `KhiveConfig` both constructors consume, then asserts not just
+    /// that the two surfaces match but that the captured format equals the
+    /// configured non-default value — the explicit expected-value check is what
+    /// makes the assertion non-vacuous. `KHIVE_OUTPUT_FORMAT` is cleared and
+    /// restored around the test (`#[serial]`) so an ambient env var can never
+    /// mask a regression in the TOML-default resolution tier.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_paths_share_identical_non_default_output_format() {
+        let prev_env = std::env::var("KHIVE_OUTPUT_FORMAT").ok();
+        std::env::remove_var("KHIVE_OUTPUT_FORMAT");
+
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.runtime.default_output_format = Some(khive_runtime::OutputFormat::Table);
+
+        let plain_server = khive_mcp::serve::build_server_multi_backend(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("plain multi-backend boot must succeed");
+
+        let coordinator_server = build_multi_backend_server_with_coordinator(
+            base_multi_backend_runtime_config(),
+            &khive_cfg,
+            None,
+        )
+        .expect("kkernel coordinator-attached multi-backend boot must succeed");
+
+        let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
+        let coordinator_surface = khive_mcp::serve::WiringSurface::capture(&coordinator_server);
+
+        match prev_env {
+            Some(v) => std::env::set_var("KHIVE_OUTPUT_FORMAT", v),
+            None => std::env::remove_var("KHIVE_OUTPUT_FORMAT"),
+        }
+
+        assert_eq!(
+            plain_surface, coordinator_surface,
+            "the plain multi-backend boot path and kkernel's coordinator-attached \
+             boot path must produce an identical wiring surface for the same config"
+        );
+        assert_eq!(
+            plain_surface.output_format,
+            khive_runtime::OutputFormat::Table,
+            "both paths must resolve the configured non-default [runtime].default_output_format \
+             (Table), not silently fall back to the builtin Json default — this is the exact \
+             ADR-078 regression class the parity test exists to catch"
         );
     }
 }
