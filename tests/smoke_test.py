@@ -197,18 +197,20 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 8 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session), so verbs() returns exactly 73 user-facing
+        # knowledge, session), so verbs() returns exactly 74 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083; brain.register_adapter (#354) and
-        # context (ADR-089, the 17th kg-substrate bare verb) are included in
-        # the count. Update this number when the pack set or verb surface
-        # changes; a silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 73, (
-            f"expected 73 user-facing verbs from the 8 default packs "
+        # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
+        # (ADR-089, the 17th kg-substrate bare verb), and comm.health (#606,
+        # verified live 2026-07-04) are included in the count. Update this
+        # number when the pack set or verb surface changes; a silent drift
+        # here is the bug this assertion exists to catch.
+        assert verbs_result["total"] == 74, (
+            f"expected 74 user-facing verbs from the 8 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089), "
+            f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
+            f"comm.health is #606), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -222,7 +224,7 @@ def main():
         # pack= filter: handler_defs.rs:729 applies pack_name.eq_ignore_ascii_case(pk);
         # each returned entry carries its "pack" field (handler_defs.rs:736).
         # Assertions must be non-vacuous: a pack=kg filter that was ignored would
-        # return the full 67-verb list, so we verify the filter returns only kg verbs.
+        # return the full 74-verb list, so we verify the filter returns only kg verbs.
         kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})
         assert len(kg_verbs["verbs"]) > 0, f"kg pack filter must return a nonempty list: {kg_verbs}"
         assert kg_verbs["total"] == len(kg_verbs["verbs"]), (
