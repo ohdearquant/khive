@@ -290,6 +290,66 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     }
 }
 
+// ── tracked background tasks ─────────────────────────────────────────────────
+//
+// Pack handlers (e.g. memory.recall's ADR-081 §5 serve-ledger append) fire
+// fire-and-forget `tokio::spawn`ed work off the response path so the caller
+// never waits on a cross-pack dispatch or a SQL write. Left untracked, that
+// work is invisible to `drain()`: a SIGTERM landing between the response
+// returning and the spawned task completing can abort it mid-flight with no
+// log and no row (codex PR #583 round-1 Medium). `track_background_task`
+// gives such spawns a process-wide presence that `drain()` waits on, exactly
+// like the `active` counter does for in-flight connections — the caller still
+// only pays for the spawn + counter increment, never the task's own work.
+static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
+    std::sync::OnceLock::new();
+
+fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
+    BACKGROUND_TASKS.get_or_init(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+}
+
+/// Decrements the shared background-task counter from `Drop`, so the count
+/// comes back down whether the tracked future returns normally, panics, or
+/// is cancelled — a plain post-`await` `fetch_sub` only covers the return
+/// path and leaks the count forever on a panic (codex PR #583 round-2
+/// Medium), since unwinding skips every statement after the panic point.
+struct BackgroundTaskGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for BackgroundTaskGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Spawn a fire-and-forget background task that daemon shutdown's `drain()`
+/// waits for, instead of a bare `tokio::spawn` that a SIGTERM can abort
+/// mid-flight with no trace. Only the enqueue (an atomic increment) is
+/// synchronous on the caller's path — the future itself still runs fully
+/// off-path, unawaited. The decrement happens via `BackgroundTaskGuard`'s
+/// `Drop`, so a panic inside `fut` still restores the count.
+pub fn track_background_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    background_tasks().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = BackgroundTaskGuard {
+        counter: background_tasks().clone(),
+    };
+    tokio::spawn(async move {
+        let _guard = guard;
+        fut.await;
+    });
+}
+
+/// Current count of in-flight tasks started via [`track_background_task`].
+/// Exposed for tests; `drain()` reads the shared counter directly.
+pub fn background_task_count() -> usize {
+    background_tasks().load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ── server ────────────────────────────────────────────────────────────────────
 
 async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
@@ -598,14 +658,16 @@ fn write_pid_file(pid_file: &std::path::Path) -> std::io::Result<()> {
 
 async fn drain(active: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
-    if active.load(Ordering::Relaxed) == 0 {
+    let remaining = || active.load(Ordering::Relaxed) + background_task_count();
+    if remaining() == 0 {
         return;
     }
     let deadline = tokio::time::Instant::now() + drain_timeout();
-    while active.load(Ordering::Relaxed) > 0 {
+    while remaining() > 0 {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                remaining = active.load(Ordering::Relaxed),
+                remaining_connections = active.load(Ordering::Relaxed),
+                remaining_background_tasks = background_task_count(),
                 "drain timeout reached; forcing shutdown"
             );
             break;
@@ -635,6 +697,7 @@ pub fn env_truthy(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Focused regression tests for the unsafe process probe (SAFETY: signal 0
     // is an existence check with no side effects; see is_process_running).
@@ -683,5 +746,115 @@ mod tests {
         std::env::set_var(key, "0");
         assert!(!env_truthy(key));
         std::env::remove_var(key);
+    }
+
+    // codex PR #583 round-1 Medium: `drain()` must wait for tracked background
+    // tasks (e.g. memory.recall's serve-ledger append), not just in-flight
+    // connections, or a SIGTERM lands mid-flight with no log and no row.
+    //
+    // `#[serial(background_tasks)]`: this test reads/asserts on the
+    // process-wide `BACKGROUND_TASKS` static shared with the two counter
+    // tests below. Under default parallel execution one test's increment
+    // leaks into another's snapshot-then-assert window (codex PR #583
+    // round-3 Medium, reproduced: both counter tests failed together,
+    // passed with `--test-threads=1`). Serializing just this named group
+    // isolates them from each other without forcing the whole test binary
+    // (including unrelated `#[serial]` tests elsewhere in this crate) onto
+    // one thread.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn drain_waits_for_tracked_background_tasks_before_returning() {
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        track_background_task(async move {
+            let _ = rx.await;
+        });
+        assert!(
+            background_task_count() >= 1,
+            "track_background_task must make the in-flight task visible immediately"
+        );
+
+        let drain_fut = drain(&active);
+        tokio::pin!(drain_fut);
+
+        // Must NOT resolve while the tracked task is still pending.
+        let too_early =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut drain_fut).await;
+        assert!(
+            too_early.is_err(),
+            "drain() must not return while a tracked background task is still running"
+        );
+
+        // Completing the task must let drain() proceed promptly.
+        tx.send(())
+            .expect("tracked task still awaiting the oneshot");
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), drain_fut).await;
+        assert!(
+            done.is_ok(),
+            "drain() must return once the tracked background task finishes"
+        );
+    }
+
+    // See the `#[serial(background_tasks)]` note on
+    // `drain_waits_for_tracked_background_tasks_before_returning` above —
+    // this test shares the same process-wide `BACKGROUND_TASKS` static and
+    // races it (and the panic test below) under default parallelism.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn track_background_task_count_returns_to_zero_after_completion() {
+        // Sanity check on the counter's own bookkeeping, independent of drain().
+        let before = background_task_count();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_background_task(async move {
+            let _ = rx.await;
+        });
+        assert_eq!(background_task_count(), before + 1);
+        tx.send(()).expect("still awaiting");
+        // Yield until the spawned task's decrement has actually run.
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(background_task_count(), before);
+    }
+
+    // See the `#[serial(background_tasks)]` note above — shares
+    // `BACKGROUND_TASKS` with the other two tests in this group.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn track_background_task_count_returns_to_baseline_after_panic() {
+        // codex PR #583 round-2 Medium: a panic inside the tracked future must
+        // still decrement the counter (via BackgroundTaskGuard's Drop), not
+        // leak it forever. `track_background_task` discards the spawned
+        // task's `JoinHandle` (it is fire-and-forget by design — the caller
+        // never awaits it), so this test does not await the panic directly;
+        // tokio isolates the panic to the spawned task instead of aborting
+        // the process, and we observe the recovery purely through the
+        // shared counter returning to baseline after the guard's `Drop`
+        // fires during that task's unwind.
+        let before = background_task_count();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_background_task(async move {
+            let _ = rx.await;
+            panic!("intentional panic to exercise the Drop-guard decrement path");
+        });
+        assert_eq!(background_task_count(), before + 1);
+
+        tx.send(()).expect("still awaiting");
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            background_task_count(),
+            before,
+            "background task counter must return to baseline after the tracked future panics"
+        );
     }
 }

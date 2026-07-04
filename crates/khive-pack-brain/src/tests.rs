@@ -4846,6 +4846,234 @@ mod adr081_retune_driver_tests {
         assert!(matches!(err, RuntimeError::NotFound(_)));
     }
 
+    #[test]
+    fn compute_query_class_is_deterministic_and_order_insensitive() {
+        let a = crate::serve_ledger::compute_query_class("Rust async runtime tuning");
+        let b = crate::serve_ledger::compute_query_class("tuning runtime async rust");
+        let c = crate::serve_ledger::compute_query_class("Rust,  async! runtime  tuning.");
+        assert_eq!(a, b, "token order must not affect the class key");
+        assert_eq!(a, c, "punctuation/whitespace must not affect the class key");
+        assert_eq!(a.len(), 16);
+
+        let d = crate::serve_ledger::compute_query_class("completely different query");
+        assert_ne!(a, d);
+    }
+
+    #[tokio::test]
+    async fn record_serve_duplicate_key_is_tolerated_not_errored() {
+        let (_pack, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let first = crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "row-a",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "dup-class",
+            "raw query",
+            42_000,
+        )
+        .await
+        .expect("first insert must succeed");
+        assert!(first, "first write must report written=true");
+
+        let second = crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "row-b",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "dup-class",
+            "raw query",
+            42_000,
+        )
+        .await
+        .expect("duplicate key must be tolerated, not errored");
+        assert!(!second, "exact-key duplicate must report written=false");
+    }
+
+    /// codex PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
+    /// KEY` column (same `id`, different natural key) must NOT be reported as
+    /// a tolerated natural-key duplicate — the row that actually exists does
+    /// not match `(namespace, target_id, query_class, served_at)`, so the
+    /// original error must propagate instead of being silently swallowed.
+    #[tokio::test]
+    async fn record_serve_primary_key_collision_with_different_natural_key_propagates_error() {
+        let (_pack, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target_a = create_test_entity(&rt, &token).await;
+        let target_b = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "shared-row-id",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target_a,
+            "class-a",
+            "raw query a",
+            1_000,
+        )
+        .await
+        .expect("first insert must succeed");
+
+        // Reuse the SAME id but a DIFFERENT natural key (different target_id) —
+        // this collides on the primary key, not the natural-key unique index.
+        let err = crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "shared-row-id",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target_b,
+            "class-b",
+            "raw query b",
+            2_000,
+        )
+        .await
+        .expect_err("a PK collision with a mismatched natural key must not be tolerated");
+        assert!(
+            matches!(err, RuntimeError::Internal(_)),
+            "expected the original insert error to propagate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_record_serve_writes_one_row_per_target_and_stamps_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target_a = create_test_entity(&rt, &token).await;
+        let target_b = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.record_serve",
+                json!({
+                    "consumer_kind": "recall",
+                    "served_by_profile_id": "adr081-recall-v1",
+                    "target_ids": [target_a.clone(), target_b.clone()],
+                    "query_raw": "async runtime tuning",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("record_serve dispatch");
+        assert_eq!(result["written"], json!(2));
+        assert_eq!(result["skipped"], json!(0));
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let raw_row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT id FROM brain_serve_ledger WHERE target_id = ?1".into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_a.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row")
+            .expect("row for target_a must exist");
+        let row_id = match raw_row.get("id") {
+            Some(khive_storage::types::SqlValue::Text(s)) => s.clone(),
+            other => panic!("expected text id, got {other:?}"),
+        };
+        drop(reader);
+
+        let row = crate::serve_ledger::get_serve_row(rt.sql().as_ref(), &row_id)
+            .await
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(
+            row.served_by_profile_id.as_deref(),
+            Some("adr081-recall-v1")
+        );
+        assert_eq!(row.query_class, result["query_class"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn handle_record_serve_tolerates_duplicate_target_in_same_batch_drain() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let params = json!({
+            "consumer_kind": "recall",
+            "target_ids": [target.clone()],
+            "query_raw": "same query twice",
+            "served_at": 99_000,
+        });
+
+        let first = pack
+            .dispatch("brain.record_serve", params.clone(), &registry, &token)
+            .await
+            .expect("first drain");
+        assert_eq!(first["written"], json!(1));
+        assert_eq!(first["skipped"], json!(0));
+
+        let second = pack
+            .dispatch("brain.record_serve", params, &registry, &token)
+            .await
+            .expect("second drain must not error");
+        assert_eq!(second["written"], json!(0));
+        assert_eq!(second["skipped"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn handle_record_serve_unresolved_profile_still_writes_row() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.record_serve",
+                json!({
+                    "consumer_kind": "recall",
+                    "target_ids": [target.clone()],
+                    "query_raw": "unresolved profile query",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("record_serve dispatch");
+        assert_eq!(result["written"], json!(1));
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let raw_row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT id, served_by_profile_id FROM brain_serve_ledger WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target)],
+                label: None,
+            })
+            .await
+            .expect("query row")
+            .expect("row must exist");
+        assert!(
+            matches!(
+                raw_row.get("served_by_profile_id"),
+                Some(khive_storage::types::SqlValue::Null) | None
+            ),
+            "unresolved profile must write a null column, not a placeholder string"
+        );
+    }
+
     /// Replay determinism: a gated (zero-weight) event, once replayed from the
     /// event log against a fresh BrainPack, must reproduce the exact same
     /// (zero) posterior effect — not re-evaluate the gate against present-day

@@ -29,8 +29,8 @@ pub use curation::{
 #[cfg(unix)]
 pub use daemon::acquire_recovery_lock;
 pub use daemon::{
-    pid_path, run_daemon, socket_path, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
-    PROTOCOL_VERSION,
+    background_task_count, pid_path, run_daemon, socket_path, track_background_task,
+    DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{

@@ -182,21 +182,31 @@ jobs:
           # and stage a raw copy in _raw_md/ (outside the Jekyll source so the theme
           # never promotes it to a nav page); a post-build step copies these into
           # _site/md/ for agent-fetchable raw markdown.
+          #
+          # This loop is also the single source for llms.txt / llms-full.txt below:
+          # PAGE_TITLE/PAGE_DESC/PAGE_ORDER_LIST are populated here and reused there,
+          # so a new docs/guide/*.md file (with a NAV_ORDER entry) propagates to the
+          # HTML sidebar, /md/ copy, llms.txt, and llms-full.txt with no second list
+          # to maintain.
+          declare -A PAGE_TITLE
+          declare -A PAGE_DESC
+          PAGE_ORDER_LIST=()
           for f in docs/guide/*.md; do
             base=$(basename "$f" .md)
             [ "$base" = "README" ] && continue
 
             entry="${NAV_ORDER[$base]:-}"
-            if [ -n "$entry" ]; then
-              nav_order="${entry%%|*}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
-              description="${rest#*|}"
-            else
-              nav_order="99"
-              title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
-              description=""
+            if [ -z "$entry" ]; then
+              echo "ERROR: docs/guide/${base}.md has no NAV_ORDER entry in pages.yml — every guide page must be added to NAV_ORDER (ADR-090 §3)." >&2
+              exit 1
             fi
+            nav_order="${entry%%|*}"
+            rest="${entry#*|}"
+            title="${rest%%|*}"
+            description="${rest#*|}"
+            PAGE_TITLE[$base]="$title"
+            PAGE_DESC[$base]="$description"
+            PAGE_ORDER_LIST+=("${nav_order}|${base}")
 
             {
               echo "---"
@@ -226,6 +236,12 @@ jobs:
             cp "$f" "_raw_md/$base.md"
           done
 
+          # Ordered basenames for the agent-surface indexes below, derived from
+          # the same PAGE_ORDER_LIST the HTML/raw-copy loop above just built
+          # (nav_order, then basename, ascending) — not a separately maintained
+          # list.
+          mapfile -t ORDERED_BASENAMES < <(printf '%s\n' "${PAGE_ORDER_LIST[@]}" | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2)
+
           # llms.txt — the llms.txt convention: short summary + linked index,
           # HTML and raw-markdown URLs for every page.
           {
@@ -238,11 +254,9 @@ jobs:
             echo "## Docs"
             echo
             echo "- [Home](${SITE_URL}/): project overview, install, demos ([markdown](${SITE_URL}/md/index.md))"
-            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
-              entry="${NAV_ORDER[$base]}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
-              description="${rest#*|}"
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              title="${PAGE_TITLE[$base]}"
+              description="${PAGE_DESC[$base]}"
               echo "- [${title}](${SITE_URL}/${base}.html): ${description} ([markdown](${SITE_URL}/md/${base}.md))"
             done
             echo
@@ -257,18 +271,37 @@ jobs:
 
           # Raw markdown copy of the homepage too, matching the /md/<base>.md
           # convention for every other page — strip the front matter block.
+          # Taken BEFORE the footer append below, so the raw copy stays the
+          # page's own content only, same as every other page's _raw_md/*.md.
           awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$SRC/index.md" > "_raw_md/index.md"
 
-          # llms-full.txt — full concatenated markdown of every doc page.
+          # Raw-markdown footer link, appended to the HTML source only (not
+          # the raw copy above) — mirrors the footer every guide page gets in
+          # its assembly step.
+          {
+            echo
+            echo "---"
+            echo
+            echo "Raw markdown for this page: [/md/index.md](md/index.md)"
+          } >> "$SRC/index.md"
+
+          # llms-full.txt — full concatenated markdown of every doc page,
+          # including Home (front-matter-stripped, reusing the same
+          # _raw_md/index.md produced above for the raw-markdown copy).
           {
             echo "# khive — full documentation"
             echo
             echo "Concatenated from ${SITE_URL}/ and every page below. Generated from docs/guide/*.md; do not edit directly."
             echo
-            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
-              entry="${NAV_ORDER[$base]}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
+            echo "---"
+            echo
+            echo "## Home"
+            echo
+            echo "Source: ${SITE_URL}/"
+            echo
+            cat "_raw_md/index.md"
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              title="${PAGE_TITLE[$base]}"
               echo
               echo "---"
               echo
@@ -279,6 +312,27 @@ jobs:
               cat "docs/guide/${base}.md"
             done
           } > "$SRC/llms-full.txt"
+
+          # Enforce that every guide page the HTML/raw-copy loop built is actually
+          # present in both agent indexes — this is the assertion for the ADR-090 §2
+          # claim ("appears in the llms.txt index, llms-full.txt, and its own
+          # /md/<page>.md copy"). A future regression that reintroduces a separately
+          # maintained page list fails the build instead of silently drifting.
+          for base in "${ORDERED_BASENAMES[@]}"; do
+            grep -qF "${base}.html" "$SRC/llms.txt" || {
+              echo "ERROR: ${base} missing from llms.txt (ADR-090 §2)" >&2
+              exit 1
+            }
+            grep -qF "${base}.html" "$SRC/llms-full.txt" || {
+              echo "ERROR: ${base} missing from llms-full.txt (ADR-090 §2)" >&2
+              exit 1
+            }
+          done
+
+          # Manifest of every raw-markdown basename this build produced (Home plus
+          # every guide page), consumed by the post-build step below so its
+          # existence check covers all of them, not a hard-coded sample.
+          printf '%s\n' index "${ORDERED_BASENAMES[@]}" > _raw_md/.manifest
 
           echo "Assembled site source:"
           find "$SRC" -maxdepth 2 -type f | sort
@@ -300,8 +354,15 @@ jobs:
           set -euo pipefail
           sudo mkdir -p _site/md
           sudo cp _raw_md/*.md _site/md/
-          test -f _site/md/getting-started.md
-          test -f _site/md/index.md
+          # Existence check over every basename the assemble step recorded (Home
+          # plus every guide page), not a two-page spot check — a missing raw
+          # copy for any page fails the build (ADR-090 §2).
+          while IFS= read -r base; do
+            test -f "_site/md/${base}.md" || {
+              echo "ERROR: _site/md/${base}.md missing after raw-markdown copy (ADR-090 §2)" >&2
+              exit 1
+            }
+          done < _raw_md/.manifest
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
