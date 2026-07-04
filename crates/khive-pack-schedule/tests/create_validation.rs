@@ -882,3 +882,451 @@ async fn schedule_schedule_accepts_exact_replayable_single_action() {
 
     assert_eq!(result["status"], "pending");
 }
+
+// ── Round-3 review gap 1: entity_type replay-parity validation ─────────────
+//
+// `entity_type` was never validated in the replay mirror at all: the
+// singleton path (`validate_conditional_requirements`) checked `name` but
+// never touched `entity_type`; the bulk path (`ScheduleBulkCreateEntryCheck`)
+// parsed `entity_type` but never validated it. The real KG `create` handler
+// validates `entity_type` in both paths
+// (`khive-pack-kg/src/handlers/create.rs:137-140` bulk, `:310` singleton)
+// via `khive-pack-kg/src/entity_type_registry.rs`'s cross-kind rejection.
+
+/// `entity_type="paper"` is a `Document` subtype
+/// (`khive-pack-kg/src/entity_type_registry.rs` `BUILTIN_DEFS`), not `Concept`
+/// — the real KG `create` handler deterministically rejects
+/// `create(kind="concept", entity_type="paper", ...)`. `schedule.schedule`
+/// must reject the same action at write time, not silently accept it and
+/// fail hours later at replay.
+#[tokio::test]
+async fn schedule_schedule_rejects_create_with_cross_kind_entity_type_singleton() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"concept\", entity_type=\"paper\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("entity_type") && msg.contains("paper"),
+        "round-3 gap 1: entity_type=\"paper\" is a Document subtype, not Concept; \
+         schedule.schedule must reject it the same way KG create does; got: {msg}"
+    );
+
+    // Confirm this really does mirror the live KG handler's own rejection.
+    let kg_err = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "concept", "entity_type": "paper", "name": "x"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err.to_string().contains("entity_type"),
+        "sanity: the live KG create handler must also reject this cross-kind entity_type; \
+         got: {kg_err}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_create_with_valid_entity_type_singleton() {
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"document\", entity_type=\"paper\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("round-3 gap 1: entity_type=\"paper\" is a valid Document subtype");
+
+    // Sanity: the live KG create handler must also accept this pairing.
+    registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "document", "entity_type": "paper", "name": "kg-doc-paper"
+            }),
+        )
+        .await
+        .expect("sanity: the live KG create handler must accept this pairing too");
+}
+
+/// `entity_type` resolution must follow aliases, not just exact canonical
+/// names — "algo" is an accepted alias for the canonical Concept subtype
+/// "algorithm" (`khive-pack-kg/src/entity_type_registry.rs` `BUILTIN_DEFS`).
+#[tokio::test]
+async fn schedule_schedule_accepts_entity_type_alias_singleton() {
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"concept\", entity_type=\"algo\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("round-3 gap 1: entity_type alias \"algo\" must resolve to \"algorithm\"");
+
+    registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "concept", "entity_type": "algo", "name": "kg-algo"}),
+        )
+        .await
+        .expect("sanity: the live KG create handler must accept the algo alias too");
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_completely_unknown_entity_type() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"concept\", entity_type=\"totally_made_up_xyz\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown entity_type"),
+        "a completely unregistered entity_type must be rejected; got: {err}"
+    );
+
+    let kg_err = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "concept", "entity_type": "totally_made_up_xyz", "name": "x"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err.to_string().contains("unknown entity_type"),
+        "sanity: the live KG create handler must also reject this; got: {kg_err}"
+    );
+}
+
+/// Same cross-kind rejection, but inside a bulk `create(items=[...])` entry
+/// — the bulk validator must apply the same `entity_type` validation
+/// per-entry that the real KG bulk create handler applies.
+#[tokio::test]
+async fn schedule_schedule_rejects_create_bulk_item_with_cross_kind_entity_type() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"concept\",\"entity_type\":\"paper\",\"name\":\"x\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("items[0]") && msg.contains("entity_type"),
+        "round-3 gap 1: bulk items[] entity_type must be validated per-entry the same way \
+         the real KG bulk create handler does; got: {msg}"
+    );
+
+    let kg_err = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [{"kind": "concept", "entity_type": "paper", "name": "x"}]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err.to_string().contains("entity_type"),
+        "sanity: the live KG bulk create handler must also reject this cross-kind \
+         entity_type; got: {kg_err}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_create_bulk_item_with_valid_entity_type() {
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"document\",\"entity_type\":\"paper\",\"name\":\"x\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("round-3 gap 1: bulk entity_type=\"paper\" under kind=\"document\" is valid");
+
+    registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [{
+                    "kind": "document", "entity_type": "paper", "name": "kg-bulk-doc-paper"
+                }]
+            }),
+        )
+        .await
+        .expect("sanity: the live KG bulk create handler must accept this pairing too");
+}
+
+/// `entity_type` validation short-circuits on the *kind name itself*: the
+/// real KG `validate_entity_type` (`khive-pack-kg/src/handlers/common.rs`)
+/// parses the kind into the base 8-variant `khive_types::EntityKind` before
+/// ever consulting the subtype registry, and `resource` (ADR-048, pack-owned,
+/// declared only in `khive-pack-kg::vocab::EntityKind`) has no variant in
+/// that base enum — so ANY non-null `entity_type` under `kind="resource"` is
+/// rejected with "unknown entity kind", regardless of the entity_type value.
+/// Verified live via `kkernel exec` against a scratch DB. `schedule.schedule`
+/// must reproduce this exact short-circuit rather than being "more lenient"
+/// than the real handler — that would be a false accept, exactly the gap-1
+/// failure mode this round of review found.
+#[tokio::test]
+async fn schedule_schedule_rejects_entity_type_under_resource_kind_singleton() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"resource\", entity_type=\"atom_type\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown entity kind"),
+        "resource-kind entities can never carry an entity_type (base EntityKind has no \
+         Resource variant); got: {msg}"
+    );
+
+    let kg_err = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "resource", "entity_type": "atom_type", "name": "x"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err.to_string().contains("unknown entity kind"),
+        "sanity: the live KG create handler must reject this the same way; got: {kg_err}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_entity_type_under_resource_kind_bulk() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"resource\",\"entity_type\":\"atom_type\",\"name\":\"x\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("items[0]") && msg.contains("unknown entity kind"),
+        "resource-kind entities can never carry an entity_type, in bulk items[] either; \
+         got: {msg}"
+    );
+
+    let kg_err = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [{"kind": "resource", "entity_type": "atom_type", "name": "x"}]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        kg_err.to_string().contains("unknown entity kind"),
+        "sanity: the live KG bulk create handler must reject this the same way; got: {kg_err}"
+    );
+}
+
+/// Self-updating parity check (mitigates the exact drift that produced
+/// round-3 gap 1): iterate every real `khive_types::EntityKind` and every
+/// subtype the LIVE `khive-pack-kg::EntityTypeRegistry` actually has
+/// registered (via the dev-dependency), and assert `schedule.schedule`'s
+/// hand-mirrored `ENTITY_TYPE_DEFS_FOR_REPLAY` table (`handlers.rs`) accepts
+/// every one of them. If `BUILTIN_DEFS` ever gains a new subtype that isn't
+/// mirrored, this test starts failing in CI instead of silently reproducing
+/// a false-rejection bug like the one round 3 found.
+#[tokio::test]
+async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
+    use khive_pack_kg::EntityTypeRegistry;
+    use khive_types::EntityKind;
+
+    let (registry, _rt) = build_registry();
+    let live = EntityTypeRegistry::global();
+
+    for kind in EntityKind::ALL {
+        let valid_types = live.valid_types_for(kind);
+        if valid_types == "(none registered)" {
+            continue;
+        }
+        for type_name in valid_types.split(" | ") {
+            let action = format!(
+                "create(kind=\"{}\", entity_type=\"{type_name}\", name=\"parity\")",
+                kind.name()
+            );
+            registry
+                .dispatch(
+                    "schedule.schedule",
+                    serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "parity gap: the live EntityTypeRegistry accepts entity_type=\
+                         {type_name:?} for kind={:?}, but schedule.schedule's mirror \
+                         rejected it — ENTITY_TYPE_DEFS_FOR_REPLAY in handlers.rs is \
+                         missing this entry: {e}",
+                        kind.name()
+                    )
+                });
+        }
+    }
+}
+
+// ── Round-3 review gap 2: entity_kind / kind alias replay-parity ───────────
+//
+// `classify_create_kind` had no alias resolution at all — neither the base
+// `khive_types::EntityKind` aliases (e.g. "paper" -> document) nor the
+// pack-local `resource`-kind aliases (e.g. "atom" -> resource, ADR-048) — so
+// `schedule.schedule` wrongly rejected legitimate KG-accepted kind spellings.
+// `canonical_entity_kind_for_replay` (the legacy `entity_kind=` path) had the
+// same gap for the pack-local alias set specifically.
+
+/// (alias, expected canonical kind) pairs spanning both the base 8
+/// `khive_types::EntityKind` aliases and the pack-local `resource`-kind
+/// aliases (ADR-048, `khive-pack-kg/src/vocab.rs`).
+const ENTITY_KIND_ALIAS_CASES: &[(&str, &str)] = &[
+    ("doc", "document"),
+    ("paper", "document"),
+    ("data", "dataset"),
+    ("benchmark", "dataset"),
+    ("repo", "project"),
+    ("crate", "project"),
+    ("library", "project"),
+    ("lib", "project"),
+    ("author", "person"),
+    ("researcher", "person"),
+    ("organization", "org"),
+    ("organisation", "org"),
+    ("lab", "org"),
+    ("company", "org"),
+    ("art", "artifact"),
+    ("svc", "service"),
+    ("atom", "resource"),
+    ("runbook", "resource"),
+    ("template", "resource"),
+    ("prompt", "resource"),
+    ("skill", "resource"),
+    ("tool", "resource"),
+];
+
+/// Every alias the real KG `create` handler accepts as a top-level `kind`
+/// must also be accepted by `schedule.schedule`, matched against a direct
+/// `create` dispatch on the same live registry as the oracle.
+#[tokio::test]
+async fn schedule_schedule_accepts_every_kg_entity_kind_alias_singleton() {
+    let (registry, _rt) = build_registry();
+
+    for &(alias, canonical) in ENTITY_KIND_ALIAS_CASES {
+        let action = format!("create(kind=\"{alias}\", name=\"x-{alias}\")");
+        registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "alias {alias:?} (-> {canonical}) must be accepted by \
+                     schedule.schedule; got: {e}"
+                )
+            });
+
+        // Sanity: the live KG create handler must also accept this alias.
+        registry
+            .dispatch(
+                "create",
+                serde_json::json!({"kind": alias, "name": format!("kg-{alias}")}),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("sanity: the live KG create handler must accept kind={alias:?}; got: {e}")
+            });
+    }
+}
+
+/// Same alias matrix, but inside a bulk `create(items=[...])` entry.
+#[tokio::test]
+async fn schedule_schedule_accepts_every_kg_entity_kind_alias_bulk() {
+    let (registry, _rt) = build_registry();
+
+    for &(alias, canonical) in ENTITY_KIND_ALIAS_CASES {
+        let action = format!("create(items=[{{\"kind\":\"{alias}\",\"name\":\"x-{alias}\"}}])");
+        registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "bulk alias {alias:?} (-> {canonical}) must be accepted by \
+                     schedule.schedule; got: {e}"
+                )
+            });
+
+        // Sanity: the live KG bulk create handler must also accept this alias.
+        registry
+            .dispatch(
+                "create",
+                serde_json::json!({
+                    "items": [{"kind": alias, "name": format!("kg-bulk-{alias}")}]
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "sanity: the live KG bulk create handler must accept kind={alias:?}; \
+                     got: {e}"
+                )
+            });
+    }
+}

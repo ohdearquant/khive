@@ -268,11 +268,14 @@ fn validate_replayable_single_action(
 /// pack's own `handle_create` (`khive-pack-kg/src/handlers/create.rs`):
 /// entity/granular-entity creates require `name`, note/granular-note creates
 /// require `content`, and a bare `kind="entity"` requires an `entity_kind`
-/// (or a granular entity kind) to resolve a concrete kind. `khive-pack-schedule`
-/// does not depend on `khive-pack-kg` (only as a dev-dependency for tests),
-/// so this reimplements the classification using `VerbRegistry::all_entity_kinds`
-/// / `all_note_kinds` — the same data `resolve_kind_spec` consults — rather
-/// than importing the KG pack's private helpers.
+/// (or a granular entity kind) to resolve a concrete kind. It also validates
+/// `entity_type` against the KG entity-type/subtype registry when present
+/// (round-3 review gap 1) — see `validate_entity_type_for_replay`.
+/// `khive-pack-schedule` does not depend on `khive-pack-kg` (only as a
+/// dev-dependency for tests), so this reimplements the classification using
+/// `VerbRegistry::all_entity_kinds` / `all_note_kinds` — the same data
+/// `resolve_kind_spec` consults — rather than importing the KG pack's
+/// private helpers.
 fn validate_conditional_requirements(
     tool: &str,
     args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
@@ -329,14 +332,14 @@ fn validate_conditional_requirements(
                 |s| canonical_entity_kind_for_replay(s, registry),
                 "entity_kind",
             )?;
-            if canonical.is_none() {
+            let Some(canonical) = canonical else {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": kind=\"entity\" requires a specific \
                      kind — use kind=<concept|document|dataset|project|person|org|artifact|\
                      service|resource> directly, or kind=entity + entity_kind=<…>"
                         .into(),
                 ));
-            }
+            };
             let name = args
                 .get("name")
                 .and_then(khive_request::ArgValue::as_value)
@@ -348,6 +351,13 @@ fn validate_conditional_requirements(
                     "schedule.action: verb \"create\": entity creation requires `name`".into(),
                 ));
             }
+            let entity_type_arg = args
+                .get("entity_type")
+                .and_then(khive_request::ArgValue::as_value)
+                .and_then(Value::as_str);
+            validate_entity_type_for_replay(&canonical, entity_type_arg).map_err(|e| {
+                RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}"))
+            })?;
         }
         CreateKindClass::Note { specific } => {
             reconcile_specific_for_replay(
@@ -386,12 +396,22 @@ enum CreateKindClass {
 }
 
 /// Classify a `create(kind=...)` value the same way
-/// `khive-pack-kg::handlers::common::resolve_kind_spec` does, using the
-/// registry's merged entity/note-kind vocabulary (the same source
-/// `resolve_kind_spec` falls back to). Returns an error for any `kind` that
-/// is guaranteed to fail replay outright: `edge` (create edges via `link`),
-/// `event` (immutable), `proposal` (create via `propose`), or an
-/// unrecognized kind string.
+/// `khive-pack-kg::handlers::common::resolve_kind_spec` does: literal
+/// substrate keywords first, then base-8-kind aliases (`khive_types::EntityKind`,
+/// e.g. `"paper"` -> `document` — a real, non-dev dependency already shared
+/// with khive-pack-kg, so this is genuine reuse, not a hand-copy), then the
+/// pack-local `resource`-kind alias set (`"atom"`, `"runbook"`, etc. ->
+/// `resource`, ADR-048; hand-copied via `resource_alias_for_replay` since
+/// `khive-pack-kg::vocab::EntityKind` is pack-private — see that function's
+/// doc comment), then the registry's merged entity/note-kind vocabulary (the
+/// same final fallback `resolve_kind_spec` uses). Returns an error for any
+/// `kind` that is guaranteed to fail replay outright: `edge` (create edges
+/// via `link`), `event` (immutable), `proposal` (create via `propose`), or
+/// an unrecognized kind string.
+///
+/// Round-3 review (gap 2) found the pre-fix version skipped alias resolution
+/// entirely, causing schedule-time false rejections (not a security hole)
+/// for legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn classify_create_kind(
     raw: &str,
     registry: &VerbRegistry,
@@ -423,6 +443,16 @@ fn classify_create_kind(
         }
         _ => {}
     }
+    if let Ok(k) = raw.parse::<khive_types::EntityKind>() {
+        return Ok(CreateKindClass::Entity {
+            specific: Some(k.name().to_string()),
+        });
+    }
+    if resource_alias_for_replay(&normalized) {
+        return Ok(CreateKindClass::Entity {
+            specific: Some("resource".to_string()),
+        });
+    }
     if registry.all_entity_kinds().contains(&normalized.as_str()) {
         return Ok(CreateKindClass::Entity {
             specific: Some(normalized),
@@ -444,15 +474,18 @@ fn classify_create_kind(
 /// Canonicalize a legacy `entity_kind` value the same way
 /// `khive-pack-kg::handlers::common::canonical_entity_kind` does: try the
 /// base `khive_types::EntityKind` parser (the 8 base kinds plus its common
-/// aliases, e.g. `"paper"` -> `document`), then fall back to the registry's
-/// merged entity-kind vocabulary (covers pack-declared additions such as
-/// `resource`, ADR-048). `khive-pack-schedule` does not depend on
-/// `khive-pack-kg` (only as a dev-dependency for tests), so it cannot resolve
-/// KG's own pack-private alias set (e.g. `"atom"` -> `resource`) — an
-/// unresolved alias here is rejected as an unknown `entity_kind`, which is
-/// strictly safe: it never lets through a value KG would accept, it only
-/// ever rejects earlier (at schedule time) something that would otherwise
-/// also need to canonicalize successfully at replay.
+/// aliases, e.g. `"paper"` -> `document`; a real, non-dev dependency already
+/// shared with khive-pack-kg — genuine reuse, not a hand-copy), then the
+/// pack-local `resource`-kind alias set (`"atom"`, `"runbook"`, etc. ->
+/// `resource`, ADR-048; hand-copied via `resource_alias_for_replay` since
+/// `khive-pack-kg::vocab::EntityKind` is pack-private and
+/// `khive-pack-schedule` does not depend on `khive-pack-kg` in production —
+/// dev-dependency only, for tests), then fall back to the registry's merged
+/// entity-kind vocabulary (covers any further pack-declared additions).
+///
+/// Round-3 review (gap 2) found the pre-fix version resolved neither alias
+/// set, causing schedule-time false rejections (not a security hole) for
+/// legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn canonical_entity_kind_for_replay(
     raw: &str,
     registry: &VerbRegistry,
@@ -461,6 +494,9 @@ fn canonical_entity_kind_for_replay(
         return Ok(k.name().to_string());
     }
     let normalized = raw.trim().to_ascii_lowercase();
+    if resource_alias_for_replay(&normalized) {
+        return Ok("resource".to_string());
+    }
     if registry.all_entity_kinds().contains(&normalized.as_str()) {
         return Ok(normalized);
     }
@@ -490,6 +526,272 @@ fn canonical_note_kind_for_replay(
         "unknown note_kind {raw:?}; valid: {}",
         all.join(" | ")
     )))
+}
+
+/// Pack-local `resource`-kind aliases (ADR-048), mirroring
+/// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm `"resource" | "atom" |
+/// "runbook" | "template" | "prompt" | "skill" | "tool"`
+/// (`khive-pack-kg/src/vocab.rs`). That type is `pub(crate)` to
+/// `khive-pack-kg` and `khive-pack-schedule` does not depend on
+/// `khive-pack-kg` in production (dev-dependency only, for tests), so this
+/// hand-copies just the alias set — six short strings — rather than the
+/// type. `normalized` must already be trimmed + lowercased (callers already
+/// compute this for the registry-vocabulary fallback). Kept in sync by
+/// `entity_kind_resource_aliases_match_real_vocab` in `create_validation.rs`,
+/// which asserts this list against the live `khive-pack-kg` vocab (via the
+/// dev-dependency) so drift is caught in CI rather than silently reproducing
+/// a round-3-style false rejection.
+fn resource_alias_for_replay(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "resource" | "atom" | "runbook" | "template" | "prompt" | "skill" | "tool"
+    )
+}
+
+/// Mirror of `khive-pack-kg::entity_type_registry::BUILTIN_DEFS` — one row
+/// per `(kind, canonical type_name, aliases)` triple, used only to reject at
+/// schedule-write-time any `entity_type` that the real KG `create` handler's
+/// `validate_entity_type` (`khive-pack-kg/src/handlers/common.rs`) would
+/// reject at trigger-time replay (round-3 review gap 1). Only the base 8
+/// `khive_types::EntityKind` kinds ever reach this table — see
+/// `validate_entity_type_for_replay` for why `resource` (and any other
+/// pack-owned kind) short-circuits before a subtype is even considered,
+/// mirroring the real handler exactly.
+///
+/// `khive-pack-schedule` does not depend on `khive-pack-kg` in production
+/// (dev-dependency only, for tests), so this hand-copies the definitions
+/// rather than importing `EntityTypeRegistry` directly. Keep in sync with
+/// `BUILTIN_DEFS`:
+/// `gap1_entity_type_exhaustive_parity_with_real_registry` in
+/// `create_validation.rs` compares every entry here against the live
+/// registry (via the dev-dependency, `khive_pack_kg::EntityTypeRegistry::global()`)
+/// and fails if the two tables diverge, so future additions to the real
+/// table that aren't mirrored here fail in CI instead of drifting silently.
+const ENTITY_TYPE_DEFS_FOR_REPLAY: &[(khive_types::EntityKind, &str, &[&str])] = &[
+    // ── Document ──────────────────────────────────────────────────────────
+    (
+        khive_types::EntityKind::Document,
+        "paper",
+        &["preprint", "article"],
+    ),
+    (khive_types::EntityKind::Document, "report", &[]),
+    (khive_types::EntityKind::Document, "blog_post", &["blog"]),
+    (khive_types::EntityKind::Document, "book", &[]),
+    (
+        khive_types::EntityKind::Document,
+        "specification",
+        &["spec"],
+    ),
+    (
+        khive_types::EntityKind::Document,
+        "documentation",
+        &["docs"],
+    ),
+    (khive_types::EntityKind::Document, "thesis", &[]),
+    // ── Concept ───────────────────────────────────────────────────────────
+    (khive_types::EntityKind::Concept, "algorithm", &["algo"]),
+    (
+        khive_types::EntityKind::Concept,
+        "theorem",
+        &["lemma", "proposition", "corollary"],
+    ),
+    (khive_types::EntityKind::Concept, "definition", &["def"]),
+    (
+        khive_types::EntityKind::Concept,
+        "structure",
+        &["inductive", "struct", "class"],
+    ),
+    (khive_types::EntityKind::Concept, "instance", &[]),
+    (khive_types::EntityKind::Concept, "axiom", &[]),
+    (khive_types::EntityKind::Concept, "goal", &["proof_goal"]),
+    (khive_types::EntityKind::Concept, "technique", &[]),
+    (khive_types::EntityKind::Concept, "architecture", &["arch"]),
+    (khive_types::EntityKind::Concept, "model_family", &["model"]),
+    (khive_types::EntityKind::Concept, "theory", &[]),
+    (khive_types::EntityKind::Concept, "research_gap", &["gap"]),
+    (
+        khive_types::EntityKind::Concept,
+        "design_pattern",
+        &["pattern"],
+    ),
+    (
+        khive_types::EntityKind::Concept,
+        "mathematical_operation",
+        &["math_op"],
+    ),
+    (khive_types::EntityKind::Concept, "metric", &[]),
+    (khive_types::EntityKind::Concept, "objective", &["loss"]),
+    // ── Dataset ───────────────────────────────────────────────────────────
+    (khive_types::EntityKind::Dataset, "benchmark", &[]),
+    (khive_types::EntityKind::Dataset, "corpus", &[]),
+    (
+        khive_types::EntityKind::Dataset,
+        "training_set",
+        &["train_set"],
+    ),
+    (
+        khive_types::EntityKind::Dataset,
+        "evaluation_set",
+        &["eval_set"],
+    ),
+    (khive_types::EntityKind::Dataset, "test_set", &[]),
+    (
+        khive_types::EntityKind::Dataset,
+        "synthetic_dataset",
+        &["synthetic"],
+    ),
+    // ── Project ───────────────────────────────────────────────────────────
+    (khive_types::EntityKind::Project, "library", &["lib"]),
+    (khive_types::EntityKind::Project, "framework", &[]),
+    (khive_types::EntityKind::Project, "tool", &[]),
+    (khive_types::EntityKind::Project, "application", &["app"]),
+    (khive_types::EntityKind::Project, "repository", &["repo"]),
+    // ── Org ───────────────────────────────────────────────────────────────
+    (
+        khive_types::EntityKind::Org,
+        "academic_institution",
+        &["university", "uni"],
+    ),
+    (khive_types::EntityKind::Org, "company", &[]),
+    (khive_types::EntityKind::Org, "research_lab", &["lab"]),
+    (khive_types::EntityKind::Org, "nonprofit", &[]),
+    (
+        khive_types::EntityKind::Org,
+        "government_agency",
+        &["gov_agency"],
+    ),
+    (khive_types::EntityKind::Org, "consortium", &[]),
+    (khive_types::EntityKind::Org, "standards_body", &[]),
+    // ── Artifact ──────────────────────────────────────────────────────────
+    (khive_types::EntityKind::Artifact, "checkpoint", &["ckpt"]),
+    (khive_types::EntityKind::Artifact, "snapshot", &[]),
+    (khive_types::EntityKind::Artifact, "export", &[]),
+    (
+        khive_types::EntityKind::Artifact,
+        "embedding_index",
+        &["embed_index"],
+    ),
+    (khive_types::EntityKind::Artifact, "state_bundle", &[]),
+    (khive_types::EntityKind::Artifact, "profile", &[]),
+    // ── Service ───────────────────────────────────────────────────────────
+    (khive_types::EntityKind::Service, "inference_engine", &[]),
+    (khive_types::EntityKind::Service, "retrieval_engine", &[]),
+    (khive_types::EntityKind::Service, "embedding_engine", &[]),
+    (khive_types::EntityKind::Service, "api", &["endpoint"]),
+    (khive_types::EntityKind::Service, "database", &["db"]),
+    (khive_types::EntityKind::Service, "search_engine", &[]),
+    (khive_types::EntityKind::Service, "mcp_server", &["mcp"]),
+    // Person — no standard subtypes (roles are metadata, not subtypes).
+];
+
+/// Normalize a raw `entity_type` string to canonical snake_case, mirroring
+/// `khive-pack-kg::entity_type_registry::to_snake_case` exactly (ADR-001:106
+/// write-time normalization step that precedes alias resolution): trim ->
+/// lowercase -> runs of separators (space, hyphen, underscore) collapsed to
+/// a single `_` -> leading/trailing `_` stripped.
+fn to_snake_case_for_replay(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_sep = true;
+    for ch in s.chars() {
+        if ch == ' ' || ch == '-' || ch == '_' {
+            if !prev_sep && !out.is_empty() {
+                out.push('_');
+                prev_sep = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    if out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Comma-separated list of canonical type names valid for `kind`, mirroring
+/// `EntityTypeRegistry::valid_types_for` for error messages.
+fn valid_entity_types_for_replay(kind: khive_types::EntityKind) -> String {
+    let mut names: Vec<&str> = ENTITY_TYPE_DEFS_FOR_REPLAY
+        .iter()
+        .filter(|(k, _, _)| *k == kind)
+        .map(|(_, type_name, _)| *type_name)
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        "(none registered)".to_string()
+    } else {
+        names.join(" | ")
+    }
+}
+
+/// Resolve a `(kind, entity_type)` pair against `ENTITY_TYPE_DEFS_FOR_REPLAY`,
+/// mirroring `EntityTypeRegistry::resolve` exactly: kind-qualified lookup
+/// first (a name or alias registered under this specific kind), then a bare
+/// lookup across all kinds — if the name/alias exists under a *different*
+/// kind, the cross-kind rejection error names the correct kind (matching
+/// the real registry's ambiguity-safe bare-name path); otherwise the type is
+/// entirely unknown.
+fn resolve_entity_type_for_replay(
+    kind: khive_types::EntityKind,
+    raw_type: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let normalized = to_snake_case_for_replay(raw_type.trim());
+
+    for (def_kind, type_name, aliases) in ENTITY_TYPE_DEFS_FOR_REPLAY.iter().copied() {
+        if def_kind == kind
+            && (type_name == normalized.as_str() || aliases.contains(&normalized.as_str()))
+        {
+            return Ok(Some(type_name.to_string()));
+        }
+    }
+
+    for (def_kind, type_name, aliases) in ENTITY_TYPE_DEFS_FOR_REPLAY.iter().copied() {
+        if type_name == normalized.as_str() || aliases.contains(&normalized.as_str()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity_type {raw_type:?} belongs to {:?}, not {:?}; valid types for {:?}: {}",
+                def_kind.name(),
+                kind.name(),
+                kind.name(),
+                valid_entity_types_for_replay(kind),
+            )));
+        }
+    }
+
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown entity_type {raw_type:?} for {:?}; valid: {}",
+        kind.name(),
+        valid_entity_types_for_replay(kind),
+    )))
+}
+
+/// Validate an `entity_type` value the same way
+/// `khive-pack-kg::handlers::common::validate_entity_type` does: parse
+/// `canonical_kind_name` into the base `khive_types::EntityKind` first, then
+/// resolve the subtype against `ENTITY_TYPE_DEFS_FOR_REPLAY`.
+///
+/// The kind-parse step is exactly what makes a pack-owned kind like
+/// `"resource"` reject *any* non-`None` `entity_type` outright: `resource`
+/// has no variant in the base 8-kind enum, so parsing `canonical_kind_name`
+/// fails before the subtype table is even consulted — the real handler has
+/// this same short-circuit (`khive-pack-kg/src/handlers/common.rs`,
+/// `validate_entity_type`), verified live via `kkernel exec` against a
+/// scratch DB. This mirrors that behavior rather than "fixing" it: the
+/// contract here is bit-for-bit replay parity with the real handler, not
+/// what the real handler arguably should do.
+fn validate_entity_type_for_replay(
+    canonical_kind_name: &str,
+    entity_type: Option<&str>,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(raw) = entity_type else {
+        return Ok(None);
+    };
+    let kind = canonical_kind_name
+        .parse::<khive_types::EntityKind>()
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!("unknown entity kind {canonical_kind_name:?}"))
+        })?;
+    resolve_entity_type_for_replay(kind, raw)
 }
 
 /// Reconcile a granular `kind`'s resolved `specific` value against a legacy
@@ -565,13 +867,20 @@ fn validate_create_bulk_items(
                     |s| canonical_entity_kind_for_replay(s, registry),
                     "entity_kind",
                 )?;
-                if canonical.is_none() {
+                let Some(canonical) = canonical else {
                     return Err(RuntimeError::InvalidInput(format!(
                         "schedule.action: verb \"create\": items[{idx}] kind=\"entity\" \
                          requires a specific kind — use kind=<concept|…> or kind=entity + \
                          entity_kind=<…>"
                     )));
-                }
+                };
+                validate_entity_type_for_replay(&canonical, entry.entity_type.as_deref()).map_err(
+                    |e| {
+                        RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] {e}"
+                        ))
+                    },
+                )?;
             }
             CreateKindClass::Note { .. } => {
                 return Err(RuntimeError::InvalidInput(format!(
