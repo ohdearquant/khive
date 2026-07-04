@@ -2,16 +2,36 @@
 //! and their scorer-assigned grades.
 //!
 //! Row creation (`record_serve`) implements the normative write side of the
-//! ledger so the table is fully usable end to end, but wiring `memory.recall` to
-//! call it is explicitly out of scope here (ADR-081 §5: the `served_by_profile_id`
-//! serve-time stamp ships as a separate, latency-gated implementation PR, #394).
-//! What this task wires up is the read side consumed by `brain.feedback` /
+//! ledger; `memory.recall` wires into it via `brain.record_serve` (ADR-081 §5,
+//! #394) to stamp `served_by_profile_id` and append the ledger row off the
+//! response path. The read side is consumed by `brain.feedback` /
 //! `brain.auto_feedback` when a caller supplies `serve_ledger_id` (ADR-081 §6):
 //! dedup by `(scorer_run_id, id)`, the `accounting_profile_id` zero-weight
 //! fail-safe, and grade backfill.
 use khive_runtime::RuntimeError;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
+use sha2::{Digest, Sha256};
+
+/// Compute the deterministic `query_class` key (ADR-081 §4): lowercase, strip
+/// punctuation to whitespace, collapse whitespace, sort+dedup unique tokens,
+/// join, SHA-256, first 16 hex chars. Order-insensitive so two queries with
+/// the same token set (in any order) fold into the same accounting key.
+pub fn compute_query_class(query_raw: &str) -> String {
+    let lowered = query_raw.to_lowercase();
+    let stripped: String = lowered
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let mut tokens: Vec<&str> = stripped.split_whitespace().collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    let normalized = tokens.join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(digest)[..16].to_string()
+}
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Internal(format!("serve ledger {context}: {e}"))
@@ -76,9 +96,10 @@ fn row_int(row: &khive_storage::types::SqlRow, col: &str) -> Result<i64, Runtime
     }
 }
 
-/// Record a new serve row (the ADR-081 §4 write side). Not yet called by the
-/// recall path (out of scope here); provided so the ledger's write contract is
-/// implemented, not stubbed, ahead of that wiring.
+/// Record a new serve row (the ADR-081 §4 write side). Returns `Ok(true)` when
+/// the row was written, `Ok(false)` when an exact-key duplicate was tolerated
+/// (the natural key `(namespace, target_id, query_class, served_at)` already
+/// has a row — a duplicate drain of the same batch, not an error).
 #[allow(clippy::too_many_arguments)]
 pub async fn record_serve(
     sql: &dyn SqlAccess,
@@ -92,9 +113,9 @@ pub async fn record_serve(
     query_class: &str,
     query_raw: &str,
     served_at: i64,
-) -> Result<(), RuntimeError> {
+) -> Result<bool, RuntimeError> {
     let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
-    writer
+    let result = writer
         .execute(SqlStatement {
             sql: "INSERT INTO brain_serve_ledger \
                   (id, namespace, consumer_kind, served_by_profile_id, resolved_profile_id, \
@@ -119,9 +140,12 @@ pub async fn record_serve(
             ],
             label: Some("brain_serve_ledger_insert".into()),
         })
-        .await
-        .map_err(|e| sql_err("insert serve row", e))?;
-    Ok(())
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) if e.is_unique_constraint_violation() => Ok(false),
+        Err(e) => Err(sql_err("insert serve row", e)),
+    }
 }
 
 /// Fetch a serve ledger row by id.

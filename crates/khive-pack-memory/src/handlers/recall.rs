@@ -33,7 +33,7 @@ impl MemoryPack {
         &self,
         token: &NamespaceToken,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         use std::sync::atomic::Ordering;
 
@@ -540,7 +540,7 @@ impl MemoryPack {
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
-        let results: Vec<Value> = ranked
+        let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
                 let content_out =
@@ -570,6 +570,73 @@ impl MemoryPack {
                 result
             })
             .collect();
+
+        // ADR-081 §5 (#394): resolve the serving profile via the same tiers
+        // 1-2 memory.feedback uses (resolve_serving_profile), stamp it into
+        // each result, then fire the cross-session serve-ledger append
+        // (ADR-081 §4) asynchronously off the response path — the recall
+        // caller must not wait on a brain-pack dispatch. An unresolved
+        // profile omits the stamp rather than guessing one; the ledger row
+        // is still written with a null served_by_profile_id in that case.
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(
+                    call_id,
+                    "results_build",
+                    t.elapsed().as_micros(),
+                    results.len(),
+                );
+            }
+            t_stage = Some(Instant::now());
+        }
+        let served_by_profile_id =
+            super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog(call_id, "profile_resolve", t.elapsed().as_micros());
+            }
+            t_stage = Some(Instant::now());
+        }
+
+        if let Some(ref profile_id) = served_by_profile_id {
+            for r in results.iter_mut() {
+                r["served_by_profile_id"] = json!(profile_id);
+            }
+        }
+
+        if !results.is_empty() {
+            let target_ids: Vec<String> = results
+                .iter()
+                .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            if !target_ids.is_empty() {
+                let registry_owned = registry.clone();
+                let namespace = token.namespace().as_str().to_string();
+                let query_raw = query_trimmed.to_string();
+                let served_by = served_by_profile_id.clone();
+                let served_at_us = chrono::Utc::now().timestamp_micros();
+                tokio::spawn(async move {
+                    let mut ledger_params = json!({
+                        "namespace": namespace,
+                        "consumer_kind": "recall",
+                        "target_ids": target_ids,
+                        "query_raw": query_raw,
+                        "served_at": served_at_us,
+                    });
+                    if let Some(profile_id) = served_by {
+                        ledger_params["served_by_profile_id"] = json!(profile_id);
+                    }
+                    if let Err(e) = registry_owned
+                        .dispatch("brain.record_serve", ledger_params)
+                        .await
+                    {
+                        eprintln!(
+                            "[memory] serve ledger dispatch failed (non-fatal, ADR-081 §4): {e}"
+                        );
+                    }
+                });
+            }
+        }
 
         // Update recall-domain posteriors before returning.
         {
@@ -819,6 +886,279 @@ mod tests {
             !hits.is_empty(),
             "vector leg must still return the seeded note while the FTS leg is \
              degraded by the residual FTS5 char ('@'), got empty results"
+        );
+    }
+
+    // ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────
+
+    fn build_full_rt_with_brain() -> khive_runtime::KhiveRuntime {
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-mem-recall-adr081-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        std::mem::forget(tmp);
+
+        khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime")
+    }
+
+    #[tokio::test]
+    async fn recall_stamps_served_by_profile_id_and_appends_serve_ledger_row() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr081 recall stamp note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr081-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.activate",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "adr081-recall-v1",
+                }),
+            )
+            .await
+            .expect("activate profile");
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "adr081-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr081 recall stamp note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+        assert_eq!(
+            hits[0]["served_by_profile_id"],
+            serde_json::json!("adr081-recall-v1"),
+            "recall response must stamp the resolved serving profile"
+        );
+
+        // The ledger append is fired via tokio::spawn off the response path —
+        // poll briefly rather than assume it has landed by the time recall returns.
+        let target_id = note_id.id.to_string();
+        let mut found = false;
+        for _ in 0..100 {
+            let mut reader = rt.sql().reader().await.expect("reader");
+            let row = reader
+                .query_row(khive_storage::types::SqlStatement {
+                    sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                        .into(),
+                    params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                    label: None,
+                })
+                .await
+                .expect("query row");
+            if let Some(row) = row {
+                assert!(
+                    matches!(
+                        row.get("served_by_profile_id"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "adr081-recall-v1"
+                    ),
+                    "ledger row must carry the same served_by_profile_id as the response stamp"
+                );
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "serve ledger row for the recalled target must appear within 2s"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "no brain pack loaded note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "no brain pack loaded note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed even without a brain pack loaded");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].get("served_by_profile_id").is_none(),
+            "no brain pack registered => no profile resolvable => no stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_profile_resolution_latency_is_bounded() {
+        use khive_pack_brain::BrainPack;
+        use std::time::Duration;
+
+        async fn timed_recall(with_brain: bool) -> Duration {
+            let rt = if with_brain {
+                build_full_rt_with_brain()
+            } else {
+                KhiveRuntime::memory().expect("in-memory runtime")
+            };
+            let ns = Namespace::parse("local").expect("ns");
+            let token = rt.authorize(ns.clone()).expect("token");
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                "latency probe note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            if with_brain {
+                builder.register(BrainPack::new(rt.clone()));
+            }
+            let registry = builder.build().expect("registry");
+
+            if with_brain {
+                registry
+                    .dispatch(
+                        "brain.create_profile",
+                        serde_json::json!({
+                            "namespace": ns.as_str(),
+                            "name": "latency-recall-v1",
+                            "consumer_kind": "recall",
+                        }),
+                    )
+                    .await
+                    .expect("create profile");
+                registry
+                    .dispatch(
+                        "brain.activate",
+                        serde_json::json!({
+                            "namespace": ns.as_str(),
+                            "profile_id": "latency-recall-v1",
+                        }),
+                    )
+                    .await
+                    .expect("activate profile");
+                registry
+                    .dispatch(
+                        "brain.bind",
+                        serde_json::json!({
+                            "namespace": ns.as_str(),
+                            "profile_id": "latency-recall-v1",
+                            "consumer_kind": "recall",
+                        }),
+                    )
+                    .await
+                    .expect("bind profile");
+            }
+
+            let start = std::time::Instant::now();
+            registry
+                .dispatch(
+                    "memory.recall",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "query": "latency probe note",
+                        "limit": 10
+                    }),
+                )
+                .await
+                .expect("recall");
+            start.elapsed()
+        }
+
+        let without_brain = timed_recall(false).await;
+        let with_brain = timed_recall(true).await;
+        eprintln!(
+            "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
+             recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
+        );
+        assert!(
+            with_brain < Duration::from_secs(2),
+            "profile resolution must not introduce unbounded latency, got {with_brain:?}"
         );
     }
 }

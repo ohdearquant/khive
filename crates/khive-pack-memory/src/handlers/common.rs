@@ -12,6 +12,7 @@ use khive_fusion::FusionStrategy;
 use khive_retrieval::{fuse_search_results, HybridConfig};
 use khive_runtime::{
     MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError, SearchHit, SearchSource,
+    VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
@@ -119,6 +120,29 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
             "invalid fusion_strategy {other:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\""
         ))),
     }
+}
+
+/// Resolve the serving profile via ADR-035 tiers 1-2 only (explicit config,
+/// then namespace-bound `brain.resolve(consumer_kind="recall")`). Shared by
+/// `memory.feedback` (which falls through to its own tier-3 global-prior
+/// behavior on `None`) and `memory.recall`'s ADR-081 §5 serve-time stamp
+/// (which simply omits the stamp on `None`) — extracted so the two resolution
+/// paths cannot drift apart.
+pub(super) async fn resolve_serving_profile(
+    brain_profile: &Option<String>,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+) -> Option<String> {
+    if let Some(profile_id) = brain_profile {
+        return Some(profile_id.clone());
+    }
+    let ns = token.namespace().as_str().to_string();
+    khive_brain_core::resolve_consumer_profile(
+        registry,
+        &ns,
+        khive_brain_core::ConsumerKind::Recall,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
