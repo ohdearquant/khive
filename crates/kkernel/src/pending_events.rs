@@ -1100,7 +1100,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
-        let prev_timeout = std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok();
+        struct RestoreTimeout(Option<String>);
+        impl Drop for RestoreTimeout {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", v),
+                    None => std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS"),
+                }
+            }
+        }
+        let _restore = RestoreTimeout(std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok());
         std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", "120");
 
         let (_tmp, db_path) = tmp_db();
@@ -1120,11 +1129,6 @@ mod tests {
         let summary = run_pending_events(Some(&db_path), "local", false)
             .await
             .expect("drain");
-
-        match prev_timeout {
-            Some(v) => std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", v),
-            None => std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS"),
-        }
 
         assert_eq!(
             summary.failed, 0,
