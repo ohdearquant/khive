@@ -4,10 +4,10 @@
 
 ## Scope
 
-The KG pack provides 16 verb handlers for the knowledge graph substrate: entity
+The KG pack provides 17 verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
-and event-sourced proposals (ADR-046). It is the first-party pack shipped with
-the khive binary.
+entity-anchored graph context (ADR-089), and event-sourced proposals (ADR-046).
+It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
 
@@ -23,6 +23,7 @@ the khive binary.
 | [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary           | Implemented |
 | [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw) | Implemented |
 | [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                 | Implemented |
+| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context    | Implemented |
 
 ## Primary Modules
 
@@ -31,8 +32,8 @@ the khive binary.
 | [`src/lib.rs`](../src/lib.rs)                                     | Pack re-exports and crate documentation                  |
 | [`src/pack.rs`](../src/pack.rs)                                   | KgPack struct, Pack trait impl, edge endpoint rules      |
 | [`src/dispatch.rs`](../src/dispatch.rs)                           | PackRuntime impl, inventory self-registration            |
-| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (16 HandlerDef entries)         |
-| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 16 verb handler implementations                          |
+| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (17 HandlerDef entries)         |
+| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 17 verb handler implementations                          |
 | [`src/vocab.rs`](../src/vocab.rs)                                 | EntityKind (9) and NoteKind (5) enums with alias parsing |
 | [`src/entity_type_registry.rs`](../src/entity_type_registry.rs)   | Validates entity_type against per-kind subtypes          |
 | [`src/apply_worker/mod.rs`](../src/apply_worker/mod.rs)           | Applies approved proposal changesets to KG               |

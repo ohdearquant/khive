@@ -147,31 +147,34 @@ available to operator-only introspection.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (16 verbs total):
+bare verb names (17 verbs total):
 
-| Verb        | Speech act  | Description                                                                                                 |
-| ----------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
-| `create`    | commissive  | Create an entity or note                                                                                    |
-| `get`       | assertive   | Fetch any record by UUID                                                                                    |
-| `list`      | assertive   | Structured browse with pagination                                                                           |
-| `update`    | declaration | Patch entity or edge fields                                                                                 |
-| `delete`    | declaration | Soft or hard delete a record                                                                                |
-| `search`    | assertive   | Hybrid FTS + vector search                                                                                  |
-| `link`      | commissive  | Create a typed directed edge                                                                                |
-| `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype   |
-| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties |
-| `query`     | assertive   | GQL/SPARQL pattern matching                                                                                 |
-| `merge`     | declaration | Deduplicate two entities                                                                                    |
-| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                 |
-| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`.                            |
-| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                        |
-| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                |
-| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                   |
+| Verb        | Speech act  | Description                                                                                                                                                                            |
+| ----------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create`    | commissive  | Create an entity or note                                                                                                                                                               |
+| `get`       | assertive   | Fetch any record by UUID                                                                                                                                                               |
+| `list`      | assertive   | Structured browse with pagination                                                                                                                                                      |
+| `update`    | declaration | Patch entity or edge fields                                                                                                                                                            |
+| `delete`    | declaration | Soft or hard delete a record                                                                                                                                                           |
+| `search`    | assertive   | Hybrid FTS + vector search                                                                                                                                                             |
+| `link`      | commissive  | Create a typed directed edge                                                                                                                                                           |
+| `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype                                                                              |
+| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties                                                                            |
+| `query`     | assertive   | GQL/SPARQL pattern matching                                                                                                                                                            |
+| `merge`     | declaration | Deduplicate two entities                                                                                                                                                               |
+| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                                                                                            |
+| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`.                                                                                                       |
+| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                                                                                                   |
+| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                           |
+| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                              |
+| `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089). |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
 (`Visibility::Subhandler`) from its output — the returned list is identical to what the
 `request` tool's MCP description advertises.
+
+`context` was added under ADR-089 (2026-07-04) as a bare kg-substrate verb — it composes the existing `search`/`neighbors` runtime ops (`hybrid_search`, `neighbors_with_query`) into a single call rather than introducing new storage or a new runtime operation, matching the "reuse runtime ops unchanged, compose in the handler" precedent already used by `traverse`.
 
 Every other pack prefixes its verbs with the pack name and a single dot:
 
@@ -199,7 +202,7 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 `crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
 `inventory`-registered pack, walks all `HandlerDef` names, and asserts:
 
-- A bare name (no dot) must be in the 16-entry kg-substrate allowlist.
+- A bare name (no dot) must be in the 17-entry kg-substrate allowlist.
 - A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
 - Two or more dots are always a violation.
 
@@ -570,6 +573,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 - [ADR-027](ADR-027-dynamic-pack-loading.md) — inventory-based pack discovery
 - [ADR-028](ADR-028-pack-scoped-backends.md) — `khive.toml` operator config
 - [ADR-046](ADR-046-event-sourced-proposals.md) — Event-Sourced Proposals — source ADR for `propose`, `review`, and `withdraw` verbs
+- [ADR-089](ADR-089-context-verb.md) — source ADR for the `context` verb (entity-anchored graph context)
 
 ## Supersedes
 
