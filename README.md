@@ -344,6 +344,9 @@ Runnable, copy-pasteable transcripts against a scratch database. See [`demos/`](
 - [`demos/gtd-memory.md`](demos/gtd-memory.md): task lifecycle and salience-weighted memory
   recall
 
+Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agents: fetch
+[`/llms.txt`](https://ohdearquant.github.io/khive/llms.txt)).
+
 ---
 
 ## Contributing
