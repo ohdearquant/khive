@@ -325,6 +325,9 @@ khive mcp --log debug                         # Log level (default: warn)
 
 Environment variables: `KHIVE_DB`, `KHIVE_NAMESPACE`, `KHIVE_NO_EMBED`, `KHIVE_LOG`.
 
+For the `kkernel` admin CLI (migrations, reindexing, data import/export, diagnostics), see
+[docs/operations.md](docs/operations.md).
+
 ### Development
 
 ```bash
