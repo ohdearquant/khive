@@ -148,6 +148,65 @@ async fn test_neighbors_outbound() {
     assert!(!neighbor_ids.contains(&d));
 }
 
+/// Regression guard (ADR-089 context-verb review, codex round 1, High-1): a
+/// `limit` narrower than the neighbor set must keep the highest-weight edges,
+/// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
+/// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
+/// a high-weight one purely by insertion order.
+#[tokio::test]
+async fn test_neighbors_limit_keeps_highest_weight_not_insertion_order() {
+    let store = setup_memory_store();
+
+    let centre = Uuid::new_v4();
+    let low = Uuid::new_v4();
+    let mid = Uuid::new_v4();
+    let high = Uuid::new_v4();
+
+    // Insert lowest-weight edge FIRST so insertion order and weight order
+    // disagree — if LIMIT ignores ORDER BY, the low-weight edge can win.
+    store
+        .upsert_edge(make_edge(centre, low, EdgeRelation::Extends, 0.1))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(centre, mid, EdgeRelation::Extends, 0.5))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(centre, high, EdgeRelation::Extends, 0.9))
+        .await
+        .unwrap();
+
+    let query = NeighborQuery {
+        direction: Direction::Out,
+        relations: None,
+        limit: Some(2),
+        min_weight: None,
+    };
+
+    let hits = store.neighbors(centre, query).await.unwrap();
+    assert_eq!(hits.len(), 2, "limit=2 must return exactly 2 neighbors");
+
+    let neighbor_ids: HashSet<Uuid> = hits.iter().map(|h| h.node_id).collect();
+    assert!(
+        neighbor_ids.contains(&high),
+        "highest-weight neighbor must survive a narrowing limit"
+    );
+    assert!(
+        neighbor_ids.contains(&mid),
+        "second-highest-weight neighbor must survive a narrowing limit"
+    );
+    assert!(
+        !neighbor_ids.contains(&low),
+        "lowest-weight neighbor must be the one dropped by limit"
+    );
+
+    // Weight-descending, node_id-ascending-tiebreak ordering must also hold
+    // for the returned rows themselves (ADR-089's neighbor-ordering contract).
+    assert!((hits[0].weight - 0.9).abs() < 1e-9);
+    assert!((hits[1].weight - 0.5).abs() < 1e-9);
+}
+
 #[tokio::test]
 async fn test_traverse_depth_2() {
     let store = setup_memory_store();
