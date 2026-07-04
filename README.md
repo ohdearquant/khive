@@ -6,6 +6,10 @@ taxonomies, and a verb-consolidated MCP surface.
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Docs](https://img.shields.io/badge/docs-ohdearquant.github.io%2Fkhive-0969da)](https://ohdearquant.github.io/khive/)
+[![Discord](https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/JDj9ENhUE8)
+
+**[Documentation](https://ohdearquant.github.io/khive/)** &middot; **[Discord](https://discord.gg/JDj9ENhUE8)**
 
 Vector search finds similar text. A knowledge graph finds _structure_: lineages, dependencies,
 contradictions, gaps. khive gives your research agent a typed, queryable graph that grows as it
@@ -345,7 +349,8 @@ Runnable, copy-pasteable transcripts against a scratch database. See [`demos/`](
   recall
 
 Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agents: fetch
-[`/llms.txt`](https://ohdearquant.github.io/khive/llms.txt)).
+[`/llms.txt`](https://ohdearquant.github.io/khive/llms.txt)). Questions and discussion:
+[Discord](https://discord.gg/JDj9ENhUE8).
 
 ---
 

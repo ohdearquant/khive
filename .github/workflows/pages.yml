@@ -48,8 +48,13 @@ jobs:
         run: |
           set -euo pipefail
           SRC=_site_src
-          rm -rf "$SRC"
-          mkdir -p "$SRC/md"
+          rm -rf "$SRC" _raw_md
+          # Raw agent-fetchable markdown is staged OUTSIDE the Jekyll source and
+          # copied into the built site after the Jekyll step. If it lives inside
+          # the source, the github-pages gem's jekyll-optional-front-matter +
+          # jekyll-titles-from-headings plugins promote each raw file into a
+          # titled page, which duplicates every entry in the sidebar nav.
+          mkdir -p "$SRC" _raw_md
 
           cat > "$SRC/_config.yml" <<'EOF'
           title: khive
@@ -64,6 +69,7 @@ jobs:
             input: GFM
           search_enabled: true
           heading_anchors: true
+          color_scheme: khive
           nav_sort: case_insensitive
           back_to_top: true
           back_to_top_text: "Back to top"
@@ -73,7 +79,25 @@ jobs:
               - "https://github.com/ohdearquant/khive"
             "crates.io":
               - "https://crates.io/crates/khive-mcp"
+            "Discord":
+              - "https://discord.gg/JDj9ENhUE8"
           aux_links_new_tab: true
+          EOF
+
+          # Custom color scheme: neutral blue accents replacing the theme's
+          # default purple palette. The palette vars are declared !default in
+          # just-the-docs, so assignments here win; $link-color and
+          # $btn-primary-color are re-declared too because the light scheme
+          # derives them from the purple palette at its own load time.
+          mkdir -p "$SRC/_sass/color_schemes"
+          cat > "$SRC/_sass/color_schemes/khive.scss" <<'EOF'
+          $purple-000: #2b6cb0;
+          $purple-100: #0969da;
+          $purple-200: #0550ae;
+          $purple-300: #033d8b;
+          $link-color: #0969da;
+          $btn-primary-color: #0969da;
+          $sidebar-color: #f7f9fb;
           EOF
 
           # basename -> "nav_order|Title|one-line description used in llms.txt"
@@ -193,9 +217,10 @@ jobs:
               echo "Raw markdown for this page: [/md/${base}.md](${SITE_URL}/md/${base}.md)"
             } > "$SRC/$base.md"
 
-            # Raw copy for agents — no front matter, so Jekyll treats this as a
-            # static file and serves it byte-for-byte at /md/<base>.md.
-            cp "$f" "$SRC/md/$base.md"
+            # Raw copy for agents — staged outside the Jekyll source and copied
+            # into the built site post-build (see the step after Build with
+            # Jekyll), so the github-pages gem cannot promote it into a page.
+            cp "$f" "_raw_md/$base.md"
           done
 
           # llms.txt — the llms.txt convention: short summary + linked index,
@@ -226,7 +251,7 @@ jobs:
 
           # Raw markdown copy of the homepage too, matching the /md/<base>.md
           # convention for every other page — strip the front matter block.
-          awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$SRC/index.md" > "$SRC/md/index.md"
+          awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$SRC/index.md" > "_raw_md/index.md"
 
           # llms-full.txt — full concatenated markdown of every doc page.
           {
@@ -260,6 +285,17 @@ jobs:
         with:
           source: _site_src
           destination: _site
+
+      - name: Add raw markdown copies to built site
+        # Post-build so Jekyll never sees these files (they would otherwise be
+        # promoted into titled pages and duplicate the sidebar nav). The Jekyll
+        # container writes _site as root, hence sudo.
+        run: |
+          set -euo pipefail
+          sudo mkdir -p _site/md
+          sudo cp _raw_md/*.md _site/md/
+          test -f _site/md/getting-started.md
+          test -f _site/md/index.md
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
