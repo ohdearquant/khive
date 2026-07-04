@@ -115,6 +115,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-087](ADR-087-workspace-mirror.md)                       | Workspace Mirror — Folding `.khive/` Into the Graph Substrate (Proposed)                                        |
 | [ADR-088](ADR-088-git-lifecycle-pack.md)                     | Git-Lifecycle Pack — Commit and Issue Note Kinds (Proposed)                                                     |
 | [ADR-089](ADR-089-context-verb.md)                           | Context Verb — Entity-Anchored Graph Context in One Call (Proposed)                                             |
+| [ADR-090](ADR-090-docs-site-standard.md)                     | Docs Site Standard — Navigation, Agent md/txt Surfaces, Visual Style (Proposed)                                 |
 
 ## Closed Taxonomies — Quick Reference
 
