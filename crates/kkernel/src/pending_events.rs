@@ -476,7 +476,7 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64
         })
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: reclaim stale firing rows: {e}"))?;
-    Ok(rows as u64)
+    Ok(rows)
 }
 
 /// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
