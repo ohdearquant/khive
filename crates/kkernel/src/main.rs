@@ -261,8 +261,11 @@ async fn main() -> Result<()> {
                     },
                 )?;
 
-                let multi =
-                    khive_mcp::serve::build_registry_for_multi_backend(base_cfg, &khive_cfg)?;
+                let multi = khive_mcp::serve::build_registry_for_multi_backend(
+                    base_cfg,
+                    &khive_cfg,
+                    a.db.as_deref(),
+                )?;
 
                 // Build BackendRegistry: one entry per unique backend (deduplicated
                 // by backend_name so packs sharing a backend share one runtime).
