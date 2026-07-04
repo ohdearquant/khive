@@ -182,6 +182,15 @@ jobs:
           # and stage a raw copy in _raw_md/ (outside the Jekyll source so the theme
           # never promotes it to a nav page); a post-build step copies these into
           # _site/md/ for agent-fetchable raw markdown.
+          #
+          # This loop is also the single source for llms.txt / llms-full.txt below:
+          # PAGE_TITLE/PAGE_DESC/PAGE_ORDER_LIST are populated here and reused there,
+          # so a new docs/guide/*.md file (with a NAV_ORDER entry) propagates to the
+          # HTML sidebar, /md/ copy, llms.txt, and llms-full.txt with no second list
+          # to maintain.
+          declare -A PAGE_TITLE
+          declare -A PAGE_DESC
+          PAGE_ORDER_LIST=()
           for f in docs/guide/*.md; do
             base=$(basename "$f" .md)
             [ "$base" = "README" ] && continue
@@ -197,6 +206,9 @@ jobs:
               title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
               description=""
             fi
+            PAGE_TITLE[$base]="$title"
+            PAGE_DESC[$base]="$description"
+            PAGE_ORDER_LIST+=("${nav_order}|${base}")
 
             {
               echo "---"
@@ -226,6 +238,12 @@ jobs:
             cp "$f" "_raw_md/$base.md"
           done
 
+          # Ordered basenames for the agent-surface indexes below, derived from
+          # the same PAGE_ORDER_LIST the HTML/raw-copy loop above just built
+          # (nav_order, then basename, ascending) — not a separately maintained
+          # list.
+          mapfile -t ORDERED_BASENAMES < <(printf '%s\n' "${PAGE_ORDER_LIST[@]}" | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2)
+
           # llms.txt — the llms.txt convention: short summary + linked index,
           # HTML and raw-markdown URLs for every page.
           {
@@ -238,11 +256,9 @@ jobs:
             echo "## Docs"
             echo
             echo "- [Home](${SITE_URL}/): project overview, install, demos ([markdown](${SITE_URL}/md/index.md))"
-            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
-              entry="${NAV_ORDER[$base]}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
-              description="${rest#*|}"
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              title="${PAGE_TITLE[$base]}"
+              description="${PAGE_DESC[$base]}"
               echo "- [${title}](${SITE_URL}/${base}.html): ${description} ([markdown](${SITE_URL}/md/${base}.md))"
             done
             echo
@@ -257,18 +273,37 @@ jobs:
 
           # Raw markdown copy of the homepage too, matching the /md/<base>.md
           # convention for every other page — strip the front matter block.
+          # Taken BEFORE the footer append below, so the raw copy stays the
+          # page's own content only, same as every other page's _raw_md/*.md.
           awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$SRC/index.md" > "_raw_md/index.md"
 
-          # llms-full.txt — full concatenated markdown of every doc page.
+          # Raw-markdown footer link, appended to the HTML source only (not
+          # the raw copy above) — mirrors the footer every guide page gets in
+          # its assembly step.
+          {
+            echo
+            echo "---"
+            echo
+            echo "Raw markdown for this page: [/md/index.md](md/index.md)"
+          } >> "$SRC/index.md"
+
+          # llms-full.txt — full concatenated markdown of every doc page,
+          # including Home (front-matter-stripped, reusing the same
+          # _raw_md/index.md produced above for the raw-markdown copy).
           {
             echo "# khive — full documentation"
             echo
             echo "Concatenated from ${SITE_URL}/ and every page below. Generated from docs/guide/*.md; do not edit directly."
             echo
-            for base in getting-started knowledge-graph memory search tasks prompt-cookbook api-reference; do
-              entry="${NAV_ORDER[$base]}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
+            echo "---"
+            echo
+            echo "## Home"
+            echo
+            echo "Source: ${SITE_URL}/"
+            echo
+            cat "_raw_md/index.md"
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              title="${PAGE_TITLE[$base]}"
               echo
               echo "---"
               echo
