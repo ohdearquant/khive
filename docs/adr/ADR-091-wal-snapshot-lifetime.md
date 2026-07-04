@@ -1,4 +1,4 @@
-# ADR-091: Bounded read-snapshot lifetime and WAL checkpoint escalation
+# ADR-091: Bounded read-transaction lifetime and WAL checkpoint escalation
 
 **Status**: Proposed
 **Date**: 2026-07-04
@@ -14,199 +14,274 @@ concurrent implementer agents plus a warm daemon. Writes started failing with
 `comm.send` and other write ops. `PRAGMA wal_checkpoint(PASSIVE)` returned `0|3768965|44`:
 the writer was not busy, 3,768,965 frames sat in the WAL, and only 44 were checkpointable.
 Process census at the time: one `kkernel mcp --daemon` plus seven `kkernel mcp [--db ...]`
-stdio sessions, several live parents more than 24h old.
+stdio sessions, several live parents more than 24h old. Killing the idle stdio processes
+freed the WAL, which is the load-bearing datum this ADR's mechanism has to explain: some
+per-process, long-lived state was pinning the checkpoint boundary, and closing the
+process (not merely being idle) released it.
 
-`0|3768965|44` means SQLite's own checkpoint boundary, the oldest live reader's snapshot
-mark, had barely moved in 3.77M frames. `PRAGMA wal_checkpoint(PASSIVE)` never blocks and
-never reclaims past the oldest reader; it is by design incapable of doing more than this
-once a reader pins the tail. The write timeouts are a downstream symptom: as the WAL and
-`-shm` grow, `wal-index` operations degrade and both readers and the writer do more work
-per statement, but the presenting error (`timed out ... waiting for writer connection`)
-is a `khive-db` writer-mutex checkout timeout (`crates/khive-db/src/pool.rs:308-319`),
-not a SQLite-level lock. The writer mutex itself was uncontended; the writer was simply
-slow underneath a bloated WAL.
+`0|3768965|44` means SQLite's own checkpoint boundary, the oldest live reader's mark, had
+barely moved across 3.77M frames. `PRAGMA wal_checkpoint(PASSIVE)` never blocks and never
+reclaims past the oldest reader; it is by design incapable of doing more than this once a
+reader pins the tail. The write timeouts are a downstream symptom: as the WAL and `-shm`
+grow, `wal-index` operations degrade and both readers and the writer do more work per
+statement, but the presenting error (`timed out ... waiting for writer connection`) is a
+`khive-db` writer-mutex checkout timeout (`crates/khive-db/src/pool.rs:308-319`), not a
+SQLite-level lock. `PASSIVE` reported `busy=0`, so the writer mutex itself was not
+contended at diagnosis time; the writer was simply slow underneath a bloated WAL, or hit
+timeouts during separate bursts. Root cause is squarely "something pinned the checkpoint
+boundary," not writer contention.
 
-### What the codebase already does (as of `origin/main`, verified 2026-07-04)
+### Round-1 review correction (this section replaces the original draft's Plank 1 basis)
 
-- `crates/khive-db/src/pool.rs` implements one writer (`Mutex<Connection>`) plus an
-  `ArrayQueue` of `max_readers` pooled reader connections (default:
-  `min(available_parallelism, 8)`, `pool.rs:15,64-67`). `ReaderGuard::drop`
-  (`pool.rs:145-156`) returns a pooled connection via `return_reader` (`pool.rs:434-454`).
-- `return_reader` already defends against one failure mode: an **explicit** transaction
-  left open on a reader (`reset_reader_connection`, `pool.rs:561-582`) issues `ROLLBACK`
-  and re-opens the connection if that fails or the connection fails a liveness probe
-  (`reader_connection_is_healthy`, `pool.rs:584-597`). This does **not** address an
-  **implicit** (autocommit) read snapshot: `conn.is_autocommit()` is `true` for a bare
-  `SELECT` the instant the last row is read, so `reset_reader_connection` short-circuits
-  to `true` (`pool.rs:562-564`) without doing anything, even though the connection's WAL
-  read mark can, in practice, still reference the point-in-time snapshot from whichever
-  statement it last executed until that connection runs a new statement. A reader
-  connection idle in the pool queue between checkouts carries its last snapshot forward
-  indefinitely; with 8 readers and uneven per-session query volume, some pooled
-  connections can sit unused for long stretches while still anchored at an old WAL
-  position.
-- `crates/khive-db/src/checkpoint.rs` (module added since the last WAL incident) already
-  runs a periodic background task (`run_checkpoint_task`, `checkpoint.rs:141-183`),
-  spawned once per daemon (`crates/khive-runtime/src/daemon.rs:498-502`). It issues
-  `PRAGMA wal_checkpoint(PASSIVE)` every `interval` (default 500ms,
-  `checkpoint.rs:53-58`) via `try_writer_nowait` (`pool.rs:337-344`, zero-wait try-lock,
-  skips the tick rather than stalling behind write traffic) and logs a rate-limited WARN
-  once WAL pages cross `warn_pages` (default 2000, ~8MB) or `high_water_pages` (default
-  6000, ~24MB; `checkpoint.rs:60-75`).
-- The module's own doc comment (`checkpoint.rs:12-21`) explains **why TRUNCATE is
-  deliberately excluded** from this periodic task: `TRUNCATE` inherits `RESTART`
-  semantics, it invokes the busy handler and waits (up to the pool's `busy_timeout`,
-  default 30s, `pool.rs:29-32,69-74`) for open reader snapshots to release before it can
-  reset the WAL file. Running that on a 500ms periodic tick could stall all writes for
-  up to 30s. So today, past `high_water_pages`, the daemon only WARNs; nothing in the
-  codebase currently reclaims the WAL automatically once PASSIVE stops making progress.
-  This is exactly the gap the incident hit: `high_water_pages` (6000) was crossed by
-  three orders of magnitude (3,768,965 observed) with no escalation path.
-- `journal_size_limit_bytes` (`pool.rs:44-49`, default 64MiB, `KHIVE_JOURNAL_SIZE_LIMIT_BYTES`)
-  is already configured on the writer connection. This pragma bounds the WAL file size
-  that a **successful TRUNCATE checkpoint** will shrink down to; it does not, by itself,
-  cause a checkpoint to run. PASSIVE checkpoints reclaim frames logically (advance the
-  boundary SQLite reuses) but do not shrink the file on disk. Only TRUNCATE (or, on
-  some platforms, the `wal_autocheckpoint`-triggered auto-checkpoint that itself may run
-  in TRUNCATE-adjacent modes under certain conditions) resizes the `-wal` file. The
-  15.5GB number in the incident is a **file size**; closing the gap between "frames
-  checkpointed" and "bytes reclaimed on disk" requires TRUNCATE to actually run.
-- Read paths in the hot query surface (`crates/khive-runtime/src/retrieval.rs:384-460`,
-  `hybrid_search`) check out and release a reader per storage call (`self.text(token)?
-  .search(...).await`, `self.vector_search(...)`), not held across the whole request.
-  The per-call-site discipline is already followed in the code we inspected. No call
-  site under `crates/khive-db/src/stores/*.rs` opens an explicit read-side `BEGIN`
-  (grep confirmed: every `BEGIN IMMEDIATE` in the tree is on a writer path,
-  `stores/note.rs:433`, `stores/entity.rs:325`, `stores/vectors.rs:356`,
-  `stores/text.rs:298,363,1111`, `stores/graph.rs:352`, `stores/sparse.rs:249`,
-  `stores/event.rs:707,722`). This rules out "explicit read `BEGIN` never committed" as
-  the mechanism and points instead at (a) the idle-pooled-connection-carries-forward-a-
-  stale-implicit-snapshot mechanism described above, and/or (b) a handler holding a
-  `ReaderGuard` across a slow non-DB step (a long embedding call, a large unbounded
-  result iteration) rather than releasing it before that step. Both are real risks under
-  the incident's topology: seven independent `kkernel mcp` processes each running their
-  own `ConnectionPool` against the same file, several sessions live for >24h.
+Codex round-1 review of this ADR rejected the original mechanism on two Blockers, both
+confirmed correct against the code:
+
+1. **An idle, returned autocommit connection does not pin a WAL snapshot.** The
+   codebase's own regression test (`crates/khive-db/src/checkpoint.rs:404-441`) proves
+   this directly: it must explicitly run `BEGIN DEFERRED; SELECT * FROM t;`
+   (`checkpoint.rs:407-410`) to construct a pin, and its own doc comment states "An idle
+   connection (no BEGIN) does NOT pin frames" (`checkpoint.rs:405-406`). SQLite's WAL
+   documentation ties a reader's end mark to the duration of its transaction; an
+   autocommit (implicit) read ends its transaction, and its snapshot lock, when the
+   statement finishes and is reset. `conn.is_autocommit()` being `true` (the state the
+   original draft flagged as ambiguous) in fact correctly indicates no held snapshot.
+   The original Context section's claim that an idle pooled connection "carries its last
+   snapshot forward indefinitely" is wrong and is retracted.
+2. **Production reads never go through the pooled `ReaderGuard`/`return_reader` path the
+   original Plank 1 targeted.** Grep-verified across every call site of
+   `ConnectionPool::reader()` in the tree (`checkpoint.rs:407` is a test; all seven
+   production call sites are inside each store's `with_reader` `else` branch: `graph.rs:
+   107`, `vectors.rs:245`, `event.rs:101`, `note.rs:96`, `entity.rs:95`, `text.rs:126`,
+   `sparse.rs:172`). Every one of those `else` branches is gated on `!self.is_file_backed`
+   (see each store's `with_reader`, e.g. `entity.rs:81-99`, `vectors.rs:232-250`). Every
+   production database is file-backed (`StorageBackend::sqlite`, `backend.rs:28-40`, sets
+   `is_file_backed: true` unconditionally). So `pool.reader()` and, with it,
+   `return_reader`'s recycling logic, is **dead code on the production read path** and
+   only ever exercises for in-memory (test) backends. Recycling connections that
+   production traffic never touches cannot fix a production incident.
+
+Given both premises of the original Plank 1 are false for production, this revision
+starts over: it inventories every place in the codebase that can actually hold a SQLite
+read transaction open, states plainly which of those are proven safe by construction,
+which are live-but-unlikely, and which cannot be resolved from static code reading alone
+(and therefore get instrumented, not "fixed" on an unverified guess).
+
+### Inventory: what can hold a WAL read mark in this codebase
+
+**(1) Standalone per-call read connections: safe by construction, confirmed.** Every
+production (file-backed) store's `with_reader` opens a fresh, standalone,
+`SQLITE_OPEN_READ_ONLY` connection per call (`open_standalone_reader`, e.g.
+`entity.rs:41-63`, mirrored in `note.rs`, `graph.rs`, `text.rs`, `vectors.rs`, `event.rs`,
+`sparse.rs`), passes it into one `FnOnce(&Connection) -> Result<R, rusqlite::Error>`
+closure executed synchronously inside `tokio::task::spawn_blocking`
+(`entity.rs:88-91`, `vectors.rs:236-238`, same shape in every store), and drops the
+connection when that closure returns (it is a function-local variable never escaped or
+stored). The generic `SqlAccess` trait impl on `StorageBackend` (`backend.rs`, the
+`reader()` method feeding `SqlBridge`) follows the identical open-standalone-per-call
+pattern. `R` is always an owned value (`Option<SqlRow>`, `Vec<SqlRow>`, etc.); no call
+site returns a live `Rows`/`Statement` cursor to the caller. A codebase-wide grep for a
+struct field of type `Box<dyn SqlReader>` or `Box<dyn SqlTransaction>` (a long-lived
+handle that could outlive one call) returned zero matches outside trait/return-type
+declarations. **This read path is bounded to the wall-clock duration of one synchronous
+closure and cannot explain a multi-hour pin**, unless that closure itself runs
+pathologically long (see (3)).
+
+**(2) `SqlBridge::begin_tx`'s explicit transactions: a genuine live-connection-duration
+risk, but not demonstrated as the incident's cause.** `sql_bridge.rs:848-894` opens a
+**standalone** connection and issues an explicit `BEGIN` (`BEGIN DEFERRED` for read-only,
+`BEGIN IMMEDIATE` for read-write, `BEGIN EXCLUSIVE` for serializable;
+`sql_bridge.rs:869-882`) that stays open, on that one connection, for exactly as long as
+the caller holds the returned `SqliteTransaction` before calling `commit()` or letting it
+drop. This is the one place in the codebase where transaction duration is fully
+caller-controlled rather than bounded by a single synchronous closure. However:
+tracing every production call site of `begin_tx` (`grep -rn "begin_tx(" crates`) finds
+exactly two non-test callers, `khive-pack-session/src/mirror/ingest.rs:615` and `:2416`,
+both `SqlTxOptions::default()` (`read_only: false`, `SqlIsolation` not `Serializable`),
+which resolves to `BEGIN IMMEDIATE`, a **write** transaction, not the read-only
+`BEGIN DEFERRED` path. Both call sites are bounded batch loops (one mirror-ingest pass
+over a file's new events) that commit at the end of the function; neither is held across
+a poll-loop sleep (`mirror/service.rs` sleeps at `service.rs:348` with no open
+transaction or connection carried across that await; every tick reopens what it needs).
+The read-only `BEGIN DEFERRED` branch requires either an explicit
+`SqlTxOptions { read_only: true, .. }` caller (none exists in the tree today) or the
+entire backend opened via `StorageBackend::sqlite_read_only` (`backend.rs:46-70`, an
+opt-in config path via `cfg.read_only` in `serve.rs:1209`, not the default `khive.db`
+backend construction). **This mechanism is real and worth bounding defensively, but it
+is a latent risk under today's call graph, not a proven explanation for #580.**
+
+**(3) A pathologically long single closure inside (1).** Because (1)'s connections are
+provably bounded to the closure's own execution, an ANN/vector search, graph traversal,
+or bulk export that itself runs for a very long time while holding its standalone reader
+would still pin the tail for that duration. This is self-terminating (the request
+eventually returns), which sits awkwardly against the incident's evidence of >24h-old
+_processes_ mattering, but cannot be fully ruled out for pathological queries (e.g. an
+unbounded `traverse` or a brute-force ANN fallback over a large corpus).
+
+**(4) The `vec0` (sqlite-vec) virtual table's internal cursor/transaction semantics.**
+`vectors.rs` queries `vec0` tables through the same bounded standalone-connection pattern
+as (1), so from the Rust wrapper's perspective KNN queries are bounded the same way.
+`vec0` itself, however, is a loaded native extension (`extension.rs`) whose own internal
+locking/cursor behavior during a KNN scan is not visible from this repository's Rust
+source and was **not verified** in this review. This is flagged as an open question, not
+asserted as a cause.
+
+**(5) The pool's own eagerly-opened, permanently idle reader connections.** For
+completeness: `ConnectionPool::new` (`pool.rs:221-243`) always opens `max_readers`
+(default up to 8) pooled reader connections at construction, even for file-backed
+backends whose reads never route through them per the finding above. These sit open for
+the process lifetime, but a WAL snapshot begins with a connection's _first statement_,
+not at `open()` (no PRAGMA in `configure_reader_connection`, `pool.rs:534-540`, executes
+a `SELECT` against the schema). Since these connections never execute a statement in
+file-backed production mode (nothing calls `pool.reader()` there), they never take a
+snapshot and are **not a candidate**.
+
+### Honest conclusion
+
+Static code reading does not conclusively identify a Rust-level mechanism that holds a
+read transaction open for the incident's observed timescale (processes live >24h). The
+strongest remaining candidates, in order of plausibility, are: (2) if a future or
+missed caller ever holds a `begin_tx` transaction across a long idle span (not currently
+demonstrated), (4) `vec0`'s internal behavior (unverified, native code, needs targeted
+instrumentation or upstream documentation review), and (3) a pathologically long bounded
+query (self-terminating, doesn't match the ">24h idle process" shape well). Per
+讲事实摆道理: rather than assert an unproven mechanism and design enforcement around it,
+this ADR now leads with instrumentation to let production telemetry identify the actual
+pin source before tuning any enforcement threshold, and separately bounds the one
+mechanism (2) that is real, live, and caller-controllable, even though it isn't proven to
+be this incident's specific trigger.
 
 ### Non-goals
 
 This ADR does not redesign writer serialization (the single-writer-mutex model is
-unchanged), does not change journal mode away from WAL, and does not add general
-connection-pool observability beyond what is needed to diagnose and bound this specific
-defect class. Batch-write contention and multi-writer scaling are tracked separately.
+unchanged), does not change journal mode away from WAL, and does not speculate further
+about `vec0`'s internal C implementation beyond flagging it as unverified. Batch-write
+contention and multi-writer scaling are tracked separately.
 
 ## Decision
 
-Two complementary planks. Plank 1 bounds how long any single reader connection can pin
-the WAL tail. Plank 2 gives the daemon a safe, bounded way to reclaim WAL bytes once
-PASSIVE checkpointing stalls behind a pinned reader, including one that briefly outlives
-Plank 1's bound.
+Three parts. Plank 0 instruments the checkpoint task to name what is actually pinning
+the boundary in production, since static reading could not conclusively identify it.
+Plank 1 bounds the one mechanism proven to allow caller-controlled read-transaction
+duration (`begin_tx`), plus the in-memory/test pooled-reader path the original draft
+targeted, narrowed to the surface it actually covers. Plank 2 (TRUNCATE escalation)
+carries over from the original draft largely unchanged, with an explicit flap/backoff
+statement added per Leo's request.
 
-### Plank 1: bounded read-snapshot lifetime
+### Plank 0: instrumentation before enforcement tuning
 
-**Primary mechanism: recycle pooled reader connections by age, unconditionally, on
-return.**
+Because Plank 1's thresholds cannot be responsibly chosen without knowing which
+mechanism is real, add observability first and treat it as a prerequisite deliverable,
+not an optional nice-to-have:
 
-Extend `return_reader` (`crates/khive-db/src/pool.rs:434-454`) so that every pooled
-reader connection is closed and reopened once it has been alive longer than a configured
-age, regardless of `is_autocommit()` state. This is a deliberate blunt instrument: rather
-than trying to detect whether a connection still references a stale WAL snapshot (which
-`is_autocommit()` cannot answer, see Context), closing and reopening the physical
-connection unconditionally guarantees the OS/SQLite-level grip on the old WAL position is
-released, because a fresh `Connection::open_with_flags` call takes a fresh snapshot only
-when it next reads.
+- On every `run_checkpoint_task` tick (`checkpoint.rs:141-183`), in addition to the
+  existing `wal_pages` observation, log (`tracing::debug!` normally, escalating to
+  `tracing::warn!` once `wal_pages` crosses `warn_pages`, matching the existing
+  rate-limited crossing pattern) the age of the oldest currently-open `begin_tx`
+  transaction, if any (see Plank 1's tracking below), and the current WAL frame count.
+- On a TRUNCATE attempt (Plank 2) that fails to make progress (`wal_pages_after` within a
+  small epsilon of `wal_pages_before`), enumerate and log every currently-open `begin_tx`
+  transaction's start time, elapsed duration, and (if the caller supplied one) a label,
+  extending `SqlTxOptions` with an optional `label: Option<&'static str>` mirroring the
+  `SqlStatement::label` convention already used elsewhere (`ingest.rs`'s
+  `label: Some("session_mirror_insert_message")` pattern). This directly answers the
+  question this ADR could not answer from static reading: which specific caller, if any,
+  is holding the pin, the next time this happens in production.
+- This data gates Plank 1's threshold tuning: `KHIVE_TX_MAX_AGE_SECS` (below) ships with
+  a conservative default and is explicitly called out as provisional pending one cycle
+  of production telemetry from this plank.
 
-- New `PoolConfig` field: `reader_max_age: Duration`, default **300s (5 min)**.
-  Overridable via `KHIVE_READER_MAX_AGE_SECS`. Tracked by recording an `opened_at:
-  Instant` alongside each pooled `Connection` (the pool currently stores bare
-  `Connection` values in the `ArrayQueue<Connection>`, `pool.rs:106`; this becomes
-  `ArrayQueue<PooledReader>` where `PooledReader { conn: Connection, opened_at: Instant }`,
-  an additive, internal-only change with no public API break).
-- New `PoolConfig` field: `reader_max_ops: u64`, default **5000**. A secondary bound for
-  connections that stay busy enough to never go idle long enough to cross the age bound;
-  incremented per checkout, checked alongside age in `return_reader`.
-- `return_reader` logic becomes: if `reset_reader_connection` fails, or the connection
-  fails `reader_connection_is_healthy`, or `opened_at.elapsed() >= reader_max_age`, or
-  `ops_count >= reader_max_ops`, close (`close_connection_quietly`, `pool.rs:599-604`)
-  and replace with a freshly opened connection (`open_reader_connection`,
-  `pool.rs:369-376`) before pushing back onto the queue. This is strictly additive to
-  the existing explicit-transaction check; it never removes it.
-- Recycling only ever happens inside `return_reader`, i.e. when the connection is _not_
-  checked out. A guard's `Drop` always completes its return before the connection is
-  eligible for recycling, so a live borrower is never yanked out from under it (see
-  Failure modes).
+### Plank 1: bound the one caller-controllable read-transaction path, retarget the rest
 
-**Diagnostic complement: checkout-age watchdog.** Age-based recycling on return cannot
-help a reader that is checked out and held for a very long time (a handler bug, or a
-slow non-DB step performed while still holding the guard); recycling only fires when
-the guard comes back. Add lightweight outstanding-checkout tracking to `ConnectionPool`:
-an `AtomicU64` counter of the oldest currently-outstanding checkout's start time (a
-single global watermark is sufficient; per-lease tracking is not needed for a warning
-signal). Expose `ConnectionPool::oldest_checkout_age(&self) -> Option<Duration>`. The
-existing periodic task (`run_checkpoint_task`, `checkpoint.rs:141-183`) samples this once
-per tick and logs a rate-limited WARN (reusing the `crossing_warn` pattern already in
-that file, `checkpoint.rs:224-228`) when it exceeds `KHIVE_READER_CHECKOUT_WARN_SECS`
-(default **10s**). This closes today's blind spot: when a WAL high-water WARN fires,
-there is currently no signal correlating it to a specific checkout being open for Ns;
-this makes that correlation visible in the same log stream.
+**`begin_tx` transaction age bound (new, replaces the original Plank 1's primary
+mechanism).** `SqliteTransaction` (`sql_bridge.rs:401-407`) gains an `opened_at: Instant`
+field, set when `begin_tx` issues its `BEGIN` (`sql_bridge.rs:882-883`). Two enforcement
+points, both because a transaction on a standalone connection cannot be safely
+force-rolled-back from a different thread than the one holding it:
 
-### Plank 2: daemon-side TRUNCATE escalation
+- **Soft cap (logging only):** every `execute`/`query_row`/`query_all` call on the
+  transaction (`sql_bridge.rs:411-538`) checks `opened_at.elapsed()` and logs a
+  rate-limited `tracing::warn!` (same edge-triggered pattern as `crossing_warn`,
+  `checkpoint.rs:224-228`) once it exceeds `KHIVE_TX_WARN_SECS` (default **30s**;
+  provisional, see Plank 0). Includes the transaction's `label` if the caller supplied
+  one.
+- **Hard cap (fail-closed):** once `opened_at.elapsed()` exceeds
+  `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see Plank 0), subsequent
+  `execute`/`query_row`/`query_all` calls on that transaction return an error instead of
+  running the statement, forcing the caller's own error-handling path to abort and drop
+  the transaction. `SqliteTransaction` has no `Drop` impl today (`sql_bridge.rs:401-407`);
+  dropping the struct drops its `Option<Connection>`, and `rusqlite::Connection::drop`
+  closes the connection, which SQLite auto-rolls-back on close. This is already correct
+  behavior; the hard cap makes sure a caller that ignores the soft-cap WARN and keeps
+  looping cannot hold the transaction open indefinitely. No committed work is lost that
+  the caller didn't already fail to commit; this is strictly a bound on worst-case
+  duration, not a change to commit semantics.
+- `KHIVE_TX_WARN_SECS` / `KHIVE_TX_MAX_AGE_SECS` are deliberately generous relative to
+  the two known production callers (bounded per-file mirror-ingest batches, expected to
+  complete in well under a second per file in normal operation) so this cap is a safety
+  net for a runaway loop or a future caller, not a routine limit.
 
-The periodic task keeps its existing behavior unchanged for every ordinary tick: PASSIVE
-only, `try_writer_nowait`, skip-on-busy (`checkpoint.rs:196-214`). This plank adds a
-second, much rarer escalation path rather than modifying that hot loop, so the
-already-tested non-blocking guarantee for normal ticks is untouched.
+**Pooled `ReaderGuard` recycling: keep, narrow the claim.** The original draft's
+age/op-count recycling on `return_reader` (`pool.rs:434-454`) is retained exactly as
+designed, because it is harmless and still correct hygiene, but the ADR no longer claims
+it protects production file-backed traffic: it only ever executes for in-memory/test
+`ConnectionPool` instances (see the Round-1 correction above). State this explicitly so a
+future reader of this ADR does not re-inherit the false production claim.
+`KHIVE_READER_MAX_AGE_SECS` (default 300s) and `KHIVE_READER_MAX_OPS` (default 5000)
+config keys are retained under this narrowed scope.
 
-- New `CheckpointConfig` fields:
-  - `truncate_high_water_pages: u64`, default **20,000 pages** (~80MB at 4KiB pages).
-    Deliberately well above `high_water_pages` (6000, WARN-only) so TRUNCATE is reserved
-    for sustained pressure, not transient bursts. Overridable via
-    `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`.
-  - `truncate_min_interval: Duration`, default **5 minutes**. Minimum spacing between
-    TRUNCATE attempts, so a stuck reader cannot cause repeated blocking attempts in a
-    tight loop. Overridable via `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS`.
-  - `truncate_busy_timeout: Duration`, default **2000ms**. A temporary busy-timeout
-    override applied to the writer connection immediately before the TRUNCATE attempt
-    and restored to the pool's configured `busy_timeout` (default 30s) immediately
-    after, win or lose. Overridable via `KHIVE_WAL_TRUNCATE_BUSY_MS`. This bounds the
-    worst-case write stall from a TRUNCATE attempt to about 2s instead of inheriting the
-    full 30s `busy_timeout`, matching the reasoning already documented for why the
-    periodic PASSIVE path avoids TRUNCATE (`checkpoint.rs:12-21`). The fix here is not
-    "run TRUNCATE at the same cadence with a short timeout" (still resource-costly if
-    attempted every 500ms), it is "run TRUNCATE occasionally, only under sustained
-    pressure, with its blocking window capped."
-- `run_checkpoint_task` logic addition, evaluated only on `CheckpointTick::Observed`
-  ticks (a skipped tick already `continue`s and is unaffected): if `wal_pages >=
-  truncate_high_water_pages` and `last_truncate_attempt.elapsed() >=
-  truncate_min_interval`, acquire the writer via the same `try_writer_nowait` already
-  held for the PASSIVE call in that tick (never a separate, blocking writer checkout),
-  temporarily set `busy_timeout = truncate_busy_timeout` via
-  `PRAGMA busy_timeout=<ms>`, issue `PRAGMA wal_checkpoint(TRUNCATE)`, restore
-  `busy_timeout` to the pool's configured value, and record `last_truncate_attempt =
-  now()` regardless of outcome (so a failed or timed-out attempt still respects the
-  min-interval before retrying).
-- Observability: `tracing::info!` on every TRUNCATE attempt with `wal_pages_before`,
-  `wal_pages_after` (re-query via `query_wal_pages`, `checkpoint.rs:242-246`), and
-  `elapsed`. `tracing::warn!` when three consecutive TRUNCATE attempts each fail to bring
-  `wal_pages` back under `warn_pages`. This is the signal that recycling (Plank 1) is
-  not resolving the pin, most likely a genuinely leaked (never-returned) reader guard
-  rather than an idle stale-snapshot connection, and should page an operator.
-- Interaction with Plank 1: Plank 1 bounds how long any pooled reader can pin the tail
-  (`reader_max_age`, default 300s) and surfaces long-held checkouts
-  (`oldest_checkout_age`). Plank 2's TRUNCATE attempts happen at 5-minute-minimum
-  spacing, so in steady state a TRUNCATE attempt is likely to occur after at least one
-  full reader-recycle cycle has already rolled off the previous generation of pinned
-  snapshots. The two planks compound rather than duplicate effort.
+**Checkout-age watchdog: retained, same narrowed scope.** `oldest_checkout_age()`
+(as originally specified) is still useful for the in-memory/test pool path and for any
+future production caller of `pool.reader()`, so it is kept, but is not claimed to cover
+today's production reads.
+
+### Plank 2: daemon-side TRUNCATE escalation (carried over, with explicit backoff)
+
+Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-only,
+`try_writer_nowait`, skip-on-busy behavior for every ordinary tick
+(`checkpoint.rs:196-214`); this plank adds a separate, much rarer escalation path.
+
+- `CheckpointConfig` gains `truncate_high_water_pages` (default **20,000 pages**,
+  `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`), `truncate_min_interval` (default **5 minutes**,
+  `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS`), and `truncate_busy_timeout` (default
+  **2000ms**, `KHIVE_WAL_TRUNCATE_BUSY_MS`), with the same semantics as originally
+  specified: past the high-water mark, no more often than the min interval, attempt
+  `PRAGMA wal_checkpoint(TRUNCATE)` via `try_writer_nowait` with a temporarily shortened
+  busy timeout restored immediately after, win or lose.
+- **Explicit flap/backoff behavior (Leo's addition):** if `try_writer_nowait()` itself
+  fails (the writer mutex is held by a concurrent write) at the moment a TRUNCATE attempt
+  is due, the attempt is skipped for that tick exactly like an ordinary PASSIVE skip; the
+  task does not retry within the same tick or spin-wait. `last_truncate_attempt` is
+  **not** updated on a skip (only on an attempt that actually acquired the writer), so
+  the next tick where the writer is free is eligible immediately rather than waiting out
+  the full `truncate_min_interval` again. If the writer is busy for a sustained period
+  (multiple consecutive ticks), each tick's ordinary PASSIVE attempt still runs
+  (`try_writer_nowait` failing for TRUNCATE doesn't preclude a separate successful
+  PASSIVE elsewhere in the same tick loop, since both share the one `try_writer_nowait`
+  call per tick, and a busy writer skips both simultaneously per the current tick
+  design). **Accepted worst case, stated explicitly:** if the writer is continuously busy
+  for the entire observation window, TRUNCATE never runs and the WAL keeps growing past
+  `truncate_high_water_pages`; the mitigation is the existing rate-limited WARN
+  escalating in severity at higher multiples of the threshold (e.g. WARN at 1x, a second
+  distinct WARN at 4x) so sustained failure to reclaim is visible to an operator rather
+  than silently absorbed, rather than promising unconditional reclamation, which would
+  require blocking writer acquisition (rejected, see original Alternatives).
+- Observability: unchanged from the original draft (`tracing::info!` per attempt with
+  before/after page counts and elapsed time; `tracing::warn!` after three consecutive
+  attempts fail to clear `warn_pages`), extended per Plank 0 to also log open `begin_tx`
+  transactions when an attempt fails to make progress.
 
 ### Config summary
 
-| Key                                    | Default | Plank | Purpose                                                               |
-| -------------------------------------- | ------- | ----- | --------------------------------------------------------------------- |
-| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Force-recycle a pooled reader connection past this age on return      |
-| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Force-recycle a pooled reader connection past this op count on return |
-| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding checkout exceeds this age            |
-| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                           |
-| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between TRUNCATE attempts                             |
-| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt             |
+| Key                                    | Default | Plank | Purpose                                                                                      | Status                                     |
+| -------------------------------------- | ------- | ----- | -------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Soft-cap WARN on an open `begin_tx` transaction's age                                        | New, provisional pending Plank 0 telemetry |
+| `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Hard-cap: reject further statements on a transaction past this age                           | New, provisional pending Plank 0 telemetry |
+| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)        | Carried over, scope narrowed               |
+| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)   | Carried over, scope narrowed               |
+| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only) | Carried over, scope narrowed               |
+| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                  | Carried over                               |
+| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                         | Carried over                               |
+| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                    | Carried over                               |
 
 Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES` (2000),
 `KHIVE_WAL_HIGH_WATER_PAGES` (6000), `KHIVE_JOURNAL_SIZE_LIMIT_BYTES` (64MiB),
@@ -226,57 +301,65 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
    older than N hours). Rejected: violent, drops in-flight agent work, and does not fix
    the mechanism since a freshly started session can re-pin the tail immediately.
    Long-lived stdio sessions are live Claude Code seats; killing them by policy is a
-   worse user experience than bounding their reader-connection lifetime underneath them.
+   worse user experience than bounding transaction/connection lifetime underneath them.
+   Also notable: the incident's own workaround (killing idle processes freed the WAL)
+   is exactly this alternative applied manually, which is precisely why it is not an
+   acceptable long-term policy rather than evidence the mechanism is understood.
 4. **Route all reads through the daemon instead of per-process pools** (collapse "N
    independent `ConnectionPool`s against one file" into one daemon-mediated reader path).
-   This would remove the multi-pool topology that made the incident's seven independent
-   pools possible in the first place, and is a natural extension of ADR-049's daemon
-   warm-state model. Noted as a future direction, out of scope here: it requires an MCP
-   transport change (stdio sessions proxying reads through the daemon socket) beyond a
-   bounded connection-lifetime fix.
+   Would remove the multi-process topology entirely and is a natural extension of
+   ADR-049's daemon warm-state model. Noted as a future direction, out of scope here: it
+   requires an MCP transport change (stdio sessions proxying reads through the daemon
+   socket) beyond a bounded-lifetime fix, and per this ADR's inventory, production reads
+   are already bounded per-call, so this alternative would not by itself have prevented
+   #580 unless the actual pin turns out to be a `begin_tx` write path that a
+   daemon-mediated design would also need to serialize correctly.
 
 ## Failure modes
 
+- **`begin_tx` hard-cap rejection during a legitimate long-running batch.** If a future
+  caller legitimately needs a transaction open longer than `KHIVE_TX_MAX_AGE_SECS`
+  (120s default), the hard cap forces it to fail and retry in smaller batches. This is
+  an intentional trade: no code path in the tree today needs a transaction anywhere near
+  that long (mirror-ingest batches are per-file and complete well under a second in
+  normal operation); if this becomes a real constraint, raise the cap rather than remove
+  it, using Plank 0's telemetry to confirm the caller's real needs first.
 - **TRUNCATE contention**: bounded to `truncate_busy_timeout` (default 2s) per attempt,
-  at most once per `truncate_min_interval` (default 5 min). Worst case: one write-path
-  caller stalls up to 2s once every 5 minutes under sustained WAL pressure, an explicit,
-  bounded trade against unbounded WAL growth.
-- **Reader starvation / yanked connection**: recycling in Plank 1 only acts inside
-  `return_reader`, never on a connection currently held by a `ReaderGuard`. A connection
-  mid-recycle (closed and reopened) briefly is not sitting in the queue for other callers
-  to take; under sustained high concurrency this could transiently reduce the effective
-  reader count by one connection for the duration of a close+reopen (sub-millisecond,
-  local file). Not expected to be observable under normal load; if it is, raise
-  `reader_max_age` rather than lowering `max_readers`.
-- **False WARN noise**: `truncate_high_water_pages` set too low relative to legitimately
-  bursty write volume would fire TRUNCATE attempts (and their bounded stalls) during
-  normal traffic spikes rather than genuine starvation. Mitigated by reusing the
-  edge-triggered `crossing_warn` pattern for logging, and by the min-interval floor;
-  tune `truncate_high_water_pages` upward if this is observed in practice rather than
-  shortening `truncate_min_interval`.
-- **Checkout-age watchdog false positives**: a legitimately slow but bounded query (e.g.
-  a large `traverse` under heavy fan-out) could cross `KHIVE_READER_CHECKOUT_WARN_SECS`
-  (10s) without indicating a leak. The watchdog only WARNs; it never forcibly reclaims a
-  live checkout, so a false positive costs a log line, not correctness.
+  at most once per `truncate_min_interval` under normal conditions (see the flap/backoff
+  note: a skipped attempt due to writer contention does not consume the interval).
+- **Flap under sustained writer load**: per the explicit backoff statement above, if the
+  writer is continuously busy, TRUNCATE never fires and WAL growth continues past
+  `truncate_high_water_pages`; accepted, escalating WARNs are the mitigation, not
+  unconditional reclamation.
+- **Instrumentation overhead**: Plank 0's per-tick age check and per-attempt transaction
+  enumeration are cheap (in-process counters/timestamps, no extra SQL queries beyond
+  what TRUNCATE failure logging already requires) and do not change checkpoint task
+  timing in any way that matters at a 500ms tick interval.
+- **Pooled reader recycling failure modes**: unchanged from the original draft, but now
+  understood to apply only to the in-memory/test pool path; any behavior change there
+  has no production blast radius.
 
 ## Consequences
 
-- WAL growth is now bounded on two independent axes: no single pooled reader connection
-  can pin the tail for longer than `reader_max_age` (or `reader_max_ops` under sustained
-  load), and once pressure sustains past `truncate_high_water_pages` regardless of cause,
-  the daemon reclaims disk bytes via a bounded-blocking TRUNCATE rather than relying on
-  an operator to notice a WARN and intervene manually.
+- The false premise from the original draft (idle pooled readers pin production WAL) is
+  retracted; this ADR no longer claims a fix for a mechanism that does not exist in the
+  production code path.
+- WAL growth now has one new, real, caller-controllable bound: no `begin_tx` transaction
+  can hold a connection open past `KHIVE_TX_MAX_AGE_SECS`, closing the one mechanism this
+  review confirmed is both live and fully under a single caller's control.
+- Plank 0's instrumentation is the load-bearing deliverable of this ADR's first
+  iteration: it converts "we don't know what's pinning the WAL" into a concrete,
+  loggable answer the next time sustained WAL pressure occurs, which Plank 1's
+  provisional thresholds and any follow-up ADR amendment can then be tuned against.
 - The existing periodic PASSIVE checkpoint tick, its skip-on-busy behavior, and its
-  `warn_pages`/`high_water_pages` WARN semantics are unchanged. This ADR is additive to
-  `checkpoint.rs`, not a rewrite.
-- New operator-facing signal: an `oldest_checkout_age` WARN correlated with a WAL
-  high-water WARN now points directly at a checkout being open for Ns, closing the
-  diagnostic gap the incident exposed (the incident's `0|3768965|44` had no accompanying
-  signal explaining which session or operation was responsible).
-- Three new config knobs for Plank 1, three for Plank 2, all defaulting to conservative
-  values requiring no operator action; existing deployments get the fix without
-  environment changes.
-- Follow-up (tracked separately, not blocking this ADR): instrument which MCP verb or
-  handler is holding the oldest outstanding checkout (today's watermark is anonymous).
-  This would need per-lease provenance tagging, a larger change than the global
-  watermark proposed here.
+  `warn_pages`/`high_water_pages` WARN semantics are unchanged; TRUNCATE escalation is
+  additive to `checkpoint.rs`, not a rewrite, with an explicit accepted-worst-case
+  statement for sustained writer contention.
+- Two new config knobs for the `begin_tx` bound (Plank 1), three carried-over knobs
+  narrowed in scope, three for TRUNCATE escalation (Plank 2); the two new keys are
+  explicitly marked provisional pending one cycle of production telemetry rather than
+  presented as tuned defaults.
+- Follow-up (tracked separately, not blocking this ADR): once Plank 0 telemetry
+  identifies whether `vec0`'s internal cursor behavior, a missed `begin_tx` caller, or
+  something else entirely is the actual #580 mechanism, file a short ADR amendment
+  narrowing or retuning Plank 1 rather than re-guessing from static code reading again.
