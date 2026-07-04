@@ -603,7 +603,7 @@ async fn resolve_brain_weights(
 
     let serve_params = serde_json::json!({
         "namespace": &ns,
-        "consumer_kind": "recall",
+        "consumer_kind": khive_brain_core::ConsumerKind::Recall.as_str(),
     });
 
     let result = registry
