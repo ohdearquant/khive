@@ -72,6 +72,41 @@ pub struct MirrorConfig {
     pub backfill: bool,
 }
 
+/// Default poll interval, in seconds, used when `KHIVE_MIRROR_POLL_SECS` is
+/// unset, non-numeric, or explicitly zero.
+const DEFAULT_MIRROR_POLL_SECS: u64 = 2;
+
+/// Parse `KHIVE_MIRROR_POLL_SECS`, rejecting an explicit `0` (which would
+/// otherwise create a hot polling loop) and falling back to
+/// `DEFAULT_MIRROR_POLL_SECS` for missing, non-numeric, or zero values.
+///
+/// Explicit zero and non-numeric input are logged as distinct warnings so an
+/// operator can tell which mistake they made.
+fn parse_mirror_poll_secs(raw: Option<&str>) -> u64 {
+    match raw {
+        None => DEFAULT_MIRROR_POLL_SECS,
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => {
+                tracing::warn!(
+                    value = v,
+                    default_secs = DEFAULT_MIRROR_POLL_SECS,
+                    "KHIVE_MIRROR_POLL_SECS must be nonzero; using default"
+                );
+                DEFAULT_MIRROR_POLL_SECS
+            }
+            Ok(secs) => secs,
+            Err(_) => {
+                tracing::warn!(
+                    value = v,
+                    default_secs = DEFAULT_MIRROR_POLL_SECS,
+                    "KHIVE_MIRROR_POLL_SECS is not numeric; using default"
+                );
+                DEFAULT_MIRROR_POLL_SECS
+            }
+        },
+    }
+}
+
 impl MirrorConfig {
     /// Build config from environment variables, falling back to safe defaults.
     ///
@@ -112,10 +147,8 @@ impl MirrorConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".chatgpt").join("exports"));
 
-        let poll_secs = std::env::var("KHIVE_MIRROR_POLL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2);
+        let poll_raw = std::env::var("KHIVE_MIRROR_POLL_SECS").ok();
+        let poll_secs = parse_mirror_poll_secs(poll_raw.as_deref());
 
         let backfill = std::env::var("KHIVE_MIRROR_BACKFILL")
             .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no"))
@@ -131,6 +164,44 @@ impl MirrorConfig {
             poll_interval: Duration::from_secs(poll_secs),
             backfill,
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::parse_mirror_poll_secs;
+
+    /// Regression for PACKSESSION-AUD-002: `KHIVE_MIRROR_POLL_SECS=0` used to
+    /// produce a hot polling loop via `Duration::from_secs(0)`. Explicit zero
+    /// must now be rejected back to the documented default, and the default
+    /// must remain distinguishable from a non-numeric value.
+    #[test]
+    fn poll_secs_zero_is_rejected_and_default_remains_two_seconds() {
+        assert_eq!(
+            parse_mirror_poll_secs(None),
+            2,
+            "missing value defaults to 2s"
+        );
+        assert_eq!(
+            parse_mirror_poll_secs(Some("abc")),
+            2,
+            "non-numeric value defaults to 2s"
+        );
+        assert_eq!(
+            parse_mirror_poll_secs(Some("0")),
+            2,
+            "explicit zero must be rejected back to the default, not accepted as a hot loop"
+        );
+        assert_eq!(
+            parse_mirror_poll_secs(Some("1")),
+            1,
+            "valid nonzero value is honored"
+        );
+        assert_eq!(
+            parse_mirror_poll_secs(Some("5")),
+            5,
+            "valid nonzero value is honored"
+        );
     }
 }
 
