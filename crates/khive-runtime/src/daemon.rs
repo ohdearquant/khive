@@ -697,6 +697,7 @@ pub fn env_truthy(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Focused regression tests for the unsafe process probe (SAFETY: signal 0
     // is an existence check with no side effects; see is_process_running).
@@ -750,7 +751,18 @@ mod tests {
     // codex PR #583 round-1 Medium: `drain()` must wait for tracked background
     // tasks (e.g. memory.recall's serve-ledger append), not just in-flight
     // connections, or a SIGTERM lands mid-flight with no log and no row.
+    //
+    // `#[serial(background_tasks)]`: this test reads/asserts on the
+    // process-wide `BACKGROUND_TASKS` static shared with the two counter
+    // tests below. Under default parallel execution one test's increment
+    // leaks into another's snapshot-then-assert window (codex PR #583
+    // round-3 Medium, reproduced: both counter tests failed together,
+    // passed with `--test-threads=1`). Serializing just this named group
+    // isolates them from each other without forcing the whole test binary
+    // (including unrelated `#[serial]` tests elsewhere in this crate) onto
+    // one thread.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn drain_waits_for_tracked_background_tasks_before_returning() {
         let active = std::sync::atomic::AtomicUsize::new(0);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -784,7 +796,12 @@ mod tests {
         );
     }
 
+    // See the `#[serial(background_tasks)]` note on
+    // `drain_waits_for_tracked_background_tasks_before_returning` above —
+    // this test shares the same process-wide `BACKGROUND_TASKS` static and
+    // races it (and the panic test below) under default parallelism.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn track_background_task_count_returns_to_zero_after_completion() {
         // Sanity check on the counter's own bookkeeping, independent of drain().
         let before = background_task_count();
@@ -804,13 +821,20 @@ mod tests {
         assert_eq!(background_task_count(), before);
     }
 
+    // See the `#[serial(background_tasks)]` note above — shares
+    // `BACKGROUND_TASKS` with the other two tests in this group.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn track_background_task_count_returns_to_baseline_after_panic() {
         // codex PR #583 round-2 Medium: a panic inside the tracked future must
         // still decrement the counter (via BackgroundTaskGuard's Drop), not
-        // leak it forever. tokio::spawn catches the panic in the returned
-        // JoinHandle rather than aborting the process, so we can await it
-        // here and assert the counter recovered.
+        // leak it forever. `track_background_task` discards the spawned
+        // task's `JoinHandle` (it is fire-and-forget by design — the caller
+        // never awaits it), so this test does not await the panic directly;
+        // tokio isolates the panic to the spawned task instead of aborting
+        // the process, and we observe the recovery purely through the
+        // shared counter returning to baseline after the guard's `Drop`
+        // fires during that task's unwind.
         let before = background_task_count();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
