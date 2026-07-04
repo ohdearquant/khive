@@ -196,16 +196,14 @@ jobs:
             [ "$base" = "README" ] && continue
 
             entry="${NAV_ORDER[$base]:-}"
-            if [ -n "$entry" ]; then
-              nav_order="${entry%%|*}"
-              rest="${entry#*|}"
-              title="${rest%%|*}"
-              description="${rest#*|}"
-            else
-              nav_order="99"
-              title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
-              description=""
+            if [ -z "$entry" ]; then
+              echo "ERROR: docs/guide/${base}.md has no NAV_ORDER entry in pages.yml — every guide page must be added to NAV_ORDER (ADR-090 §3)." >&2
+              exit 1
             fi
+            nav_order="${entry%%|*}"
+            rest="${entry#*|}"
+            title="${rest%%|*}"
+            description="${rest#*|}"
             PAGE_TITLE[$base]="$title"
             PAGE_DESC[$base]="$description"
             PAGE_ORDER_LIST+=("${nav_order}|${base}")
@@ -315,6 +313,27 @@ jobs:
             done
           } > "$SRC/llms-full.txt"
 
+          # Enforce that every guide page the HTML/raw-copy loop built is actually
+          # present in both agent indexes — this is the assertion for the ADR-090 §2
+          # claim ("appears in the llms.txt index, llms-full.txt, and its own
+          # /md/<page>.md copy"). A future regression that reintroduces a separately
+          # maintained page list fails the build instead of silently drifting.
+          for base in "${ORDERED_BASENAMES[@]}"; do
+            grep -qF "${base}.html" "$SRC/llms.txt" || {
+              echo "ERROR: ${base} missing from llms.txt (ADR-090 §2)" >&2
+              exit 1
+            }
+            grep -qF "${base}.html" "$SRC/llms-full.txt" || {
+              echo "ERROR: ${base} missing from llms-full.txt (ADR-090 §2)" >&2
+              exit 1
+            }
+          done
+
+          # Manifest of every raw-markdown basename this build produced (Home plus
+          # every guide page), consumed by the post-build step below so its
+          # existence check covers all of them, not a hard-coded sample.
+          printf '%s\n' index "${ORDERED_BASENAMES[@]}" > _raw_md/.manifest
+
           echo "Assembled site source:"
           find "$SRC" -maxdepth 2 -type f | sort
 
@@ -335,8 +354,15 @@ jobs:
           set -euo pipefail
           sudo mkdir -p _site/md
           sudo cp _raw_md/*.md _site/md/
-          test -f _site/md/getting-started.md
-          test -f _site/md/index.md
+          # Existence check over every basename the assemble step recorded (Home
+          # plus every guide page), not a two-page spot check — a missing raw
+          # copy for any page fails the build (ADR-090 §2).
+          while IFS= read -r base; do
+            test -f "_site/md/${base}.md" || {
+              echo "ERROR: _site/md/${base}.md missing after raw-markdown copy (ADR-090 §2)" >&2
+              exit 1
+            }
+          done < _raw_md/.manifest
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
