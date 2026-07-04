@@ -71,6 +71,31 @@ fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf
         None => anyhow::bail!("save_to path has no parent directory: {}", joined.display()),
     };
 
+    // Containment must be proven BEFORE any directory creation: walk up to the
+    // deepest existing ancestor and canonicalize that. `..` components were
+    // already rejected above, so the not-yet-existing suffix can only descend
+    // beneath the ancestor — if the ancestor is inside the root, the parent is.
+    let mut existing = parent;
+    while !existing.exists() {
+        existing = match existing.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => p,
+            None => anyhow::bail!(
+                "save_to path has no existing ancestor: {}",
+                joined.display()
+            ),
+        };
+    }
+    let canonical_existing = existing.canonicalize().map_err(|e| {
+        anyhow::anyhow!("canonicalize save_to ancestor {}: {e}", existing.display())
+    })?;
+    if !canonical_existing.starts_with(root) {
+        anyhow::bail!(
+            "save_to path escapes the allowed export root ({}): {}",
+            root.display(),
+            joined.display()
+        );
+    }
+
     std::fs::create_dir_all(parent)
         .map_err(|e| anyhow::anyhow!("create save_to parent dir {}: {e}", parent.display()))?;
 
@@ -412,6 +437,28 @@ mod tests {
             assert!(
                 err.to_string().contains("traversal"),
                 "expected traversal error, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn outside_root_missing_parent_is_rejected_without_creating_directories() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let envelope = make_envelope(vec![json!({ "ok": true, "tool": "t", "result": {} })]);
+
+        with_root(tmp.path(), || {
+            let missing_parent = outside.path().join("no").join("such").join("dir");
+            let dest = missing_parent.join("escape.jsonl");
+            let err = write_and_manifest(&envelope, &dest, true).unwrap_err();
+            assert!(
+                err.to_string().contains("escapes the allowed export root"),
+                "expected escape error, got: {err}"
+            );
+            assert!(
+                !missing_parent.exists() && !outside.path().join("no").exists(),
+                "outside-root parent directories must not be created"
             );
         });
     }
