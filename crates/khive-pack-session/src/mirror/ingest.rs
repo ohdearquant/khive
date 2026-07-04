@@ -1,8 +1,9 @@
 //! Idempotent file tail + upsert into the session mirror tables.
 //!
 //! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`
-//! via a buffered, line-at-a-time reader bounded by [`MirrorLimits`], parses
-//! complete lines using the parser selected by [`LineTailSource`] (mapped
+//! via a buffered, line-at-a-time reader bounded by an internal per-pass
+//! byte/event cap, parses complete lines using the parser selected by
+//! [`LineTailSource`] (mapped
 //! internally to [`MirrorSource`]), and writes the resulting bounded chunk to
 //! the session mirror tables in a single transaction.  A single call
 //! processes at most one bounded chunk — never the whole file at once — so
