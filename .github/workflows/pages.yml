@@ -112,7 +112,9 @@ jobs:
             [search]="5|Search and Retrieval|FTS5, vector search, hybrid fusion, and reranking."
             [tasks]="6|GTD Task Management|Task lifecycle, priorities, and dependency edges."
             [prompt-cookbook]="7|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
-            [api-reference]="8|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
+            [tips-and-tricks]="8|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
+            [proof-graph-case-study]="9|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
+            [api-reference]="10|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'
