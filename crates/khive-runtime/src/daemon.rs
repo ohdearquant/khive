@@ -290,6 +290,46 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     }
 }
 
+// ── tracked background tasks ─────────────────────────────────────────────────
+//
+// Pack handlers (e.g. memory.recall's ADR-081 §5 serve-ledger append) fire
+// fire-and-forget `tokio::spawn`ed work off the response path so the caller
+// never waits on a cross-pack dispatch or a SQL write. Left untracked, that
+// work is invisible to `drain()`: a SIGTERM landing between the response
+// returning and the spawned task completing can abort it mid-flight with no
+// log and no row (codex PR #583 round-1 Medium). `track_background_task`
+// gives such spawns a process-wide presence that `drain()` waits on, exactly
+// like the `active` counter does for in-flight connections — the caller still
+// only pays for the spawn + counter increment, never the task's own work.
+static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
+    std::sync::OnceLock::new();
+
+fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
+    BACKGROUND_TASKS.get_or_init(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+}
+
+/// Spawn a fire-and-forget background task that daemon shutdown's `drain()`
+/// waits for, instead of a bare `tokio::spawn` that a SIGTERM can abort
+/// mid-flight with no trace. Only the enqueue (an atomic increment) is
+/// synchronous on the caller's path — the future itself still runs fully
+/// off-path, unawaited.
+pub fn track_background_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    background_tasks().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn(async move {
+        fut.await;
+        background_tasks().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Current count of in-flight tasks started via [`track_background_task`].
+/// Exposed for tests; `drain()` reads the shared counter directly.
+pub fn background_task_count() -> usize {
+    background_tasks().load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ── server ────────────────────────────────────────────────────────────────────
 
 async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
@@ -598,14 +638,16 @@ fn write_pid_file(pid_file: &std::path::Path) -> std::io::Result<()> {
 
 async fn drain(active: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
-    if active.load(Ordering::Relaxed) == 0 {
+    let remaining = || active.load(Ordering::Relaxed) + background_task_count();
+    if remaining() == 0 {
         return;
     }
     let deadline = tokio::time::Instant::now() + drain_timeout();
-    while active.load(Ordering::Relaxed) > 0 {
+    while remaining() > 0 {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                remaining = active.load(Ordering::Relaxed),
+                remaining_connections = active.load(Ordering::Relaxed),
+                remaining_background_tasks = background_task_count(),
                 "drain timeout reached; forcing shutdown"
             );
             break;
@@ -683,5 +725,62 @@ mod tests {
         std::env::set_var(key, "0");
         assert!(!env_truthy(key));
         std::env::remove_var(key);
+    }
+
+    // codex PR #583 round-1 Medium: `drain()` must wait for tracked background
+    // tasks (e.g. memory.recall's serve-ledger append), not just in-flight
+    // connections, or a SIGTERM lands mid-flight with no log and no row.
+    #[tokio::test]
+    async fn drain_waits_for_tracked_background_tasks_before_returning() {
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        track_background_task(async move {
+            let _ = rx.await;
+        });
+        assert!(
+            background_task_count() >= 1,
+            "track_background_task must make the in-flight task visible immediately"
+        );
+
+        let drain_fut = drain(&active);
+        tokio::pin!(drain_fut);
+
+        // Must NOT resolve while the tracked task is still pending.
+        let too_early =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut drain_fut).await;
+        assert!(
+            too_early.is_err(),
+            "drain() must not return while a tracked background task is still running"
+        );
+
+        // Completing the task must let drain() proceed promptly.
+        tx.send(())
+            .expect("tracked task still awaiting the oneshot");
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), drain_fut).await;
+        assert!(
+            done.is_ok(),
+            "drain() must return once the tracked background task finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_background_task_count_returns_to_zero_after_completion() {
+        // Sanity check on the counter's own bookkeeping, independent of drain().
+        let before = background_task_count();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_background_task(async move {
+            let _ = rx.await;
+        });
+        assert_eq!(background_task_count(), before + 1);
+        tx.send(()).expect("still awaiting");
+        // Yield until the spawned task's decrement has actually run.
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(background_task_count(), before);
     }
 }

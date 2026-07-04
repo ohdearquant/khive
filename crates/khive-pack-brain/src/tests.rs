@@ -4900,6 +4900,57 @@ mod adr081_retune_driver_tests {
         assert!(!second, "exact-key duplicate must report written=false");
     }
 
+    /// codex PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
+    /// KEY` column (same `id`, different natural key) must NOT be reported as
+    /// a tolerated natural-key duplicate — the row that actually exists does
+    /// not match `(namespace, target_id, query_class, served_at)`, so the
+    /// original error must propagate instead of being silently swallowed.
+    #[tokio::test]
+    async fn record_serve_primary_key_collision_with_different_natural_key_propagates_error() {
+        let (_pack, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target_a = create_test_entity(&rt, &token).await;
+        let target_b = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "shared-row-id",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target_a,
+            "class-a",
+            "raw query a",
+            1_000,
+        )
+        .await
+        .expect("first insert must succeed");
+
+        // Reuse the SAME id but a DIFFERENT natural key (different target_id) —
+        // this collides on the primary key, not the natural-key unique index.
+        let err = crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "shared-row-id",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target_b,
+            "class-b",
+            "raw query b",
+            2_000,
+        )
+        .await
+        .expect_err("a PK collision with a mismatched natural key must not be tolerated");
+        assert!(
+            matches!(err, RuntimeError::Internal(_)),
+            "expected the original insert error to propagate, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn handle_record_serve_writes_one_row_per_target_and_stamps_profile() {
         let (pack, rt) = make_pack();

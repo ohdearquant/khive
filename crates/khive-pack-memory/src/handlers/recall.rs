@@ -615,7 +615,12 @@ impl MemoryPack {
                 let query_raw = query_trimmed.to_string();
                 let served_by = served_by_profile_id.clone();
                 let served_at_us = chrono::Utc::now().timestamp_micros();
-                tokio::spawn(async move {
+                // Tracked, not a bare tokio::spawn, so daemon shutdown's drain()
+                // waits for this append instead of a SIGTERM aborting it
+                // mid-flight with no ledger row and no log (codex PR #583
+                // round-1 Medium). The response path still only pays for the
+                // enqueue (an atomic increment) — never the SQL write itself.
+                khive_runtime::track_background_task(async move {
                     let mut ledger_params = json!({
                         "namespace": namespace,
                         "consumer_kind": "recall",
@@ -990,8 +995,8 @@ mod tests {
             "recall response must stamp the resolved serving profile"
         );
 
-        // The ledger append is fired via tokio::spawn off the response path —
-        // poll briefly rather than assume it has landed by the time recall returns.
+        // The ledger append is fired via track_background_task off the response
+        // path — poll briefly rather than assume it has landed by the time recall returns.
         let target_id = note_id.id.to_string();
         let mut found = false;
         for _ in 0..100 {

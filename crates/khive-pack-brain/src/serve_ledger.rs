@@ -143,9 +143,48 @@ pub async fn record_serve(
         .await;
     match result {
         Ok(_) => Ok(true),
-        Err(e) if e.is_unique_constraint_violation() => Ok(false),
+        Err(e) if e.is_unique_constraint_violation() => {
+            // codex PR #583 round-1 Low: `is_unique_constraint_violation` fires
+            // for ANY unique-index collision on this table — the intended
+            // natural key `(namespace, target_id, query_class, served_at)`,
+            // but also the `id TEXT PRIMARY KEY` column and any future unique
+            // index. Confirm the natural-key row actually exists before
+            // reporting a tolerated duplicate; otherwise this would mask a
+            // genuine `id` collision (or other future constraint) as a no-op.
+            if natural_key_row_exists(sql, namespace, target_id, query_class, served_at).await? {
+                Ok(false)
+            } else {
+                Err(sql_err("insert serve row", e))
+            }
+        }
         Err(e) => Err(sql_err("insert serve row", e)),
     }
+}
+
+async fn natural_key_row_exists(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    target_id: &str,
+    query_class: &str,
+    served_at: i64,
+) -> Result<bool, RuntimeError> {
+    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM brain_serve_ledger \
+                  WHERE namespace = ?1 AND target_id = ?2 AND query_class = ?3 AND served_at = ?4"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(target_id.to_string()),
+                SqlValue::Text(query_class.to_string()),
+                SqlValue::Integer(served_at),
+            ],
+            label: Some("brain_serve_ledger_natural_key_check".into()),
+        })
+        .await
+        .map_err(|e| sql_err("check natural key", e))?;
+    Ok(row.is_some())
 }
 
 /// Fetch a serve ledger row by id.
