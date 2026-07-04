@@ -3,7 +3,7 @@
 Ready-to-use patterns for every common khive operation. Each pattern shows the
 exact `request(ops="...")` syntax, expected response shape, and when to use it.
 
-All examples use the function-call DSL form. JSON form is equivalent — use it
+All examples use the function-call DSL form. JSON form is equivalent; use it
 when the DSL string would be hard to escape.
 
 ---
@@ -13,7 +13,7 @@ when the DSL string would be hard to escape.
 ### Create an entity
 
 ```
-request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={domain: \"attention\", year: 2022})")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={\"domain\": \"attention\", \"year\": 2022})")
 ```
 
 Response:
@@ -49,7 +49,7 @@ makes it discoverable via `neighbors`.
 request(ops="link(source_id=\"<concept_id>\", target_id=\"<paper_id>\", relation=\"introduced_by\", weight=1.0)")
 ```
 
-Use when: you discover a relationship. Direction matters — check the
+Use when: you discover a relationship. Direction matters, so check the
 [edge relation guide](knowledge-graph.md) for source/target conventions.
 
 ### Batch create
@@ -130,7 +130,7 @@ Use when: you want only specific relationship types.
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=3, relations=[\"extends\", \"variant_of\"], include_roots=false)")
 ```
 
-Use when: you want to explore lineage — what extends what, multi-hop dependency
+Use when: you want to explore lineage: what extends what, multi-hop dependency
 chains, reachability analysis.
 
 ### GQL query
@@ -145,8 +145,8 @@ request(ops="query(query=\"MATCH (a:concept)-[:implements]->(b:project) RETURN a
 request(ops="query(query=\"SELECT ?c WHERE { ?c :extends+ ?b . ?b :name 'LoRA' . } LIMIT 10\")")
 ```
 
-Use GQL or SPARQL when: you need pattern matching over the graph structure —
-"find all concepts that extend something introduced by a specific paper".
+Use GQL or SPARQL when: you need pattern matching over the graph structure, for
+example "find all concepts that extend something introduced by a specific paper".
 
 ---
 
@@ -288,7 +288,7 @@ request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
 ### Auto-feedback after recall
 
 ```
-request(ops="brain.auto_feedback(results=[{id: \"<uuid>\", used: true}])")
+request(ops="brain.auto_feedback(results=[{\"id\": \"<uuid>\", \"used\": true}])")
 ```
 
 Convenience verb: call after `memory.recall` to automatically feed back which
@@ -392,7 +392,7 @@ request(ops="stats()")
 ```
 
 Returns entity, edge, note, and event counts. Check `total_edges /
-total_entities` — below 4 means the graph needs more linking.
+total_entities`; below 4 means the graph needs more linking.
 
 ---
 
@@ -406,7 +406,7 @@ Multiple independent operations in one call:
 request(ops="[search(kind=\"entity\", query=\"LoRA\"), search(kind=\"note\", query=\"LoRA\"), stats()]")
 ```
 
-Each op runs independently. A failed op does not abort the batch — each entry
+Each op runs independently. A failed op does not abort the batch; each entry
 has its own `ok`/`error` field.
 
 ### Two-step create-then-link
@@ -432,9 +432,9 @@ request(ops="search(kind=\"entity\", query=\"FlashAttention\")")
 
 ## See also
 
-- [Getting Started](getting-started.md) — installation and first session
-- [Knowledge Graph Modeling](knowledge-graph.md) — when to use each entity kind
+- [Getting Started](getting-started.md): installation and first session
+- [Knowledge Graph Modeling](knowledge-graph.md): when to use each entity kind
   and relation
-- [Search and Retrieval](search.md) — how scoring, reranking, and decompose work
-- [Memory and Recall](memory.md) — memory-specific patterns
-- [GTD Task Management](tasks.md) — task lifecycle details
+- [Search and Retrieval](search.md): how scoring, reranking, and decompose work
+- [Memory and Recall](memory.md): memory-specific patterns
+- [GTD Task Management](tasks.md): task lifecycle details

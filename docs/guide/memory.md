@@ -1,8 +1,8 @@
 # Memory and Recall
 
-This guide covers how agent memory works in khive — how to store memories with
+This guide covers how the memory pack works in khive: how to store memories with
 appropriate salience, how decay affects recall ranking, and patterns for
-effective cross-session memory.
+effective cross-session recall.
 
 ## Two memory types
 
@@ -46,7 +46,7 @@ ranges:
 | 0.5-0.7  | Session summaries, routine context           | "Completed attention benchmark run"         |
 | < 0.5    | Low-value, ephemeral, auto-generated         | Routine status updates                      |
 
-A common mistake is inflating salience — if everything is 0.9+, the scoring
+A common mistake is inflating salience: if everything is 0.9+, the scoring
 signal is lost and recall becomes unranked.
 
 ### Linking memories to entities
@@ -133,11 +133,11 @@ With the semantic default `decay_factor=0.005`:
 
 Higher `decay_factor` means faster decay:
 
-- `0.001`: very slow (693-day half-life) — for permanent reference memories
-- `0.005`: slow (139-day half-life) — semantic default, good for durable facts
-- `0.02`: moderate (35-day half-life) — episodic default, good for session context
-- `0.05`: fast (14-day half-life) — for session-specific context
-- `0.1`: very fast (7-day half-life) — for truly ephemeral context
+- `0.001`: very slow (693-day half-life), for permanent reference memories
+- `0.005`: slow (139-day half-life), semantic default, good for durable facts
+- `0.02`: moderate (35-day half-life), episodic default, good for session context
+- `0.05`: fast (14-day half-life), for session-specific context
+- `0.1`: very fast (7-day half-life), for truly ephemeral context
 
 ## Brain integration
 
@@ -147,7 +147,7 @@ recalling memories, you can feed back which results were useful:
 ### Auto-feedback (recommended)
 
 ```
-request(ops="brain.auto_feedback(results=[{id: \"<mem1_uuid>\", used: true}, {id: \"<mem2_uuid>\", used: false}])")
+request(ops="brain.auto_feedback(results=[{\"id\": \"<mem1_uuid>\", \"used\": true}, {\"id\": \"<mem2_uuid>\", \"used\": false}])")
 ```
 
 Call this after `memory.recall` to automatically signal which results you
@@ -206,7 +206,7 @@ request(ops="memory.remember(content=\"HANDOFF: Attention benchmark suite is rea
 
 ## See also
 
-- [Search and Retrieval](search.md) — how hybrid search and RRF fusion work
-- [Prompt Cookbook](prompt-cookbook.md) — memory verb patterns
-- [GTD Task Management](tasks.md) — task lifecycle (often paired with memory
+- [Search and Retrieval](search.md): how hybrid search and RRF fusion work
+- [Prompt Cookbook](prompt-cookbook.md): memory verb patterns
+- [GTD Task Management](tasks.md): task lifecycle (often paired with memory
   for context)
