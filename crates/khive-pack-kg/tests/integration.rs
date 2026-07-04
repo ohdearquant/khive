@@ -79,14 +79,15 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
-// handler count from 11 to 14, then 15 with verbs introspection.
+// handler count from 11 to 14, then 15 with verbs introspection, then 16
+// with stats, then 17 with context (ADR-089).
 #[test]
-fn pack_verbs_returns_sixteen() {
+fn pack_verbs_returns_seventeen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        16,
-        "KgPack must expose exactly 16 verbs (15 previous + stats)"
+        17,
+        "KgPack must expose exactly 17 verbs (16 previous + context)"
     );
 }
 
@@ -8216,5 +8217,772 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
         "Finding 1: list(no delivered filter) must return 200 notes (page cap of 211 total); \
          got {}",
         all_items.len()
+    );
+}
+
+// ---- context (ADR-089): entity-anchored graph context in one call ----
+
+#[tokio::test]
+async fn context_requires_query_or_entity_ids() {
+    let pack = pack();
+    let err = pack
+        .dispatch("context", json!({}))
+        .await
+        .expect_err("context with neither query nor entity_ids must be rejected");
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+    assert!(
+        invalid_input_message(&err).contains("query")
+            && invalid_input_message(&err).contains("entity_ids"),
+        "error must name both query and entity_ids; got: {}",
+        invalid_input_message(&err)
+    );
+}
+
+#[tokio::test]
+async fn context_empty_entity_ids_and_absent_query_is_rejected() {
+    let pack = pack();
+    let err = pack
+        .dispatch("context", json!({"entity_ids": []}))
+        .await
+        .expect_err("context with an empty entity_ids array and no query must be rejected");
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+}
+
+#[tokio::test]
+async fn context_entity_ids_anchor_carries_full_entity_record() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "CtxAnchorA",
+                "entity_kind": "concept",
+                "description": "the anchor concept",
+                "properties": {"domain": "attention"}
+            }),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    let resp = pack
+        .dispatch("context", json!({"entity_ids": [a_id], "hops": 0}))
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().expect("anchors array");
+    assert_eq!(anchors.len(), 1, "exactly one anchor expected");
+    let entity = &anchors[0]["entity"];
+    assert_eq!(entity["id"], a_id);
+    assert_eq!(entity["name"], "CtxAnchorA");
+    assert_eq!(entity["kind"], "concept");
+    assert_eq!(entity["description"], "the anchor concept");
+    assert_eq!(entity["properties"]["domain"], "attention");
+    assert_eq!(
+        anchors[0]["neighbors"].as_array().unwrap().len(),
+        0,
+        "hops=0 must return anchors only, no expansion"
+    );
+    assert_eq!(resp["truncated"], false);
+    assert_eq!(resp["dropped"]["anchors"], 0);
+    assert_eq!(resp["dropped"]["neighbors"], 0);
+}
+
+#[tokio::test]
+async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxHop1A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxHop1B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends", "weight": 0.9}),
+    )
+    .await
+    .expect("link A->B");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing"}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 1, "expected exactly one hop-1 neighbor");
+    let n = &neighbors[0];
+    assert_eq!(n["id"], b_id);
+    assert_eq!(n["name"], "CtxHop1B");
+    assert_eq!(n["relation"], "extends");
+    assert_eq!(n["direction"], "outgoing");
+    assert_eq!(n["hop"], 1);
+    assert_eq!(n["via"], Value::Null);
+    assert!((n["weight"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn context_default_direction_is_both_unlike_neighbors_outgoing_default() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxDirA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxDirB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    // B --extends--> A: from A's perspective this is an incoming edge only.
+    pack.dispatch(
+        "link",
+        json!({"source_id": b_id, "target_id": a_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link B->A");
+
+    let resp = pack
+        .dispatch("context", json!({"entity_ids": [a_id]}))
+        .await
+        .expect("context with omitted direction must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert!(
+        neighbors.iter().any(|n| n["id"] == b_id),
+        "default direction=\"both\" must surface B via the incoming edge; got: {neighbors:?}"
+    );
+    let hit = neighbors.iter().find(|n| n["id"] == b_id).unwrap();
+    assert_eq!(hit["direction"], "incoming");
+}
+
+#[tokio::test]
+async fn context_hops_two_expands_second_hop_with_via_set_to_hop1_parent() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxChainA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxChainB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxChainC", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create C");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let c_id = c["id"].as_str().unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+    pack.dispatch(
+        "link",
+        json!({"source_id": b_id, "target_id": c_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link B->C");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 2, "direction": "outgoing"}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    let hop1: Vec<&Value> = neighbors.iter().filter(|n| n["hop"] == 1).collect();
+    let hop2: Vec<&Value> = neighbors.iter().filter(|n| n["hop"] == 2).collect();
+    assert_eq!(hop1.len(), 1, "expected B as the sole hop-1 neighbor");
+    assert_eq!(hop1[0]["id"], b_id);
+    assert_eq!(hop2.len(), 1, "expected C as the sole hop-2 neighbor");
+    assert_eq!(hop2[0]["id"], c_id);
+    assert_eq!(
+        hop2[0]["via"], b_id,
+        "hop-2 record must carry via = hop-1 parent id"
+    );
+
+    // Deterministic order: hop-1 records precede hop-2 records for the anchor.
+    let hop_values: Vec<i64> = neighbors
+        .iter()
+        .map(|n| n["hop"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        hop_values,
+        vec![1, 2],
+        "hop-1 must precede hop-2 in output order"
+    );
+}
+
+#[tokio::test]
+async fn context_hops_zero_does_not_expand_even_with_edges_present() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxHop0A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxHop0B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    let resp = pack
+        .dispatch("context", json!({"entity_ids": [a_id], "hops": 0}))
+        .await
+        .expect("context must succeed");
+    assert_eq!(resp["anchors"][0]["neighbors"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxDedupA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxDedupB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let shared = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxDedupShared", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create Shared");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let shared_id = shared["id"].as_str().unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": shared_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->Shared");
+    pack.dispatch(
+        "link",
+        json!({"source_id": b_id, "target_id": shared_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link B->Shared");
+
+    // a_id listed first in entity_ids => selection order puts A before B.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id, b_id], "hops": 1, "direction": "outgoing"}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert_eq!(anchors.len(), 2);
+    let a_neighbors = anchors[0]["neighbors"].as_array().unwrap();
+    let b_neighbors = anchors[1]["neighbors"].as_array().unwrap();
+    assert!(
+        a_neighbors.iter().any(|n| n["id"] == shared_id),
+        "Shared must appear under the first anchor (A)"
+    );
+    assert!(
+        !b_neighbors.iter().any(|n| n["id"] == shared_id),
+        "Shared must NOT be repeated under the second anchor (B) — global visited-set dedup"
+    );
+}
+
+#[tokio::test]
+async fn context_anchor_never_relisted_as_neighbor_of_another_anchor() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxSelfA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxSelfB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    // A --extends--> B, and B is ALSO an explicit anchor.
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id, b_id], "hops": 1, "direction": "outgoing"}),
+        )
+        .await
+        .expect("context must succeed");
+
+    let a_neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert!(
+        !a_neighbors.iter().any(|n| n["id"] == b_id),
+        "B is already a top-level anchor and must not be duplicated inside A's neighbor list; got {a_neighbors:?}"
+    );
+}
+
+#[tokio::test]
+async fn context_explicit_entity_ids_never_clamped_by_limit() {
+    let pack = pack();
+    let mut ids = Vec::new();
+    for i in 0..7 {
+        let e = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxManyAnchor{i}"), "entity_kind": "concept"}),
+            )
+            .await
+            .expect("create entity");
+        ids.push(e["id"].as_str().unwrap().to_string());
+    }
+
+    // limit=1 (its floor-adjacent clamp) must not truncate explicit entity_ids.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": ids.clone(), "limit": 1, "hops": 0}),
+        )
+        .await
+        .expect("context must succeed");
+    assert_eq!(
+        resp["anchors"].as_array().unwrap().len(),
+        7,
+        "all 7 explicit entity_ids must be honored regardless of `limit`"
+    );
+}
+
+#[tokio::test]
+async fn context_query_selects_anchors_via_hybrid_search() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "CtxQueryRoPE", "entity_kind": "concept", "description": "rotary position embedding"}),
+    )
+    .await
+    .expect("create RoPE");
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "CtxQueryUnrelated", "entity_kind": "concept", "description": "completely different topic"}),
+    )
+    .await
+    .expect("create unrelated");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"query": "CtxQueryRoPE rotary position embedding", "hops": 0}),
+        )
+        .await
+        .expect("context must succeed");
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert!(
+        !anchors.is_empty(),
+        "query-based anchor selection must return at least one anchor"
+    );
+    assert!(
+        anchors
+            .iter()
+            .any(|a| a["entity"]["name"] == "CtxQueryRoPE"),
+        "expected the matching entity among query-selected anchors; got: {anchors:?}"
+    );
+}
+
+#[tokio::test]
+async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fills() {
+    let pack = pack();
+    let explicit = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxComboExplicit", "entity_kind": "concept", "description": "explicit anchor"}),
+        )
+        .await
+        .expect("create explicit");
+    let explicit_id = explicit["id"].as_str().unwrap().to_string();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "CtxComboSearchHit", "entity_kind": "concept", "description": "distinctive combo search text"}),
+    )
+    .await
+    .expect("create search hit");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({
+                "entity_ids": [explicit_id.clone()],
+                "query": "CtxComboSearchHit distinctive combo search text",
+                "hops": 0,
+            }),
+        )
+        .await
+        .expect("context must succeed");
+
+    let anchors = resp["anchors"].as_array().unwrap();
+    assert_eq!(
+        anchors[0]["entity"]["id"], explicit_id,
+        "explicit entity_ids must come first in selection order"
+    );
+    assert!(
+        anchors
+            .iter()
+            .any(|a| a["entity"]["name"] == "CtxComboSearchHit"),
+        "query must contribute additional anchors after explicit ids; got: {anchors:?}"
+    );
+}
+
+#[tokio::test]
+async fn context_relations_filter_restricts_expansion() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxRelFilterA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxRelFilterB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxRelFilterC", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create C");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let c_id = c["id"].as_str().unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A-extends->B");
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": c_id, "relation": "part_of"}),
+    )
+    .await
+    .expect("link A-part_of->C");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing", "relations": ["extends"]}),
+        )
+        .await
+        .expect("context must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(
+        neighbors.len(),
+        1,
+        "only the extends-filtered neighbor must appear"
+    );
+    assert_eq!(neighbors[0]["id"], b_id);
+}
+
+#[tokio::test]
+async fn context_symmetric_relation_direction_is_reported_as_both() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxSymA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxSymB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "competes_with"}),
+    )
+    .await
+    .expect("link A competes_with B");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing", "relations": ["competes_with"]}),
+        )
+        .await
+        .expect("context must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(
+        neighbors[0]["direction"], "both",
+        "symmetric relations have no directionality and must be tagged \"both\" \
+         regardless of the requested direction"
+    );
+}
+
+#[tokio::test]
+async fn context_fanout_caps_neighbors_per_node_per_hop() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxFanoutA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    for i in 0..5 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxFanoutN{i}"), "entity_kind": "concept"}),
+            )
+            .await
+            .expect("create neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": n_id, "relation": "extends", "weight": 0.1 + (i as f64) * 0.1}),
+        )
+        .await
+        .expect("link A->neighbor");
+    }
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing", "fanout": 2}),
+        )
+        .await
+        .expect("context must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(
+        neighbors.len(),
+        2,
+        "fanout=2 must cap hop-1 neighbors at 2 even though 5 edges exist"
+    );
+}
+
+#[tokio::test]
+async fn context_budget_truncation_sets_flag_and_dropped_counts() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxBudgetA", "entity_kind": "concept", "description": "anchor with several neighbors"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    for i in 0..5 {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxBudgetN{i}"), "entity_kind": "concept", "description": "a neighbor entity with enough text to consume budget"}),
+            )
+            .await
+            .expect("create neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": n_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link A->neighbor");
+    }
+
+    // Small budget: only the anchor entity (and maybe a neighbor or two) fit.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "outgoing", "budget": 256}),
+        )
+        .await
+        .expect("context must succeed");
+
+    assert_eq!(
+        resp["truncated"], true,
+        "a 256-char budget must truncate 5 verbose neighbors"
+    );
+    let dropped_neighbors = resp["dropped"]["neighbors"].as_i64().unwrap();
+    assert!(
+        dropped_neighbors > 0,
+        "expected at least one dropped neighbor; got dropped={:?}",
+        resp["dropped"]
+    );
+}
+
+#[tokio::test]
+async fn context_ample_budget_reports_no_truncation() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxAmpleA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxAmpleB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b["id"].as_str().unwrap().to_string();
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "budget": 65536}),
+        )
+        .await
+        .expect("context must succeed");
+    assert_eq!(resp["truncated"], false);
+    assert_eq!(resp["dropped"]["anchors"], 0);
+    assert_eq!(resp["dropped"]["neighbors"], 0);
+}
+
+#[tokio::test]
+async fn context_out_of_range_params_are_clamped_not_rejected() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxClampA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    // hops=99 clamps to 2; budget=1 clamps to 256; fanout=0 clamps to 1;
+    // limit=0 clamps to 1 — none of these should error.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 99, "budget": 1, "fanout": 0, "limit": 0}),
+        )
+        .await
+        .expect("out-of-range params must be clamped, not rejected");
+    assert!(resp["anchors"].is_array());
+}
+
+#[tokio::test]
+async fn context_unknown_relation_in_filter_is_rejected() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxBadRelA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "relations": ["not_a_real_relation"]}),
+        )
+        .await
+        .expect_err("unknown relation in filter must be rejected");
+    assert!(is_invalid_input(&err), "must be InvalidInput; got: {err:?}");
+}
+
+#[tokio::test]
+async fn context_verb_is_registered_in_kg_handlers() {
+    let pack = pack();
+    let names: Vec<&str> = pack.verbs().iter().map(|h| h.name).collect();
+    assert!(
+        names.contains(&"context"),
+        "context must be a registered KgPack verb"
     );
 }

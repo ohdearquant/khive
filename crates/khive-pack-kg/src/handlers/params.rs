@@ -199,6 +199,19 @@ pub(crate) struct TraverseParams {
     pub(crate) include_properties: Option<bool>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextParams {
+    pub(crate) query: Option<String>,
+    pub(crate) entity_ids: Option<Vec<String>>,
+    pub(crate) hops: Option<i64>,
+    pub(crate) budget: Option<i64>,
+    pub(crate) relations: Option<Vec<String>>,
+    pub(crate) direction: Option<String>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) fanout: Option<u32>,
+}
+
 pub(crate) const HARD_CAP: usize = 10_000;
 
 #[derive(Deserialize)]

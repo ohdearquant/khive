@@ -178,16 +178,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 16 handlers including propose/review/withdraw/verbs/stats
+// KG pack must expose exactly 17 handlers including propose/review/withdraw/verbs/stats/context
 #[test]
-fn kg_pack_exposes_16_handlers() {
+fn kg_pack_exposes_17_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        16,
-        "kg pack must expose 16 handlers (was 15, +1 for stats — #280)"
+        17,
+        "kg pack must expose 17 handlers (was 16, +1 for context — ADR-089)"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -198,6 +198,10 @@ fn kg_pack_exposes_16_handlers() {
     );
     assert!(names.contains(&"verbs"), "verbs must be in KG_HANDLERS");
     assert!(names.contains(&"stats"), "stats must be in KG_HANDLERS");
+    assert!(
+        names.contains(&"context"),
+        "context must be in KG_HANDLERS (ADR-089)"
+    );
 }
 
 // ---- Wave 4 regression tests ----
