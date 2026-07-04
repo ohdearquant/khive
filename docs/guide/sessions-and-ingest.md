@@ -151,11 +151,12 @@ at `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (default 256 MiB).
 
 ### Worked example
 
-Enable Codex mirroring only, then list the mirrored provider labels via
-`session.list` filtered by provider (the mirror writes `source` into the
-`sessions` table, not `properties.provider` on a note, so `session.list`
-filters khive-native `session.store` records, not mirrored rows; the two are
-queried separately today):
+Enable Codex mirroring only. Note that mirroring and the note-based session
+verbs are separate stores today: the mirror writes provider data (including
+`source`) into the private `sessions` table, while `session.list` queries
+khive-native `session.store` records and filters `properties.provider` on
+those notes. `session.list(provider="codex")` therefore does not return
+mirrored rows.
 
 ```bash
 KHIVE_MIRROR_ENABLED=false \
