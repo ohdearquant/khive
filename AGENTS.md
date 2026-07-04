@@ -15,7 +15,7 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 8 packs load by default. **72 public verbs** across the packs (regenerate via
+All 8 packs load by default. **73 public verbs** across the packs (regenerate via
 `request(ops="verbs()")` before editing this line).
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.

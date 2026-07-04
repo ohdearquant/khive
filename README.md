@@ -65,7 +65,7 @@ this table):
 
 | Pack          | Prefix       | Verbs | What it does                                          |
 | ------------- | ------------ | ----- | ----------------------------------------------------- |
-| **kg**        | _(bare)_     | 16    | Entities, edges, notes, graph queries                 |
+| **kg**        | _(bare)_     | 17    | Entities, edges, notes, graph queries                 |
 | **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)         |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall      |
 | **brain**     | `brain.`     | 14    | Bayesian user profiles + feedback loop                |
@@ -129,7 +129,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 16 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 17 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (5 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (14 verbs)           │
@@ -241,7 +241,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 8 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 72-verb catalog.
+MCP client discovers the `request` tool with the full 73-verb catalog.
 
 ### Alternative: npm
 
