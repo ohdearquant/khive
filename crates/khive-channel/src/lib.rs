@@ -222,9 +222,15 @@ pub trait Channel: Send + Sync + 'static {
 ///
 /// The MCP server holds an `Arc<ChannelRegistry>` and polls all registered
 /// channels in a background loop, ingesting results via `comm.ingest`.
+///
+/// Keyed by the composite `(kind, slug)` identity (khive #606 round-1 codex
+/// review, High finding), NOT `kind` alone: two accounts of the same `kind`
+/// (e.g. two mailboxes, both `kind() == "email"`) must coexist as distinct
+/// registered adapters, or they collapse before the heartbeat writer ever
+/// gets a chance to persist separate `channel_health` rows for them.
 #[derive(Default)]
 pub struct ChannelRegistry {
-    channels: HashMap<String, Arc<dyn Channel>>,
+    channels: HashMap<(String, String), Arc<dyn Channel>>,
 }
 
 impl ChannelRegistry {
@@ -233,19 +239,46 @@ impl ChannelRegistry {
         Self::default()
     }
 
-    /// Register a channel adapter. Replaces any previous adapter with the same `kind`.
+    /// Register a channel adapter. Replaces any previous adapter with the
+    /// same `(kind, slug)` composite identity — the pre-#606 "same-kind
+    /// replaces" semantics still hold for the common single-credential-per-
+    /// kind case (where `slug()` falls back to `kind()`), but two adapters
+    /// of the same kind with distinct `slug()` values now coexist.
     pub fn register(&mut self, channel: Arc<dyn Channel>) {
-        self.channels.insert(channel.kind().to_string(), channel);
+        let key = (channel.kind().to_string(), channel.slug());
+        self.channels.insert(key, channel);
     }
 
-    /// Look up a channel by kind.
+    /// Look up a channel by kind only.
+    ///
+    /// When multiple adapters share `kind` (distinct `slug()` values), this
+    /// returns an unspecified one of them (`HashMap` iteration order is not
+    /// defined) — it exists for the common single-credential-per-kind case.
+    /// Callers that must resolve a specific credential among several sharing
+    /// a kind need [`ChannelRegistry::get_by_slug`]. No production call site
+    /// resolves outbound `send` through this registry today (the outbox loop
+    /// holds its own `Arc<EmailChannel>` directly), so no send-path
+    /// resolution currently depends on which adapter this returns when
+    /// several share a kind.
     pub fn get(&self, kind: &str) -> Option<Arc<dyn Channel>> {
-        self.channels.get(kind).cloned()
+        self.channels
+            .iter()
+            .find(|((k, _), _)| k == kind)
+            .map(|(_, v)| Arc::clone(v))
     }
 
-    /// Iterate over all registered channels.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn Channel>)> {
-        self.channels.iter().map(|(k, v)| (k.as_str(), v))
+    /// Look up a channel by its exact `(kind, slug)` composite identity.
+    pub fn get_by_slug(&self, kind: &str, slug: &str) -> Option<Arc<dyn Channel>> {
+        self.channels
+            .get(&(kind.to_string(), slug.to_string()))
+            .cloned()
+    }
+
+    /// Iterate over all registered channels as `(kind, slug, channel)` triples.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &Arc<dyn Channel>)> {
+        self.channels
+            .iter()
+            .map(|((k, s), v)| (k.as_str(), s.as_str(), v))
     }
 
     /// Returns `true` if no channels are registered.
@@ -272,6 +305,10 @@ mod tests {
     struct MockChannel {
         sent: Arc<Mutex<Vec<ChannelEnvelope>>>,
         inbound: Vec<ChannelEnvelope>,
+        // `None` -> `slug()` falls back to the trait default (`kind()`).
+        // `Some(_)` -> distinct per-credential identity, for #606's
+        // same-kind-different-slug regressions.
+        slug: Option<String>,
     }
 
     impl MockChannel {
@@ -279,6 +316,15 @@ mod tests {
             Self {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 inbound,
+                slug: None,
+            }
+        }
+
+        fn with_slug(inbound: Vec<ChannelEnvelope>, slug: impl Into<String>) -> Self {
+            Self {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                inbound,
+                slug: Some(slug.into()),
             }
         }
     }
@@ -287,6 +333,10 @@ mod tests {
     impl Channel for MockChannel {
         fn kind(&self) -> &'static str {
             "mock"
+        }
+
+        fn slug(&self) -> String {
+            self.slug.clone().unwrap_or_else(|| self.kind().to_string())
         }
 
         async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
@@ -360,19 +410,49 @@ mod tests {
     }
 
     #[test]
-    fn registry_replaces_existing() {
+    fn registry_replaces_existing_same_composite_identity() {
+        // Two registrations with the SAME (kind, slug) — both default to
+        // slug() == kind() here — still replace in place, matching the
+        // pre-#606 single-credential-per-kind semantics.
         let mut reg = ChannelRegistry::new();
         reg.register(Arc::new(MockChannel::new(vec![])));
         reg.register(Arc::new(MockChannel::new(vec![])));
-        assert_eq!(reg.len(), 1, "same kind replaces");
+        assert_eq!(reg.len(), 1, "same (kind, slug) replaces");
+    }
+
+    #[test]
+    fn registry_does_not_collapse_same_kind_distinct_slug() {
+        // #606 round-1 codex review, High finding: two accounts sharing
+        // `kind()` but with distinct `slug()` values (e.g. two mailboxes)
+        // must coexist as two registered adapters, not collapse into one.
+        let mut reg = ChannelRegistry::new();
+        reg.register(Arc::new(MockChannel::with_slug(vec![], "a@example.com")));
+        reg.register(Arc::new(MockChannel::with_slug(vec![], "b@example.com")));
+        assert_eq!(
+            reg.len(),
+            2,
+            "same kind + distinct slug must coexist, not collapse"
+        );
+        assert!(reg.get_by_slug("mock", "a@example.com").is_some());
+        assert!(reg.get_by_slug("mock", "b@example.com").is_some());
     }
 
     #[test]
     fn registry_iter_yields_all() {
         let mut reg = ChannelRegistry::new();
         reg.register(Arc::new(MockChannel::new(vec![])));
-        let kinds: Vec<&str> = reg.iter().map(|(k, _)| k).collect();
+        let kinds: Vec<&str> = reg.iter().map(|(k, _, _)| k).collect();
         assert_eq!(kinds, vec!["mock"]);
+    }
+
+    #[test]
+    fn registry_iter_yields_both_slugs_for_same_kind() {
+        let mut reg = ChannelRegistry::new();
+        reg.register(Arc::new(MockChannel::with_slug(vec![], "a@example.com")));
+        reg.register(Arc::new(MockChannel::with_slug(vec![], "b@example.com")));
+        let mut slugs: Vec<&str> = reg.iter().map(|(_, s, _)| s).collect();
+        slugs.sort_unstable();
+        assert_eq!(slugs, vec!["a@example.com", "b@example.com"]);
     }
 
     #[test]

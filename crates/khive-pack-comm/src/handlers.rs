@@ -886,11 +886,26 @@ pub(crate) async fn handle_ingest(
 /// addition to kind is the point of #606's amendment 2: two accounts of the
 /// same kind (e.g. two mailboxes, both `kind() == "email"`) must not collapse
 /// into a single row.
+///
+/// The three components are hashed as a JSON array of strings, NOT joined
+/// with a `:` delimiter (round-1 codex review, Medium finding). Namespaces
+/// may themselves contain `:` (hierarchical namespace strings are explicitly
+/// allowed), so a delimiter-joined `format!("...:{a}:{b}:{c}")` is not an
+/// injective encoding: `(namespace="a:b", channel_kind="c", channel_slug="d")`
+/// and `(namespace="a", channel_kind="b:c", channel_slug="d")` both produced
+/// the identical string `"khive:channel_health:a:b:c:d"` under the old
+/// scheme. `serde_json::to_vec` of an array of strings is unambiguous —
+/// each element is quoted and internal quotes/backslashes are escaped — so
+/// distinct triples always serialize to distinct byte sequences.
 fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("khive:channel_health:{namespace}:{channel_kind}:{channel_slug}").as_bytes(),
-    )
+    let key = serde_json::to_vec(&(
+        "khive:channel_health",
+        namespace,
+        channel_kind,
+        channel_slug,
+    ))
+    .expect("a 4-tuple of &str always serializes to JSON");
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, &key)
 }
 
 /// `heartbeat` — persist one poll attempt's outcome into the channel's
@@ -948,7 +963,15 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    let ns = token.namespace().as_str();
+    // #606 spec-gate Blocker fix (Leo 2026-07-04): heartbeat rows are an
+    // OPERATIONAL surface, not message data. Persist to
+    // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
+    // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
+    // cannot cause heartbeat rows to land anywhere but where `handle_health`
+    // reads from. This is enforced here (not just at the serve.rs call site)
+    // so the guarantee holds even if a future caller passes a different
+    // `namespace` dispatch param.
+    let ns = crate::CHANNEL_HEALTH_NAMESPACE;
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
 
@@ -1049,19 +1072,25 @@ fn channel_health_to_json(note: &Note) -> Value {
 
 /// `health` — read-only per-channel health snapshot (khive #606).
 ///
-/// Reads the daemon-persisted `channel_health` rows for the caller's
-/// namespace. Cross-process read is the point of this verb (spec-gate
-/// amendment 1): a client-role process (stdio MCP without `--daemon`) has no
-/// in-memory poll-loop state of its own, so it must read what the daemon
-/// already wrote. `role` answers "who owns the loops", not "whose memory
-/// answered": any persisted row means some daemon owns the channel loops, so
-/// `role` is reported as `"daemon"` with `source: "daemon-heartbeat"`
-/// regardless of whether THIS process is that daemon. `role: "client"` with
-/// an empty `channels` array is correct only when no daemon heartbeat state
-/// exists at all (fresh install, or a daemon that has never completed a poll
-/// tick) — the comm pack has no visibility into which channels are
-/// configured (that lives in `khive-mcp`/`khive-channel-email`), so an empty
-/// result is the only fact-based response available at this layer.
+/// Reads the daemon-persisted `channel_health` rows from
+/// `crate::CHANNEL_HEALTH_NAMESPACE` UNCONDITIONALLY — never
+/// `token.namespace()` (spec-gate Blocker fix, Leo 2026-07-04). Heartbeat
+/// rows are an operational surface, not message data, so a client-role
+/// no-arg call must see them regardless of what namespace the caller's own
+/// messages happen to be ingested under (e.g. `KHIVE_EMAIL_INGEST_NAMESPACE`
+/// set to something other than `"local"`). Cross-process read is the point
+/// of this verb (spec-gate amendment 1): a client-role process (stdio MCP
+/// without `--daemon`) has no in-memory poll-loop state of its own, so it
+/// must read what the daemon already wrote. `role` answers "who owns the
+/// loops", not "whose memory answered": any persisted row means some daemon
+/// owns the channel loops, so `role` is reported as `"daemon"` with
+/// `source: "daemon-heartbeat"` regardless of whether THIS process is that
+/// daemon. `role: "client"` with an empty `channels` array is correct only
+/// when no daemon heartbeat state exists at all (fresh install, or a daemon
+/// that has never completed a poll tick) — the comm pack has no visibility
+/// into which channels are configured (that lives in
+/// `khive-mcp`/`khive-channel-email`), so an empty result is the only
+/// fact-based response available at this layer.
 ///
 /// Never returns a computed `healthy: bool` (spec-gate amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.
@@ -1088,7 +1117,7 @@ pub(crate) async fn handle_health(
     };
     let page = store
         .query_notes_filtered(
-            token.namespace().as_str(),
+            crate::CHANNEL_HEALTH_NAMESPACE,
             &filter,
             PageRequest {
                 limit: MAX_CHANNELS,
@@ -1096,6 +1125,14 @@ pub(crate) async fn handle_health(
             },
         )
         .await?;
+
+    if page.items.len() == MAX_CHANNELS as usize {
+        tracing::debug!(
+            max_channels = MAX_CHANNELS,
+            "comm.health: channel_health row count hit the page limit; \
+             results may be silently truncated"
+        );
+    }
 
     let channels: Vec<Value> = page.items.iter().map(channel_health_to_json).collect();
     let as_of = Utc::now().to_rfc3339();
@@ -1269,10 +1306,36 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_references_header, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, sanitize_reference_token, wrap_message_id,
+        build_references_header, heartbeat_note_id, message_id_match_candidates,
+        parent_references_chain, parent_wire_message_id, sanitize_reference_token, wrap_message_id,
     };
     use serde_json::json;
+
+    // #606 round-1 codex review, Medium finding: a delimiter-joined
+    // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
+    // components may themselves contain `:` — these two distinct triples
+    // both produced `"khive:channel_health:a:b:c:d"` under the pre-fix
+    // scheme (`namespace:kind:slug` == `"a:b"` + `"c"` + `"d"` joins to the
+    // same string as `"a"` + `"b:c"` + `"d"`). The JSON-array encoding must
+    // keep them distinct.
+    #[test]
+    fn heartbeat_note_id_does_not_collide_on_delimiter_bearing_components() {
+        let a = heartbeat_note_id("a:b", "c", "d");
+        let b = heartbeat_note_id("a", "b:c", "d");
+        assert_ne!(
+            a, b,
+            "distinct (namespace, channel_kind, channel_slug) triples with \
+             colons inside a component must never hash to the same id"
+        );
+    }
+
+    #[test]
+    fn heartbeat_note_id_is_deterministic() {
+        assert_eq!(
+            heartbeat_note_id("local", "email", "leo@khive.ai"),
+            heartbeat_note_id("local", "email", "leo@khive.ai"),
+        );
+    }
 
     #[test]
     fn candidates_bare_input_adds_bracketed_form() {

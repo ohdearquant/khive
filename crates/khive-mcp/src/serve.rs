@@ -295,10 +295,12 @@ async fn channel_poll_loop(
     const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
 
     let mut last_poll = Utc::now();
-    // One backoff state per channel kind, i.e. per credential — a given
-    // channel kind (e.g. "email") maps to exactly one configured credential
-    // in this process, so failures on one credential never throttle another.
-    let mut backoffs: HashMap<String, ImapBackoff> = HashMap::new();
+    // One backoff state per (kind, slug) — i.e. per credential (#606 round-1
+    // codex review, High finding). Keying by kind alone would throttle a
+    // second same-kind credential (e.g. a second mailbox) whenever the first
+    // one's connection fails, even though the two are independent
+    // credentials with independent connectivity.
+    let mut backoffs: HashMap<(String, String), ImapBackoff> = HashMap::new();
     let mut next_interval = HAPPY_PATH_INTERVAL;
 
     loop {
@@ -308,21 +310,15 @@ async fn channel_poll_loop(
         let since = last_poll;
         last_poll = Utc::now();
 
-        for (kind, channel) in channels.iter() {
-            let slug = channel.slug();
+        for (kind, slug, channel) in channels.iter() {
+            let backoff_key = (kind.to_string(), slug.to_string());
             match channel.poll(since).await {
                 Ok(envelopes) => {
-                    if let Some(backoff) = backoffs.get_mut(kind) {
+                    if let Some(backoff) = backoffs.get_mut(&backoff_key) {
                         backoff.record_success();
                     }
-                    record_channel_heartbeat(
-                        &registry,
-                        &ingest_namespace,
-                        kind,
-                        &slug,
-                        HeartbeatOutcome::Success,
-                    )
-                    .await;
+                    record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success)
+                        .await;
                     for env in envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
@@ -351,9 +347,8 @@ async fn channel_poll_loop(
                     let class = channel_error_class(&e);
                     record_channel_heartbeat(
                         &registry,
-                        &ingest_namespace,
                         kind,
-                        &slug,
+                        slug,
                         HeartbeatOutcome::Failure {
                             class,
                             message: e.to_string(),
@@ -361,7 +356,7 @@ async fn channel_poll_loop(
                     )
                     .await;
                     if is_backoff_eligible(&e) {
-                        let backoff = backoffs.entry(kind.to_string()).or_default();
+                        let backoff = backoffs.entry(backoff_key).or_default();
                         let tick = backoff.record_failure();
                         log_eligible_poll_failure(kind, &e, &tick);
                         next_interval = next_interval.max(tick.delay);
@@ -410,16 +405,26 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 /// (#606). Best-effort: a failed heartbeat write is logged and does not
 /// interrupt the poll loop — the heartbeat row is an observability surface,
 /// not a correctness dependency for message delivery.
+///
+/// Takes NO `namespace` parameter (round-2, spec-gate Blocker fix, Leo
+/// 2026-07-04): heartbeat rows are an operational surface, not message data,
+/// so they are ALWAYS dispatched against
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — the same constant
+/// `handle_health` reads from — regardless of what
+/// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
+/// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
+/// namespace to this same constant, so the guarantee holds even if a future
+/// caller changes what this dispatch call passes.
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,
-    namespace: &str,
     channel_kind: &str,
     channel_slug: &str,
     outcome: HeartbeatOutcome,
 ) {
     use serde_json::json;
 
+    let namespace = khive_pack_comm::CHANNEL_HEALTH_NAMESPACE;
     let params = match outcome {
         HeartbeatOutcome::Success => json!({
             "namespace": namespace,
@@ -3451,7 +3456,6 @@ brain_profile = "project-profile"
             // must return without panicking (the caller only logs a warning).
             record_channel_heartbeat(
                 &registry,
-                "local",
                 "email",
                 "leo@khive.ai",
                 HeartbeatOutcome::Success,
@@ -3471,7 +3475,6 @@ brain_profile = "project-profile"
 
             record_channel_heartbeat(
                 &registry,
-                "local",
                 "email",
                 "leo@khive.ai",
                 HeartbeatOutcome::Success,
@@ -3486,6 +3489,197 @@ brain_profile = "project-profile"
             assert_eq!(channels.len(), 1);
             assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
             assert_eq!(channels[0]["channel_slug"].as_str(), Some("leo@khive.ai"));
+        }
+
+        /// #606 round-1 codex review, Blocker finding: a daemon polling under a
+        /// non-local `KHIVE_EMAIL_INGEST_NAMESPACE` must not cause a client-role
+        /// no-arg `comm.health()` to report empty state. `record_channel_heartbeat`
+        /// takes no `namespace` parameter — the write is unconditionally pinned to
+        /// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — so this regression proves
+        /// the heartbeat row is visible via the default (local-scoped) `comm.health`
+        /// read even though this daemon's *messages* are configured to ingest into
+        /// a completely different namespace.
+        #[tokio::test]
+        async fn heartbeat_visible_via_health_regardless_of_configured_ingest_namespace() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            // Simulates `KHIVE_EMAIL_INGEST_NAMESPACE=lambda:mybot`: comm.ingest for
+            // an inbound message would target this namespace, but the heartbeat
+            // write must ignore it entirely.
+            let configured_ingest_namespace = "lambda:mybot";
+            let ingest_params = serde_json::json!({
+                "namespace": configured_ingest_namespace,
+                "from": "email:sender@example.com",
+                "to": "email:leo@khive.ai",
+                "content": "hello",
+                "channel_kind": "email",
+                "external_id": "test-msg-1",
+                "default_inbound_actor": "lambda:leo",
+            });
+            registry
+                .dispatch("comm.ingest", ingest_params)
+                .await
+                .expect("message ingest into the configured namespace succeeds");
+
+            record_channel_heartbeat(
+                &registry,
+                "email",
+                "leo@khive.ai",
+                HeartbeatOutcome::Success,
+            )
+            .await;
+
+            // A no-arg client-role comm.health() call must see the heartbeat row —
+            // it must NOT report role="client" with an empty channels array just
+            // because messages are configured to ingest into a non-local namespace.
+            let health = registry
+                .dispatch("comm.health", serde_json::json!({}))
+                .await
+                .expect("health succeeds");
+            assert_eq!(health["role"].as_str(), Some("daemon"));
+            let channels = health["channels"].as_array().expect("channels array");
+            assert_eq!(
+                channels.len(),
+                1,
+                "heartbeat row must be visible to a no-arg client comm.health() call \
+                 regardless of the configured message-ingest namespace"
+            );
+            assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
+            assert_eq!(channels[0]["channel_slug"].as_str(), Some("leo@khive.ai"));
+        }
+    }
+
+    // --- ChannelRegistry composite-key production path (round-1 codex review, High finding) ---
+
+    #[cfg(feature = "channel-email")]
+    mod composite_key_registry_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError, ChannelRegistry};
+        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+        use std::sync::Arc;
+
+        /// Two independent inboxes that both report `kind() == "email"` but
+        /// distinct `slug()` mailbox addresses, exactly like two configured
+        /// `EmailChannel` credentials would.
+        struct TwoMailboxChannel {
+            slug: String,
+        }
+
+        #[async_trait]
+        impl Channel for TwoMailboxChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            fn slug(&self) -> String {
+                self.slug.clone()
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(vec![])
+            }
+        }
+
+        /// #606 round-1 codex review, High finding: this is the regression codex
+        /// specifically asked for — a PRODUCTION `ChannelRegistry` populated
+        /// through the real `register()` path (not a pack-level dispatch
+        /// bypassing registration) with two same-kind, different-slug adapters.
+        /// Both must be registered (not collapsed) and both must be pollable by
+        /// the production poll loop, producing two independent `comm.health()`
+        /// rows and two independent backoff states. This test FAILS against a
+        /// `kind`-only-keyed `ChannelRegistry` (both registrations collapse to
+        /// `len() == 1`) and PASSES against the `(kind, slug)`-composite-keyed
+        /// registry.
+        #[tokio::test]
+        async fn two_same_kind_channels_both_poll_and_both_persist_health_rows() {
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(TwoMailboxChannel {
+                slug: "mailbox-a@example.com".to_string(),
+            }));
+            ch_registry.register(Arc::new(TwoMailboxChannel {
+                slug: "mailbox-b@example.com".to_string(),
+            }));
+            assert_eq!(
+                ch_registry.len(),
+                2,
+                "two same-kind, different-slug adapters must both register, not collapse"
+            );
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            // Drive exactly what the production poll loop does per tick: iterate
+            // the registry and record a heartbeat for every (kind, slug, channel).
+            for (kind, slug, _channel) in ch_registry.iter() {
+                record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success).await;
+            }
+
+            let health = registry
+                .dispatch("comm.health", serde_json::json!({}))
+                .await
+                .expect("health succeeds");
+            let channels = health["channels"].as_array().expect("channels array");
+            assert_eq!(
+                channels.len(),
+                2,
+                "both mailboxes must produce independent comm.health rows"
+            );
+            let slugs: std::collections::BTreeSet<&str> = channels
+                .iter()
+                .map(|c| c["channel_slug"].as_str().expect("channel_slug present"))
+                .collect();
+            assert_eq!(
+                slugs,
+                std::collections::BTreeSet::from([
+                    "mailbox-a@example.com",
+                    "mailbox-b@example.com"
+                ])
+            );
+        }
+
+        /// Backoff state independence: the production poll loop keys its
+        /// `HashMap<(String, String), ImapBackoff>` by the same composite
+        /// identity, so a failure on one mailbox must never throttle the other.
+        #[test]
+        fn backoff_state_is_independent_per_kind_slug_pair() {
+            use khive_channel_email::ImapBackoff;
+            use std::collections::HashMap;
+
+            let mut backoffs: HashMap<(String, String), ImapBackoff> = HashMap::new();
+            let key_a = ("email".to_string(), "mailbox-a@example.com".to_string());
+            let key_b = ("email".to_string(), "mailbox-b@example.com".to_string());
+
+            let tick_a = backoffs.entry(key_a.clone()).or_default().record_failure();
+            assert!(
+                !backoffs.contains_key(&key_b),
+                "mailbox-b must have no backoff state after only mailbox-a fails"
+            );
+            assert!(tick_a.delay.as_secs() >= 1, "mailbox-a backoff engaged");
+
+            // mailbox-b independently starts fresh and succeeds immediately.
+            let backoff_b = backoffs.entry(key_b).or_default();
+            backoff_b.record_success();
+            assert_eq!(
+                backoffs.get(&key_a).unwrap().attempt(),
+                1,
+                "mailbox-a's backoff attempt count must be unaffected by mailbox-b's success"
+            );
         }
     }
 

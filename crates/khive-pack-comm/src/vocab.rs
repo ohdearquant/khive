@@ -229,7 +229,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
         name: "comm.heartbeat",
         description: "Persist a per-channel-credential heartbeat row after a poll attempt. \
                        Subhandler — not callable on the MCP wire; only the daemon's channel \
-                       poll loop calls this (khive #606).",
+                       poll loop calls this (khive #606). The row is ALWAYS pinned to \
+                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") regardless of \
+                       the caller's dispatch namespace — heartbeat rows are an operational \
+                       surface, not message data, so they never follow \
+                       `KHIVE_EMAIL_INGEST_NAMESPACE` or any other caller-chosen namespace.",
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -237,7 +241,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
                 name: "namespace",
                 param_type: "string",
                 required: true,
-                description: "Target namespace for the heartbeat row.",
+                description: "Dispatch routing key (ADR-007 Rule 3 explicit escape) consumed \
+                              by `VerbRegistry::dispatch` to mint the call's `NamespaceToken`. \
+                              Callers should always pass \
+                              `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE`: the persisted row's \
+                              actual namespace is hardcoded to that constant inside the \
+                              handler regardless of this value, so a different value here \
+                              does not redirect where the row lands.",
             },
             ParamDef {
                 name: "channel_kind",
@@ -282,7 +292,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
         description: "Read-only per-channel health snapshot (khive #606). Returns the \
                        daemon-persisted heartbeat row for every known channel: timestamps \
                        and consecutive-failure counts only — never a computed healthy bool. \
-                       Health judgment belongs to the caller.",
+                       Health judgment belongs to the caller. Reads \
+                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") UNCONDITIONALLY \
+                       — regardless of the caller's dispatch/token namespace — so a client-role \
+                       no-arg call always sees daemon-persisted state when it exists, even if \
+                       the caller's own messages are ingested under a different namespace.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
