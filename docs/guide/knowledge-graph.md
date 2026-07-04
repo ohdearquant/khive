@@ -339,5 +339,7 @@ Overall target: 5+ edges per entity average. Check with `stats()`; if
 - [Prompt Cookbook](prompt-cookbook.md): concrete verb patterns for all the
   operations described here
 - [Search and Retrieval](search.md): how to find things in the graph
+- [Specialized Packs](specialized-packs.md): niche packs, such as the
+  formal-math pack, that extend the base edge ontology additively
 - [AGENTS.md](../../AGENTS.md): the full agent reference with GQL/SPARQL
   examples

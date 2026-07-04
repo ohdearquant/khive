@@ -210,3 +210,5 @@ request(ops="memory.remember(content=\"HANDOFF: Attention benchmark suite is rea
 - [Prompt Cookbook](prompt-cookbook.md): memory verb patterns
 - [GTD Task Management](tasks.md): task lifecycle (often paired with memory
   for context)
+- [Agent Sessions and Data Ingest](sessions-and-ingest.md): a separate,
+  session-scoped persistence model for transcripts and provider mirrors

@@ -111,10 +111,13 @@ jobs:
             [memory]="4|Memory and Recall|Episodic vs semantic memory, salience, and decay-weighted recall."
             [search]="5|Search and Retrieval|FTS5, vector search, hybrid fusion, and reranking."
             [tasks]="6|GTD Task Management|Task lifecycle, priorities, and dependency edges."
-            [prompt-cookbook]="7|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
-            [tips-and-tricks]="8|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
-            [proof-graph-case-study]="9|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
-            [api-reference]="10|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
+            [communication]="7|Communication and Email|Actor-addressed messaging, threading, and the optional email channel."
+            [sessions-and-ingest]="8|Agent Sessions and Data Ingest|Session record verbs and provider transcript mirror ingest."
+            [specialized-packs]="9|Specialized Packs|Niche packs beyond the production set, starting with the formal-math pack."
+            [prompt-cookbook]="10|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
+            [tips-and-tricks]="11|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
+            [proof-graph-case-study]="12|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
+            [api-reference]="13|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'
