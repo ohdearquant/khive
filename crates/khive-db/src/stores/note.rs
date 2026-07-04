@@ -431,6 +431,8 @@ impl NoteStore for SqlNoteStore {
 
         self.with_writer("upsert_notes", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("note_upsert_batch".to_string()));
             let mut affected = 0u64;
             let mut failed = 0u64;
             let mut first_error = String::new();

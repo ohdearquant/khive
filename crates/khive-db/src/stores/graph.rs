@@ -350,6 +350,8 @@ impl GraphStore for SqlGraphStore {
 
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("graph_upsert_edges".to_string()));
             let mut affected = 0u64;
 
             for edge in &edges {
@@ -1030,6 +1032,14 @@ impl GraphStore for SqlGraphStore {
             // graph snapshot.  Without this, a writer committing between chunks could
             // let roots 1..400 see the pre-commit graph and 401..800 see the post-commit
             // graph.  One pool checkout, one snapshot for the full traverse.
+            //
+            // ADR-091 Plank 0: this is the most WAL-pin-relevant span in the store —
+            // it intentionally holds a read snapshot across chunked traversal work.
+            // Registered before the transaction is opened so the handle (declared
+            // first) drops after `tx`'s own Drop runs (locals drop in reverse
+            // declaration order within the same scope).
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("graph_traverse_read".to_string()));
             let tx = conn.unchecked_transaction()?;
 
             // Accumulate per-root state across all chunks: (nodes_with_path_weight, seen_set).

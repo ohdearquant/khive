@@ -294,6 +294,14 @@ impl VectorStore for SqliteVecStore {
             // vec0 does not support INSERT OR REPLACE — delete then insert.
             // Wrap in a transaction so a failed INSERT rolls back the DELETE,
             // leaving the previous vector intact (no-worse-than-stale guarantee).
+            //
+            // ADR-091 Plank 0: register the span before opening the transaction so
+            // the handle (declared first) drops AFTER `tx` (declared second) —
+            // locals drop in reverse declaration order, so `tx`'s own Drop (which
+            // rolls back if uncommitted) runs while the registry entry is still
+            // present.
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("vec_insert_tx".to_string()));
             let tx = conn.unchecked_transaction()?;
 
             let del_sql = format!(
@@ -354,6 +362,8 @@ impl VectorStore for SqliteVecStore {
             );
 
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("vector_insert_batch".to_string()));
             let mut affected = 0u64;
             let mut failed = 0u64;
             let mut first_error = String::new();
@@ -493,6 +503,11 @@ impl VectorStore for SqliteVecStore {
 
             // DELETE then INSERT in one transaction so a failed INSERT rolls back
             // the DELETE, leaving the previous vector intact (no-worse-than-stale).
+            //
+            // ADR-091 Plank 0: registered before the transaction is opened — see
+            // the matching note in `insert()` above for the drop-order rationale.
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("vec_update_tx".to_string()));
             let tx = conn.unchecked_transaction()?;
 
             let del_sql = format!(
@@ -851,6 +866,12 @@ impl VectorStore for SqliteVecStore {
             // `with_writer` serialises all callers through the pool mutex — at most one
             // writer closure executes on this connection at a time, so no nested
             // transactions can exist when this line runs.
+            //
+            // ADR-091 Plank 0: registered before the transaction is opened — see the
+            // matching note in `insert()` for the drop-order rationale (the handle,
+            // declared first, drops after `tx`'s own Drop/rollback runs).
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("vec_orphan_sweep".to_string()));
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,

@@ -167,6 +167,7 @@ pub async fn apply_fold_gate(
     exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
         .await
         .map_err(|e| sql_err("begin", e))?;
+    let _tx_handle = khive_storage::tx_registry::register(Some("fold_gate_apply".to_string()));
 
     let result = apply_gate_within_tx(
         writer.as_mut(),
@@ -293,6 +294,8 @@ where
     exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
         .await
         .map_err(|e| sql_err("begin", e))?;
+    let _tx_handle =
+        khive_storage::tx_registry::register(Some("fold_gate_apply_event".to_string()));
 
     let result = apply_gate_and_append_within_tx(
         writer.as_mut(),
