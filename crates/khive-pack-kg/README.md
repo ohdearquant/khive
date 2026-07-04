@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-16 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+17 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb        | What it does                                                                    |
 | ----------- | ------------------------------------------------------------------------------- |
@@ -27,6 +27,7 @@ workspace declares it as a dependency.
 | `withdraw`  | Rescind an open proposal (proposer-only)                                        |
 | `verbs`     | List all MCP-callable verbs registered on the server                            |
 | `stats`     | Aggregate KG substrate counts (entities, edges, notes)                          |
+| `context`   | Entity-anchored graph context in one call (ADR-089)                             |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).

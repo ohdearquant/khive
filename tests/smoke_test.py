@@ -193,21 +193,24 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 8 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session), so verbs() returns exactly 72 user-facing
+        # knowledge, session), so verbs() returns exactly 73 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083; brain.register_adapter (#354) is included
-        # in the count. Update this number when the pack set or verb surface
+        # Visibility::Verb per ADR-083; brain.register_adapter (#354) and
+        # context (ADR-089, the 17th kg-substrate bare verb) are included in
+        # the count. Update this number when the pack set or verb surface
         # changes; a silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 72, (
-            f"expected 72 user-facing verbs from the 8 default packs "
+        assert verbs_result["total"] == 73, (
+            f"expected 73 user-facing verbs from the 8 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083), got {verbs_result['total']}: {verbs_result}"
+            f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089), "
+            f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
         assert "create" in verb_names, f"'create' must appear in verbs listing: {verb_names}"
         assert "stats" in verb_names, f"'stats' must appear in verbs listing: {verb_names}"
+        assert "context" in verb_names, f"'context' (ADR-089) must appear in verbs listing: {verb_names}"
         # each entry carries verb, pack, description, category per handler_defs.rs:735-742
         first = verbs_result["verbs"][0]
         for key in ("verb", "pack", "description", "category"):

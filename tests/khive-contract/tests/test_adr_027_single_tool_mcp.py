@@ -13,7 +13,7 @@ from khive_contract.fixtures import KG_VERBS as _KG_VERBS
 
 VERBS_UNDER_TEST = {"create"}
 
-# KG verbs imported from fixtures.py — single source of truth (16 verbs).
+# KG verbs imported from fixtures.py — single source of truth (17 verbs).
 KG_VERBS = tuple(sorted(_KG_VERBS))
 GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
 MEMORY_VERBS = ("memory.remember", "memory.recall")

@@ -107,7 +107,7 @@ fn every_non_kg_verb_is_namespaced() {
                 if !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
                     violations.push(format!(
                         "pack={pack_name:?} verb={verb_name:?}: bare name is not in the \
-                         kg-substrate-16 allowlist. Add `{pack_name}.` prefix."
+                         kg-substrate-17 allowlist. Add `{pack_name}.` prefix."
                     ));
                 }
             }

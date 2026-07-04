@@ -83,7 +83,7 @@ ANNOTATES_SOURCE_MUST_BE_NOTE = True
 
 # ---------------------------------------------------------------------------
 # Product verb manifest (ADR-023 / ADR-025 / ADR-027)
-# KG pack ships 16 verbs; bare names (no pack prefix).
+# KG pack ships 17 verbs; bare names (no pack prefix).
 # Source of truth: crates/khive-pack-kg/src/handler_defs.rs KG_HANDLERS
 # ---------------------------------------------------------------------------
 
@@ -105,6 +105,7 @@ KG_VERBS: frozenset[str] = frozenset(
         "review",
         "withdraw",
         "verbs",
+        "context",
     }
 )
 
@@ -127,8 +128,8 @@ MEMORY_VERBS: frozenset[str] = frozenset(
 
 DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS | GTD_VERBS | MEMORY_VERBS
 
-# The play spec says "15 product verbs"; the baseline exposes 23
-# (KG:16 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (23) subsumes
+# The play spec says "15 product verbs"; the baseline exposes 24
+# (KG:17 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (24) subsumes
 # the stated minimum (15).
 PLAY_SPEC_MINIMUM_VERB_COUNT = 15
 
