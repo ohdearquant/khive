@@ -19,19 +19,19 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 ## What you get
 
-| Capability                  | How                                                                                                                                                |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **72 verbs, 8 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge, session: all load by default                                                                    |
-| **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                      |
-| **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                |
-| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                |
-| **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths                           |
-| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                                             |
-| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                                                  |
-| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                                                         |
-| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                                                  |
-| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                                                         |
-| **Namespace attribution**   | Every record stamped with a namespace; all records share one store by default; operators may supply a custom Gate for namespace-scoped enforcement |
+| Capability                  | How                                                                                                                                                      |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **72 verbs, 8 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge, session: all load by default                                                                          |
+| **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
+| **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
+| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
+| **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths                                 |
+| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                                                   |
+| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                                                        |
+| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                                                               |
+| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                                                        |
+| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                                                               |
+| **Namespace attribution**   | Every record is stamped with a namespace and all records share one store by default. Operators can supply a custom Gate for namespace-scoped enforcement |
 
 ---
 
@@ -77,8 +77,7 @@ this table):
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
 
-Agents reach khive via MCP stdio, using Python, TypeScript, Rust, or any MCP-compatible client.
-No language SDK to learn.
+Agents reach khive via MCP stdio, using Python, TypeScript, Rust, or any MCP-compatible client, so there is no language SDK to learn.
 
 ---
 
