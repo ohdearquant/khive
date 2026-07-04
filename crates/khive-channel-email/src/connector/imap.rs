@@ -16,6 +16,7 @@ use mail_parser::MessageParser;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::instrument;
 
+use crate::backoff::ImapSingleFlight;
 use crate::oauth::{TokenProvider, XOAuth2Authenticator};
 
 use super::RawEmail;
@@ -54,6 +55,10 @@ pub(crate) struct LiveImap {
     host: String,
     port: u16,
     auth: ImapAuthConfig,
+    /// Per-credential single-flight guard (#605): at most one concurrent
+    /// connection attempt for this `LiveImap` (i.e. this credential) proceeds;
+    /// a bounded semaphore is the only way to widen the cap later.
+    single_flight: ImapSingleFlight,
 }
 
 impl LiveImap {
@@ -71,6 +76,7 @@ impl LiveImap {
                 username: username.into(),
                 password: password.into(),
             },
+            single_flight: ImapSingleFlight::new(),
         }
     }
 
@@ -93,6 +99,7 @@ impl LiveImap {
                 mailbox: mailbox.into(),
                 token_provider,
             },
+            single_flight: ImapSingleFlight::new(),
         }
     }
 
@@ -190,6 +197,12 @@ impl ImapConnector for LiveImap {
         since: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<RawEmail>, ChannelError> {
+        // Single-flight (#605): hold this credential's one permit for the
+        // full connect-through-logout lifecycle below, so a second concurrent
+        // call (e.g. a future caller widening the poll loop's concurrency)
+        // waits for this connection to finish instead of opening a second one
+        // against the same mailbox.
+        let _permit = self.single_flight.acquire().await;
         let mut session = self.connect().await?;
 
         // SELECT returns the Mailbox struct; uid_validity is the UIDVALIDITY value needed
