@@ -59,7 +59,7 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
 All 8 packs load by default — **72 verbs** out of the box (verified against the live
-`verbs()` registry, 2026-07-03 — regenerate with `request(ops="verbs()")` before editing
+`verbs()` registry, 2026-07-04 — regenerate with `request(ops="verbs()")` before editing
 this table):
 
 | Pack          | Prefix       | Verbs | What it does                                          |
@@ -78,6 +78,42 @@ this table):
 
 Agents reach khive via MCP stdio — Python, TypeScript, Rust, or any MCP-compatible client.
 No language SDK to learn.
+
+---
+
+## Why typed edges, not just vector similarity
+
+A vector index returns "these two texts are close." It has no idea that document B introduced
+concept A, that concept C is a variant of concept A, or that concept D was superseded by concept
+E last month. Cosine distance carries no direction and no type — it can't tell you what a
+relationship _is_, only that something is nearby.
+
+khive's graph carries both signals. Every edge is one of 17 closed relations across 9
+categories: structure (`contains`, `part_of`, `instance_of`), derivation (`extends`,
+`variant_of`, `introduced_by`, `supersedes`), provenance (`derived_from`), temporal
+(`precedes`), dependency (`depends_on`, `enables`), implementation (`implements`), lateral
+(`competes_with`, `composed_with`), annotation (`annotates`), and epistemic (`supports`,
+`refutes`).
+
+Here's the difference in practice, run against a scratch database
+(full transcript in [`demos/research-ingest.md`](demos/research-ingest.md)):
+
+```
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\")")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention-2\", description=\"Improved parallelism and work partitioning over FlashAttention\")")
+request(ops="link(source_id=\"<fa2_id>\", target_id=\"<fa_id>\", relation=\"extends\")")
+request(ops="traverse(roots=[\"<fa_id>\"], max_depth=2)")
+```
+
+`traverse` returns the lineage directly: FlashAttention-2 reaches FlashAttention across one
+`extends` edge, with the edge id and relation name attached to the path. A vector search over
+the same two entities returns a similarity score between two chunks of text — no way to tell
+which one came first or which direction the relationship runs.
+
+khive runs both signals together. `search` combines FTS5 and vector similarity through RRF
+fusion to find candidates. `traverse`, `neighbors`, and GQL/SPARQL walk the typed edges to show
+how those candidates actually relate. Similarity surfaces what's nearby in meaning. The graph
+records what's connected, in which direction, and why.
 
 ---
 
@@ -182,42 +218,53 @@ touching consumers.
 
 ## Quick start
 
-**1. Install:**
+**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp), currently at `0.3.0`):
 
 ```bash
-npm install -g khive
+cargo install kkernel
 ```
+
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. If you
+don't have Rust, install it first via [rustup](https://rustup.rs).
 
 **2. Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
 global):
 
 ```json
-{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
-```
-
-**That's it.** All 8 packs load by default, a background daemon auto-spawns to keep the runtime
-warm, and Claude Code discovers the `request` tool with the full 72-verb catalog.
-
-### Alternative: install via Cargo
-
-If you prefer Rust tooling or need to build from source:
-
-```bash
-cargo install kkernel                          # from crates.io — installs the `kkernel` binary
-# or:
-git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
-```
-
-Then point your MCP config at the binary's `mcp` subcommand:
-
-```json
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
 
-`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
-surface. The npm package installs a thin `khive` (and a `khive-mcp` compatibility)
-shim that forwards to `kkernel mcp` — the Cargo path invokes `kkernel` directly.
+**3. Verify:**
+
+```bash
+kkernel --version   # confirms the binary and version you just installed
+```
+
+**That's it.** All 8 packs load by default, a background daemon auto-spawns to keep the runtime
+warm, and any MCP client discovers the `request` tool with the full 72-verb catalog.
+
+### Alternative: npm
+
+An npm-distributed `khive` package also exists, but the published version there can lag behind
+the latest crates.io release — check `khive --version` (or `khive-mcp --version`) after install
+and compare it to the [crates.io version](https://crates.io/crates/khive-mcp) before relying on
+features documented here.
+
+```bash
+npm install -g khive
+```
+
+```json
+{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cd crates && cargo build --release -p kkernel
+# binary at crates/target/release/kkernel
+```
 
 ### Usage
 
@@ -231,6 +278,17 @@ request(ops="link(source_id=\"<uuid>\", target_id=\"<uuid>\", relation=\"variant
 # Batch multiple ops in one call:
 request(ops="[create(...), create(...), link(...)]")
 ```
+
+### Claude Desktop
+
+Add the same server entry to `claude_desktop_config.json`:
+
+```json
+{ "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
+```
+
+See [docs/guide/getting-started.md](docs/guide/getting-started.md) for the config file location
+on each platform.
 
 ### Claude Code plugin (skills + agent)
 
@@ -274,6 +332,17 @@ Prerequisites: Rust 1.94+ (via [rustup](https://rustup.rs)),
 Deno 2.x (for the TypeScript CLI layer — optional)
 
 - Node.js 20+ and pnpm (for frontend — optional)
+
+---
+
+## Demos
+
+Runnable, copy-pasteable transcripts against a scratch database — see [`demos/`](demos/):
+
+- [`demos/research-ingest.md`](demos/research-ingest.md) — create entities, link them, search,
+  and traverse the graph
+- [`demos/gtd-memory.md`](demos/gtd-memory.md) — task lifecycle and salience-weighted memory
+  recall
 
 ---
 

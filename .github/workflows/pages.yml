@@ -1,0 +1,150 @@
+name: pages
+
+# Builds a static docs site from docs/guide/*.md and README.md using Jekyll's
+# GitHub Pages Actions build (no bundled framework, no npm/node toolchain).
+# NOTE: GitHub Pages is not yet enabled on this repo (Settings > Pages > Build
+# and deployment > Source: GitHub Actions). This workflow will not deploy
+# anything until that source is set; see the PR that introduced this file.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/guide/**"
+      - "README.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble Jekyll source from docs/guide
+        run: |
+          set -euo pipefail
+          SRC=_site_src
+          rm -rf "$SRC"
+          mkdir -p "$SRC"
+
+          cat > "$SRC/_config.yml" <<'EOF'
+          title: khive
+          description: "A typed knowledge graph runtime for AI agents, over MCP."
+          theme: jekyll-theme-minimal
+          markdown: kramdown
+          kramdown:
+            input: GFM
+          EOF
+
+          cat > "$SRC/index.md" <<'EOF'
+          ---
+          layout: default
+          title: khive
+          ---
+
+          # khive
+
+          A research knowledge graph runtime. Typed substrates, closed taxonomies, and a
+          verb-consolidated MCP surface — built for agents that need structure, not just vectors.
+
+          Vector search finds similar text. A knowledge graph finds structure: lineages,
+          dependencies, contradictions, gaps. khive gives an agent a typed, queryable graph that
+          grows as it works.
+
+          [crates.io](https://crates.io/crates/khive-mcp) &middot;
+          [GitHub](https://github.com/ohdearquant/khive) &middot;
+          [License: Apache 2.0](https://github.com/ohdearquant/khive/blob/main/LICENSE)
+
+          ## Documentation
+
+          - [Getting Started](getting-started.html) — install, connect, first session
+          - [Knowledge Graph Modeling](knowledge-graph.html) — entity kinds, edge relations, modeling patterns
+          - [Prompt Cookbook](prompt-cookbook.html) — ready-to-use verb patterns
+          - [Search and Retrieval](search.html) — FTS, vector, hybrid fusion, reranking
+          - [Memory and Recall](memory.html) — episodic vs semantic, salience, decay
+          - [GTD Task Management](tasks.html) — task lifecycle, priorities, dependencies
+
+          ## Demos
+
+          Runnable transcripts, captured against a scratch database, in the repo's
+          [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
+
+          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md) — create entities, link them, search, and traverse the graph
+          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md) — task lifecycle and salience-weighted memory recall
+
+          ## Install
+
+          ```bash
+          cargo install kkernel
+          ```
+
+          `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
+          Full install and MCP client setup: [Getting Started](getting-started.html).
+
+          ## Reference
+
+          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md) — full verb reference for agents using khive
+          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr) — the design contract
+          EOF
+
+          for f in docs/guide/*.md; do
+            base=$(basename "$f" .md)
+            [ "$base" = "README" ] && continue
+            title=$(head -n1 "$f" | sed -E 's/^#+[[:space:]]*//')
+            {
+              echo "---"
+              echo "layout: default"
+              echo "title: \"${title}\""
+              echo "---"
+              echo
+              # rewrite in-repo relative links to the site's flat .html layout;
+              # links that point outside docs/guide (repo-root files, ADRs) go
+              # to their GitHub blob URL instead, since they aren't part of
+              # this site. External links are left untouched.
+              sed -E \
+                -e 's#\]\(\.\./\.\./([A-Za-z0-9_./-]+)\)#](https://github.com/ohdearquant/khive/blob/main/\1)#g' \
+                -e 's#\]\(\.\./adr/([A-Za-z0-9_./-]+)\)#](https://github.com/ohdearquant/khive/blob/main/docs/adr/\1)#g' \
+                -e 's#\]\(\.\./README\.md([^)]*)\)#](index.html\1)#g' \
+                -e 's#\]\(([A-Za-z0-9_-]+)\.md([^)]*)\)#](\1.html\2)#g' \
+                "$f"
+            } > "$SRC/$base.md"
+          done
+
+          echo "Assembled site source:"
+          ls -la "$SRC"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: _site_src
+          destination: _site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

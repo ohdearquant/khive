@@ -13,7 +13,7 @@ when the DSL string would be hard to escape.
 ### Create an entity
 
 ```
-request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={domain: \"attention\", year: 2022})")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={\"domain\": \"attention\", \"year\": 2022})")
 ```
 
 Response:
@@ -288,7 +288,7 @@ request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
 ### Auto-feedback after recall
 
 ```
-request(ops="brain.auto_feedback(results=[{id: \"<uuid>\", used: true}])")
+request(ops="brain.auto_feedback(results=[{\"id\": \"<uuid>\", \"used\": true}])")
 ```
 
 Convenience verb: call after `memory.recall` to automatically feed back which

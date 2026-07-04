@@ -32,7 +32,7 @@ common kind and the default.
 ```
 create(kind="entity", entity_kind="concept", name="LoRA",
        description="Low-Rank Adaptation of LLMs",
-       properties={domain: "fine-tuning", type: "technique", year: 2021})
+       properties={"domain": "fine-tuning", "type": "technique", "year": 2021})
 ```
 
 Use `concept` for anything that is an idea, method, or approach. Use
@@ -46,8 +46,8 @@ Papers, preprints, technical reports, blog posts, books.
 ```
 create(kind="entity", entity_kind="document",
        name="Attention Is All You Need",
-       properties={authors: "Vaswani et al.", year: 2017,
-                   source: "arxiv:1706.03762"})
+       properties={"authors": "Vaswani et al.", "year": 2017,
+                   "source": "arxiv:1706.03762"})
 ```
 
 Name the entity with its short title. Put full title, authors, year, and
@@ -60,7 +60,7 @@ Benchmarks, corpora, evaluation sets.
 ```
 create(kind="entity", entity_kind="dataset", name="MMLU",
        description="Massive Multitask Language Understanding benchmark",
-       properties={type: "benchmark", year: 2021})
+       properties={"type": "benchmark", "year": 2021})
 ```
 
 ### project
@@ -70,7 +70,7 @@ Codebases, libraries, tools, frameworks.
 ```
 create(kind="entity", entity_kind="project", name="lattice-inference",
        description="Pure-Rust transformer inference engine",
-       properties={status: "implemented"})
+       properties={"status": "implemented"})
 ```
 
 ### person
@@ -79,7 +79,7 @@ Researchers, engineers, authors.
 
 ```
 create(kind="entity", entity_kind="person", name="Edward Hu",
-       properties={affiliation: "Microsoft"})
+       properties={"affiliation": "Microsoft"})
 ```
 
 ### org
@@ -97,7 +97,7 @@ Binaries, model checkpoints, Docker images, packages.
 
 ```
 create(kind="entity", entity_kind="artifact", name="Llama-3-70B",
-       properties={type: "checkpoint", source: "meta-llama"})
+       properties={"type": "checkpoint", "source": "meta-llama"})
 ```
 
 ### service
@@ -106,7 +106,7 @@ APIs, hosted endpoints, SaaS products.
 
 ```
 create(kind="entity", entity_kind="service", name="OpenAI API",
-       properties={type: "api"})
+       properties={"type": "api"})
 ```
 
 ### resource
@@ -118,7 +118,7 @@ managed by the knowledge pack rather than authored as raw entities.
 ```
 create(kind="entity", entity_kind="resource", name="retrieval-patterns",
        description="Domain knowledge pack for hybrid retrieval patterns",
-       properties={type: "domain"})
+       properties={"type": "domain"})
 ```
 
 ## Note kinds
@@ -245,11 +245,11 @@ from concepts to the paper.
 
 ```
 create(kind="entity", entity_kind="document", name="LoRA Paper",
-       properties={title: "LoRA: Low-Rank Adaptation of Large Language Models",
-                   authors: "Hu et al.", year: 2021, source: "arxiv:2106.09685"})
+       properties={"title": "LoRA: Low-Rank Adaptation of Large Language Models",
+                   "authors": "Hu et al.", "year": 2021, "source": "arxiv:2106.09685"})
 
 create(kind="entity", entity_kind="concept", name="LoRA",
-       properties={domain: "fine-tuning", type: "technique"})
+       properties={"domain": "fine-tuning", "type": "technique"})
 
 link(source_id="<lora_id>", target_id="<paper_id>", relation="introduced_by")
 ```
@@ -267,7 +267,7 @@ concepts it realizes, and `depends_on` for external dependencies:
 
 ```
 create(kind="entity", entity_kind="project", name="lattice-inference",
-       properties={status: "implemented"})
+       properties={"status": "implemented"})
 
 link(source_id="<lattice_id>", target_id="<flash_id>", relation="implements")
 link(source_id="<lattice_id>", target_id="<tokio_id>", relation="depends_on")

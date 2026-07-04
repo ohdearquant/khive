@@ -30,7 +30,10 @@ npm install -g khive
 npm install -g @khive-ai/cli
 ```
 
-The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`.
+The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`. The npm
+release can lag the crates.io release — run `khive --version` after install and compare against
+[crates.io/crates/khive-mcp](https://crates.io/crates/khive-mcp) if you need the latest verbs
+documented here.
 
 ### From source
 
@@ -97,7 +100,7 @@ Entities are the nodes in your knowledge graph. khive has 9 entity kinds:
 `service`, `resource`.
 
 ```
-request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={domain: \"attention\", year: 2022})")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"FlashAttention\", description=\"IO-aware exact attention algorithm\", properties={\"domain\": \"attention\", \"year\": 2022})")
 ```
 
 Response:
@@ -117,7 +120,7 @@ Response:
 ### 2. Create a related entity
 
 ```
-request(ops="create(kind=\"entity\", entity_kind=\"document\", name=\"FlashAttention: Fast and Memory-Efficient Exact Attention\", properties={authors: \"Dao et al.\", year: 2022, source: \"arxiv:2205.14135\"})")
+request(ops="create(kind=\"entity\", entity_kind=\"document\", name=\"FlashAttention: Fast and Memory-Efficient Exact Attention\", properties={\"authors\": \"Dao et al.\", \"year\": 2022, \"source\": \"arxiv:2205.14135\"})")
 ```
 
 ### 3. Link them

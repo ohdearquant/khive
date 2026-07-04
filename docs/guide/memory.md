@@ -147,7 +147,7 @@ recalling memories, you can feed back which results were useful:
 ### Auto-feedback (recommended)
 
 ```
-request(ops="brain.auto_feedback(results=[{id: \"<mem1_uuid>\", used: true}, {id: \"<mem2_uuid>\", used: false}])")
+request(ops="brain.auto_feedback(results=[{\"id\": \"<mem1_uuid>\", \"used\": true}, {\"id\": \"<mem2_uuid>\", \"used\": false}])")
 ```
 
 Call this after `memory.recall` to automatically signal which results you
