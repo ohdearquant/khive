@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 72 verbs across 8
+khive exposes exactly one MCP tool, `request`. Everything else — 73 verbs across 8
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
 2026-07-03) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **72**, matching both the live registry `total` field and
+struct literals). Verb count: **73**, matching both the live registry `total` field and
 the sum of the 8 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -21,7 +21,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                  | Optional?           |
 | ----------- | ----- | -------------------------- | ------------------- |
-| `kg`        | 16    | `KHIVE_PACKS=kg` (default) | No — base substrate |
+| `kg`        | 17    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
 | `brain`     | 14    | `KHIVE_PACKS=kg,brain`     | Yes                 |
@@ -30,8 +30,8 @@ An always-machine-readable copy of this page is at
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 16 + 5 + 5 +
-14 + 5 + 4 + 19 + 4 = **72 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 17 + 5 + 5 +
+14 + 5 + 4 + 19 + 4 = **73 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -129,7 +129,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 16 verbs
+## `kg` pack — 17 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -323,6 +323,59 @@ Multi-hop BFS traversal.
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
+```
+
+### `context` — Assertive
+
+Entity-anchored graph context in one call ([ADR-089](../adr/ADR-089-context-verb.md)).
+Resolves anchors from `query` and/or `entity_ids`, expands 1-2 hops via the same
+runtime op behind `neighbors`, and assembles a budgeted, deterministically-ordered
+response — replacing a caller-side `search | neighbors` chain with a single
+round-trip. `direction` defaults to `"both"` here, diverging deliberately from
+`neighbors`'s `"outgoing"` default. At least one of `query`/`entity_ids` is required.
+One embedding inference when `query` is used; zero for a pure `entity_ids` call.
+
+| Param        | Type            | Required | Notes                                                                                 |
+| ------------ | --------------- | -------- | ------------------------------------------------------------------------------------- |
+| `query`      | string          | no\*     | Semantic anchor selection via hybrid search; adds anchors after `entity_ids`.         |
+| `entity_ids` | array\<string\> | no\*     | Explicit anchor UUIDs/prefixes/slugs. Honored in full, never clamped by `limit`.      |
+| `hops`       | integer         | no       | Expansion depth, clamped 0..=2 (default 1).                                           |
+| `budget`     | integer         | no       | Output budget in Unicode scalars of compact JSON, clamped 256..=65536 (default 4096). |
+| `relations`  | array\<string\> | no       | Edge-relation filter applied during expansion.                                        |
+| `direction`  | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                      |
+| `limit`      | integer         | no       | Max anchors from the `query` leg, clamped 1..=20 (default 5).                         |
+| `fanout`     | integer         | no       | Max neighbors per expanded node per hop, clamped 1..=50 (default 10).                 |
+
+\* at least one of `query`/`entity_ids` required.
+
+```
+request(ops="context(query=\"rotary position embedding\", hops=1, budget=4096)")
+```
+
+Response shape:
+
+```json
+{
+  "anchors": [
+    {
+      "entity": { "id": "…", "name": "…", "kind": "concept", "description": "…", "properties": {} },
+      "neighbors": [
+        {
+          "id": "…",
+          "name": "…",
+          "relation": "extends",
+          "direction": "outgoing",
+          "weight": 0.9,
+          "hop": 1,
+          "via": null,
+          "description": "…"
+        }
+      ]
+    }
+  ],
+  "truncated": false,
+  "dropped": { "anchors": 0, "neighbors": 0 }
+}
 ```
 
 ### `query` — Assertive

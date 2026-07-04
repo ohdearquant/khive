@@ -1,6 +1,7 @@
 //! KG pack verb handlers — split into one file per verb group.
 
 mod common;
+mod context;
 mod create;
 mod get;
 mod graph;

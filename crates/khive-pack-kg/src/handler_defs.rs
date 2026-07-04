@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (16 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (17 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 17] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -558,6 +558,79 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
                 param_type: "array of string",
                 required: false,
                 description: "Restrict traversal to these relation types.",
+            },
+        ],
+    },
+    // Assertive: entity-anchored graph context in one call (ADR-089)
+    HandlerDef {
+        name: "context",
+        description: "Entity-anchored graph context: resolve anchors from `query` and/or \
+                      `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
+                      a budgeted, deterministically-ordered response. `direction` defaults to \
+                      \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
+                      least one of `query`/`entity_ids` is required. One embedding inference \
+                      when `query` is used; zero for a pure `entity_ids` call.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: false,
+                description: "Semantic anchor selection via hybrid search over entities; also \
+                              contributes anchors alongside entity_ids (duplicates collapse). \
+                              At least one of query/entity_ids is required.",
+            },
+            ParamDef {
+                name: "entity_ids",
+                param_type: "array of string",
+                required: false,
+                description: "Explicit anchor UUIDs, short prefixes, or slugs (ADR-046 \
+                              resolution). Honored in full — never clamped by `limit`. At \
+                              least one of query/entity_ids is required.",
+            },
+            ParamDef {
+                name: "hops",
+                param_type: "integer",
+                required: false,
+                description: "Expansion depth, clamped 0..=2 (default 1). 0 = anchors only, \
+                              no neighbor expansion.",
+            },
+            ParamDef {
+                name: "budget",
+                param_type: "integer",
+                required: false,
+                description: "Output budget in Unicode scalar values of compact JSON per \
+                              record, clamped 256..=65536 (default 4096). Governs response \
+                              size, not expansion work.",
+            },
+            ParamDef {
+                name: "relations",
+                param_type: "array of string",
+                required: false,
+                description: "Edge-relation filter applied during expansion (default: all).",
+            },
+            ParamDef {
+                name: "direction",
+                param_type: "string",
+                required: false,
+                description: "Edge direction during expansion: \"outgoing\" | \"incoming\" | \
+                              \"both\" (default \"both\" — diverges from `neighbors`' \
+                              \"outgoing\" default; see ADR-089).",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Max anchors taken from the `query` search leg, clamped 1..=20 \
+                              (default 5). Does not clamp explicit entity_ids.",
+            },
+            ParamDef {
+                name: "fanout",
+                param_type: "integer",
+                required: false,
+                description: "Max neighbors returned per expanded node per hop, clamped \
+                              1..=50 (default 10). Work bound: anchors × (fanout + fanout²).",
             },
         ],
     },

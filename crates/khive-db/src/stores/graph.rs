@@ -917,8 +917,13 @@ impl GraphStore for SqlGraphStore {
                 String::new()
             };
 
+            // Deterministic weight-descending order, tie-broken by node_id ascending,
+            // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
+            // drop high-weight neighbors in favor of arbitrary SQLite row order
+            // (ADR-089 context-verb review, codex round 1, High-1).
             let full_sql = format!(
-                "SELECT node_id, edge_id, relation, weight FROM ({}){}{}",
+                "SELECT node_id, edge_id, relation, weight FROM ({}){} \
+                 ORDER BY weight DESC, node_id ASC{}",
                 sql, where_extra, limit_clause
             );
 

@@ -17,8 +17,9 @@ The building blocks exist and are warm-path:
 
 - `hybrid_search` (khive-runtime/src/retrieval.rs) resolves a query to ranked entities
   with one embedding inference against the daemon-warm embedder (ADR-049).
-- `neighbors_with_query` (the runtime op behind `neighbors`) already fuses a query into
-  1-hop neighbor ranking with direction, relation, weight, and limit filters.
+- `neighbors_with_query` (the runtime op behind `neighbors`) provides bounded 1-hop
+  neighbor expansion with direction, relation, weight, and limit filters; query-aware
+  neighbor reranking is a follow-up (see Amendment below).
 - `traverse` provides bounded multi-hop BFS.
 
 No existing verb composes them. `traverse` takes explicit roots without semantic anchor
@@ -38,17 +39,17 @@ At least one of `query`, `entity_ids` is required; both may be supplied.
 
 ### Parameters
 
-| Param        | Type     | Default | Semantics                                                         |
-| ------------ | -------- | ------- | ----------------------------------------------------------------- |
-| `query`      | string   | —       | Semantic anchor selection via hybrid search; also ranks neighbors |
-| `entity_ids` | [string] | —       | Explicit anchors (UUID, short prefix, or slug per ADR-046 rules)  |
-| `hops`       | int      | 1       | Expansion depth; closed range 0..=2. 0 = anchors only             |
-| `budget`     | int      | 4096    | Output budget in characters, clamped 256..=65536                  |
-| `relations`  | [string] | all     | Edge-relation filter applied during expansion                     |
-| `direction`  | string   | "both"  | `outgoing` / `incoming` / `both`                                  |
-| `limit`      | int      | 5       | Max anchors taken from `query` search, clamped 1..=20             |
-| `fanout`     | int      | 10      | Max neighbors returned per expanded node per hop, clamped 1..=50  |
-| `namespace`  | string   | "local" | Standard multi-record namespace default (ADR-007)                 |
+| Param        | Type     | Default | Semantics                                                                                        |
+| ------------ | -------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `query`      | string   | —       | Semantic anchor selection via hybrid search. Does not rank neighbors in v1 (see Amendment below) |
+| `entity_ids` | [string] | —       | Explicit anchors (UUID, short prefix, or slug per ADR-046 rules)                                 |
+| `hops`       | int      | 1       | Expansion depth; closed range 0..=2. 0 = anchors only                                            |
+| `budget`     | int      | 4096    | Output budget in characters, clamped 256..=65536                                                 |
+| `relations`  | [string] | all     | Edge-relation filter applied during expansion                                                    |
+| `direction`  | string   | "both"  | `outgoing` / `incoming` / `both`                                                                 |
+| `limit`      | int      | 5       | Max anchors taken from `query` search, clamped 1..=20                                            |
+| `fanout`     | int      | 10      | Max neighbors returned per expanded node per hop, clamped 1..=50                                 |
+| `namespace`  | string   | "local" | Standard multi-record namespace default (ADR-007)                                                |
 
 `direction` defaults to `both` for this verb. The `neighbors` verb's `outgoing` default
 is a known agent footgun in the context-assembly use case; a new verb is not bound by
@@ -57,18 +58,23 @@ the old default and the divergence is documented in both verbs' help text.
 ### Semantics
 
 1. **Anchor selection.** `entity_ids` resolve directly (each through the standard
-   slug-then-prefix resolution) and are honored in full — caller-supplied ids are never
-   clamped by `limit`. `query` runs one `hybrid_search` over entities and takes the top
-   `limit` hits. When both are supplied, explicit ids come first and search fills up to
-   `limit` additional anchors; duplicates collapse.
+   slug-then-prefix resolution), are verified to name an existing, visible entity, and
+   are honored in full — caller-supplied ids are never clamped by `limit`; an id that
+   does not resolve to a visible entity is a request error (`NotFound`/`InvalidInput`
+   naming the offending id), not a silently dropped anchor. `query` runs one
+   `hybrid_search` over entities and takes hits until `limit` anchors not already present
+   among the explicit ids have been added, fetching a wider candidate window than `limit`
+   so that overlap with explicit anchors does not under-fill the query leg (bounded by a
+   documented cap — see Amendment below). When both are supplied, explicit ids come
+   first and search fills up to `limit` additional anchors; duplicates collapse.
 2. **Expansion.** For each anchor, `neighbors_with_query` runs with the verb's
-   `direction`/`relations` filters and a per-call result cap of `fanout`. When `query` is
-   present it participates in neighbor ranking exactly as in the `neighbors` verb.
-   `hops=2` expands each first-hop node once more with the same filters and the same
-   `fanout` cap; visited-set dedup prevents cycles. Work done is therefore bounded
-   independently of `budget`: at most `anchors × (fanout + fanout²)` neighbor records are
-   fetched (defaults: 5 × 110 = 550). `budget` governs output size; `fanout` and `hops`
-   govern expansion work.
+   `direction`/`relations` filters and a per-call result cap of `fanout`. Per-hop
+   neighbor ordering is edge-weight descending (see Amendment below for the ordering
+   contract). `hops=2` expands each first-hop node once more with the same filters and
+   the same `fanout` cap; visited-set dedup prevents cycles. Work done is therefore
+   bounded independently of `budget`: at most `anchors × (fanout + fanout²)` neighbor
+   records are fetched (defaults: 5 × 110 = 550). `budget` governs output size; `fanout`
+   and `hops` govern expansion work.
 3. **Hop-2 representation.** Second-hop records are flattened into their anchor's single
    `neighbors` list, marked `hop: 2`, carrying the `relation`/`direction`/`weight` of the
    edge that discovered them and `via` set to the id of their hop-1 parent (hop-1 records
@@ -78,7 +84,8 @@ the old default and the divergence is documented in both verbs' help text.
 4. **Assembly.** The response groups by anchor: anchor record (name, kind, description,
    properties), then its neighbor list (name, kind, relation, direction, weight, hop,
    via, one-line description). Deterministic order: anchors in selection order; within an
-   anchor, hop-1 before hop-2, each stratum by fused score descending, ties by UUID.
+   anchor, hop-1 before hop-2, each stratum by edge weight descending, ties by UUID
+   (see Amendment below).
 5. **Budget enforcement.** Assembly appends records in the deterministic order until the
    next record would push the running total past `budget`, then stops and sets
    `truncated: true` with counts of dropped anchors/neighbors. The counted quantity is
@@ -163,3 +170,43 @@ separate design.
 - The per-turn hook can replace its flat recall+search injection with one `context` call
   once shipped; measured wall-time comparison against the 2.2 s baseline is part of the
   implementation PR's acceptance evidence.
+
+## Amendment (2026-07-04): neighbor ordering
+
+The implementation PR found that `neighbors_with_query` (the runtime op behind both the
+`neighbors` verb and this verb's expansion step) has no query-aware reranking of neighbors
+today: `NeighborQuery` carries only `direction`, `relations`, `limit`, and `min_weight`, with
+no query text input. The original text above ("query also ranks neighbors", "participates in
+neighbor ranking exactly as in the neighbors verb", "fused score descending") described a
+capability that does not exist in the shipped `neighbors` op, so `context` cannot inherit it.
+
+This amendment makes the shipped behavior the contract, not a documented gap:
+
+- **Per-hop neighbor ordering is edge-weight descending, ties broken by node UUID
+  ascending.** This applies uniformly whether or not `query` is supplied. `query` selects
+  and orders anchors (via `hybrid_search`) but does not rerank neighbors in v1.
+- This ordering is enforced at the storage layer: `neighbors()` in
+  `khive-db/src/stores/graph.rs` applies `ORDER BY weight DESC, node_id ASC` before its SQL
+  `LIMIT`, so a `fanout` (or the `neighbors` verb's `limit`) narrower than the full neighbor
+  set keeps the highest-weight edges rather than an arbitrary row-order subset. Prior to
+  this fix, `LIMIT` was applied with no `ORDER BY` and could silently drop high-weight
+  neighbors in favor of low-weight ones.
+- **Named upgrade path**: query-aware fused-score neighbor reranking remains the intended
+  future direction described in the Context section above. Shipping it requires adding a
+  query-text input to `NeighborQuery` and a fused dense+edge-weight scoring path in the
+  `neighbors_with_query` runtime op; that is out of scope for this verb's implementation
+  PR and tracked as a follow-up ADR/implementation against the `neighbors` op itself, not
+  against `context`. Once it lands, `context` inherits it automatically since it calls the
+  same op.
+- **Query-fill window.** Anchor selection's "search fills up to `limit` additional anchors"
+  promise (§1 above) is implemented by fetching a candidate window wider than `limit` from
+  `hybrid_search` (4× `limit + len(entity_ids)`) so that hits which collapse into explicit
+  `entity_ids` duplicates do not under-fill the query leg. This multiplier is an
+  implementation detail of the handler, not a caller-visible parameter; it is documented
+  here because it is the mechanism that keeps the "up to `limit` additional anchors"
+  contract true when overlap occurs.
+- **Explicit anchor validation.** `entity_ids` resolution additionally verifies each
+  resolved id names an existing, visible entity (not a note, an edge, or a deleted/absent
+  row) before expansion begins; a non-entity or unresolvable id is a request error, not a
+  silently absent anchor. This was implicit in "honored in full" (§1) but not stated as a
+  validation requirement; this amendment makes it explicit.

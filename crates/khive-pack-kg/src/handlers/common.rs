@@ -21,9 +21,9 @@ use crate::entity_type_registry::EntityTypeRegistry;
 use crate::vocab::NoteKind;
 
 pub(crate) use super::params::{
-    CreateParams, DeleteParams, GetParams, LinkParams, ListParams, ListProposalsParams,
-    MergeParams, NeighborsParams, ProposeParams, QueryParams, ReviewParams, SearchParams,
-    StatsParams, TraverseParams, UpdateParams, WithdrawParams, HARD_CAP,
+    ContextParams, CreateParams, DeleteParams, GetParams, LinkParams, ListParams,
+    ListProposalsParams, MergeParams, NeighborsParams, ProposeParams, QueryParams, ReviewParams,
+    SearchParams, StatsParams, TraverseParams, UpdateParams, WithdrawParams, HARD_CAP,
 };
 
 // ---- Kind canonicalization ----

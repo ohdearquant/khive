@@ -1,6 +1,6 @@
 //! Contract test: every non-kg verb must be namespaced as `<pack>.<verb>`.
 //!
-//! The kg substrate pack owns the 16 bare verb names (create, get, list, …).
+//! The kg substrate pack owns the 17 bare verb names (create, get, list, …).
 //! Every other pack must prefix its verbs with the pack name followed by a
 //! single dot: `memory.recall`, `gtd.assign`, etc. Sub-variants use a single
 //! additional underscore-delimited segment, NOT a second dot:
@@ -8,7 +8,7 @@
 //!
 //! This test walks every `HandlerDef` across every pack registered in the
 //! `inventory` (i.e. linked into this test binary) and asserts:
-//!   1. A name without a dot must be in the kg-substrate-16 allowlist.
+//!   1. A name without a dot must be in the kg-substrate-17 allowlist.
 //!   2. A name with exactly one dot must have a prefix equal to `Pack::NAME`
 //!      (validated via `all_handlers_with_names`).
 //!   3. A name with two or more dots is always invalid — sub-variants use
@@ -41,9 +41,10 @@ use khive_pack_schedule::SchedulePack as _;
 /// Bare verb names owned by the kg substrate pack. These are the only names
 /// permitted to omit the `<pack>.` prefix.
 ///
-/// The 16 entries cover CRUD + graph + curation + proposal primitives, plus
-/// `stats` for aggregate namespace metrics and `verbs` for verb-registry
-/// introspection (J-help PR #464).
+/// The 17 entries cover CRUD + graph + curation + proposal primitives, plus
+/// `stats` for aggregate namespace metrics, `verbs` for verb-registry
+/// introspection (J-help PR #464), and `context` for entity-anchored graph
+/// context in one call (ADR-089).
 const KG_SUBSTRATE_VERBS: &[&str] = &[
     "create",
     "get",
@@ -61,6 +62,7 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
     "review",
     "withdraw",
     "verbs",
+    "context",
 ];
 
 fn build_full_registry() -> Vec<(String, String)> {
@@ -105,7 +107,7 @@ fn every_non_kg_verb_is_namespaced() {
                 if !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
                     violations.push(format!(
                         "pack={pack_name:?} verb={verb_name:?}: bare name is not in the \
-                         kg-substrate-16 allowlist. Add `{pack_name}.` prefix."
+                         kg-substrate-17 allowlist. Add `{pack_name}.` prefix."
                     ));
                 }
             }
@@ -137,7 +139,7 @@ fn every_non_kg_verb_is_namespaced() {
     );
 }
 
-/// Complementary check: the kg substrate pack must expose all 16 mandated bare
+/// Complementary check: the kg substrate pack must expose all 17 mandated bare
 /// verbs and no dotted ones. This catches regressions in the kg pack itself.
 #[test]
 fn kg_pack_exposes_bare_verbs_only() {
@@ -149,7 +151,7 @@ fn kg_pack_exposes_bare_verbs_only() {
         .map(|(_, verb)| verb.as_str())
         .collect();
 
-    // Every kg-substrate-16 name must be present.
+    // Every kg-substrate-17 name must be present.
     let missing: Vec<&&str> = KG_SUBSTRATE_VERBS
         .iter()
         .filter(|v| !kg_verbs.contains(v))
