@@ -70,7 +70,7 @@ which ADR-017 disallows.
         pub query: Option<String>,
         pub entity_ids: Vec<String>,
         pub consumer_kind: String,
-        pub allocated_budget: usize,
+        pub budget_hint: usize,       // total assembly budget; NOT a per-contributor allocation
         pub hops: u8, pub fanout: u8, pub direction: Direction, pub relations: Vec<String>,
     }
 
@@ -104,16 +104,30 @@ packs loaded it returns a valid empty assembly.
 
 ### 4. Budget allocation
 
-The caller passes total `budget`. The composer runs contributors (§Execution), forms the success set
-S, looks up per-`consumer_kind` weights from config, restricts them to S and renormalizes; absent
-config → equal split over S. Contributors are ordered by the registry's topological pack order.
-Contributors return their natural top-k candidates (bounded by their own caps, not by budget) and
-MUST self-filter below their own usefulness floor rather than pad. Assembly is a two-pass greedy fill:
-pass 1 appends each contributor's ranked slices up to its allocation; pass 2 (reflow) distributes
-`budget − Σused` to contributors in the same order until the global cap. Reflow is mandatory — it is
-what lets a substrate with no relevant content yield its budget to substrates that do, which is why
-partitioned budgets (no cross-pack fusion) do not underperform fused ranking. Truncation sets
-`truncated: true` with dropped counts and is a view decision (nothing mutated).
+This is a **one-round design**: allocation happens strictly after fanout, never before it, and
+`ContextRequest` never carries a per-contributor allocation. The caller passes total `budget`.
+The sequence is:
+
+1. The composer runs all contributors concurrently (§Execution). Each receives the request's
+   `budget_hint` (the total assembly budget) purely as an advisory cap on how much it retrieves —
+   contributors are not required to honor it precisely and MUST NOT rely on it as their allocation;
+   they return their natural top-k candidates bounded by their own caps (memory `limit`, kg
+   `fanout`, knowledge top-k), not by budget, and MUST self-filter below their own usefulness floor
+   rather than pad.
+2. Only after fanout completes does the composer form the success set S (§Execution), look up
+   per-`consumer_kind` weights from config, restrict them to S, and renormalize; absent config →
+   equal split over S. Contributors are ordered by the registry's topological pack order.
+3. Per-contributor allocation is applied **only during composer assembly** — it never reaches the
+   contributor. Assembly is a two-pass greedy fill over each contributor's already-returned
+   candidates: pass 1 appends each contributor's ranked slices up to its computed allocation; pass 2
+   (reflow) distributes `budget − Σused` to contributors in the same order until the global cap.
+   Reflow is mandatory — it is what lets a substrate with no relevant content yield its budget to
+   substrates that do, which is why partitioned budgets (no cross-pack fusion) do not underperform
+   fused ranking. Truncation sets `truncated: true` with dropped counts and is a view decision
+   (nothing mutated).
+
+This is explicitly not a two-phase bid: contributors are invoked exactly once per assembly: there is
+no pre-round where they are told their allocation before retrieving.
 
 Config:
 
@@ -123,9 +137,9 @@ Config:
     max_concurrent_contributors = 4
     [context.weights.<consumer_kind>]  # e.g. prefetch: kg=0.5, memory=0.3, knowledge=0.2
 
-Contributors receive only an allocated char count; how it was computed is composer-internal, so v2
-learned allocation (ADR-081 posteriors per (consumer_kind, source_pack)) drops in with no trait
-change.
+Contributors never see how the split was computed — that computation is entirely composer-internal
+and happens after they return — so v2 learned allocation (ADR-081 posteriors per
+(consumer_kind, source_pack)) drops in with no trait change.
 
 ### 5. Execution model
 
@@ -143,11 +157,36 @@ benefit). This invariant aligns with ADR-091's reader-lifetime rules.
 
 ### 6. Serve attribution
 
-`served_by_profile_id` is resolved once at the composer level using the request `consumer_kind`,
-via the existing shared three-tier resolution helper `khive_brain_core::resolve_consumer_profile`
-(`crates/khive-brain-core/src/profile.rs:118`, ADR-035/ADR-058) — the same helper the memory pack
-(`ConsumerKind::Recall`) and knowledge pack (`ConsumerKind::KnowledgeCompose`) already share — and is
-stamped on the response.
+**Consumer-kind vocabulary is closed, and this ADR must extend it.** `resolve_consumer_profile`
+(`crates/khive-brain-core/src/profile.rs:118`) takes a `ConsumerKind` enum, not a bare string
+(`crates/khive-brain-core/src/profile.rs:31` currently declares only `Recall`, `KnowledgeCompose`,
+`Rerank`), and ADR-058 is explicit that adding a new consumer means adding a variant, never a bare
+string literal at a new call site (`docs/adr/ADR-058-brain-posterior-read-path.md:343`). This ADR
+does **not** propose a string-based resolver, and does not treat `context.assemble`'s free-form,
+caller-supplied `consumer_kind` request field (§3, used for budget-weight lookup) as the same thing
+as the closed Rust-side profile-resolution vocabulary — the two are deliberately decoupled:
+
+- **Required addition**: add `ConsumerKind::Context` (`as_str() == "context"`) to the enum in
+  `crates/khive-brain-core/src/profile.rs`, alongside the `brain.record_serve` wrapper, as part of
+  this ADR's implementation PR — the same ADR-058-conformant pattern used for `Recall` and
+  `KnowledgeCompose`.
+- **Profile resolution** (`served_by_profile_id`) is attempted **only** when the request's
+  `consumer_kind` string maps to a known `ConsumerKind` variant (today: exactly `"context"` →
+  `ConsumerKind::Context`, resolved once at the composer level via the existing shared three-tier
+  helper `khive_brain_core::resolve_consumer_profile`, ADR-035/ADR-058 — the same helper the memory
+  pack (`ConsumerKind::Recall`) and knowledge pack (`ConsumerKind::KnowledgeCompose`) already share).
+- **Budget-weight lookup is unconstrained and separate.** The request's `consumer_kind` string
+  (§4's `[context.weights.<consumer_kind>]` config keys, e.g. `"prefetch"`) is used for allocation
+  regardless of whether it maps to a `ConsumerKind` variant — this is config-table lookup, not
+  Rust-enum resolution, and ADR-058's closed-enum rule does not apply to it.
+- **Any `consumer_kind` string that does not map to a known `ConsumerKind` variant** (e.g. the
+  response example's `"prefetch"`) skips profile resolution entirely: `served_by_profile_id` is
+  `None` on the response, and the `brain.record_serve` dispatch (below) carries
+  `served_by_profile_id: None`. Budget-weight lookup for that request is unaffected. This is not a
+  silent failure — the response field is simply absent/null, which is the existing "no resolvable
+  profile" fail-safe shape ADR-081 §4 already defines for zero-weight recording.
+
+`served_by_profile_id`, when resolved, is stamped on the response.
 
 The ADR-081 §4 cross-session serve ledger (`brain_serve_ledger`) already models exactly the row shape
 this needs: one row per served target, keyed `(namespace, target_id, query_class, served_at)`. Its
@@ -160,15 +199,32 @@ MCP verb. This ADR corrects an earlier draft's assumption that such a verb and a
 no change.
 
 Concretely, this ADR requires one small addition to `khive-pack-brain`: a thin `brain.record_serve`
-verb (`Visibility::Verb`, `target_ids: Vec<String>`, `consumer_kind`, `served_by_profile_id?`,
-`query_raw`, `served_at`) that loops the existing `record_serve` function once per id, writing one
-ledger row per target — no schema migration, since the table already stores one row per `target_id`.
-The composer fires this dispatch once per assembly, asynchronously off the response path
+verb (`Visibility::Verb`, params: `target_ids: Vec<String>`, `consumer_kind`,
+`served_by_profile_id?`, `query_raw`, `served_at`) whose handler derives every field the existing
+`record_serve` function (`crates/khive-pack-brain/src/serve_ledger.rs:83`) requires but the wrapper's
+own params do not carry directly:
+
+- `namespace` — derived from the dispatch token (the same `NamespaceToken` the registry mints at the
+  dispatch boundary for every verb call, ADR-007), not a caller-supplied param.
+- `id` (row id) — one freshly generated id per target, generated by the handler, not the caller.
+- `query_class` — derived from `query_raw` per ADR-081 §4's deterministic normalization algorithm
+  (lowercase, strip punctuation, collapse whitespace, sort unique tokens, join, first 16 hex chars of
+  the SHA-256; `docs/adr/ADR-081-recall-retune-driver.md:182`), computed once per dispatch and reused
+  for every target in the loop (all targets in one assembly share one `query_raw`).
+- `resolved_profile_id` / `resolved_at` — always `None` on this path; ADR-081 §4's
+  `accounting_profile_id` derivation (`COALESCE(served_by_profile_id, resolved_profile_id)`) already
+  handles a row where only `served_by_profile_id` (or neither) is set.
+
+With those four fields derived, the handler loops the existing single-target `record_serve` function
+once per `target_id` in `target_ids`, writing one ledger row per target — no schema migration, since
+the table already stores one row per `target_id`; every column the table requires is now accounted
+for. The composer fires this dispatch once per assembly, asynchronously off the response path
 (`tokio::spawn`, fail-soft — the same fire-and-forget shape already used elsewhere in the pack, e.g.
 `crates/khive-pack-memory/src/ann.rs:289`), carrying `target_ids` = all appended slice ids across all
-contributors, `consumer_kind`, `query_raw`, `served_at`, `served_by_profile_id`. This is the
-least-event-volume design that still gives ADR-081 per-target — and therefore per-substrate (target
-id → owning substrate) — granularity at one dispatch per assembly.
+contributors, `consumer_kind`, `query_raw`, `served_at`, `served_by_profile_id` (per the vocabulary
+constraint above: `None` when `consumer_kind` does not map to a known `ConsumerKind` variant). This is
+the least-event-volume design that still gives ADR-081 per-target — and therefore per-substrate
+(target id → owning substrate) — granularity at one dispatch per assembly.
 
 **Feedback path.** The response lists every slice with `{id, source_pack, score_semantics}` and the
 assembly-level `served_by_profile_id`, so the caller (or the ADR-081 out-of-band scorer) emits
@@ -235,8 +291,13 @@ signals.
   (/knowledge) contributors. No new edge relations, no schema migration, request-only MCP surface
   (ADR-016) unchanged.
 - One small addition to `khive-pack-brain`: a thin `brain.record_serve` verb wrapping the existing
-  (currently unwired) ADR-081 §4 write function, looped over `target_ids`. This is new verb surface,
-  scoped to this ADR's implementation PR, not a schema change.
+  (currently unwired) ADR-081 §4 write function, deriving `namespace`/row `id`/`query_class` and
+  looping over `target_ids`. This is new verb surface, scoped to this ADR's implementation PR, not a
+  schema change.
+- One small addition to `khive-brain-core`: a new `ConsumerKind::Context` variant
+  (`crates/khive-brain-core/src/profile.rs:31`), added the same ADR-058-conformant way `Recall` and
+  `KnowledgeCompose` were — this is what lets `served_by_profile_id` resolve for the composer's
+  default `consumer_kind` at all; it does not open the closed-enum resolver to arbitrary strings.
 - The per-turn prefetch hook can replace its caller-side recall+search assembly with one
   `context.assemble` call — gated on measured wall-time beating the caller-side chain (ADR-089's 2.2s
   baseline is the comparator; if it does not beat it, the verb does not ship). This measured
