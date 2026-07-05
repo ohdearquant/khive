@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::types::{
-    BatchWriteSummary, DeleteMode, Edge, EdgeFilter, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, StorageResult, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
+    GraphPath, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, StorageResult,
+    TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -37,6 +38,40 @@ pub trait GraphStore: Send + Sync + 'static {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> StorageResult<Vec<NeighborHit>>;
+    /// Return neighbors in BOTH directions in a single call, each tagged with
+    /// the direction (`Out`/`In`) it was found in. `query.direction` is
+    /// ignored — this always fetches both directions.
+    ///
+    /// Exists so a caller that needs both-direction neighbors labeled by
+    /// direction (e.g. the `context` verb) can do so with one storage query
+    /// instead of two separate direction-scoped `neighbors` calls. The
+    /// default implementation preserves the original two-call behavior for
+    /// backends that don't override it; `SqlGraphStore` overrides this with a
+    /// single `UNION ALL` query that projects a direction literal per arm.
+    async fn neighbors_both_directions(
+        &self,
+        node_id: Uuid,
+        query: NeighborQuery,
+    ) -> StorageResult<Vec<DirectedNeighborHit>> {
+        let mut out_query = query.clone();
+        out_query.direction = Direction::Out;
+        let mut in_query = query;
+        in_query.direction = Direction::In;
+        let mut result = Vec::new();
+        for hit in self.neighbors(node_id, out_query).await? {
+            result.push(DirectedNeighborHit {
+                hit,
+                direction: Direction::Out,
+            });
+        }
+        for hit in self.neighbors(node_id, in_query).await? {
+            result.push(DirectedNeighborHit {
+                hit,
+                direction: Direction::In,
+            });
+        }
+        Ok(result)
+    }
     /// Fetch multiple edges by their link IDs in a single round-trip.
     ///
     /// IDs that are not found (absent or soft-deleted) are silently skipped;

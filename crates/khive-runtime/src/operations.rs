@@ -17,9 +17,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath,
+    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement,
+    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -1758,6 +1758,63 @@ impl KhiveRuntime {
                 .then(a.node_id.cmp(&b.node_id))
         });
         Ok(hits)
+    }
+
+    /// Get both-direction neighbors, each tagged with the direction (`Out`/
+    /// `In`) it was found in, via a single storage query per visible
+    /// namespace instead of two separate direction-scoped `neighbors_with_query`
+    /// calls (ADR-089 context-verb optimization — halves the neighbor SELECT
+    /// count for `context(direction="both")` expansion). `query.direction` is
+    /// ignored — always both.
+    ///
+    /// Mirrors `neighbors_with_query`'s dedup/enrich/soft-delete-filter/order
+    /// pipeline exactly, carrying the per-hit direction tag through unchanged.
+    pub async fn neighbors_with_query_directed(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        query: NeighborQuery,
+    ) -> RuntimeResult<Vec<(NeighborHit, Direction)>> {
+        if !self.substrate_exists_in_ns(token, node_id).await? {
+            return Ok(Vec::new());
+        }
+
+        let mut hits: Vec<DirectedNeighborHit> = Vec::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let mut ns_hits = self
+                .graph(&temp)?
+                .neighbors_both_directions(node_id, query.clone())
+                .await?;
+            hits.append(&mut ns_hits);
+        }
+        hits.sort_by_key(|h| (h.hit.node_id, h.hit.edge_id));
+        hits.dedup_by_key(|h| (h.hit.node_id, h.hit.edge_id));
+
+        let mut plain_hits: Vec<NeighborHit> = hits.iter().map(|h| h.hit.clone()).collect();
+        self.enrich_neighbor_hits(token, &mut plain_hits).await;
+        for (dh, enriched) in hits.iter_mut().zip(plain_hits) {
+            dh.hit = enriched;
+        }
+
+        // Filter out soft-deleted entity nodes (Fix 2).
+        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.hit.node_id).collect();
+        let deleted = self.deleted_entity_ids(candidate_ids).await;
+        if !deleted.is_empty() {
+            hits.retain(|h| !deleted.contains(&h.hit.node_id));
+        }
+        // Same global weight-descending/node_id-ascending restore as
+        // `neighbors_with_query` (ADR-089 context-verb review, internal review
+        // round 2, High) — the (node_id, edge_id) sort above exists only to
+        // make `dedup_by_key` adjacent-comparable.
+        hits.sort_by(|a, b| {
+            b.hit
+                .weight
+                .partial_cmp(&a.hit.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.hit.node_id.cmp(&b.hit.node_id))
+        });
+        Ok(hits.into_iter().map(|h| (h.hit, h.direction)).collect())
     }
 
     /// Traverse the graph from a set of root nodes.
