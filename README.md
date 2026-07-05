@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **73 verbs, 8 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge, session: all load by default                                                                          |
+| **74 verbs, 8 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge, session: all load by default                                                                          |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,7 +63,7 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 8 packs load by default, giving **73 verbs** out of the box (verified against the live
+All 8 packs load by default, giving **74 verbs** out of the box (verified against the live
 `verbs()` registry, 2026-07-04; regenerate with `request(ops="verbs()")` before editing
 this table):
 
@@ -73,7 +73,7 @@ this table):
 | **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)         |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall      |
 | **brain**     | `brain.`     | 14    | Bayesian user profiles + feedback loop                |
-| **comm**      | `comm.`      | 5     | Threaded messaging                                    |
+| **comm**      | `comm.`      | 6     | Threaded messaging                                    |
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                |
 | **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search            |
 | **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export) |
@@ -245,7 +245,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 8 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 73-verb catalog.
+MCP client discovers the `request` tool with the full 74-verb catalog.
 
 ### Alternative: npm
 
@@ -372,7 +372,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.3.0, published on [crates.io](https://crates.io/crates/khive-mcp).** 73 verbs across 8
+**v0.3.0, published on [crates.io](https://crates.io/crates/khive-mcp).** 74 verbs across 8
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
 embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

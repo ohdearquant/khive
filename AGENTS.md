@@ -15,7 +15,7 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 8 packs load by default. **73 public verbs** across the packs (regenerate via
+All 8 packs load by default. **74 public verbs** across the packs (regenerate via
 `request(ops="verbs()")` before editing this line).
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
@@ -117,7 +117,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.bindings`         | List binding rows                                    | Audit profile routing                                      |
 | `brain.register_adapter` | Register an adapter integrity record                 | Gate adapter composition to the active base-model revision |
 
-### Comm pack — 5 verbs (`comm.` prefix)
+### Comm pack — 6 verbs (`comm.` prefix)
 
 | Verb          | What it does                           | When to use                              |
 | ------------- | -------------------------------------- | ---------------------------------------- |
@@ -126,6 +126,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `comm.read`   | Mark an **inbound** message as read    | Acknowledge receipt (recipient action)   |
 | `comm.reply`  | Reply to a message (threading linkage) | Respond in-thread                        |
 | `comm.thread` | Retrieve full conversation thread      | Read the whole conversation              |
+| `comm.health` | Per-channel health snapshot (no args)  | Check daemon channel-poll state          |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
