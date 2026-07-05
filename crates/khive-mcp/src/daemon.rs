@@ -60,6 +60,124 @@ pub(crate) fn reset_counters() {
     DAEMON_DISPATCH.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+// ── local-dispatch fallback telemetry ─────────────────────────────────────────
+//
+// Every path below that returns `None` (or is matched as a fallback outcome)
+// means the caller silently dispatches locally instead of via the warm daemon.
+// A silent fallback is the bug this instrumentation exists to surface: it must
+// always be loud (a structured WARN) and counted. These are process-global
+// production counters (not `#[cfg(test)]`-gated like the instrumentation seams
+// above) — they realize the metric `khive_daemon_fallback_total{reason}`; a
+// future metrics-export slice can read them without touching call sites.
+
+/// Reason a request fell back to local dispatch instead of the warm daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    ConfigMismatch,
+    NamespaceMismatch,
+    NoSocket,
+    ParseFailure,
+    ProtocolMismatch,
+}
+
+impl FallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::ConfigMismatch => "config_mismatch",
+            FallbackReason::NamespaceMismatch => "namespace_mismatch",
+            FallbackReason::NoSocket => "no_socket",
+            FallbackReason::ParseFailure => "parse_failure",
+            FallbackReason::ProtocolMismatch => "protocol_mismatch",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicUsize {
+        match self {
+            FallbackReason::ConfigMismatch => &FALLBACK_CONFIG_MISMATCH,
+            FallbackReason::NamespaceMismatch => &FALLBACK_NAMESPACE_MISMATCH,
+            FallbackReason::NoSocket => &FALLBACK_NO_SOCKET,
+            FallbackReason::ParseFailure => &FALLBACK_PARSE_FAILURE,
+            FallbackReason::ProtocolMismatch => &FALLBACK_PROTOCOL_MISMATCH,
+        }
+    }
+}
+
+/// `khive_daemon_fallback_total{reason="<all>"}` — sum across all reasons.
+static FALLBACK_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="config_mismatch"}`
+static FALLBACK_CONFIG_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="namespace_mismatch"}`
+static FALLBACK_NAMESPACE_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="no_socket"}`
+static FALLBACK_NO_SOCKET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="parse_failure"}`
+static FALLBACK_PARSE_FAILURE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="protocol_mismatch"}`
+static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// REASON: these accessors have no production call site yet — this slice adds the
+// counters and their read path; a future metrics-export slice wires them to a real
+// exporter (see the `khive_daemon_fallback_total{reason}` doc comments above) without
+// needing to touch `record_fallback`'s call sites. Exercised directly by the counter
+// tests below in the meantime.
+#[allow(dead_code)]
+/// Total fallback count across all reasons.
+pub(crate) fn fallback_total() -> usize {
+    FALLBACK_TOTAL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[allow(dead_code)]
+/// Fallback count for a single `reason`.
+pub(crate) fn fallback_count(reason: FallbackReason) -> usize {
+    reason.counter().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fallback_counters() {
+    use std::sync::atomic::Ordering::SeqCst;
+    FALLBACK_TOTAL.store(0, SeqCst);
+    FALLBACK_CONFIG_MISMATCH.store(0, SeqCst);
+    FALLBACK_NAMESPACE_MISMATCH.store(0, SeqCst);
+    FALLBACK_NO_SOCKET.store(0, SeqCst);
+    FALLBACK_PARSE_FAILURE.store(0, SeqCst);
+    FALLBACK_PROTOCOL_MISMATCH.store(0, SeqCst);
+}
+
+/// Emit the standardized `daemon_fallback` WARN and increment the matching
+/// counters. Call exactly once per fallback event, at the point where the
+/// caller is about to dispatch locally instead of via the warm daemon.
+///
+/// `config_id_daemon` is `None` when no daemon response was available to read
+/// it from (socket unreachable, undecodable response) or the daemon omitted it
+/// (legacy daemon) — logged as the literal `"none"` string rather than the
+/// field being absent, since presence-vs-absence is itself diagnostic. `db`
+/// (the canonical db path) is intentionally not logged here: neither call site
+/// has it in scope without broader plumbing, and inventing a value would be
+/// worse than omitting the field.
+fn record_fallback(
+    reason: FallbackReason,
+    config_id_client: &str,
+    config_id_daemon: Option<&str>,
+    namespace_client: &str,
+) {
+    FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    reason
+        .counter()
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tracing::warn!(
+        reason = reason.as_str(),
+        config_id_client,
+        config_id_daemon = config_id_daemon.unwrap_or("none"),
+        namespace_client,
+        pid = std::process::id(),
+        "daemon_fallback"
+    );
+}
+
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
 
 #[async_trait]
@@ -200,6 +318,7 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
 fn map_response(
     resp: DaemonResponseFrame,
     expected_config_id: &str,
+    namespace_client: &str,
 ) -> Option<Result<String, McpError>> {
     // Protocol version mismatch is a hard error — do NOT fall back to local
     // dispatch, which would hide the skew. Surface the daemon's own message.
@@ -214,13 +333,34 @@ fn map_response(
         return Some(Err(McpError::internal_error(msg, None)));
     }
 
-    if resp.namespace_mismatch || resp.config_mismatch {
+    if resp.namespace_mismatch {
+        record_fallback(
+            FallbackReason::NamespaceMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
+        return None;
+    }
+    if resp.config_mismatch {
+        record_fallback(
+            FallbackReason::ConfigMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
         return None;
     }
     // Fail closed: only trust a result the daemon positively confirms it served
     // under our exact config. A legacy daemon omits `served_config_id` (→ None)
     // and a config-drifted daemon echoes a different id — both fall back local.
     if resp.served_config_id.as_deref() != Some(expected_config_id) {
+        record_fallback(
+            FallbackReason::ConfigMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
         return None;
     }
     if resp.ok {
@@ -589,7 +729,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     }
 
     match try_forward_inner(frame).await {
-        ForwardOutcome::Response(resp) => return map_response(resp, &frame.config_id),
+        ForwardOutcome::Response(resp) => {
+            return map_response(resp, &frame.config_id, &frame.namespace)
+        }
         ForwardOutcome::NoSocket => {
             // No socket present; fall through to the first-spawn path below.
         }
@@ -605,14 +747,48 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 Err(e) => {
                     tracing::warn!(error = %e,
                         "kill_and_respawn failed during stale-daemon recovery; falling back to local dispatch");
+                    record_fallback(
+                        FallbackReason::ParseFailure,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
                     return None;
                 }
                 Ok(RecoveryOutcome::Skipped) => {
                     // Under-lock probe confirmed a live matching daemon; forward the
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
-                        _ => None,
+                        ForwardOutcome::Response(resp) => {
+                            map_response(resp, &frame.config_id, &frame.namespace)
+                        }
+                        ForwardOutcome::NoSocket => {
+                            record_fallback(
+                                FallbackReason::NoSocket,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
+                        ForwardOutcome::ParseFailure => {
+                            record_fallback(
+                                FallbackReason::ParseFailure,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
+                        ForwardOutcome::ProtocolMismatch => {
+                            record_fallback(
+                                FallbackReason::ProtocolMismatch,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
                     };
                 }
                 Ok(RecoveryOutcome::Spawned) => {}
@@ -626,11 +802,19 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             while tokio::time::Instant::now() < deadline {
                 if UnixStream::connect(&sock).await.is_ok() {
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        ForwardOutcome::Response(resp) => {
+                            map_response(resp, &frame.config_id, &frame.namespace)
+                        }
                         ForwardOutcome::ParseFailure => {
                             tracing::warn!(
                                 "freshly spawned daemon also returned an undecodable response; \
                                  falling back to local dispatch"
+                            );
+                            record_fallback(
+                                FallbackReason::ParseFailure,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
                             );
                             None
                         }
@@ -641,11 +825,25 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                             ),
                             None,
                         ))),
-                        ForwardOutcome::NoSocket => None,
+                        ForwardOutcome::NoSocket => {
+                            record_fallback(
+                                FallbackReason::NoSocket,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
                     };
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            record_fallback(
+                FallbackReason::NoSocket,
+                &frame.config_id,
+                None,
+                &frame.namespace,
+            );
             return None;
         }
         ForwardOutcome::ProtocolMismatch => {
@@ -670,7 +868,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // Under-lock probe confirmed a live matching daemon; forward the
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        ForwardOutcome::Response(resp) => {
+                            map_response(resp, &frame.config_id, &frame.namespace)
+                        }
                         _ => Some(Err(McpError::internal_error(
                             format!(
                                 "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -692,7 +892,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 }
                 if UnixStream::connect(&sock).await.is_ok() {
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id, &frame.namespace),
                         ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
                             Some(Err(McpError::internal_error(
                                 format!(
@@ -728,6 +928,12 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 
     // NoSocket path: first-time spawn (no stale daemon to kill).
     if spawn_daemon().is_err() {
+        record_fallback(
+            FallbackReason::NoSocket,
+            &frame.config_id,
+            None,
+            &frame.namespace,
+        );
         return None;
     }
 
@@ -736,11 +942,19 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     while tokio::time::Instant::now() < deadline {
         if UnixStream::connect(&sock).await.is_ok() {
             return match try_forward_inner(frame).await {
-                ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                ForwardOutcome::Response(resp) => {
+                    map_response(resp, &frame.config_id, &frame.namespace)
+                }
                 ForwardOutcome::ParseFailure => {
                     tracing::warn!(
                         "freshly spawned daemon also returned an undecodable response; \
                          falling back to local dispatch"
+                    );
+                    record_fallback(
+                        FallbackReason::ParseFailure,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
                     );
                     None
                 }
@@ -751,11 +965,25 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     ),
                     None,
                 ))),
-                ForwardOutcome::NoSocket => None,
+                ForwardOutcome::NoSocket => {
+                    record_fallback(
+                        FallbackReason::NoSocket,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
+                    None
+                }
             };
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    record_fallback(
+        FallbackReason::NoSocket,
+        &frame.config_id,
+        None,
+        &frame.namespace,
+    );
     None
 }
 
@@ -834,6 +1062,7 @@ mod tests {
     // ── map_response (pure, MCP-specific) ─────────────────────────────────────
 
     const CFG: &str = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+    const NS: &str = "test";
 
     fn frame_ok(result: &str) -> DaemonResponseFrame {
         DaemonResponseFrame {
@@ -861,8 +1090,15 @@ mod tests {
         }
     }
 
+    // These four tests exercise `map_response` branches that now also increment
+    // the process-global fallback counters (via `record_fallback`) — `#[serial]`
+    // + a reset at the top keeps their counter assertions deterministic against
+    // any other test in this file that touches the same counters.
+
     #[test]
+    #[serial]
     fn map_response_namespace_mismatch_yields_none() {
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: false,
             result: None,
@@ -873,11 +1109,16 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_config_mismatch_yields_none() {
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: false,
             result: None,
@@ -888,13 +1129,18 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_legacy_daemon_missing_echo_yields_none() {
         // A pre-config_id daemon omits served_config_id (→ None). Even on an
         // ok=true result the client MUST fall back to local dispatch.
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: true,
             result: Some("served-by-broad-registry".to_string()),
@@ -905,13 +1151,20 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: 0,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        // The served_config_id-echo path is bucketed under config_mismatch —
+        // there is no separate reason for "echo missing/drifted" in the closed
+        // 5-value reason set.
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_echo_drift_yields_none() {
         // A daemon serving under a different config (echo != expected) is not
         // trusted, even without an explicit config_mismatch flag.
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: true,
             result: Some("served-by-other-config".to_string()),
@@ -924,12 +1177,14 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
     fn map_response_ok_with_result_yields_some_ok() {
-        match map_response(frame_ok("the-result"), CFG) {
+        match map_response(frame_ok("the-result"), CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
             other => panic!("expected Some(Ok(\"the-result\")), got {other:?}"),
         }
@@ -947,7 +1202,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, ""),
             other => panic!("expected Some(Ok(\"\")), got {other:?}"),
         }
@@ -955,7 +1210,7 @@ mod tests {
 
     #[test]
     fn map_response_not_ok_yields_some_err_preserving_message() {
-        match map_response(frame_err(Some("boom: bad verb")), CFG) {
+        match map_response(frame_err(Some("boom: bad verb")), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(message.contains("boom: bad verb"), "got: {message}");
             }
@@ -965,7 +1220,7 @@ mod tests {
 
     #[test]
     fn map_response_not_ok_without_message_yields_contextual_err() {
-        match map_response(frame_err(None), CFG) {
+        match map_response(frame_err(None), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(!message.is_empty(), "fallback message must not be empty");
                 assert!(
@@ -989,7 +1244,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(
                     message.contains("protocol mismatch"),
@@ -1016,7 +1271,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: 99,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(
                     message.contains("protocol mismatch"),
@@ -1031,12 +1286,100 @@ mod tests {
         }
     }
 
+    // ── daemon_fallback telemetry: counters (ADR-091 F1) ──────────────────────
+    //
+    // `no_socket` / `parse_failure` / `protocol_mismatch` are only reachable
+    // inside `forward_or_spawn` on paths that require a real daemon subprocess
+    // or multi-second connect timeouts (the existing suite deliberately avoids
+    // that cost elsewhere in this file — see `try_forward_inner_returns_parse_
+    // failure_when_daemon_closes_without_response` above, which asserts the
+    // `ForwardOutcome` discriminant directly rather than driving the full
+    // `forward_or_spawn` retry loop). `record_fallback` is the single function
+    // every one of those call sites invokes, so exercising it directly gives
+    // the same counter-correctness guarantee without the slow paths.
+
+    #[test]
+    #[serial]
+    fn record_fallback_no_socket_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 0);
+        assert_eq!(fallback_count(FallbackReason::ProtocolMismatch), 0);
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_parse_failure_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 1);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_protocol_mismatch_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::ProtocolMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_id_daemon_defaults_to_none_literal_when_absent() {
+        // The log field itself isn't asserted (no tracing-capture harness in this
+        // crate — see the crate's Cargo.toml dev-dependencies), but the counter
+        // side effect proves the call completes and increments exactly once even
+        // when `config_id_daemon` is `None` (the common case at every
+        // forward_or_spawn fallback site, since no decodable daemon response was
+        // available to read a served config id from).
+        reset_fallback_counters();
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn fallback_total_sums_all_reason_counters() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+        record_fallback(
+            FallbackReason::NamespaceMismatch,
+            CFG,
+            Some(CFG),
+            "other-ns",
+        );
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+        record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+
+        let sum = fallback_count(FallbackReason::ConfigMismatch)
+            + fallback_count(FallbackReason::NamespaceMismatch)
+            + fallback_count(FallbackReason::NoSocket)
+            + fallback_count(FallbackReason::ParseFailure)
+            + fallback_count(FallbackReason::ProtocolMismatch);
+        assert_eq!(sum, 5);
+        assert_eq!(
+            fallback_total(),
+            5,
+            "total must equal the sum of all reasons"
+        );
+    }
+
     // ── forward_or_spawn fallback (env-mutating → serial) ─────────────────────
 
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_returns_none_when_no_daemon_set() {
         clear_daemon_env();
+        reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         std::env::set_var("KHIVE_SOCKET", &sock);
@@ -1058,6 +1401,11 @@ mod tests {
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
         assert!(!sock.exists());
+        // KHIVE_NO_DAEMON is an explicit operator opt-out, not one of the 5
+        // silent-fallback reasons this telemetry tracks — it must NOT bump the
+        // fallback counters (that would be noisy for legitimate always-local
+        // deployments).
+        assert_eq!(fallback_total(), 0);
 
         clear_daemon_env();
     }
