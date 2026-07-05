@@ -1,6 +1,6 @@
 # ADR-091: Bounded read-transaction lifetime and WAL checkpoint escalation
 
-**Status**: Proposed
+**Status**: Accepted (ratified 2026-07-05)
 **Date**: 2026-07-04
 **Depends on**: ADR-015 (schema migrations), ADR-049 (daemon warm state)
 **Fixes**: [#580](https://github.com/ohdearquant/khive/issues/580)

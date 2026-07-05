@@ -1,6 +1,6 @@
 # ADR-067: Write-Owner Daemon — Single-Writer Task and Write Queue
 
-**Status**: Proposed
+**Status**: Accepted (ratified 2026-07-05)
 **Date**: 2026-06-23
 **Issue**: #195 (cross-op atomicity for `--ops-file` bulk apply); 2026-06-22 write-wedge incident
 **Amends**: ADR-049 (khived daemon — adds write-queue layer inside the daemon process)
