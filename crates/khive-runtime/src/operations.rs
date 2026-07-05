@@ -1500,8 +1500,9 @@ impl KhiveRuntime {
     /// this path. Both endpoints must exist in the local namespace, so setting
     /// `target_backend = None` is the only valid choice (F161).
     ///
-    /// A record that exists but belongs to a different namespace is treated as not found
-    /// (fail-closed; no cross-namespace existence leak).
+    /// Endpoint existence is a by-ID check and namespace-agnostic (ADR-007
+    /// Rule 2; #631): a record that exists in a different namespace than the
+    /// caller still resolves, exactly as `get()` would.
     pub async fn link(
         &self,
         token: &NamespaceToken,
@@ -1516,9 +1517,13 @@ impl KhiveRuntime {
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         let metadata = if relation == EdgeRelation::DependsOn {
+            // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
+            // above (#631). The visible-set-scoped `resolve` would silently drop the
+            // dependency_kind inference for endpoints validation now allows outside
+            // the caller's visible set.
             match (
-                self.resolve(token, source_id).await?,
-                self.resolve(token, target_id).await?,
+                self.resolve_edge_endpoint(token, source_id).await?,
+                self.resolve_edge_endpoint(token, target_id).await?,
             ) {
                 (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
                     merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
@@ -3932,9 +3937,13 @@ impl KhiveRuntime {
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
         let metadata = if spec.relation == EdgeRelation::DependsOn {
+            // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
+            // above (#631). The visible-set-scoped `resolve` would silently drop the
+            // dependency_kind inference for endpoints validation now allows outside
+            // the caller's visible set.
             match (
-                self.resolve(token, source_id).await?,
-                self.resolve(token, target_id).await?,
+                self.resolve_edge_endpoint(token, source_id).await?,
+                self.resolve_edge_endpoint(token, target_id).await?,
             ) {
                 (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
                     merge_dependency_kind(&src_e.kind, &tgt_e.kind, spec.metadata.clone())
