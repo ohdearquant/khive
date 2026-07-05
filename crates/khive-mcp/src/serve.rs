@@ -1057,9 +1057,14 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
     // to preserve byte-for-byte backward compatibility.
-    let khive_cfg = KhiveConfig::load_with_home_fallback(args.config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    //
+    // `config.db_path` (already resolved above) anchors tier-3 project-local config
+    // discovery to the database's own directory rather than the process cwd, so this
+    // reload agrees with the one inside `resolve_runtime_config` regardless of cwd.
+    let khive_cfg =
+        KhiveConfig::load_with_home_fallback(args.config.as_deref(), config.db_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+            .unwrap_or_default();
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -1381,15 +1386,27 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         ..RuntimeConfig::default()
     };
 
+    // Captured before `base_config` (which owns `db_path`) is consumed below —
+    // threaded into the config-file resolvers so tier-3 project-local config
+    // discovery anchors to the resolved database's directory rather than the
+    // process cwd (kills config_id drift between a client and the daemon
+    // serving the same database at a different working directory).
+    let db_path_for_config = base_config.db_path.clone();
+
     let resolved = if inputs.no_embed {
         let no_embed_base = RuntimeConfig {
             embedding_model: None,
             additional_embedding_models: vec![],
             ..base_config
         };
-        resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)?
+        resolve_actor_from_config(
+            inputs.config,
+            no_embed_base,
+            inputs.namespace_explicit,
+            db_path_for_config.as_deref(),
+        )?
     } else {
-        resolve_config(inputs.config, base_config)?
+        resolve_config(inputs.config, base_config, db_path_for_config.as_deref())?
     };
 
     // ADR-057: the `--actor` / `--namespace` CLI flag must populate `actor_id`
@@ -1470,11 +1487,16 @@ pub fn apply_env_output_format(toml_default: Option<OutputFormat>) -> OutputForm
 /// Precedence for embedding engines:
 /// 1. Config file `[[engines]]`
 /// 2. Env vars `KHIVE_EMBEDDING_MODEL` + `KHIVE_ADDITIONAL_EMBEDDING_MODELS`
+///
+/// `db_path` is the already-resolved database path (or `None` for an in-memory
+/// database); it anchors tier-3 project-local config discovery to the
+/// database's own directory instead of the process cwd.
 fn resolve_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
+    db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path)
+    match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
@@ -1502,15 +1524,19 @@ fn resolve_config(
 }
 
 /// Resolve only the actor namespace from a config file (no-embed path).
+///
+/// `db_path` anchors tier-3 project-local config discovery to the database's
+/// own directory instead of the process cwd (see [`resolve_config`]).
 fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
     cli_namespace_explicit: bool,
+    db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
     if cli_namespace_explicit {
         return Ok(base);
     }
-    match KhiveConfig::load_with_home_fallback(config_path)
+    match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
