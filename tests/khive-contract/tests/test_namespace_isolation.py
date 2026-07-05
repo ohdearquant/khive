@@ -2,7 +2,7 @@
 
 ADR: ADR-007
 section: By-ID namespace-agnostic access (Rule 2); Multi-record namespace scoping (Rule 3);
-         Link endpoint resolution (namespace-scoped write path)
+         Link endpoint resolution (by-ID, namespace-agnostic)
 """
 
 from __future__ import annotations
@@ -128,23 +128,24 @@ def test_read_isolation_between_namespaces(
 
 @pytest.mark.adr_007
 @pytest.mark.slow
-def test_write_isolation_cross_namespace_link_fails(
+def test_write_cross_namespace_link_succeeds(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
     sample_entity,
 ) -> None:
-    """link endpoint resolution is namespace-scoped — cross-namespace links are rejected.
+    """link endpoint resolution is by-ID and namespace-agnostic — cross-namespace links succeed.
 
     ADR: ADR-007
-    section: Link endpoint resolution; Multi-record namespace scoping (Rule 3)
+    section: By-ID namespace-agnostic access (Rule 2); Link endpoint resolution
 
-    link is not a by-ID op: endpoint resolution looks up source and target entities within the
-    caller-supplied namespace. A link that references an entity from a different namespace fails
-    with not-found because the endpoint is invisible to the scoped lookup — consistent with
-    Rule 3 (multi-record namespace scoping) even though the UUID itself is globally unique.
+    link consumes caller-supplied endpoint IDs, so endpoint validation is a by-ID operation
+    under ADR-007 Rev 6 Rule 2: no namespace equality check at any layer. A link whose source
+    and target live in different namespaces succeeds; the caller namespace stamps the edge
+    (attribution), it does not gate endpoint visibility.
 
-    This test is distinct from the by-ID get contract (Rule 2): link does NOT use WHERE id = ?
-    unconditionally; it uses a namespace-scoped entity fetch for endpoint validation.
+    The prior contract asserted not-found here. That namespace-scoped endpoint fetch was the
+    v1 fail-closed bug pattern (the same class removed by PR-A1 for get) and was corrected
+    for link in #631.
     """
     ns_alpha = f"{temp_namespace}_alpha"
     ns_beta = f"{temp_namespace}_beta"
@@ -167,40 +168,34 @@ def test_write_isolation_cross_namespace_link_fails(
     })
     beta_id = beta["id"]
 
-    # link from beta using alpha as target must fail
+    # link from beta using alpha as target must succeed (by-ID endpoints, Rule 2)
     envelope_fwd = khive_session.request_batch([{
         "tool": "link",
         "args": {
             "source_id": beta_id,
             "target_id": alpha_id,
-            "relation": "depends_on",
+            "relation": "extends",
             "namespace": ns_beta,
         },
     }])
     first_fwd = envelope_fwd["results"][0]
-    assert not first_fwd.get("ok", False), (
-        "Cross-namespace link (beta→alpha, beta caller) must fail"
-    )
-    err_fwd = first_fwd.get("error", "").lower()
-    assert "not found" in err_fwd, (
-        f"Cross-namespace link must fail with not-found, got: {first_fwd.get('error')!r}"
+    assert first_fwd.get("ok", False), (
+        "Cross-namespace link (beta→alpha, beta caller) must succeed: link endpoint "
+        f"resolution is by-ID and namespace-agnostic, got: {first_fwd.get('error')!r}"
     )
 
-    # link with alpha as source from beta namespace must also fail
+    # link with alpha as source from beta namespace must also succeed
     envelope_rev = khive_session.request_batch([{
         "tool": "link",
         "args": {
             "source_id": alpha_id,
             "target_id": beta_id,
-            "relation": "extends",
+            "relation": "supersedes",
             "namespace": ns_beta,
         },
     }])
     first_rev = envelope_rev["results"][0]
-    assert not first_rev.get("ok", False), (
-        "Cross-namespace link (alpha→beta, beta caller) must fail"
-    )
-    err_rev = first_rev.get("error", "").lower()
-    assert "not found" in err_rev, (
-        f"Cross-namespace reverse link must fail with not-found, got: {first_rev.get('error')!r}"
+    assert first_rev.get("ok", False), (
+        "Cross-namespace link (alpha→beta, beta caller) must succeed: link endpoint "
+        f"resolution is by-ID and namespace-agnostic, got: {first_rev.get('error')!r}"
     )

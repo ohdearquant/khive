@@ -9268,3 +9268,349 @@ async fn context_verb_is_registered_in_kg_handlers() {
         "context must be a registered KgPack verb"
     );
 }
+
+// ---- #631: link() endpoint resolution must match get()'s by-ID contract ----
+//
+// Two divergences between `link`'s endpoint resolution and `get`'s by-ID
+// resolution, both surfaced on the documented
+// `remember(...) | link(source_id=$prev.id, target_id=<old-uuid>, relation="supersedes")`
+// chain from a namespace-stamped caller:
+//
+// 1. Short-prefix resolution: `link`'s source_id/target_id prefix form used
+//    `resolve_uuid_async` (namespace-scoped `resolve_prefix`), while `get`
+//    already used the unfiltered `resolve_uuid_unfiltered` (#391 §3). A short
+//    prefix of a record stamped outside the caller's own namespace resolved
+//    for `get` but not for `link`.
+// 2. Endpoint existence validation: `validate_edge_relation_endpoints` checked
+//    each endpoint via `resolve_primary`, which requires
+//    `record.namespace == token.namespace()`. Per ADR-007 Rule 2, by-ID ops
+//    are namespace-agnostic — `link` consumes two by-ID endpoints, so its
+//    existence check must follow the same contract as `get()`, not re-add a
+//    namespace equality check the by-ID contract already forbids.
+//
+// Both are fixed by resolving link endpoints through the same namespace-
+// agnostic path get() uses (`resolve_uuid_unfiltered` for the string form,
+// `resolve_edge_endpoint`/`substrate_exists_by_id` for existence). These
+// tests lock in both fixes independently.
+
+/// `link` by short prefix, with the caller in a DIFFERENT namespace than both
+/// endpoints, must resolve like `get()` does (was
+/// `InvalidInput("no record matches prefix...")` pre-fix).
+#[tokio::test]
+async fn link_by_short_prefix_cross_namespace_endpoints_resolves() {
+    let f = pack();
+
+    let a_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link631PrefixA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link631PrefixB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let a_prefix = &a_full[..8];
+    let b_prefix = &b_full[..8];
+
+    // Both entities live in "local"; the caller acts from a different namespace.
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_prefix,
+                "target_id": b_prefix,
+                "relation": "extends",
+                "namespace": "ns-caller",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link by short prefix from a different namespace must resolve like get() (#631); got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(
+        edge.get("source_id").and_then(Value::as_str),
+        Some(a_full.as_str())
+    );
+    assert_eq!(
+        edge.get("target_id").and_then(Value::as_str),
+        Some(b_full.as_str())
+    );
+}
+
+/// `link` between two entities in a namespace OTHER than the caller's own
+/// namespace must succeed via full UUIDs — the by-ID endpoint existence check
+/// is namespace-agnostic (ADR-007 Rule 2), not scoped to the caller's primary
+/// namespace (was `NotFound("link source/target ... not found in namespace")`
+/// pre-fix).
+#[tokio::test]
+async fn link_entities_cross_namespace_endpoints_succeeds() {
+    let f = pack();
+
+    let a_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link631EntA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link631EntB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_full,
+                "target_id": b_full,
+                "relation": "extends",
+                "namespace": "ns-caller",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link between records in a different namespace than the caller must succeed (#631); got: {result:?}"
+    );
+}
+
+/// The canonical `remember | supersedes` chain, modeled as note-to-note
+/// `supersedes`: linking a note that supersedes another note must succeed
+/// when the caller's namespace differs from both notes' stored namespace.
+/// Pre-fix this hit the same `resolve_primary` endpoint-existence check as
+/// entity-to-entity links and failed with
+/// `NotFound("link source/target ... not found in namespace")`.
+#[tokio::test]
+async fn link_supersedes_notes_cross_namespace_succeeds() {
+    let f = pack();
+
+    let old_note = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "old memory content"}),
+        )
+        .await
+        .expect("create old note must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let new_note = f
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "corrected memory content"}),
+        )
+        .await
+        .expect("create new note must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Both notes live in "local"; the caller supersedes from a different namespace,
+    // mirroring an actor-namespaced memory.remember() | link(relation="supersedes") caller.
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": new_note,
+                "target_id": old_note,
+                "relation": "supersedes",
+                "namespace": "ns-caller",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "supersedes link between notes in a different namespace than the caller must succeed (#631); got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(
+        edge.get("relation").and_then(Value::as_str),
+        Some("supersedes")
+    );
+    assert_eq!(
+        edge.get("source_id").and_then(Value::as_str),
+        Some(new_note.as_str())
+    );
+    assert_eq!(
+        edge.get("target_id").and_then(Value::as_str),
+        Some(old_note.as_str())
+    );
+}
+
+// ---- #638 round 1 codex findings ----
+
+/// `create(kind="note", annotates=[...])` must resolve a short hex prefix of an
+/// `annotates` target the same way `get()` resolves it, even when the caller
+/// is in a different namespace than the target (round-1 finding 1). Pre-fix,
+/// `create.rs`'s `annotates[]` handling used `resolve_uuid_async`, whose
+/// prefix branch is namespace-scoped (`resolve_prefix`), so a short prefix to
+/// a foreign-namespace target failed with
+/// `InvalidInput("no record matches prefix...")` before the runtime-side
+/// `substrate_exists_by_id` fix ever saw a UUID.
+#[tokio::test]
+async fn create_note_annotates_by_short_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let target_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Create638AnnotTarget", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create target entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let target_prefix = &target_full[..8];
+
+    // The target lives in "local"; the caller creates the annotating note from a
+    // different namespace.
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "annotates via short prefix cross-namespace",
+                "annotates": [target_prefix],
+                "namespace": "ns-caller",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "create note annotates by short prefix from a different namespace must succeed (#638 round 1 finding 1); got: {result:?}"
+    );
+}
+
+/// `create(kind=entity, edges=[{target_id, relation}])` must resolve a short
+/// hex prefix of an edge target the same way `get()` resolves it, even when
+/// the caller is in a different namespace than the target (round-1 finding
+/// 1's second call site, `create.rs:427`).
+#[tokio::test]
+async fn create_entity_with_edges_target_by_short_prefix_cross_namespace_succeeds() {
+    let f = pack();
+
+    let target_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Create638EdgeTarget", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create target entity must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let target_prefix = &target_full[..8];
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Create638EdgeSource",
+                "entity_kind": "concept",
+                "edges": [{"target_id": target_prefix, "relation": "extends"}],
+                "namespace": "ns-caller",
+            }),
+        )
+        .await
+        .expect("create with edges must succeed");
+
+    // No per-edge error should report the target as unresolved, and the edge
+    // must actually have been created.
+    assert!(
+        created.get("edge_errors").is_none(),
+        "edges[].target_id by short prefix from a different namespace must resolve (#638 round 1 finding 1); got: {created:?}"
+    );
+    let edges = created
+        .get("edges")
+        .and_then(Value::as_array)
+        .expect("response must include edges[]");
+    assert_eq!(
+        edges.len(),
+        1,
+        "expected exactly one created edge; got: {created:?}"
+    );
+}
+
+/// Cross-namespace `depends_on` link between two `project` entities must still
+/// infer `dependency_kind = "build"` (ADR-002 §inference default), even though
+/// endpoint validation now allows the target to live outside the caller's
+/// namespace (round-1 finding 2). Pre-fix, `link`'s `dependency_kind`
+/// inference used the visible-set-scoped `resolve`, which silently dropped
+/// the inferred metadata for an endpoint outside the caller's visible set —
+/// the edge was created, but without the ADR-002 default.
+#[tokio::test]
+async fn link_depends_on_project_to_project_cross_namespace_infers_dependency_kind() {
+    let f = pack();
+
+    let a_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link638DependsOnA", "entity_kind": "project"}),
+        )
+        .await
+        .expect("create A must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_full = f
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Link638DependsOnB", "entity_kind": "project"}),
+        )
+        .await
+        .expect("create B must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Both projects live in "local"; the caller links from a different namespace.
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_full,
+                "target_id": b_full,
+                "relation": "depends_on",
+                "namespace": "ns-caller",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "cross-namespace project->project depends_on link must succeed (#631); got: {result:?}"
+    );
+    let edge = result.unwrap();
+    assert_eq!(
+        edge.get("metadata")
+            .and_then(|m| m.get("dependency_kind"))
+            .and_then(Value::as_str),
+        Some("build"),
+        "cross-namespace depends_on must still infer dependency_kind=build (#638 round 1 finding 2); got edge: {edge:?}"
+    );
+}

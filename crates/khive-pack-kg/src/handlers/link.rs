@@ -6,7 +6,7 @@ use khive_runtime::{LinkSpec, NamespaceToken, RuntimeError};
 
 use super::common::{
     deser, enrich_allowlist_error, format_edge_output, merge_entry_metadata, parse_relation,
-    resolve_uuid_async, to_json, validate_weight, LinkParams,
+    resolve_uuid_unfiltered, to_json, validate_weight, LinkParams,
 };
 use crate::KgPack;
 
@@ -32,8 +32,10 @@ impl KgPack {
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 for entry in entries {
-                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, token).await?;
-                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, token).await?;
+                    let source =
+                        resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await?;
+                    let target =
+                        resolve_uuid_unfiltered(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
                     let (source, target) = if relation.is_symmetric() && target < source {
                         (target, source)
@@ -75,7 +77,8 @@ impl KgPack {
                 let mut skipped = 0usize;
                 for (idx, entry) in entries.into_iter().enumerate() {
                     let source =
-                        match resolve_uuid_async(&entry.source_id, &self.runtime, token).await {
+                        match resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await
+                        {
                             Ok(id) => id,
                             Err(e) => {
                                 error_list.push(json!({"index": idx, "error": format!("{e}")}));
@@ -83,7 +86,8 @@ impl KgPack {
                             }
                         };
                     let target =
-                        match resolve_uuid_async(&entry.target_id, &self.runtime, token).await {
+                        match resolve_uuid_unfiltered(&entry.target_id, &self.runtime, token).await
+                        {
                             Ok(id) => id,
                             Err(e) => {
                                 error_list.push(json!({"index": idx, "error": format!("{e}")}));
@@ -154,8 +158,8 @@ impl KgPack {
         let relation_str = p.relation.ok_or_else(|| {
             RuntimeError::InvalidInput("link requires relation (or links for bulk)".into())
         })?;
-        let source = resolve_uuid_async(&source_id_str, &self.runtime, token).await?;
-        let target = resolve_uuid_async(&target_id_str, &self.runtime, token).await?;
+        let source = resolve_uuid_unfiltered(&source_id_str, &self.runtime, token).await?;
+        let target = resolve_uuid_unfiltered(&target_id_str, &self.runtime, token).await?;
         let weight = validate_weight(p.weight)?;
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;

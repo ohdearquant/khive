@@ -7,7 +7,7 @@ use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
     normalize_entity_timestamps, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, validate_weight,
+    resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight,
     CreateParams, KindSpec,
 };
 use crate::KgPack;
@@ -332,7 +332,7 @@ impl KgPack {
                 })?;
                 let mut annotates = Vec::new();
                 for s in p.annotates.unwrap_or_default() {
-                    annotates.push(resolve_uuid_async(&s, &self.runtime, token).await?);
+                    annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
                 }
                 let note = self
                     .runtime
@@ -423,18 +423,23 @@ impl KgPack {
                 let mut edge_results: Vec<Value> = Vec::with_capacity(edge_specs.len());
                 let mut edge_errors: Vec<Value> = Vec::with_capacity(edge_specs.len());
                 for (idx, spec) in edge_specs.into_iter().enumerate() {
-                    let target =
-                        match resolve_uuid_async(&spec.target_id, &self.runtime, token).await {
-                            Ok(id) => id,
-                            Err(e) => {
-                                edge_errors.push(json!({
-                                    "index": idx,
-                                    "target_id": spec.target_id,
-                                    "error": format!("{e}"),
-                                }));
-                                continue;
-                            }
-                        };
+                    let target = match resolve_uuid_unfiltered(
+                        &spec.target_id,
+                        &self.runtime,
+                        token,
+                    )
+                    .await
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            edge_errors.push(json!({
+                                "index": idx,
+                                "target_id": spec.target_id,
+                                "error": format!("{e}"),
+                            }));
+                            continue;
+                        }
+                    };
                     let relation = match parse_relation(&spec.relation) {
                         Ok(r) => r,
                         Err(e) => {
