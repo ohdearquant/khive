@@ -334,33 +334,48 @@ impl KhiveConfig {
     ///
     /// 1. Explicit `path` (from `--config` / `KHIVE_CONFIG`)
     /// 2. `./khive.toml` (project-local, project root)
-    /// 3. `./.khive/config.toml` (project-local, hidden dir)
+    /// 3. `<db-dir>/config.toml` (project-local, anchored to the resolved database's
+    ///    own directory — see [`Self::project_config_anchor_dir`])
     /// 4. `~/.khive/config.toml` (user-global)
     ///
     /// Returns the first file found, or `Ok(None)` when none exist.
     /// Parse errors are propagated immediately — a malformed config is always
     /// an error regardless of which tier it came from.
-    pub fn load_with_home_fallback(path: Option<&Path>) -> Result<Option<Self>, ConfigError> {
+    ///
+    /// `db_path` should be the same database path the caller is about to open
+    /// (or has already resolved). Passing it makes tier 3 resolve identically
+    /// for any two processes that target the same database, regardless of
+    /// their process working directory — this is what lets a thin client and
+    /// a warm daemon serving the same database agree on one config file. Pass
+    /// `None` when no database path is known yet; tier 3 then falls back to
+    /// the process cwd, matching the pre-existing behavior.
+    pub fn load_with_home_fallback(
+        path: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<Option<Self>, ConfigError> {
         // Tier 1: explicit path (highest priority).
         if let Some(p) = path {
             return Self::load(Some(p));
         }
 
-        // Tiers 2-4: search project root, hidden dir, user-global.
+        // Tiers 2-4: search project root, db-anchored hidden dir, user-global.
         let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home_root = std::env::var_os("HOME").map(PathBuf::from);
-        Self::load_with_roots(&project_root, home_root.as_deref())
+        Self::load_with_roots(&project_root, home_root.as_deref(), db_path)
     }
 
     /// Testable inner search: tiers 2-4, given explicit roots instead of
     /// reading `cwd` and `HOME` from process state.
     ///
-    /// - Tier 2: `<project_root>/khive.toml`
-    /// - Tier 3: `<project_root>/.khive/config.toml`
+    /// - Tier 2: `<project_root>/khive.toml` (still cwd-anchored — unchanged)
+    /// - Tier 3: `<db_dir>/config.toml`, anchored to `db_path` rather than
+    ///   `project_root` (see [`Self::project_config_anchor_dir`]); falls back to
+    ///   `<project_root>/.khive/config.toml` when `db_path` is `None`
     /// - Tier 4: `<home_root>/.khive/config.toml` (skipped when `None`)
     pub(crate) fn load_with_roots(
         project_root: &Path,
         home_root: Option<&Path>,
+        db_path: Option<&Path>,
     ) -> Result<Option<Self>, ConfigError> {
         // Tier 2: project root khive.toml.
         let tier2 = project_root.join("khive.toml");
@@ -368,8 +383,9 @@ impl KhiveConfig {
             return Self::load(Some(&tier2));
         }
 
-        // Tier 3: project-local hidden dir.
-        let tier3 = project_root.join(".khive/config.toml");
+        // Tier 3: project-local hidden dir, anchored to the resolved database's
+        // own directory instead of the process cwd.
+        let tier3 = Self::project_config_anchor_dir(db_path, project_root).join("config.toml");
         if tier3.exists() {
             return Self::load(Some(&tier3));
         }
@@ -383,6 +399,53 @@ impl KhiveConfig {
         }
 
         Ok(None)
+    }
+
+    /// Resolve the directory searched for the tier-3 project-local config file.
+    ///
+    /// Anchored to the directory containing the resolved database file, not the
+    /// process cwd: two processes at different working directories that open the
+    /// same database agree on this directory, which is what keeps their
+    /// `config_id` fingerprints in sync (a client and a warm daemon serving the
+    /// same database must resolve identical config so the daemon accepts the
+    /// client's forwarded requests instead of rejecting them on a config
+    /// mismatch).
+    ///
+    /// `db_path` is canonicalized first so symlinks/relative components collapse
+    /// to the same absolute directory regardless of caller cwd. The database file
+    /// may not exist yet (first run before anything has been written) — in that
+    /// case canonicalization fails and the path is absolutized against
+    /// `project_root` instead (or used as-is if already absolute); this must
+    /// never panic, it is the expected cold-start case.
+    ///
+    /// If `db_dir` (the resolved database's parent directory) is itself named
+    /// `.khive`, the config lives directly inside it (`<db_dir>/config.toml`) —
+    /// this is the common case where the database is `<root>/.khive/khive.db`.
+    /// Otherwise the config lives in a `.khive` subdirectory of `db_dir`.
+    ///
+    /// `db_path == None` (e.g. an in-memory database, or no database path known
+    /// yet) falls back to `<project_root>/.khive`, preserving the pre-existing
+    /// cwd-anchored behavior for callers with no database to anchor on.
+    fn project_config_anchor_dir(db_path: Option<&Path>, project_root: &Path) -> PathBuf {
+        let Some(db_path) = db_path else {
+            return project_root.join(".khive");
+        };
+
+        let absolute = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
+            if db_path.is_absolute() {
+                db_path.to_path_buf()
+            } else {
+                project_root.join(db_path)
+            }
+        });
+
+        let db_dir = absolute.parent().map(Path::to_path_buf).unwrap_or(absolute);
+
+        if db_dir.file_name().is_some_and(|name| name == ".khive") {
+            db_dir
+        } else {
+            db_dir.join(".khive")
+        }
     }
 
     /// Validate the parsed config for logical consistency.
@@ -910,7 +973,7 @@ default = true
     fn test_load_with_home_fallback_no_files() {
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
-        let result = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()));
+        let result = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None);
         assert!(
             result.expect("no error expected").is_none(),
             "should return None when no config files exist in the given roots"
@@ -928,7 +991,7 @@ default = true
 id = "lambda:explicit"
 "#,
         );
-        let cfg = KhiveConfig::load_with_home_fallback(Some(&path))
+        let cfg = KhiveConfig::load_with_home_fallback(Some(&path), None)
             .expect("no error expected")
             .expect("file found");
         assert_eq!(cfg.actor.id.as_deref(), Some("lambda:explicit"));
@@ -1081,7 +1144,7 @@ id = "lambda:"
         )
         .unwrap();
 
-        let cfg = KhiveConfig::load_with_roots(dir.path(), None)
+        let cfg = KhiveConfig::load_with_roots(dir.path(), None, None)
             .expect("no error expected")
             .expect("file should be found");
         assert_eq!(
@@ -1104,7 +1167,7 @@ id = "lambda:"
         .unwrap();
         // No khive.toml.
 
-        let cfg = KhiveConfig::load_with_roots(dir.path(), None)
+        let cfg = KhiveConfig::load_with_roots(dir.path(), None, None)
             .expect("no error expected")
             .expect("file should be found");
         assert_eq!(
@@ -1128,7 +1191,7 @@ id = "lambda:"
         .unwrap();
         // No project-level files.
 
-        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()))
+        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
             .expect("no error expected")
             .expect("file should be found");
         assert_eq!(
@@ -1160,13 +1223,184 @@ id = "lambda:"
         )
         .unwrap();
 
-        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()))
+        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
             .expect("no error expected")
             .expect("file should be found");
         assert_eq!(
             cfg.actor.id.as_deref(),
             Some("lambda:project-wins"),
             "project .khive/config.toml (tier 3) must win over ~/.khive/config.toml (tier 4)"
+        );
+    }
+
+    // ── tier-3 db-dir anchor tests (config discovery canonicalization) ─────
+
+    // Two different process working directories, targeting the same database,
+    // must resolve the identical tier-3 config file. Each cwd also carries its
+    // own decoy `.khive/config.toml` so the test fails loudly (mismatched
+    // actor ids) if the resolver ever falls back to the old cwd anchor instead
+    // of the db-dir anchor.
+    #[test]
+    fn test_load_with_roots_same_db_different_cwd_resolves_identical_config() {
+        let cwd_a = tempfile::tempdir().unwrap();
+        let cwd_b = tempfile::tempdir().unwrap();
+
+        // Decoy cwd-anchored configs — must NOT be picked up once anchoring
+        // moves to the db directory.
+        std::fs::create_dir_all(cwd_a.path().join(".khive")).unwrap();
+        std::fs::write(
+            cwd_a.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:wrong-cwd-a\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd_b.path().join(".khive")).unwrap();
+        std::fs::write(
+            cwd_b.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:wrong-cwd-b\"\n",
+        )
+        .unwrap();
+
+        // The database and its co-located config live under a THIRD root,
+        // distinct from either simulated cwd.
+        let db_root = tempfile::tempdir().unwrap();
+        let khive_dir = db_root.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).unwrap();
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").unwrap(); // must exist for canonicalize to succeed
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            "[actor]\nid = \"lambda:db-anchored\"\n",
+        )
+        .unwrap();
+
+        let cfg_a = KhiveConfig::load_with_roots(cwd_a.path(), None, Some(&db_path))
+            .expect("no error expected")
+            .expect("db-anchored config must be found from cwd A");
+        let cfg_b = KhiveConfig::load_with_roots(cwd_b.path(), None, Some(&db_path))
+            .expect("no error expected")
+            .expect("db-anchored config must be found from cwd B");
+
+        assert_eq!(
+            cfg_a.actor.id.as_deref(),
+            Some("lambda:db-anchored"),
+            "cwd A must resolve the db-anchored config, not its own decoy"
+        );
+        assert_eq!(
+            cfg_b.actor.id.as_deref(),
+            Some("lambda:db-anchored"),
+            "cwd B must resolve the db-anchored config, not its own decoy"
+        );
+        assert_eq!(
+            cfg_a.actor.id, cfg_b.actor.id,
+            "two processes at different cwds targeting the same db must resolve \
+             identical config, killing config_id drift between client and daemon"
+        );
+    }
+
+    // Explicit `--config`/`KHIVE_CONFIG` (tier 1) must still win over the new
+    // db-dir anchor (tier 3) — precedence is preserved, only the tier-3 anchor
+    // moved.
+    #[test]
+    fn test_load_with_home_fallback_explicit_config_wins_over_db_anchor() {
+        let explicit_dir = tempfile::tempdir().unwrap();
+        let explicit_path = write_toml(&explicit_dir, "[actor]\nid = \"lambda:explicit-wins\"\n");
+
+        let db_root = tempfile::tempdir().unwrap();
+        let khive_dir = db_root.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).unwrap();
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            "[actor]\nid = \"lambda:db-anchor-loses\"\n",
+        )
+        .unwrap();
+
+        let cfg = KhiveConfig::load_with_home_fallback(Some(&explicit_path), Some(&db_path))
+            .expect("no error expected")
+            .expect("explicit path must be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:explicit-wins"),
+            "explicit --config/KHIVE_CONFIG must win over the db-dir anchor"
+        );
+    }
+
+    // Tier 4 (`~/.khive/config.toml`) must still be reached when the db-anchored
+    // tier-3 directory has no `config.toml` alongside it.
+    #[test]
+    fn test_load_with_roots_home_fallback_reached_when_db_anchor_has_no_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            home_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:home-fallback\"\n",
+        )
+        .unwrap();
+
+        // A real db directory that exists but has no co-located config.toml.
+        let db_root = tempfile::tempdir().unwrap();
+        let khive_dir = db_root.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).unwrap();
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").unwrap();
+
+        let cfg = KhiveConfig::load_with_roots(cwd.path(), Some(home_dir.path()), Some(&db_path))
+            .expect("no error expected")
+            .expect("home-tier config must be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:home-fallback"),
+            "tier 4 (~/.khive/config.toml) must still be reached when the db-anchored \
+             tier-3 directory has no config.toml"
+        );
+    }
+
+    // Cold start: the database file does not exist yet (first run). Anchor
+    // resolution must not panic and must fall through the remaining tiers.
+    #[test]
+    fn test_load_with_roots_nonexistent_db_path_does_not_panic_and_falls_through() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            home_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:home-cold-start\"\n",
+        )
+        .unwrap();
+
+        // Absolute path under a directory tree that was never created.
+        let nonexistent_db = cwd.path().join("never-created/.khive/khive.db");
+
+        let cfg =
+            KhiveConfig::load_with_roots(cwd.path(), Some(home_dir.path()), Some(&nonexistent_db))
+                .expect("cold-start db path must not error or panic")
+                .expect("home-tier config must still be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:home-cold-start"),
+            "a nonexistent db path (cold start) must fall through to tier 4, not panic"
+        );
+    }
+
+    // Cold start with a *relative* nonexistent db path exercises the
+    // cwd-join fallback branch specifically (as opposed to the
+    // already-absolute fallback branch above). Must not panic; no config
+    // exists anywhere so the result is `Ok(None)`.
+    #[test]
+    fn test_load_with_roots_relative_nonexistent_db_path_does_not_panic() {
+        let cwd = tempfile::tempdir().unwrap();
+        let relative_db = PathBuf::from("never-created/.khive/khive.db");
+
+        let result = KhiveConfig::load_with_roots(cwd.path(), None, Some(&relative_db));
+        assert!(
+            result.is_ok(),
+            "relative cold-start db path must not error or panic: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "no config exists anywhere in this test; result must be None"
         );
     }
 

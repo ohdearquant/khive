@@ -233,7 +233,19 @@ async fn main() -> Result<()> {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
-            let khive_cfg = KhiveConfig::load_with_home_fallback(a.config.as_deref())
+            //
+            // `db_path_hint` anchors tier-3 project-local config discovery to the
+            // database's own directory rather than the process cwd; an explicit
+            // `--db`/`KHIVE_DB` here mirrors the resolution `resolve_runtime_config`
+            // performs below (the `:memory:` sentinel means no file to anchor on).
+            // The unset (default) case still falls through to the pre-existing cwd
+            // anchor for this early check only — it does not affect the actual
+            // per-request `config_id` computed further down this path.
+            let db_path_hint = match a.db.as_deref() {
+                Some(":memory:") | None => None,
+                Some(p) => Some(std::path::Path::new(p)),
+            };
+            let khive_cfg = KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint)
                 .unwrap_or_default()
                 .unwrap_or_default();
 

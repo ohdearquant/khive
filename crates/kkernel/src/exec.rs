@@ -473,7 +473,10 @@ async fn run_exec_inline_with_forward(
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Note: enforce_strict_actor_mode was called above before the daemon fast-path;
     // it is not repeated here — the single early check covers both paths.
-    let toml_default = KhiveConfig::load_with_home_fallback(None)
+    //
+    // `rt.config().db_path` anchors tier-3 project-local config discovery to the
+    // database's own directory rather than the process cwd, matching the serve path.
+    let toml_default = KhiveConfig::load_with_home_fallback(None, rt.config().db_path.as_deref())
         .ok()
         .flatten()
         .and_then(|c| c.runtime.default_output_format);
