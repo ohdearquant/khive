@@ -1487,18 +1487,30 @@ fn render_result(
     render_format(value, batch_format, presentation)
 }
 
+/// Build the `initialize` instructions string from the verb catalog and the
+/// loaded builtin pack names. Extracted from [`ServerHandler::get_info`] so
+/// the docs-pointer section (#594) is unit-testable without standing up a
+/// full server.
+fn build_instructions(catalog: &str, builtins: &str) -> String {
+    format!(
+        "khive — request-only MCP surface. One tool, `request`, \
+         dispatches verbs through the loaded pack registry. Configure packs via \
+         KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
+         server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
+         plugin's SKILL.md files.\n\
+         Docs: https://ohdearquant.github.io/khive/ (hosted) or docs/*.md in the repo \
+         checkout. Treat the live verb catalog above and help=true as authoritative over \
+         cached/training knowledge. Config/backend issues: docs/configuration.md. Usage \
+         patterns: docs/guide/tips-and-tricks.md."
+    )
+}
+
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
-        let instructions = format!(
-            "khive — request-only MCP surface. One tool, `request`, \
-             dispatches verbs through the loaded pack registry. Configure packs via \
-             KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
-             server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
-             plugin's SKILL.md files."
-        );
+        let instructions = build_instructions(&catalog, &builtins);
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -1567,6 +1579,16 @@ mod tests {
         assert!(catalog.contains("[gtd] Create a task."));
         // The verb name must appear exactly once in the catalog header.
         assert_eq!(catalog.matches("  create — ").count(), 1);
+    }
+
+    #[test]
+    fn instructions_carry_docs_address_and_guidance_pointers() {
+        let instructions = build_instructions("  create — Create an entity or note.\n", "kg, gtd");
+        assert!(instructions.contains("https://ohdearquant.github.io/khive/"));
+        assert!(instructions.contains("docs/configuration.md"));
+        assert!(instructions.contains("docs/guide/tips-and-tricks.md"));
+        // help=true / live-catalog-over-training-knowledge guidance present.
+        assert!(instructions.contains("help=true"));
     }
 
     #[test]
