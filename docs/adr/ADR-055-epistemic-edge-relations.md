@@ -202,7 +202,7 @@ speculative growth — it is staged delivery with a named next consumer.
 
 The core decision — _add `supports`/`refutes` as the minimal epistemic pair_ — is accepted
 and is **not** open for relitigation. The following are **maintainer design
-choices** in service of that decision. The adversarial review verdict and resolution are recorded
+choices** in service of that decision. The review outcome and resolution are recorded
 for each.
 
 1. **Claim representation** (REFRAMED). A claim may be a `concept` entity (entity form) OR a

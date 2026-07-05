@@ -104,8 +104,8 @@ impl ImapBackoff {
     /// step, and returns a [`BackoffTick`] carrying the jittered delay to
     /// sleep plus whether this is a new escalation edge worth a `warn!` log.
     ///
-    /// The jittered `delay` is clamped to `max` (internal review round 1 finding
-    /// 2026-07-04): jitter is additive noise on top of `step`, but `step`
+    /// The jittered `delay` is clamped to `max` (regression guard): jitter is additive
+    /// noise on top of `step`, but `step`
     /// itself can already equal `max` once escalation saturates, so an
     /// unclamped `step + jitter` would let a "~10min cap" reach 750s at the
     /// default 25% jitter window. Clamping here keeps `delay <= max` as a

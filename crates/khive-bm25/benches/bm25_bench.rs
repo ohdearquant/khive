@@ -39,7 +39,7 @@ const VOCAB: &[&str] = &[
     "forest",
     "mountain",
     "valley",
-    "operator",
+    "ocean",
     "desert",
     "plain",
     "cloud",

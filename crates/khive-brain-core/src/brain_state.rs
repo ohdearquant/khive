@@ -650,7 +650,7 @@ mod tests {
         );
     }
 
-    // ── entity_posterior_order strict coverage (PR #535 internal review round 1) ────────
+    // ── entity_posterior_order strict coverage regression guard (PR #535) ──────────────
 
     /// Build a fresh version-1 `BalancedRecallSnapshot` with `n` entity
     /// posteriors and a fully-covering order, for mutation in the tests below.

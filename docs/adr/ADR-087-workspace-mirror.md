@@ -79,10 +79,10 @@ maps cleanly, e.g. `notes/handoffs/*` → `entity_type="handoff"`).
 4. **Scope: explicit include/exclude, not "everything under `.khive/`."** Config-driven
    glob lists (`KHIVE_MIRROR_WORKSPACE_INCLUDE` / `_EXCLUDE`, matching the session mirror's
    own env-var configuration convention), with a recommended default:
-   - **Include**: `.khive/notes/**`, `.khive/reports/**`, `.khive/reviews/**` (local,
+   - **Include**: `.khive/notes/**`, `.khive/reports/**`, `.khive/codex_reviews/**` (local,
      gitignored, but valuable review history worth having "on record" in the local graph —
      mirroring is orthogonal to what gets committed to the public repo), workspace
-     artifact and completion-report markdown from configured workspace roots.
+     `artifacts/`/completion-report markdown under `.khive/workspaces/*/`.
    - **Exclude**: `.khive/kg/*.ndjson` and `schema.yaml` (already graph-versioned via
      ADR-010's git-native snapshot mechanism — mirroring the graph's own export back into
      itself would be circular), `.khive/scripts/` (executable code, not document content —
@@ -141,7 +141,7 @@ config, defaulting to the high-value subpaths, avoids both.
 
 ## Consequences
 
-- `.khive/notes/`, `.khive/reports/`, and `.khive/reviews/` content becomes
+- `.khive/notes/`, `.khive/reports/`, and `.khive/codex_reviews/` content becomes
   queryable, linkable, and versioned the same way any agent-authored document would be.
 - The mirror inherits ADR-080 §6's operational risk profile (a misconfigured poll interval
   or an unbounded read) but also inherits its already-fixed defenses — no new defect class

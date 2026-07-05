@@ -537,9 +537,9 @@ mod tests {
     // --- EXO no-authserv-id trust anchor (ADR-056 Amendment 2026-07-03) ---
 
     /// The plain (non-ARC) `Authentication-Results` header value Exchange
-    /// Online stamps on its internal hop, taken verbatim from the real fixture
-    /// `/Users/lion/projects/local workspace artifact`
-    /// (unfolded), minus the leading `Authentication-Results: ` field name.
+    /// Online stamps on its internal hop, taken verbatim from a local test
+    /// mailbox fixture (unfolded), minus the leading `Authentication-Results: `
+    /// field name.
     const EXO_FIXTURE_HEADER_VALUE: &str = "spf=pass (sender IP is 2607:f8b0:4864:20::1129) smtp.mailfrom=gmail.com; dkim=pass (signature was verified) header.d=gmail.com;dmarc=pass action=none header.from=gmail.com;compauth=pass reason=100";
 
     #[test]

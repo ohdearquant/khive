@@ -368,7 +368,7 @@ update_entity, update_note, update_edge, delete_edge.
 
 CHANGE FROM ADR-007 v1: The 2026-05-27 Namespace-by-Layer amendment routed memory, gtd, comm,
 brain, and schedule multi-record ops by actor namespace ("WHERE namespace = <actor_namespace>"),
-while routing KG and knowledge to "local". internal review finding 2 correctly identified this
+while routing KG and knowledge to "local". A review finding correctly identified this
 as a contradiction of Rule 0: framing per-pack actor routing as "explicit pack policy"
 re-introduces the exact actor-as-namespace isolation coupling the accepted design removed. Finding 1
 added that memory is live-audited as bulk "local" and that cross-lambda learning via
