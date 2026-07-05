@@ -120,6 +120,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-092](ADR-092-context-composer.md)                       | Cross-Substrate Context Composer — ContextContributor Trait + `context.assemble` (Proposed)                     |
 | [ADR-093](ADR-093-sessions-raw-zstd-compression.md)          | zstd Compression for Session-Mirror Raw Storage (Proposed)                                                      |
 | [ADR-094](ADR-094-lifecycle-telemetry-events.md)             | Sequencing-Assertable Lifecycle Telemetry Events (Proposed)                                                     |
+| [ADR-095](ADR-095-verb-surface-consolidation.md)             | Verb-Surface Consolidation and Field-Validation Governance (Proposed)                                           |
 
 ## Closed Taxonomies — Quick Reference
 
