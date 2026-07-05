@@ -165,6 +165,14 @@ Every `(source_kind, relation, target_kind)` triple must be explicitly allowed. 
 triples are rejected at write time. Pack endpoint rules (via `EDGE_RULES`) add rows to the
 allowlist but cannot remove base rules.
 
+> **Centralization note (2026-07-05)**: this base contract and every loaded pack's
+> `EDGE_RULES` additions are composed and enforced at one site,
+> `validate_edge_relation_endpoints` (`crates/khive-runtime/src/operations.rs`) — there is no
+> duplicate per-verb endpoint check elsewhere in the runtime. This centralization shipped and
+> is recorded as complete in [ADR-095](ADR-095-verb-surface-consolidation.md); it is not open
+> for re-litigation. See also [ADR-017](ADR-017-pack-standard.md) §"Pack-extensible edge
+> endpoints" for how packs declare their `EDGE_RULES` additions.
+
 ### Validation algorithm
 
 ```text

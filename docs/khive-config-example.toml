@@ -81,10 +81,11 @@
 # khive falls back to the legacy two-tier env pair (KHIVE_EMBEDDING_MODEL +
 # KHIVE_ADDITIONAL_EMBEDDING_MODELS; see the env reference at the end), and to
 # the built-in default models when those env vars are unset.
-# Caveat: if a config file is present AND those env vars are set AND no
-# [[engines]] block overrides them, khive logs a warning that the env vars are
-# "ignored" — but with nothing to override them they are still applied via the
-# base runtime config.
+# Caveat: if a config file is present with a non-empty [[engines]] block AND
+# those env vars are also set, khive logs a warning that the env vars are
+# "overridden" by [[engines]] (the config file wins). When no [[engines]]
+# block is configured, no warning is logged — the env vars (or built-in
+# defaults) simply apply, as described above.
 
 # Exactly one [[engines]] entry must set `default = true`.
 # That engine becomes the primary embedding model used for entity indexing

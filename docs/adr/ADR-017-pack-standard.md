@@ -462,6 +462,13 @@ with the full registered set in the error message.
 The 15 edge relations (ADR-002) are closed. Their semantics are universal: `depends_on`
 means "X cannot complete without Y" regardless of substrate. Packs cannot add relations.
 
+> **Centralization note (2026-07-05)**: the base contract below plus every loaded pack's
+> `EDGE_RULES` are composed and enforced at a single validator,
+> `validate_edge_relation_endpoints` (`crates/khive-runtime/src/operations.rs`) — see
+> [ADR-002](ADR-002-edge-ontology.md) §"Endpoint Validation" and
+> [ADR-095](ADR-095-verb-surface-consolidation.md) for the record of this shipped
+> centralization.
+
 But the per-relation **endpoint contract** (which `(source, relation, target)` triples
 are legal) is pack-extensible. A pack declares additional legal endpoint triples for
 existing relations:
