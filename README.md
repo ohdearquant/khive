@@ -73,7 +73,7 @@ this table):
 | **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)         |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall      |
 | **brain**     | `brain.`     | 14    | Bayesian user profiles + feedback loop                |
-| **comm**      | `comm.`      | 5     | Threaded messaging                                    |
+| **comm**      | `comm.`      | 6     | Threaded messaging                                    |
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                |
 | **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search            |
 | **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export) |

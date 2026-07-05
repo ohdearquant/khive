@@ -29,7 +29,7 @@ All 8 packs load by default. A background daemon auto-spawns to keep the runtime
 | **gtd**       | 5     | Task lifecycle (inbox → next → active → done)         |
 | **memory**    | 5     | Salience-weighted remember / decay-ranked recall      |
 | **brain**     | 14    | Bayesian user profiles + feedback loop                |
-| **comm**      | 5     | Threaded messaging                                    |
+| **comm**      | 6     | Threaded messaging                                    |
 | **schedule**  | 4     | Reminders and scheduled verb execution                |
 | **knowledge** | 19    | Atom-based KB with embedding rerank search            |
 | **session**   | 4     | Session record persistence (store/list/resume/export) |
