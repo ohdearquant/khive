@@ -1053,10 +1053,16 @@ impl GraphStore for SqlGraphStore {
 
             // Same global weight-descending/node_id-ascending order as `neighbors`
             // (ADR-089 context-verb review, internal review round 1, High-1),
-            // applied across BOTH directions before `LIMIT` truncates.
+            // applied across BOTH directions before `LIMIT` truncates. A
+            // reciprocal pair (an Out edge and an In edge to/from the same
+            // neighbor at the same weight) ties on `(weight, node_id)`, so the
+            // order is extended with a direction rank (`out` before `in`) and
+            // finally `edge_id` to make the pre-`LIMIT` order fully
+            // deterministic (internal review round 2, High).
             let full_sql = format!(
                 "SELECT node_id, edge_id, relation, weight, dir FROM ({}){} \
-                 ORDER BY weight DESC, node_id ASC{}",
+                 ORDER BY weight DESC, node_id ASC, \
+                 CASE dir WHEN 'out' THEN 0 ELSE 1 END ASC, edge_id ASC{}",
                 sql, where_extra, limit_clause
             );
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use khive_storage::types::{Direction, TraversalOptions};
+use serial_test::serial;
 use std::collections::HashSet;
 
 fn setup_memory_store() -> SqlGraphStore {
@@ -110,7 +111,11 @@ async fn test_count_edges() {
     assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 5);
 }
 
+// `#[serial(neighbor_select_count)]`: shares the key with the tests that
+// assert on the process-wide `NEIGHBOR_SELECT_COUNT` so a concurrent
+// `neighbors()` call from this test can't corrupt their count.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn test_neighbors_outbound() {
     let store = setup_memory_store();
 
@@ -153,7 +158,9 @@ async fn test_neighbors_outbound() {
 /// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
 /// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
 /// a high-weight one purely by insertion order.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn test_neighbors_limit_keeps_highest_weight_not_insertion_order() {
     let store = setup_memory_store();
 
@@ -214,7 +221,9 @@ async fn test_neighbors_limit_keeps_highest_weight_not_insertion_order() {
 /// in one storage query instead of two. Outgoing and incoming weights
 /// interleave (0.9, 0.6, 0.3 outgoing vs 0.8, 0.4 incoming) so the assertion
 /// proves global post-union ordering, not per-branch order.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn test_neighbors_both_directions_matches_two_separate_calls_and_order() {
     let store = setup_memory_store();
 
@@ -330,7 +339,9 @@ async fn test_neighbors_both_directions_matches_two_separate_calls_and_order() {
 /// Tight `fanout`/`limit` parity: with a narrowing limit, `neighbors_both_directions`
 /// must keep the same top-K set (by global weight) that the pre-optimization
 /// two-call-then-merge-then-truncate approach kept.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn test_neighbors_both_directions_limit_keeps_global_top_k() {
     let store = setup_memory_store();
 
@@ -393,7 +404,12 @@ async fn test_neighbors_both_directions_limit_keeps_global_top_k() {
 /// `khive-pack-kg/src/handlers/context.rs`). For N expanded nodes across V
 /// visible namespaces this is the `2*N*V -> 1*N*V` reduction described in the
 /// verification verdict.
+///
+/// `#[serial(neighbor_select_count)]`: `NEIGHBOR_SELECT_COUNT` is a process-wide
+/// counter — any other test issuing a neighbor SELECT while this one resets
+/// and checks it would corrupt the count under the default parallel test runner.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn test_neighbors_both_directions_halves_storage_query_count() {
     let store = setup_memory_store();
     let centre = Uuid::new_v4();
@@ -438,6 +454,60 @@ async fn test_neighbors_both_directions_halves_storage_query_count() {
         "the old pattern of two direction-scoped neighbors() calls issues 2 SELECTs — \
          exactly the query count neighbors_both_directions halves"
     );
+}
+
+/// Reciprocal equal-weight determinism (internal review round 2, High): a
+/// node with an Out edge to a neighbor and an In edge from the SAME neighbor
+/// at the SAME weight ties on `(weight, node_id)` — the pre-fix `ORDER BY`.
+/// Under a tight `limit`, the surviving row must be picked by a deterministic
+/// tie-break (the `out` row wins), not by whichever row SQLite happens to
+/// return first. Repeated to demonstrate the result is stable across calls.
+///
+/// `#[serial(neighbor_select_count)]`: shares the key with
+/// `test_neighbors_both_directions_halves_storage_query_count` so this test's
+/// repeated `neighbors_both_directions` calls can't corrupt that test's count
+/// of the process-wide `NEIGHBOR_SELECT_COUNT`.
+#[tokio::test]
+#[serial(neighbor_select_count)]
+async fn test_neighbors_both_directions_reciprocal_equal_weight_limit_is_deterministic() {
+    let store = setup_memory_store();
+
+    let centre = Uuid::new_v4();
+    let other = Uuid::new_v4();
+
+    store
+        .upsert_edge(make_edge(centre, other, EdgeRelation::Extends, 0.5))
+        .await
+        .unwrap();
+    store
+        .upsert_edge(make_edge(other, centre, EdgeRelation::Extends, 0.5))
+        .await
+        .unwrap();
+
+    let query = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: Some(1),
+        min_weight: None,
+    };
+
+    for _ in 0..5 {
+        let directed = store
+            .neighbors_both_directions(centre, query.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            directed.len(),
+            1,
+            "limit=1 must return exactly one hit even with a reciprocal equal-weight pair"
+        );
+        assert_eq!(directed[0].hit.node_id, other);
+        assert_eq!(
+            directed[0].direction,
+            Direction::Out,
+            "the out-direction row must win the weight/node_id tie deterministically"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1101,7 +1171,9 @@ fn single_neighbour_set(hits: &[NeighborHit]) -> HashSet<Uuid> {
 /// `limit` hits per source, not up to 2× (one per direction).
 /// Before the fix, Both ran Out and In separately and concatenated, so a node
 /// with ≥1 outgoing AND ≥1 incoming edge would yield 2 hits when limit=1.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_both_limit_matches_single_source_neighbors() {
     let store = setup_memory_store();
     // 2 outgoing, 2 incoming from centre
@@ -1147,7 +1219,9 @@ async fn batch_neighbors_both_limit_matches_single_source_neighbors() {
 }
 
 /// PARITY: set equality for Out direction, with and without limit.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_out_parity_with_neighbors() {
     let store = setup_memory_store();
     let (centre, out_nodes, _) = build_star(&store, 3, 2).await;
@@ -1177,7 +1251,9 @@ async fn batch_neighbors_out_parity_with_neighbors() {
 }
 
 /// PARITY: set equality for In direction.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_in_parity_with_neighbors() {
     let store = setup_memory_store();
     let (centre, _, in_nodes) = build_star(&store, 2, 3).await;
@@ -1204,7 +1280,9 @@ async fn batch_neighbors_in_parity_with_neighbors() {
 }
 
 /// PARITY: set equality for Both direction, no limit.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_both_parity_no_limit() {
     let store = setup_memory_store();
     let (centre, out_nodes, in_nodes) = build_star(&store, 2, 3).await;
@@ -1231,7 +1309,9 @@ async fn batch_neighbors_both_parity_no_limit() {
 }
 
 /// PARITY: relations filter applies correctly across directions.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_relations_filter_parity() {
     let store = setup_memory_store();
     let centre = Uuid::new_v4();
@@ -1270,7 +1350,9 @@ async fn batch_neighbors_relations_filter_parity() {
 }
 
 /// PARITY: min_weight filter applies correctly.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_min_weight_filter_parity() {
     let store = setup_memory_store();
     let centre = Uuid::new_v4();
@@ -1517,7 +1599,9 @@ async fn get_edges_chunk_boundary() {
 ///
 /// Correctness: for a random sample of sources, batch result must equal the
 /// per-source neighbors() result.
+// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
 #[tokio::test]
+#[serial(neighbor_select_count)]
 async fn batch_neighbors_both_chunk_boundary() {
     let store = setup_memory_store();
 
