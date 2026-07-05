@@ -51,9 +51,11 @@ At least one of `query`, `entity_ids` is required; both may be supplied.
 | `fanout`     | int      | 10      | Max neighbors returned per expanded node per hop, clamped 1..=50                                 |
 | `namespace`  | string   | "local" | Standard multi-record namespace default (ADR-007)                                                |
 
-`direction` defaults to `both` for this verb. The `neighbors` verb's `outgoing` default
-is a known agent footgun in the context-assembly use case; a new verb is not bound by
-the old default and the divergence is documented in both verbs' help text.
+`direction` defaults to `both` for this verb. At the time of this decision the
+`neighbors` verb defaulted to `outgoing`, a known agent footgun in the
+context-assembly use case; a new verb is not bound by the old default. The
+`neighbors`/`traverse` default was later corrected to `both` as well (#517), so
+the two verbs no longer diverge.
 
 ### Semantics
 

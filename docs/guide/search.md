@@ -82,9 +82,9 @@ Use `list` when you want categorical browsing, not similarity ranking.
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
 ```
 
-Direction options: `out` (default), `in`, `both`. **Always pass
-`direction="both"` unless you specifically want only outgoing edges** — the
-default is outgoing-only, which misses inbound relationships.
+Direction options: `out`, `in`, `both` (default). Omitting `direction`
+returns edges in both directions; pass `out` or `in` when you specifically
+want only one side.
 
 Filter by relation:
 
@@ -101,7 +101,7 @@ request(ops="traverse(roots=[\"<uuid>\"], max_depth=3, relations=[\"extends\", \
 Returns paths — each path is a list of nodes from root to leaf. Use
 `include_roots=false` to exclude the starting nodes from results.
 
-Traverse is BFS-based. It respects `direction` (default: `out`) and
+Traverse is BFS-based. It respects `direction` (default: `both`) and
 `relations` filters.
 
 ## Pattern matching: `query`
